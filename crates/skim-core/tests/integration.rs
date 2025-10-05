@@ -8,7 +8,6 @@ use skim_core::{transform, transform_auto, Language, Mode};
 use std::path::Path;
 
 #[test]
-#[ignore] // Remove #[ignore] after Week 2 implementation
 fn test_transform_typescript_structure() {
     let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
     let result = transform(source, Language::TypeScript, Mode::Structure);
@@ -27,7 +26,6 @@ fn test_transform_typescript_structure() {
 }
 
 #[test]
-#[ignore] // Remove #[ignore] after Week 2 implementation
 fn test_transform_auto_detection() {
     let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
     let path = Path::new("simple.ts");

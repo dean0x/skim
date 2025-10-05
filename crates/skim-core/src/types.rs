@@ -77,7 +77,7 @@ impl Language {
     pub fn to_tree_sitter(self) -> tree_sitter::Language {
         match self {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Self::JavaScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), // Note: Use TS parser for JS
+            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
