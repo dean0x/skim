@@ -1,0 +1,39 @@
+[package]
+name = "skim-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "Core library for smart code reading and transformation"
+repository = "https://github.com/youruser/skim"
+keywords = ["ast", "code-analysis", "tree-sitter", "llm"]
+categories = ["parser-implementations", "development-tools"]
+
+[dependencies]
+tree-sitter = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-java = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+insta = "1.39"  # Snapshot testing
+criterion = "0.5"  # Benchmarking
+
+# Benchmark (Phase 2, Week 7)
+# [[bench]]
+# name = "transform_bench"
+# harness = false
+
+[lints.clippy]
+# Enforce strict error handling in library code
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"  # Allow during development, warn to remind removal
+
+[lib]
+name = "skim_core"
+path = "src/lib.rs"

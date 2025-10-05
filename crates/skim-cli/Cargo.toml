@@ -1,0 +1,20 @@
+[package]
+name = "skim-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "CLI interface for skim-core smart code reader"
+repository = "https://github.com/youruser/skim"
+
+[[bin]]
+name = "skim"
+path = "src/main.rs"
+
+[dependencies]
+skim-core = { path = "../skim-core" }
+clap = { version = "4.5", features = ["derive"] }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2.0"  # CLI testing

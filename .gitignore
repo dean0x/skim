@@ -1,0 +1,41 @@
+# Rust build artifacts
+/target/
+# NOTE: Cargo.lock IS committed for applications (ensures reproducible builds)
+# Only libraries should ignore Cargo.lock
+
+# Debug and profiling
+*.pdb
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+flamegraph.svg
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation scratch folder (local notes, not for version control)
+.docs/
+
+# Cargo dist artifacts
+dist/
+
+# Test artifacts
+tests/tmp/
+*.snap.new
+
+# Coverage reports
+coverage/
+*.profraw
+tarpaulin-report.html
+
+# Benchmark results
+criterion/
+
+# Cache
+.cache/

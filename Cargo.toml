@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/skim-core",
+    "crates/skim-cli",
+]
+resolver = "2"
+
+# Shared dependencies across workspace
+[workspace.dependencies]
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[workspace.metadata.dist]
+# cargo-dist configuration (Phase 3, Week 11)
+cargo-dist-version = "0.14.0"
+ci = ["github"]
+installers = ["shell", "npm"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc"
+]
+
+[workspace.metadata.dist.npm]
+scope = "@skim"  # Or alternative if unavailable
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
