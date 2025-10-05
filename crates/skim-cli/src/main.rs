@@ -14,6 +14,9 @@ use std::path::PathBuf;
 
 use skim_core::{transform, transform_auto, Language, Mode};
 
+/// Maximum input size to prevent memory exhaustion (50MB)
+const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
+
 /// Skim - Smart code reader for AI agents
 ///
 /// Transform source code by stripping implementation details while
@@ -103,10 +106,30 @@ fn main() -> anyhow::Result<()> {
     let is_stdin = args.file.to_str() == Some("-");
     let source = if is_stdin {
         let mut buffer = String::new();
-        io::stdin().read_to_string(&mut buffer)?;
+        let bytes_read = io::stdin()
+            .take(MAX_INPUT_SIZE as u64 + 1)
+            .read_to_string(&mut buffer)?;
+
+        if bytes_read > MAX_INPUT_SIZE {
+            anyhow::bail!(
+                "Input too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+                bytes_read,
+                MAX_INPUT_SIZE,
+                MAX_INPUT_SIZE / 1024 / 1024
+            );
+        }
         buffer
     } else {
-        fs::read_to_string(&args.file)?
+        let contents = fs::read_to_string(&args.file)?;
+        if contents.len() > MAX_INPUT_SIZE {
+            anyhow::bail!(
+                "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+                contents.len(),
+                MAX_INPUT_SIZE,
+                MAX_INPUT_SIZE / 1024 / 1024
+            );
+        }
+        contents
     };
 
     // Transform using core library

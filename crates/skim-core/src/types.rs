@@ -52,7 +52,21 @@ impl Language {
     }
 
     /// Detect language from file path
+    ///
+    /// # Security
+    /// Rejects paths with directory traversal components (ParentDir, RootDir)
+    /// to prevent path traversal attacks in future caching features.
     pub fn from_path(path: &Path) -> Option<Self> {
+        use std::path::Component;
+
+        // SECURITY: Reject paths with traversal components
+        for component in path.components() {
+            match component {
+                Component::ParentDir | Component::RootDir => return None,
+                _ => {}
+            }
+        }
+
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(Self::from_extension)

@@ -7,7 +7,9 @@ resolver = "2"
 
 # Shared dependencies across workspace
 [workspace.dependencies]
-tree-sitter = "0.24"
+# CRITICAL: Must match tree-sitter-* grammar versions (0.23.x)
+# Do NOT upgrade to 0.24+ until all grammars support it (ABI compatibility)
+tree-sitter = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-python = "0.23"
