@@ -22,6 +22,9 @@ flamegraph.svg
 # Documentation scratch folder (local notes, not for version control)
 .docs/
 
+# Claude Code project instructions (local development only)
+CLAUDE.md
+
 # Cargo dist artifacts
 dist/
 
