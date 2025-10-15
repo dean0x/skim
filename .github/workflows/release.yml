@@ -200,7 +200,7 @@ jobs:
             }
 
             console.error('ERROR: rskim binary not found for your platform');
-            console.error(\`Platform: \${platform}, Architecture: \${arch}\`);
+            console.error(`Platform: ${platform}, Architecture: ${arch}`);
             console.error('Please report this issue at: https://github.com/dean0x/skim/issues');
             process.exit(1);
           }
