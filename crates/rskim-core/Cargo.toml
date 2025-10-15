@@ -1,11 +1,12 @@
 [package]
 name = "rskim-core"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "Core library for smart code reading and transformation"
 repository = "https://github.com/dean0x/skim"
+readme = "README.md"
 keywords = ["ast", "code-analysis", "tree-sitter", "llm"]
 categories = ["parser-implementations", "development-tools"]
 

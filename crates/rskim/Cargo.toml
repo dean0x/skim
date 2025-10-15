@@ -1,18 +1,19 @@
 [package]
 name = "rskim"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "Smart code reader - streaming code transformation for AI agents"
 repository = "https://github.com/dean0x/skim"
+readme = "README.md"
 
 [[bin]]
 name = "rskim"
 path = "src/main.rs"
 
 [dependencies]
-rskim-core = { version = "0.2.0", path = "../rskim-core" }
+rskim-core = { version = "0.2.1", path = "../rskim-core" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 
