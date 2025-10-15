@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "crates/skim-core",
-    "crates/skim-cli",
+    "crates/rskim-core",
+    "crates/rskim",
 ]
 resolver = "2"
 

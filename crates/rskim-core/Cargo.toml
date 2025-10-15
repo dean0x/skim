@@ -1,11 +1,11 @@
 [package]
-name = "skim-core"
-version = "0.1.0"
+name = "rskim-core"
+version = "0.2.0"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "Core library for smart code reading and transformation"
-repository = "https://github.com/youruser/skim"
+repository = "https://github.com/dean0x/skim"
 keywords = ["ast", "code-analysis", "tree-sitter", "llm"]
 categories = ["parser-implementations", "development-tools"]
 
@@ -35,5 +35,5 @@ panic = "deny"
 todo = "warn"  # Allow during development, warn to remind removal
 
 [lib]
-name = "skim_core"
+name = "rskim_core"
 path = "src/lib.rs"

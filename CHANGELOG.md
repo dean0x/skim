@@ -7,10 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned for v0.2.0
-- Multi-file glob support (`skim src/**/*.ts`)
+### Planned for Future Versions
+- Multi-file glob support (`rskim src/**/*.ts`)
 - Parser caching (mtime-based)
 - Parallel processing with rayon
+
+## [0.2.0] - 2025-10-15
+
+### Changed
+- **BREAKING:** Renamed all packages to `rskim` for consistency
+  - `skim-core` → `rskim-core`
+  - `skim-cli` → `rskim` (binary also renamed)
+  - Updated repository URLs to https://github.com/dean0x/skim
+- Simplified distribution strategy: native CLI only (removed WASM)
+- Configured cargo-dist for npm distribution as `rskim`
+
+### Migration Guide
+```bash
+# Old (v0.1.0)
+cargo install skim-cli
+
+# New (v0.2.0+)
+cargo install rskim
+
+# Or via npm (coming soon with cargo-dist)
+npm install -g rskim
+```
 
 ## [0.1.0] - 2025-10-15
 

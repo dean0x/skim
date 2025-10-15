@@ -1,18 +1,18 @@
 [package]
-name = "skim-cli"
-version = "0.1.0"
+name = "rskim"
+version = "0.2.0"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
-description = "CLI interface for skim-core smart code reader"
-repository = "https://github.com/youruser/skim"
+description = "Smart code reader - streaming code transformation for AI agents"
+repository = "https://github.com/dean0x/skim"
 
 [[bin]]
-name = "skim"
+name = "rskim"
 path = "src/main.rs"
 
 [dependencies]
-skim-core = { version = "0.1.0", path = "../skim-core" }
+rskim-core = { version = "0.2.0", path = "../rskim-core" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 

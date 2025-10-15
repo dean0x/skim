@@ -1,6 +1,6 @@
-//! Skim CLI - Command-line interface for skim-core
+//! rskim CLI - Command-line interface for rskim-core
 //!
-//! ARCHITECTURE: Thin I/O layer over skim-core library.
+//! ARCHITECTURE: Thin I/O layer over rskim-core library.
 //! This binary handles:
 //! - File I/O (reading from disk/stdin)
 //! - CLI argument parsing (clap)
@@ -12,25 +12,25 @@ use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 
-use skim_core::{transform, transform_auto, Language, Mode};
+use rskim_core::{transform, transform_auto, Language, Mode};
 
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
 
-/// Skim - Smart code reader for AI agents
+/// rskim - Smart code reader for AI agents
 ///
 /// Transform source code by stripping implementation details while
 /// preserving structure, signatures, and types.
 #[derive(Parser, Debug)]
-#[command(name = "skim")]
+#[command(name = "rskim")]
 #[command(author, version, about, long_about = None)]
 #[command(after_help = "EXAMPLES:\n  \
-    skim file.ts                       Read TypeScript with structure mode\n  \
-    skim file.py --mode signatures     Extract Python signatures\n  \
-    skim file.rs | bat -l rust         Skim Rust and highlight\n  \
-    cat code.ts | skim - --lang=ts     Read from stdin with explicit language\n  \
-    skim - -l python < script.py       Short form language flag\n\n\
-For more info: https://github.com/youruser/skim")]
+    rskim file.ts                       Read TypeScript with structure mode\n  \
+    rskim file.py --mode signatures     Extract Python signatures\n  \
+    rskim file.rs | bat -l rust         Skim Rust and highlight\n  \
+    cat code.ts | rskim - --lang=ts     Read from stdin with explicit language\n  \
+    rskim - -l python < script.py       Short form language flag\n\n\
+For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File to read (use '-' for stdin)
     #[arg(value_name = "FILE")]
