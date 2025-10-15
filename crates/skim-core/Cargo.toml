@@ -23,10 +23,9 @@ thiserror = { workspace = true }
 insta = "1.39"  # Snapshot testing
 criterion = "0.5"  # Benchmarking
 
-# Benchmark (Phase 2, Week 7)
-# [[bench]]
-# name = "transform_bench"
-# harness = false
+[[bench]]
+name = "transform_bench"
+harness = false
 
 [lints.clippy]
 # Enforce strict error handling in library code

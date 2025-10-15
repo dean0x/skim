@@ -54,16 +54,17 @@ impl Language {
     /// Detect language from file path
     ///
     /// # Security
-    /// Rejects paths with directory traversal components (ParentDir, RootDir)
+    /// Rejects paths with parent directory traversal components (`..`)
     /// to prevent path traversal attacks in future caching features.
+    /// Absolute paths are allowed.
     pub fn from_path(path: &Path) -> Option<Self> {
         use std::path::Component;
 
-        // SECURITY: Reject paths with traversal components
+        // SECURITY: Reject paths with parent directory traversal
+        // Allow absolute paths (RootDir is fine), but reject .. (ParentDir)
         for component in path.components() {
-            match component {
-                Component::ParentDir | Component::RootDir => return None,
-                _ => {}
+            if matches!(component, Component::ParentDir) {
+                return None;
             }
         }
 

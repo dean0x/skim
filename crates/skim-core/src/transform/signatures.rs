@@ -103,7 +103,7 @@ fn is_signature_node(kind: &str, node_types: &SignatureNodeTypes) -> bool {
 fn extract_signature(
     node: Node,
     source: &str,
-    node_types: &SignatureNodeTypes,
+    _node_types: &SignatureNodeTypes,
 ) -> Result<Option<String>> {
     // Find the body node
     let body_node = find_body_for_signature(node);

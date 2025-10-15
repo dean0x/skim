@@ -5,6 +5,7 @@
 use crate::Language;
 
 /// Get tree-sitter node types for a language
+#[allow(dead_code)]
 ///
 /// Different languages have different AST node types:
 /// - TypeScript: "function_declaration", "class_declaration"
@@ -48,6 +49,7 @@ pub(crate) fn get_node_types(language: Language) -> LanguageNodeTypes {
 }
 
 /// Node type mappings for a language
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct LanguageNodeTypes {
     pub function: &'static str,
