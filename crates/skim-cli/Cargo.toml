@@ -12,7 +12,7 @@ name = "skim"
 path = "src/main.rs"
 
 [dependencies]
-skim-core = { path = "../skim-core" }
+skim-core = { version = "0.1.0", path = "../skim-core" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 
