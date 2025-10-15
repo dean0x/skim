@@ -50,9 +50,9 @@ mod types;
 mod parser;
 mod transform;
 
-// Cache module (Phase 3)
-#[cfg(feature = "cache")]
-mod cache;
+// Cache module (Phase 3 - not yet implemented)
+// #[cfg(feature = "cache")]
+// mod cache;
 
 // ============================================================================
 // Public API - Core Transformation Functions

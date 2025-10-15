@@ -16,7 +16,7 @@ crate-type = ["cdylib", "rlib"]
 skim-core = { path = "../skim-core", version = "0.1.0" }
 wasm-bindgen = { workspace = true }
 web-sys = { workspace = true, features = ["console"] }
-console_error_panic_hook = { workspace = true }
+console_error_panic_hook = { workspace = true, optional = true }
 wee_alloc = { workspace = true, optional = true }
 
 [dev-dependencies]
