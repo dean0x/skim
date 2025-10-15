@@ -86,6 +86,11 @@ pub(crate) fn transform_structure(
             )));
         }
 
+        // Skip overlapping replacements (nested functions already handled by parent)
+        if start < last_pos {
+            continue;
+        }
+
         // Validate UTF-8 boundaries before slicing
         if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
             return Err(SkimError::ParseError(format!(
