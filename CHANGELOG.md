@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned for v0.2.0
-- WASM support with `@vscode/tree-sitter-wasm`
-- JavaScript/TypeScript API for browser and Node.js
+### Added (v0.2.0 - In Progress)
+- **WASM Bindings** - `skim-wasm` crate with JavaScript/TypeScript API
+- Basic WASM exports: `transform()`, `Language`, `Mode` enums
+- Browser and Node.js support (target: web, nodejs, bundler)
+- HTML example for browser testing
+- Node.js example for server-side usage
+
+### Planned for v0.2.0 Completion
+- Grammar loading via `web-tree-sitter` runtime
+- Integration with `@vscode/tree-sitter-wasm` for pre-compiled grammars
+- Lazy grammar loading (reduce initial bundle size)
+- npm package publication (`@skim/wasm`)
 - Multi-file glob support (`skim src/**/*.ts`)
 - Parser caching (mtime-based)
 - Parallel processing with rayon

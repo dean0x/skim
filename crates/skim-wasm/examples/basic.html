@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Skim WASM Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .panel {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        textarea {
+            width: 100%;
+            height: 400px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: vertical;
+        }
+        .controls {
+            margin-bottom: 15px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        select, button {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        .stats {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .stats span {
+            font-weight: bold;
+            color: #28a745;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 Skim WASM Demo</h1>
+    <p>Transform source code by removing implementation details while preserving structure.</p>
+
+    <div class="container">
+        <div class="panel">
+            <h3>Input Code</h3>
+            <div class="controls">
+                <select id="language">
+                    <option value="TypeScript">TypeScript</option>
+                    <option value="JavaScript">JavaScript</option>
+                    <option value="Python">Python</option>
+                    <option value="Rust">Rust</option>
+                    <option value="Go">Go</option>
+                    <option value="Java">Java</option>
+                </select>
+                <select id="mode">
+                    <option value="Structure">Structure (70-80% reduction)</option>
+                    <option value="Signatures">Signatures (85-92% reduction)</option>
+                    <option value="Types">Types (90-95% reduction)</option>
+                    <option value="Full">Full (no transformation)</option>
+                </select>
+                <button onclick="transform()">Transform</button>
+            </div>
+            <textarea id="input" placeholder="Paste your code here...">function add(a: number, b: number): number {
+  // Add two numbers
+  const result = a + b;
+  console.log(`Adding ${a} + ${b} = ${result}`);
+  return result;
+}
+
+class Calculator {
+  constructor(private name: string) {}
+
+  multiply(x: number, y: number): number {
+    const result = x * y;
+    console.log(`${this.name}: ${x} * ${y} = ${result}`);
+    return result;
+  }
+}</textarea>
+        </div>
+
+        <div class="panel">
+            <h3>Transformed Code</h3>
+            <div class="stats" id="stats">
+                Click "Transform" to see results
+            </div>
+            <textarea id="output" readonly placeholder="Transformed code will appear here..."></textarea>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { transform as skimTransform, Language, Mode } from './pkg/skim_wasm.js';
+
+        // Initialize WASM module
+        await init();
+        console.log('✅ Skim WASM initialized');
+
+        // Make transform function available globally
+        window.transform = function() {
+            const input = document.getElementById('input').value;
+            const languageStr = document.getElementById('language').value;
+            const modeStr = document.getElementById('mode').value;
+
+            // Map strings to enum values
+            const language = Language[languageStr];
+            const mode = Mode[modeStr];
+
+            try {
+                const result = skimTransform(input, language, mode);
+
+                document.getElementById('output').value = result.content;
+                document.getElementById('stats').innerHTML = `
+                    <strong>Original:</strong> ${result.originalSize} bytes<br>
+                    <strong>Transformed:</strong> ${result.transformedSize} bytes<br>
+                    <strong>Reduction:</strong> <span>${result.reductionPercentage.toFixed(1)}%</span>
+                `;
+            } catch (error) {
+                document.getElementById('output').value = `Error: ${error}`;
+                document.getElementById('stats').innerHTML = `<strong style="color: red;">Transformation failed</strong>`;
+            }
+        };
+
+        console.log('🚀 Ready to transform code');
+    </script>
+</body>
+</html>
