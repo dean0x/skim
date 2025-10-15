@@ -2,7 +2,6 @@
 members = [
     "crates/skim-core",
     "crates/skim-cli",
-    "crates/skim-wasm",
 ]
 resolver = "2"
 
@@ -20,14 +19,7 @@ tree-sitter-java = "0.23"
 thiserror = "1.0"
 anyhow = "1.0"
 
-# WASM dependencies
-wasm-bindgen = "0.2"
-web-sys = "0.3"
-console_error_panic_hook = "0.1"
-wee_alloc = "0.4"
-
 [workspace.metadata.dist]
-# cargo-dist configuration (Phase 3, Week 11)
 cargo-dist-version = "0.14.0"
 ci = ["github"]
 installers = ["shell", "npm"]
@@ -38,8 +30,9 @@ targets = [
     "x86_64-pc-windows-msvc"
 ]
 
+# npm package name (unscoped)
 [workspace.metadata.dist.npm]
-scope = "@skim"  # Or alternative if unavailable
+package = "rskim"
 
 [profile.release]
 opt-level = 3
