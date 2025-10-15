@@ -123,24 +123,31 @@ class Calculator {
     </div>
 
     <script type="module">
-        import init, { transform as skimTransform, Language, Mode } from './pkg/skim_wasm.js';
+        import { init, transform as skimTransform, Language, Mode } from '../src/wrapper.js';
 
         // Initialize WASM module
+        console.log('🔄 Initializing Skim WASM...');
         await init();
         console.log('✅ Skim WASM initialized');
 
-        // Make transform function available globally
-        window.transform = function() {
-            const input = document.getElementById('input').value;
-            const languageStr = document.getElementById('language').value;
-            const modeStr = document.getElementById('mode').value;
+        // Preload TypeScript grammar (most common)
+        try {
+            await skimTransform('', Language.TypeScript, Mode.Full);
+            console.log('✅ TypeScript grammar preloaded');
+        } catch (e) {
+            console.warn('Grammar preload failed (will load on demand):', e.message);
+        }
 
-            // Map strings to enum values
-            const language = Language[languageStr];
-            const mode = Mode[modeStr];
+        // Make transform function available globally
+        window.transform = async function() {
+            const input = document.getElementById('input').value;
+            const languageStr = document.getElementById('language').value.toLowerCase();
+            const modeStr = document.getElementById('mode').value.toLowerCase();
 
             try {
-                const result = skimTransform(input, language, mode);
+                document.getElementById('stats').innerHTML = '⏳ Transforming...';
+
+                const result = await skimTransform(input, languageStr, modeStr);
 
                 document.getElementById('output').value = result.content;
                 document.getElementById('stats').innerHTML = `
@@ -149,8 +156,9 @@ class Calculator {
                     <strong>Reduction:</strong> <span>${result.reductionPercentage.toFixed(1)}%</span>
                 `;
             } catch (error) {
-                document.getElementById('output').value = `Error: ${error}`;
-                document.getElementById('stats').innerHTML = `<strong style="color: red;">Transformation failed</strong>`;
+                console.error('Transform error:', error);
+                document.getElementById('output').value = `Error: ${error.message}`;
+                document.getElementById('stats').innerHTML = `<strong style="color: red;">Transformation failed: ${error.message}</strong>`;
             }
         };
 

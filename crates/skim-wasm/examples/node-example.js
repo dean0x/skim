@@ -1,9 +1,10 @@
 // Example: Using Skim WASM in Node.js
 //
 // Usage:
+//   npm install (first time only)
 //   node examples/node-example.js
 
-const { transform, Language, Mode } = require('../pkg/skim_wasm.js');
+import { init, transform, Language, Mode } from '../src/wrapper.js';
 
 const typeScriptCode = `
 function fibonacci(n: number): number {
@@ -29,32 +30,42 @@ class MathUtils {
 }
 `;
 
-console.log('🔍 Skim WASM - Node.js Example\n');
-console.log('Original Code:');
-console.log('─'.repeat(50));
-console.log(typeScriptCode);
-console.log('─'.repeat(50));
-console.log(`Size: ${typeScriptCode.length} bytes\n`);
+async function main() {
+  console.log('🔍 Skim WASM - Node.js Example\n');
 
-// Transform with different modes
-const modes = [
-  { mode: Mode.Structure, name: 'Structure' },
-  { mode: Mode.Signatures, name: 'Signatures' },
-  { mode: Mode.Types, name: 'Types' },
-];
+  // Initialize
+  console.log('⏳ Initializing...');
+  await init();
+  console.log('✅ Initialized\n');
 
-modes.forEach(({ mode, name }) => {
-  try {
-    const result = transform(typeScriptCode, Language.TypeScript, mode);
+  console.log('Original Code:');
+  console.log('─'.repeat(50));
+  console.log(typeScriptCode);
+  console.log('─'.repeat(50));
+  console.log(`Size: ${typeScriptCode.length} bytes\n`);
 
-    console.log(`\n${name} Mode (${result.reductionPercentage.toFixed(1)}% reduction):`);
-    console.log('─'.repeat(50));
-    console.log(result.content);
-    console.log('─'.repeat(50));
-    console.log(`Size: ${result.transformedSize} bytes (was ${result.originalSize} bytes)`);
-  } catch (error) {
-    console.error(`❌ ${name} mode failed:`, error);
+  // Transform with different modes
+  const modes = [
+    { mode: Mode.Structure, name: 'Structure' },
+    { mode: Mode.Signatures, name: 'Signatures' },
+    { mode: Mode.Types, name: 'Types' },
+  ];
+
+  for (const { mode, name } of modes) {
+    try {
+      const result = await transform(typeScriptCode, Language.TypeScript, mode);
+
+      console.log(`\n${name} Mode (${result.reductionPercentage.toFixed(1)}% reduction):`);
+      console.log('─'.repeat(50));
+      console.log(result.content);
+      console.log('─'.repeat(50));
+      console.log(`Size: ${result.transformedSize} bytes (was ${result.originalSize} bytes)`);
+    } catch (error) {
+      console.error(`❌ ${name} mode failed:`, error.message);
+    }
   }
-});
 
-console.log('\n✅ Transformation complete');
+  console.log('\n✅ Transformation complete');
+}
+
+main().catch(console.error);

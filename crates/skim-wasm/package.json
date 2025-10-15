@@ -1,0 +1,64 @@
+{
+  "name": "@skim/wasm",
+  "version": "0.2.0",
+  "description": "WASM-powered code transformation for JavaScript and TypeScript",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "pkg",
+    "grammars"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --release",
+    "build:nodejs": "wasm-pack build --target nodejs --release",
+    "build:bundler": "wasm-pack build --target bundler --release",
+    "test": "node examples/node-example.js",
+    "serve": "python3 -m http.server 8000"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/skim.git"
+  },
+  "keywords": [
+    "wasm",
+    "webassembly",
+    "tree-sitter",
+    "ast",
+    "code-analysis",
+    "llm",
+    "typescript",
+    "javascript",
+    "python",
+    "rust",
+    "go",
+    "java"
+  ],
+  "author": "Skim Contributors",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/dean0x/skim/issues"
+  },
+  "homepage": "https://github.com/dean0x/skim#readme",
+  "dependencies": {
+    "web-tree-sitter": "^0.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  },
+  "peerDependencies": {
+    "@vscode/tree-sitter-wasm": "^0.1.4"
+  },
+  "peerDependenciesMeta": {
+    "@vscode/tree-sitter-wasm": {
+      "optional": true
+    }
+  }
+}

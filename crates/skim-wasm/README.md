@@ -24,7 +24,10 @@ npm install @skim/wasm
 ### Basic Example
 
 ```javascript
-import { transform, Language, Mode } from '@skim/wasm';
+import { init, transform, Language, Mode } from '@skim/wasm';
+
+// Initialize once when your app starts
+await init();
 
 const sourceCode = `
 function add(a: number, b: number): number {
@@ -32,7 +35,7 @@ function add(a: number, b: number): number {
 }
 `;
 
-const result = transform(sourceCode, Language.TypeScript, Mode.Structure);
+const result = await transform(sourceCode, Language.TypeScript, Mode.Structure);
 
 console.log(result.content);
 // Output: function add(a: number, b: number): number { /* ... */ }
@@ -64,13 +67,19 @@ Mode.Full        // No transformation (0% reduction)
 ### Advanced Example
 
 ```javascript
-import { transform, Language, Mode } from '@skim/wasm';
+import { init, transform, loadGrammar, Language, Mode } from '@skim/wasm';
+
+// Initialize
+await init();
+
+// Preload grammars (optional, for better performance)
+await loadGrammar(Language.Python);
 
 // Read file content
 const code = await fetch('/api/code').then(r => r.text());
 
 // Transform
-const result = transform(code, Language.Python, Mode.Signatures);
+const result = await transform(code, Language.Python, Mode.Signatures);
 
 // Use in LLM context
 const prompt = `
@@ -84,41 +93,57 @@ What endpoints are exposed?
 
 ## API Reference
 
+### `init(options?)`
+
+Initialize web-tree-sitter runtime. **Must be called once before using transform().**
+
+**Parameters:**
+- `options` (object, optional)
+  - `treeSitterWasmPath` (string) - Custom path to tree-sitter.wasm runtime
+
+**Returns:** Promise<void>
+
 ### `transform(source, language, mode)`
 
 Transform source code.
 
 **Parameters:**
 - `source` (string) - Source code to transform
-- `language` (Language) - Programming language
-- `mode` (Mode) - Transformation mode
+- `language` (Language | string) - Programming language
+- `mode` (Mode | string) - Transformation mode
 
-**Returns:**
-- `TransformResult` object with:
-  - `content` (string) - Transformed code
-  - `originalSize` (number) - Original size in bytes
-  - `transformedSize` (number) - Transformed size in bytes
-  - `reductionPercentage` (number) - Reduction percentage
+**Returns:** Promise<TransformResult>
+- `content` (string) - Transformed code
+- `originalSize` (number) - Original size in bytes
+- `transformedSize` (number) - Transformed size in bytes
+- `reductionPercentage` (number) - Reduction percentage
 
-**Throws:**
-- Error string if transformation fails
+**Throws:** Error if transformation fails
 
-### `log(message)`
+### `loadGrammar(language, grammarPath?)`
 
-Log a message to browser console (for debugging).
+Preload a grammar for a specific language (optional, for performance).
+
+**Parameters:**
+- `language` (Language | string) - Language to load
+- `grammarPath` (string, optional) - Custom path to grammar WASM file
+
+**Returns:** Promise<unknown>
 
 ## Use Cases
 
 ### 1. Code Editor Extension
 
 ```javascript
-import { transform, Language, Mode } from '@skim/wasm';
+import { init, transform, Language, Mode } from '@skim/wasm';
 
-function skimCurrentFile(editor) {
+await init();
+
+async function skimCurrentFile(editor) {
   const text = editor.document.getText();
   const lang = detectLanguage(editor.document.languageId);
 
-  const result = transform(text, lang, Mode.Structure);
+  const result = await transform(text, lang, Mode.Structure);
 
   // Show in new tab
   editor.openTextDocument({ content: result.content });
@@ -128,14 +153,16 @@ function skimCurrentFile(editor) {
 ### 2. Documentation Generator
 
 ```javascript
-import { transform, Language, Mode } from '@skim/wasm';
+import { init, transform, Language, Mode } from '@skim/wasm';
+
+await init();
 
 async function extractAPI(files) {
   const apis = [];
 
   for (const file of files) {
     const content = await readFile(file);
-    const result = transform(content, Language.TypeScript, Mode.Signatures);
+    const result = await transform(content, Language.TypeScript, Mode.Signatures);
     apis.push({ file, signatures: result.content });
   }
 
@@ -146,17 +173,22 @@ async function extractAPI(files) {
 ### 3. LLM Context Optimization
 
 ```javascript
-import { transform, Language, Mode } from '@skim/wasm';
+import { init, transform, Language, Mode } from '@skim/wasm';
 
-function optimizeForLLM(codebase) {
-  return codebase.map(file => {
-    const result = transform(file.content, file.language, Mode.Structure);
-    return {
-      ...file,
-      optimized: result.content,
-      savingsPercent: result.reductionPercentage
-    };
-  });
+await init();
+
+async function optimizeForLLM(codebase) {
+  const optimized = await Promise.all(
+    codebase.map(async file => {
+      const result = await transform(file.content, file.language, Mode.Structure);
+      return {
+        ...file,
+        optimized: result.content,
+        savingsPercent: result.reductionPercentage
+      };
+    })
+  );
+  return optimized;
 }
 ```
 
