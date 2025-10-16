@@ -39,18 +39,22 @@ export function processUser(user: User): Result { /* ... */ }
 
 ## Installation
 
-### Via Cargo (Recommended for Rust developers)
+### Via npx (Recommended - no install required)
 
 ```bash
-cargo install rskim
+npx rskim file.ts
 ```
 
 ### Via npm
 
 ```bash
 npm install -g rskim
-# or use without install
-npx rskim file.ts
+```
+
+### Via Cargo
+
+```bash
+cargo install rskim
 ```
 
 ### From Source
@@ -66,39 +70,40 @@ cargo build --release
 
 ```bash
 # Extract structure from TypeScript
-rskim src/app.ts
+npx rskim src/app.ts
 
 # Get only function signatures
-rskim src/app.ts --mode signatures
+npx rskim src/app.ts --mode signatures
 
 # Extract type definitions
-rskim src/types.ts --mode types
+npx rskim src/types.ts --mode types
 
 # Pipe to other tools
-rskim src/app.ts | bat -l typescript
-rskim src/**/*.ts | wc -l
+npx rskim src/app.ts | bat -l typescript
 
 # Read from stdin (requires --language)
-cat app.ts | rskim - --language typescript
+cat app.ts | npx rskim - --language typescript
 ```
 
 ## Usage
 
-```
+```bash
+npx rskim [FILE] [OPTIONS]
+
+# Or if installed globally
 rskim [FILE] [OPTIONS]
-
-Arguments:
-  <FILE>  File to read (use '-' for stdin)
-
-Options:
-  -m, --mode <MODE>          Transformation mode [default: structure]
-                             [values: structure, signatures, types, full]
-  -l, --language <LANGUAGE>  Explicit language (required for stdin)
-                             [values: typescript, javascript, python, rust, go, java]
-      --force                Force parsing even if language unsupported
-  -h, --help                 Print help
-  -V, --version              Print version
 ```
+
+**Arguments:**
+- `<FILE>` - File to read (use '-' for stdin)
+
+**Options:**
+- `-m, --mode <MODE>` - Transformation mode [default: structure]
+  - Values: `structure`, `signatures`, `types`, `full`
+- `-l, --language <LANGUAGE>` - Explicit language (required for stdin)
+  - Values: `typescript`, `javascript`, `python`, `rust`, `go`, `java`
+- `-h, --help` - Print help
+- `-V, --version` - Print version
 
 ## Transformation Modes
 
@@ -109,7 +114,7 @@ Options:
 Keeps function/method signatures, class declarations, type definitions, imports/exports. Strips all implementation bodies.
 
 ```bash
-rskim file.ts --mode structure
+npx rskim file.ts --mode structure
 ```
 
 **Use case**: Understanding code organization and APIs
@@ -121,7 +126,7 @@ rskim file.ts --mode structure
 More aggressive - keeps ONLY callable signatures, removes everything else.
 
 ```bash
-rskim file.ts --mode signatures
+npx rskim file.ts --mode signatures
 ```
 
 **Use case**: Generating API documentation or type stubs
@@ -133,7 +138,7 @@ rskim file.ts --mode signatures
 Keeps only type definitions (interfaces, type aliases, enums). Removes all code.
 
 ```bash
-rskim file.ts --mode types
+npx rskim file.ts --mode types
 ```
 
 **Use case**: Type system analysis
@@ -145,7 +150,7 @@ rskim file.ts --mode types
 No transformation - returns original source (like `cat`).
 
 ```bash
-rskim file.ts --mode full
+npx rskim file.ts --mode full
 ```
 
 **Use case**: Passthrough for testing or comparison
@@ -220,28 +225,28 @@ impl UserRepository {
 
 ```bash
 # Send only structure to AI for code review
-rskim src/**/*.ts | llm "Review this architecture"
+npx rskim src/app.ts | llm "Review this architecture"
 ```
 
 ### 2. Codebase Documentation
 
 ```bash
 # Generate API surface documentation
-find src -name "*.ts" -exec rskim {} --mode signatures \; > api-surface.txt
+npx rskim src/api.ts --mode signatures > api-docs.txt
 ```
 
 ### 3. Type System Analysis
 
 ```bash
 # Extract all type definitions for analysis
-rskim src/types.ts --mode types
+npx rskim src/types.ts --mode types
 ```
 
 ### 4. Code Navigation
 
 ```bash
 # Quick overview of file structure
-rskim large-file.py | less
+npx rskim large-file.py | less
 ```
 
 ## Security
