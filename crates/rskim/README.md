@@ -19,7 +19,7 @@ Think of it like `cat`, but smart about what code to show.
 cargo install rskim
 ```
 
-### Via npm (coming soon)
+### Via npm
 
 ```bash
 npm install -g rskim
@@ -222,7 +222,7 @@ For programmatic usage, see the [`rskim-core`](https://crates.io/crates/rskim-co
 
 - [Repository](https://github.com/dean0x/skim)
 - [Library Documentation](https://docs.rs/rskim-core)
-- [npm Package](https://www.npmjs.com/package/rskim) (coming soon)
+- [npm Package](https://www.npmjs.com/package/rskim)
 
 ## License
 

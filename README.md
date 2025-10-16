@@ -42,15 +42,15 @@ export function processUser(user: User): Result { /* ... */ }
 ### Via Cargo (Recommended for Rust developers)
 
 ```bash
-cargo install skim
+cargo install rskim
 ```
 
-### Via npm (Coming soon)
+### Via npm
 
 ```bash
-npm install -g @skim/cli
+npm install -g rskim
 # or use without install
-npx @skim/cli file.ts
+npx rskim file.ts
 ```
 
 ### From Source
@@ -59,33 +59,33 @@ npx @skim/cli file.ts
 git clone https://github.com/dean0x/skim.git
 cd skim
 cargo build --release
-# Binary at target/release/skim
+# Binary at target/release/rskim
 ```
 
 ## Quick Start
 
 ```bash
 # Extract structure from TypeScript
-skim src/app.ts
+rskim src/app.ts
 
 # Get only function signatures
-skim src/app.ts --mode signatures
+rskim src/app.ts --mode signatures
 
 # Extract type definitions
-skim src/types.ts --mode types
+rskim src/types.ts --mode types
 
 # Pipe to other tools
-skim src/app.ts | bat -l typescript
-skim src/**/*.ts | wc -l
+rskim src/app.ts | bat -l typescript
+rskim src/**/*.ts | wc -l
 
 # Read from stdin (requires --language)
-cat app.ts | skim - --language typescript
+cat app.ts | rskim - --language typescript
 ```
 
 ## Usage
 
 ```
-skim [FILE] [OPTIONS]
+rskim [FILE] [OPTIONS]
 
 Arguments:
   <FILE>  File to read (use '-' for stdin)
@@ -109,7 +109,7 @@ Options:
 Keeps function/method signatures, class declarations, type definitions, imports/exports. Strips all implementation bodies.
 
 ```bash
-skim file.ts --mode structure
+rskim file.ts --mode structure
 ```
 
 **Use case**: Understanding code organization and APIs
@@ -121,7 +121,7 @@ skim file.ts --mode structure
 More aggressive - keeps ONLY callable signatures, removes everything else.
 
 ```bash
-skim file.ts --mode signatures
+rskim file.ts --mode signatures
 ```
 
 **Use case**: Generating API documentation or type stubs
@@ -133,7 +133,7 @@ skim file.ts --mode signatures
 Keeps only type definitions (interfaces, type aliases, enums). Removes all code.
 
 ```bash
-skim file.ts --mode types
+rskim file.ts --mode types
 ```
 
 **Use case**: Type system analysis
@@ -145,7 +145,7 @@ skim file.ts --mode types
 No transformation - returns original source (like `cat`).
 
 ```bash
-skim file.ts --mode full
+rskim file.ts --mode full
 ```
 
 **Use case**: Passthrough for testing or comparison
@@ -220,28 +220,28 @@ impl UserRepository {
 
 ```bash
 # Send only structure to AI for code review
-skim src/**/*.ts | llm "Review this architecture"
+rskim src/**/*.ts | llm "Review this architecture"
 ```
 
 ### 2. Codebase Documentation
 
 ```bash
 # Generate API surface documentation
-find src -name "*.ts" -exec skim {} --mode signatures \; > api-surface.txt
+find src -name "*.ts" -exec rskim {} --mode signatures \; > api-surface.txt
 ```
 
 ### 3. Type System Analysis
 
 ```bash
 # Extract all type definitions for analysis
-skim src/types.ts --mode types
+rskim src/types.ts --mode types
 ```
 
 ### 4. Code Navigation
 
 ```bash
 # Quick overview of file structure
-skim large-file.py | less
+rskim large-file.py | less
 ```
 
 ## Security
@@ -337,7 +337,7 @@ Should take ~30 minutes per language.
 
 ## Project Status
 
-**Current**: Early development (v0.1.0)
+**Current**: Production ready (v0.2.3)
 
 ✅ **Implemented:**
 - TypeScript/JavaScript/Python/Rust/Go/Java support
@@ -345,6 +345,7 @@ Should take ~30 minutes per language.
 - CLI with stdin support
 - DoS protections
 - Comprehensive test suite
+- npm and cargo distribution
 
 🚧 **In Progress:**
 - Test coverage improvements
@@ -352,10 +353,9 @@ Should take ~30 minutes per language.
 - Performance optimizations
 
 📋 **Planned:**
-- Multi-file/glob support (`skim src/**/*.ts`)
+- Multi-file/glob support (`rskim src/**/*.ts`)
 - Caching layer (mtime-based)
 - Parallel processing with rayon
-- npm distribution via cargo-dist
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
@@ -374,8 +374,8 @@ Contributions welcome! Please:
 ```
 skim/
 ├── crates/
-│   ├── skim-core/     # Core library (language-agnostic)
-│   └── skim-cli/      # CLI binary (I/O layer)
+│   ├── rskim-core/    # Core library (language-agnostic)
+│   └── rskim/         # CLI binary (I/O layer)
 ├── tests/fixtures/    # Test files for each language
 └── benches/           # Performance benchmarks (planned)
 ```
@@ -394,8 +394,8 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - **Repository**: https://github.com/dean0x/skim
 - **Issues**: https://github.com/dean0x/skim/issues
-- **Crates.io**: https://crates.io/crates/skim (coming soon)
-- **npm**: https://npmjs.com/package/@skim/cli (coming soon)
+- **Crates.io**: https://crates.io/crates/rskim
+- **npm**: https://www.npmjs.com/package/rskim
 
 ---
 
