@@ -1,8 +1,8 @@
-//! Integration tests for skim-core
+//! Integration tests for rskim-core
 //!
 //! These tests validate the full pipeline from source → transformation.
 
-use skim_core::{transform, transform_auto, Language, Mode};
+use rskim_core::{transform, transform_auto, Language, Mode};
 use std::path::Path;
 
 // ============================================================================
@@ -223,7 +223,7 @@ fn test_transform_auto_detection() {
 
 #[test]
 fn test_detect_language_from_path() {
-    use skim_core::detect_language_from_path;
+    use rskim_core::detect_language_from_path;
 
     assert_eq!(
         detect_language_from_path(Path::new("test.ts")),
@@ -253,7 +253,7 @@ fn test_detect_language_from_path() {
 
 #[test]
 fn test_unsupported_language() {
-    use skim_core::detect_language_from_path;
+    use rskim_core::detect_language_from_path;
 
     assert_eq!(
         detect_language_from_path(Path::new("unknown.xyz")),

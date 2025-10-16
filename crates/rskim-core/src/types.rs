@@ -33,7 +33,7 @@ impl Language {
     /// # Examples
     /// ```
     /// use std::path::Path;
-    /// use skim_core::Language;
+    /// use rskim_core::Language;
     ///
     /// assert_eq!(Language::from_extension("ts"), Some(Language::TypeScript));
     /// assert_eq!(Language::from_extension("py"), Some(Language::Python));

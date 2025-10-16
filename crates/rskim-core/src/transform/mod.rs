@@ -41,8 +41,6 @@ pub(crate) fn transform_tree(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // NOTE: Tests require parser implementation
     // These are schema validation only
 }

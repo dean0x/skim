@@ -22,7 +22,7 @@ Core library for smart code reading and transformation.
 
 ```toml
 [dependencies]
-rskim-core = "0.2"
+rskim-core = "0.3"
 ```
 
 ## Usage

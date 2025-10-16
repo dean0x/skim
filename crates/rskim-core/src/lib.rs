@@ -18,13 +18,13 @@
 //! # Example
 //!
 //! ```no_run
-//! use skim_core::{transform, Language, Mode};
+//! use rskim_core::{transform, Language, Mode};
 //!
 //! let source = "function add(a: number, b: number) { return a + b; }";
 //! let result = transform(source, Language::TypeScript, Mode::Structure)?;
 //!
 //! // Result: "function add(a: number, b: number) { /* ... */ }"
-//! # Ok::<(), skim_core::SkimError>(())
+//! # Ok::<(), rskim_core::SkimError>(())
 //! ```
 //!
 //! # Design Principles
@@ -87,14 +87,14 @@ mod transform;
 /// # Examples
 ///
 /// ```no_run
-/// use skim_core::{transform, Language, Mode};
+/// use rskim_core::{transform, Language, Mode};
 ///
 /// let typescript = "function greet(name: string) { console.log(`Hello, ${name}`); }";
 /// let result = transform(typescript, Language::TypeScript, Mode::Structure)?;
 ///
 /// assert!(result.contains("function greet(name: string)"));
 /// assert!(!result.contains("console.log"));
-/// # Ok::<(), skim_core::SkimError>(())
+/// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn transform(
     source: &str,
@@ -118,13 +118,13 @@ pub fn transform(
 /// # Examples
 ///
 /// ```no_run
-/// use skim_core::{transform_with_config, Language, Mode, TransformConfig};
+/// use rskim_core::{transform_with_config, Language, Mode, TransformConfig};
 ///
 /// let config = TransformConfig::with_mode(Mode::Signatures)
 ///     .preserve_comments(false);
 ///
 /// let result = transform_with_config("fn main() {}", Language::Rust, &config)?;
-/// # Ok::<(), skim_core::SkimError>(())
+/// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn transform_with_config(
     source: &str,
@@ -159,13 +159,13 @@ pub fn transform_with_config(
 /// # Examples
 ///
 /// ```no_run
-/// use skim_core::{transform_auto, Mode};
+/// use rskim_core::{transform_auto, Mode};
 /// use std::path::Path;
 ///
 /// let source = "def hello(): pass";
 /// let path = Path::new("script.py");
 /// let result = transform_auto(source, path, Mode::Structure)?;
-/// # Ok::<(), skim_core::SkimError>(())
+/// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn transform_auto(
     source: &str,
@@ -190,7 +190,7 @@ pub fn transform_auto(
 /// # Examples
 ///
 /// ```no_run
-/// use skim_core::{transform_detailed, Language, Mode};
+/// use rskim_core::{transform_detailed, Language, Mode};
 ///
 /// let result = transform_detailed("code", Language::Python, Mode::Structure)?;
 ///
@@ -198,7 +198,7 @@ pub fn transform_auto(
 /// if let Some(reduction) = result.reduction_percentage() {
 ///     println!("Token reduction: {:.1}%", reduction);
 /// }
-/// # Ok::<(), skim_core::SkimError>(())
+/// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn transform_detailed(
     source: &str,
@@ -228,7 +228,7 @@ pub fn transform_detailed(
 /// # Examples
 ///
 /// ```
-/// use skim_core::{detect_language, Language};
+/// use rskim_core::{detect_language, Language};
 ///
 /// assert_eq!(detect_language("ts"), Some(Language::TypeScript));
 /// assert_eq!(detect_language("py"), Some(Language::Python));
@@ -243,7 +243,7 @@ pub fn detect_language(extension: &str) -> Option<Language> {
 /// # Examples
 ///
 /// ```
-/// use skim_core::{detect_language_from_path, Language};
+/// use rskim_core::{detect_language_from_path, Language};
 /// use std::path::Path;
 ///
 /// let path = Path::new("src/main.rs");

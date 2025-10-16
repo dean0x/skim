@@ -345,7 +345,7 @@ Should take ~30 minutes per language.
 
 ## Project Status
 
-**Current**: Production ready (v0.2.3)
+**Current**: Production ready (v0.3.1)
 
 ✅ **Implemented:**
 - TypeScript/JavaScript/Python/Rust/Go/Java support
@@ -361,7 +361,7 @@ Should take ~30 minutes per language.
 - Performance optimizations
 
 📋 **Planned:**
-- Multi-file/glob support (`rskim src/**/*.ts`)
+- Multi-file/glob support (`skim src/**/*.ts`)
 - Caching layer (mtime-based)
 - Parallel processing with rayon
 

@@ -12,6 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parser caching (mtime-based)
 - Parallel processing with rayon
 
+## [0.3.2] - 2025-10-16
+
+### Fixed
+- **Main README** - Project status showed outdated version (v0.2.3 → v0.3.1)
+- **Main README** - Planned features example still used old binary name (`rskim` → `skim`)
+- **Core library README** - Dependency version example showed `"0.2"` instead of `"0.3"`
+- **Core library** - Doc tests and integration tests used wrong crate name (`skim_core` → `rskim_core`)
+  - Affected files: `lib.rs`, `types.rs`, `integration.rs`, `transform/mod.rs`
+  - All doc examples now use correct `rskim_core` import
+  - Fixed unused import warning in transform module
+
+**Context**: Documentation and naming issues discovered after v0.3.1 release. The `skim_core` references were remnants from original project naming before the v0.2.1 rename to `rskim`.
+
 ## [0.3.1] - 2025-10-16
 
 ### Fixed
@@ -158,6 +171,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **0.3.2** (2025-10-16): README documentation alignment fixes
 - **0.3.1** (2025-10-16): Hotfix for remaining language name references in docs/tests
 - **0.3.0** (2025-10-16): Binary renamed to `skim`, package remains `rskim`
 - **0.2.4** (2025-10-16): Fixed language flag names, updated all documentation
