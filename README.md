@@ -39,23 +39,23 @@ export function processUser(user: User): Result { /* ... */ }
 
 ## Installation
 
-### Via npx (Recommended - no install required)
+### Try it (no install required)
 
 ```bash
 npx rskim file.ts
 ```
 
-### Via npm
+### Install globally (recommended for regular use)
 
 ```bash
+# Via npm
 npm install -g rskim
-```
 
-### Via Cargo
-
-```bash
+# Via Cargo
 cargo install rskim
 ```
+
+> **Note**: Use `npx` for trying it out. For regular use, install globally to avoid npx overhead (~100-500ms per invocation).
 
 ### From Source
 
@@ -69,28 +69,31 @@ cargo build --release
 ## Quick Start
 
 ```bash
-# Extract structure from TypeScript
+# Try it with npx (no install)
 npx rskim src/app.ts
 
+# Or install globally for better performance
+npm install -g rskim
+
+# Extract structure from TypeScript
+rskim src/app.ts
+
 # Get only function signatures
-npx rskim src/app.ts --mode signatures
+rskim src/app.ts --mode signatures
 
 # Extract type definitions
-npx rskim src/types.ts --mode types
+rskim src/types.ts --mode types
 
 # Pipe to other tools
-npx rskim src/app.ts | bat -l typescript
+rskim src/app.ts | bat -l typescript
 
 # Read from stdin (requires --language)
-cat app.ts | npx rskim - --language typescript
+cat app.ts | rskim - --language typescript
 ```
 
 ## Usage
 
 ```bash
-npx rskim [FILE] [OPTIONS]
-
-# Or if installed globally
 rskim [FILE] [OPTIONS]
 ```
 
@@ -114,7 +117,7 @@ rskim [FILE] [OPTIONS]
 Keeps function/method signatures, class declarations, type definitions, imports/exports. Strips all implementation bodies.
 
 ```bash
-npx rskim file.ts --mode structure
+rskim file.ts --mode structure
 ```
 
 **Use case**: Understanding code organization and APIs
@@ -126,7 +129,7 @@ npx rskim file.ts --mode structure
 More aggressive - keeps ONLY callable signatures, removes everything else.
 
 ```bash
-npx rskim file.ts --mode signatures
+rskim file.ts --mode signatures
 ```
 
 **Use case**: Generating API documentation or type stubs
@@ -138,7 +141,7 @@ npx rskim file.ts --mode signatures
 Keeps only type definitions (interfaces, type aliases, enums). Removes all code.
 
 ```bash
-npx rskim file.ts --mode types
+rskim file.ts --mode types
 ```
 
 **Use case**: Type system analysis
@@ -150,7 +153,7 @@ npx rskim file.ts --mode types
 No transformation - returns original source (like `cat`).
 
 ```bash
-npx rskim file.ts --mode full
+rskim file.ts --mode full
 ```
 
 **Use case**: Passthrough for testing or comparison
@@ -225,28 +228,28 @@ impl UserRepository {
 
 ```bash
 # Send only structure to AI for code review
-npx rskim src/app.ts | llm "Review this architecture"
+rskim src/app.ts | llm "Review this architecture"
 ```
 
 ### 2. Codebase Documentation
 
 ```bash
 # Generate API surface documentation
-npx rskim src/api.ts --mode signatures > api-docs.txt
+find src -name "*.ts" -exec rskim {} --mode signatures \; > api-docs.txt
 ```
 
 ### 3. Type System Analysis
 
 ```bash
 # Extract all type definitions for analysis
-npx rskim src/types.ts --mode types
+rskim src/types.ts --mode types
 ```
 
 ### 4. Code Navigation
 
 ```bash
 # Quick overview of file structure
-npx rskim large-file.py | less
+rskim large-file.py | less
 ```
 
 ## Security
