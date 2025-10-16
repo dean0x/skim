@@ -12,7 +12,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parser caching (mtime-based)
 - Parallel processing with rayon
 
-## [0.2.0] - 2025-10-15
+## [0.2.4] - 2025-10-16
+
+### Fixed
+- **BREAKING:** Language flag names now use lowercase instead of kebab-case
+  - `--language=type-script` → `--language=typescript`
+  - `--language=java-script` → `--language=javascript`
+  - Short aliases still work: `--lang=ts`, `--lang=js`
+- All README files updated to reflect current state (npm live, correct package names)
+- CHANGELOG now includes all historical versions (0.2.1, 0.2.2, 0.2.3)
+- Error message fixed: `skim` → `rskim`
+
+### Changed
+- Installation documentation now recommends `npx` for trial usage
+- Clarified npx performance trade-offs (~100-500ms overhead per invocation)
+
+## [0.2.3] - 2025-10-15
+
+### Fixed
+- npm wrapper script syntax error (template literal escaping)
+- Binary now works correctly when installed via npm
+
+## [0.2.2] - 2025-10-15
+
+### Added
+- npm distribution via GitHub Actions
+- Automated cross-platform binary building (Linux, macOS x64/ARM, Windows)
+- npm package published as `rskim`
+
+### Fixed
+- GitHub Actions workflow for npm publishing
+
+## [0.2.1] - 2025-10-15
 
 ### Changed
 - **BREAKING:** Renamed all packages to `rskim` for consistency
@@ -94,7 +125,11 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
-- **0.1.0** (2025-10-15): First public release - Production-ready CLI with 6 languages, 4 modes, 62 tests
+- **0.2.4** (2025-10-16): Fixed language flag names, updated all documentation
+- **0.2.3** (2025-10-15): Fixed npm wrapper script syntax
+- **0.2.2** (2025-10-15): npm distribution via GitHub Actions
+- **0.2.1** (2025-10-15): Renamed to rskim with comprehensive documentation
+- **0.1.0** (2025-10-15): Initial release as skim-cli
 
 ---
 
