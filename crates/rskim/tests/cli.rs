@@ -18,7 +18,7 @@ fn test_cli_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains("0.3.0"));
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn test_cli_stdin_with_language() {
         .unwrap()
         .arg("-")
         .arg("--language")
-        .arg("type-script")
+        .arg("typescript")
         .write_stdin("function test() { return 42; }")
         .assert()
         .success()
@@ -352,7 +352,7 @@ fn test_cli_explicit_language_override() {
         .unwrap()
         .arg(&file_path)
         .arg("--language")
-        .arg("type-script")
+        .arg("typescript")
         .assert()
         .success()
         .stdout(predicate::str::contains("function test"));

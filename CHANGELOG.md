@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parser caching (mtime-based)
 - Parallel processing with rayon
 
+## [0.3.1] - 2025-10-16
+
+### Fixed
+- CLI README documentation still referenced old language names (`type-script`, `java-script`)
+- Test files using incorrect language flag format (should be `typescript`, not `type-script`)
+- Test version assertion updated to match current version (0.3.0 → 0.3.1)
+
+**Context**: These issues were overlooked in v0.3.0 release. Language names were changed to lowercase in v0.2.4, but some documentation and test references weren't updated.
+
 ## [0.3.0] - 2025-10-16
 
 ### Changed
@@ -149,6 +158,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **0.3.1** (2025-10-16): Hotfix for remaining language name references in docs/tests
 - **0.3.0** (2025-10-16): Binary renamed to `skim`, package remains `rskim`
 - **0.2.4** (2025-10-16): Fixed language flag names, updated all documentation
 - **0.2.3** (2025-10-15): Fixed npm wrapper script syntax

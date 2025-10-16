@@ -76,7 +76,7 @@ Options:
   -m, --mode <MODE>         Transformation mode [default: structure]
                             [possible values: structure, signatures, types, full]
   -l, --language <LANGUAGE> Override language detection
-                            [possible values: type-script, java-script, python, rust, go, java]
+                            [possible values: typescript, javascript, python, rust, go, java]
   -h, --help                Print help
   -V, --version             Print version
 ```
