@@ -30,8 +30,9 @@ cargo install skim-cli
 # New (v0.2.0+)
 cargo install rskim
 
-# Or via npm (coming soon with cargo-dist)
+# Or via npm
 npm install -g rskim
+npx rskim file.ts  # no install required
 ```
 
 ## [0.1.0] - 2025-10-15
@@ -83,13 +84,9 @@ npm install -g rskim
 
 ## Roadmap
 
-### v0.2.0 (Planned)
-- **WASM Support** - Browser and Node.js JavaScript API using `@vscode/tree-sitter-wasm`
-- **npm Package** - Direct JavaScript library (`@skim/wasm`)
-- **Performance** - Parser caching and parallel processing
-
 ### v0.3.0 (Future)
-- **Multi-file Support** - Glob patterns (`skim src/**/*.ts`)
+- **Multi-file Support** - Glob patterns (`rskim src/**/*.ts`)
+- **Performance** - Parser caching and parallel processing with rayon
 - **Streaming API** - Process large files incrementally
 - **Custom Modes** - User-defined transformation rules
 
