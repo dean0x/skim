@@ -50,7 +50,7 @@ rskim file.py --mode signatures
 rskim file.rs | bat -l rust
 
 # Read from stdin
-cat code.ts | rskim - --language=type-script
+cat code.ts | rskim - --language=typescript
 ```
 
 ## Features

@@ -74,9 +74,9 @@ impl From<ModeArg> for Mode {
 /// Language argument (clap value_enum wrapper)
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum LanguageArg {
-    #[value(alias = "ts")]
+    #[value(name = "typescript", alias = "ts")]
     TypeScript,
-    #[value(alias = "js")]
+    #[value(name = "javascript", alias = "js")]
     JavaScript,
     #[value(alias = "py")]
     Python,
@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
             if is_stdin {
                 anyhow::bail!(
                     "Language detection failed: reading from stdin requires --language flag\n\
-                     Example: cat file.ts | skim - --language=typescript"
+                     Example: cat file.ts | rskim - --language=typescript"
                 );
             }
             transform_auto(&source, &args.file, mode)?

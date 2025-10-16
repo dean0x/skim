@@ -88,7 +88,7 @@ rskim src/types.ts --mode types
 rskim src/app.ts | bat -l typescript
 
 # Read from stdin (requires --language)
-cat app.ts | rskim - --language typescript
+cat app.ts | rskim - --language=typescript
 ```
 
 ## Usage
