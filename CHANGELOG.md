@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parser caching (mtime-based)
 - Parallel processing with rayon
 
+## [0.3.3] - 2025-10-16
+
+### Fixed
+- **CLI README (crates.io)** - Critical branding and command errors
+  - Title changed from "# rskim" to "# Skim" (official brand name)
+  - Overview text changed from "rskim transforms..." to "**Skim** transforms..."
+  - Fixed broken npx commands: `npx skim file.ts` → `npx rskim file.ts` (2 occurrences)
+
+**Context**: The CLI README is displayed on crates.io and was showing incorrect branding and broken commands that would not work.
+
+**Important distinction:**
+- **Brand name**: Skim (official name)
+- **Package name**: rskim (for `npm install -g rskim`, `npx rskim`, `cargo install rskim`)
+- **Binary name**: skim (after installation: `skim file.ts`)
+
 ## [0.3.2] - 2025-10-16
 
 ### Fixed
@@ -171,6 +186,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **0.3.3** (2025-10-16): CLI README branding and broken npx command fixes
 - **0.3.2** (2025-10-16): README documentation alignment fixes
 - **0.3.1** (2025-10-16): Hotfix for remaining language name references in docs/tests
 - **0.3.0** (2025-10-16): Binary renamed to `skim`, package remains `rskim`

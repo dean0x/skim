@@ -1,4 +1,4 @@
-# rskim
+# Skim
 
 Smart code reader - streaming code transformation for AI agents.
 
@@ -7,7 +7,7 @@ Smart code reader - streaming code transformation for AI agents.
 
 ## Overview
 
-`rskim` transforms source code by intelligently removing implementation details while preserving structure, signatures, and types - perfect for optimizing code for LLM context windows.
+**Skim** transforms source code by intelligently removing implementation details while preserving structure, signatures, and types - perfect for optimizing code for LLM context windows.
 
 Think of it like `cat`, but smart about what code to show.
 
@@ -16,7 +16,7 @@ Think of it like `cat`, but smart about what code to show.
 ### Try it (no install required)
 
 ```bash
-npx skim file.ts
+npx rskim file.ts
 ```
 
 ### Install globally (recommended for regular use)
@@ -35,7 +35,7 @@ cargo install rskim
 
 ```bash
 # Try it with npx (no install)
-npx skim file.ts
+npx rskim file.ts
 
 # Or install globally for better performance
 npm install -g rskim

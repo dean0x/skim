@@ -18,7 +18,7 @@ fn test_cli_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.3.2"));
+        .stdout(predicate::str::contains("0.3.3"));
 }
 
 #[test]
