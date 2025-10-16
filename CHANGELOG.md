@@ -8,9 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned for Future Versions
-- Multi-file glob support (`rskim src/**/*.ts`)
+- Multi-file glob support (`skim src/**/*.ts`)
 - Parser caching (mtime-based)
 - Parallel processing with rayon
+
+## [0.3.0] - 2025-10-16
+
+### Changed
+- **BREAKING:** Binary name changed from `rskim` to `skim`
+  - Installation still uses `rskim`: `npm install -g rskim` or `cargo install rskim`
+  - Command usage now uses `skim`: `skim file.ts` (shorter, cleaner)
+  - Official branded name: **Skim**
+  - Package name remains `rskim` to avoid conflicts
+
+### Migration
+```bash
+# Installation (unchanged)
+npm install -g rskim
+cargo install rskim
+
+# Old command (v0.2.x)
+rskim file.ts
+
+# New command (v0.3.0+)
+skim file.ts
+```
+
+**Rationale**: Shorter command for daily use. Package name `rskim` avoids npm/crates.io namespace conflicts.
 
 ## [0.2.4] - 2025-10-16
 
@@ -115,8 +139,8 @@ npx rskim file.ts  # no install required
 
 ## Roadmap
 
-### v0.3.0 (Future)
-- **Multi-file Support** - Glob patterns (`rskim src/**/*.ts`)
+### v0.4.0 (Future)
+- **Multi-file Support** - Glob patterns (`skim src/**/*.ts`)
 - **Performance** - Parser caching and parallel processing with rayon
 - **Streaming API** - Process large files incrementally
 - **Custom Modes** - User-defined transformation rules
@@ -125,10 +149,11 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **0.3.0** (2025-10-16): Binary renamed to `skim`, package remains `rskim`
 - **0.2.4** (2025-10-16): Fixed language flag names, updated all documentation
 - **0.2.3** (2025-10-15): Fixed npm wrapper script syntax
 - **0.2.2** (2025-10-15): npm distribution via GitHub Actions
-- **0.2.1** (2025-10-15): Renamed to rskim with comprehensive documentation
+- **0.2.1** (2025-10-15): Renamed package to rskim with comprehensive documentation
 - **0.1.0** (2025-10-15): Initial release as skim-cli
 
 ---

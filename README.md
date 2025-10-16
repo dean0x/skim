@@ -63,7 +63,7 @@ cargo install rskim
 git clone https://github.com/dean0x/skim.git
 cd skim
 cargo build --release
-# Binary at target/release/rskim
+# Binary at target/release/skim
 ```
 
 ## Quick Start
@@ -76,25 +76,25 @@ npx rskim src/app.ts
 npm install -g rskim
 
 # Extract structure from TypeScript
-rskim src/app.ts
+skim src/app.ts
 
 # Get only function signatures
-rskim src/app.ts --mode signatures
+skim src/app.ts --mode signatures
 
 # Extract type definitions
-rskim src/types.ts --mode types
+skim src/types.ts --mode types
 
 # Pipe to other tools
-rskim src/app.ts | bat -l typescript
+skim src/app.ts | bat -l typescript
 
 # Read from stdin (requires --language)
-cat app.ts | rskim - --language=typescript
+cat app.ts | skim - --language=typescript
 ```
 
 ## Usage
 
 ```bash
-rskim [FILE] [OPTIONS]
+skim [FILE] [OPTIONS]
 ```
 
 **Arguments:**
@@ -117,7 +117,7 @@ rskim [FILE] [OPTIONS]
 Keeps function/method signatures, class declarations, type definitions, imports/exports. Strips all implementation bodies.
 
 ```bash
-rskim file.ts --mode structure
+skim file.ts --mode structure
 ```
 
 **Use case**: Understanding code organization and APIs
@@ -129,7 +129,7 @@ rskim file.ts --mode structure
 More aggressive - keeps ONLY callable signatures, removes everything else.
 
 ```bash
-rskim file.ts --mode signatures
+skim file.ts --mode signatures
 ```
 
 **Use case**: Generating API documentation or type stubs
@@ -141,7 +141,7 @@ rskim file.ts --mode signatures
 Keeps only type definitions (interfaces, type aliases, enums). Removes all code.
 
 ```bash
-rskim file.ts --mode types
+skim file.ts --mode types
 ```
 
 **Use case**: Type system analysis
@@ -153,7 +153,7 @@ rskim file.ts --mode types
 No transformation - returns original source (like `cat`).
 
 ```bash
-rskim file.ts --mode full
+skim file.ts --mode full
 ```
 
 **Use case**: Passthrough for testing or comparison
@@ -228,28 +228,28 @@ impl UserRepository {
 
 ```bash
 # Send only structure to AI for code review
-rskim src/app.ts | llm "Review this architecture"
+skim src/app.ts | llm "Review this architecture"
 ```
 
 ### 2. Codebase Documentation
 
 ```bash
 # Generate API surface documentation
-find src -name "*.ts" -exec rskim {} --mode signatures \; > api-docs.txt
+find src -name "*.ts" -exec skim {} --mode signatures \; > api-docs.txt
 ```
 
 ### 3. Type System Analysis
 
 ```bash
 # Extract all type definitions for analysis
-rskim src/types.ts --mode types
+skim src/types.ts --mode types
 ```
 
 ### 4. Code Navigation
 
 ```bash
 # Quick overview of file structure
-rskim large-file.py | less
+skim large-file.py | less
 ```
 
 ## Security

@@ -16,7 +16,7 @@ Think of it like `cat`, but smart about what code to show.
 ### Try it (no install required)
 
 ```bash
-npx rskim file.ts
+npx skim file.ts
 ```
 
 ### Install globally (recommended for regular use)
@@ -35,22 +35,22 @@ cargo install rskim
 
 ```bash
 # Try it with npx (no install)
-npx rskim file.ts
+npx skim file.ts
 
 # Or install globally for better performance
 npm install -g rskim
 
 # Read TypeScript with structure mode
-rskim file.ts
+skim file.ts
 
 # Extract Python function signatures
-rskim file.py --mode signatures
+skim file.py --mode signatures
 
 # Pipe to syntax highlighter
-rskim file.rs | bat -l rust
+skim file.rs | bat -l rust
 
 # Read from stdin
-cat code.ts | rskim - --language=typescript
+cat code.ts | skim - --language=typescript
 ```
 
 ## Features
@@ -66,7 +66,7 @@ cat code.ts | rskim - --language=typescript
 ### Basic Usage
 
 ```bash
-rskim <FILE>
+skim <FILE>
 ```
 
 ### Options
@@ -88,7 +88,7 @@ Options:
 Removes function bodies while preserving signatures (70-80% reduction).
 
 ```bash
-rskim file.ts
+skim file.ts
 ```
 
 **Input:**
@@ -110,7 +110,7 @@ function add(a: number, b: number): number { /* ... */ }
 Extracts only function and method signatures (85-92% reduction).
 
 ```bash
-rskim file.py --mode signatures
+skim file.py --mode signatures
 ```
 
 **Input:**
@@ -131,7 +131,7 @@ def calculate_total(items: list[Item], tax_rate: float) -> Decimal:
 Extracts only type definitions (90-95% reduction).
 
 ```bash
-rskim file.ts --mode types
+skim file.ts --mode types
 ```
 
 **Input:**
@@ -159,7 +159,7 @@ interface User {
 Returns original code unchanged (0% reduction).
 
 ```bash
-rskim file.rs --mode full
+skim file.rs --mode full
 ```
 
 ## Examples
@@ -168,37 +168,37 @@ rskim file.rs --mode full
 
 ```bash
 # Get overview of all TypeScript files
-find src -name '*.ts' -exec rskim {} \;
+find src -name '*.ts' -exec skim {} \;
 
 # Extract all Python function signatures
-rskim app.py --mode signatures > api.txt
+skim app.py --mode signatures > api.txt
 
 # Review Rust types
-rskim lib.rs --mode types | less
+skim lib.rs --mode types | less
 ```
 
 ### Prepare code for LLMs
 
 ```bash
 # Reduce token count before sending to GPT
-rskim large_file.ts | wc -w
+skim large_file.ts | wc -w
 # Output: 150 (was 600)
 
 # Get just the API surface
-rskim server.py --mode signatures | pbcopy
+skim server.py --mode signatures | pbcopy
 ```
 
 ### Pipe workflows
 
 ```bash
 # Skim and highlight
-rskim file.rs | bat -l rust
+skim file.rs | bat -l rust
 
 # Skim and search
-rskim file.ts | grep "interface"
+skim file.ts | grep "interface"
 
 # Skim multiple files
-cat *.py | rskim - --language=python
+cat *.py | skim - --language=python
 ```
 
 ## Supported Languages

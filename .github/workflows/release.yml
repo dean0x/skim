@@ -20,20 +20,20 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: rskim
-            asset_name: rskim-x86_64-unknown-linux-gnu
+            artifact_name: skim
+            asset_name: skim-x86_64-unknown-linux-gnu
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: rskim
-            asset_name: rskim-x86_64-apple-darwin
+            artifact_name: skim
+            asset_name: skim-x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: rskim
-            asset_name: rskim-aarch64-apple-darwin
+            artifact_name: skim
+            asset_name: skim-aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: rskim.exe
-            asset_name: rskim-x86_64-pc-windows-msvc
+            artifact_name: skim.exe
+            asset_name: skim-x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -140,7 +140,7 @@ jobs:
             "version": "$VERSION",
             "description": "Smart code reader - streaming code transformation for AI agents",
             "bin": {
-              "rskim": "./bin/rskim.js"
+              "skim": "./bin/skim.js"
             },
             "repository": {
               "type": "git",
@@ -172,7 +172,7 @@ jobs:
           EOF
 
           # Create wrapper script
-          cat > npm-package/bin/rskim.js <<'EOF'
+          cat > npm-package/bin/skim.js <<'EOF'
           #!/usr/bin/env node
           const { spawnSync } = require('child_process');
           const path = require('path');
@@ -182,9 +182,9 @@ jobs:
             const platform = process.platform;
             const arch = process.arch;
 
-            let binaryName = 'rskim';
+            let binaryName = 'skim';
             if (platform === 'win32') {
-              binaryName = 'rskim.exe';
+              binaryName = 'skim.exe';
             }
 
             // Try to find the binary in the package
@@ -199,7 +199,7 @@ jobs:
               }
             }
 
-            console.error('ERROR: rskim binary not found for your platform');
+            console.error('ERROR: skim binary not found for your platform');
             console.error(`Platform: ${platform}, Architecture: ${arch}`);
             console.error('Please report this issue at: https://github.com/dean0x/skim/issues');
             process.exit(1);
@@ -213,7 +213,7 @@ jobs:
           process.exit(result.status || 0);
           EOF
 
-          chmod +x npm-package/bin/rskim.js
+          chmod +x npm-package/bin/skim.js
 
           # Copy README
           cp crates/rskim/README.md npm-package/
@@ -236,10 +236,10 @@ jobs:
           mkdir -p ../npm-package/bin/darwin/arm64
           mkdir -p ../npm-package/bin/win32/x64
 
-          cp rskim-x86_64-unknown-linux-gnu/rskim ../npm-package/bin/linux/x64/ || true
-          cp rskim-x86_64-apple-darwin/rskim ../npm-package/bin/darwin/x64/ || true
-          cp rskim-aarch64-apple-darwin/rskim ../npm-package/bin/darwin/arm64/ || true
-          cp rskim-x86_64-pc-windows-msvc/rskim.exe ../npm-package/bin/win32/x64/ || true
+          cp skim-x86_64-unknown-linux-gnu/skim ../npm-package/bin/linux/x64/ || true
+          cp skim-x86_64-apple-darwin/skim ../npm-package/bin/darwin/x64/ || true
+          cp skim-aarch64-apple-darwin/skim ../npm-package/bin/darwin/arm64/ || true
+          cp skim-x86_64-pc-windows-msvc/skim.exe ../npm-package/bin/win32/x64/ || true
 
       - name: Publish to npm
         run: cd npm-package && npm publish --access public

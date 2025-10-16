@@ -1,4 +1,4 @@
-//! rskim CLI - Command-line interface for rskim-core
+//! skim CLI - Command-line interface for rskim-core
 //!
 //! ARCHITECTURE: Thin I/O layer over rskim-core library.
 //! This binary handles:
@@ -17,19 +17,19 @@ use rskim_core::{transform, transform_auto, Language, Mode};
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
 
-/// rskim - Smart code reader for AI agents
+/// skim - Smart code reader for AI agents
 ///
 /// Transform source code by stripping implementation details while
 /// preserving structure, signatures, and types.
 #[derive(Parser, Debug)]
-#[command(name = "rskim")]
+#[command(name = "skim")]
 #[command(author, version, about, long_about = None)]
 #[command(after_help = "EXAMPLES:\n  \
-    rskim file.ts                       Read TypeScript with structure mode\n  \
-    rskim file.py --mode signatures     Extract Python signatures\n  \
-    rskim file.rs | bat -l rust         Skim Rust and highlight\n  \
-    cat code.ts | rskim - --lang=ts     Read from stdin with explicit language\n  \
-    rskim - -l python < script.py       Short form language flag\n\n\
+    skim file.ts                       Read TypeScript with structure mode\n  \
+    skim file.py --mode signatures     Extract Python signatures\n  \
+    skim file.rs | bat -l rust         Skim Rust and highlight\n  \
+    cat code.ts | skim - --lang=ts     Read from stdin with explicit language\n  \
+    skim - -l python < script.py       Short form language flag\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File to read (use '-' for stdin)
@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
             if is_stdin {
                 anyhow::bail!(
                     "Language detection failed: reading from stdin requires --language flag\n\
-                     Example: cat file.ts | rskim - --language=typescript"
+                     Example: cat file.ts | skim - --language=typescript"
                 );
             }
             transform_auto(&source, &args.file, mode)?
