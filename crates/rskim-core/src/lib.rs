@@ -43,16 +43,15 @@ pub use types::{
     SkimError,
     Result,
     Parser,
-    CacheKey,
 };
 
 mod types;
 mod parser;
 mod transform;
 
-// Cache module (Phase 3 - not yet implemented)
-// #[cfg(feature = "cache")]
-// mod cache;
+// NOTE: Caching is implemented at the CLI layer (rskim binary), not in the core library.
+// The core library remains pure and I/O-free.
+// See: crates/rskim/src/cache.rs for the caching implementation.
 
 // ============================================================================
 // Public API - Core Transformation Functions

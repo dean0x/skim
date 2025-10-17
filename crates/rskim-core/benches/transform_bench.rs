@@ -3,7 +3,7 @@
 //! Run with: cargo bench
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use skim_core::{transform, Language, Mode};
+use rskim_core::{transform, Language, Mode};
 
 // ============================================================================
 // Benchmark Fixtures

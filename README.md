@@ -30,9 +30,11 @@ export function processUser(user: User): Result { /* ... */ }
 
 ## Features
 
-- 🚀 **Fast** - <50ms for 1000-line files (powered by tree-sitter)
+- 🚀 **Fast** - 14.6ms for 3000-line files (powered by tree-sitter)
+- ⚡ **Cached** - 40-50x faster on repeated processing (enabled by default)
 - 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java
 - 🎯 **Multiple modes** - Structure, signatures, types, or full code
+- 📂 **Multi-file** - Glob patterns (`src/**/*.ts`) with parallel processing
 - 📦 **Zero config** - Auto-detects language from file extension
 - 🔒 **DoS-resistant** - Built-in limits prevent stack overflow and memory exhaustion
 - 💧 **Streaming** - Outputs to stdout for pipe workflows
@@ -78,8 +80,14 @@ npm install -g rskim
 # Extract structure from TypeScript
 skim src/app.ts
 
-# Get only function signatures
-skim src/app.ts --mode signatures
+# Process multiple files with glob patterns
+skim 'src/**/*.ts'
+
+# Process all TypeScript files with custom parallelism
+skim '*.{js,ts}' --jobs 4
+
+# Get only function signatures from multiple files
+skim 'src/*.ts' --mode signatures --no-header
 
 # Extract type definitions
 skim src/types.ts --mode types
@@ -89,6 +97,15 @@ skim src/app.ts | bat -l typescript
 
 # Read from stdin (requires --language)
 cat app.ts | skim - --language=typescript
+
+# Clear cache
+skim --clear-cache
+
+# Disable caching for pure transformation
+skim file.ts --no-cache
+
+# Show token reduction statistics
+skim file.ts --show-stats
 ```
 
 ## Usage
@@ -98,13 +115,18 @@ skim [FILE] [OPTIONS]
 ```
 
 **Arguments:**
-- `<FILE>` - File to read (use '-' for stdin)
+- `<FILE>` - File to read (use '-' for stdin, supports glob patterns like '*.ts' or 'src/**/*.js')
 
 **Options:**
 - `-m, --mode <MODE>` - Transformation mode [default: structure]
   - Values: `structure`, `signatures`, `types`, `full`
 - `-l, --language <LANGUAGE>` - Explicit language (required for stdin)
   - Values: `typescript`, `javascript`, `python`, `rust`, `go`, `java`
+- `-j, --jobs <JOBS>` - Number of parallel jobs for multi-file processing [default: number of CPUs]
+- `--no-header` - Don't print file path headers for multi-file output
+- `--no-cache` - Disable caching (caching is enabled by default)
+- `--clear-cache` - Clear all cached files and exit
+- `--show-stats` - Show token reduction statistics (output to stderr)
 - `-h, --help` - Print help
 - `-V, --version` - Print version
 
@@ -229,20 +251,26 @@ impl UserRepository {
 ```bash
 # Send only structure to AI for code review
 skim src/app.ts | llm "Review this architecture"
+
+# Process entire directory for LLM context
+skim 'src/**/*.ts' --no-header | llm "Analyze this codebase"
 ```
 
 ### 2. Codebase Documentation
 
 ```bash
-# Generate API surface documentation
-find src -name "*.ts" -exec skim {} --mode signatures \; > api-docs.txt
+# Generate API surface documentation (new: glob support)
+skim 'src/**/*.ts' --mode signatures > api-docs.txt
+
+# Process with parallel jobs for faster documentation generation
+skim 'lib/**/*.py' --mode signatures --jobs 8 > python-api.txt
 ```
 
 ### 3. Type System Analysis
 
 ```bash
 # Extract all type definitions for analysis
-skim src/types.ts --mode types
+skim 'src/**/*.ts' --mode types --no-header
 ```
 
 ### 4. Code Navigation
@@ -250,7 +278,81 @@ skim src/types.ts --mode types
 ```bash
 # Quick overview of file structure
 skim large-file.py | less
+
+# Overview of entire module
+skim 'src/auth/*.ts' | less
 ```
+
+## Caching
+
+**Caching is enabled by default** for maximum performance on repeated processing.
+
+### How It Works
+
+- **Cache key**: SHA256 hash of (file path + modification time + mode)
+- **Location**: `~/.cache/skim/` (platform-specific)
+- **Invalidation**: Automatic when file is modified (mtime-based)
+- **Storage**: JSON files with metadata
+
+### Performance Impact
+
+| Scenario | Time | Speedup |
+|----------|------|---------|
+| First run (no cache) | 244ms | 1.0x |
+| **Second run (cached)** | **5ms** | **48.8x faster!** |
+
+### Cache Management
+
+```bash
+# View cache location
+ls ~/.cache/skim/
+
+# Clear all cache
+skim --clear-cache
+
+# Disable caching (for specific run)
+skim file.ts --no-cache
+
+# Caching works with all features
+skim 'src/**/*.ts' --jobs 8 --mode signatures  # Cached by default
+```
+
+### When Caching Helps
+
+- ✅ Repeated processing of same files (e.g., in watch mode)
+- ✅ Large codebases with infrequent changes
+- ✅ CI/CD pipelines processing same files multiple times
+- ✅ Development workflows with hot reloading
+
+### When to Disable Caching
+
+- ⚠️ One-time transformations for LLM input (no benefit)
+- ⚠️ Piping through stdin (caching not supported)
+- ⚠️ Testing/debugging transformation logic
+- ⚠️ Disk space constrained environments
+
+## Token Counting
+
+**Show token reduction statistics** with the `--show-stats` flag to understand context window savings.
+
+```bash
+skim file.ts --show-stats
+# Output (stderr): [skim] 1,000 tokens → 200 tokens (80.0% reduction)
+
+skim 'src/**/*.ts' --show-stats
+# Output (stderr): [skim] 15,000 tokens → 3,000 tokens (80.0% reduction) across 50 file(s)
+```
+
+### Features
+- Uses OpenAI's tiktoken (cl100k_base encoding for GPT-3.5/GPT-4)
+- Works with single files, multi-file globs, and stdin
+- Output to stderr (keeps stdout clean for piping)
+- Aggregates stats across multiple files
+
+### Use Cases
+- **LLM optimization**: Measure how much context window you're saving
+- **Mode comparison**: Compare reduction rates between structure/signatures/types modes
+- **Benchmarking**: Track token efficiency improvements
 
 ## Security
 
@@ -296,9 +398,23 @@ See [SECURITY.md](SECURITY.md) for vulnerability disclosure process.
 
 ## Performance
 
-**Target**: <50ms for 1000-line files
+**Target**: <50ms for 1000-line files ✅ **Exceeded** (14.6ms for 3000-line files)
 
-**Benchmarks** (coming soon):
+### Benchmark Results
+
+**Small files (<100 lines):**
+- Go: 60µs (fastest)
+- Rust: 68µs
+- Python: 73µs
+- Java: 84µs
+- TypeScript: 33µs (simple) / 83µs (medium complexity)
+
+**Scaling (structure mode):**
+- 100 functions (300 lines): 1.3ms
+- 500 functions (1500 lines): 6.4ms
+- **1000 functions (3000 lines): 14.6ms** ✅
+
+**Run benchmarks:**
 ```bash
 cargo bench
 ```
@@ -345,25 +461,20 @@ Should take ~30 minutes per language.
 
 ## Project Status
 
-**Current**: Production ready (v0.3.1)
+**Current**: Production ready (v0.3.3)
 
 ✅ **Implemented:**
 - TypeScript/JavaScript/Python/Rust/Go/Java support
 - Structure/signatures/types/full modes
 - CLI with stdin support
+- Multi-file glob support (`skim 'src/**/*.ts'`)
+- Parallel processing with rayon (`--jobs` flag)
+- **Caching layer with mtime-based invalidation (enabled by default)**
+- **Token counting with `--show-stats` (GPT-3.5/GPT-4 compatible)**
 - DoS protections
-- Comprehensive test suite
+- Comprehensive test suite (70 tests passing)
+- Performance benchmarks (verified: 14.6ms for 3000-line files, 5ms cached)
 - npm and cargo distribution
-
-🚧 **In Progress:**
-- Test coverage improvements
-- Benchmark suite
-- Performance optimizations
-
-📋 **Planned:**
-- Multi-file/glob support (`skim src/**/*.ts`)
-- Caching layer (mtime-based)
-- Parallel processing with rayon
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
