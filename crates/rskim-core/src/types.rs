@@ -159,7 +159,7 @@ pub enum Mode {
 
 impl Mode {
     /// Parse mode from string (for CLI/API)
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "structure" => Some(Self::Structure),
             "signatures" => Some(Self::Signatures),
@@ -419,10 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_from_str() {
-        assert_eq!(Mode::from_str("structure"), Some(Mode::Structure));
-        assert_eq!(Mode::from_str("STRUCTURE"), Some(Mode::Structure));
-        assert_eq!(Mode::from_str("invalid"), None);
+    fn test_mode_parse() {
+        assert_eq!(Mode::parse("structure"), Some(Mode::Structure));
+        assert_eq!(Mode::parse("STRUCTURE"), Some(Mode::Structure));
+        assert_eq!(Mode::parse("invalid"), None);
     }
 
     #[test]

@@ -56,11 +56,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated CONTRIBUTING.md with accurate crate names and performance targets
 - Fixed benchmark imports for consistency
 
+### Security & Hardening
+- **Path traversal prevention** - Glob patterns reject absolute paths and `..` components
+- **Symlink filtering** - Glob processing skips symlinks to prevent sensitive file access
+- **Secure cache permissions** - Cache directory set to 0700, files to 0600 (Unix)
+- **Integer overflow protection** - Fixed overflow in token reduction calculation for edge cases
+
+### Performance Optimizations
+- **Lazy tokenizer initialization** - Using `OnceLock` to avoid recreating tokenizer on every call
+- **Token count caching** - Extended `CacheEntry` struct to store token counts, eliminating double file reads
+- **Improved glob validation** - Added `--jobs` upper bound validation (max 128) to prevent resource exhaustion
+
+### Code Quality Improvements
+- **Named return types** - Replaced tuple returns with `ProcessResult` struct for clarity
+- **Reduced function parameters** - Created `ProcessOptions` struct (5 params → 1 struct)
+- **Helper functions** - Extracted `report_token_stats()` to eliminate code duplication
+- **Clippy fixes** - Renamed `Mode::from_str()` to `Mode::parse()` to avoid standard library conflicts
+- **Lifetime cleanup** - Removed unnecessary lifetime annotations
+
+### Dependencies
+- **Updated** tiktoken-rs from 0.5 to 0.7 (latest stable)
+- **Updated** dirs from 5.0 to 6.0 (latest stable)
+
 ### Testing
-- **70 total tests** - All passing (8 + 19 + 11 + 24 + 8)
+- **101 total tests** - All passing (+44% increase from v0.3.3's 70 tests)
+  - 8 unit tests
+  - 19 CLI tests
+  - 10 glob pattern tests (NEW)
+  - 9 caching tests (NEW)
+  - 12 token stats tests (NEW)
+  - 11 rskim-core tests
+  - 24 integration tests
+  - 8 doc tests
 - Verified parallel processing with CPU usage tests
 - Verified caching with repeated file processing
 - Verified token counting accuracy
+- Comprehensive glob security testing (path traversal, symlink rejection)
 
 ### Breaking Changes
 None. All new features are opt-in via CLI flags.

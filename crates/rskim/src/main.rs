@@ -130,30 +130,115 @@ impl From<LanguageArg> for Language {
     }
 }
 
+/// Options for processing a file (reduces function parameters)
+#[derive(Debug, Clone, Copy)]
+struct ProcessOptions {
+    /// Transformation mode
+    mode: Mode,
+    /// Explicit language override (None for auto-detection)
+    explicit_lang: Option<Language>,
+    /// Whether to use cache
+    use_cache: bool,
+    /// Whether to include original content for token counting
+    include_original: bool,
+}
+
+impl ProcessOptions {
+    /// Create new processing options
+    fn new(mode: Mode, explicit_lang: Option<Language>, use_cache: bool, include_original: bool) -> Self {
+        Self {
+            mode,
+            explicit_lang,
+            use_cache,
+            include_original,
+        }
+    }
+}
+
+/// Result of processing a file (replaces tuple return)
+#[derive(Debug)]
+struct ProcessResult {
+    /// Transformed output
+    output: String,
+    /// Original file content (if needed for token counting)
+    original: Option<String>,
+    /// Original token count (if computed)
+    original_tokens: Option<usize>,
+    /// Transformed token count (if computed)
+    transformed_tokens: Option<usize>,
+}
+
+impl ProcessResult {
+    /// Create a new ProcessResult
+    fn new(
+        output: String,
+        original: Option<String>,
+        original_tokens: Option<usize>,
+        transformed_tokens: Option<usize>,
+    ) -> Self {
+        Self {
+            output,
+            original,
+            original_tokens,
+            transformed_tokens,
+        }
+    }
+}
+
+/// Report token statistics to stderr if token counts are available
+fn report_token_stats(original_tokens: Option<usize>, transformed_tokens: Option<usize>, suffix: &str) {
+    if let (Some(orig), Some(trans)) = (original_tokens, transformed_tokens) {
+        let stats = tokens::TokenStats::new(orig, trans);
+        eprintln!("\n[skim] {}{}", stats.format(), suffix);
+    }
+}
+
 /// Check if path contains glob pattern characters
 fn has_glob_pattern(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('[')
 }
 
+/// Validate glob pattern to prevent path traversal attacks
+fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
+    // Reject absolute paths
+    if pattern.starts_with('/') {
+        anyhow::bail!(
+            "Glob pattern must be relative (cannot start with '/')\n\
+             Pattern: {}\n\
+             Use relative paths like 'src/**/*.ts' instead of '/src/**/*.ts'",
+            pattern
+        );
+    }
+
+    // Reject patterns containing .. (parent directory traversal)
+    if pattern.contains("..") {
+        anyhow::bail!(
+            "Glob pattern cannot contain '..' (parent directory traversal)\n\
+             Pattern: {}\n\
+             This prevents accessing files outside the current directory",
+            pattern
+        );
+    }
+
+    Ok(())
+}
+
 /// Process a single file and return transformed content and optionally original content
 fn process_file(
     path: &Path,
-    mode: Mode,
-    explicit_lang: Option<Language>,
-    use_cache: bool,
-    include_original: bool,
-) -> anyhow::Result<(String, Option<String>)> {
+    options: ProcessOptions,
+) -> anyhow::Result<ProcessResult> {
     // Try to read from cache if enabled
-    let cached_result = if use_cache {
-        cache::read_cache(path, mode)
+    let cached_result = if options.use_cache {
+        cache::read_cache(path, options.mode)
     } else {
         None
     };
 
-    // If we have cached result and don't need original, return early
-    if let Some(ref cached) = cached_result {
-        if !include_original {
-            return Ok((cached.clone(), None));
+    // If we have cached result with token counts, return without reading file
+    if let Some((ref content, orig_tokens, trans_tokens)) = cached_result {
+        if !options.include_original && orig_tokens.is_some() && trans_tokens.is_some() {
+            return Ok(ProcessResult::new(content.clone(), None, orig_tokens, trans_tokens));
         }
     }
 
@@ -169,25 +254,35 @@ fn process_file(
         );
     }
 
-    // If we have cached result, return it with original
-    if let Some(cached) = cached_result {
-        return Ok((cached, Some(contents)));
+    // If we have cached result, return it with original content
+    if let Some((content, orig_tokens, trans_tokens)) = cached_result {
+        return Ok(ProcessResult::new(content, Some(contents), orig_tokens, trans_tokens));
     }
 
     // Transform the file
-    let result = match explicit_lang {
-        Some(language) => transform(&contents, language, mode)?,
-        None => transform_auto(&contents, path, mode)?,
+    let result = match options.explicit_lang {
+        Some(language) => transform(&contents, language, options.mode)?,
+        None => transform_auto(&contents, path, options.mode)?,
+    };
+
+    // Count tokens if stats are needed
+    let (orig_tokens, trans_tokens) = if options.include_original {
+        match (tokens::count_tokens(&contents), tokens::count_tokens(&result)) {
+            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
     };
 
     // Write to cache if enabled
-    if use_cache {
+    if options.use_cache {
         // Ignore cache write errors (don't fail transformation if caching fails)
-        let _ = cache::write_cache(path, mode, &result);
+        let _ = cache::write_cache(path, options.mode, &result, orig_tokens, trans_tokens);
     }
 
-    let original = if include_original { Some(contents) } else { None };
-    Ok((result, original))
+    let original = if options.include_original { Some(contents) } else { None };
+    Ok(ProcessResult::new(result, original, orig_tokens, trans_tokens))
 }
 
 /// Process multiple files matched by glob pattern (with parallel processing)
@@ -200,14 +295,36 @@ fn process_glob(
     use_cache: bool,
     show_stats: bool,
 ) -> anyhow::Result<()> {
+    // Validate glob pattern for security
+    validate_glob_pattern(pattern)?;
+
     let paths: Vec<_> = glob(pattern)?
         .filter_map(|entry| entry.ok())
-        .filter(|p| p.is_file())
+        .filter(|p| {
+            // Only process regular files, not directories
+            if !p.is_file() {
+                return false;
+            }
+
+            // Security: Reject symlinks to prevent access to sensitive files
+            // A malicious user could create symlinks pointing to /etc/passwd, SSH keys, etc.
+            if let Ok(metadata) = p.symlink_metadata() {
+                if metadata.file_type().is_symlink() {
+                    eprintln!("Warning: Skipping symlink: {}", p.display());
+                    return false;
+                }
+            }
+
+            true
+        })
         .collect();
 
     if paths.is_empty() {
         anyhow::bail!("No files matched pattern: {}", pattern);
     }
+
+    // Create process options
+    let options = ProcessOptions::new(mode, explicit_lang, use_cache, show_stats);
 
     // Configure rayon thread pool if jobs specified
     let results: Vec<_> = if let Some(num_jobs) = jobs {
@@ -217,14 +334,14 @@ fn process_glob(
             .install(|| {
                 paths
                     .par_iter()
-                    .map(|path| (path, process_file(path, mode, explicit_lang, use_cache, show_stats)))
+                    .map(|path| (path, process_file(path, options)))
                     .collect()
             })
     } else {
         // Use default rayon thread pool (number of CPUs)
         paths
             .par_iter()
-            .map(|path| (path, process_file(path, mode, explicit_lang, use_cache, show_stats)))
+            .map(|path| (path, process_file(path, options)))
             .collect()
     };
 
@@ -239,7 +356,7 @@ fn process_glob(
 
     for (idx, (path, result)) in results.iter().enumerate() {
         match result {
-            Ok((output, original)) => {
+            Ok(process_result) => {
                 // Add file separator header (unless disabled)
                 if !no_header && paths.len() > 1 {
                     if idx > 0 {
@@ -248,19 +365,14 @@ fn process_glob(
                     writeln!(writer, "// === {} ===", path.display())?;
                 }
 
-                write!(writer, "{}", output)?;
+                write!(writer, "{}", process_result.output)?;
                 success_count += 1;
 
-                // Accumulate token counts if show_stats is enabled
+                // Accumulate token counts if show_stats is enabled (use cached counts)
                 if show_stats {
-                    if let Some(orig) = original {
-                        if let (Ok(orig_tokens), Ok(trans_tokens)) = (
-                            tokens::count_tokens(orig),
-                            tokens::count_tokens(output),
-                        ) {
-                            total_original_tokens += orig_tokens;
-                            total_transformed_tokens += trans_tokens;
-                        }
+                    if let (Some(orig), Some(trans)) = (process_result.original_tokens, process_result.transformed_tokens) {
+                        total_original_tokens += orig;
+                        total_transformed_tokens += trans;
                     }
                 }
             }
@@ -290,8 +402,8 @@ fn process_glob(
 
     // Output token statistics if requested
     if show_stats && total_original_tokens > 0 {
-        let stats = tokens::TokenStats::new(total_original_tokens, total_transformed_tokens);
-        eprintln!("\n[skim] {} across {} file(s)", stats.format(), success_count);
+        let suffix = format!(" across {} file(s)", success_count);
+        report_token_stats(Some(total_original_tokens), Some(total_transformed_tokens), &suffix);
     }
 
     Ok(())
@@ -299,6 +411,21 @@ fn process_glob(
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Validate --jobs parameter (max 128 to prevent resource exhaustion)
+    if let Some(jobs) = args.jobs {
+        if jobs == 0 {
+            anyhow::bail!("--jobs must be at least 1");
+        }
+        if jobs > 128 {
+            anyhow::bail!(
+                "--jobs value too high: {} (maximum: 128)\n\
+                 Using too many threads can exhaust system resources.\n\
+                 Recommended: Use default (number of CPUs) or specify a moderate value.",
+                jobs
+            );
+        }
+    }
 
     // Handle clear-cache command
     if args.clear_cache {
@@ -367,25 +494,18 @@ fn main() -> anyhow::Result<()> {
 
     // Handle single file
     let path = PathBuf::from(&file);
-    let (result, original) = process_file(&path, mode, explicit_lang, use_cache, args.show_stats)?;
+    let options = ProcessOptions::new(mode, explicit_lang, use_cache, args.show_stats);
+    let process_result = process_file(&path, options)?;
 
     // Output transformed result
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
-    write!(writer, "{}", result)?;
+    write!(writer, "{}", process_result.output)?;
     writer.flush()?;
 
-    // Output token statistics if requested
+    // Output token statistics if requested (use cached counts)
     if args.show_stats {
-        if let Some(orig) = original {
-            if let (Ok(orig_tokens), Ok(trans_tokens)) = (
-                tokens::count_tokens(&orig),
-                tokens::count_tokens(&result),
-            ) {
-                let stats = tokens::TokenStats::new(orig_tokens, trans_tokens);
-                eprintln!("\n[skim] {}", stats.format());
-            }
-        }
+        report_token_stats(process_result.original_tokens, process_result.transformed_tokens, "");
     }
 
     Ok(())

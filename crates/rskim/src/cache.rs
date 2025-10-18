@@ -25,6 +25,12 @@ struct CacheEntry {
     mode: String,
     /// Cached transformed output
     content: String,
+    /// Original token count (optional for backward compatibility)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_tokens: Option<usize>,
+    /// Transformed token count (optional for backward compatibility)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transformed_tokens: Option<usize>,
 }
 
 /// Get platform-specific cache directory (~/.cache/skim/ on Linux/macOS)
@@ -33,8 +39,24 @@ fn get_cache_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("Failed to determine cache directory"))?
         .join("skim");
 
-    // Create cache directory if it doesn't exist
-    fs::create_dir_all(&cache_dir)?;
+    // Create cache directory with secure permissions (owner-only on Unix)
+    #[cfg(unix)]
+    {
+        use std::fs::DirBuilder;
+        use std::os::unix::fs::DirBuilderExt;
+
+        if !cache_dir.exists() {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700); // rwx------ (owner-only)
+            builder.recursive(true);
+            builder.create(&cache_dir)?;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(&cache_dir)?;
+    }
 
     Ok(cache_dir)
 }
@@ -68,7 +90,8 @@ fn cache_key(path: &Path, mtime: SystemTime, mode: Mode) -> Result<String> {
 }
 
 /// Read cached output if valid (mtime matches)
-pub fn read_cache(path: &Path, mode: Mode) -> Option<String> {
+/// Returns: (content, original_tokens, transformed_tokens)
+pub fn read_cache(path: &Path, mode: Mode) -> Option<(String, Option<usize>, Option<usize>)> {
     // Get file metadata
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
@@ -92,7 +115,7 @@ pub fn read_cache(path: &Path, mode: Mode) -> Option<String> {
     let mode_str = format!("{:?}", mode);
 
     if entry.mtime_secs == mtime_secs && entry.mode == mode_str {
-        Some(entry.content)
+        Some((entry.content, entry.original_tokens, entry.transformed_tokens))
     } else {
         // Cache is stale, delete it
         let _ = fs::remove_file(&cache_file);
@@ -101,7 +124,13 @@ pub fn read_cache(path: &Path, mode: Mode) -> Option<String> {
 }
 
 /// Write transformed output to cache
-pub fn write_cache(path: &Path, mode: Mode, content: &str) -> Result<()> {
+pub fn write_cache(
+    path: &Path,
+    mode: Mode,
+    content: &str,
+    original_tokens: Option<usize>,
+    transformed_tokens: Option<usize>,
+) -> Result<()> {
     // Get file metadata
     let metadata = fs::metadata(path)?;
     let mtime = metadata.modified()?;
@@ -118,11 +147,21 @@ pub fn write_cache(path: &Path, mode: Mode, content: &str) -> Result<()> {
         mtime_secs,
         mode: format!("{:?}", mode),
         content: content.to_string(),
+        original_tokens,
+        transformed_tokens,
     };
 
     // Write to cache file
     let json = serde_json::to_string(&entry)?;
     fs::write(&cache_file, json)?;
+
+    // Set secure file permissions on Unix (owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&cache_file, perms)?;
+    }
 
     Ok(())
 }
@@ -173,13 +212,15 @@ mod tests {
         // Initially no cache
         assert!(read_cache(&path, Mode::Structure).is_none());
 
-        // Write to cache
+        // Write to cache with token counts
         let content = "transformed output";
-        write_cache(&path, Mode::Structure, content).unwrap();
+        write_cache(&path, Mode::Structure, content, Some(100), Some(50)).unwrap();
 
         // Read from cache
-        let cached = read_cache(&path, Mode::Structure).unwrap();
+        let (cached, orig_tokens, trans_tokens) = read_cache(&path, Mode::Structure).unwrap();
         assert_eq!(cached, content);
+        assert_eq!(orig_tokens, Some(100));
+        assert_eq!(trans_tokens, Some(50));
 
         // Different mode should not find cache
         assert!(read_cache(&path, Mode::Signatures).is_none());
@@ -201,11 +242,9 @@ mod tests {
         }
 
         // Write to cache
-        write_cache(&path, Mode::Structure, "cached v1").unwrap();
-        assert_eq!(
-            read_cache(&path, Mode::Structure).unwrap(),
-            "cached v1"
-        );
+        write_cache(&path, Mode::Structure, "cached v1", None, None).unwrap();
+        let (cached, _, _) = read_cache(&path, Mode::Structure).unwrap();
+        assert_eq!(cached, "cached v1");
 
         // Sleep to ensure mtime resolution (some filesystems have 1-second resolution)
         std::thread::sleep(std::time::Duration::from_secs(1));

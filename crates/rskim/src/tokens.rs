@@ -4,14 +4,26 @@
 //! - Provides accurate token counts for LLM context window calculation
 //! - Counts tokens before and after transformation
 //! - Reports reduction statistics
+//! - Lazy initialization to avoid recreating tokenizer on every call
 
 use anyhow::Result;
-use tiktoken_rs::cl100k_base;
+use std::sync::OnceLock;
+use tiktoken_rs::{cl100k_base, CoreBPE};
+
+/// Global tokenizer instance (lazy-initialized on first use)
+static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+
+/// Get or initialize the global tokenizer instance
+fn get_tokenizer() -> &'static CoreBPE {
+    TOKENIZER.get_or_init(|| {
+        cl100k_base().expect("Failed to initialize cl100k_base tokenizer")
+    })
+}
 
 /// Count tokens in text using cl100k_base encoding (GPT-3.5-turbo, GPT-4)
 pub fn count_tokens(text: &str) -> Result<usize> {
-    let bpe = cl100k_base()?;
-    let tokens = bpe.encode_with_special_tokens(text);
+    let tokenizer = get_tokenizer();
+    let tokens = tokenizer.encode_with_special_tokens(text);
     Ok(tokens.len())
 }
 
@@ -30,12 +42,12 @@ impl TokenStats {
         Self { original, transformed }
     }
 
-    /// Calculate reduction percentage
+    /// Calculate reduction percentage (negative if transformed is larger)
     pub fn reduction_percentage(&self) -> f32 {
         if self.original == 0 {
             return 0.0;
         }
-        ((self.original - self.transformed) as f32 / self.original as f32) * 100.0
+        ((self.original as f32 - self.transformed as f32) / self.original as f32) * 100.0
     }
 
     /// Get tokens saved
