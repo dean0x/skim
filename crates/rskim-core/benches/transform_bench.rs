@@ -2,8 +2,10 @@
 //!
 //! Run with: cargo bench
 
+#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in benchmarks
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use skim_core::{transform, Language, Mode};
+use rskim_core::{transform, Language, Mode};
 
 // ============================================================================
 // Benchmark Fixtures

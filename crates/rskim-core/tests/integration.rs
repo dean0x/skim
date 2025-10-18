@@ -2,6 +2,8 @@
 //!
 //! These tests validate the full pipeline from source → transformation.
 
+#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+
 use rskim_core::{transform, transform_auto, Language, Mode};
 use std::path::Path;
 

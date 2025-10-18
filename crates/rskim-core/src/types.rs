@@ -159,7 +159,7 @@ pub enum Mode {
 
 impl Mode {
     /// Parse mode from string (for CLI/API)
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "structure" => Some(Self::Structure),
             "signatures" => Some(Self::Signatures),
@@ -198,9 +198,11 @@ pub struct TransformConfig {
     /// If false, strips all comments.
     pub preserve_comments: bool,
 
-    /// Whether to use caching (Phase 3)
+    /// Whether to use caching
     ///
-    /// If true, transformed results are cached based on file mtime.
+    /// NOTE: This field is reserved for future library users who want to implement
+    /// their own caching. The CLI (rskim binary) implements caching separately
+    /// and ignores this field. See: crates/rskim/src/cache.rs
     pub cache_enabled: bool,
 }
 
@@ -311,7 +313,9 @@ pub enum SkimError {
     #[error("Invalid configuration: {0}")]
     ConfigError(String),
 
-    /// Cache error (Phase 3)
+    /// Cache error (reserved for future use)
+    ///
+    /// NOTE: The CLI implements its own caching layer and doesn't use this error.
     #[error("Cache error: {0}")]
     CacheError(String),
 
@@ -326,40 +330,15 @@ pub enum SkimError {
 pub type Result<T> = std::result::Result<T, SkimError>;
 
 // ============================================================================
-// Cache Types (Phase 3)
+// Cache Types (Reserved for Future Library Users)
 // ============================================================================
-
-/// Cache key for transformed results
-///
-/// ARCHITECTURE: Cache invalidation based on:
-/// - File path
-/// - File modification time (mtime)
-/// - Transformation mode
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CacheKey {
-    /// File path (normalized)
-    pub path: PathBuf,
-
-    /// File modification time (seconds since Unix epoch)
-    pub mtime: u64,
-
-    /// Transformation mode
-    pub mode: Mode,
-}
-
-impl CacheKey {
-    /// Create cache key from file metadata
-    pub fn new(path: PathBuf, mtime: u64, mode: Mode) -> Self {
-        Self { path, mtime, mode }
-    }
-
-    /// Compute cache key hash for storage
-    ///
-    /// Uses Blake3 for fast, collision-resistant hashing (Phase 3).
-    pub fn hash_key(&self) -> String {
-        todo!("Implement Blake3 hashing in Phase 3")
-    }
-}
+//
+// NOTE: The CLI (rskim binary) has its own caching implementation.
+// See: crates/rskim/src/cache.rs
+//
+// These types are kept here for documentation and potential future use by
+// library consumers who want to implement their own caching strategies.
+// The core library itself remains pure and I/O-free.
 
 // ============================================================================
 // Parser Types
@@ -440,10 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_from_str() {
-        assert_eq!(Mode::from_str("structure"), Some(Mode::Structure));
-        assert_eq!(Mode::from_str("STRUCTURE"), Some(Mode::Structure));
-        assert_eq!(Mode::from_str("invalid"), None);
+    fn test_mode_parse() {
+        assert_eq!(Mode::parse("structure"), Some(Mode::Structure));
+        assert_eq!(Mode::parse("STRUCTURE"), Some(Mode::Structure));
+        assert_eq!(Mode::parse("invalid"), None);
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub(crate) fn transform_structure(
     let node_types = get_node_types_for_language(language);
 
     // Find all body nodes to replace
-    let mut replacements: HashMap<(usize, usize), &str> = HashMap::new();
+    let mut replacements: HashMap<(usize, usize), &'static str> = HashMap::new();
     collect_body_replacements(tree.root_node(), &node_types, &mut replacements, 0)?;
 
     // Check node count limit to prevent memory exhaustion
@@ -125,10 +125,10 @@ pub(crate) fn transform_structure(
 /// # Security
 /// - Enforces MAX_AST_DEPTH to prevent stack overflow
 /// - Returns error if depth limit exceeded
-fn collect_body_replacements<'a>(
+fn collect_body_replacements(
     node: Node,
     node_types: &NodeTypes,
-    replacements: &mut HashMap<(usize, usize), &'a str>,
+    replacements: &mut HashMap<(usize, usize), &'static str>,
     depth: usize,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested AST

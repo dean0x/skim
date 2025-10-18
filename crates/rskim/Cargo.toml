@@ -1,6 +1,6 @@
 [package]
 name = "rskim"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -13,11 +13,19 @@ name = "skim"
 path = "src/main.rs"
 
 [dependencies]
-rskim-core = { version = "0.3.3", path = "../rskim-core" }
+rskim-core = { version = "0.4.0", path = "../rskim-core" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
+glob = { workspace = true }
+rayon = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tiktoken-rs = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.0"
 tempfile = "3.0"
+serde_json = { workspace = true }
