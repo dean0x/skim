@@ -40,6 +40,12 @@ pub(crate) fn transform_types(
     language: Language,
     _config: &crate::TransformConfig,
 ) -> Result<String> {
+    // ARCHITECTURE: Markdown types mode extracts ALL headers (H1-H6)
+    // (same as signatures mode - no type system in markdown)
+    if language == Language::Markdown {
+        return crate::transform::structure::extract_markdown_headers(source, tree, 1, 6);
+    }
+
     let node_types = get_type_node_types(language);
 
     let mut type_defs = Vec::new();
@@ -207,6 +213,13 @@ fn get_type_node_types(language: Language) -> TypeNodeTypes {
             enum_def: "enum_declaration",
             class_decl: "class_declaration",
             struct_def: "",
+        },
+        Language::Markdown => TypeNodeTypes {
+            type_alias: "", // Not applicable
+            interface: "",  // Not applicable
+            enum_def: "",   // Not applicable
+            class_decl: "", // Not applicable
+            struct_def: "", // Not applicable
         },
     }
 }

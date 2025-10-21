@@ -39,6 +39,11 @@ pub(crate) fn transform_signatures(
     language: Language,
     _config: &crate::TransformConfig,
 ) -> Result<String> {
+    // ARCHITECTURE: Markdown signatures mode extracts ALL headers (H1-H6)
+    if language == Language::Markdown {
+        return crate::transform::structure::extract_markdown_headers(source, tree, 1, 6);
+    }
+
     let node_types = get_signature_node_types(language);
 
     let mut signatures = Vec::new();
@@ -181,6 +186,10 @@ fn get_signature_node_types(language: Language) -> SignatureNodeTypes {
         Language::Java => SignatureNodeTypes {
             function: "method_declaration",
             method: "method_declaration",
+        },
+        Language::Markdown => SignatureNodeTypes {
+            function: "atx_heading", // Not used - markdown uses special extraction
+            method: "atx_heading",    // Not used - markdown uses special extraction
         },
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rskim-core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -18,6 +18,7 @@ tree-sitter-python = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-go = { workspace = true }
 tree-sitter-java = { workspace = true }
+tree-sitter-md = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

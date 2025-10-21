@@ -10,7 +10,7 @@ use thiserror::Error;
 // Language Support
 // ============================================================================
 
-/// Supported programming languages
+/// Supported programming languages and markup formats
 ///
 /// ARCHITECTURE: Adding a new language requires:
 /// 1. Add variant here
@@ -25,6 +25,7 @@ pub enum Language {
     Rust,
     Go,
     Java,
+    Markdown,
 }
 
 impl Language {
@@ -47,6 +48,7 @@ impl Language {
             "rs" => Some(Self::Rust),
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
+            "md" | "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -82,6 +84,7 @@ impl Language {
             Self::Rust => "Rust",
             Self::Go => "Go",
             Self::Java => "Java",
+            Self::Markdown => "Markdown",
         }
     }
 
@@ -89,6 +92,10 @@ impl Language {
     ///
     /// ARCHITECTURE: This is the ONLY place where tree-sitter grammars are loaded.
     /// Pattern: Lazy loading per language (don't load all grammars upfront).
+    ///
+    /// # Note on Markdown
+    /// tree-sitter-md has two parsers: LANGUAGE (block) and INLINE_LANGUAGE (inline).
+    /// We only use LANGUAGE (block parser) since we're extracting headers, not inline formatting.
     pub fn to_tree_sitter(self) -> tree_sitter::Language {
         match self {
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
@@ -97,6 +104,7 @@ impl Language {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
             Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
         }
     }
 }

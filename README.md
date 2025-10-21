@@ -32,7 +32,7 @@ export function processUser(user: User): Result { /* ... */ }
 
 - 🚀 **Fast** - 14.6ms for 3000-line files (powered by tree-sitter)
 - ⚡ **Cached** - 40-50x faster on repeated processing (enabled by default)
-- 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java
+- 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java, Markdown
 - 🎯 **Multiple modes** - Structure, signatures, types, or full code
 - 📂 **Multi-file** - Glob patterns (`src/**/*.ts`) with parallel processing
 - 📦 **Zero config** - Auto-detects language from file extension
@@ -92,6 +92,9 @@ skim 'src/*.ts' --mode signatures --no-header
 # Extract type definitions
 skim src/types.ts --mode types
 
+# Extract markdown headers (H1-H3 for structure, H1-H6 for signatures/types)
+skim README.md --mode structure
+
 # Pipe to other tools
 skim src/app.ts | bat -l typescript
 
@@ -121,7 +124,7 @@ skim [FILE] [OPTIONS]
 - `-m, --mode <MODE>` - Transformation mode [default: structure]
   - Values: `structure`, `signatures`, `types`, `full`
 - `-l, --language <LANGUAGE>` - Explicit language (required for stdin)
-  - Values: `typescript`, `javascript`, `python`, `rust`, `go`, `java`
+  - Values: `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `markdown`
 - `-j, --jobs <JOBS>` - Number of parallel jobs for multi-file processing [default: number of CPUs]
 - `--no-header` - Don't print file path headers for multi-file output
 - `--no-cache` - Disable caching (caching is enabled by default)
@@ -182,14 +185,15 @@ skim file.ts --mode full
 
 ## Supported Languages
 
-| Language   | Status | Extensions      | Notes                    |
-|------------|--------|-----------------|--------------------------|
-| TypeScript | ✅     | `.ts`, `.tsx`   | Excellent grammar        |
-| JavaScript | ✅     | `.js`, `.jsx`   | Full ES2024 support      |
-| Python     | ✅     | `.py`, `.pyi`   | Complete coverage        |
-| Rust       | ✅     | `.rs`           | Up-to-date grammar       |
-| Go         | ✅     | `.go`           | Stable                   |
-| Java       | ✅     | `.java`         | Good coverage            |
+| Language   | Status | Extensions         | Notes                    |
+|------------|--------|--------------------|--------------------------|
+| TypeScript | ✅     | `.ts`, `.tsx`      | Excellent grammar        |
+| JavaScript | ✅     | `.js`, `.jsx`      | Full ES2024 support      |
+| Python     | ✅     | `.py`, `.pyi`      | Complete coverage        |
+| Rust       | ✅     | `.rs`              | Up-to-date grammar       |
+| Go         | ✅     | `.go`              | Stable                   |
+| Java       | ✅     | `.java`            | Good coverage            |
+| Markdown   | ✅     | `.md`, `.markdown` | Header extraction        |
 
 ## Examples
 
@@ -242,6 +246,38 @@ impl UserRepository {
 impl UserRepository {
     pub async fn create(&self, user: NewUser) -> Result<User> { /* ... */ }
 }
+```
+
+### Markdown
+
+```markdown
+# Input
+# Project Documentation
+
+This is the introduction to our project.
+
+## Getting Started
+
+Follow these steps to get started.
+
+### Prerequisites
+
+You'll need Node.js installed.
+
+#### Installation
+
+Run npm install.
+
+# Output (structure mode - H1-H3 only)
+# Project Documentation
+## Getting Started
+### Prerequisites
+
+# Output (signatures/types mode - H1-H6 all headers)
+# Project Documentation
+## Getting Started
+### Prerequisites
+#### Installation
 ```
 
 ## Use Cases

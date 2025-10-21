@@ -211,6 +211,72 @@ fn test_java_types() {
 }
 
 // ============================================================================
+// Markdown Tests
+// ============================================================================
+
+#[test]
+fn test_markdown_structure() {
+    let source = include_str!("../../../tests/fixtures/markdown/simple.md");
+    let result = transform(source, Language::Markdown, Mode::Structure).unwrap();
+
+    // Should contain H1-H3 headers
+    assert!(result.contains("# Main Title"));
+    assert!(result.contains("## Section One"));
+    assert!(result.contains("### Subsection 1.1"));
+    assert!(result.contains("Setext Style H1"));
+    assert!(result.contains("Setext Style H2"));
+
+    // Should NOT contain H4-H6
+    assert!(!result.contains("#### Deep Header"));
+    assert!(!result.contains("##### Even Deeper"));
+    assert!(!result.contains("###### Deepest"));
+
+    // Should NOT contain body content
+    assert!(!result.contains("introductory content"));
+    assert!(!result.contains("implementation details"));
+}
+
+#[test]
+fn test_markdown_signatures() {
+    let source = include_str!("../../../tests/fixtures/markdown/simple.md");
+    let result = transform(source, Language::Markdown, Mode::Signatures).unwrap();
+
+    // Should contain ALL headers (H1-H6)
+    assert!(result.contains("# Main Title"));
+    assert!(result.contains("## Section One"));
+    assert!(result.contains("### Subsection 1.1"));
+    assert!(result.contains("#### Deep Header"));
+    assert!(result.contains("##### Even Deeper"));
+    assert!(result.contains("###### Deepest"));
+
+    // Should NOT contain body content
+    assert!(!result.contains("introductory content"));
+}
+
+#[test]
+fn test_markdown_types() {
+    let source = include_str!("../../../tests/fixtures/markdown/simple.md");
+    let result = transform(source, Language::Markdown, Mode::Types).unwrap();
+
+    // Types mode should be identical to signatures for markdown (no type system)
+    let signatures = transform(source, Language::Markdown, Mode::Signatures).unwrap();
+    assert_eq!(result, signatures);
+
+    // Should contain ALL headers
+    assert!(result.contains("# Main Title"));
+    assert!(result.contains("###### Deepest"));
+}
+
+#[test]
+fn test_markdown_full() {
+    let source = include_str!("../../../tests/fixtures/markdown/simple.md");
+    let result = transform(source, Language::Markdown, Mode::Full).unwrap();
+
+    // Should be identical to input
+    assert_eq!(result, source);
+}
+
+// ============================================================================
 // Language Detection Tests
 // ============================================================================
 
@@ -250,6 +316,14 @@ fn test_detect_language_from_path() {
     assert_eq!(
         detect_language_from_path(Path::new("Main.java")),
         Some(Language::Java)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("README.md")),
+        Some(Language::Markdown)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("doc.markdown")),
+        Some(Language::Markdown)
     );
 }
 
