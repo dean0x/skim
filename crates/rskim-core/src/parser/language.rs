@@ -11,6 +11,7 @@ use crate::Language;
 /// - TypeScript: "function_declaration", "class_declaration"
 /// - Python: "function_definition", "class_definition"
 /// - Rust: "function_item", "struct_item"
+/// - Markdown: "atx_heading", "setext_heading" (headers instead of functions)
 ///
 /// This function returns language-specific node type mappings.
 pub(crate) fn get_node_types(language: Language) -> LanguageNodeTypes {
@@ -44,6 +45,12 @@ pub(crate) fn get_node_types(language: Language) -> LanguageNodeTypes {
             class: "class_declaration",
             interface: "interface_declaration",
             type_alias: "", // Java has no type aliases (pre-generics)
+        },
+        Language::Markdown => LanguageNodeTypes {
+            function: "atx_heading", // Headers are document structure (like functions in code)
+            class: "setext_heading", // Alternative header syntax
+            interface: "", // N/A for markdown
+            type_alias: "", // N/A for markdown
         },
     }
 }
