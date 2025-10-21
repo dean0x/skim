@@ -14,6 +14,12 @@ const MAX_AST_DEPTH: usize = 500;
 /// Maximum number of AST nodes to prevent memory exhaustion
 const MAX_AST_NODES: usize = 100_000;
 
+/// Maximum markdown traversal depth to prevent stack overflow
+const MAX_MARKDOWN_DEPTH: usize = 500;
+
+/// Maximum number of markdown headers to prevent memory exhaustion
+const MAX_MARKDOWN_HEADERS: usize = 10_000;
+
 /// Transform to structure-only (strip implementations)
 ///
 /// # What to Keep
@@ -231,6 +237,10 @@ fn get_node_types_for_language(language: Language) -> NodeTypes {
 ///
 /// # Returns
 /// Only the header lines within the specified range
+///
+/// # Security
+/// - Enforces MAX_MARKDOWN_DEPTH to prevent stack overflow
+/// - Enforces MAX_MARKDOWN_HEADERS to prevent memory exhaustion
 pub(crate) fn extract_markdown_headers(
     source: &str,
     tree: &Tree,
@@ -240,10 +250,26 @@ pub(crate) fn extract_markdown_headers(
     let mut headers = Vec::new();
     let root = tree.root_node();
 
-    // Traverse all nodes to find headers
-    let mut visit_stack = vec![root];
+    // Traverse all nodes to find headers (depth, node)
+    let mut visit_stack = vec![(0_usize, root)];
 
-    while let Some(node) = visit_stack.pop() {
+    while let Some((depth, node)) = visit_stack.pop() {
+        // SECURITY: Prevent stack overflow from deeply nested AST
+        if depth > MAX_MARKDOWN_DEPTH {
+            return Err(SkimError::ParseError(format!(
+                "Maximum markdown depth exceeded: {} (possible malicious input)",
+                MAX_MARKDOWN_DEPTH
+            )));
+        }
+
+        // SECURITY: Prevent memory exhaustion from excessive headers
+        if headers.len() > MAX_MARKDOWN_HEADERS {
+            return Err(SkimError::ParseError(format!(
+                "Too many markdown headers: {} (max: {}). Possible malicious input.",
+                headers.len(),
+                MAX_MARKDOWN_HEADERS
+            )));
+        }
         let node_type = node.kind();
 
         // ATX headers: # Header
@@ -274,22 +300,32 @@ pub(crate) fn extract_markdown_headers(
         // Setext headers: underlined with === or ---
         else if node_type == "setext_heading" {
             // Setext headers are H1 (===) or H2 (---)
-            // Determine level by checking the underline character
-            let header_text = node.utf8_text(source.as_bytes())
-                .map_err(|e| SkimError::ParseError(format!("UTF-8 error in setext header: {}", e)))?;
+            // Determine level by checking child node type for underline marker
+            let mut cursor = node.walk();
+            let underline = node.children(&mut cursor).find(|child| {
+                let kind = child.kind();
+                kind == "setext_h1_underline" || kind == "setext_h2_underline"
+            });
 
-            // H1 uses '=', H2 uses '-'
-            let level = if header_text.contains("===") || header_text.contains('=') { 1 } else { 2 };
+            let level = if let Some(underline_node) = underline {
+                // Extract level from underline node type
+                if underline_node.kind() == "setext_h1_underline" { 1 } else { 2 }
+            } else {
+                // Fallback: if no underline child found, default to H1
+                1
+            };
 
             if level >= min_level && level <= max_level {
+                let header_text = node.utf8_text(source.as_bytes())
+                    .map_err(|e| SkimError::ParseError(format!("UTF-8 error in setext header: {}", e)))?;
                 headers.push(header_text.to_string());
             }
         }
 
-        // Add children to visit stack (depth-first traversal)
+        // Add children to visit stack with incremented depth (depth-first traversal)
         let mut child_cursor = node.walk();
         for child in node.children(&mut child_cursor) {
-            visit_stack.push(child);
+            visit_stack.push((depth + 1, child));
         }
     }
 

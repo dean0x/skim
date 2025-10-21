@@ -270,6 +270,7 @@ pub fn supported_languages() -> &'static [Language] {
         Language::Rust,
         Language::Go,
         Language::Java,
+        Language::Markdown,
     ]
 }
 
@@ -288,7 +289,8 @@ mod tests {
 
     #[test]
     fn test_supported_languages() {
-        assert_eq!(supported_languages().len(), 6);
+        assert_eq!(supported_languages().len(), 7);
+        assert!(supported_languages().contains(&Language::Markdown));
     }
 
     #[test]

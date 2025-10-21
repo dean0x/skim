@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - TBD
+
+### Added
+- **Markdown Support** - Extract document structure from markdown files
+  - Support for `.md` and `.markdown` file extensions
+  - **Structure mode** - Extracts H1-H3 headers only (document outline)
+  - **Signatures/Types modes** - Extracts all headers H1-H6 (complete structure)
+  - **Full mode** - Returns original markdown unchanged
+  - Supports both ATX headers (`# Title`) and Setext headers (underlined)
+  - Auto-detection from file extension
+
+### Internal
+- New test fixture: `tests/fixtures/markdown/simple.md`
+- Added 10 CLI integration tests for markdown (`cli_markdown.rs`)
+- Added 4 core library unit tests for markdown (`integration.rs`)
+- Updated `supported_languages()` API to include Markdown
+- Added `Language::Markdown` to CLI `LanguageArg` enum
+
+### Security & Hardening
+- Added `MAX_MARKDOWN_DEPTH` (500) limit to prevent stack overflow
+- Added `MAX_MARKDOWN_HEADERS` (10,000) limit to prevent memory exhaustion
+- Improved setext header detection using AST instead of text matching
+- Depth tracking in markdown AST traversal
+
+### Dependencies
+- **Updated** tree-sitter from 0.23 to 0.25 (ABI 15 support)
+- **Updated** tree-sitter-javascript from 0.23 to 0.25
+- **Updated** tree-sitter-python from 0.23 to 0.25
+- **Updated** tree-sitter-go from 0.23 to 0.25
+- **Added** tree-sitter-md 0.5 (markdown grammar)
+
+### Testing
+- **115 total tests** - All passing (+14% increase from v0.4.0's 101 tests)
+  - 10 new markdown CLI tests
+  - 4 new markdown integration tests
+  - All existing tests continue to pass
+
+### Breaking Changes
+None. Markdown support is additive and auto-detected by file extension.
+
 ## [0.4.0] - 2025-10-17
 
 ### Added
