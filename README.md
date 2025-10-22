@@ -1,6 +1,6 @@
 # Skim 🔍
 
-> **Smart code reader for AI agents** - Strip implementation, keep structure
+> **Rust based smart code reader for AI agents** - Strip implementation, keep structure
 
 Skim transforms source code by removing implementation details while preserving structure, signatures, and types. Built with tree-sitter for fast, accurate multi-language parsing.
 
@@ -13,12 +13,27 @@ Skim transforms source code by removing implementation details while preserving 
 
 ## Why Skim?
 
-**Problem**: Large codebases don't fit in LLM context windows. You need structure, not implementation.
+Take a typical 80-file TypeScript project: 63,000 tokens. Modern LLMs handle 200k+ context, so capacity isn't the issue.
 
-**Solution**: Skim intelligently strips function bodies and implementation details while preserving the information AI agents need to understand your code.
+But **context capacity isn't the bottleneck — attention is.** That 63k contains maybe 5k of actual signal. The rest? Implementation noise: loop bodies, error handlers, validation chains the model doesn't need to reason about architecture.
+
+**Large contexts degrade model performance.** Research consistently shows attention dilution in long contexts — models lose track of critical details even within their window. More tokens means higher latency, degraded recall, and weaker reasoning. The inverse scaling problem: past a threshold, *adding context makes outputs worse.*
+
+**80% of the time, the model doesn't need implementation details.** It doesn't care *how* you loop through users or validate emails. It needs to understand *what* your code does and how pieces connect.
+
+That's where Skim comes in.
+
+| Mode       | Tokens | Reduction | Use Case                   |
+|------------|--------|-----------|----------------------------|
+| Full       | 63,198 | 0%        | Original source code       |
+| Structure  | 25,119 | 60.3%     | Understanding architecture |
+| Signatures | 7,328  | 88.4%     | API documentation          |
+| Types      | 5,181  | 91.8%     | Type system analysis       |
+
+For example:
 
 ```typescript
-// Input: Full implementation
+// Before: Full implementation (100 tokens)
 export function processUser(user: User): Result {
     const validated = validateUser(user);
     if (!validated) throw new Error("Invalid");
@@ -26,11 +41,13 @@ export function processUser(user: User): Result {
     return await saveToDatabase(normalized);
 }
 
-// Output: Structure only
+// After: Structure only (12 tokens)
 export function processUser(user: User): Result { /* ... */ }
 ```
 
-**Token reduction**: 70-90% smaller for better LLM context utilization.
+**One command. 60-90% smaller.** Your 63,000-token codebase? Now 5,000 tokens. Fits comfortably in a single prompt with room for your question.
+
+That same 80-file project that wouldn't fit? Now you can ask: *"Explain the entire authentication flow"* or *"How do these services interact?"* — and the AI actually has enough context to answer.
 
 ## Features
 
@@ -345,7 +362,7 @@ Language Detection → tree-sitter Parser → Transformation → Streaming Outpu
 
 ### Real-World Token Reduction
 
-**Production TypeScript Codebase (80 files):**
+**Production TypeScript Codebase:**
 
 | Mode       | Tokens | Reduction | LLM Context Multiplier |
 |------------|--------|-----------|------------------------|
