@@ -128,80 +128,45 @@ skim file.ts --show-stats
 ## Usage
 
 ```bash
-skim [FILE|DIRECTORY] [OPTIONS]
+# Basic usage (auto-detects language)
+skim file.ts                    # Single file
+skim src/                       # Directory (recursive)
+skim 'src/**/*.ts'             # Glob pattern
+
+# With options
+skim file.ts --mode signatures  # Different mode
+skim src/ --jobs 8             # Parallel processing
+skim - --language typescript   # Stdin (requires --language)
 ```
 
-**Arguments:**
-- `<FILE>` - File, directory, or glob pattern to process (use '-' for stdin)
-  - Single file: `skim file.ts` (auto-detects language from extension)
-  - Directory: `skim src/` (recursively processes all supported files)
-  - Glob pattern: `skim 'src/**/*.ts'` (processes matching files)
-  - Stdin: `skim -` (requires `--language` flag)
+**Common options:**
+- `-m, --mode` - Transformation mode: `structure` (default), `signatures`, `types`, `full`
+- `-l, --language` - Override auto-detection (required for stdin only)
+- `-j, --jobs` - Parallel processing threads (default: CPU cores)
+- `--no-cache` - Disable caching
+- `--show-stats` - Show token reduction stats
 
-**Options:**
-- `-m, --mode <MODE>` - Transformation mode [default: structure]
-  - Values: `structure`, `signatures`, `types`, `full`
-- `-l, --language <LANGUAGE>` - Override language detection (required for stdin, optional fallback otherwise)
-  - Values: `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `markdown`
-  - **Auto-detection:** Language is automatically detected from file extensions by default
-  - **Use when:** Reading from stdin, or processing files with unusual extensions
-- `-j, --jobs <JOBS>` - Number of parallel jobs for multi-file processing [default: number of CPUs]
-- `--no-header` - Don't print file path headers for multi-file output
-- `--no-cache` - Disable caching (caching is enabled by default)
-- `--clear-cache` - Clear all cached files and exit
-- `--show-stats` - Show token reduction statistics (output to stderr)
-- `-h, --help` - Print help
-- `-V, --version` - Print version
+📖 **[Full Usage Guide →](docs/usage.md)**
 
 ## Transformation Modes
 
-### Structure Mode (Default)
+Skim offers four modes with different levels of aggressiveness:
 
-**Token reduction: 70-80%**
-
-Keeps function/method signatures, class declarations, type definitions, imports/exports. Strips all implementation bodies.
-
-```bash
-skim file.ts --mode structure
-```
-
-**Use case**: Understanding code organization and APIs
-
-### Signatures Mode
-
-**Token reduction: 85-92%**
-
-More aggressive - keeps ONLY callable signatures, removes everything else.
+| Mode       | Reduction | What's Kept                              | Use Case                   |
+|------------|-----------|------------------------------------------|----------------------------|
+| Structure  | 70-80%    | Signatures, types, classes, imports      | Understanding architecture |
+| Signatures | 85-92%    | Only callable signatures                 | API documentation          |
+| Types      | 90-95%    | Only type definitions                    | Type system analysis       |
+| Full       | 0%        | Everything (original source)             | Testing/comparison         |
 
 ```bash
-skim file.ts --mode signatures
+skim file.ts --mode structure   # Default
+skim file.ts --mode signatures  # More aggressive
+skim file.ts --mode types       # Most aggressive
+skim file.ts --mode full        # No transformation
 ```
 
-**Use case**: Generating API documentation or type stubs
-
-### Types Mode
-
-**Token reduction: 90-95%**
-
-Keeps only type definitions (interfaces, type aliases, enums). Removes all code.
-
-```bash
-skim file.ts --mode types
-```
-
-**Use case**: Type system analysis
-
-### Full Mode
-
-**Token reduction: 0%**
-
-No transformation - returns original source (like `cat`).
-
-```bash
-skim file.ts --mode full
-```
-
-**Use case**: Passthrough for testing or comparison
+📖 **[Detailed Mode Guide →](docs/modes.md)**
 
 ## Supported Languages
 
@@ -217,7 +182,7 @@ skim file.ts --mode full
 
 ## Examples
 
-### TypeScript/JavaScript
+### TypeScript
 
 ```typescript
 // Input
@@ -250,117 +215,51 @@ def process_data(items: List[Item]) -> Dict[str, Any]:
 def process_data(items: List[Item]) -> Dict[str, Any]: { /* ... */ }
 ```
 
-### Rust
-
-```rust
-// Input
-impl UserRepository {
-    pub async fn create(&self, user: NewUser) -> Result<User> {
-        let validated = self.validate(user)?;
-        let id = Uuid::new_v4();
-        self.db.insert(id, validated).await
-    }
-}
-
-// Output (structure mode)
-impl UserRepository {
-    pub async fn create(&self, user: NewUser) -> Result<User> { /* ... */ }
-}
-```
-
-### Markdown
-
-```markdown
-# Input
-# Project Documentation
-
-This is the introduction to our project.
-
-## Getting Started
-
-Follow these steps to get started.
-
-### Prerequisites
-
-You'll need Node.js installed.
-
-#### Installation
-
-Run npm install.
-
-# Output (structure mode - H1-H3 only)
-# Project Documentation
-## Getting Started
-### Prerequisites
-
-# Output (signatures/types mode - H1-H6 all headers)
-# Project Documentation
-## Getting Started
-### Prerequisites
-#### Installation
-```
+📖 **[More Examples (All Languages) →](docs/examples.md)**
 
 ## Use Cases
 
-### 1. LLM Context Optimization
+### LLM Context Optimization
+
+Reduce codebase size by 60-90% to fit in LLM context windows:
 
 ```bash
-# Send only structure to AI for code review
-skim src/app.ts | llm "Review this architecture"
-
-# Process entire directory for LLM context (auto-detects all languages)
 skim src/ --no-header | llm "Analyze this codebase"
-
-# Process specific subdirectory
-skim src/components/ --mode signatures | llm "Review these components"
+skim src/app.ts | llm "Review this architecture"
 ```
 
-### 2. Codebase Documentation
+### API Documentation
+
+Extract function signatures for documentation:
 
 ```bash
-# Generate API surface documentation from directory
 skim src/ --mode signatures > api-docs.txt
-
-# Process specific file types with glob pattern
-skim 'lib/**/*.py' --mode signatures --jobs 8 > python-api.txt
-
-# Document mixed-language codebase (auto-detects each file)
-skim . --no-header --mode signatures > full-api.txt
+skim 'lib/**/*.py' --mode signatures > python-api.txt
 ```
 
-### 3. Type System Analysis
+### Type System Analysis
+
+Focus on type definitions and interfaces:
 
 ```bash
-# Extract all type definitions from directory
 skim src/ --mode types --no-header
-
-# Extract types from specific files
-skim 'src/**/*.ts' --mode types --no-header
+skim 'src/**/*.ts' --mode types
 ```
 
-### 4. Code Navigation
+### Code Navigation
+
+Quick overview without implementation details:
 
 ```bash
-# Quick overview of file structure
 skim large-file.py | less
-
-# Overview of entire directory
 skim src/auth/ | less
-
-# Overview of specific module
-skim 'src/auth/*.ts' | less
 ```
+
+📖 **[10 Detailed Use Cases →](docs/use-cases.md)**
 
 ## Caching
 
-**Caching is enabled by default** for maximum performance on repeated processing.
-
-### How It Works
-
-- **Cache key**: SHA256 hash of (file path + modification time + mode)
-- **Location**: `~/.cache/skim/` (platform-specific)
-- **Invalidation**: Automatic when file is modified (mtime-based)
-- **Storage**: JSON files with metadata
+**Caching is enabled by default** for 40-50x faster repeated processing.
 
 ### Performance Impact
 
@@ -372,97 +271,65 @@ skim 'src/auth/*.ts' | less
 ### Cache Management
 
 ```bash
-# View cache location
-ls ~/.cache/skim/
-
-# Clear all cache
-skim --clear-cache
-
-# Disable caching (for specific run)
-skim file.ts --no-cache
-
-# Caching works with all features
-skim 'src/**/*.ts' --jobs 8 --mode signatures  # Cached by default
+ls ~/.cache/skim/           # View cache
+skim --clear-cache          # Clear cache
+skim file.ts --no-cache     # Disable for one run
 ```
 
-### When Caching Helps
+**How it works:**
+- Cache key: SHA256(file path + mtime + mode)
+- Automatic invalidation when files change
+- Platform-specific cache directory
 
-- ✅ Repeated processing of same files (e.g., in watch mode)
-- ✅ Large codebases with infrequent changes
-- ✅ CI/CD pipelines processing same files multiple times
-- ✅ Development workflows with hot reloading
+**When to disable caching:**
+- One-time LLM transformations
+- Stdin processing
+- Disk-constrained environments
 
-### When to Disable Caching
-
-- ⚠️ One-time transformations for LLM input (no benefit)
-- ⚠️ Piping through stdin (caching not supported)
-- ⚠️ Testing/debugging transformation logic
-- ⚠️ Disk space constrained environments
+📖 **[Caching Internals →](docs/caching.md)**
 
 ## Token Counting
 
-**Show token reduction statistics** with the `--show-stats` flag to understand context window savings.
+See exactly how much context you're saving with `--show-stats`:
 
 ```bash
 skim file.ts --show-stats
-# Output (stderr): [skim] 1,000 tokens → 200 tokens (80.0% reduction)
+# [skim] 1,000 tokens → 200 tokens (80.0% reduction)
 
 skim 'src/**/*.ts' --show-stats
-# Output (stderr): [skim] 15,000 tokens → 3,000 tokens (80.0% reduction) across 50 file(s)
+# [skim] 15,000 tokens → 3,000 tokens (80.0% reduction) across 50 file(s)
 ```
 
-### Features
-- Uses OpenAI's tiktoken (cl100k_base encoding for GPT-3.5/GPT-4)
-- Works with single files, multi-file globs, and stdin
-- Output to stderr (keeps stdout clean for piping)
-- Aggregates stats across multiple files
-
-### Use Cases
-- **LLM optimization**: Measure how much context window you're saving
-- **Mode comparison**: Compare reduction rates between structure/signatures/types modes
-- **Benchmarking**: Track token efficiency improvements
+Uses OpenAI's tiktoken (cl100k_base for GPT-3.5/GPT-4). Output to stderr for clean piping.
 
 ## Security
 
-Skim includes built-in protections against DoS attacks:
+Skim includes built-in DoS protections:
 
-- **Max recursion depth**: 500 levels (prevents stack overflow on deeply nested code)
-- **Max input size**: 50MB (prevents memory exhaustion)
-- **Max AST nodes**: 100,000 nodes (prevents memory exhaustion)
-- **UTF-8 validation**: Safe handling of multi-byte Unicode
+- **Max recursion depth**: 500 levels
+- **Max input size**: 50MB per file
+- **Max AST nodes**: 100,000 nodes
 - **Path traversal protection**: Rejects malicious paths
+- **No code execution**: Only parses, never runs code
 
-See [SECURITY.md](SECURITY.md) for vulnerability disclosure process.
+📖 **[Security Details & Best Practices →](docs/security.md)**
+🔒 **[Vulnerability Disclosure →](SECURITY.md)**
 
 ## Architecture
 
+Skim uses a clean, streaming architecture:
+
 ```
-┌─────────────────┐
-│  Language       │
-│  Detection      │
-└────────┬────────┘
-         │
-┌────────▼────────┐
-│  tree-sitter    │
-│  Parser         │
-└────────┬────────┘
-         │
-┌────────▼────────┐
-│  Transformation │
-│  Layer          │
-└────────┬────────┘
-         │
-┌────────▼────────┐
-│  Streaming      │
-│  Output         │
-└─────────────────┘
+Language Detection → tree-sitter Parser → Transformation → Streaming Output
 ```
 
 **Design principles:**
 - **Streaming-first**: Output to stdout, no intermediate files
-- **Zero-copy**: Uses `&str` slices to avoid allocations
-- **Error-tolerant**: tree-sitter handles incomplete/broken code gracefully
-- **Type-safe**: Explicit error handling with `Result<T, E>` (no panics in library code)
+- **Zero-copy**: Uses `&str` slices to minimize allocations
+- **Error-tolerant**: Handles incomplete/broken code gracefully
+- **Type-safe**: Explicit error handling, no panics
+
+📖 **[Architecture Deep Dive →](docs/architecture.md)**
 
 ## Performance
 
@@ -470,83 +337,53 @@ See [SECURITY.md](SECURITY.md) for vulnerability disclosure process.
 
 ### Benchmark Results
 
-**Small files (<100 lines):**
-- Go: 60µs (fastest)
-- Rust: 68µs
-- Python: 73µs
-- Java: 84µs
-- TypeScript: 33µs (simple) / 83µs (medium complexity)
-
-**Scaling (structure mode):**
-- 100 functions (300 lines): 1.3ms
-- 500 functions (1500 lines): 6.4ms
-- **1000 functions (3000 lines): 14.6ms** ✅
+| File Size | Lines | Time   | Speed      |
+|-----------|-------|--------|------------|
+| Small     | 300   | 1.3ms  | 4.3µs/line |
+| Medium    | 1500  | 6.4ms  | 4.3µs/line |
+| **Large** | **3000** | **14.6ms** | **4.9µs/line** |
 
 ### Real-World Token Reduction
 
 **Production TypeScript Codebase (80 files):**
 
-| Mode       | Tokens | Reduction | Use Case                   |
-|------------|--------|-----------|----------------------------|
-| Full       | 63,198 | 0%        | Original source code       |
-| **Structure**  | **25,119** | **60.3%**     | **Understanding architecture** |
-| **Signatures** | **7,328**  | **88.4%**     | **API documentation**          |
-| **Types**      | **5,181**  | **91.8%**     | **Type system analysis**       |
+| Mode       | Tokens | Reduction | LLM Context Multiplier |
+|------------|--------|-----------|------------------------|
+| Full       | 63,198 | 0%        | 1.0x                   |
+| **Structure**  | **25,119** | **60.3%** | **2.5x more code**     |
+| **Signatures** | **7,328**  | **88.4%** | **8.6x more code**     |
+| **Types**      | **5,181**  | **91.8%** | **12.2x more code**    |
 
-**What this means:**
-- Structure mode: Fit **2.5x more code** in your LLM context window
-- Signatures mode: Fit **8.6x more code** for API documentation
-- Types mode: Fit **12.2x more code** for type system analysis
-
-**Use cases:**
-- LLM context optimization: "Explain this entire codebase" (60-90% smaller)
-- Documentation generation: Extract all public APIs in milliseconds
-- Type analysis: Focus only on type definitions and interfaces
-
-**Run benchmarks:**
-```bash
-cargo bench
-```
-
-Built with performance in mind:
-- tree-sitter for fast parsing
-- Zero-copy string operations
-- Optimized release builds (LTO enabled)
+📖 **[Full Performance Benchmarks →](docs/performance.md)**
 
 ## Development
 
-### Build
+### Quick Start
 
 ```bash
+# Build and test
 cargo build --release
-```
-
-### Test
-
-```bash
 cargo test --all-features
-```
 
-### Lint
-
-```bash
+# Lint
 cargo clippy -- -D warnings
 cargo fmt -- --check
+
+# Benchmark
+cargo bench
 ```
 
-### Add New Language
+### Adding New Languages
 
-1. Add grammar to `Cargo.toml`:
-```toml
-tree-sitter-newlang = "0.23"
-```
+~30 minutes per language:
 
+1. Add tree-sitter grammar to `Cargo.toml`
 2. Update `Language` enum in `src/types.rs`
-3. Add mapping in `to_tree_sitter()` method
-4. Add file extension in `from_extension()`
-5. Add test fixtures
+3. Add file extension mapping
+4. Add test fixtures
+5. Run tests
 
-Should take ~30 minutes per language.
+📖 **[Development Guide →](docs/development.md)**
 
 ## Project Status
 
@@ -569,6 +406,20 @@ Should take ~30 minutes per language.
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
+## Documentation
+
+Comprehensive guides for all aspects of Skim:
+
+- 📖 **[Usage Guide](docs/usage.md)** - Complete CLI reference and options
+- 🎯 **[Transformation Modes](docs/modes.md)** - Detailed mode comparison and examples
+- 💡 **[Examples](docs/examples.md)** - Language-specific transformation examples
+- 🚀 **[Use Cases](docs/use-cases.md)** - 10 practical scenarios with commands
+- ⚡ **[Caching](docs/caching.md)** - Caching internals and best practices
+- 🔒 **[Security](docs/security.md)** - DoS protections and security best practices
+- 🏗️ **[Architecture](docs/architecture.md)** - System design and technical details
+- ⏱️ **[Performance](docs/performance.md)** - Benchmarks and optimization guide
+- 🛠️ **[Development](docs/development.md)** - Contributing and adding languages
+
 ## Contributing
 
 Contributions welcome! Please:
@@ -578,6 +429,8 @@ Contributions welcome! Please:
 3. Follow existing code style (`cargo fmt`, `cargo clippy`)
 4. Add tests for new features
 5. Update documentation
+
+📖 **See [Development Guide](docs/development.md) for detailed instructions**
 
 ### Project Structure
 
