@@ -35,15 +35,17 @@ const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
     skim file.ts                       Read TypeScript with structure mode (cached)\n  \
     skim file.py --mode signatures     Extract Python signatures\n  \
     skim file.rs | bat -l rust         Skim Rust and highlight\n  \
-    cat code.ts | skim - --lang=ts     Read from stdin with explicit language\n  \
+    cat code.ts | skim - --lang=ts     Read from stdin (requires --language)\n  \
     skim - -l python < script.py       Short form language flag\n  \
-    skim 'src/**/*.ts'                 Process all TypeScript files (cached)\n  \
+    skim src/                          Process all files in directory recursively\n  \
+    skim 'src/**/*.ts'                 Process all TypeScript files (glob pattern)\n  \
     skim '*.{js,ts}' --no-header       Process multiple files without headers\n  \
+    skim . --jobs 8                    Process current directory with 8 threads\n  \
     skim file.ts --no-cache            Disable caching for pure transformation\n  \
     skim --clear-cache                 Clear all cached files\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
-    /// File to read (use '-' for stdin, supports glob patterns like '*.ts' or 'src/**/*.js')
+    /// File, directory, or glob pattern to process (use '-' for stdin)
     #[arg(value_name = "FILE", required_unless_present = "clear_cache")]
     file: Option<String>,
 
@@ -52,7 +54,7 @@ struct Args {
     #[arg(help = "Transformation mode: structure, signatures, types, or full")]
     mode: ModeArg,
 
-    /// Explicit language (required when reading from stdin, applies to all files when using globs)
+    /// Override language detection (required for stdin, optional fallback otherwise)
     #[arg(short, long, value_enum)]
     #[arg(help = "Programming language: typescript, python, rust, go, java")]
     language: Option<LanguageArg>,
@@ -164,6 +166,7 @@ struct ProcessResult {
     /// Transformed output
     output: String,
     /// Original file content (if needed for token counting)
+    #[allow(dead_code)]
     original: Option<String>,
     /// Original token count (if computed)
     original_tokens: Option<usize>,
@@ -263,9 +266,19 @@ fn process_file(
     }
 
     // Transform the file
-    let result = match options.explicit_lang {
-        Some(language) => transform(&contents, language, options.mode)?,
-        None => transform_auto(&contents, path, options.mode)?,
+    // ARCHITECTURE: Option B - Always try auto-detection first, use explicit_lang as fallback
+    // This allows mixed-language directories while still supporting edge cases like .inc files
+    let result = match transform_auto(&contents, path, options.mode) {
+        Ok(output) => output,
+        Err(e) => {
+            // Auto-detection failed - use explicit language as fallback if provided
+            if let Some(language) = options.explicit_lang {
+                transform(&contents, language, options.mode)?
+            } else {
+                // No fallback available - propagate the auto-detection error
+                return Err(e.into());
+            }
+        }
     };
 
     // Count tokens if stats are needed
@@ -286,6 +299,116 @@ fn process_file(
 
     let original = if options.include_original { Some(contents) } else { None };
     Ok(ProcessResult::new(result, original, orig_tokens, trans_tokens))
+}
+
+/// Options for multi-file processing
+#[derive(Debug, Clone, Copy)]
+struct MultiFileOptions {
+    mode: Mode,
+    explicit_lang: Option<Language>,
+    no_header: bool,
+    jobs: Option<usize>,
+    use_cache: bool,
+    show_stats: bool,
+}
+
+/// Process multiple files (with parallel processing)
+///
+/// ARCHITECTURE: Generic file processor used by both glob and directory inputs.
+/// Handles parallel processing, error aggregation, and statistics.
+fn process_files(
+    paths: Vec<PathBuf>,
+    source_description: &str,
+    options: MultiFileOptions,
+) -> anyhow::Result<()> {
+    if paths.is_empty() {
+        anyhow::bail!("No files found: {}", source_description);
+    }
+
+    // Create process options
+    let process_options = ProcessOptions::new(options.mode, options.explicit_lang, options.use_cache, options.show_stats);
+
+    // Configure rayon thread pool if jobs specified
+    let results: Vec<_> = if let Some(num_jobs) = options.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_jobs)
+            .build()?
+            .install(|| {
+                paths
+                    .par_iter()
+                    .map(|path| (path, process_file(path, process_options)))
+                    .collect()
+            })
+    } else {
+        // Use default rayon thread pool (number of CPUs)
+        paths
+            .par_iter()
+            .map(|path| (path, process_file(path, process_options)))
+            .collect()
+    };
+
+    // Write results to stdout (sequentially to maintain order)
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+
+    let mut success_count = 0;
+    let mut error_count = 0;
+    let mut total_original_tokens = 0usize;
+    let mut total_transformed_tokens = 0usize;
+
+    for (idx, (path, result)) in results.iter().enumerate() {
+        match result {
+            Ok(process_result) => {
+                // Add file separator header (unless disabled)
+                if !options.no_header && paths.len() > 1 {
+                    if idx > 0 {
+                        writeln!(writer)?; // Blank line between files
+                    }
+                    writeln!(writer, "// === {} ===", path.display())?;
+                }
+
+                write!(writer, "{}", process_result.output)?;
+                success_count += 1;
+
+                // Accumulate token counts if show_stats is enabled (use cached counts)
+                if options.show_stats {
+                    if let (Some(orig), Some(trans)) = (process_result.original_tokens, process_result.transformed_tokens) {
+                        total_original_tokens += orig;
+                        total_transformed_tokens += trans;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error processing {}: {}", path.display(), e);
+                error_count += 1;
+            }
+        }
+    }
+
+    writer.flush()?;
+
+    if success_count == 0 {
+        anyhow::bail!(
+            "All {} file(s) failed to process",
+            error_count
+        );
+    }
+
+    if error_count > 0 {
+        eprintln!(
+            "\nProcessed {} file(s) successfully, {} failed",
+            success_count,
+            error_count
+        );
+    }
+
+    // Output token statistics if requested
+    if options.show_stats && total_original_tokens > 0 {
+        let suffix = format!(" across {} file(s)", success_count);
+        report_token_stats(Some(total_original_tokens), Some(total_transformed_tokens), &suffix);
+    }
+
+    Ok(())
 }
 
 /// Process multiple files matched by glob pattern (with parallel processing)
@@ -322,94 +445,95 @@ fn process_glob(
         })
         .collect();
 
-    if paths.is_empty() {
-        anyhow::bail!("No files matched pattern: {}", pattern);
-    }
-
-    // Create process options
-    let options = ProcessOptions::new(mode, explicit_lang, use_cache, show_stats);
-
-    // Configure rayon thread pool if jobs specified
-    let results: Vec<_> = if let Some(num_jobs) = jobs {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_jobs)
-            .build()?
-            .install(|| {
-                paths
-                    .par_iter()
-                    .map(|path| (path, process_file(path, options)))
-                    .collect()
-            })
-    } else {
-        // Use default rayon thread pool (number of CPUs)
-        paths
-            .par_iter()
-            .map(|path| (path, process_file(path, options)))
-            .collect()
+    let options = MultiFileOptions {
+        mode,
+        explicit_lang,
+        no_header,
+        jobs,
+        use_cache,
+        show_stats,
     };
 
-    // Write results to stdout (sequentially to maintain order)
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
+    process_files(
+        paths,
+        &format!("pattern '{}'", pattern),
+        options,
+    )
+}
 
-    let mut success_count = 0;
-    let mut error_count = 0;
-    let mut total_original_tokens = 0usize;
-    let mut total_transformed_tokens = 0usize;
+/// Collect all supported files from a directory recursively
+///
+/// ARCHITECTURE: Walks directory tree, filters for supported extensions.
+/// Uses Language::from_path() for extension validation.
+fn collect_files_from_directory(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    use std::fs;
 
-    for (idx, (path, result)) in results.iter().enumerate() {
-        match result {
-            Ok(process_result) => {
-                // Add file separator header (unless disabled)
-                if !no_header && paths.len() > 1 {
-                    if idx > 0 {
-                        writeln!(writer)?; // Blank line between files
-                    }
-                    writeln!(writer, "// === {} ===", path.display())?;
-                }
+    let mut files = Vec::new();
 
-                write!(writer, "{}", process_result.output)?;
-                success_count += 1;
+    fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
 
-                // Accumulate token counts if show_stats is enabled (use cached counts)
-                if show_stats {
-                    if let (Some(orig), Some(trans)) = (process_result.original_tokens, process_result.transformed_tokens) {
-                        total_original_tokens += orig;
-                        total_transformed_tokens += trans;
-                    }
-                }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Security: Reject symlinks to prevent access to sensitive files
+            let metadata = entry.metadata()?;
+            if metadata.file_type().is_symlink() {
+                eprintln!("Warning: Skipping symlink: {}", path.display());
+                continue;
             }
-            Err(e) => {
-                eprintln!("Error processing {}: {}", path.display(), e);
-                error_count += 1;
+
+            if metadata.is_dir() {
+                // Recurse into subdirectories
+                visit_dir(&path, files)?;
+            } else if metadata.is_file() {
+                // Check if file has supported extension
+                if Language::from_path(&path).is_some() {
+                    files.push(path);
+                }
             }
         }
+
+        Ok(())
     }
 
-    writer.flush()?;
+    visit_dir(dir, &mut files)?;
 
-    if success_count == 0 {
-        anyhow::bail!(
-            "All {} file(s) failed to process",
-            error_count
-        );
-    }
+    // Sort for deterministic output
+    files.sort();
 
-    if error_count > 0 {
-        eprintln!(
-            "\nProcessed {} file(s) successfully, {} failed",
-            success_count,
-            error_count
-        );
-    }
+    Ok(files)
+}
 
-    // Output token statistics if requested
-    if show_stats && total_original_tokens > 0 {
-        let suffix = format!(" across {} file(s)", success_count);
-        report_token_stats(Some(total_original_tokens), Some(total_transformed_tokens), &suffix);
-    }
+/// Process all supported files in a directory recursively
+fn process_directory(
+    dir: &Path,
+    mode: Mode,
+    explicit_lang: Option<Language>,
+    no_header: bool,
+    jobs: Option<usize>,
+    use_cache: bool,
+    show_stats: bool,
+) -> anyhow::Result<()> {
+    let paths = collect_files_from_directory(dir)?;
 
-    Ok(())
+    let options = MultiFileOptions {
+        mode,
+        explicit_lang,
+        no_header,
+        jobs,
+        use_cache,
+        show_stats,
+    };
+
+    process_files(
+        paths,
+        &format!("directory '{}'", dir.display()),
+        options,
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -490,13 +614,26 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Check if input is a directory
+    let path = PathBuf::from(&file);
+    if path.is_dir() {
+        return process_directory(
+            &path,
+            mode,
+            explicit_lang,
+            args.no_header,
+            args.jobs,
+            use_cache,
+            args.show_stats,
+        );
+    }
+
     // Handle glob patterns
     if has_glob_pattern(&file) {
         return process_glob(&file, mode, explicit_lang, args.no_header, args.jobs, use_cache, args.show_stats);
     }
 
     // Handle single file
-    let path = PathBuf::from(&file);
     let options = ProcessOptions::new(mode, explicit_lang, use_cache, args.show_stats);
     let process_result = process_file(&path, options)?;
 

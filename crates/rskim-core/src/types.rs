@@ -440,8 +440,8 @@ mod tests {
             .with_cache(true);
 
         assert_eq!(config.mode, Mode::Signatures);
-        assert_eq!(config.preserve_comments, false);
-        assert_eq!(config.cache_enabled, true);
+        assert!(!config.preserve_comments);
+        assert!(config.cache_enabled);
     }
 
     #[test]

@@ -94,7 +94,7 @@ fn test_glob_no_matches() {
         .current_dir(temp_dir.path())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("No files matched pattern"));
+        .stderr(predicate::str::contains("No files found"));
 }
 
 #[test]

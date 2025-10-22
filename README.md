@@ -34,8 +34,9 @@ export function processUser(user: User): Result { /* ... */ }
 - ⚡ **Cached** - 40-50x faster on repeated processing (enabled by default)
 - 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java, Markdown
 - 🎯 **Multiple modes** - Structure, signatures, types, or full code
+- 📁 **Directory support** - Process entire directories recursively (`skim src/`)
 - 📂 **Multi-file** - Glob patterns (`src/**/*.ts`) with parallel processing
-- 📦 **Zero config** - Auto-detects language from file extension
+- 🤖 **Auto-detection** - Automatically detects language from file extension
 - 🔒 **DoS-resistant** - Built-in limits prevent stack overflow and memory exhaustion
 - 💧 **Streaming** - Outputs to stdout for pipe workflows
 
@@ -77,8 +78,14 @@ npx rskim src/app.ts
 # Or install globally for better performance
 npm install -g rskim
 
-# Extract structure from TypeScript
+# Extract structure from single file (auto-detects language)
 skim src/app.ts
+
+# Process entire directory recursively (auto-detects all languages)
+skim src/
+
+# Process current directory
+skim .
 
 # Process multiple files with glob patterns
 skim 'src/**/*.ts'
@@ -98,8 +105,11 @@ skim README.md --mode structure
 # Pipe to other tools
 skim src/app.ts | bat -l typescript
 
-# Read from stdin (requires --language)
+# Read from stdin (REQUIRES --language flag)
 cat app.ts | skim - --language=typescript
+
+# Override language detection for unusual file extensions
+skim weird.inc --language=typescript
 
 # Clear cache
 skim --clear-cache
@@ -114,17 +124,23 @@ skim file.ts --show-stats
 ## Usage
 
 ```bash
-skim [FILE] [OPTIONS]
+skim [FILE|DIRECTORY] [OPTIONS]
 ```
 
 **Arguments:**
-- `<FILE>` - File to read (use '-' for stdin, supports glob patterns like '*.ts' or 'src/**/*.js')
+- `<FILE>` - File, directory, or glob pattern to process (use '-' for stdin)
+  - Single file: `skim file.ts` (auto-detects language from extension)
+  - Directory: `skim src/` (recursively processes all supported files)
+  - Glob pattern: `skim 'src/**/*.ts'` (processes matching files)
+  - Stdin: `skim -` (requires `--language` flag)
 
 **Options:**
 - `-m, --mode <MODE>` - Transformation mode [default: structure]
   - Values: `structure`, `signatures`, `types`, `full`
-- `-l, --language <LANGUAGE>` - Explicit language (required for stdin)
+- `-l, --language <LANGUAGE>` - Override language detection (required for stdin, optional fallback otherwise)
   - Values: `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `markdown`
+  - **Auto-detection:** Language is automatically detected from file extensions by default
+  - **Use when:** Reading from stdin, or processing files with unusual extensions
 - `-j, --jobs <JOBS>` - Number of parallel jobs for multi-file processing [default: number of CPUs]
 - `--no-header` - Don't print file path headers for multi-file output
 - `--no-cache` - Disable caching (caching is enabled by default)
@@ -288,24 +304,33 @@ Run npm install.
 # Send only structure to AI for code review
 skim src/app.ts | llm "Review this architecture"
 
-# Process entire directory for LLM context
-skim 'src/**/*.ts' --no-header | llm "Analyze this codebase"
+# Process entire directory for LLM context (auto-detects all languages)
+skim src/ --no-header | llm "Analyze this codebase"
+
+# Process specific subdirectory
+skim src/components/ --mode signatures | llm "Review these components"
 ```
 
 ### 2. Codebase Documentation
 
 ```bash
-# Generate API surface documentation (new: glob support)
-skim 'src/**/*.ts' --mode signatures > api-docs.txt
+# Generate API surface documentation from directory
+skim src/ --mode signatures > api-docs.txt
 
-# Process with parallel jobs for faster documentation generation
+# Process specific file types with glob pattern
 skim 'lib/**/*.py' --mode signatures --jobs 8 > python-api.txt
+
+# Document mixed-language codebase (auto-detects each file)
+skim . --no-header --mode signatures > full-api.txt
 ```
 
 ### 3. Type System Analysis
 
 ```bash
-# Extract all type definitions for analysis
+# Extract all type definitions from directory
+skim src/ --mode types --no-header
+
+# Extract types from specific files
 skim 'src/**/*.ts' --mode types --no-header
 ```
 
@@ -315,7 +340,10 @@ skim 'src/**/*.ts' --mode types --no-header
 # Quick overview of file structure
 skim large-file.py | less
 
-# Overview of entire module
+# Overview of entire directory
+skim src/auth/ | less
+
+# Overview of specific module
 skim 'src/auth/*.ts' | less
 ```
 
@@ -450,6 +478,27 @@ See [SECURITY.md](SECURITY.md) for vulnerability disclosure process.
 - 500 functions (1500 lines): 6.4ms
 - **1000 functions (3000 lines): 14.6ms** ✅
 
+### Real-World Token Reduction
+
+**Production TypeScript Codebase (80 files):**
+
+| Mode | Original Tokens | Final Tokens | Reduction | Saved Tokens |
+|------|----------------|--------------|-----------|--------------|
+| Full (no transform) | 63,198 | 63,198 | 0% | 0 |
+| **Structure** | 63,198 | 25,119 | **60.3%** | 38,079 |
+| **Signatures** | 63,198 | 7,328 | **88.4%** | 55,870 |
+| **Types** | 63,198 | 5,181 | **91.8%** | 58,017 |
+
+**What this means:**
+- Structure mode: Fit **2.5x more code** in your LLM context window
+- Signatures mode: Fit **8.6x more code** for API documentation
+- Types mode: Fit **12.2x more code** for type system analysis
+
+**Use cases:**
+- LLM context optimization: "Explain this entire codebase" (60-90% smaller)
+- Documentation generation: Extract all public APIs in milliseconds
+- Type analysis: Focus only on type definitions and interfaces
+
 **Run benchmarks:**
 ```bash
 cargo bench
@@ -497,18 +546,20 @@ Should take ~30 minutes per language.
 
 ## Project Status
 
-**Current**: Production ready (v0.3.3)
+**Current**: Production ready (v0.5.0+)
 
 ✅ **Implemented:**
-- TypeScript/JavaScript/Python/Rust/Go/Java support
+- TypeScript/JavaScript/Python/Rust/Go/Java/Markdown support
 - Structure/signatures/types/full modes
 - CLI with stdin support
+- **Directory support (`skim src/` - recursively processes all files)**
 - Multi-file glob support (`skim 'src/**/*.ts'`)
+- **Automatic language detection from file extensions**
 - Parallel processing with rayon (`--jobs` flag)
 - **Caching layer with mtime-based invalidation (enabled by default)**
 - **Token counting with `--show-stats` (GPT-3.5/GPT-4 compatible)**
 - DoS protections
-- Comprehensive test suite (70 tests passing)
+- Comprehensive test suite (128 tests passing)
 - Performance benchmarks (verified: 14.6ms for 3000-line files, 5ms cached)
 - npm and cargo distribution
 
