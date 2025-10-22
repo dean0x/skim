@@ -486,12 +486,12 @@ See [SECURITY.md](SECURITY.md) for vulnerability disclosure process.
 
 **Production TypeScript Codebase (80 files):**
 
-| Mode | Original Tokens | Final Tokens | Reduction | Saved Tokens |
-|------|----------------|--------------|-----------|--------------|
-| Full (no transform) | 63,198 | 63,198 | 0% | 0 |
-| **Structure** | 63,198 | 25,119 | **60.3%** | 38,079 |
-| **Signatures** | 63,198 | 7,328 | **88.4%** | 55,870 |
-| **Types** | 63,198 | 5,181 | **91.8%** | 58,017 |
+| Mode       | Tokens | Reduction | Use Case                   |
+|------------|--------|-----------|----------------------------|
+| Full       | 63,198 | 0%        | Original source code       |
+| **Structure**  | **25,119** | **60.3%**     | **Understanding architecture** |
+| **Signatures** | **7,328**  | **88.4%**     | **API documentation**          |
+| **Types**      | **5,181**  | **91.8%**     | **Type system analysis**       |
 
 **What this means:**
 - Structure mode: Fit **2.5x more code** in your LLM context window
