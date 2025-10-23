@@ -51,6 +51,7 @@ impl TokenStats {
     }
 
     /// Get tokens saved
+    #[allow(dead_code)]
     pub fn tokens_saved(&self) -> usize {
         self.original.saturating_sub(self.transformed)
     }
@@ -70,14 +71,12 @@ impl TokenStats {
 fn format_number(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::new();
-    let mut count = 0;
 
-    for ch in s.chars().rev() {
+    for (count, ch) in s.chars().rev().enumerate() {
         if count > 0 && count % 3 == 0 {
             result.push(',');
         }
         result.push(ch);
-        count += 1;
     }
 
     result.chars().rev().collect()
