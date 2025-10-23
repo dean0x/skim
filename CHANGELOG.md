@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2025-10-23
+
+### Added
+- **Directory Support** - Process entire directories recursively
+  - Process directories: `skim src/`, `skim .`
+  - Recursive traversal of all subdirectories
+  - Mixed-language support (process `.ts`, `.py`, `.rs` files in same directory)
+  - Works with all existing flags (`--mode`, `--jobs`, `--show-stats`, etc.)
+  - Compatible with caching and parallel processing
+
+### Security & Hardening
+- **Critical security fix** - Symlink detection bug in directory traversal
+  - Changed from `entry.metadata()` to `path.symlink_metadata()`
+  - Previous bug: `metadata()` follows symlinks, so `is_symlink()` check never triggered
+  - Impact: Directory processing could follow symlinks to sensitive files
+  - Now correctly detects and rejects symlinks for security
+
+### Improvements
+- **Language Detection** - Auto-detection is now primary, `--language` is fallback
+  - Language detection always tries auto-detect from file extension first
+  - `--language` flag now acts as fallback/override when auto-detection fails
+  - Better experience: Most files "just work" without manual flag
+  - Breaking change: None (backward compatible behavior)
+
+### Code Quality
+- Added `MAX_JOBS` constant (was magic number 128)
+- Extracted `MultiFileOptions` struct to reduce function parameters (8 → 3)
+- Added explanatory comments for symlink security checks
+- Refactored `process_files()` for reuse by glob and directory inputs
+
+### Documentation
+- Updated README with directory examples and real-world use cases
+- Added real-world benchmarks: 60-91% token reduction on 80-file codebase
+- Clarified auto-detection is default, `--language` is fallback
+- Updated CLI help text with directory processing examples
+- Refactored documentation structure: moved detailed content to `docs/` folder
+- Modernized README messaging and improved storytelling
+- Added professional badges (crates.io, npm, downloads, Rust version)
+
+### Testing
+- **128 total tests** - All passing (+13 tests from v0.5.0's 115)
+  - Added 13 new directory processing tests (`cli_directory.rs`)
+  - Tests cover single/mixed languages, recursive directories, edge cases
+  - Comprehensive testing of symlink rejection security fix
+
+### Performance
+- Maintains <50ms target for individual file processing
+- Caching works seamlessly with directory processing
+- Parallel processing with `--jobs` flag applies to directories
+- Real-world verified: 80-file Next.js codebase processed efficiently
+
+### Breaking Changes
+None. All changes are backward compatible.
+
 ## [0.5.0] - 2025-10-21
 
 ### Added
