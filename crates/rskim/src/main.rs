@@ -24,6 +24,9 @@ use rskim_core::{transform, transform_auto, Language, Mode};
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
 
+/// Maximum number of parallel jobs (threads) to prevent resource exhaustion
+const MAX_JOBS: usize = 128;
+
 /// skim - Smart code reader for AI agents
 ///
 /// Transform source code by stripping implementation details while
@@ -480,11 +483,15 @@ fn collect_files_from_directory(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
             let path = entry.path();
 
             // Security: Reject symlinks to prevent access to sensitive files
-            let metadata = entry.metadata()?;
-            if metadata.file_type().is_symlink() {
+            // Use symlink_metadata() to check the link itself, not the target
+            let symlink_metadata = path.symlink_metadata()?;
+            if symlink_metadata.file_type().is_symlink() {
                 eprintln!("Warning: Skipping symlink: {}", path.display());
                 continue;
             }
+
+            // Get regular metadata for is_dir/is_file checks
+            let metadata = entry.metadata()?;
 
             if metadata.is_dir() {
                 // Recurse into subdirectories
@@ -539,17 +546,18 @@ fn process_directory(
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Validate --jobs parameter (max 128 to prevent resource exhaustion)
+    // Validate --jobs parameter to prevent resource exhaustion
     if let Some(jobs) = args.jobs {
         if jobs == 0 {
             anyhow::bail!("--jobs must be at least 1");
         }
-        if jobs > 128 {
+        if jobs > MAX_JOBS {
             anyhow::bail!(
-                "--jobs value too high: {} (maximum: 128)\n\
+                "--jobs value too high: {} (maximum: {})\n\
                  Using too many threads can exhaust system resources.\n\
                  Recommended: Use default (number of CPUs) or specify a moderate value.",
-                jobs
+                jobs,
+                MAX_JOBS
             );
         }
     }
