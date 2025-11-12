@@ -22,7 +22,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: skim
             asset_name: skim-x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact_name: skim
             asset_name: skim-aarch64-unknown-linux-gnu
@@ -48,6 +48,18 @@ jobs:
           # Extract version from git tag
           TAG_VERSION="${GITHUB_REF#refs/tags/v}"
           echo "Git tag version: $TAG_VERSION"
+
+          # Validate tag format (semantic versioning only)
+          if ! [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "❌ ERROR: Invalid tag format: $TAG_VERSION"
+            echo ""
+            echo "Tags must follow semantic versioning:"
+            echo "  Valid: 1.0.0, 1.2.3, 1.0.0-beta.1, 1.0.0-rc.2"
+            echo "  Invalid: v1.0.0, 1.0, latest"
+            echo ""
+            echo "This validation prevents command injection attacks."
+            exit 1
+          fi
 
           # Extract version from Cargo.toml
           CARGO_VERSION=$(grep '^version = ' crates/rskim/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -80,7 +92,7 @@ jobs:
 
       - name: Install cross (for ARM64 Linux)
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross@0.2.5
 
       - name: Build (native)
         if: matrix.use_cross != true
@@ -208,11 +220,17 @@ jobs:
           # Extract version from tag
           VERSION="${GITHUB_REF#refs/tags/v}"
 
-          # Create package.json
-          cat > npm-package/package.json <<EOF
+          # Validate version format (reuse validation from earlier step)
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "ERROR: Invalid version format: $VERSION"
+            exit 1
+          fi
+
+          # Create package.json with quoted HERE-doc (prevents variable injection)
+          cat > npm-package/package.json <<'EOF'
           {
             "name": "rskim",
-            "version": "$VERSION",
+            "version": "VERSION_PLACEHOLDER",
             "description": "Smart code reader - streaming code transformation for AI agents",
             "bin": {
               "skim": "./bin/skim.js"
@@ -245,6 +263,9 @@ jobs:
             ]
           }
           EOF
+
+          # Replace version placeholder with actual version
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" npm-package/package.json
 
           # Create wrapper script
           cat > npm-package/bin/skim.js <<'EOF'
@@ -352,11 +373,17 @@ jobs:
           cd artifacts
           for dir in */; do
             cd "$dir"
-            if [ -f *.tar.gz ]; then
-              tar xzf *.tar.gz
-            elif [ -f *.zip ]; then
-              unzip -q *.zip
-            fi
+            # Use explicit loops to avoid glob injection
+            for tarfile in *.tar.gz; do
+              if [ -f "$tarfile" ]; then
+                tar xzf "$tarfile"
+              fi
+            done
+            for zipfile in *.zip; do
+              if [ -f "$zipfile" ]; then
+                unzip -q "$zipfile"
+              fi
+            done
             cd ..
           done
 
