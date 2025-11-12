@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **ARM64 Linux Support** - Added `aarch64-unknown-linux-gnu` target for Linux ARM64 systems
+  - Fixes npm installation on ARM64 Linux (Raspberry Pi, AWS Graviton, etc.)
+  - Uses cross-compilation via `cross-rs` for reliable builds
+  - npm package now includes `bin/linux/arm64/skim` binary
+  - Updated platform support documentation
+
+### Security & Quality
+- **Smoke Tests in CI** - All release binaries now verified before publishing
+  - Native platform tests execute `--version` and basic transformation
+  - ARM64 Linux tested via QEMU emulation
+  - Prevents shipping broken cross-compiled binaries
+- **Version Consistency Check** - CI enforces Cargo.toml and git tag versions match
+  - Prevents split-brain releases (different versions on cargo vs npm)
+  - Fails build with clear instructions if versions diverge
+  - Protected against command injection via semantic version validation
+- **Comprehensive Test Suites** - 38 new security regression tests
+  - npm wrapper test suite (21 tests) validates platform detection and error handling
+  - Version check validation tests (17 tests) ensure regex extraction correctness
+  - Tests run automatically in CI before builds
+  - Prevents security regressions (command injection, shell injection, JSON injection)
+- **Improved npm Error Messages** - Better diagnostics for installation failures
+  - Lists all supported platforms explicitly
+  - Distinguishes "unsupported platform" from "packaging bug" from "libc mismatch"
+  - Suggests `cargo install rskim` workaround when appropriate
+  - Detects Alpine Linux (musl) incompatibility and provides guidance
+- **Dependency Pinning** - All CI dependencies use fixed versions
+  - cross-rs pinned to v0.2.5 from crates.io (prevents supply chain attacks)
+  - Ubuntu runner pinned to 22.04 (deterministic QEMU version)
+  - Shell scripts use quoted glob patterns (prevents shell injection)
+
+### Changed
+- CI/CD now builds 5 platform targets (was 4)
+- Release workflow uses `cross` for ARM64 Linux cross-compilation
+
 ## [0.6.0] - 2025-10-23
 
 ### Added

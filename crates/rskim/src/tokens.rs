@@ -15,9 +15,7 @@ static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
 
 /// Get or initialize the global tokenizer instance
 fn get_tokenizer() -> &'static CoreBPE {
-    TOKENIZER.get_or_init(|| {
-        cl100k_base().expect("Failed to initialize cl100k_base tokenizer")
-    })
+    TOKENIZER.get_or_init(|| cl100k_base().expect("Failed to initialize cl100k_base tokenizer"))
 }
 
 /// Count tokens in text using cl100k_base encoding (GPT-3.5-turbo, GPT-4)
@@ -39,7 +37,10 @@ pub struct TokenStats {
 impl TokenStats {
     /// Create new token stats
     pub fn new(original: usize, transformed: usize) -> Self {
-        Self { original, transformed }
+        Self {
+            original,
+            transformed,
+        }
     }
 
     /// Calculate reduction percentage (negative if transformed is larger)

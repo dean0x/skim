@@ -12,9 +12,21 @@ fn test_directory_single_language() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create multiple TypeScript files
-    fs::write(temp_dir.path().join("file1.ts"), "function test1() { return 1; }").unwrap();
-    fs::write(temp_dir.path().join("file2.ts"), "function test2() { return 2; }").unwrap();
-    fs::write(temp_dir.path().join("file3.ts"), "function test3() { return 3; }").unwrap();
+    fs::write(
+        temp_dir.path().join("file1.ts"),
+        "function test1() { return 1; }",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join("file2.ts"),
+        "function test2() { return 2; }",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join("file3.ts"),
+        "function test3() { return 3; }",
+    )
+    .unwrap();
 
     Command::cargo_bin("skim")
         .unwrap()
@@ -60,7 +72,11 @@ fn test_directory_recursive() {
     fs::create_dir_all(temp_dir.path().join("src/utils")).unwrap();
     fs::write(temp_dir.path().join("root.ts"), "function root() {}").unwrap();
     fs::write(temp_dir.path().join("src/main.ts"), "function main() {}").unwrap();
-    fs::write(temp_dir.path().join("src/utils/helper.ts"), "function helper() {}").unwrap();
+    fs::write(
+        temp_dir.path().join("src/utils/helper.ts"),
+        "function helper() {}",
+    )
+    .unwrap();
 
     let output = Command::cargo_bin("skim")
         .unwrap()
@@ -147,8 +163,9 @@ fn test_directory_with_modes() {
 
     fs::write(
         temp_dir.path().join("test.ts"),
-        "function test() { console.log('impl'); }"
-    ).unwrap();
+        "function test() { console.log('impl'); }",
+    )
+    .unwrap();
 
     // Test structure mode (default)
     Command::cargo_bin("skim")
@@ -202,7 +219,7 @@ fn test_directory_skips_symlinks() {
         use std::os::unix::fs::symlink;
         let _ = symlink(
             temp_dir.path().join("real.ts"),
-            temp_dir.path().join("link.ts")
+            temp_dir.path().join("link.ts"),
         );
 
         Command::cargo_bin("skim")

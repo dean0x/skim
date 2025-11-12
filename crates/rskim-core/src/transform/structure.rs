@@ -5,8 +5,8 @@
 //! Token reduction target: 70-80%
 
 use crate::{Language, Result, SkimError, TransformConfig};
-use tree_sitter::{Node, Tree};
 use std::collections::HashMap;
+use tree_sitter::{Node, Tree};
 
 /// Maximum AST recursion depth to prevent stack overflow attacks
 const MAX_AST_DEPTH: usize = 500;
@@ -222,7 +222,7 @@ fn get_node_types_for_language(language: Language) -> NodeTypes {
         },
         Language::Markdown => NodeTypes {
             function: "atx_heading", // Not used - markdown uses special extraction
-            method: "atx_heading",    // Not used - markdown uses special extraction
+            method: "atx_heading",   // Not used - markdown uses special extraction
         },
     }
 }
@@ -290,13 +290,13 @@ pub(crate) fn extract_markdown_headers(
                     .unwrap_or(1); // Default to H1 if parsing fails
 
                 if level >= min_level && level <= max_level {
-                    let header_text = node.utf8_text(source.as_bytes())
-                        .map_err(|e| SkimError::ParseError(format!("UTF-8 error in header: {}", e)))?;
+                    let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
+                        SkimError::ParseError(format!("UTF-8 error in header: {}", e))
+                    })?;
                     headers.push(header_text.to_string());
                 }
             }
         }
-
         // Setext headers: underlined with === or ---
         else if node_type == "setext_heading" {
             // Setext headers are H1 (===) or H2 (---)
@@ -309,15 +309,20 @@ pub(crate) fn extract_markdown_headers(
 
             let level = if let Some(underline_node) = underline {
                 // Extract level from underline node type
-                if underline_node.kind() == "setext_h1_underline" { 1 } else { 2 }
+                if underline_node.kind() == "setext_h1_underline" {
+                    1
+                } else {
+                    2
+                }
             } else {
                 // Fallback: if no underline child found, default to H1
                 1
             };
 
             if level >= min_level && level <= max_level {
-                let header_text = node.utf8_text(source.as_bytes())
-                    .map_err(|e| SkimError::ParseError(format!("UTF-8 error in setext header: {}", e)))?;
+                let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
+                    SkimError::ParseError(format!("UTF-8 error in setext header: {}", e))
+                })?;
                 headers.push(header_text.to_string());
             }
         }

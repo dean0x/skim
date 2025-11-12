@@ -12,9 +12,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    name: Run Test Suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run npm wrapper tests
+        run: node crates/rskim/tests/npm_wrapper_test.js
+
+      - name: Run version check validation tests
+        run: bash scripts/ci/test-version-check.sh
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: test
     strategy:
       matrix:
         include:
@@ -22,6 +40,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: skim
             asset_name: skim-x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            artifact_name: skim
+            asset_name: skim-aarch64-unknown-linux-gnu
+            use_cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: skim
@@ -38,13 +61,95 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify version consistency
+        run: |
+          # Extract version from git tag
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Git tag version: $TAG_VERSION"
+
+          # Validate tag format (semantic versioning only)
+          if ! [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "❌ ERROR: Invalid tag format: $TAG_VERSION"
+            echo ""
+            echo "Tags must follow semantic versioning:"
+            echo "  Valid: 1.0.0, 1.2.3, 1.0.0-beta.1, 1.0.0-rc.2"
+            echo "  Invalid: v1.0.0, 1.0, latest"
+            echo ""
+            echo "This validation prevents command injection attacks."
+            exit 1
+          fi
+
+          # Extract version from Cargo.toml
+          CARGO_VERSION=$(grep '^version = ' crates/rskim/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Cargo.toml version: $CARGO_VERSION"
+
+          # Compare versions
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "❌ ERROR: Version mismatch detected!"
+            echo ""
+            echo "Git tag version:     v$TAG_VERSION"
+            echo "Cargo.toml version:  $CARGO_VERSION"
+            echo ""
+            echo "Please update crates/rskim/Cargo.toml to match the git tag version."
+            echo "Then delete the tag, commit the fix, and re-create the tag:"
+            echo "  git tag -d v$TAG_VERSION"
+            echo "  git push origin :refs/tags/v$TAG_VERSION"
+            echo "  # Update Cargo.toml"
+            echo "  git commit -am 'Fix version to $TAG_VERSION'"
+            echo "  git tag v$TAG_VERSION"
+            echo "  git push origin main --tags"
+            exit 1
+          fi
+
+          echo "✅ Version consistency verified: $TAG_VERSION"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
+      - name: Install cross (for ARM64 Linux)
+        if: matrix.use_cross == true
+        run: cargo install cross@0.2.5
+
+      - name: Build (native)
+        if: matrix.use_cross != true
         run: cargo build --release --target ${{ matrix.target }} -p rskim
+
+      - name: Build (cross-compile)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }} -p rskim
+
+      - name: Smoke test (native)
+        if: matrix.use_cross != true
+        run: |
+          BINARY="./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          echo "Testing binary: $BINARY"
+          $BINARY --version
+          echo "fn main() { println!(\"test\"); }" > test_smoke.rs
+          $BINARY test_smoke.rs > /dev/null
+          rm test_smoke.rs
+          echo "✅ Smoke test passed"
+
+      - name: Smoke test (ARM64 Linux via QEMU)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          # Install QEMU for ARM64 emulation
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+          BINARY="./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          echo "Testing ARM64 binary via QEMU: $BINARY"
+
+          # Test version output
+          qemu-aarch64-static $BINARY --version
+
+          # Test basic transformation
+          echo "fn main() { println!(\"test\"); }" > test_smoke.rs
+          qemu-aarch64-static $BINARY test_smoke.rs > /dev/null
+          rm test_smoke.rs
+
+          echo "✅ ARM64 smoke test passed via QEMU"
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
@@ -133,11 +238,17 @@ jobs:
           # Extract version from tag
           VERSION="${GITHUB_REF#refs/tags/v}"
 
-          # Create package.json
-          cat > npm-package/package.json <<EOF
+          # Validate version format (reuse validation from earlier step)
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "ERROR: Invalid version format: $VERSION"
+            exit 1
+          fi
+
+          # Create package.json with quoted HERE-doc (prevents variable injection)
+          cat > npm-package/package.json <<'EOF'
           {
             "name": "rskim",
-            "version": "$VERSION",
+            "version": "VERSION_PLACEHOLDER",
             "description": "Smart code reader - streaming code transformation for AI agents",
             "bin": {
               "skim": "./bin/skim.js"
@@ -171,6 +282,9 @@ jobs:
           }
           EOF
 
+          # Replace version placeholder with actual version
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" npm-package/package.json
+
           # Create wrapper script
           cat > npm-package/bin/skim.js <<'EOF'
           #!/usr/bin/env node
@@ -182,27 +296,82 @@ jobs:
             const platform = process.platform;
             const arch = process.arch;
 
-            let binaryName = 'skim';
-            if (platform === 'win32') {
-              binaryName = 'skim.exe';
+            // Define supported platforms and their binary paths
+            const supportedPlatforms = {
+              'linux-x64': 'bin/linux/x64/skim',
+              'linux-arm64': 'bin/linux/arm64/skim',
+              'darwin-x64': 'bin/darwin/x64/skim',
+              'darwin-arm64': 'bin/darwin/arm64/skim',
+              'win32-x64': 'bin/win32/x64/skim.exe',
+            };
+
+            const platformKey = `${platform}-${arch}`;
+            const binaryRelativePath = supportedPlatforms[platformKey];
+
+            // Check if platform is supported
+            if (!binaryRelativePath) {
+              console.error(`ERROR: Platform ${platform}-${arch} is not supported by the npm package.`);
+              console.error('');
+              console.error('Supported platforms:');
+              Object.keys(supportedPlatforms).forEach(p => {
+                console.error(`  - ${p}`);
+              });
+              console.error('');
+              console.error('Workaround: Install via Cargo instead:');
+              console.error('  cargo install rskim');
+              console.error('');
+              console.error('If you believe this platform should be supported, please report:');
+              console.error('  https://github.com/dean0x/skim/issues');
+              process.exit(1);
             }
 
-            // Try to find the binary in the package
-            const possiblePaths = [
-              path.join(__dirname, '..', 'bin', platform, arch, binaryName),
-              path.join(__dirname, '..', 'bin', binaryName),
-            ];
+            // Check if binary exists in package
+            const binaryPath = path.join(__dirname, '..', binaryRelativePath);
+            if (!fs.existsSync(binaryPath)) {
+              console.error('ERROR: Binary missing from npm package');
+              console.error(`Expected location: ${binaryPath}`);
+              console.error(`Platform: ${platformKey}`);
+              console.error('');
+              console.error('This is a packaging bug. Please report:');
+              console.error('  https://github.com/dean0x/skim/issues');
+              console.error('');
+              console.error('Workaround: Install via Cargo instead:');
+              console.error('  cargo install rskim');
+              process.exit(1);
+            }
 
-            for (const p of possiblePaths) {
-              if (fs.existsSync(p)) {
-                return p;
+            // Quick check if binary is executable (catches glibc/musl issues)
+            try {
+              const testResult = spawnSync(binaryPath, ['--version'], {
+                timeout: 5000,
+                stdio: 'pipe'
+              });
+
+              if (testResult.error) {
+                console.error('ERROR: Binary exists but cannot be executed');
+                console.error(`Reason: ${testResult.error.message}`);
+                console.error('');
+
+                if (testResult.error.code === 'ENOENT' || testResult.error.message.includes('libc')) {
+                  console.error('This may be a C library incompatibility issue.');
+                  console.error('Common cause: Alpine Linux (musl) vs glibc binary mismatch');
+                  console.error('');
+                  console.error('If you are using Alpine Linux, install via Cargo instead:');
+                  console.error('  apk add cargo');
+                  console.error('  cargo install rskim');
+                } else {
+                  console.error('Workaround: Install via Cargo instead:');
+                  console.error('  cargo install rskim');
+                }
+                console.error('');
+                console.error('For more help, see: https://github.com/dean0x/skim/issues');
+                process.exit(1);
               }
+            } catch (e) {
+              // Non-fatal, just proceed
             }
 
-            console.error('ERROR: skim binary not found for your platform');
-            console.error(`Platform: ${platform}, Architecture: ${arch}`);
-            console.error('Please report this issue at: https://github.com/dean0x/skim/issues');
-            process.exit(1);
+            return binaryPath;
           }
 
           const binary = getBinaryPath();
@@ -222,21 +391,29 @@ jobs:
           cd artifacts
           for dir in */; do
             cd "$dir"
-            if [ -f *.tar.gz ]; then
-              tar xzf *.tar.gz
-            elif [ -f *.zip ]; then
-              unzip -q *.zip
-            fi
+            # Use explicit loops to avoid glob injection
+            for tarfile in *.tar.gz; do
+              if [ -f "$tarfile" ]; then
+                tar xzf "$tarfile"
+              fi
+            done
+            for zipfile in *.zip; do
+              if [ -f "$zipfile" ]; then
+                unzip -q "$zipfile"
+              fi
+            done
             cd ..
           done
 
           # Copy binaries to npm package structure
           mkdir -p ../npm-package/bin/linux/x64
+          mkdir -p ../npm-package/bin/linux/arm64
           mkdir -p ../npm-package/bin/darwin/x64
           mkdir -p ../npm-package/bin/darwin/arm64
           mkdir -p ../npm-package/bin/win32/x64
 
           cp skim-x86_64-unknown-linux-gnu/skim ../npm-package/bin/linux/x64/ || true
+          cp skim-aarch64-unknown-linux-gnu/skim ../npm-package/bin/linux/arm64/ || true
           cp skim-x86_64-apple-darwin/skim ../npm-package/bin/darwin/x64/ || true
           cp skim-aarch64-apple-darwin/skim ../npm-package/bin/darwin/arm64/ || true
           cp skim-x86_64-pc-windows-msvc/skim.exe ../npm-package/bin/win32/x64/ || true

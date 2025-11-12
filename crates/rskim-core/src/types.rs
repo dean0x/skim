@@ -384,11 +384,9 @@ impl Parser {
     /// # Errors
     /// Returns `SkimError::ParseError` if parsing fails.
     pub fn parse(&mut self, source: &str) -> Result<tree_sitter::Tree> {
-        self.tree_sitter_parser
-            .parse(source, None)
-            .ok_or_else(|| SkimError::ParseError(
-                format!("Failed to parse {} source", self.language.name())
-            ))
+        self.tree_sitter_parser.parse(source, None).ok_or_else(|| {
+            SkimError::ParseError(format!("Failed to parse {} source", self.language.name()))
+        })
     }
 
     /// Get language for this parser
