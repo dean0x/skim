@@ -12,9 +12,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    name: Run Test Suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run npm wrapper tests
+        run: node crates/rskim/tests/npm_wrapper_test.js
+
+      - name: Run version check validation tests
+        run: bash scripts/ci/test-version-check.sh
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: test
     strategy:
       matrix:
         include:

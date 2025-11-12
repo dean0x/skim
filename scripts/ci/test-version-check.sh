@@ -1,7 +1,19 @@
 #!/bin/bash
 
 # Test suite for version consistency check script
-# This validates the regex extraction and comparison logic used in the release workflow
+#
+# Usage:
+#   ./scripts/ci/test-version-check.sh
+#
+# This validates the regex extraction and comparison logic used in the release
+# workflow's version consistency check. The tests ensure that:
+#
+# 1. Version strings are correctly extracted from Cargo.toml
+# 2. Semantic version validation rejects malicious input (command injection prevention)
+# 3. Git tag parsing works correctly for standard and prerelease versions
+# 4. Version comparison logic detects mismatches accurately
+#
+# Run this locally before committing changes to version validation logic.
 
 # Don't exit on error - we want to run all tests
 set +e
