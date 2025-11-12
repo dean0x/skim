@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **ARM64 Linux Support** - Added `aarch64-unknown-linux-gnu` target for Linux ARM64 systems
+  - Fixes npm installation on ARM64 Linux (Raspberry Pi, AWS Graviton, etc.)
+  - Uses cross-compilation via `cross-rs` for reliable builds
+  - npm package now includes `bin/linux/arm64/skim` binary
+  - Updated platform support documentation
+
+### Security & Quality
+- **Smoke Tests in CI** - All release binaries now verified before publishing
+  - Native platform tests execute `--version` and basic transformation
+  - ARM64 Linux tested via QEMU emulation
+  - Prevents shipping broken cross-compiled binaries
+- **Version Consistency Check** - CI enforces Cargo.toml and git tag versions match
+  - Prevents split-brain releases (different versions on cargo vs npm)
+  - Fails build with clear instructions if versions diverge
+- **Improved npm Error Messages** - Better diagnostics for installation failures
+  - Lists all supported platforms explicitly
+  - Distinguishes "unsupported platform" from "packaging bug" from "libc mismatch"
+  - Suggests `cargo install rskim` workaround when appropriate
+  - Detects Alpine Linux (musl) incompatibility and provides guidance
+
+### Changed
+- CI/CD now builds 5 platform targets (was 4)
+- Release workflow uses `cross` for ARM64 Linux cross-compilation
+
 ## [0.6.0] - 2025-10-23
 
 ### Added
