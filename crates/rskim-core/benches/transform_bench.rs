@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in benchmarks
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use rskim_core::{transform, Language, Mode};
 
 // ============================================================================
@@ -41,43 +41,31 @@ fn bench_structure_mode(c: &mut Criterion) {
 
     // TypeScript
     group.bench_function("typescript_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_TS), Language::TypeScript, Mode::Structure).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_TS), Language::TypeScript, Mode::Structure).unwrap())
     });
 
     group.bench_function("typescript_medium", |b| {
-        b.iter(|| {
-            transform(black_box(MEDIUM_TS), Language::TypeScript, Mode::Structure).unwrap()
-        })
+        b.iter(|| transform(black_box(MEDIUM_TS), Language::TypeScript, Mode::Structure).unwrap())
     });
 
     // Python
     group.bench_function("python_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_PY), Language::Python, Mode::Structure).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_PY), Language::Python, Mode::Structure).unwrap())
     });
 
     // Rust
     group.bench_function("rust_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_RS), Language::Rust, Mode::Structure).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_RS), Language::Rust, Mode::Structure).unwrap())
     });
 
     // Go
     group.bench_function("go_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_GO), Language::Go, Mode::Structure).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_GO), Language::Go, Mode::Structure).unwrap())
     });
 
     // Java
     group.bench_function("java_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_JAVA), Language::Java, Mode::Structure).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_JAVA), Language::Java, Mode::Structure).unwrap())
     });
 
     group.finish();
@@ -91,21 +79,15 @@ fn bench_signatures_mode(c: &mut Criterion) {
     let mut group = c.benchmark_group("signatures_mode");
 
     group.bench_function("typescript_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_TS), Language::TypeScript, Mode::Signatures).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_TS), Language::TypeScript, Mode::Signatures).unwrap())
     });
 
     group.bench_function("python_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_PY), Language::Python, Mode::Signatures).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_PY), Language::Python, Mode::Signatures).unwrap())
     });
 
     group.bench_function("rust_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_RS), Language::Rust, Mode::Signatures).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_RS), Language::Rust, Mode::Signatures).unwrap())
     });
 
     group.finish();
@@ -119,15 +101,11 @@ fn bench_types_mode(c: &mut Criterion) {
     let mut group = c.benchmark_group("types_mode");
 
     group.bench_function("typescript_medium", |b| {
-        b.iter(|| {
-            transform(black_box(MEDIUM_TS), Language::TypeScript, Mode::Types).unwrap()
-        })
+        b.iter(|| transform(black_box(MEDIUM_TS), Language::TypeScript, Mode::Types).unwrap())
     });
 
     group.bench_function("rust_small", |b| {
-        b.iter(|| {
-            transform(black_box(SMALL_RS), Language::Rust, Mode::Types).unwrap()
-        })
+        b.iter(|| transform(black_box(SMALL_RS), Language::Rust, Mode::Types).unwrap())
     });
 
     group.finish();
@@ -169,9 +147,7 @@ fn bench_mode_comparison(c: &mut Criterion) {
             BenchmarkId::new("typescript", format!("{:?}", mode)),
             &mode,
             |b, &mode| {
-                b.iter(|| {
-                    transform(black_box(SMALL_TS), Language::TypeScript, mode).unwrap()
-                })
+                b.iter(|| transform(black_box(SMALL_TS), Language::TypeScript, mode).unwrap())
             },
         );
     }
@@ -198,11 +174,7 @@ fn bench_language_comparison(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{:?}", lang)),
             &source,
-            |b, &input| {
-                b.iter(|| {
-                    transform(black_box(input), lang, Mode::Structure).unwrap()
-                })
-            },
+            |b, &input| b.iter(|| transform(black_box(input), lang, Mode::Structure).unwrap()),
         );
     }
 

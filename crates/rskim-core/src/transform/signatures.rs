@@ -189,7 +189,7 @@ fn get_signature_node_types(language: Language) -> SignatureNodeTypes {
         },
         Language::Markdown => SignatureNodeTypes {
             function: "atx_heading", // Not used - markdown uses special extraction
-            method: "atx_heading",    // Not used - markdown uses special extraction
+            method: "atx_heading",   // Not used - markdown uses special extraction
         },
     }
 }

@@ -71,7 +71,11 @@ struct Args {
     no_header: bool,
 
     /// Number of parallel jobs (default: number of CPUs)
-    #[arg(short, long, help = "Number of parallel jobs for multi-file processing")]
+    #[arg(
+        short,
+        long,
+        help = "Number of parallel jobs for multi-file processing"
+    )]
     jobs: Option<usize>,
 
     /// Disable caching (caching is enabled by default for performance)
@@ -153,7 +157,12 @@ struct ProcessOptions {
 
 impl ProcessOptions {
     /// Create new processing options
-    fn new(mode: Mode, explicit_lang: Option<Language>, use_cache: bool, include_original: bool) -> Self {
+    fn new(
+        mode: Mode,
+        explicit_lang: Option<Language>,
+        use_cache: bool,
+        include_original: bool,
+    ) -> Self {
         Self {
             mode,
             explicit_lang,
@@ -195,7 +204,11 @@ impl ProcessResult {
 }
 
 /// Report token statistics to stderr if token counts are available
-fn report_token_stats(original_tokens: Option<usize>, transformed_tokens: Option<usize>, suffix: &str) {
+fn report_token_stats(
+    original_tokens: Option<usize>,
+    transformed_tokens: Option<usize>,
+    suffix: &str,
+) {
     if let (Some(orig), Some(trans)) = (original_tokens, transformed_tokens) {
         let stats = tokens::TokenStats::new(orig, trans);
         eprintln!("\n[skim] {}{}", stats.format(), suffix);
@@ -233,10 +246,7 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
 }
 
 /// Process a single file and return transformed content and optionally original content
-fn process_file(
-    path: &Path,
-    options: ProcessOptions,
-) -> anyhow::Result<ProcessResult> {
+fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
     // Try to read from cache if enabled
     let cached_result = if options.use_cache {
         cache::read_cache(path, options.mode)
@@ -247,7 +257,12 @@ fn process_file(
     // If we have cached result with token counts, return without reading file
     if let Some((ref content, orig_tokens, trans_tokens)) = cached_result {
         if !options.include_original && orig_tokens.is_some() && trans_tokens.is_some() {
-            return Ok(ProcessResult::new(content.clone(), None, orig_tokens, trans_tokens));
+            return Ok(ProcessResult::new(
+                content.clone(),
+                None,
+                orig_tokens,
+                trans_tokens,
+            ));
         }
     }
 
@@ -265,7 +280,12 @@ fn process_file(
 
     // If we have cached result, return it with original content
     if let Some((content, orig_tokens, trans_tokens)) = cached_result {
-        return Ok(ProcessResult::new(content, Some(contents), orig_tokens, trans_tokens));
+        return Ok(ProcessResult::new(
+            content,
+            Some(contents),
+            orig_tokens,
+            trans_tokens,
+        ));
     }
 
     // Transform the file
@@ -286,7 +306,10 @@ fn process_file(
 
     // Count tokens if stats are needed
     let (orig_tokens, trans_tokens) = if options.include_original {
-        match (tokens::count_tokens(&contents), tokens::count_tokens(&result)) {
+        match (
+            tokens::count_tokens(&contents),
+            tokens::count_tokens(&result),
+        ) {
             (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
             _ => (None, None),
         }
@@ -300,8 +323,17 @@ fn process_file(
         let _ = cache::write_cache(path, options.mode, &result, orig_tokens, trans_tokens);
     }
 
-    let original = if options.include_original { Some(contents) } else { None };
-    Ok(ProcessResult::new(result, original, orig_tokens, trans_tokens))
+    let original = if options.include_original {
+        Some(contents)
+    } else {
+        None
+    };
+    Ok(ProcessResult::new(
+        result,
+        original,
+        orig_tokens,
+        trans_tokens,
+    ))
 }
 
 /// Options for multi-file processing
@@ -329,7 +361,12 @@ fn process_files(
     }
 
     // Create process options
-    let process_options = ProcessOptions::new(options.mode, options.explicit_lang, options.use_cache, options.show_stats);
+    let process_options = ProcessOptions::new(
+        options.mode,
+        options.explicit_lang,
+        options.use_cache,
+        options.show_stats,
+    );
 
     // Configure rayon thread pool if jobs specified
     let results: Vec<_> = if let Some(num_jobs) = options.jobs {
@@ -375,7 +412,10 @@ fn process_files(
 
                 // Accumulate token counts if show_stats is enabled (use cached counts)
                 if options.show_stats {
-                    if let (Some(orig), Some(trans)) = (process_result.original_tokens, process_result.transformed_tokens) {
+                    if let (Some(orig), Some(trans)) = (
+                        process_result.original_tokens,
+                        process_result.transformed_tokens,
+                    ) {
                         total_original_tokens += orig;
                         total_transformed_tokens += trans;
                     }
@@ -391,24 +431,24 @@ fn process_files(
     writer.flush()?;
 
     if success_count == 0 {
-        anyhow::bail!(
-            "All {} file(s) failed to process",
-            error_count
-        );
+        anyhow::bail!("All {} file(s) failed to process", error_count);
     }
 
     if error_count > 0 {
         eprintln!(
             "\nProcessed {} file(s) successfully, {} failed",
-            success_count,
-            error_count
+            success_count, error_count
         );
     }
 
     // Output token statistics if requested
     if options.show_stats && total_original_tokens > 0 {
         let suffix = format!(" across {} file(s)", success_count);
-        report_token_stats(Some(total_original_tokens), Some(total_transformed_tokens), &suffix);
+        report_token_stats(
+            Some(total_original_tokens),
+            Some(total_transformed_tokens),
+            &suffix,
+        );
     }
 
     Ok(())
@@ -457,11 +497,7 @@ fn process_glob(
         show_stats,
     };
 
-    process_files(
-        paths,
-        &format!("pattern '{}'", pattern),
-        options,
-    )
+    process_files(paths, &format!("pattern '{}'", pattern), options)
 }
 
 /// Collect all supported files from a directory recursively
@@ -536,11 +572,7 @@ fn process_directory(
         show_stats,
     };
 
-    process_files(
-        paths,
-        &format!("directory '{}'", dir.display()),
-        options,
-    )
+    process_files(paths, &format!("directory '{}'", dir.display()), options)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -610,10 +642,9 @@ fn main() -> anyhow::Result<()> {
 
         // Output token statistics if requested
         if args.show_stats {
-            if let (Ok(orig_tokens), Ok(trans_tokens)) = (
-                tokens::count_tokens(&buffer),
-                tokens::count_tokens(&result),
-            ) {
+            if let (Ok(orig_tokens), Ok(trans_tokens)) =
+                (tokens::count_tokens(&buffer), tokens::count_tokens(&result))
+            {
                 let stats = tokens::TokenStats::new(orig_tokens, trans_tokens);
                 eprintln!("\n[skim] {}", stats.format());
             }
@@ -638,7 +669,15 @@ fn main() -> anyhow::Result<()> {
 
     // Handle glob patterns
     if has_glob_pattern(&file) {
-        return process_glob(&file, mode, explicit_lang, args.no_header, args.jobs, use_cache, args.show_stats);
+        return process_glob(
+            &file,
+            mode,
+            explicit_lang,
+            args.no_header,
+            args.jobs,
+            use_cache,
+            args.show_stats,
+        );
     }
 
     // Handle single file
@@ -653,7 +692,11 @@ fn main() -> anyhow::Result<()> {
 
     // Output token statistics if requested (use cached counts)
     if args.show_stats {
-        report_token_stats(process_result.original_tokens, process_result.transformed_tokens, "");
+        report_token_stats(
+            process_result.original_tokens,
+            process_result.transformed_tokens,
+            "",
+        );
     }
 
     Ok(())

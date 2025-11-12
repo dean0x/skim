@@ -3,8 +3,8 @@
 //! ARCHITECTURE: This module operates on tree-sitter Trees.
 //! Each mode has its own transformation strategy.
 
-pub mod structure;
 pub mod signatures;
+pub mod structure;
 pub mod types;
 
 use crate::{Language, Mode, Result, TransformConfig};

@@ -14,7 +14,7 @@ pub mod language;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
 mod tests {
-    use crate::{Parser, Language};
+    use crate::{Language, Parser};
 
     #[test]
     fn test_parser_typescript() {

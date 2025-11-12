@@ -49,8 +49,8 @@ pub(crate) fn get_node_types(language: Language) -> LanguageNodeTypes {
         Language::Markdown => LanguageNodeTypes {
             function: "atx_heading", // Headers are document structure (like functions in code)
             class: "setext_heading", // Alternative header syntax
-            interface: "", // N/A for markdown
-            type_alias: "", // N/A for markdown
+            interface: "",           // N/A for markdown
+            type_alias: "",          // N/A for markdown
         },
     }
 }

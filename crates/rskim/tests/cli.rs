@@ -76,7 +76,9 @@ fn test_cli_signatures_mode() {
         .arg("signatures")
         .assert()
         .success()
-        .stdout(predicate::str::contains("function add(a: number, b: number): number"))
+        .stdout(predicate::str::contains(
+            "function add(a: number, b: number): number",
+        ))
         .stdout(predicate::str::contains("return").not());
 }
 

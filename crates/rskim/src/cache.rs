@@ -67,18 +67,11 @@ fn cache_key(path: &Path, mtime: SystemTime, mode: Mode) -> Result<String> {
     let canonical_path = path.canonicalize()?;
 
     // Convert mtime to seconds since UNIX epoch
-    let mtime_secs = mtime
-        .duration_since(SystemTime::UNIX_EPOCH)?
-        .as_secs();
+    let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
     // Create hash input: "path|mtime|mode"
     let mode_str = format!("{:?}", mode);
-    let hash_input = format!(
-        "{}|{}|{}",
-        canonical_path.display(),
-        mtime_secs,
-        mode_str
-    );
+    let hash_input = format!("{}|{}|{}", canonical_path.display(), mtime_secs, mode_str);
 
     // Generate SHA256 hash
     let mut hasher = Sha256::new();
@@ -115,7 +108,11 @@ pub fn read_cache(path: &Path, mode: Mode) -> Option<(String, Option<usize>, Opt
     let mode_str = format!("{:?}", mode);
 
     if entry.mtime_secs == mtime_secs && entry.mode == mode_str {
-        Some((entry.content, entry.original_tokens, entry.transformed_tokens))
+        Some((
+            entry.content,
+            entry.original_tokens,
+            entry.transformed_tokens,
+        ))
     } else {
         // Cache is stale, delete it
         let _ = fs::remove_file(&cache_file);

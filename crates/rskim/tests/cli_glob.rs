@@ -12,9 +12,21 @@ fn test_glob_single_pattern() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create multiple TypeScript files
-    fs::write(temp_dir.path().join("file1.ts"), "function test1() { return 1; }").unwrap();
-    fs::write(temp_dir.path().join("file2.ts"), "function test2() { return 2; }").unwrap();
-    fs::write(temp_dir.path().join("file3.ts"), "function test3() { return 3; }").unwrap();
+    fs::write(
+        temp_dir.path().join("file1.ts"),
+        "function test1() { return 1; }",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join("file2.ts"),
+        "function test2() { return 2; }",
+    )
+    .unwrap();
+    fs::write(
+        temp_dir.path().join("file3.ts"),
+        "function test3() { return 3; }",
+    )
+    .unwrap();
 
     Command::cargo_bin("skim")
         .unwrap()
@@ -69,7 +81,11 @@ fn test_glob_recursive_pattern() {
     // Create nested directory structure
     fs::create_dir_all(temp_dir.path().join("src/utils")).unwrap();
     fs::write(temp_dir.path().join("src/main.ts"), "function main() {}").unwrap();
-    fs::write(temp_dir.path().join("src/utils/helper.ts"), "function helper() {}").unwrap();
+    fs::write(
+        temp_dir.path().join("src/utils/helper.ts"),
+        "function helper() {}",
+    )
+    .unwrap();
 
     // Note: On some systems, glob patterns might not work recursively without proper shell expansion
     // This test validates the basic glob functionality

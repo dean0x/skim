@@ -331,10 +331,7 @@ fn test_detect_language_from_path() {
 fn test_unsupported_language() {
     use rskim_core::detect_language_from_path;
 
-    assert_eq!(
-        detect_language_from_path(Path::new("unknown.xyz")),
-        None
-    );
+    assert_eq!(detect_language_from_path(Path::new("unknown.xyz")), None);
 }
 
 // ============================================================================

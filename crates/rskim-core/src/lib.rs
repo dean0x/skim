@@ -35,19 +35,11 @@
 //! 4. **Type-first** - Complete type schema before implementation
 
 // Re-export core types for public API
-pub use types::{
-    Language,
-    Mode,
-    TransformConfig,
-    TransformResult,
-    SkimError,
-    Result,
-    Parser,
-};
+pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
-mod types;
 mod parser;
 mod transform;
+mod types;
 
 // NOTE: Caching is implemented at the CLI layer (rskim binary), not in the core library.
 // The core library remains pure and I/O-free.
@@ -95,11 +87,7 @@ mod transform;
 /// assert!(!result.contains("console.log"));
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
-pub fn transform(
-    source: &str,
-    language: Language,
-    mode: Mode,
-) -> Result<String> {
+pub fn transform(source: &str, language: Language, mode: Mode) -> Result<String> {
     // ARCHITECTURE: Use default config for simple API
     transform_with_config(source, language, &TransformConfig::with_mode(mode))
 }
@@ -166,11 +154,7 @@ pub fn transform_with_config(
 /// let result = transform_auto(source, path, Mode::Structure)?;
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
-pub fn transform_auto(
-    source: &str,
-    path: &std::path::Path,
-    mode: Mode,
-) -> Result<String> {
+pub fn transform_auto(source: &str, path: &std::path::Path, mode: Mode) -> Result<String> {
     let language = Language::from_path(path)
         .ok_or_else(|| SkimError::UnsupportedLanguage(path.to_path_buf()))?;
 
@@ -199,11 +183,7 @@ pub fn transform_auto(
 /// }
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
-pub fn transform_detailed(
-    source: &str,
-    language: Language,
-    mode: Mode,
-) -> Result<TransformResult> {
+pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Result<TransformResult> {
     let start = std::time::Instant::now();
 
     let content = transform(source, language, mode)?;
@@ -212,8 +192,8 @@ pub fn transform_detailed(
 
     Ok(TransformResult {
         content,
-        original_tokens: None,      // TODO: Implement in Phase 3
-        transformed_tokens: None,   // TODO: Implement in Phase 3
+        original_tokens: None,    // TODO: Implement in Phase 3
+        transformed_tokens: None, // TODO: Implement in Phase 3
         duration_ms: Some(duration_ms),
     })
 }
