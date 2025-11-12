@@ -123,6 +123,7 @@ jobs:
 
       - name: Smoke test (native)
         if: matrix.use_cross != true
+        shell: bash
         run: |
           BINARY="./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
           echo "Testing binary: $BINARY"
@@ -134,6 +135,7 @@ jobs:
 
       - name: Smoke test (ARM64 Linux via QEMU)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
         run: |
           # Install QEMU for ARM64 emulation
           sudo apt-get update
@@ -154,6 +156,7 @@ jobs:
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
+        shell: bash
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
@@ -233,6 +236,7 @@ jobs:
           path: artifacts
 
       - name: Create npm package
+        shell: bash
         run: |
           mkdir -p npm-package/bin
 
