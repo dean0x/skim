@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2025-11-12
+
 ### Added
 - **ARM64 Linux Support** - Added `aarch64-unknown-linux-gnu` target for Linux ARM64 systems
   - Fixes npm installation on ARM64 Linux (Raspberry Pi, AWS Graviton, etc.)
@@ -14,15 +16,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - npm package now includes `bin/linux/arm64/skim` binary
   - Updated platform support documentation
 
-### Security & Quality
+### Security
+- **HIGH**: Semantic version validation to prevent command injection in release workflow
+- **CRITICAL**: Pin cross-rs to stable v0.2.5 from crates.io (supply chain hardening)
+- **HIGH**: Pin Ubuntu runner to 22.04 for deterministic QEMU version
+- **MEDIUM**: Quote glob patterns in artifact extraction (shell injection prevention)
+- **MEDIUM**: Use quoted HERE-doc for package.json generation (JSON injection prevention)
+
+### Fixed
+- npm installation failure on ARM64 Linux platforms
+- Version consistency checks now prevent Cargo.toml/tag mismatches
+- Code formatting (rustfmt) across all source files
+
+### Changed
 - **Smoke Tests in CI** - All release binaries now verified before publishing
   - Native platform tests execute `--version` and basic transformation
   - ARM64 Linux tested via QEMU emulation
   - Prevents shipping broken cross-compiled binaries
-- **Version Consistency Check** - CI enforces Cargo.toml and git tag versions match
-  - Prevents split-brain releases (different versions on cargo vs npm)
-  - Fails build with clear instructions if versions diverge
-  - Protected against command injection via semantic version validation
 - **Comprehensive Test Suites** - 38 new security regression tests
   - npm wrapper test suite (21 tests) validates platform detection and error handling
   - Version check validation tests (17 tests) ensure regex extraction correctness
@@ -33,12 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Distinguishes "unsupported platform" from "packaging bug" from "libc mismatch"
   - Suggests `cargo install rskim` workaround when appropriate
   - Detects Alpine Linux (musl) incompatibility and provides guidance
-- **Dependency Pinning** - All CI dependencies use fixed versions
-  - cross-rs pinned to v0.2.5 from crates.io (prevents supply chain attacks)
-  - Ubuntu runner pinned to 22.04 (deterministic QEMU version)
-  - Shell scripts use quoted glob patterns (prevents shell injection)
-
-### Changed
 - CI/CD now builds 5 platform targets (was 4)
 - Release workflow uses `cross` for ARM64 Linux cross-compilation
 
