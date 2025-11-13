@@ -137,12 +137,15 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
-          # Install QEMU for ARM64 emulation
+          # Install QEMU and ARM64 libraries for cross-arch emulation
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static
+          sudo apt-get install -y qemu-user-static libc6-arm64-cross
 
           BINARY="./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
           echo "Testing ARM64 binary via QEMU: $BINARY"
+
+          # Set library path for ARM64 dynamic linker
+          export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
 
           # Test version output
           qemu-aarch64-static $BINARY --version
