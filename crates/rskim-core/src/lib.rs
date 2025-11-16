@@ -118,14 +118,9 @@ pub fn transform_with_config(
     language: Language,
     config: &TransformConfig,
 ) -> Result<String> {
-    // 1. Create parser for language
-    let mut parser = Parser::new(language)?;
-
-    // 2. Parse source code
-    let tree = parser.parse(source)?;
-
-    // 3. Transform based on mode
-    transform::transform_tree(source, &tree, language, config)
+    // ARCHITECTURE: Language encapsulates parsing strategy (tree-sitter vs serde_json)
+    // This eliminates special-case conditionals - each language handles its own parsing
+    language.transform_source(source, config)
 }
 
 /// Transform source code with automatic language detection from file path
@@ -251,6 +246,7 @@ pub fn supported_languages() -> &'static [Language] {
         Language::Go,
         Language::Java,
         Language::Markdown,
+        Language::Json,
     ]
 }
 
@@ -269,8 +265,9 @@ mod tests {
 
     #[test]
     fn test_supported_languages() {
-        assert_eq!(supported_languages().len(), 7);
+        assert_eq!(supported_languages().len(), 8);
         assert!(supported_languages().contains(&Language::Markdown));
+        assert!(supported_languages().contains(&Language::Json));
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //!
 //! ARCHITECTURE: This module operates on tree-sitter Trees.
 //! Each mode has its own transformation strategy.
+//! JSON is handled separately without tree-sitter.
 
+pub mod json;
 pub mod signatures;
 pub mod structure;
 pub mod types;

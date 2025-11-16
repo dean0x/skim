@@ -820,6 +820,7 @@ version = "0.6.1"
 dependencies = [
  "criterion",
  "insta",
+ "serde_json",
  "thiserror 1.0.69",
  "tree-sitter",
  "tree-sitter-go",
