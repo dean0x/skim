@@ -189,16 +189,16 @@ skim file.ts --mode full        # No transformation
 
 ## Supported Languages
 
-| Language   | Status | Extensions         | Notes                    |
-|------------|--------|--------------------|--------------------------|
-| TypeScript | ✅     | `.ts`, `.tsx`      | Excellent grammar        |
-| JavaScript | ✅     | `.js`, `.jsx`      | Full ES2024 support      |
-| Python     | ✅     | `.py`, `.pyi`      | Complete coverage        |
-| Rust       | ✅     | `.rs`              | Up-to-date grammar       |
-| Go         | ✅     | `.go`              | Stable                   |
-| Java       | ✅     | `.java`            | Good coverage            |
-| Markdown   | ✅     | `.md`, `.markdown` | Header extraction        |
-| JSON       | ✅     | `.json`            | Structure extraction     |
+| Language   | Status | Extensions         | Notes                           |
+|------------|--------|--------------------|---------------------------------|
+| TypeScript | ✅     | `.ts`, `.tsx`      | Excellent grammar               |
+| JavaScript | ✅     | `.js`, `.jsx`      | Full ES2024 support             |
+| Python     | ✅     | `.py`, `.pyi`      | Complete coverage               |
+| Rust       | ✅     | `.rs`              | Up-to-date grammar              |
+| Go         | ✅     | `.go`              | Stable                          |
+| Java       | ✅     | `.java`            | Good coverage                   |
+| Markdown   | ✅     | `.md`, `.markdown` | Header extraction               |
+| JSON       | ✅     | `.json`            | Structure extraction (serde)    |
 
 ## Examples
 
@@ -462,7 +462,7 @@ cargo bench
 - **Caching layer with mtime-based invalidation (enabled by default)**
 - **Token counting with `--show-stats` (GPT-3.5/GPT-4 compatible)**
 - DoS protections
-- Comprehensive test suite (128 tests passing)
+- Comprehensive test suite (151 tests passing)
 - Performance benchmarks (verified: 14.6ms for 3000-line files, 5ms cached)
 - npm and cargo distribution
 
