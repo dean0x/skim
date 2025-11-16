@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **JSON Language Support** - Extract structure from JSON files for LLM context optimization
+  - Strips all values, keeps only keys and nesting structure
+  - Automatic language detection for `.json` files
+  - CLI support: `--language=json` for stdin processing
+  - 60-80% token reduction for typical JSON files
+  - Security limits: MAX_JSON_DEPTH=500, MAX_JSON_KEYS=10,000
+  - Uses serde_json (Strategy Pattern for non-tree-sitter languages)
+  - All modes (structure/signatures/types) produce identical output (JSON is data, not code)
+
+### Changed
+- **Architecture Improvement** - Strategy Pattern for language-specific parsing
+  - `Language::transform_source()` routes each language to appropriate parser
+  - Non-tree-sitter languages (JSON, future YAML/TOML) handled cleanly
+  - Type-safe Option returns instead of unreachable!() panics
+  - Eliminates special-case conditionals in transform function
+
+### Fixed
+- Type safety violations in transform modules (replaced unreachable!() with Option types)
+- Missing JSON in CLI language argument options
+
 ## [0.6.1] - 2025-11-12
 
 ### Added

@@ -306,6 +306,7 @@ Need structure + signatures? → Use Structure mode (default)
 | Go         | ✅     | `.go`              | Stable                   |
 | Java       | ✅     | `.java`            | Good coverage            |
 | Markdown   | ✅     | `.md`, `.markdown` | Header extraction        |
+| JSON       | ✅     | `.json`            | Structure extraction     |
 
 ### Language-Specific Notes
 
@@ -313,6 +314,13 @@ Need structure + signatures? → Use Structure mode (default)
 - Structure mode: Extracts H1-H3 headers
 - Signatures/Types mode: Extracts H1-H6 headers
 - Full mode: Original markdown content
+
+**JSON:**
+- All modes (structure/signatures/types/full) produce identical output
+- JSON is data, not code, so there are no "signatures" or "types" to extract
+- Extracts structure: keeps only keys and nesting, strips all values
+- Example: `{"name": "John", "age": 30}` → `{name, age}`
+- Security limits: MAX_JSON_DEPTH=500, MAX_JSON_KEYS=10,000
 
 ## Performance by Mode
 

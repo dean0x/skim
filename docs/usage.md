@@ -46,7 +46,7 @@ See [Transformation Modes](./modes.md) for detailed information.
 
 Override language detection (required for stdin, optional fallback otherwise)
 
-**Values:** `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `markdown`
+**Values:** `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `markdown`, `json`
 
 **Auto-detection:** Language is automatically detected from file extensions by default
 
@@ -58,6 +58,9 @@ Override language detection (required for stdin, optional fallback otherwise)
 ```bash
 # Required for stdin
 cat file.ts | skim - --language=typescript
+
+# JSON from stdin
+echo '{"api": {"key": "secret"}}' | skim - --language=json
 
 # Fallback for unusual extension
 skim weird.inc --language=typescript
