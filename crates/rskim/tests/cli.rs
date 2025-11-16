@@ -18,7 +18,8 @@ fn test_cli_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.6.1"));
+        .stdout(predicate::str::contains("skim"))
+        .stdout(predicate::str::is_match(r"\d+\.\d+\.\d+").unwrap());
 }
 
 #[test]
