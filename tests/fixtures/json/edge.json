@@ -1,0 +1,12 @@
+{
+  "empty_object": {},
+  "empty_array": [],
+  "null_value": null,
+  "boolean_true": true,
+  "boolean_false": false,
+  "number_int": 42,
+  "number_float": 3.14,
+  "string_empty": "",
+  "unicode": "Hello 世界 🌍",
+  "mixed_array": [1, "text", true, null, {"nested": "object"}]
+}

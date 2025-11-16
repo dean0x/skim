@@ -1,0 +1,21 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "name": "Alice",
+      "role": "admin"
+    },
+    {
+      "id": 2,
+      "name": "Bob",
+      "role": "user"
+    },
+    {
+      "id": 3,
+      "name": "Charlie",
+      "role": "moderator"
+    }
+  ],
+  "tags": ["important", "urgent", "reviewed"],
+  "counts": [10, 20, 30, 40]
+}

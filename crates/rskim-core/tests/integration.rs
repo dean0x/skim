@@ -3,6 +3,7 @@
 //! These tests validate the full pipeline from source → transformation.
 
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+#![allow(clippy::expect_used)] // Expect is acceptable in tests
 
 use rskim_core::{transform, transform_auto, Language, Mode};
 use std::path::Path;
@@ -325,6 +326,10 @@ fn test_detect_language_from_path() {
         detect_language_from_path(Path::new("doc.markdown")),
         Some(Language::Markdown)
     );
+    assert_eq!(
+        detect_language_from_path(Path::new("data.json")),
+        Some(Language::Json)
+    );
 }
 
 #[test]
@@ -403,4 +408,264 @@ fn test_signatures_more_aggressive() {
 
     // Signatures should be more aggressive than structure
     assert!(signatures.len() < structure.len());
+}
+
+// ============================================================================
+// JSON Tests
+// ============================================================================
+
+#[test]
+fn test_json_simple_structure() {
+    let source = include_str!("../../../tests/fixtures/json/simple.json");
+    let result = transform(source, Language::Json, Mode::Structure).unwrap();
+
+    // Should contain keys
+    assert!(result.contains("name"));
+    assert!(result.contains("age"));
+    assert!(result.contains("email"));
+    assert!(result.contains("active"));
+
+    // Should NOT contain values
+    assert!(!result.contains("John Doe"));
+    assert!(!result.contains("30"));
+    assert!(!result.contains("john@example.com"));
+    assert!(!result.contains("true"));
+}
+
+#[test]
+fn test_json_nested_structure() {
+    let source = include_str!("../../../tests/fixtures/json/nested.json");
+    let result = transform(source, Language::Json, Mode::Structure).unwrap();
+
+    // Should contain nested keys
+    assert!(result.contains("user"));
+    assert!(result.contains("profile"));
+    assert!(result.contains("name"));
+    assert!(result.contains("address"));
+    assert!(result.contains("street"));
+    assert!(result.contains("settings"));
+    assert!(result.contains("metadata"));
+
+    // Should NOT contain values
+    assert!(!result.contains("Jane Smith"));
+    assert!(!result.contains("123 Main St"));
+    assert!(!result.contains("dark"));
+}
+
+#[test]
+fn test_json_arrays() {
+    let source = include_str!("../../../tests/fixtures/json/array.json");
+    let result = transform(source, Language::Json, Mode::Structure).unwrap();
+
+    // Should contain array key
+    assert!(result.contains("users"));
+
+    // For arrays of objects, should show structure of first item
+    assert!(result.contains("id"));
+    assert!(result.contains("name"));
+    assert!(result.contains("role"));
+
+    // Should NOT contain actual values
+    assert!(!result.contains("Alice"));
+    assert!(!result.contains("admin"));
+
+    // For arrays of primitives, just show the key
+    assert!(result.contains("tags"));
+    assert!(result.contains("counts"));
+    assert!(!result.contains("important"));
+    assert!(!result.contains("10"));
+}
+
+#[test]
+fn test_json_edge_cases() {
+    let source = include_str!("../../../tests/fixtures/json/edge.json");
+    let result = transform(source, Language::Json, Mode::Structure).unwrap();
+
+    // Should handle empty objects/arrays
+    assert!(result.contains("empty_object"));
+    assert!(result.contains("empty_array"));
+
+    // Should handle null, booleans, numbers
+    assert!(result.contains("null_value"));
+    assert!(result.contains("boolean_true"));
+    assert!(result.contains("number_int"));
+    assert!(result.contains("string_empty"));
+
+    // Should handle unicode
+    assert!(result.contains("unicode"));
+
+    // Should handle mixed arrays (just shows key, not nested object structure)
+    assert!(result.contains("mixed_array"));
+    // For mixed arrays, we just show the key, not the nested object
+}
+
+#[test]
+fn test_json_modes_identical() {
+    let source = include_str!("../../../tests/fixtures/json/simple.json");
+
+    // All modes should produce same output for JSON (modes don't apply)
+    let structure = transform(source, Language::Json, Mode::Structure).unwrap();
+    let signatures = transform(source, Language::Json, Mode::Signatures).unwrap();
+    let types = transform(source, Language::Json, Mode::Types).unwrap();
+    let full = transform(source, Language::Json, Mode::Full).unwrap();
+
+    // NOTE: JSON ignores mode parameter, always does structure extraction
+    assert_eq!(structure, signatures);
+    assert_eq!(structure, types);
+    assert_eq!(structure, full);
+}
+
+#[test]
+fn test_json_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/json/simple.json");
+    let path = Path::new("data.json");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok());
+
+    let content = result.unwrap();
+    assert!(content.contains("name"));
+    assert!(!content.contains("John Doe"));
+}
+
+#[test]
+fn test_json_invalid() {
+    let source = r#"{"invalid": "#;
+    let result = transform(source, Language::Json, Mode::Structure);
+
+    // Should return error for invalid JSON
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Invalid JSON"));
+}
+
+#[test]
+fn test_json_deeply_nested_security() {
+    // SECURITY TEST: Ensure deeply nested JSON is rejected (depth > 500)
+    let mut json = String::from("{\"level1\":");
+    for i in 2..=550 {
+        json.push_str(&format!("{{\"level{}\":", i));
+    }
+    json.push_str("\"value\"");
+    for _ in 0..550 {
+        json.push('}');
+    }
+
+    let result = transform(&json, Language::Json, Mode::Structure);
+
+    // Should reject with depth/recursion limit error
+    // Note: serde_json has its own recursion limit of 128, our validate_json_depth provides additional protection at 500
+    assert!(result.is_err(), "Expected error for deeply nested JSON");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("recursion limit") || err_msg.contains("nesting depth") || err_msg.contains("depth exceeded"),
+        "Error message should mention recursion/depth limit, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_json_token_reduction() {
+    let source = include_str!("../../../tests/fixtures/json/nested.json");
+    let result = transform(source, Language::Json, Mode::Structure).unwrap();
+
+    // JSON structure should be significantly smaller than original
+    assert!(result.len() < source.len());
+
+    // Should achieve reasonable reduction (30-60% depending on structure)
+    let reduction_ratio = (source.len() - result.len()) as f64 / source.len() as f64;
+    assert!(reduction_ratio > 0.30, "Expected >30% reduction, got {:.1}%", reduction_ratio * 100.0);
+}
+
+#[test]
+fn test_json_large_keys_security() {
+    // SECURITY TEST: Ensure JSON with >10,000 keys is rejected
+    let mut json = String::from("{");
+    for i in 0..10_001 {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("\"key_{}\":{}", i, i));
+    }
+    json.push('}');
+
+    let result = transform(&json, Language::Json, Mode::Structure);
+
+    assert!(result.is_err(), "Expected error for excessive keys");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("key count exceeded"),
+        "Error message should mention key count limit, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_json_top_level_array_of_objects() {
+    // Top-level array containing objects should extract first object's structure
+    let json = r#"[{"id": 1, "name": "First"}, {"id": 2, "name": "Second"}]"#;
+    let result = transform(json, Language::Json, Mode::Structure).unwrap();
+
+    // Should show structure of first object
+    assert!(result.contains("id"), "Should contain 'id' key");
+    assert!(result.contains("name"), "Should contain 'name' key");
+    assert!(!result.contains("First"), "Should not contain values");
+    assert!(!result.contains("Second"), "Should not contain values");
+}
+
+#[test]
+fn test_json_top_level_array_of_primitives() {
+    // Top-level array of primitives should return empty array
+    let json = r#"[1, 2, 3, "four", true, null]"#;
+    let result = transform(json, Language::Json, Mode::Structure).unwrap();
+
+    // Should return empty array representation
+    assert_eq!(result.trim(), "[]", "Array of primitives should return []");
+}
+
+#[test]
+fn test_json_top_level_empty_array() {
+    // Empty top-level array
+    let json = r#"[]"#;
+    let result = transform(json, Language::Json, Mode::Structure).unwrap();
+
+    assert_eq!(result.trim(), "[]", "Empty array should return []");
+}
+
+#[test]
+fn test_json_primitive_root() {
+    // Standalone primitive values at root level
+    // These are valid JSON but unusual - handle gracefully
+    let test_cases = vec![
+        ("42", ""),           // number
+        ("\"text\"", ""),     // string
+        ("true", ""),         // boolean
+        ("null", ""),         // null
+        ("3.14", ""),         // float
+    ];
+
+    for (input, expected) in test_cases {
+        let result = transform(input, Language::Json, Mode::Structure).unwrap();
+        assert_eq!(
+            result.trim(),
+            expected,
+            "Primitive root '{}' should return empty string, got: '{}'",
+            input,
+            result
+        );
+    }
+}
+
+#[test]
+fn test_json_nested_arrays() {
+    // Arrays of arrays (matrix-like structures)
+    let json = r#"{"matrix": [[1, 2], [3, 4]], "data": [{"id": 1}]}"#;
+    let result = transform(json, Language::Json, Mode::Structure).unwrap();
+
+    // matrix is array of arrays (primitives) - just show key
+    assert!(result.contains("matrix"), "Should contain 'matrix' key");
+    // data is array of objects - show structure
+    assert!(result.contains("data"), "Should contain 'data' key");
+    assert!(result.contains("id"), "Should contain nested 'id' key from data");
+    // Should not contain actual values
+    assert!(!result.contains("[["), "Should not contain array syntax");
 }

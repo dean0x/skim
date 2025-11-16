@@ -1,0 +1,21 @@
+{
+  "user": {
+    "profile": {
+      "name": "Jane Smith",
+      "age": 28,
+      "address": {
+        "street": "123 Main St",
+        "city": "Springfield",
+        "zipcode": "12345"
+      }
+    },
+    "settings": {
+      "theme": "dark",
+      "notifications": true
+    }
+  },
+  "metadata": {
+    "created": "2025-01-01T00:00:00Z",
+    "updated": "2025-01-14T00:00:00Z"
+  }
+}
