@@ -14,8 +14,8 @@ use thiserror::Error;
 ///
 /// ARCHITECTURE: Adding a new language requires:
 /// 1. Add variant here
-/// 2. Add tree-sitter grammar to Cargo.toml
-/// 3. Implement `to_tree_sitter()` mapping
+/// 2. Add tree-sitter grammar to Cargo.toml (unless special-cased like JSON)
+/// 3. Implement `to_tree_sitter()` mapping (or handle specially like JSON)
 /// 4. Add file extension in `from_extension()`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
@@ -26,6 +26,7 @@ pub enum Language {
     Go,
     Java,
     Markdown,
+    Json,
 }
 
 impl Language {
@@ -49,6 +50,7 @@ impl Language {
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
             "md" | "markdown" => Some(Self::Markdown),
+            "json" => Some(Self::Json),
             _ => None,
         }
     }
@@ -85,6 +87,7 @@ impl Language {
             Self::Go => "Go",
             Self::Java => "Java",
             Self::Markdown => "Markdown",
+            Self::Json => "JSON",
         }
     }
 
@@ -96,15 +99,49 @@ impl Language {
     /// # Note on Markdown
     /// tree-sitter-md has two parsers: LANGUAGE (block) and INLINE_LANGUAGE (inline).
     /// We only use LANGUAGE (block parser) since we're extracting headers, not inline formatting.
-    pub fn to_tree_sitter(self) -> tree_sitter::Language {
+    ///
+    /// # Note on JSON
+    /// JSON returns None because it uses serde_json for parsing, not tree-sitter.
+    /// JSON transformation is handled separately in the transform layer.
+    pub(crate) fn to_tree_sitter(self) -> Option<tree_sitter::Language> {
         match self {
-            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Self::Python => tree_sitter_python::LANGUAGE.into(),
-            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Self::Go => tree_sitter_go::LANGUAGE.into(),
-            Self::Java => tree_sitter_java::LANGUAGE.into(),
-            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            Self::JavaScript => Some(tree_sitter_javascript::LANGUAGE.into()),
+            Self::Python => Some(tree_sitter_python::LANGUAGE.into()),
+            Self::Rust => Some(tree_sitter_rust::LANGUAGE.into()),
+            Self::Go => Some(tree_sitter_go::LANGUAGE.into()),
+            Self::Java => Some(tree_sitter_java::LANGUAGE.into()),
+            Self::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
+            Self::Json => None, // Uses serde_json, not tree-sitter
+        }
+    }
+
+    /// Transform source code for this language
+    ///
+    /// ARCHITECTURE: Encapsulates language-specific parsing strategy.
+    /// - JSON: Uses serde_json parser
+    /// - All others: Use tree-sitter parser
+    ///
+    /// This eliminates special-case conditionals in the main transform function.
+    ///
+    /// # Errors
+    /// Returns parsing or transformation errors specific to the language.
+    pub(crate) fn transform_source(
+        self,
+        source: &str,
+        config: &TransformConfig,
+    ) -> Result<String> {
+        match self {
+            Self::Json => {
+                // JSON uses serde_json, ignores transformation modes
+                crate::transform::json::transform_json(source)
+            }
+            _ => {
+                // Tree-sitter based languages
+                let mut parser = Parser::new(self)?;
+                let tree = parser.parse(source)?;
+                crate::transform::transform_tree(source, &tree, self, config)
+            }
         }
     }
 }
@@ -366,9 +403,17 @@ impl Parser {
     ///
     /// # Errors
     /// Returns `SkimError::TreeSitterError` if grammar fails to load.
+    /// Returns `SkimError::ConfigError` for languages that don't use tree-sitter (e.g., JSON).
     pub fn new(language: Language) -> Result<Self> {
+        let ts_language = language.to_tree_sitter().ok_or_else(|| {
+            SkimError::ConfigError(format!(
+                "{} does not use tree-sitter parser",
+                language.name()
+            ))
+        })?;
+
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&language.to_tree_sitter())?;
+        parser.set_language(&ts_language)?;
 
         Ok(Self {
             language,

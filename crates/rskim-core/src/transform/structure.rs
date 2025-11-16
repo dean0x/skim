@@ -57,7 +57,14 @@ pub(crate) fn transform_structure(
     }
 
     // Get language-specific node types
-    let node_types = get_node_types_for_language(language);
+    // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
+    // and never reaches this code path. This unwrap is safe due to early return above.
+    let node_types = get_node_types_for_language(language).ok_or_else(|| {
+        SkimError::ParseError(format!(
+            "Language {:?} does not support tree-sitter structure transformation",
+            language
+        ))
+    })?;
 
     // Find all body nodes to replace
     let mut replacements: HashMap<(usize, usize), &'static str> = HashMap::new();
@@ -198,32 +205,37 @@ struct NodeTypes {
 }
 
 /// Get node types based on language
-fn get_node_types_for_language(language: Language) -> NodeTypes {
+///
+/// Returns None for languages that don't use tree-sitter node types (e.g., JSON).
+/// ARCHITECTURE: JSON is handled by the Strategy Pattern in Language::transform_source(),
+/// which calls json::transform_json() directly instead of using tree-sitter parsing.
+fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
     match language {
-        Language::TypeScript | Language::JavaScript => NodeTypes {
+        Language::TypeScript | Language::JavaScript => Some(NodeTypes {
             function: "function_declaration",
             method: "method_definition",
-        },
-        Language::Python => NodeTypes {
+        }),
+        Language::Python => Some(NodeTypes {
             function: "function_definition",
             method: "function_definition",
-        },
-        Language::Rust => NodeTypes {
+        }),
+        Language::Rust => Some(NodeTypes {
             function: "function_item",
             method: "function_item",
-        },
-        Language::Go => NodeTypes {
+        }),
+        Language::Go => Some(NodeTypes {
             function: "function_declaration",
             method: "method_declaration",
-        },
-        Language::Java => NodeTypes {
+        }),
+        Language::Java => Some(NodeTypes {
             function: "method_declaration",
             method: "method_declaration",
-        },
-        Language::Markdown => NodeTypes {
+        }),
+        Language::Markdown => Some(NodeTypes {
             function: "atx_heading", // Not used - markdown uses special extraction
             method: "atx_heading",   // Not used - markdown uses special extraction
-        },
+        }),
+        Language::Json => None,
     }
 }
 

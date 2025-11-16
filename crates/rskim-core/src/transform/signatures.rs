@@ -44,7 +44,14 @@ pub(crate) fn transform_signatures(
         return crate::transform::structure::extract_markdown_headers(source, tree, 1, 6);
     }
 
-    let node_types = get_signature_node_types(language);
+    // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
+    // and never reaches this code path.
+    let node_types = get_signature_node_types(language).ok_or_else(|| {
+        SkimError::ParseError(format!(
+            "Language {:?} does not support tree-sitter signature transformation",
+            language
+        ))
+    })?;
 
     let mut signatures = Vec::new();
     collect_signatures(tree.root_node(), source, &node_types, &mut signatures, 0)?;
@@ -165,31 +172,35 @@ struct SignatureNodeTypes {
 }
 
 /// Get signature node types for language
-fn get_signature_node_types(language: Language) -> SignatureNodeTypes {
+///
+/// Returns None for languages that don't use tree-sitter (e.g., JSON).
+/// ARCHITECTURE: JSON is handled by the Strategy Pattern in Language::transform_source().
+fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
     match language {
-        Language::TypeScript | Language::JavaScript => SignatureNodeTypes {
+        Language::TypeScript | Language::JavaScript => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "method_definition",
-        },
-        Language::Python => SignatureNodeTypes {
+        }),
+        Language::Python => Some(SignatureNodeTypes {
             function: "function_definition",
             method: "function_definition",
-        },
-        Language::Rust => SignatureNodeTypes {
+        }),
+        Language::Rust => Some(SignatureNodeTypes {
             function: "function_item",
             method: "function_item",
-        },
-        Language::Go => SignatureNodeTypes {
+        }),
+        Language::Go => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "method_declaration",
-        },
-        Language::Java => SignatureNodeTypes {
+        }),
+        Language::Java => Some(SignatureNodeTypes {
             function: "method_declaration",
             method: "method_declaration",
-        },
-        Language::Markdown => SignatureNodeTypes {
+        }),
+        Language::Markdown => Some(SignatureNodeTypes {
             function: "atx_heading", // Not used - markdown uses special extraction
             method: "atx_heading",   // Not used - markdown uses special extraction
-        },
+        }),
+        Language::Json => None,
     }
 }

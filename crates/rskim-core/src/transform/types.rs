@@ -46,7 +46,14 @@ pub(crate) fn transform_types(
         return crate::transform::structure::extract_markdown_headers(source, tree, 1, 6);
     }
 
-    let node_types = get_type_node_types(language);
+    // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
+    // and never reaches this code path.
+    let node_types = get_type_node_types(language).ok_or_else(|| {
+        SkimError::ParseError(format!(
+            "Language {:?} does not support tree-sitter type transformation",
+            language
+        ))
+    })?;
 
     let mut type_defs = Vec::new();
     collect_type_definitions(tree.root_node(), source, &node_types, &mut type_defs, 0)?;
@@ -170,56 +177,60 @@ struct TypeNodeTypes {
 }
 
 /// Get type node types for language
-fn get_type_node_types(language: Language) -> TypeNodeTypes {
+///
+/// Returns None for languages that don't use tree-sitter (e.g., JSON).
+/// ARCHITECTURE: JSON is handled by the Strategy Pattern in Language::transform_source().
+fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
     match language {
-        Language::TypeScript => TypeNodeTypes {
+        Language::TypeScript => Some(TypeNodeTypes {
             type_alias: "type_alias_declaration",
             interface: "interface_declaration",
             enum_def: "enum_declaration",
             class_decl: "class_declaration",
             struct_def: "", // Not applicable
-        },
-        Language::JavaScript => TypeNodeTypes {
+        }),
+        Language::JavaScript => Some(TypeNodeTypes {
             type_alias: "",
             interface: "",
             enum_def: "",
             class_decl: "class_declaration",
             struct_def: "",
-        },
-        Language::Python => TypeNodeTypes {
+        }),
+        Language::Python => Some(TypeNodeTypes {
             type_alias: "type_alias_statement",
             interface: "",
             enum_def: "",
             class_decl: "class_definition",
             struct_def: "",
-        },
-        Language::Rust => TypeNodeTypes {
+        }),
+        Language::Rust => Some(TypeNodeTypes {
             type_alias: "type_item",
             interface: "trait_item",
             enum_def: "enum_item",
             class_decl: "",
             struct_def: "struct_item",
-        },
-        Language::Go => TypeNodeTypes {
+        }),
+        Language::Go => Some(TypeNodeTypes {
             type_alias: "type_declaration",
             interface: "interface_type",
             enum_def: "",
             class_decl: "",
             struct_def: "struct_type",
-        },
-        Language::Java => TypeNodeTypes {
+        }),
+        Language::Java => Some(TypeNodeTypes {
             type_alias: "",
             interface: "interface_declaration",
             enum_def: "enum_declaration",
             class_decl: "class_declaration",
             struct_def: "",
-        },
-        Language::Markdown => TypeNodeTypes {
+        }),
+        Language::Markdown => Some(TypeNodeTypes {
             type_alias: "", // Not applicable
             interface: "",  // Not applicable
             enum_def: "",   // Not applicable
             class_decl: "", // Not applicable
             struct_def: "", // Not applicable
-        },
+        }),
+        Language::Json => None,
     }
 }
