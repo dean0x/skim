@@ -55,6 +55,54 @@ Error: File too large: 52,428,800 bytes exceeds maximum of 52,428,800 bytes (50M
 const x = [[[[[[...]]]]]]  // Extremely deep nesting
 ```
 
+### Max JSON Nesting Depth
+
+**Limit**: 500 levels (serde_json enforces 128 by default)
+
+**Purpose**: Prevents stack overflow on deeply nested JSON objects
+
+**Example of protected input:**
+```json
+{
+  "level1": {
+    "level2": {
+      "level3": {
+        // ... 500+ levels deep
+      }
+    }
+  }
+}
+```
+
+**Error message:**
+```
+Error: JSON nesting depth exceeded: 501 (max: 500). Possible malicious input.
+```
+
+**Note**: serde_json has a default recursion limit of 128, which provides primary protection. Our 500-level limit provides a secondary validation layer for consistency with other transformers.
+
+### Max JSON Keys
+
+**Limit**: 10,000 keys per file
+
+**Purpose**: Prevents memory exhaustion from JSON with millions of keys
+
+**Example of protected input:**
+```json
+{
+  "key0": "value",
+  "key1": "value",
+  // ... 10,000+ keys total across all nested objects
+}
+```
+
+**Error message:**
+```
+Error: JSON key count exceeded: 10001 (max: 10000). Possible malicious input.
+```
+
+**Rationale**: Processing JSON with millions of keys could exhaust memory. The 10,000 key limit matches the MAX_SIGNATURES limit used in other transformers, ensuring consistent protection.
+
 ### UTF-8 Validation
 
 **Protection**: Safe handling of multi-byte Unicode characters

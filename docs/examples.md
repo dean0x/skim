@@ -285,6 +285,147 @@ More specific details here.
 ##### Details
 ```
 
+## JSON
+
+JSON transformation extracts structure (keys only) while stripping all values, achieving maximum token reduction for configuration files and API responses.
+
+### Simple Object
+
+**Input:**
+```json
+{
+  "name": "John Doe",
+  "age": 30,
+  "email": "john@example.com"
+}
+```
+
+**Output:**
+```
+{
+  name,
+  age,
+  email
+}
+```
+
+Note: All values are stripped, only keys remain. Quotes are removed for compactness.
+
+### Nested Object (API Response)
+
+**Input:**
+```json
+{
+  "user": {
+    "profile": {
+      "name": "Jane Smith",
+      "age": 28,
+      "address": {
+        "street": "123 Main St",
+        "city": "Springfield",
+        "zipcode": "12345"
+      }
+    },
+    "settings": {
+      "theme": "dark",
+      "notifications": true
+    }
+  },
+  "metadata": {
+    "created": "2024-01-01",
+    "updated": "2024-12-01"
+  }
+}
+```
+
+**Output:**
+```
+{
+  user: {
+    profile: {
+      name,
+      age,
+      address: {
+        street,
+        city,
+        zipcode
+      }
+    },
+    settings: {
+      theme,
+      notifications
+    }
+  },
+  metadata: {
+    created,
+    updated
+  }
+}
+```
+
+### Arrays
+
+**Input:**
+```json
+{
+  "tags": ["admin", "user", "moderator"],
+  "items": [
+    {"id": 1, "price": 100, "name": "Product A"},
+    {"id": 2, "price": 200, "name": "Product B"}
+  ]
+}
+```
+
+**Output:**
+```
+{
+  tags,
+  items: {
+    id,
+    price,
+    name
+  }
+}
+```
+
+Note:
+- Arrays of primitives (like `tags`) show only the key name
+- Arrays of objects (like `items`) show the structure of the first object
+
+### Top-Level Array
+
+**Input:**
+```json
+[
+  {"id": 1, "name": "First"},
+  {"id": 2, "name": "Second"}
+]
+```
+
+**Output:**
+```
+{
+  id,
+  name
+}
+```
+
+For top-level arrays containing objects, Skim shows the structure of the first object.
+
+### Mode Behavior
+
+JSON always uses structure extraction regardless of the `--mode` flag:
+
+```bash
+# All modes produce identical output for JSON
+skim data.json                    # structure mode
+skim data.json --mode=signatures  # same as structure
+skim data.json --mode=types       # same as structure
+skim data.json --mode=full        # same as structure
+```
+
+This is because JSON is data, not code, so there are no "signatures" or "types" to extract - only structure.
+
 ## Complex Examples
 
 ### TypeScript: Full Application Structure

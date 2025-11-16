@@ -183,6 +183,8 @@ skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation
 ```
 
+**Note on JSON files:** JSON always uses structure extraction regardless of mode. Since JSON is data (not code), there are no "signatures" or "types" to extract—only structure. All modes produce identical output for JSON files.
+
 📖 **[Detailed Mode Guide →](docs/modes.md)**
 
 ## Supported Languages
@@ -196,6 +198,7 @@ skim file.ts --mode full        # No transformation
 | Go         | ✅     | `.go`              | Stable                   |
 | Java       | ✅     | `.java`            | Good coverage            |
 | Markdown   | ✅     | `.md`, `.markdown` | Header extraction        |
+| JSON       | ✅     | `.json`            | Structure extraction     |
 
 ## Examples
 
@@ -230,6 +233,48 @@ def process_data(items: List[Item]) -> Dict[str, Any]:
 
 # Output (structure mode)
 def process_data(items: List[Item]) -> Dict[str, Any]: { /* ... */ }
+```
+
+### JSON
+
+```json
+// Input
+{
+  "user": {
+    "profile": {
+      "name": "Jane Smith",
+      "age": 28,
+      "tags": ["admin", "verified"]
+    },
+    "settings": {
+      "theme": "dark",
+      "notifications": true
+    }
+  },
+  "items": [
+    {"id": 1, "price": 100},
+    {"id": 2, "price": 200}
+  ]
+}
+
+// Output (structure mode)
+{
+  user: {
+    profile: {
+      name,
+      age,
+      tags
+    },
+    settings: {
+      theme,
+      notifications
+    }
+  },
+  items: {
+    id,
+    price
+  }
+}
 ```
 
 📖 **[More Examples (All Languages) →](docs/examples.md)**
