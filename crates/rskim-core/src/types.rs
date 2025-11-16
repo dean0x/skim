@@ -126,11 +126,7 @@ impl Language {
     ///
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
-    pub(crate) fn transform_source(
-        self,
-        source: &str,
-        config: &TransformConfig,
-    ) -> Result<String> {
+    pub(crate) fn transform_source(self, source: &str, config: &TransformConfig) -> Result<String> {
         match self {
             Self::Json => {
                 // JSON uses serde_json, ignores transformation modes
