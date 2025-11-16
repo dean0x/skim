@@ -68,8 +68,7 @@ fn extract_structure(value: &Value, depth: usize, key_count: &mut usize) -> Resu
     if depth > MAX_JSON_DEPTH {
         return Err(SkimError::ParseError(format!(
             "JSON nesting depth exceeded: {} (max: {}). Possible malicious input.",
-            depth,
-            MAX_JSON_DEPTH
+            depth, MAX_JSON_DEPTH
         )));
     }
 
@@ -97,8 +96,7 @@ fn extract_object_structure(
     if *key_count > MAX_JSON_KEYS {
         return Err(SkimError::ParseError(format!(
             "JSON key count exceeded: {} (max: {}). Possible malicious input.",
-            key_count,
-            MAX_JSON_KEYS
+            key_count, MAX_JSON_KEYS
         )));
     }
 
@@ -163,11 +161,7 @@ fn format_array_value(arr: &[Value], depth: usize, key_count: &mut usize) -> Res
 /// Extract structure from top-level JSON array
 ///
 /// For arrays at root level, shows structure of first object if present.
-fn extract_array_structure(
-    arr: &[Value],
-    depth: usize,
-    key_count: &mut usize,
-) -> Result<String> {
+fn extract_array_structure(arr: &[Value], depth: usize, key_count: &mut usize) -> Result<String> {
     let Some(first) = arr.first() else {
         return Ok("[]".to_string());
     };
@@ -214,8 +208,7 @@ mod tests {
     #[test]
     fn test_array_of_primitives() {
         let input = r#"{"tags": ["admin", "user", "moderator"]}"#;
-        let result =
-            transform_json(input).expect("array of primitives should parse successfully");
+        let result = transform_json(input).expect("array of primitives should parse successfully");
 
         assert!(result.contains("tags"));
         assert!(!result.contains("admin"));

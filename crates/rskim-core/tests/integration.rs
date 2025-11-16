@@ -557,7 +557,9 @@ fn test_json_deeply_nested_security() {
     assert!(result.is_err(), "Expected error for deeply nested JSON");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("recursion limit") || err_msg.contains("nesting depth") || err_msg.contains("depth exceeded"),
+        err_msg.contains("recursion limit")
+            || err_msg.contains("nesting depth")
+            || err_msg.contains("depth exceeded"),
         "Error message should mention recursion/depth limit, got: {}",
         err_msg
     );
@@ -573,7 +575,11 @@ fn test_json_token_reduction() {
 
     // Should achieve reasonable reduction (30-60% depending on structure)
     let reduction_ratio = (source.len() - result.len()) as f64 / source.len() as f64;
-    assert!(reduction_ratio > 0.30, "Expected >30% reduction, got {:.1}%", reduction_ratio * 100.0);
+    assert!(
+        reduction_ratio > 0.30,
+        "Expected >30% reduction, got {:.1}%",
+        reduction_ratio * 100.0
+    );
 }
 
 #[test]
@@ -636,11 +642,11 @@ fn test_json_primitive_root() {
     // Standalone primitive values at root level
     // These are valid JSON but unusual - handle gracefully
     let test_cases = vec![
-        ("42", ""),           // number
-        ("\"text\"", ""),     // string
-        ("true", ""),         // boolean
-        ("null", ""),         // null
-        ("3.14", ""),         // float
+        ("42", ""),       // number
+        ("\"text\"", ""), // string
+        ("true", ""),     // boolean
+        ("null", ""),     // null
+        ("3.14", ""),     // float
     ];
 
     for (input, expected) in test_cases {
@@ -665,7 +671,10 @@ fn test_json_nested_arrays() {
     assert!(result.contains("matrix"), "Should contain 'matrix' key");
     // data is array of objects - show structure
     assert!(result.contains("data"), "Should contain 'data' key");
-    assert!(result.contains("id"), "Should contain nested 'id' key from data");
+    assert!(
+        result.contains("id"),
+        "Should contain nested 'id' key from data"
+    );
     // Should not contain actual values
     assert!(!result.contains("[["), "Should not contain array syntax");
 }
