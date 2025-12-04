@@ -56,6 +56,9 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
         // ARCHITECTURE: JSON uses serde_json parser, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
         Language::Json => None,
+        // ARCHITECTURE: YAML uses serde_yaml parser, not tree-sitter.
+        // This is enforced by the Strategy Pattern in Language::transform_source().
+        Language::Yaml => None,
     }
 }
 

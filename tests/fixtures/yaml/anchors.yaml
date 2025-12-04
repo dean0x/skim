@@ -1,0 +1,21 @@
+# YAML anchors and aliases example
+# Note: serde_yaml resolves these, so output will show resolved values
+
+defaults: &defaults
+  adapter: postgres
+  host: localhost
+  port: 5432
+
+development:
+  <<: *defaults
+  database: dev_db
+
+staging:
+  <<: *defaults
+  database: staging_db
+  host: staging.example.com
+
+production:
+  <<: *defaults
+  database: prod_db
+  host: prod.example.com

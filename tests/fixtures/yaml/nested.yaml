@@ -1,0 +1,12 @@
+user:
+  name: John Doe
+  age: 30
+  address:
+    street: 123 Main St
+    city: Springfield
+    zip: "12345"
+  preferences:
+    theme: dark
+    notifications:
+      email: true
+      sms: false

@@ -202,5 +202,6 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
             method: "atx_heading",   // Not used - markdown uses special extraction
         }),
         Language::Json => None,
+        Language::Yaml => None,
     }
 }

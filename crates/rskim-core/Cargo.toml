@@ -21,6 +21,7 @@ tree-sitter-java = { workspace = true }
 tree-sitter-md = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 [dev-dependencies]
 insta = "1.39"  # Snapshot testing

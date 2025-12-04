@@ -27,6 +27,7 @@ pub enum Language {
     Java,
     Markdown,
     Json,
+    Yaml,
 }
 
 impl Language {
@@ -51,6 +52,7 @@ impl Language {
             "java" => Some(Self::Java),
             "md" | "markdown" => Some(Self::Markdown),
             "json" => Some(Self::Json),
+            "yaml" | "yml" => Some(Self::Yaml),
             _ => None,
         }
     }
@@ -88,6 +90,7 @@ impl Language {
             Self::Java => "Java",
             Self::Markdown => "Markdown",
             Self::Json => "JSON",
+            Self::Yaml => "YAML",
         }
     }
 
@@ -113,6 +116,7 @@ impl Language {
             Self::Java => Some(tree_sitter_java::LANGUAGE.into()),
             Self::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
             Self::Json => None, // Uses serde_json, not tree-sitter
+            Self::Yaml => None, // Uses serde_yaml, not tree-sitter
         }
     }
 
@@ -131,6 +135,10 @@ impl Language {
             Self::Json => {
                 // JSON uses serde_json, ignores transformation modes
                 crate::transform::json::transform_json(source)
+            }
+            Self::Yaml => {
+                // YAML uses serde_yaml, ignores transformation modes
+                crate::transform::yaml::transform_yaml(source)
             }
             _ => {
                 // Tree-sitter based languages
