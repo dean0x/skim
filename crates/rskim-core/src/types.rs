@@ -116,7 +116,7 @@ impl Language {
             Self::Java => Some(tree_sitter_java::LANGUAGE.into()),
             Self::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
             Self::Json => None, // Uses serde_json, not tree-sitter
-            Self::Yaml => None, // Uses serde_yaml, not tree-sitter
+            Self::Yaml => None, // Uses serde_yaml_ng, not tree-sitter
         }
     }
 
@@ -137,7 +137,7 @@ impl Language {
                 crate::transform::json::transform_json(source)
             }
             Self::Yaml => {
-                // YAML uses serde_yaml, ignores transformation modes
+                // YAML uses serde_yaml_ng, ignores transformation modes
                 crate::transform::yaml::transform_yaml(source)
             }
             _ => {

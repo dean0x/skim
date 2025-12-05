@@ -1,5 +1,5 @@
 # YAML anchors and aliases example
-# Note: serde_yaml resolves these, so output will show resolved values
+# Note: serde_yaml_ng resolves these, so output will show resolved values
 
 defaults: &defaults
   adapter: postgres

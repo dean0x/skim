@@ -1,6 +1,6 @@
 //! YAML structure extraction
 //!
-//! ARCHITECTURE: YAML uses serde_yaml for parsing, not tree-sitter.
+//! ARCHITECTURE: YAML uses serde_yaml_ng for parsing, not tree-sitter.
 //! Output format: Compact key-only structure for maximum token reduction.
 //!
 //! # Output Format
@@ -36,10 +36,10 @@
 //! - Arrays of objects -> show single object structure
 //! - Empty arrays/objects -> just show key name
 //! - Multi-document files -> show all documents with `---` preserved
-//! - Anchors/aliases -> resolved by serde_yaml (not preserved)
+//! - Anchors/aliases -> resolved by serde_yaml_ng (not preserved)
 
 use crate::{Result, SkimError};
-use serde_yaml::Value;
+use serde_yaml_ng::Value;
 
 /// Maximum YAML nesting depth to prevent stack overflow DoS attacks
 ///
@@ -72,7 +72,7 @@ pub(crate) fn transform_yaml(source: &str) -> Result<String> {
                 continue;
             }
 
-            let value: Value = serde_yaml::from_str(doc)
+            let value: Value = serde_yaml_ng::from_str(doc)
                 .map_err(|e| SkimError::ParseError(format!("Invalid YAML: {}", e)))?;
 
             let mut key_count = 0;
@@ -102,7 +102,7 @@ pub(crate) fn transform_yaml(source: &str) -> Result<String> {
 
 /// Transform a single YAML document
 fn transform_single_document(source: &str) -> Result<String> {
-    let value: Value = serde_yaml::from_str(source)
+    let value: Value = serde_yaml_ng::from_str(source)
         .map_err(|e| SkimError::ParseError(format!("Invalid YAML: {}", e)))?;
 
     let mut key_count = 0;
@@ -182,7 +182,7 @@ fn extract_structure(value: &Value, depth: usize, key_count: &mut usize) -> Resu
 ///
 /// Returns formatted string with keys and nested structures.
 fn extract_mapping_structure(
-    map: &serde_yaml::Mapping,
+    map: &serde_yaml_ng::Mapping,
     depth: usize,
     key_count: &mut usize,
 ) -> Result<String> {
@@ -338,8 +338,7 @@ items:
   - id: 2
     price: 200
 "#;
-        let result =
-            transform_yaml(input).expect("sequence of mappings should parse successfully");
+        let result = transform_yaml(input).expect("sequence of mappings should parse successfully");
 
         assert!(result.contains("items"));
         assert!(result.contains("id"));
@@ -391,7 +390,8 @@ kind: Deployment
 ---
 second: doc
 "#;
-        let result = transform_yaml(input).expect("multi-document without leading --- should parse");
+        let result =
+            transform_yaml(input).expect("multi-document without leading --- should parse");
 
         assert!(result.contains("first"));
         assert!(result.contains("second"));
@@ -420,7 +420,7 @@ name: value
 
     #[test]
     fn test_anchors_resolved() {
-        // Note: serde_yaml resolves anchors, so this tests that we handle resolved values correctly
+        // Note: serde_yaml_ng resolves anchors, so this tests that we handle resolved values correctly
         let input = r#"
 defaults: &defaults
   adapter: postgres
@@ -434,7 +434,7 @@ development:
 
         assert!(result.contains("defaults"));
         assert!(result.contains("development"));
-        // Anchor syntax won't appear in output (resolved by serde_yaml)
+        // Anchor syntax won't appear in output (resolved by serde_yaml_ng)
     }
 
     #[test]
@@ -458,9 +458,9 @@ development:
     #[test]
     fn test_depth_limit() {
         // Create deeply nested YAML that exceeds safety limits
-        // Note: serde_yaml has its own recursion limit (128) which is stricter
+        // Note: serde_yaml_ng has its own recursion limit (128) which is stricter
         // than our MAX_YAML_DEPTH (500), so we test with a smaller nesting
-        // to verify our own limit works when serde_yaml doesn't hit its limit first.
+        // to verify our own limit works when serde_yaml_ng doesn't hit its limit first.
         let mut yaml = String::new();
         for i in 0..=MAX_YAML_DEPTH + 1 {
             yaml.push_str(&"  ".repeat(i));
@@ -472,15 +472,34 @@ development:
 
         let result = transform_yaml(&yaml);
 
-        // Should fail due to either serde_yaml recursion limit or our depth limit
+        // Should fail due to either serde_yaml_ng recursion limit or our depth limit
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        // Accept either our error message or serde_yaml's recursion error
+        // Accept either our error message or serde_yaml_ng's recursion error
         assert!(
             err.contains("depth exceeded")
                 || err.contains("recursion limit")
                 || err.contains("Invalid YAML"),
             "Expected depth/recursion error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_key_count_limit() {
+        // SECURITY TEST: Ensure YAML with >10,000 keys is rejected
+        let mut yaml = String::new();
+        for i in 0..10_001 {
+            yaml.push_str(&format!("key_{}: {}\n", i, i));
+        }
+
+        let result = transform_yaml(&yaml);
+
+        assert!(result.is_err(), "Expected error for excessive keys");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("key count exceeded"),
+            "Error message should mention key count limit, got: {}",
             err
         );
     }
