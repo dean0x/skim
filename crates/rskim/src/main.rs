@@ -127,6 +127,8 @@ enum LanguageArg {
     #[value(alias = "md")]
     Markdown,
     Json,
+    #[value(alias = "yml")]
+    Yaml,
 }
 
 impl From<LanguageArg> for Language {
@@ -140,6 +142,7 @@ impl From<LanguageArg> for Language {
             LanguageArg::Java => Language::Java,
             LanguageArg::Markdown => Language::Markdown,
             LanguageArg::Json => Language::Json,
+            LanguageArg::Yaml => Language::Yaml,
         }
     }
 }

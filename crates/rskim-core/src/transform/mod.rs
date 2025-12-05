@@ -8,6 +8,7 @@ pub mod json;
 pub mod signatures;
 pub mod structure;
 pub mod types;
+pub mod yaml;
 
 use crate::{Language, Mode, Result, TransformConfig};
 use tree_sitter::Tree;

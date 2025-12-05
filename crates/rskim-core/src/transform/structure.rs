@@ -236,6 +236,7 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             method: "atx_heading",   // Not used - markdown uses special extraction
         }),
         Language::Json => None,
+        Language::Yaml => None,
     }
 }
 

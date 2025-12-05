@@ -53,7 +53,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 
 - 🚀 **Fast** - 14.6ms for 3000-line files (powered by tree-sitter)
 - ⚡ **Cached** - 40-50x faster on repeated processing (enabled by default)
-- 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java, Markdown
+- 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java, Markdown, JSON, YAML
 - 🎯 **Multiple modes** - Structure, signatures, types, or full code
 - 📁 **Directory support** - Process entire directories recursively (`skim src/`)
 - 📂 **Multi-file** - Glob patterns (`src/**/*.ts`) with parallel processing
@@ -183,7 +183,7 @@ skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation
 ```
 
-**Note on JSON files:** JSON always uses structure extraction regardless of mode. Since JSON is data (not code), there are no "signatures" or "types" to extract—only structure. All modes produce identical output for JSON files.
+**Note on JSON/YAML files:** JSON and YAML always use structure extraction regardless of mode. Since they are data (not code), there are no "signatures" or "types" to extract—only structure. All modes produce identical output for JSON and YAML files.
 
 📖 **[Detailed Mode Guide →](docs/modes.md)**
 
@@ -199,6 +199,7 @@ skim file.ts --mode full        # No transformation
 | Java       | ✅     | `.java`            | Good coverage                   |
 | Markdown   | ✅     | `.md`, `.markdown` | Header extraction               |
 | JSON       | ✅     | `.json`            | Structure extraction (serde)    |
+| YAML       | ✅     | `.yaml`, `.yml`    | Multi-document support (serde)  |
 
 ## Examples
 
@@ -275,6 +276,41 @@ def process_data(items: List[Item]) -> Dict[str, Any]: { /* ... */ }
     price
   }
 }
+```
+
+### YAML (Multi-Document)
+
+```yaml
+# Input (Kubernetes manifests)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  database_url: postgres://localhost:5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+
+# Output (structure mode)
+apiVersion
+kind
+metadata:
+  name
+data:
+  database_url
+---
+apiVersion
+kind
+metadata:
+  name
+spec:
+  replicas
 ```
 
 📖 **[More Examples (All Languages) →](docs/examples.md)**
@@ -452,7 +488,7 @@ cargo bench
 **Current**: Production ready (v0.6.0+)
 
 ✅ **Implemented:**
-- TypeScript/JavaScript/Python/Rust/Go/Java/Markdown support
+- TypeScript/JavaScript/Python/Rust/Go/Java/Markdown/JSON/YAML support
 - Structure/signatures/types/full modes
 - CLI with stdin support
 - **Directory support (`skim src/` - recursively processes all files)**

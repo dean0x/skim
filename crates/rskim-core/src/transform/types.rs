@@ -232,5 +232,6 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             struct_def: "", // Not applicable
         }),
         Language::Json => None,
+        Language::Yaml => None,
     }
 }

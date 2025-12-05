@@ -247,6 +247,7 @@ pub fn supported_languages() -> &'static [Language] {
         Language::Java,
         Language::Markdown,
         Language::Json,
+        Language::Yaml,
     ]
 }
 
@@ -265,9 +266,10 @@ mod tests {
 
     #[test]
     fn test_supported_languages() {
-        assert_eq!(supported_languages().len(), 8);
+        assert_eq!(supported_languages().len(), 9);
         assert!(supported_languages().contains(&Language::Markdown));
         assert!(supported_languages().contains(&Language::Json));
+        assert!(supported_languages().contains(&Language::Yaml));
     }
 
     #[test]

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **YAML Language Support** - Extract structure from YAML files for LLM context optimization
+  - Strips all values, keeps only keys and nesting structure
+  - Multi-document support (preserves `---` separators between documents)
+  - Automatic language detection for `.yaml` and `.yml` files
+  - CLI support: `--language=yaml` or `--language=yml` for stdin processing
+  - 60-80% token reduction for typical YAML files
+  - Security limits: MAX_YAML_DEPTH=500, MAX_YAML_KEYS=10,000
+  - Uses serde_yaml_ng (maintained fork, Strategy Pattern for non-tree-sitter languages)
+  - All modes (structure/signatures/types) produce identical output (YAML is data, not code)
+  - Real-world fixtures: Kubernetes manifests, GitHub Actions workflows
+  - Note: Anchors/aliases are resolved by serde_yaml_ng parser (not preserved in output)
+
 ## [0.7.0] - 2025-11-16
 
 ### Added
