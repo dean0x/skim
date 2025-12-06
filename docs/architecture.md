@@ -132,6 +132,8 @@ let result = match transform_auto(&contents, path, mode) {
 - Go: `.go`
 - Java: `.java`
 - Markdown: `.md`, `.markdown`
+- JSON: `.json`
+- YAML: `.yaml`, `.yml`
 
 ### Parser Layer
 
