@@ -307,6 +307,7 @@ Need structure + signatures? → Use Structure mode (default)
 | Java       | ✅     | `.java`            | Good coverage            |
 | Markdown   | ✅     | `.md`, `.markdown` | Header extraction        |
 | JSON       | ✅     | `.json`            | Structure extraction     |
+| YAML       | ✅     | `.yaml`, `.yml`    | Structure extraction     |
 
 ### Language-Specific Notes
 
@@ -321,6 +322,15 @@ Need structure + signatures? → Use Structure mode (default)
 - Extracts structure: keeps only keys and nesting, strips all values
 - Example: `{"name": "John", "age": 30}` → `{name, age}`
 - Security limits: MAX_JSON_DEPTH=500, MAX_JSON_KEYS=10,000
+
+**YAML:**
+- All modes (structure/signatures/types/full) produce identical output
+- YAML is data, not code, so there are no "signatures" or "types" to extract
+- Extracts structure: keeps only keys and nesting, strips all values
+- Multi-document support: Files with `---` separators process all documents
+- Example: `name: John` → `name`
+- Security limits: MAX_YAML_DEPTH=500, MAX_YAML_KEYS=10,000
+- Note: Anchors and aliases are resolved by the parser (not preserved)
 
 ## Performance by Mode
 

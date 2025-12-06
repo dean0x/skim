@@ -426,6 +426,140 @@ skim data.json --mode=full        # same as structure
 
 This is because JSON is data, not code, so there are no "signatures" or "types" to extract - only structure.
 
+## YAML
+
+YAML transformation extracts structure (keys only) while stripping all values, similar to JSON. Multi-document YAML files are fully supported.
+
+### Simple Object
+
+**Input:**
+```yaml
+name: John Doe
+age: 30
+email: john@example.com
+active: true
+```
+
+**Output:**
+```
+name
+age
+email
+active
+```
+
+### Nested Object (Kubernetes Config)
+
+**Input:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  labels:
+    app: my-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-app
+```
+
+**Output:**
+```
+apiVersion
+kind
+metadata:
+  name
+  labels:
+    app
+spec:
+  replicas
+  selector:
+    matchLabels:
+      app
+```
+
+### Multi-Document YAML
+
+**Input:**
+```yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  database_url: postgres://localhost:5432
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+data:
+  api_key: base64encodedkey
+```
+
+**Output:**
+```
+apiVersion
+kind
+metadata:
+  name
+data:
+  database_url
+---
+apiVersion
+kind
+metadata:
+  name
+data:
+  api_key
+```
+
+Note: Document separators (`---`) are preserved in the output.
+
+### Arrays
+
+**Input:**
+```yaml
+tags:
+  - admin
+  - user
+  - moderator
+items:
+  - id: 1
+    name: Product A
+  - id: 2
+    name: Product B
+```
+
+**Output:**
+```
+tags
+items:
+  id
+  name
+```
+
+Note:
+- Arrays of primitives (like `tags`) show only the key name
+- Arrays of objects (like `items`) show the structure of the first object
+
+### Mode Behavior
+
+YAML always uses structure extraction regardless of the `--mode` flag:
+
+```bash
+# All modes produce identical output for YAML
+skim config.yaml                    # structure mode
+skim config.yaml --mode=signatures  # same as structure
+skim config.yaml --mode=types       # same as structure
+skim config.yaml --mode=full        # same as structure
+```
+
+This is because YAML is data, not code, so there are no "signatures" or "types" to extract - only structure.
+
 ## Complex Examples
 
 ### TypeScript: Full Application Structure

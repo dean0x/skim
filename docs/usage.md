@@ -46,7 +46,7 @@ See [Transformation Modes](./modes.md) for detailed information.
 
 Override language detection (required for stdin, optional fallback otherwise)
 
-**Values:** `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `markdown`, `json`
+**Values:** `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `markdown`, `json`, `yaml`
 
 **Auto-detection:** Language is automatically detected from file extensions by default
 

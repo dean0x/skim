@@ -103,6 +103,47 @@ Error: JSON key count exceeded: 10001 (max: 10000). Possible malicious input.
 
 **Rationale**: Processing JSON with millions of keys could exhaust memory. The 10,000 key limit matches the MAX_SIGNATURES limit used in other transformers, ensuring consistent protection.
 
+### Max YAML Nesting Depth
+
+**Limit**: 500 levels (serde_yaml_ng enforces 128 by default)
+
+**Purpose**: Prevents stack overflow on deeply nested YAML objects
+
+**Example of protected input:**
+```yaml
+level1:
+  level2:
+    level3:
+      # ... 500+ levels deep
+```
+
+**Error message:**
+```
+Error: YAML nesting depth exceeded: 501 (max: 500). Possible malicious input.
+```
+
+**Note**: serde_yaml_ng has a default recursion limit of 128, which provides primary protection. Our 500-level limit provides a secondary validation layer for consistency with JSON.
+
+### Max YAML Keys
+
+**Limit**: 10,000 keys per file
+
+**Purpose**: Prevents memory exhaustion from YAML with millions of keys
+
+**Example of protected input:**
+```yaml
+key0: value
+key1: value
+# ... 10,000+ keys total across all nested objects
+```
+
+**Error message:**
+```
+Error: YAML key count exceeded: 10001 (max: 10000). Possible malicious input.
+```
+
+**Rationale**: Processing YAML with millions of keys could exhaust memory. The 10,000 key limit matches the JSON limit, ensuring consistent protection across data formats.
+
 ### UTF-8 Validation
 
 **Protection**: Safe handling of multi-byte Unicode characters

@@ -678,3 +678,258 @@ fn test_json_nested_arrays() {
     // Should not contain actual values
     assert!(!result.contains("[["), "Should not contain array syntax");
 }
+
+// ============================================================================
+// YAML Tests
+// ============================================================================
+
+#[test]
+fn test_yaml_simple_structure() {
+    let source = include_str!("../../../tests/fixtures/yaml/simple.yaml");
+    let result = transform(source, Language::Yaml, Mode::Structure).unwrap();
+
+    // Should contain keys
+    assert!(result.contains("name"));
+    assert!(result.contains("age"));
+    assert!(result.contains("email"));
+    assert!(result.contains("active"));
+
+    // Should NOT contain values
+    assert!(!result.contains("John Doe"));
+    assert!(!result.contains("30"));
+    assert!(!result.contains("john@example.com"));
+    assert!(!result.contains("true"));
+}
+
+#[test]
+fn test_yaml_nested_structure() {
+    let source = include_str!("../../../tests/fixtures/yaml/nested.yaml");
+    let result = transform(source, Language::Yaml, Mode::Structure).unwrap();
+
+    // Should contain nested keys
+    assert!(result.contains("user"));
+    assert!(result.contains("name"));
+    assert!(result.contains("address"));
+    assert!(result.contains("street"));
+    assert!(result.contains("city"));
+    assert!(result.contains("preferences"));
+    assert!(result.contains("theme"));
+    assert!(result.contains("notifications"));
+
+    // Should NOT contain values
+    assert!(!result.contains("John Doe"));
+    assert!(!result.contains("123 Main St"));
+    assert!(!result.contains("dark"));
+    assert!(!result.contains("Springfield"));
+}
+
+#[test]
+fn test_yaml_multi_document() {
+    let source = include_str!("../../../tests/fixtures/yaml/multi-doc.yaml");
+    let result = transform(source, Language::Yaml, Mode::Structure).unwrap();
+
+    // Should contain document separator
+    assert!(
+        result.contains("---"),
+        "Multi-document output should contain ---"
+    );
+
+    // Should contain keys from all documents
+    assert!(result.contains("apiVersion"));
+    assert!(result.contains("kind"));
+    assert!(result.contains("metadata"));
+    assert!(result.contains("name"));
+    assert!(result.contains("data"));
+    assert!(result.contains("spec"));
+    assert!(result.contains("replicas"));
+
+    // Should NOT contain values
+    assert!(!result.contains("ConfigMap"));
+    assert!(!result.contains("Secret"));
+    assert!(!result.contains("Deployment"));
+    assert!(!result.contains("app-config"));
+    assert!(!result.contains("value1"));
+}
+
+#[test]
+fn test_yaml_anchors() {
+    let source = include_str!("../../../tests/fixtures/yaml/anchors.yaml");
+    let result = transform(source, Language::Yaml, Mode::Structure).unwrap();
+
+    // Should contain keys
+    assert!(result.contains("defaults"));
+    assert!(result.contains("development"));
+    assert!(result.contains("production"));
+    assert!(result.contains("adapter"));
+    assert!(result.contains("host"));
+    assert!(result.contains("database"));
+
+    // Should NOT contain values (anchors are resolved)
+    assert!(!result.contains("postgres"));
+    assert!(!result.contains("localhost"));
+    assert!(!result.contains("dev_db"));
+    assert!(!result.contains("prod_db"));
+}
+
+#[test]
+fn test_yaml_modes_identical() {
+    let source = include_str!("../../../tests/fixtures/yaml/simple.yaml");
+
+    // All modes should produce same output for YAML (modes don't apply)
+    let structure = transform(source, Language::Yaml, Mode::Structure).unwrap();
+    let signatures = transform(source, Language::Yaml, Mode::Signatures).unwrap();
+    let types = transform(source, Language::Yaml, Mode::Types).unwrap();
+    let full = transform(source, Language::Yaml, Mode::Full).unwrap();
+
+    // NOTE: YAML ignores mode parameter, always does structure extraction
+    assert_eq!(structure, signatures);
+    assert_eq!(structure, types);
+    assert_eq!(structure, full);
+}
+
+#[test]
+fn test_yaml_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/yaml/simple.yaml");
+    let path = Path::new("config.yaml");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok());
+
+    let content = result.unwrap();
+    assert!(content.contains("name"));
+    assert!(!content.contains("John Doe"));
+}
+
+#[test]
+fn test_yaml_auto_detection_yml() {
+    let source = include_str!("../../../tests/fixtures/yaml/simple.yaml");
+    let path = Path::new("config.yml");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok());
+
+    let content = result.unwrap();
+    assert!(content.contains("name"));
+}
+
+#[test]
+fn test_yaml_invalid() {
+    let source = r#"invalid: [unclosed"#;
+    let result = transform(source, Language::Yaml, Mode::Structure);
+
+    // Should return error for invalid YAML
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Invalid YAML"));
+}
+
+#[test]
+fn test_yaml_deeply_nested_security() {
+    // SECURITY TEST: Ensure deeply nested YAML is rejected
+    // Note: serde_yaml_ng has internal recursion limit (128) which triggers first
+    let mut yaml = String::new();
+    for i in 0..=200 {
+        yaml.push_str(&"  ".repeat(i));
+        yaml.push_str(&format!("level{}: \n", i));
+    }
+    yaml.push_str(&"  ".repeat(201));
+    yaml.push_str("value: end");
+
+    let result = transform(&yaml, Language::Yaml, Mode::Structure);
+
+    // Should reject with depth/recursion limit error
+    assert!(result.is_err(), "Expected error for deeply nested YAML");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("recursion limit")
+            || err_msg.contains("depth exceeded")
+            || err_msg.contains("Invalid YAML"),
+        "Error message should mention recursion/depth limit, got: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_yaml_token_reduction() {
+    let source = include_str!("../../../tests/fixtures/yaml/nested.yaml");
+    let result = transform(source, Language::Yaml, Mode::Structure).unwrap();
+
+    // YAML structure should be significantly smaller than original
+    assert!(result.len() < source.len());
+
+    // Should achieve reasonable reduction
+    let reduction_ratio = (source.len() - result.len()) as f64 / source.len() as f64;
+    assert!(
+        reduction_ratio > 0.30,
+        "Expected >30% reduction, got {:.1}%",
+        reduction_ratio * 100.0
+    );
+}
+
+#[test]
+fn test_yaml_kubernetes_fixture() {
+    let source = include_str!("../../../tests/fixtures/yaml/kubernetes.yaml");
+    let result = transform(source, Language::Yaml, Mode::Structure).unwrap();
+
+    // Kubernetes manifests should be properly processed
+    assert!(result.contains("apiVersion"));
+    assert!(result.contains("kind"));
+    assert!(result.contains("metadata"));
+    assert!(result.contains("spec"));
+
+    // Values should be stripped
+    assert!(!result.contains("apps/v1"));
+    assert!(!result.contains("Deployment"));
+}
+
+#[test]
+fn test_yaml_github_actions_fixture() {
+    let source = include_str!("../../../tests/fixtures/yaml/github-actions.yaml");
+    let result = transform(source, Language::Yaml, Mode::Structure).unwrap();
+
+    // GitHub Actions workflow should be properly processed
+    assert!(result.contains("name"));
+    assert!(result.contains("on"));
+    assert!(result.contains("jobs"));
+    assert!(result.contains("steps"));
+
+    // Values should be stripped
+    assert!(!result.contains("ubuntu-latest"));
+    assert!(!result.contains("actions/checkout"));
+}
+
+#[test]
+fn test_detect_language_yaml() {
+    use rskim_core::detect_language_from_path;
+
+    assert_eq!(
+        detect_language_from_path(Path::new("config.yaml")),
+        Some(Language::Yaml)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("config.yml")),
+        Some(Language::Yaml)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("kubernetes/deployment.yaml")),
+        Some(Language::Yaml)
+    );
+}
+
+#[test]
+fn test_yaml_large_keys_security() {
+    // SECURITY TEST: Ensure YAML with >10,000 keys is rejected
+    let mut yaml = String::new();
+    for i in 0..10_001 {
+        yaml.push_str(&format!("key_{}: {}\n", i, i));
+    }
+
+    let result = transform(&yaml, Language::Yaml, Mode::Structure);
+
+    assert!(result.is_err(), "Expected error for excessive keys");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("key count exceeded"),
+        "Error message should mention key count limit, got: {}",
+        err_msg
+    );
+}
