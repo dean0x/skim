@@ -1,0 +1,36 @@
+{
+  "name": "rskim",
+  "version": "0.0.0",
+  "description": "Smart code reader - streaming code transformation for AI agents",
+  "keywords": ["code", "ast", "tree-sitter", "llm", "transformation"],
+  "author": "Skim Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/skim.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dean0x/skim/issues"
+  },
+  "homepage": "https://github.com/dean0x/skim#readme",
+  "bin": {
+    "skim": "bin/skim",
+    "rskim": "bin/skim"
+  },
+  "files": ["bin", "scripts"],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "@rskim/cli-darwin-arm64": "0.0.0",
+    "@rskim/cli-darwin-x64": "0.0.0",
+    "@rskim/cli-linux-arm64": "0.0.0",
+    "@rskim/cli-linux-x64": "0.0.0",
+    "@rskim/cli-linux-arm64-musl": "0.0.0",
+    "@rskim/cli-linux-x64-musl": "0.0.0",
+    "@rskim/cli-win32-x64": "0.0.0"
+  }
+}

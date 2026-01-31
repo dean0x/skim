@@ -1,0 +1,14 @@
+{
+  "name": "@rskim/cli-linux-arm64",
+  "version": "0.0.0",
+  "description": "rskim native binary for Linux ARM64 (glibc)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/skim.git"
+  },
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["glibc"],
+  "files": ["skim"]
+}

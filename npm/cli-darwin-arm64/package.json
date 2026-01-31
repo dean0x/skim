@@ -1,0 +1,13 @@
+{
+  "name": "@rskim/cli-darwin-arm64",
+  "version": "0.0.0",
+  "description": "rskim native binary for macOS ARM64 (Apple Silicon)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/skim.git"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["skim"]
+}

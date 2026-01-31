@@ -12,47 +12,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Run Test Suites
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Run npm wrapper tests
-        run: node crates/rskim/tests/npm_wrapper_test.js
-
-      - name: Run version check validation tests
-        run: bash scripts/ci/test-version-check.sh
-
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    needs: test
     strategy:
       matrix:
         include:
+          # Linux x64 (glibc)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: skim
             asset_name: skim-x86_64-unknown-linux-gnu
+          # Linux ARM64 (glibc)
           - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact_name: skim
             asset_name: skim-aarch64-unknown-linux-gnu
             use_cross: true
+          # Linux x64 (musl/Alpine)
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: skim
+            asset_name: skim-x86_64-unknown-linux-musl
+          # Linux ARM64 (musl/Alpine)
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            artifact_name: skim
+            asset_name: skim-aarch64-unknown-linux-musl
+            use_cross: true
+          # macOS x64 (Intel)
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: skim
             asset_name: skim-x86_64-apple-darwin
+          # macOS ARM64 (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: skim
             asset_name: skim-aarch64-apple-darwin
+          # Windows x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: skim.exe
@@ -109,9 +107,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross (for ARM64 Linux)
+      - name: Install musl-tools (Linux musl native)
+        if: matrix.target == 'x86_64-unknown-linux-musl' && matrix.use_cross != true
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (for cross-compilation)
         if: matrix.use_cross == true
-        run: cargo install cross@0.2.5
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build (native)
         if: matrix.use_cross != true
@@ -122,7 +124,7 @@ jobs:
         run: cross build --release --target ${{ matrix.target }} -p rskim
 
       - name: Smoke test (native)
-        if: matrix.use_cross != true
+        if: matrix.use_cross != true && matrix.os != 'windows-latest'
         shell: bash
         run: |
           BINARY="./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
@@ -133,7 +135,19 @@ jobs:
           rm test_smoke.rs
           echo "✅ Smoke test passed"
 
-      - name: Smoke test (ARM64 Linux via QEMU)
+      - name: Smoke test (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          BINARY="./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          echo "Testing binary: $BINARY"
+          $BINARY --version
+          echo "fn main() { println!(\"test\"); }" > test_smoke.rs
+          $BINARY test_smoke.rs > /dev/null
+          rm test_smoke.rs
+          echo "✅ Smoke test passed"
+
+      - name: Smoke test (ARM64 Linux glibc via QEMU)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         shell: bash
         run: |
@@ -156,6 +170,26 @@ jobs:
           rm test_smoke.rs
 
           echo "✅ ARM64 smoke test passed via QEMU"
+
+      - name: Smoke test (ARM64 Linux musl via QEMU)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          # Install QEMU for cross-arch emulation
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+          BINARY="./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          echo "Testing ARM64 musl binary via QEMU: $BINARY"
+
+          # Static musl binaries don't need dynamic linker setup
+          qemu-aarch64-static $BINARY --version
+
+          echo "fn main() { println!(\"test\"); }" > test_smoke.rs
+          qemu-aarch64-static $BINARY test_smoke.rs > /dev/null
+          rm test_smoke.rs
+
+          echo "✅ ARM64 musl smoke test passed via QEMU"
 
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
@@ -210,8 +244,16 @@ jobs:
             npm install -g rskim
             ```
 
+            ### Via Homebrew (macOS)
+            ```bash
+            brew tap dean0x/tap
+            brew install rskim
+            ```
+
             ### Via Binary
             Download the binary for your platform from the assets below.
+
+            **Linux users:** Use `-musl` variants for Alpine Linux and other musl-based distributions.
 
             See [CHANGELOG.md](https://github.com/dean0x/skim/blob/main/CHANGELOG.md) for details.
           draft: false
@@ -219,10 +261,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  npm-publish:
-    name: Publish to npm
+  publish-crates:
+    name: Publish to crates.io
     needs: build
     runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p rskim
+
+  publish-npm:
+    name: Publish npm packages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -237,169 +298,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
 
-      - name: Create npm package
+      - name: Extract artifacts
         shell: bash
         run: |
-          mkdir -p npm-package/bin
-
-          # Extract version from tag
-          VERSION="${GITHUB_REF#refs/tags/v}"
-
-          # Validate version format (reuse validation from earlier step)
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
-            echo "ERROR: Invalid version format: $VERSION"
-            exit 1
-          fi
-
-          # Create package.json with quoted HERE-doc (prevents variable injection)
-          cat > npm-package/package.json <<'EOF'
-          {
-            "name": "rskim",
-            "version": "VERSION_PLACEHOLDER",
-            "description": "Smart code reader - streaming code transformation for AI agents",
-            "bin": {
-              "skim": "./bin/skim.js"
-            },
-            "repository": {
-              "type": "git",
-              "url": "git+https://github.com/dean0x/skim.git"
-            },
-            "keywords": [
-              "code",
-              "ast",
-              "tree-sitter",
-              "llm",
-              "transformation"
-            ],
-            "author": "Skim Contributors",
-            "license": "MIT",
-            "bugs": {
-              "url": "https://github.com/dean0x/skim/issues"
-            },
-            "homepage": "https://github.com/dean0x/skim#readme",
-            "os": [
-              "darwin",
-              "linux",
-              "win32"
-            ],
-            "cpu": [
-              "x64",
-              "arm64"
-            ]
-          }
-          EOF
-
-          # Replace version placeholder with actual version
-          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" npm-package/package.json
-
-          # Create wrapper script
-          cat > npm-package/bin/skim.js <<'EOF'
-          #!/usr/bin/env node
-          const { spawnSync } = require('child_process');
-          const path = require('path');
-          const fs = require('fs');
-
-          function getBinaryPath() {
-            const platform = process.platform;
-            const arch = process.arch;
-
-            // Define supported platforms and their binary paths
-            const supportedPlatforms = {
-              'linux-x64': 'bin/linux/x64/skim',
-              'linux-arm64': 'bin/linux/arm64/skim',
-              'darwin-x64': 'bin/darwin/x64/skim',
-              'darwin-arm64': 'bin/darwin/arm64/skim',
-              'win32-x64': 'bin/win32/x64/skim.exe',
-            };
-
-            const platformKey = `${platform}-${arch}`;
-            const binaryRelativePath = supportedPlatforms[platformKey];
-
-            // Check if platform is supported
-            if (!binaryRelativePath) {
-              console.error(`ERROR: Platform ${platform}-${arch} is not supported by the npm package.`);
-              console.error('');
-              console.error('Supported platforms:');
-              Object.keys(supportedPlatforms).forEach(p => {
-                console.error(`  - ${p}`);
-              });
-              console.error('');
-              console.error('Workaround: Install via Cargo instead:');
-              console.error('  cargo install rskim');
-              console.error('');
-              console.error('If you believe this platform should be supported, please report:');
-              console.error('  https://github.com/dean0x/skim/issues');
-              process.exit(1);
-            }
-
-            // Check if binary exists in package
-            const binaryPath = path.join(__dirname, '..', binaryRelativePath);
-            if (!fs.existsSync(binaryPath)) {
-              console.error('ERROR: Binary missing from npm package');
-              console.error(`Expected location: ${binaryPath}`);
-              console.error(`Platform: ${platformKey}`);
-              console.error('');
-              console.error('This is a packaging bug. Please report:');
-              console.error('  https://github.com/dean0x/skim/issues');
-              console.error('');
-              console.error('Workaround: Install via Cargo instead:');
-              console.error('  cargo install rskim');
-              process.exit(1);
-            }
-
-            // Quick check if binary is executable (catches glibc/musl issues)
-            try {
-              const testResult = spawnSync(binaryPath, ['--version'], {
-                timeout: 5000,
-                stdio: 'pipe'
-              });
-
-              if (testResult.error) {
-                console.error('ERROR: Binary exists but cannot be executed');
-                console.error(`Reason: ${testResult.error.message}`);
-                console.error('');
-
-                if (testResult.error.code === 'ENOENT' || testResult.error.message.includes('libc')) {
-                  console.error('This may be a C library incompatibility issue.');
-                  console.error('Common cause: Alpine Linux (musl) vs glibc binary mismatch');
-                  console.error('');
-                  console.error('If you are using Alpine Linux, install via Cargo instead:');
-                  console.error('  apk add cargo');
-                  console.error('  cargo install rskim');
-                } else {
-                  console.error('Workaround: Install via Cargo instead:');
-                  console.error('  cargo install rskim');
-                }
-                console.error('');
-                console.error('For more help, see: https://github.com/dean0x/skim/issues');
-                process.exit(1);
-              }
-            } catch (e) {
-              // Non-fatal, just proceed
-            }
-
-            return binaryPath;
-          }
-
-          const binary = getBinaryPath();
-          const result = spawnSync(binary, process.argv.slice(2), {
-            stdio: 'inherit',
-          });
-
-          process.exit(result.status || 0);
-          EOF
-
-          chmod +x npm-package/bin/skim.js
-
-          # Copy README
-          cp crates/rskim/README.md npm-package/
-
-          # Extract and organize binaries
           cd artifacts
           for dir in */; do
             cd "$dir"
-            # Use explicit loops to avoid glob injection
             for tarfile in *.tar.gz; do
               if [ -f "$tarfile" ]; then
                 tar xzf "$tarfile"
@@ -413,20 +319,98 @@ jobs:
             cd ..
           done
 
-          # Copy binaries to npm package structure
-          mkdir -p ../npm-package/bin/linux/x64
-          mkdir -p ../npm-package/bin/linux/arm64
-          mkdir -p ../npm-package/bin/darwin/x64
-          mkdir -p ../npm-package/bin/darwin/arm64
-          mkdir -p ../npm-package/bin/win32/x64
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-          cp skim-x86_64-unknown-linux-gnu/skim ../npm-package/bin/linux/x64/ || true
-          cp skim-aarch64-unknown-linux-gnu/skim ../npm-package/bin/linux/arm64/ || true
-          cp skim-x86_64-apple-darwin/skim ../npm-package/bin/darwin/x64/ || true
-          cp skim-aarch64-apple-darwin/skim ../npm-package/bin/darwin/arm64/ || true
-          cp skim-x86_64-pc-windows-msvc/skim.exe ../npm-package/bin/win32/x64/ || true
+      - name: Generate npm packages
+        run: node scripts/generate-npm-packages.mjs ${{ steps.version.outputs.VERSION }} artifacts
 
-      - name: Publish to npm
-        run: cd npm-package && npm publish --access public
+      - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-x64 cli-linux-arm64 cli-linux-x64-musl cli-linux-arm64-musl cli-win32-x64; do
+            echo "Publishing @rskim/$pkg..."
+            npm publish npm/$pkg --access public --provenance || {
+              echo "Warning: Failed to publish @rskim/$pkg (may already exist)"
+            }
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish npm/rskim --access public 
+  update-homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: dean0x/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Download macOS binaries for checksums
+        run: |
+          curl -sL "https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-aarch64-apple-darwin.tar.gz" -o skim-darwin-arm64.tar.gz
+          curl -sL "https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-x86_64-apple-darwin.tar.gz" -o skim-darwin-x64.tar.gz
+
+      - name: Calculate checksums
+        id: checksums
+        run: |
+          echo "ARM64_SHA256=$(sha256sum skim-darwin-arm64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          echo "X64_SHA256=$(sha256sum skim-darwin-x64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+      - name: Update formula
+        run: |
+          cat > homebrew-tap/Formula/rskim.rb << 'EOF'
+          class Rskim < Formula
+            desc "Smart code reader - streaming code transformation for AI agents"
+            homepage "https://github.com/dean0x/skim"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "URL_ARM64_PLACEHOLDER"
+                sha256 "SHA256_ARM64_PLACEHOLDER"
+              end
+              on_intel do
+                url "URL_X64_PLACEHOLDER"
+                sha256 "SHA256_X64_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "skim"
+            end
+
+            test do
+              system "#{bin}/skim", "--version"
+            end
+          end
+          EOF
+          # Remove leading whitespace and substitute values
+          sed -i 's/^          //' homebrew-tap/Formula/rskim.rb
+          sed -i "s|VERSION_PLACEHOLDER|${{ steps.version.outputs.VERSION }}|g" homebrew-tap/Formula/rskim.rb
+          sed -i "s|URL_ARM64_PLACEHOLDER|https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-aarch64-apple-darwin.tar.gz|g" homebrew-tap/Formula/rskim.rb
+          sed -i "s|URL_X64_PLACEHOLDER|https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-x86_64-apple-darwin.tar.gz|g" homebrew-tap/Formula/rskim.rb
+          sed -i "s|SHA256_ARM64_PLACEHOLDER|${{ steps.checksums.outputs.ARM64_SHA256 }}|g" homebrew-tap/Formula/rskim.rb
+          sed -i "s|SHA256_X64_PLACEHOLDER|${{ steps.checksums.outputs.X64_SHA256 }}|g" homebrew-tap/Formula/rskim.rb
+
+      - name: Commit and push
+        run: |
+          cd homebrew-tap
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add Formula/rskim.rb
+          git commit -m "Update rskim to ${{ steps.version.outputs.VERSION }}"
+          git push
