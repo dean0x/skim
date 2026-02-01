@@ -1,0 +1,244 @@
+#!/usr/bin/env node
+const { spawnSync, execSync } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+/**
+ * Cached result for musl detection (null = not yet computed)
+ */
+let _muslCached = null;
+
+/**
+ * Detect if running on musl-based Linux (Alpine, Void, etc.)
+ * Result is cached at module level since it cannot change during execution.
+ *
+ * ARCHITECTURE NOTE: This function is intentionally duplicated in scripts/postinstall.js.
+ * Postinstall scripts run before node_modules is fully available, so that script
+ * must be self-contained with no external dependencies. Do not extract to a shared
+ * module - it would break postinstall execution.
+ */
+function isMusl() {
+  if (_muslCached !== null) {
+    return _muslCached;
+  }
+  _muslCached = detectMusl();
+  return _muslCached;
+}
+
+/**
+ * Internal musl detection logic
+ */
+function detectMusl() {
+  if (process.platform !== 'linux') {
+    return false;
+  }
+
+  // Check for Alpine Linux (most common musl distro)
+  try {
+    const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
+    if (osRelease.includes('Alpine')) {
+      return true;
+    }
+  } catch {
+    // File doesn't exist, continue checking
+  }
+
+  // Check ldd output for musl
+  try {
+    const lddOutput = execSync('ldd --version 2>&1 || true', { encoding: 'utf8' });
+    if (lddOutput.includes('musl')) {
+      return true;
+    }
+  } catch {
+    // ldd not available, continue checking
+  }
+
+  // Check for musl dynamic linker
+  try {
+    const files = fs.readdirSync('/lib');
+    if (files.some(f => f.startsWith('ld-musl'))) {
+      return true;
+    }
+  } catch {
+    // /lib doesn't exist or not readable
+  }
+
+  return false;
+}
+
+/**
+ * Get the platform-specific package name
+ */
+function getPlatformPackage() {
+  const platform = process.platform;
+  const arch = process.arch;
+  const musl = isMusl();
+
+  const packages = {
+    'darwin-arm64': '@rskim/cli-darwin-arm64',
+    'darwin-x64': '@rskim/cli-darwin-x64',
+    'linux-arm64': musl ? '@rskim/cli-linux-arm64-musl' : '@rskim/cli-linux-arm64',
+    'linux-x64': musl ? '@rskim/cli-linux-x64-musl' : '@rskim/cli-linux-x64',
+    'win32-x64': '@rskim/cli-win32-x64',
+  };
+
+  const key = `${platform}-${arch}`;
+  return packages[key];
+}
+
+/**
+ * Find installed platform package binary using walktree algorithm.
+ *
+ * Walks up the directory tree looking for node_modules containing the platform package.
+ * This approach is package-manager agnostic and works with npm, pnpm, yarn (classic & berry),
+ * bun, and arbitrary monorepo nesting depths.
+ */
+function findPlatformBinary(packageName) {
+  if (!packageName) {
+    return null;
+  }
+
+  const binaryName = process.platform === 'win32' ? 'skim.exe' : 'skim';
+  let currentDir = __dirname;
+
+  // Walk up the directory tree looking for node_modules
+  for (let i = 0; i < 10; i++) {
+    const candidate = path.join(currentDir, 'node_modules', packageName, binaryName);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    const parent = path.dirname(currentDir);
+    if (parent === currentDir) break; // Hit filesystem root
+    currentDir = parent;
+  }
+
+  return null;
+}
+
+/**
+ * Find fallback binary in local bin directory (from postinstall)
+ */
+function findFallbackBinary() {
+  const binaryName = process.platform === 'win32' ? 'skim.exe' : 'skim';
+  const fallbackPath = path.join(__dirname, binaryName);
+
+  if (fs.existsSync(fallbackPath)) {
+    return fallbackPath;
+  }
+
+  return null;
+}
+
+/**
+ * Get the binary path, with helpful error messages
+ */
+function getBinaryPath() {
+  const platform = process.platform;
+  const arch = process.arch;
+  const musl = isMusl();
+
+  // Get the platform-specific package
+  const packageName = getPlatformPackage();
+
+  if (!packageName) {
+    console.error(`ERROR: Platform ${platform}-${arch} is not supported.`);
+    console.error('');
+    console.error('Supported platforms:');
+    console.error('  - darwin-arm64 (macOS Apple Silicon)');
+    console.error('  - darwin-x64 (macOS Intel)');
+    console.error('  - linux-arm64 (Linux ARM64, glibc)');
+    console.error('  - linux-arm64-musl (Linux ARM64, Alpine/musl)');
+    console.error('  - linux-x64 (Linux x64, glibc)');
+    console.error('  - linux-x64-musl (Linux x64, Alpine/musl)');
+    console.error('  - win32-x64 (Windows x64)');
+    console.error('');
+    console.error('Workaround: Install via Cargo instead:');
+    console.error('  cargo install rskim');
+    console.error('');
+    console.error('Report issues: https://github.com/dean0x/skim/issues');
+    process.exit(1);
+  }
+
+  // Try to find the platform package binary
+  let binaryPath = findPlatformBinary(packageName);
+
+  // Fallback to local binary (from postinstall)
+  if (!binaryPath) {
+    binaryPath = findFallbackBinary();
+  }
+
+  if (!binaryPath) {
+    console.error(`ERROR: Could not find skim binary.`);
+    console.error('');
+    console.error(`Expected platform package: ${packageName}`);
+    if (musl) {
+      console.error('Detected: musl-based Linux (Alpine, Void, etc.)');
+    }
+    console.error('');
+    console.error('The platform-specific package may have failed to install.');
+    console.error('This can happen with npm\'s optional dependencies.');
+    console.error('');
+    console.error('Try reinstalling:');
+    console.error('  npm uninstall -g rskim && npm install -g rskim');
+    console.error('');
+    console.error('Or install via Cargo:');
+    console.error('  cargo install rskim');
+    console.error('');
+    console.error('Report issues: https://github.com/dean0x/skim/issues');
+    process.exit(1);
+  }
+
+  // Verify binary is executable
+  try {
+    const testResult = spawnSync(binaryPath, ['--version'], {
+      timeout: 5000,
+      stdio: 'pipe',
+    });
+
+    if (testResult.error) {
+      const errorMsg = testResult.error.message || '';
+
+      console.error('ERROR: Binary exists but cannot be executed.');
+      console.error(`Path: ${binaryPath}`);
+      console.error(`Error: ${errorMsg}`);
+      console.error('');
+
+      if (errorMsg.includes('ENOENT') || errorMsg.includes('libc') || errorMsg.includes('GLIBC')) {
+        console.error('This appears to be a C library compatibility issue.');
+        if (musl) {
+          console.error('You are on musl-based Linux but may have a glibc binary.');
+        } else {
+          console.error('You may be on Alpine/musl but have a glibc binary.');
+        }
+        console.error('');
+        console.error('For Alpine Linux:');
+        console.error('  apk add cargo');
+        console.error('  cargo install rskim');
+      } else {
+        console.error('Workaround: Install via Cargo:');
+        console.error('  cargo install rskim');
+      }
+      console.error('');
+      console.error('Report issues: https://github.com/dean0x/skim/issues');
+      process.exit(1);
+    }
+  } catch {
+    // Non-fatal, proceed with execution
+  }
+
+  return binaryPath;
+}
+
+// Main execution
+const binaryPath = getBinaryPath();
+const result = spawnSync(binaryPath, process.argv.slice(2), {
+  stdio: 'inherit',
+});
+
+if (result.error) {
+  console.error(`ERROR: Failed to execute skim: ${result.error.message}`);
+  process.exit(1);
+}
+
+process.exit(result.status || 0);
