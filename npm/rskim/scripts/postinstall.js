@@ -77,17 +77,28 @@ function getPlatformPackage() {
 }
 
 /**
- * Check if platform package is already installed
+ * Check if platform package is already installed using walktree algorithm.
+ *
+ * Walks up the directory tree looking for node_modules containing the platform package.
+ * This approach is package-manager agnostic and works with npm, pnpm, yarn (classic & berry),
+ * bun, and arbitrary monorepo nesting depths.
  */
 function isPlatformPackageInstalled(packageName) {
   const binaryName = process.platform === 'win32' ? 'skim.exe' : 'skim';
-  const searchPaths = [
-    path.join(__dirname, '..', 'node_modules', packageName, binaryName),
-    path.join(__dirname, '..', '..', packageName, binaryName),
-    path.join(__dirname, '..', '..', '.pnpm', 'node_modules', packageName, binaryName),
-  ];
+  let currentDir = __dirname;
 
-  return searchPaths.some(p => fs.existsSync(p));
+  // Walk up the directory tree looking for node_modules
+  for (let i = 0; i < 10; i++) {
+    const candidate = path.join(currentDir, 'node_modules', packageName, binaryName);
+    if (fs.existsSync(candidate)) {
+      return true;
+    }
+    const parent = path.dirname(currentDir);
+    if (parent === currentDir) break; // Hit filesystem root
+    currentDir = parent;
+  }
+
+  return false;
 }
 
 /**

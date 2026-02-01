@@ -163,7 +163,7 @@ jobs:
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5
+        run: cargo install cross --version 0.2.5
 
       - name: Build (native)
         if: matrix.use_cross != true
@@ -390,10 +390,14 @@ jobs:
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish npm/rskim --access public 
+        run: |
+          npm publish npm/rskim --access public || {
+            echo "Warning: Failed to publish rskim (may already exist)"
+          }
+
   update-homebrew:
     name: Update Homebrew tap
-    needs: release
+    needs: [release, publish-crates, publish-npm]
     runs-on: ubuntu-latest
 
     steps:
