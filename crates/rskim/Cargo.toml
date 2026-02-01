@@ -1,6 +1,6 @@
 [package]
 name = "rskim"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -13,7 +13,7 @@ name = "skim"
 path = "src/main.rs"
 
 [dependencies]
-rskim-core = { version = "0.8.0", path = "../rskim-core" }
+rskim-core = { version = "0.9.0", path = "../rskim-core" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 glob = { workspace = true }
