@@ -5,9 +5,31 @@ const fs = require('fs');
 const os = require('os');
 
 /**
+ * Cached result for musl detection (null = not yet computed)
+ */
+let _muslCached = null;
+
+/**
  * Detect if running on musl-based Linux (Alpine, Void, etc.)
+ * Result is cached at module level since it cannot change during execution.
+ *
+ * ARCHITECTURE NOTE: This function is intentionally duplicated in scripts/postinstall.js.
+ * Postinstall scripts run before node_modules is fully available, so that script
+ * must be self-contained with no external dependencies. Do not extract to a shared
+ * module - it would break postinstall execution.
  */
 function isMusl() {
+  if (_muslCached !== null) {
+    return _muslCached;
+  }
+  _muslCached = detectMusl();
+  return _muslCached;
+}
+
+/**
+ * Internal musl detection logic
+ */
+function detectMusl() {
   if (process.platform !== 'linux') {
     return false;
   }

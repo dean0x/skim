@@ -16,6 +16,11 @@ const os = require('os');
 
 /**
  * Detect if running on musl-based Linux
+ *
+ * ARCHITECTURE NOTE: This function is intentionally duplicated in bin/skim.
+ * Postinstall scripts run before node_modules is fully available, so this script
+ * must be self-contained with no external dependencies. Do not extract to a shared
+ * module - it would break postinstall execution.
  */
 function isMusl() {
   if (process.platform !== 'linux') {
@@ -95,6 +100,28 @@ function isFallbackInstalled() {
 }
 
 /**
+ * Trusted domains for redirect validation.
+ * Only follow redirects to these domains to prevent redirect attacks.
+ */
+const TRUSTED_DOMAINS = [
+  'registry.npmjs.org',
+  'registry.yarnpkg.com',
+  'registry.npmmirror.com',
+];
+
+/**
+ * Validate that a URL is within trusted domains
+ */
+function isUrlTrusted(urlString) {
+  try {
+    const url = new URL(urlString);
+    return TRUSTED_DOMAINS.some(domain => url.hostname === domain || url.hostname.endsWith('.' + domain));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Download file with redirect handling
  */
 function downloadToFile(url, destPath, maxRedirects = 5) {
@@ -110,7 +137,15 @@ function downloadToFile(url, destPath, maxRedirects = 5) {
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
         file.close();
         fs.unlinkSync(destPath);
-        downloadToFile(response.headers.location, destPath, maxRedirects - 1)
+
+        // Validate redirect URL stays within trusted domains
+        const redirectUrl = response.headers.location;
+        if (!isUrlTrusted(redirectUrl)) {
+          reject(new Error(`Redirect to untrusted domain blocked: ${redirectUrl}`));
+          return;
+        }
+
+        downloadToFile(redirectUrl, destPath, maxRedirects - 1)
           .then(resolve)
           .catch(reject);
         return;
@@ -143,10 +178,12 @@ function downloadToFile(url, destPath, maxRedirects = 5) {
 
 /**
  * Get the npm registry tarball URL for a package
+ * Uses the abbreviated metadata endpoint (/{package}/{version}) for efficiency.
  */
 async function getPackageTarballUrl(packageName, version) {
   return new Promise((resolve, reject) => {
-    const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}`;
+    // Use abbreviated metadata endpoint - returns only the specific version data
+    const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}/${encodeURIComponent(version)}`;
 
     https.get(url, (response) => {
       if (response.statusCode !== 200) {
@@ -158,10 +195,9 @@ async function getPackageTarballUrl(packageName, version) {
       response.on('data', chunk => data += chunk);
       response.on('end', () => {
         try {
-          const pkg = JSON.parse(data);
-          const versionData = pkg.versions[version];
-          if (!versionData) {
-            reject(new Error(`Version ${version} not found for ${packageName}`));
+          const versionData = JSON.parse(data);
+          if (!versionData.dist || !versionData.dist.tarball) {
+            reject(new Error(`Tarball URL not found for ${packageName}@${version}`));
             return;
           }
           resolve(versionData.dist.tarball);
