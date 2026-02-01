@@ -394,7 +394,7 @@ jobs:
         run: |
           for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-x64 cli-linux-arm64 cli-linux-x64-musl cli-linux-arm64-musl cli-win32-x64; do
             echo "Publishing @rskim/$pkg..."
-            npm publish npm/$pkg --access public || {
+            npm publish ./npm/$pkg --access public || {
               echo "Warning: Failed to publish @rskim/$pkg (may already exist)"
             }
           done
@@ -403,7 +403,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish npm/rskim --access public || {
+          npm publish ./npm/rskim --access public || {
             echo "Warning: Failed to publish rskim (may already exist)"
           }
 
