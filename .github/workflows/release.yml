@@ -362,18 +362,24 @@ jobs:
         shell: bash
         run: |
           cd artifacts
-          # With merge-multiple: true, files are flattened (no subdirs)
+          # Extract each archive into a subdirectory matching artifact name
+          # e.g., skim-aarch64-apple-darwin.tar.gz -> skim-aarch64-apple-darwin/skim
           for tarfile in *.tar.gz; do
             if [ -f "$tarfile" ]; then
-              tar xzf "$tarfile"
+              dirname="${tarfile%.tar.gz}"
+              mkdir -p "$dirname"
+              tar xzf "$tarfile" -C "$dirname"
             fi
           done
           for zipfile in *.zip; do
             if [ -f "$zipfile" ]; then
-              unzip -q "$zipfile"
+              dirname="${zipfile%.zip}"
+              mkdir -p "$dirname"
+              unzip -q "$zipfile" -d "$dirname"
             fi
           done
-          ls -la
+          echo "Extracted artifacts:"
+          ls -la */
 
       - name: Get version from tag
         id: version
