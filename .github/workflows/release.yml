@@ -325,7 +325,15 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish -p rskim
+        run: |
+          # Publish rskim-core first (rskim depends on it)
+          cargo publish -p rskim-core --allow-dirty || {
+            echo "Warning: rskim-core publish failed (may already exist)"
+          }
+          # Wait for crates.io to index the new version
+          sleep 30
+          # Then publish rskim
+          cargo publish -p rskim --allow-dirty
 
   publish-npm:
     name: Publish npm packages
@@ -354,20 +362,18 @@ jobs:
         shell: bash
         run: |
           cd artifacts
-          for dir in */; do
-            cd "$dir"
-            for tarfile in *.tar.gz; do
-              if [ -f "$tarfile" ]; then
-                tar xzf "$tarfile"
-              fi
-            done
-            for zipfile in *.zip; do
-              if [ -f "$zipfile" ]; then
-                unzip -q "$zipfile"
-              fi
-            done
-            cd ..
+          # With merge-multiple: true, files are flattened (no subdirs)
+          for tarfile in *.tar.gz; do
+            if [ -f "$tarfile" ]; then
+              tar xzf "$tarfile"
+            fi
           done
+          for zipfile in *.zip; do
+            if [ -f "$zipfile" ]; then
+              unzip -q "$zipfile"
+            fi
+          done
+          ls -la
 
       - name: Get version from tag
         id: version
