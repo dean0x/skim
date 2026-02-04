@@ -407,76 +407,19 @@ jobs:
             echo "Warning: Failed to publish rskim (may already exist)"
           }
 
-  update-homebrew:
-    name: Update Homebrew tap
+  trigger-homebrew:
+    name: Trigger Homebrew update
     needs: [release, publish-crates, publish-npm]
     runs-on: ubuntu-latest
-
     steps:
       - name: Get version from tag
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Checkout homebrew-tap
-        uses: actions/checkout@v4
-        with:
-          repository: dean0x/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: homebrew-tap
-
-      - name: Download macOS binaries for checksums
+      - name: Trigger formula update
         run: |
-          curl -sL "https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-aarch64-apple-darwin.tar.gz" -o skim-darwin-arm64.tar.gz
-          curl -sL "https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-x86_64-apple-darwin.tar.gz" -o skim-darwin-x64.tar.gz
-
-      - name: Calculate checksums
-        id: checksums
-        run: |
-          echo "ARM64_SHA256=$(sha256sum skim-darwin-arm64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-          echo "X64_SHA256=$(sha256sum skim-darwin-x64.tar.gz | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-
-      - name: Update formula
-        run: |
-          cat > homebrew-tap/Formula/rskim.rb << 'EOF'
-          class Rskim < Formula
-            desc "Smart code reader - streaming code transformation for AI agents"
-            homepage "https://github.com/dean0x/skim"
-            version "VERSION_PLACEHOLDER"
-            license "MIT"
-
-            on_macos do
-              on_arm do
-                url "URL_ARM64_PLACEHOLDER"
-                sha256 "SHA256_ARM64_PLACEHOLDER"
-              end
-              on_intel do
-                url "URL_X64_PLACEHOLDER"
-                sha256 "SHA256_X64_PLACEHOLDER"
-              end
-            end
-
-            def install
-              bin.install "skim"
-            end
-
-            test do
-              system "#{bin}/skim", "--version"
-            end
-          end
-          EOF
-          # Remove leading whitespace and substitute values
-          sed -i 's/^          //' homebrew-tap/Formula/rskim.rb
-          sed -i "s|VERSION_PLACEHOLDER|${{ steps.version.outputs.VERSION }}|g" homebrew-tap/Formula/rskim.rb
-          sed -i "s|URL_ARM64_PLACEHOLDER|https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-aarch64-apple-darwin.tar.gz|g" homebrew-tap/Formula/rskim.rb
-          sed -i "s|URL_X64_PLACEHOLDER|https://github.com/dean0x/skim/releases/download/v${{ steps.version.outputs.VERSION }}/skim-x86_64-apple-darwin.tar.gz|g" homebrew-tap/Formula/rskim.rb
-          sed -i "s|SHA256_ARM64_PLACEHOLDER|${{ steps.checksums.outputs.ARM64_SHA256 }}|g" homebrew-tap/Formula/rskim.rb
-          sed -i "s|SHA256_X64_PLACEHOLDER|${{ steps.checksums.outputs.X64_SHA256 }}|g" homebrew-tap/Formula/rskim.rb
-
-      - name: Commit and push
-        run: |
-          cd homebrew-tap
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git add Formula/rskim.rb
-          git commit -m "Update rskim to ${{ steps.version.outputs.VERSION }}"
-          git push
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.HOMEBREW_TAP_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/dean0x/homebrew-tap/dispatches \
+            -d '{"event_type":"update-formula","client_payload":{"formula":"rskim","version":"${{ steps.version.outputs.VERSION }}"}}'
