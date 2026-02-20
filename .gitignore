@@ -42,3 +42,6 @@ criterion/
 
 # Cache
 .cache/
+
+# Launch materials (marketing)
+/launch/
