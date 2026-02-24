@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "skim",
+  "description": "Skim - Smart code reader for AI agents",
+  "owner": {
+    "name": "Dean Keren",
+    "email": "dean@keren.dev"
+  },
+  "plugins": [
+    {
+      "name": "skimmer",
+      "source": "./plugins/skimmer",
+      "description": "Codebase orientation agent powered by rskim - understand project structure, find relevant code, plan integration",
+      "version": "1.0.0",
+      "keywords": ["codebase", "orientation", "structure", "code-reader", "agent"]
+    }
+  ]
+}

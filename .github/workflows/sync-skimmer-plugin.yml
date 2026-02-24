@@ -1,0 +1,29 @@
+name: Sync Skimmer Plugin
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/skimmer/**'
+
+jobs:
+  sync:
+    name: Sync to dean0x/skimmer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push plugin subtree to standalone repo
+        env:
+          GITHUB_TOKEN: ${{ secrets.SKIMMER_DEPLOY_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Extract the plugins/skimmer subtree into a temporary branch
+          git subtree split --prefix=plugins/skimmer -b skimmer-standalone
+
+          # Push to the standalone repo
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/dean0x/skimmer.git" skimmer-standalone:main --force

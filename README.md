@@ -355,6 +355,32 @@ skim src/auth/ | less
 
 📖 **[10 Detailed Use Cases →](docs/use-cases.md)**
 
+## Claude Code Plugin
+
+Skim ships a Claude Code plugin that adds a `/skim` command and Skimmer agent for codebase orientation directly inside Claude Code sessions.
+
+### Install
+
+```bash
+# Add the skim marketplace
+/plugin marketplace add dean0x/skim
+
+# Install the skimmer plugin
+/plugin install skimmer
+```
+
+### Usage
+
+```bash
+# Orient for a specific task
+/skim add JWT authentication
+
+# General codebase orientation
+/skim
+```
+
+The Skimmer agent maps project structure, finds task-relevant code, and generates an integration plan — all powered by `rskim` under the hood.
+
 ## Caching
 
 **Caching is enabled by default** for 40-50x faster repeated processing.
