@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - 'plugins/skimmer/**'
+      - '.github/workflows/sync-skimmer-plugin.yml'
+  workflow_dispatch:
 
 jobs:
   sync:
