@@ -7,9 +7,9 @@
   },
   "version": "1.0.0",
   "homepage": "https://github.com/dean0x/skim",
-  "repository": "https://github.com/dean0x/skim",
+  "repository": "https://github.com/dean0x/skimmer",
   "license": "MIT",
   "keywords": ["codebase", "orientation", "structure", "code-reader"],
-  "agents": [],
-  "skills": []
+  "agents": ["./agents/skimmer.md"],
+  "commands": ["./commands/skim.md"]
 }
