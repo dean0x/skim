@@ -4,12 +4,12 @@
 
 Skim transforms source code by removing implementation details while preserving structure, signatures, and types. Built with tree-sitter for fast, accurate multi-language parsing.
 
+[![Website](https://img.shields.io/badge/Website-skim-e87040)](https://dean0x.github.io/x/skim/)
+[![CI](https://github.com/dean0x/skim/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/skim/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/rskim.svg)](https://crates.io/crates/rskim)
 [![npm](https://img.shields.io/npm/v/rskim.svg)](https://www.npmjs.com/package/rskim)
 [![Downloads](https://img.shields.io/crates/d/rskim.svg)](https://crates.io/crates/rskim)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg?logo=rust)](https://www.rust-lang.org/)
 
 ## Why Skim?
 
@@ -584,6 +584,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Links
 
+- **Website**: https://dean0x.github.io/x/skim/
 - **Repository**: https://github.com/dean0x/skim
 - **Issues**: https://github.com/dean0x/skim/issues
 - **Crates.io**: https://crates.io/crates/rskim
