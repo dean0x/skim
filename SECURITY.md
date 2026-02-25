@@ -64,9 +64,7 @@ Current limits are conservative defaults:
 
 **Please DO NOT open public issues for security vulnerabilities.**
 
-Instead, please report security issues by emailing:
-
-**security@[your-domain].com** (or create a private security advisory on GitHub)
+To report a vulnerability, [create a private security advisory](https://github.com/dean0x/skim/security/advisories/new) on this repository.
 
 ### What to Include
 
