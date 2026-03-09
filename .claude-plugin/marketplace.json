@@ -3,8 +3,7 @@
   "name": "skim",
   "description": "Skim - Smart code reader for AI agents",
   "owner": {
-    "name": "Dean Keren",
-    "email": "dean@keren.dev"
+    "name": "Dean0x"
   },
   "plugins": [
     {
