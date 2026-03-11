@@ -360,3 +360,87 @@ fn test_cli_explicit_language_override() {
         .success()
         .stdout(predicate::str::contains("function test"));
 }
+
+// ============================================================================
+// Minimal Mode Tests
+// ============================================================================
+
+#[test]
+fn test_cli_minimal_mode() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.ts");
+    fs::write(
+        &file_path,
+        "// regular comment\n/**\n * JSDoc\n */\nfunction add(a: number, b: number): number {\n    // body comment\n    return a + b;\n}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--mode")
+        .arg("minimal")
+        .assert()
+        .success()
+        // JSDoc preserved
+        .stdout(predicate::str::contains("JSDoc"))
+        // Body comment preserved
+        .stdout(predicate::str::contains("// body comment"))
+        // All code preserved
+        .stdout(predicate::str::contains("function add"))
+        .stdout(predicate::str::contains("return a + b"))
+        // Regular comment stripped
+        .stdout(predicate::str::contains("// regular comment").not());
+}
+
+#[test]
+fn test_cli_minimal_mode_stdin() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--language")
+        .arg("typescript")
+        .arg("--mode")
+        .arg("minimal")
+        .write_stdin("// strip this\nfunction test() { return 42; }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("function test"))
+        .stdout(predicate::str::contains("return 42"))
+        .stdout(predicate::str::contains("// strip this").not());
+}
+
+#[test]
+fn test_cli_minimal_mode_python_shebang() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.py");
+    fs::write(
+        &file_path,
+        "#!/usr/bin/env python3\n# regular comment\ndef hello():\n    pass\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--mode")
+        .arg("minimal")
+        .assert()
+        .success()
+        // Shebang preserved
+        .stdout(predicate::str::contains("#!/usr/bin/env python3"))
+        // Code preserved
+        .stdout(predicate::str::contains("def hello()"))
+        // Regular comment stripped
+        .stdout(predicate::str::contains("# regular comment").not());
+}
+
+#[test]
+fn test_cli_minimal_mode_help_text() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("minimal"));
+}

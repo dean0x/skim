@@ -37,6 +37,9 @@
 // Re-export core types for public API
 pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
+// Re-export utility functions for public API
+pub use transform::utils::{get_comment_prefix, get_comment_suffix};
+
 mod parser;
 mod transform;
 mod types;

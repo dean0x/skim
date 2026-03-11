@@ -933,3 +933,588 @@ fn test_yaml_large_keys_security() {
         err_msg
     );
 }
+
+// ============================================================================
+// Minimal Mode Tests
+// ============================================================================
+
+// --- TypeScript Minimal ---
+
+#[test]
+fn test_typescript_minimal_strips_regular_comments() {
+    let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // Should NOT contain regular comments
+    assert!(
+        !result.contains("// FIXTURE:"),
+        "Regular single-line comment should be stripped"
+    );
+    assert!(
+        !result.contains("// TESTS:"),
+        "Regular single-line comment should be stripped"
+    );
+    assert!(
+        !result.contains("// This is a regular single-line comment"),
+        "Regular comment should be stripped"
+    );
+    assert!(
+        !result.contains("/* This is a regular block comment"),
+        "Regular block comment should be stripped"
+    );
+    assert!(
+        !result.contains("// Another regular comment"),
+        "Regular comment between declarations should be stripped"
+    );
+    assert!(
+        !result.contains("/* Regular block comment at module level"),
+        "Module-level block comment should be stripped"
+    );
+}
+
+#[test]
+fn test_typescript_minimal_preserves_jsdoc() {
+    let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // Should preserve JSDoc comments
+    assert!(result.contains("/**"), "JSDoc comments should be preserved");
+    assert!(
+        result.contains("* This is a JSDoc comment (KEEP)"),
+        "JSDoc content should be preserved"
+    );
+    assert!(
+        result.contains("* @param x"),
+        "JSDoc @param tags should be preserved"
+    );
+    assert!(
+        result.contains("* A documented class (KEEP)"),
+        "Class JSDoc should be preserved"
+    );
+    assert!(
+        result.contains("/** Constructor doc (KEEP) */"),
+        "Constructor JSDoc should be preserved"
+    );
+}
+
+#[test]
+fn test_typescript_minimal_preserves_body_comments() {
+    let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // Should preserve comments inside function bodies
+    assert!(
+        result.contains("// This comment is inside a function body (KEEP)"),
+        "Body comment should be preserved"
+    );
+    assert!(
+        result.contains("// inline comment in body (KEEP)"),
+        "Inline body comment should be preserved"
+    );
+    assert!(
+        result.contains("// body comment (KEEP)"),
+        "Method body comment should be preserved"
+    );
+}
+
+#[test]
+fn test_typescript_minimal_preserves_all_code() {
+    let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // Should keep all code intact
+    assert!(result.contains("export function add(x: number, y: number): number"));
+    assert!(result.contains("const result = x + y;"));
+    assert!(result.contains("return result;"));
+    assert!(result.contains("export class Calculator"));
+    assert!(result.contains("export interface Config"));
+    assert!(result.contains("export const VERSION"));
+}
+
+#[test]
+fn test_typescript_minimal_normalizes_blank_lines() {
+    let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // The fixture has 4+ blank lines that should be normalized to max 2
+    // Check that there are no 3+ consecutive blank lines
+    assert!(
+        !result.contains("\n\n\n\n"),
+        "Should normalize 4+ consecutive blank lines"
+    );
+}
+
+// --- JavaScript Minimal ---
+
+#[test]
+fn test_javascript_minimal_strips_regular_comments() {
+    let source = include_str!("../../../tests/fixtures/javascript/comments.js");
+    let result = transform(source, Language::JavaScript, Mode::Minimal).unwrap();
+
+    assert!(
+        !result.contains("// FIXTURE:"),
+        "Regular comment should be stripped"
+    );
+    assert!(
+        !result.contains("/* This is a regular block comment"),
+        "Regular block comment should be stripped"
+    );
+}
+
+#[test]
+fn test_javascript_minimal_preserves_jsdoc() {
+    let source = include_str!("../../../tests/fixtures/javascript/comments.js");
+    let result = transform(source, Language::JavaScript, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("* This is a JSDoc comment (KEEP)"),
+        "JSDoc should be preserved"
+    );
+    assert!(
+        result.contains("* @param {number} x"),
+        "JSDoc @param should be preserved"
+    );
+}
+
+#[test]
+fn test_javascript_minimal_preserves_body_comments() {
+    let source = include_str!("../../../tests/fixtures/javascript/comments.js");
+    let result = transform(source, Language::JavaScript, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// This comment is inside a function body (KEEP)"),
+        "Body comment should be preserved"
+    );
+}
+
+// --- Python Minimal ---
+
+#[test]
+fn test_python_minimal_strips_regular_comments() {
+    let source = include_str!("../../../tests/fixtures/python/comments.py");
+    let result = transform(source, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(
+        !result.contains("# This is a regular comment at module level"),
+        "Regular Python comment should be stripped"
+    );
+    assert!(
+        !result.contains("# Another regular comment"),
+        "Regular Python comment should be stripped"
+    );
+    assert!(
+        !result.contains("# Regular comment between functions"),
+        "Regular between-function comment should be stripped"
+    );
+    assert!(
+        !result.contains("# Regular module-level comment"),
+        "Regular module-level comment should be stripped"
+    );
+}
+
+#[test]
+fn test_python_minimal_preserves_docstrings() {
+    let source = include_str!("../../../tests/fixtures/python/comments.py");
+    let result = transform(source, Language::Python, Mode::Minimal).unwrap();
+
+    // Python docstrings (triple-quoted strings) should be preserved
+    assert!(
+        result.contains("\"\"\"Add two numbers together."),
+        "Function docstring should be preserved"
+    );
+    assert!(
+        result.contains("\"\"\"A simple calculator class (KEEP).\"\"\""),
+        "Class docstring should be preserved"
+    );
+    assert!(
+        result.contains("\"\"\"Initialize calculator (KEEP).\"\"\""),
+        "Method docstring should be preserved"
+    );
+    assert!(
+        result.contains("\"\"\"Add to stored value (KEEP).\"\"\""),
+        "Method docstring should be preserved"
+    );
+}
+
+#[test]
+fn test_python_minimal_preserves_shebang() {
+    let source = include_str!("../../../tests/fixtures/python/comments.py");
+    let result = transform(source, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(
+        result.starts_with("#!/usr/bin/env python3"),
+        "Shebang should be preserved"
+    );
+}
+
+#[test]
+fn test_python_minimal_preserves_body_comments() {
+    let source = include_str!("../../../tests/fixtures/python/comments.py");
+    let result = transform(source, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("# This comment is inside a function body (KEEP)"),
+        "Body comment should be preserved"
+    );
+    assert!(
+        result.contains("# inline comment in body (KEEP)"),
+        "Inline body comment should be preserved"
+    );
+    assert!(
+        result.contains("# body comment (KEEP)"),
+        "Method body comment should be preserved"
+    );
+}
+
+// --- Rust Minimal ---
+
+#[test]
+fn test_rust_minimal_strips_regular_comments() {
+    let source = include_str!("../../../tests/fixtures/rust/comments.rs");
+    let result = transform(source, Language::Rust, Mode::Minimal).unwrap();
+
+    assert!(
+        !result.contains("// FIXTURE:"),
+        "Regular line comment should be stripped"
+    );
+    assert!(
+        !result.contains("// This is a regular line comment"),
+        "Regular comment should be stripped"
+    );
+    assert!(
+        !result.contains("/* This is a regular block comment"),
+        "Regular block comment should be stripped"
+    );
+    assert!(
+        !result.contains("// Regular comment between items"),
+        "Comment between items should be stripped"
+    );
+    assert!(
+        !result.contains("/* Regular block comment at module level"),
+        "Module-level block comment should be stripped"
+    );
+    assert!(
+        !result.contains("// Regular comment (STRIP)"),
+        "Regular comment should be stripped"
+    );
+}
+
+#[test]
+fn test_rust_minimal_preserves_doc_comments() {
+    let source = include_str!("../../../tests/fixtures/rust/comments.rs");
+    let result = transform(source, Language::Rust, Mode::Minimal).unwrap();
+
+    // /// doc comments
+    assert!(
+        result.contains("/// Function doc comment (KEEP)"),
+        "/// doc comment should be preserved"
+    );
+    assert!(
+        result.contains("/// Multi-line doc comment (KEEP)"),
+        "/// multi-line doc comment should be preserved"
+    );
+    assert!(
+        result.contains("/// Struct doc comment (KEEP)"),
+        "Struct doc comment should be preserved"
+    );
+    assert!(
+        result.contains("/// Field doc comment (KEEP)"),
+        "Field doc comment should be preserved"
+    );
+
+    // //! inner doc comments
+    assert!(
+        result.contains("//! Module-level doc comment (KEEP)"),
+        "//! inner doc comment should be preserved"
+    );
+    assert!(
+        result.contains("//! Another inner doc comment (KEEP)"),
+        "//! inner doc comment should be preserved"
+    );
+}
+
+#[test]
+fn test_rust_minimal_preserves_body_comments() {
+    let source = include_str!("../../../tests/fixtures/rust/comments.rs");
+    let result = transform(source, Language::Rust, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// This comment is inside a function body (KEEP)"),
+        "Body comment should be preserved"
+    );
+    assert!(
+        result.contains("// inline comment in body (KEEP)"),
+        "Inline body comment should be preserved"
+    );
+    assert!(
+        result.contains("// body comment (KEEP)"),
+        "Method body comment should be preserved"
+    );
+}
+
+// --- Go Minimal ---
+
+#[test]
+fn test_go_minimal_strips_standalone_comments() {
+    let source = include_str!("../../../tests/fixtures/go/comments.go");
+    let result = transform(source, Language::Go, Mode::Minimal).unwrap();
+
+    assert!(
+        !result.contains("// FIXTURE:"),
+        "Standalone comment should be stripped"
+    );
+    assert!(
+        !result.contains("// TESTS:"),
+        "Standalone comment should be stripped"
+    );
+    assert!(
+        !result.contains("// This is a standalone comment"),
+        "Standalone comment should be stripped"
+    );
+    assert!(
+        !result.contains("/* This is a standalone block comment"),
+        "Standalone block comment should be stripped"
+    );
+    assert!(
+        !result.contains("// Regular comment not adjacent"),
+        "Non-adjacent comment should be stripped"
+    );
+    assert!(
+        !result.contains("/* Block comment at module level"),
+        "Non-adjacent block comment should be stripped"
+    );
+    assert!(
+        !result.contains("// Standalone comment (STRIP)"),
+        "Standalone comment should be stripped"
+    );
+}
+
+#[test]
+fn test_go_minimal_preserves_doc_comments() {
+    let source = include_str!("../../../tests/fixtures/go/comments.go");
+    let result = transform(source, Language::Go, Mode::Minimal).unwrap();
+
+    // Go doc comments are adjacent to declarations
+    assert!(
+        result.contains("// Add adds two numbers together."),
+        "Doc comment adjacent to func should be preserved"
+    );
+    assert!(
+        result.contains("// This is a Go doc comment adjacent to a declaration (KEEP)."),
+        "Multi-line Go doc comment should be preserved"
+    );
+    assert!(
+        result.contains("// Calculator is a simple calculator."),
+        "Doc comment adjacent to type should be preserved"
+    );
+    assert!(
+        result.contains("// NewCalculator creates a new Calculator."),
+        "Doc comment adjacent to func should be preserved"
+    );
+    assert!(
+        result.contains("// Add adds to the calculator value."),
+        "Doc comment adjacent to method should be preserved"
+    );
+}
+
+#[test]
+fn test_go_minimal_preserves_body_comments() {
+    let source = include_str!("../../../tests/fixtures/go/comments.go");
+    let result = transform(source, Language::Go, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// This comment is inside a function body (KEEP)"),
+        "Body comment should be preserved"
+    );
+    assert!(
+        result.contains("// inline comment in body (KEEP)"),
+        "Inline body comment should be preserved"
+    );
+    assert!(
+        result.contains("// body comment (KEEP)"),
+        "Method body comment should be preserved"
+    );
+}
+
+// --- Java Minimal ---
+
+#[test]
+fn test_java_minimal_strips_regular_comments() {
+    let source = include_str!("../../../tests/fixtures/java/Comments.java");
+    let result = transform(source, Language::Java, Mode::Minimal).unwrap();
+
+    assert!(
+        !result.contains("// FIXTURE:"),
+        "Regular comment should be stripped"
+    );
+    assert!(
+        !result.contains("// This is a regular single-line comment"),
+        "Regular single-line comment should be stripped"
+    );
+    assert!(
+        !result.contains("/* This is a regular block comment"),
+        "Regular block comment should be stripped"
+    );
+    assert!(
+        !result.contains("// Regular comment inside class but outside method"),
+        "Class-level comment should be stripped"
+    );
+    assert!(
+        !result.contains("/* Regular block comment at top level"),
+        "Top-level block comment should be stripped"
+    );
+    assert!(
+        !result.contains("// Regular comment (STRIP)"),
+        "Regular comment should be stripped"
+    );
+}
+
+#[test]
+fn test_java_minimal_preserves_javadoc() {
+    let source = include_str!("../../../tests/fixtures/java/Comments.java");
+    let result = transform(source, Language::Java, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("* This is a Javadoc comment (KEEP)"),
+        "Javadoc should be preserved"
+    );
+    assert!(
+        result.contains("* @author test"),
+        "Javadoc @author should be preserved"
+    );
+    assert!(
+        result.contains("* Constructor Javadoc (KEEP)"),
+        "Constructor Javadoc should be preserved"
+    );
+    assert!(
+        result.contains("* Add method Javadoc (KEEP)"),
+        "Method Javadoc should be preserved"
+    );
+}
+
+#[test]
+fn test_java_minimal_preserves_body_comments() {
+    let source = include_str!("../../../tests/fixtures/java/Comments.java");
+    let result = transform(source, Language::Java, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// This comment is inside a method body (KEEP)"),
+        "Constructor body comment should be preserved"
+    );
+    assert!(
+        result.contains("// inline comment in body (KEEP)"),
+        "Inline body comment should be preserved"
+    );
+    assert!(
+        result.contains("// body comment (KEEP)"),
+        "Method body comment should be preserved"
+    );
+}
+
+// --- Passthrough Tests ---
+
+#[test]
+fn test_json_minimal_passthrough() {
+    let source = include_str!("../../../tests/fixtures/json/simple.json");
+    let result = transform(source, Language::Json, Mode::Minimal).unwrap();
+
+    // JSON should be returned unchanged
+    assert_eq!(
+        result, source,
+        "JSON should pass through unchanged in minimal mode"
+    );
+}
+
+#[test]
+fn test_yaml_minimal_passthrough() {
+    let source = include_str!("../../../tests/fixtures/yaml/simple.yaml");
+    let result = transform(source, Language::Yaml, Mode::Minimal).unwrap();
+
+    // YAML should be returned unchanged
+    assert_eq!(
+        result, source,
+        "YAML should pass through unchanged in minimal mode"
+    );
+}
+
+#[test]
+fn test_markdown_minimal_passthrough() {
+    let source = include_str!("../../../tests/fixtures/markdown/simple.md");
+    let result = transform(source, Language::Markdown, Mode::Minimal).unwrap();
+
+    // Markdown should be returned unchanged
+    assert_eq!(
+        result, source,
+        "Markdown should pass through unchanged in minimal mode"
+    );
+}
+
+// --- Edge Cases ---
+
+#[test]
+fn test_minimal_empty_file() {
+    let source = "";
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+    assert_eq!(result, "");
+}
+
+#[test]
+fn test_minimal_no_comments() {
+    let source = "export function add(a: number, b: number): number {\n    return a + b;\n}\n";
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // No comments to strip, should be essentially unchanged
+    assert!(result.contains("export function add"));
+    assert!(result.contains("return a + b;"));
+}
+
+#[test]
+fn test_minimal_only_comments() {
+    let source = "// comment 1\n// comment 2\n// comment 3\n";
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // All comments stripped, result should be mostly empty (just blank lines from normalization)
+    assert!(
+        !result.contains("// comment"),
+        "All comments should be stripped"
+    );
+}
+
+#[test]
+fn test_minimal_blank_line_normalization() {
+    let source = "const a = 1;\n\n\n\n\nconst b = 2;\n";
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // 5 blank lines should be normalized to 2
+    assert!(
+        !result.contains("\n\n\n\n"),
+        "4+ consecutive blank lines should be normalized"
+    );
+    assert!(result.contains("const a = 1;"));
+    assert!(result.contains("const b = 2;"));
+}
+
+#[test]
+fn test_minimal_preserves_inline_body_comment_with_code() {
+    let source = "function test() {\n    const x = 1; // important note\n}\n";
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// important note"),
+        "Inline comment in function body should be preserved"
+    );
+}
+
+#[test]
+fn test_minimal_token_reduction() {
+    let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // Minimal mode should reduce tokens (by removing comments)
+    assert!(
+        result.len() < source.len(),
+        "Minimal mode should reduce file size: original={}, result={}",
+        source.len(),
+        result.len()
+    );
+}

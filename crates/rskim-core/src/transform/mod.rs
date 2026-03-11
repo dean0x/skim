@@ -5,9 +5,11 @@
 //! JSON is handled separately without tree-sitter.
 
 pub mod json;
+pub mod minimal;
 pub mod signatures;
 pub mod structure;
 pub mod types;
+pub mod utils;
 pub mod yaml;
 
 use crate::{Language, Mode, Result, TransformConfig};
@@ -39,6 +41,7 @@ pub(crate) fn transform_tree(
         Mode::Signatures => signatures::transform_signatures(source, tree, language, config),
         Mode::Types => types::transform_types(source, tree, language, config),
         Mode::Full => Ok(source.to_string()), // No transformation
+        Mode::Minimal => minimal::transform_minimal(source, tree, language, config),
     }
 }
 
