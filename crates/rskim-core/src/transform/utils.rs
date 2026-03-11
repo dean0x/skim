@@ -69,12 +69,8 @@ pub(crate) fn is_inside_function_body(node: Node, language: Language) -> bool {
 fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
     match language {
         Language::TypeScript | Language::JavaScript => &["statement_block"],
-        Language::Python => &["block"],
-        Language::Rust => &["block"],
-        Language::Go => &["block"],
-        // Java uses "block" for method bodies and "constructor_body" for constructors
+        Language::Python | Language::Rust | Language::Go => &["block"],
         Language::Java => &["block", "constructor_body"],
-        // Markdown, JSON, YAML don't have function bodies
         Language::Markdown | Language::Json | Language::Yaml => &[],
     }
 }

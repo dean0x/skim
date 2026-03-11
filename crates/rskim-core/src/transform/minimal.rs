@@ -28,7 +28,6 @@ pub(crate) fn transform_minimal(
     language: Language,
     _config: &TransformConfig,
 ) -> Result<String> {
-    // Collect comment ranges to remove
     let mut ranges_to_remove: Vec<(usize, usize)> = Vec::new();
     let mut node_count = 0;
     collect_removable_comments(
@@ -40,16 +39,10 @@ pub(crate) fn transform_minimal(
         0,
     )?;
 
-    // Sort by start position
     ranges_to_remove.sort_unstable_by_key(|&(start, _)| start);
-
-    // Remove duplicates and handle overlaps
     ranges_to_remove.dedup();
 
-    // Pass 2: Build output with comments removed
     let after_removal = remove_ranges(source, &ranges_to_remove)?;
-
-    // Pass 3: Normalize blank lines (3+ consecutive -> 2)
     let normalized = normalize_blank_lines(&after_removal);
 
     Ok(normalized)
@@ -87,24 +80,19 @@ fn collect_removable_comments(
 
     let kind = node.kind();
 
-    // Check if this node is a comment that should be removed
     if is_comment_node(kind, language) {
         let should_preserve = is_shebang(node, source)
             || is_inside_function_body(node, language)
             || is_doc_comment(node, source, language);
 
         if !should_preserve {
-            // This is a regular comment at module/class level - mark for removal
             let start = node.start_byte();
             let end = node.end_byte();
-
-            // Extend range to include the entire line if the comment is the only content
             let (adjusted_start, adjusted_end) = adjust_range_for_line_removal(source, start, end);
             ranges.push((adjusted_start, adjusted_end));
         }
     }
 
-    // Recursively process children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_removable_comments(child, source, language, ranges, node_count, depth + 1)?;
@@ -113,29 +101,25 @@ fn collect_removable_comments(
     Ok(())
 }
 
-/// Check if a comment node is a shebang line (e.g., #!/usr/bin/env python3)
+/// Check if a comment node is a shebang line (e.g., `#!/usr/bin/env python3`)
 ///
-/// Shebangs are always on the first line and start with `#!`.
+/// Shebangs must start at byte 0 and begin with `#!`.
 fn is_shebang(node: Node, source: &str) -> bool {
-    // Shebangs must start at the very beginning of the file (byte 0)
     if node.start_byte() != 0 {
         return false;
     }
-
-    match node.utf8_text(source.as_bytes()) {
-        Ok(text) => text.starts_with("#!"),
-        Err(_) => false,
-    }
+    node.utf8_text(source.as_bytes())
+        .map(|text| text.starts_with("#!"))
+        .unwrap_or(false)
 }
 
 /// Check if a node kind represents a comment in the given language
 fn is_comment_node(kind: &str, language: Language) -> bool {
     match language {
-        Language::TypeScript | Language::JavaScript => kind == "comment",
-        Language::Python => kind == "comment",
-        Language::Rust => kind == "line_comment" || kind == "block_comment",
-        Language::Go => kind == "comment",
-        Language::Java => kind == "line_comment" || kind == "block_comment",
+        Language::TypeScript | Language::JavaScript | Language::Python | Language::Go => {
+            kind == "comment"
+        }
+        Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
         // Markdown, JSON, YAML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml => false,
     }
@@ -190,50 +174,30 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
 ///
 /// Go doc comments are comments that immediately precede a declaration
 /// (function, type, var, const) with no blank lines between them.
-///
-/// Algorithm:
-/// 1. Check if this comment is part of a contiguous block (no blank lines between comments)
-/// 2. Check if the contiguous block immediately precedes a declaration
+/// Walks forward through siblings to find the end of the contiguous comment
+/// block and checks whether a declaration immediately follows.
 fn is_go_doc_comment(node: Node, source: &str) -> bool {
-    // First, build the contiguous comment block starting from this node.
-    // A contiguous block means no blank lines between consecutive comments.
-    //
-    // Walk forward from this node, checking each next sibling:
-    // - If it's a comment AND no blank line gap from previous, continue the block
-    // - If it's a declaration AND no blank line gap from previous comment, this is a doc block
-    // - Otherwise, stop
-
     let mut current_end = node.end_byte();
     let mut sibling = node.next_named_sibling();
 
     while let Some(sib) = sibling {
         let sib_start = sib.start_byte();
 
-        // Check for blank line gap between current end and sibling start
         if current_end <= sib_start && sib_start <= source.len() {
             let between = &source[current_end..sib_start];
             let newline_count = between.chars().filter(|&c| c == '\n').count();
-
             if newline_count > 1 {
-                // Blank line gap - this comment is NOT part of a doc block
                 return false;
             }
         }
 
         if is_comment_node(sib.kind(), Language::Go) {
-            // Continue the contiguous block
             current_end = sib.end_byte();
             sibling = sib.next_named_sibling();
             continue;
         }
 
-        if is_go_declaration(sib.kind()) {
-            // Contiguous block immediately precedes a declaration
-            return true;
-        }
-
-        // Non-comment, non-declaration sibling found
-        return false;
+        return is_go_declaration(sib.kind());
     }
 
     false
@@ -288,20 +252,9 @@ fn adjust_range_for_line_removal(source: &str, start: usize, end: usize) -> (usi
         // Comment is the only content on this line - remove the entire line
         (line_start, line_end)
     } else if only_whitespace_after {
-        // Comment is at end of line with code before it (inline comment)
-        // Remove whitespace before the comment and the comment itself
-        // Find where the trailing whitespace before the comment starts
+        // Inline trailing comment: remove leading whitespace before the comment too
         let trimmed_start = source[line_start..start].trim_end().len() + line_start;
-
-        // Ensure we keep at least up to the code
-        let adjusted_start = if trimmed_start < start {
-            trimmed_start
-        } else {
-            start
-        };
-
-        // Remove from the whitespace before comment to end of comment (but keep newline)
-        (adjusted_start, end)
+        (trimmed_start, end)
     } else {
         // Comment is in the middle or start of a line with other content - just remove the comment
         (start, end)
@@ -321,7 +274,6 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
     let mut last_pos = 0;
 
     for &(start, end) in ranges {
-        // Validate byte ranges
         if end < start {
             return Err(SkimError::ParseError(format!(
                 "Invalid range: start={} end={}",
@@ -336,18 +288,13 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
             )));
         }
 
-        // Skip overlapping ranges
         if start < last_pos {
-            // If this range extends past the previous one, adjust
             if end > last_pos {
-                // Partial overlap - skip to the non-overlapping part
-                // But since we're removing, just extend last_pos
                 last_pos = end;
             }
             continue;
         }
 
-        // Validate UTF-8 boundaries
         if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
             return Err(SkimError::ParseError(format!(
                 "Invalid UTF-8 boundary at range [{}, {})",
@@ -355,12 +302,10 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
             )));
         }
 
-        // Copy everything before this range
         result.push_str(&source[last_pos..start]);
         last_pos = end;
     }
 
-    // Validate final position
     if !source.is_char_boundary(last_pos) {
         return Err(SkimError::ParseError(format!(
             "Invalid UTF-8 boundary at position {}",
@@ -368,28 +313,24 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
         )));
     }
 
-    // Copy remaining source
     result.push_str(&source[last_pos..]);
 
-    // Trim trailing whitespace from lines that had content removed
-    let trimmed = trim_trailing_whitespace_on_lines(&result);
-
-    Ok(trimmed)
+    Ok(trim_trailing_whitespace_on_lines(&result))
 }
 
 /// Trim trailing whitespace from each line
 fn trim_trailing_whitespace_on_lines(source: &str) -> String {
-    let lines: Vec<&str> = source.lines().collect();
     let mut result = String::with_capacity(source.len());
+    let mut first = true;
 
-    for (i, line) in lines.iter().enumerate() {
-        result.push_str(line.trim_end());
-        if i < lines.len() - 1 {
+    for line in source.lines() {
+        if !first {
             result.push('\n');
         }
+        result.push_str(line.trim_end());
+        first = false;
     }
 
-    // Preserve trailing newline if original had one
     if source.ends_with('\n') {
         result.push('\n');
     }
@@ -402,29 +343,28 @@ fn trim_trailing_whitespace_on_lines(source: &str) -> String {
 /// A "blank line" is a line containing only whitespace.
 fn normalize_blank_lines(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
-    let mut consecutive_blank_lines = 0;
-    let ends_with_newline = source.ends_with('\n');
+    let mut consecutive_blanks: usize = 0;
+    let mut first = true;
 
-    // Use lines() iterator which strips trailing newline
-    let lines: Vec<&str> = source.lines().collect();
-
-    for (i, line) in lines.iter().enumerate() {
+    for line in source.lines() {
         if line.trim().is_empty() {
-            consecutive_blank_lines += 1;
-            if consecutive_blank_lines <= 2 {
-                result.push_str(line);
-                if i < lines.len() - 1 || ends_with_newline {
-                    result.push('\n');
-                }
+            consecutive_blanks += 1;
+            if consecutive_blanks > 2 {
+                continue;
             }
-            // Skip lines beyond 2 consecutive blanks
         } else {
-            consecutive_blank_lines = 0;
-            result.push_str(line);
-            if i < lines.len() - 1 || ends_with_newline {
-                result.push('\n');
-            }
+            consecutive_blanks = 0;
         }
+
+        if !first {
+            result.push('\n');
+        }
+        result.push_str(line);
+        first = false;
+    }
+
+    if source.ends_with('\n') {
+        result.push('\n');
     }
 
     result
