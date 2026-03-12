@@ -72,16 +72,17 @@ pub(crate) fn truncate_to_lines(
     language: Language,
     max_lines: usize,
 ) -> Result<String> {
+    // If no spans provided, fall back to simple line truncation immediately
+    // to avoid a redundant lines().collect() (simple_line_truncate does its own)
+    if spans.is_empty() {
+        return simple_line_truncate(text, language, max_lines);
+    }
+
     let lines: Vec<&str> = text.lines().collect();
 
     // If output fits, return unchanged
     if lines.len() <= max_lines {
         return Ok(text.to_string());
-    }
-
-    // If no spans provided, fall back to simple line truncation
-    if spans.is_empty() {
-        return simple_line_truncate(text, language, max_lines);
     }
 
     // Filter out empty spans and spans beyond the actual line count
@@ -505,6 +506,94 @@ mod tests {
         assert!(
             !result.ends_with('\n'),
             "Should not add trailing newline: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_max_lines_zero_with_spans_does_not_panic() {
+        // CONTRACT: max_lines=0 is guarded by CLI validation (--max-lines must be >= 1).
+        // At the core library level, with_max_lines(0) is accepted without error.
+        // The truncation engine clamps effective_budget to 1, selects a span, then
+        // result_lines.truncate(0) empties the output. However, the trailing-newline
+        // preservation step appends '\n' when the original text ends with '\n',
+        // producing "\n" -- a single empty trailing newline.
+        // This test documents that edge behavior since 0 is not a valid input in practice.
+        let text = "type A = string\nfunction foo() {}\n";
+        let spans = vec![
+            NodeSpan::new(0..1, "type_alias_declaration"),
+            NodeSpan::new(1..2, "function_declaration"),
+        ];
+
+        // Should not panic
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 0).unwrap();
+        // result_lines is empty after truncate(0), but trailing '\n' is preserved
+        // from the original, so output is "\n"
+        assert_eq!(
+            result, "\n",
+            "max_lines=0 with trailing newline should produce only the preserved newline"
+        );
+    }
+
+    #[test]
+    fn test_simple_line_truncate_max_lines_zero_does_not_panic() {
+        // CONTRACT: max_lines=0 at simple_line_truncate level. The function uses
+        // saturating_sub(1) so content_lines=0, producing only the marker line.
+        // Then truncation to 0 would clip everything. This documents the edge behavior.
+        let text = "line 1\nline 2\nline 3\n";
+
+        let result = simple_line_truncate(text, Language::TypeScript, 0).unwrap();
+        let line_count = result.lines().count();
+        // saturating_sub(1) => content_lines=0, then push marker => 1 line,
+        // but no final truncate(0) call exists in simple_line_truncate
+        // so we get 1 line (just the marker). Document this clamping behavior.
+        assert!(
+            line_count <= 1,
+            "simple_line_truncate with max_lines=0 should produce at most 1 line, got {}: {:?}",
+            line_count,
+            result
+        );
+    }
+
+    #[test]
+    fn test_overlapping_spans_output_within_budget() {
+        // Verify that overlapping NodeSpan ranges do not cause the output to exceed
+        // the max_lines budget. The truncation algorithm should handle overlapping
+        // spans gracefully via the final truncate(max_lines) enforcement.
+        let text = "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\n";
+        let spans = vec![
+            NodeSpan::new(0..3, "type_alias_declaration"),  // lines 0-2
+            NodeSpan::new(1..4, "type_alias_declaration"),  // lines 1-3 (overlaps with first)
+            NodeSpan::new(3..6, "function_declaration"),    // lines 3-5 (overlaps with second)
+        ];
+
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4).unwrap();
+        let line_count = result.lines().count();
+        assert!(
+            line_count <= 4,
+            "Overlapping spans should not cause output to exceed budget of 4 lines, got {}: {:?}",
+            line_count,
+            result
+        );
+    }
+
+    #[test]
+    fn test_adjacent_spans_output_within_budget() {
+        // Adjacent spans (end of one == start of next) should not produce spurious
+        // gap markers, and output should stay within budget.
+        let text = "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\n";
+        let spans = vec![
+            NodeSpan::new(0..2, "type_alias_declaration"),  // lines 0-1
+            NodeSpan::new(2..4, "type_alias_declaration"),  // lines 2-3 (adjacent)
+            NodeSpan::new(4..6, "function_declaration"),    // lines 4-5 (adjacent)
+        ];
+
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4).unwrap();
+        let line_count = result.lines().count();
+        assert!(
+            line_count <= 4,
+            "Adjacent spans should not cause output to exceed budget of 4 lines, got {}: {:?}",
+            line_count,
             result
         );
     }
