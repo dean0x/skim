@@ -226,9 +226,10 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
             function: "method_declaration",
             method: "method_declaration",
         }),
+        // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(SignatureNodeTypes {
-            function: "atx_heading", // Not used - markdown uses special extraction
-            method: "atx_heading",   // Not used - markdown uses special extraction
+            function: "atx_heading",
+            method: "atx_heading",
         }),
         Language::Json => None,
         Language::Yaml => None,

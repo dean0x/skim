@@ -144,8 +144,7 @@ pub(crate) fn transform_structure_with_spans(
         // Track the offset change at this replacement point
         let replaced_len = end - start;
         let replacement_len = replacement.len();
-        // SAFETY: usize-to-i64 cast is safe because both values are bounded by
-        // source file size, which is far below i64::MAX (~9.2 exabytes).
+        // SAFETY: Both values bounded by source file size (far below i64::MAX).
         offset_delta += replacement_len as i64 - replaced_len as i64;
         offset_map.push((end, offset_delta));
 
@@ -261,9 +260,10 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             function: "method_declaration",
             method: "method_declaration",
         }),
+        // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(NodeTypes {
-            function: "atx_heading", // Not used - markdown uses special extraction
-            method: "atx_heading",   // Not used - markdown uses special extraction
+            function: "atx_heading",
+            method: "atx_heading",
         }),
         Language::Json => None,
         Language::Yaml => None,
@@ -307,8 +307,7 @@ fn build_spans_from_top_level_nodes(
             Err(0) => 0,
             Err(idx) => offset_map[idx - 1].1,
         };
-        // SAFETY: usize-to-i64 cast is safe because source_byte is a byte position
-        // within the source file, which is far below i64::MAX (~9.2 exabytes).
+        // SAFETY: source_byte bounded by source file size (far below i64::MAX).
         (source_byte as i64 + delta).max(0) as usize
     };
 
@@ -411,8 +410,6 @@ pub(crate) fn extract_markdown_headers(
     min_level: u32,
     max_level: u32,
 ) -> Result<String> {
-    // ARCHITECTURE: Delegate to _with_spans and discard span metadata,
-    // matching the pattern used by transform_structure -> transform_structure_with_spans.
     let (text, _spans) = extract_markdown_headers_with_spans(source, tree, min_level, max_level)?;
     Ok(text)
 }

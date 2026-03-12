@@ -258,12 +258,13 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "class_declaration",
             struct_def: "",
         }),
+        // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(TypeNodeTypes {
-            type_alias: "", // Not applicable
-            interface: "",  // Not applicable
-            enum_def: "",   // Not applicable
-            class_decl: "", // Not applicable
-            struct_def: "", // Not applicable
+            type_alias: "",
+            interface: "",
+            enum_def: "",
+            class_decl: "",
+            struct_def: "",
         }),
         Language::Json => None,
         Language::Yaml => None,
