@@ -85,12 +85,12 @@ pub(crate) fn transform_signatures_with_spans(
     let mut current_line = 0;
 
     let texts: Vec<String> = signatures
-        .iter()
+        .into_iter()
         .map(|(sig, kind)| {
             let line_count = sig.lines().count().max(1);
             spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
             current_line += line_count;
-            sig.clone()
+            sig
         })
         .collect();
 

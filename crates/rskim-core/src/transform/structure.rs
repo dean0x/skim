@@ -405,95 +405,10 @@ pub(crate) fn extract_markdown_headers(
     min_level: u32,
     max_level: u32,
 ) -> Result<String> {
-    let mut headers = Vec::new();
-    let root = tree.root_node();
-
-    // Traverse all nodes to find headers (depth, node)
-    let mut visit_stack = vec![(0_usize, root)];
-
-    while let Some((depth, node)) = visit_stack.pop() {
-        // SECURITY: Prevent stack overflow from deeply nested AST
-        if depth > MAX_MARKDOWN_DEPTH {
-            return Err(SkimError::ParseError(format!(
-                "Maximum markdown depth exceeded: {} (possible malicious input)",
-                MAX_MARKDOWN_DEPTH
-            )));
-        }
-
-        // SECURITY: Prevent memory exhaustion from excessive headers
-        if headers.len() > MAX_MARKDOWN_HEADERS {
-            return Err(SkimError::ParseError(format!(
-                "Too many markdown headers: {} (max: {}). Possible malicious input.",
-                headers.len(),
-                MAX_MARKDOWN_HEADERS
-            )));
-        }
-        let node_type = node.kind();
-
-        // ATX headers: # Header
-        if node_type == "atx_heading" {
-            // Find marker child to determine level (atx_h1_marker through atx_h6_marker)
-            let mut cursor = node.walk();
-            let marker = node.children(&mut cursor).find(|child| {
-                child.kind().starts_with("atx_h") && child.kind().ends_with("_marker")
-            });
-
-            if let Some(marker) = marker {
-                // Extract level from marker node type (atx_h1_marker -> 1, atx_h2_marker -> 2, etc.)
-                let marker_kind = marker.kind();
-                let level = marker_kind
-                    .chars()
-                    .find(|c| c.is_ascii_digit())
-                    .and_then(|c| c.to_digit(10))
-                    .unwrap_or(1); // Default to H1 if parsing fails
-
-                if level >= min_level && level <= max_level {
-                    let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
-                        SkimError::ParseError(format!("UTF-8 error in header: {}", e))
-                    })?;
-                    headers.push(header_text.to_string());
-                }
-            }
-        }
-        // Setext headers: underlined with === or ---
-        else if node_type == "setext_heading" {
-            // Setext headers are H1 (===) or H2 (---)
-            // Determine level by checking child node type for underline marker
-            let mut cursor = node.walk();
-            let underline = node.children(&mut cursor).find(|child| {
-                let kind = child.kind();
-                kind == "setext_h1_underline" || kind == "setext_h2_underline"
-            });
-
-            let level = if let Some(underline_node) = underline {
-                // Extract level from underline node type
-                if underline_node.kind() == "setext_h1_underline" {
-                    1
-                } else {
-                    2
-                }
-            } else {
-                // Fallback: if no underline child found, default to H1
-                1
-            };
-
-            if level >= min_level && level <= max_level {
-                let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
-                    SkimError::ParseError(format!("UTF-8 error in setext header: {}", e))
-                })?;
-                headers.push(header_text.to_string());
-            }
-        }
-
-        // Add children to visit stack with incremented depth (depth-first traversal)
-        let mut child_cursor = node.walk();
-        for child in node.children(&mut child_cursor) {
-            visit_stack.push((depth + 1, child));
-        }
-    }
-
-    // Join headers with newlines
-    Ok(headers.join("\n"))
+    // ARCHITECTURE: Delegate to _with_spans and discard span metadata,
+    // matching the pattern used by transform_structure -> transform_structure_with_spans.
+    let (text, _spans) = extract_markdown_headers_with_spans(source, tree, min_level, max_level)?;
+    Ok(text)
 }
 
 /// Extract markdown headers with NodeSpan metadata for truncation
@@ -585,12 +500,12 @@ pub(crate) fn extract_markdown_headers_with_spans(
     let mut current_line = 0;
 
     let texts: Vec<String> = headers
-        .iter()
+        .into_iter()
         .map(|(text, kind)| {
             let line_count = text.lines().count().max(1);
             spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
             current_line += line_count;
-            text.clone()
+            text
         })
         .collect();
 

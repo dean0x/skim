@@ -83,21 +83,22 @@ pub(crate) fn transform_types_with_spans(
 
     // Build text and spans, tracking line offsets
     // Types mode joins with \n\n (two newlines between defs)
-    let mut spans = Vec::with_capacity(type_defs.len());
+    let type_defs_count = type_defs.len();
+    let mut spans = Vec::with_capacity(type_defs_count);
     let mut current_line = 0;
 
     let texts: Vec<String> = type_defs
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(idx, (def, kind))| {
             let line_count = def.lines().count().max(1);
             spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
             current_line += line_count;
             // Account for the blank line separator between defs
-            if idx < type_defs.len() - 1 {
+            if idx < type_defs_count - 1 {
                 current_line += 1; // \n\n adds one extra line
             }
-            def.clone()
+            def
         })
         .collect();
 
