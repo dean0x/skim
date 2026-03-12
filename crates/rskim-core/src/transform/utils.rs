@@ -8,16 +8,7 @@ use tree_sitter::Node;
 /// Get the single-line comment prefix for a language
 ///
 /// Returns the character(s) that start a single-line comment in the given language.
-///
-/// # Examples
-/// ```
-/// use rskim_core::get_comment_prefix;
-/// use rskim_core::Language;
-///
-/// assert_eq!(get_comment_prefix(Language::TypeScript), "//");
-/// assert_eq!(get_comment_prefix(Language::Python), "#");
-/// ```
-pub fn get_comment_prefix(language: Language) -> &'static str {
+pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
     match language {
         Language::Python => "#",
         Language::Markdown => "<!--",
@@ -26,16 +17,7 @@ pub fn get_comment_prefix(language: Language) -> &'static str {
 }
 
 /// Get the comment suffix for a language (non-empty only for Markdown)
-///
-/// # Examples
-/// ```
-/// use rskim_core::get_comment_suffix;
-/// use rskim_core::Language;
-///
-/// assert_eq!(get_comment_suffix(Language::Markdown), " -->");
-/// assert_eq!(get_comment_suffix(Language::TypeScript), "");
-/// ```
-pub fn get_comment_suffix(language: Language) -> &'static str {
+pub(crate) fn get_comment_suffix(language: Language) -> &'static str {
     match language {
         Language::Markdown => " -->",
         _ => "",
@@ -59,8 +41,14 @@ pub(crate) fn is_inside_function_body(node: Node, language: Language) -> bool {
     let body_kinds = get_body_node_kinds(language);
     let fn_kinds = get_function_node_kinds(language);
     let mut current = node.parent();
+    let mut depth = 0;
+    const MAX_PARENT_WALK: usize = 500;
 
     while let Some(parent) = current {
+        depth += 1;
+        if depth > MAX_PARENT_WALK {
+            return false;
+        }
         let kind = parent.kind();
         if body_kinds.contains(&kind) {
             return true;

@@ -9,7 +9,7 @@ pub mod minimal;
 pub mod signatures;
 pub mod structure;
 pub mod types;
-pub mod utils;
+pub(crate) mod utils;
 pub mod yaml;
 
 use crate::{Language, Mode, Result, TransformConfig};
