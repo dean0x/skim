@@ -468,7 +468,7 @@ mod tests {
     fn test_remove_ranges_non_char_boundary() {
         // Multi-byte UTF-8 character: the euro sign takes 3 bytes
         let source = "a\u{20AC}b"; // "a" + euro sign (3 bytes) + "b" = 5 bytes total
-        // Byte 2 is in the middle of the euro sign (bytes 1..4)
+                                   // Byte 2 is in the middle of the euro sign (bytes 1..4)
         let ranges = vec![(2, 4)];
         let result = remove_ranges(source, &ranges);
         assert!(result.is_err());
@@ -522,7 +522,10 @@ mod tests {
         let config = TransformConfig::default();
 
         let result = transform_minimal(&source, &tree, Language::Python, &config);
-        assert!(result.is_err(), "Expected error when exceeding MAX_AST_NODES");
+        assert!(
+            result.is_err(),
+            "Expected error when exceeding MAX_AST_NODES"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Too many AST nodes"),
@@ -536,5 +539,4 @@ mod tests {
     // expressions like `(((((...))))` do not produce 500 levels of AST depth in
     // practice. The depth guard exists as a defense-in-depth measure against
     // hypothetical malicious grammars or future grammar changes.
-
 }
