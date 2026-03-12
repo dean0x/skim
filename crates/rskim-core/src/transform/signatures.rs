@@ -34,7 +34,8 @@ const MAX_SIGNATURES: usize = 10_000;
 ///
 /// Extract only callable signatures, one per line.
 /// More aggressive than structure mode - no bodies at all.
-#[allow(dead_code)] // Used by tests and as convenience wrapper
+#[cfg(test)]
+#[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn transform_signatures(
     source: &str,
     tree: &Tree,
@@ -105,6 +106,7 @@ fn collect_signatures_with_kinds(
     signatures: &mut Vec<(String, &'static str)>,
     depth: usize,
 ) -> Result<()> {
+    // SECURITY: Prevent stack overflow from deeply nested or malicious input
     if depth > MAX_AST_DEPTH {
         return Err(SkimError::ParseError(format!(
             "Maximum AST depth exceeded: {} (possible malicious input)",

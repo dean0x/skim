@@ -29,6 +29,9 @@ const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
 /// Maximum number of parallel jobs (threads) to prevent resource exhaustion
 const MAX_JOBS: usize = 128;
 
+/// Maximum value for --max-lines to prevent unreasonable memory allocation
+const MAX_MAX_LINES: usize = 1_000_000;
+
 /// skim - Smart code reader for AI agents
 ///
 /// Transform source code by stripping implementation details while
@@ -611,6 +614,14 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!(
                 "--max-lines must be at least 1\n\
                  Use --max-lines 1 to get a single line of output."
+            );
+        }
+        if max_lines > MAX_MAX_LINES {
+            anyhow::bail!(
+                "--max-lines value too high: {} (maximum: {})\n\
+                 Files exceeding this limit should be processed without truncation.",
+                max_lines,
+                MAX_MAX_LINES
             );
         }
     }

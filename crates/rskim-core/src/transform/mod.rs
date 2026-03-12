@@ -73,6 +73,10 @@ fn transform_tree_with_spans(
             signatures::transform_signatures_with_spans(source, tree, language, config)
         }
         Mode::Types => types::transform_types_with_spans(source, tree, language, config),
+        // ARCHITECTURE: Full and Minimal inline their span logic here rather than
+        // having _with_spans variants like structure/signatures/types. Full is a pure
+        // passthrough (no AST transformation), and Minimal preserves all code, so both
+        // produce a single "source_file" span with no AST-level priority ranking needed.
         Mode::Full => {
             let text = source.to_string();
             let line_count = text.lines().count();
@@ -82,7 +86,6 @@ fn transform_tree_with_spans(
         Mode::Minimal => {
             let text = minimal::transform_minimal(source, tree, language, config)?;
             let line_count = text.lines().count();
-            // Minimal mode preserves all code, so return a single span
             let spans = vec![NodeSpan::new(0..line_count, "source_file")];
             Ok((text, spans))
         }

@@ -35,7 +35,8 @@ const MAX_TYPE_DEFS: usize = 10_000;
 /// # Implementation Strategy
 ///
 /// Most aggressive mode. Extract only type system information.
-#[allow(dead_code)] // Used by tests and as convenience wrapper
+#[cfg(test)]
+#[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn transform_types(
     source: &str,
     tree: &Tree,
@@ -113,6 +114,7 @@ fn collect_type_definitions_with_kinds(
     type_defs: &mut Vec<(String, &'static str)>,
     depth: usize,
 ) -> Result<()> {
+    // SECURITY: Prevent stack overflow from deeply nested or malicious input
     if depth > MAX_AST_DEPTH {
         return Err(SkimError::ParseError(format!(
             "Maximum AST depth exceeded: {} (possible malicious input)",

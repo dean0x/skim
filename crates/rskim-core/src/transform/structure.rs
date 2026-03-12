@@ -45,7 +45,8 @@ const MAX_MARKDOWN_HEADERS: usize = 10_000;
 ///    - Replace body with `/* ... */`
 /// 3. For classes: keep structure, strip method bodies
 /// 4. Preserve indentation
-#[allow(dead_code)] // Used by tests and as convenience wrapper
+#[cfg(test)]
+#[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn transform_structure(
     source: &str,
     tree: &Tree,
@@ -143,6 +144,8 @@ pub(crate) fn transform_structure_with_spans(
         // Track the offset change at this replacement point
         let replaced_len = end - start;
         let replacement_len = replacement.len();
+        // SAFETY: usize-to-i64 cast is safe because both values are bounded by
+        // source file size, which is far below i64::MAX (~9.2 exabytes).
         offset_delta += replacement_len as i64 - replaced_len as i64;
         offset_map.push((end, offset_delta));
 
@@ -304,6 +307,8 @@ fn build_spans_from_top_level_nodes(
             Err(0) => 0,
             Err(idx) => offset_map[idx - 1].1,
         };
+        // SAFETY: usize-to-i64 cast is safe because source_byte is a byte position
+        // within the source file, which is far below i64::MAX (~9.2 exabytes).
         (source_byte as i64 + delta).max(0) as usize
     };
 
@@ -312,7 +317,7 @@ fn build_spans_from_top_level_nodes(
         let source_start = child.start_byte();
         let source_end = child.end_byte();
 
-        let output_start = source_to_output_byte(source_start);
+        let output_start = source_to_output_byte(source_start).min(output.len());
         let output_end = source_to_output_byte(source_end).min(output.len());
 
         let start_line = byte_to_line(output_start);
@@ -398,7 +403,8 @@ pub(crate) fn to_static_node_kind(kind: &str) -> &'static str {
 /// # Security
 /// - Enforces MAX_MARKDOWN_DEPTH to prevent stack overflow
 /// - Enforces MAX_MARKDOWN_HEADERS to prevent memory exhaustion
-#[allow(dead_code)] // Used by tests and as convenience wrapper
+#[cfg(test)]
+#[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn extract_markdown_headers(
     source: &str,
     tree: &Tree,
