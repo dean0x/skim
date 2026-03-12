@@ -17,11 +17,11 @@ const MAX_AST_NODES: usize = 100_000;
 
 /// Transform source by stripping non-doc comments and normalizing blank lines
 ///
-/// Three-pass algorithm:
+/// Two-pass algorithm:
 /// 1. Walk AST collecting byte ranges of non-doc comment nodes to remove
 ///    (skip doc comments, skip comments inside function bodies, skip shebangs)
-/// 2. Remove collected ranges from source, trim trailing whitespace on affected lines
-/// 3. Normalize blank lines (3+ consecutive -> 2)
+/// 2. Remove collected ranges from source, then trim trailing whitespace and
+///    normalize blank lines (3+ consecutive -> 2) in a single fused pass
 pub(crate) fn transform_minimal(
     source: &str,
     tree: &Tree,
@@ -43,7 +43,7 @@ pub(crate) fn transform_minimal(
     ranges_to_remove.dedup();
 
     let after_removal = remove_ranges(source, &ranges_to_remove)?;
-    let normalized = normalize_blank_lines(&after_removal);
+    let normalized = trim_and_normalize(&after_removal);
 
     Ok(normalized)
 }
@@ -264,7 +264,6 @@ fn adjust_range_for_line_removal(source: &str, start: usize, end: usize) -> (usi
 /// Remove collected byte ranges from source
 ///
 /// Builds a new string by copying everything except the removed ranges.
-/// Also trims trailing whitespace on lines where content was removed.
 fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
     if ranges.is_empty() {
         return Ok(source.to_string());
@@ -315,39 +314,22 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
 
     result.push_str(&source[last_pos..]);
 
-    Ok(trim_trailing_whitespace_on_lines(&result))
+    Ok(result)
 }
 
-/// Trim trailing whitespace from each line
-fn trim_trailing_whitespace_on_lines(source: &str) -> String {
-    let mut result = String::with_capacity(source.len());
-    let mut first = true;
-
-    for line in source.lines() {
-        if !first {
-            result.push('\n');
-        }
-        result.push_str(line.trim_end());
-        first = false;
-    }
-
-    if source.ends_with('\n') {
-        result.push('\n');
-    }
-
-    result
-}
-
-/// Normalize blank lines: 3+ consecutive blank lines become 2
+/// Trim trailing whitespace from each line and normalize blank lines in a single pass
 ///
-/// A "blank line" is a line containing only whitespace.
-fn normalize_blank_lines(source: &str) -> String {
+/// Combines two operations to avoid an extra allocation:
+/// 1. Trims trailing whitespace from each line
+/// 2. Normalizes blank lines: 3+ consecutive blank lines become 2
+fn trim_and_normalize(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut consecutive_blanks: usize = 0;
     let mut first = true;
 
     for line in source.lines() {
-        if line.trim().is_empty() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
             consecutive_blanks += 1;
             if consecutive_blanks > 2 {
                 continue;
@@ -359,7 +341,7 @@ fn normalize_blank_lines(source: &str) -> String {
         if !first {
             result.push('\n');
         }
-        result.push_str(line);
+        result.push_str(trimmed);
         first = false;
     }
 
@@ -375,24 +357,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize_blank_lines_preserves_two() {
+    fn test_trim_and_normalize_preserves_two_blanks() {
         let input = "a\n\n\nb\n";
-        let result = normalize_blank_lines(input);
+        let result = trim_and_normalize(input);
         assert_eq!(result, "a\n\n\nb\n");
     }
 
     #[test]
-    fn test_normalize_blank_lines_reduces_four_to_two() {
+    fn test_trim_and_normalize_reduces_four_blanks_to_two() {
         let input = "a\n\n\n\n\nb\n";
-        let result = normalize_blank_lines(input);
+        let result = trim_and_normalize(input);
         assert_eq!(result, "a\n\n\nb\n");
     }
 
     #[test]
-    fn test_normalize_blank_lines_no_change_needed() {
+    fn test_trim_and_normalize_no_change_needed() {
         let input = "a\n\nb\n";
-        let result = normalize_blank_lines(input);
+        let result = trim_and_normalize(input);
         assert_eq!(result, "a\n\nb\n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_trims_trailing_whitespace() {
+        let input = "hello   \nworld  \n";
+        let result = trim_and_normalize(input);
+        assert_eq!(result, "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_combined() {
+        // Verify both trimming and normalization happen in one pass
+        let input = "hello   \n\n\n\n\nworld  \n";
+        let result = trim_and_normalize(input);
+        assert_eq!(result, "hello\n\n\nworld\n");
     }
 
     #[test]
@@ -405,10 +402,139 @@ mod tests {
         assert_eq!(end, 16); // includes the newline
     }
 
+    // ========================================================================
+    // Issue 5: adjust_range_for_line_removal trailing/inline comment branches
+    // ========================================================================
+
     #[test]
-    fn test_trim_trailing_whitespace() {
-        let input = "hello   \nworld  \n";
-        let result = trim_trailing_whitespace_on_lines(input);
-        assert_eq!(result, "hello\nworld\n");
+    fn test_adjust_range_trailing_comment() {
+        let source = "let x = 1; // trailing\nmore code\n";
+        // "// trailing" starts at byte 11, ends at byte 22
+        let (start, end) = adjust_range_for_line_removal(source, 11, 22);
+        // Should remove " // trailing" (the trailing whitespace + comment) but keep "let x = 1;"
+        // The function trims whitespace before the comment on the same line
+        assert!(start <= 11, "start should be at or before comment start");
+        assert_eq!(end, 22);
+        // Verify the remaining text makes sense
+        let remaining = format!("{}{}", &source[..start], &source[end..]);
+        assert!(
+            remaining.starts_with("let x = 1;"),
+            "should preserve code before trailing comment, got: {:?}",
+            remaining
+        );
     }
+
+    #[test]
+    fn test_adjust_range_inline_comment_with_code_after() {
+        // Comment at start of line with code after it -- the "middle" branch
+        let source = "/* comment */ let x = 1;\n";
+        // "/* comment */" starts at byte 0, ends at byte 13
+        let (start, end) = adjust_range_for_line_removal(source, 0, 13);
+        // There is non-whitespace after the comment, so just remove the comment itself
+        assert_eq!(start, 0);
+        assert_eq!(end, 13);
+    }
+
+    // ========================================================================
+    // Issue 4: remove_ranges error-path tests
+    // ========================================================================
+
+    #[test]
+    fn test_remove_ranges_end_before_start() {
+        let source = "hello world";
+        let ranges = vec![(5, 3)]; // end < start
+        let result = remove_ranges(source, &ranges);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid range"),
+            "Expected 'Invalid range' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_remove_ranges_end_exceeds_source_length() {
+        let source = "hello";
+        let ranges = vec![(0, 100)]; // end > source.len()
+        let result = remove_ranges(source, &ranges);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Range exceeds source length"),
+            "Expected 'Range exceeds source length' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_remove_ranges_non_char_boundary() {
+        // Multi-byte UTF-8 character: the euro sign takes 3 bytes
+        let source = "a\u{20AC}b"; // "a" + euro sign (3 bytes) + "b" = 5 bytes total
+        // Byte 2 is in the middle of the euro sign (bytes 1..4)
+        let ranges = vec![(2, 4)];
+        let result = remove_ranges(source, &ranges);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Invalid UTF-8 boundary"),
+            "Expected 'Invalid UTF-8 boundary' error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_remove_ranges_empty_ranges() {
+        let source = "hello world";
+        let ranges = vec![];
+        let result = remove_ranges(source, &ranges).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_remove_ranges_valid_removal() {
+        let source = "hello beautiful world";
+        let ranges = vec![(5, 15)]; // remove " beautiful"
+        let result = remove_ranges(source, &ranges).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    // ========================================================================
+    // Issue 3: Security limit error-path tests
+    // ========================================================================
+
+    #[test]
+    fn test_max_ast_nodes_limit() {
+        // Generate Python source with many expressions to exceed MAX_AST_NODES (100,000).
+        // Each line `x = 0 + 1 + 2 + ... + 19` generates ~25 AST nodes (identifiers,
+        // operators, integers, expression_statement wrappers), so 4500 lines is enough.
+        let mut source = String::new();
+        for i in 0..4500 {
+            source.push_str(&format!(
+                "x = {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {}\n",
+                i, i+1, i+2, i+3, i+4, i+5, i+6, i+7, i+8, i+9,
+                i+10, i+11, i+12, i+13, i+14, i+15, i+16, i+17, i+18, i+19
+            ));
+        }
+
+        let mut parser = crate::Parser::new(Language::Python).unwrap();
+        let tree = parser.parse(&source).unwrap();
+        let config = TransformConfig::default();
+
+        let result = transform_minimal(&source, &tree, Language::Python, &config);
+        assert!(result.is_err(), "Expected error when exceeding MAX_AST_NODES");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Too many AST nodes"),
+            "Expected 'Too many AST nodes' error, got: {}",
+            err_msg
+        );
+    }
+
+    // NOTE: MAX_AST_DEPTH (500) is not tested because tree-sitter grammars impose
+    // their own nesting limits that are well below 500 levels. Even deeply nested
+    // expressions like `(((((...))))` do not produce 500 levels of AST depth in
+    // practice. The depth guard exists as a defense-in-depth measure against
+    // hypothetical malicious grammars or future grammar changes.
+
 }
