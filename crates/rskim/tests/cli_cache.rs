@@ -297,3 +297,28 @@ fn test_no_cache_with_show_stats() {
         .success()
         .stderr(predicate::str::contains("[skim]"));
 }
+
+#[test]
+fn test_cache_stats_computed_on_hit_when_missing() {
+    // Scenario: First run without --show-stats caches (content, None, None).
+    // Second run WITH --show-stats should still compute and display tokens.
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.ts");
+    fs::write(&file_path, "function test() { return 42; }").unwrap();
+
+    // First run without --show-stats (caches without token counts)
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .assert()
+        .success();
+
+    // Second run with --show-stats (should compute tokens from cache hit)
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--show-stats")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[skim]"));
+}

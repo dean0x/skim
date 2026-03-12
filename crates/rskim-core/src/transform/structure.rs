@@ -4,6 +4,7 @@
 //!
 //! Token reduction target: 70-80%
 
+use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
@@ -44,16 +45,30 @@ const MAX_MARKDOWN_HEADERS: usize = 10_000;
 ///    - Replace body with `/* ... */`
 /// 3. For classes: keep structure, strip method bodies
 /// 4. Preserve indentation
+#[cfg(test)]
+#[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn transform_structure(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &TransformConfig,
+    config: &TransformConfig,
 ) -> Result<String> {
+    let (text, _spans) = transform_structure_with_spans(source, tree, language, config)?;
+    Ok(text)
+}
+
+/// Transform to structure-only and return NodeSpan metadata for truncation
+pub(crate) fn transform_structure_with_spans(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    _config: &TransformConfig,
+) -> Result<(String, Vec<NodeSpan>)> {
     // ARCHITECTURE: Markdown uses extraction, not replacement
     // Extract H1-H3 headers only (top-level document structure)
     if language == Language::Markdown {
-        return extract_markdown_headers(source, tree, 1, 3);
+        let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 3)?;
+        return Ok((text, spans));
     }
 
     // Get language-specific node types
@@ -79,8 +94,7 @@ pub(crate) fn transform_structure(
         )));
     }
 
-    // Build output by replacing bodies
-    // Preallocate with buffer for replacement overhead
+    // Build output by replacing bodies, tracking byte offset changes
     let estimated_capacity = source.len() + (replacements.len() * 20);
     let mut result = String::with_capacity(estimated_capacity);
     let mut last_pos = 0;
@@ -88,6 +102,10 @@ pub(crate) fn transform_structure(
     // Sort replacements by start position
     let mut sorted_replacements: Vec<_> = replacements.into_iter().collect();
     sorted_replacements.sort_unstable_by_key(|(range, _)| range.0);
+
+    // Track cumulative byte offset delta (output_pos - source_pos)
+    let mut offset_delta: i64 = 0;
+    let mut offset_map: Vec<(usize, i64)> = Vec::new(); // (source_byte, delta)
 
     for ((start, end), replacement) in sorted_replacements {
         // Validate byte ranges
@@ -122,6 +140,14 @@ pub(crate) fn transform_structure(
         result.push_str(&source[last_pos..start]);
         // Add replacement
         result.push_str(replacement);
+
+        // Track the offset change at this replacement point
+        let replaced_len = end - start;
+        let replacement_len = replacement.len();
+        // SAFETY: Both values bounded by source file size (far below i64::MAX).
+        offset_delta += replacement_len as i64 - replaced_len as i64;
+        offset_map.push((end, offset_delta));
+
         last_pos = end;
     }
 
@@ -136,7 +162,10 @@ pub(crate) fn transform_structure(
     // Copy remaining source
     result.push_str(&source[last_pos..]);
 
-    Ok(result)
+    // Build NodeSpans from top-level AST children
+    let spans = build_spans_from_top_level_nodes(tree, &result, &offset_map);
+
+    Ok((result, spans))
 }
 
 /// Recursively collect body nodes that should be replaced
@@ -231,12 +260,131 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             function: "method_declaration",
             method: "method_declaration",
         }),
+        // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(NodeTypes {
-            function: "atx_heading", // Not used - markdown uses special extraction
-            method: "atx_heading",   // Not used - markdown uses special extraction
+            function: "atx_heading",
+            method: "atx_heading",
         }),
         Language::Json => None,
         Language::Yaml => None,
+    }
+}
+
+/// Build NodeSpans from top-level AST children, mapping source byte positions
+/// to output line ranges using the offset map
+fn build_spans_from_top_level_nodes(
+    tree: &Tree,
+    output: &str,
+    offset_map: &[(usize, i64)],
+) -> Vec<NodeSpan> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut spans = Vec::new();
+
+    // Pre-compute line starts in the output for byte-to-line conversion
+    let line_starts: Vec<usize> =
+        std::iter::once(0)
+            .chain(output.bytes().enumerate().filter_map(|(i, b)| {
+                if b == b'\n' {
+                    Some(i + 1)
+                } else {
+                    None
+                }
+            }))
+            .collect();
+
+    let byte_to_line = |byte_pos: usize| -> usize {
+        match line_starts.binary_search(&byte_pos) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        }
+    };
+
+    // Map source byte position to output byte position using offset map
+    let source_to_output_byte = |source_byte: usize| -> usize {
+        let delta = match offset_map.binary_search_by_key(&source_byte, |&(pos, _)| pos) {
+            Ok(idx) => offset_map[idx].1,
+            Err(0) => 0,
+            Err(idx) => offset_map[idx - 1].1,
+        };
+        // SAFETY: source_byte bounded by source file size (far below i64::MAX).
+        (source_byte as i64 + delta).max(0) as usize
+    };
+
+    for child in root.children(&mut cursor) {
+        let kind = child.kind();
+        let source_start = child.start_byte();
+        let source_end = child.end_byte();
+
+        let output_start = source_to_output_byte(source_start).min(output.len());
+        let output_end = source_to_output_byte(source_end).min(output.len());
+
+        let start_line = byte_to_line(output_start);
+        let end_line = byte_to_line(output_end.saturating_sub(1)) + 1;
+
+        // Map tree-sitter node kinds to static str for priority scoring
+        let static_kind = to_static_node_kind(kind);
+
+        if start_line < end_line {
+            spans.push(NodeSpan::new(start_line..end_line, static_kind));
+        }
+    }
+
+    spans
+}
+
+/// Map a tree-sitter node kind string to a static &str for use in NodeSpan
+///
+/// ARCHITECTURE: tree-sitter node kind strings have static lifetime tied to the
+/// grammar, but Rust can't prove this to the borrow checker. We map known kinds
+/// to static strings. Unknown kinds get "unknown" which has lowest priority.
+pub(crate) fn to_static_node_kind(kind: &str) -> &'static str {
+    match kind {
+        // Priority 5: Type definitions
+        "type_alias_declaration" => "type_alias_declaration",
+        "interface_declaration" => "interface_declaration",
+        "struct_item" => "struct_item",
+        "trait_item" => "trait_item",
+        "enum_item" => "enum_item",
+        "enum_declaration" => "enum_declaration",
+        "type_item" => "type_item",
+        "type_alias_statement" => "type_alias_statement",
+        "type_declaration" => "type_declaration",
+        "atx_heading" => "atx_heading",
+        "setext_heading" => "setext_heading",
+
+        // Priority 4: Functions
+        "function_declaration" => "function_declaration",
+        "function_item" => "function_item",
+        "method_declaration" => "method_declaration",
+        "function_definition" => "function_definition",
+        "method_definition" => "method_definition",
+        "arrow_function" => "arrow_function",
+        "function_expression" => "function_expression",
+
+        // Priority 3: Imports
+        "import_statement" => "import_statement",
+        "use_declaration" => "use_declaration",
+        "use_item" => "use_item",
+        "import_declaration" => "import_declaration",
+        "export_statement" => "export_statement",
+
+        // Priority 2: Containers
+        "class_declaration" => "class_declaration",
+        "class_definition" => "class_definition",
+        "module_declaration" => "module_declaration",
+        "impl_item" => "impl_item",
+
+        // Priority 1: Everything else
+        "program" => "program",
+        "source_file" => "source_file",
+        "expression_statement" => "expression_statement",
+        "lexical_declaration" => "lexical_declaration",
+        "variable_declaration" => "variable_declaration",
+        "comment" => "comment",
+        "line_comment" => "line_comment",
+        "block_comment" => "block_comment",
+        _ => "unknown",
     }
 }
 
@@ -254,20 +402,33 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
 /// # Security
 /// - Enforces MAX_MARKDOWN_DEPTH to prevent stack overflow
 /// - Enforces MAX_MARKDOWN_HEADERS to prevent memory exhaustion
+#[cfg(test)]
+#[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn extract_markdown_headers(
     source: &str,
     tree: &Tree,
     min_level: u32,
     max_level: u32,
 ) -> Result<String> {
-    let mut headers = Vec::new();
+    let (text, _spans) = extract_markdown_headers_with_spans(source, tree, min_level, max_level)?;
+    Ok(text)
+}
+
+/// Extract markdown headers with NodeSpan metadata for truncation
+///
+/// Each header gets its own span with "atx_heading" or "setext_heading" kind.
+pub(crate) fn extract_markdown_headers_with_spans(
+    source: &str,
+    tree: &Tree,
+    min_level: u32,
+    max_level: u32,
+) -> Result<(String, Vec<NodeSpan>)> {
+    let mut headers: Vec<(String, &'static str)> = Vec::new();
     let root = tree.root_node();
 
-    // Traverse all nodes to find headers (depth, node)
     let mut visit_stack = vec![(0_usize, root)];
 
     while let Some((depth, node)) = visit_stack.pop() {
-        // SECURITY: Prevent stack overflow from deeply nested AST
         if depth > MAX_MARKDOWN_DEPTH {
             return Err(SkimError::ParseError(format!(
                 "Maximum markdown depth exceeded: {} (possible malicious input)",
@@ -275,7 +436,6 @@ pub(crate) fn extract_markdown_headers(
             )));
         }
 
-        // SECURITY: Prevent memory exhaustion from excessive headers
         if headers.len() > MAX_MARKDOWN_HEADERS {
             return Err(SkimError::ParseError(format!(
                 "Too many markdown headers: {} (max: {}). Possible malicious input.",
@@ -283,37 +443,31 @@ pub(crate) fn extract_markdown_headers(
                 MAX_MARKDOWN_HEADERS
             )));
         }
+
         let node_type = node.kind();
 
-        // ATX headers: # Header
         if node_type == "atx_heading" {
-            // Find marker child to determine level (atx_h1_marker through atx_h6_marker)
             let mut cursor = node.walk();
             let marker = node.children(&mut cursor).find(|child| {
                 child.kind().starts_with("atx_h") && child.kind().ends_with("_marker")
             });
 
             if let Some(marker) = marker {
-                // Extract level from marker node type (atx_h1_marker -> 1, atx_h2_marker -> 2, etc.)
                 let marker_kind = marker.kind();
                 let level = marker_kind
                     .chars()
                     .find(|c| c.is_ascii_digit())
                     .and_then(|c| c.to_digit(10))
-                    .unwrap_or(1); // Default to H1 if parsing fails
+                    .unwrap_or(1);
 
                 if level >= min_level && level <= max_level {
                     let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
                         SkimError::ParseError(format!("UTF-8 error in header: {}", e))
                     })?;
-                    headers.push(header_text.to_string());
+                    headers.push((header_text.to_string(), "atx_heading"));
                 }
             }
-        }
-        // Setext headers: underlined with === or ---
-        else if node_type == "setext_heading" {
-            // Setext headers are H1 (===) or H2 (---)
-            // Determine level by checking child node type for underline marker
+        } else if node_type == "setext_heading" {
             let mut cursor = node.walk();
             let underline = node.children(&mut cursor).find(|child| {
                 let kind = child.kind();
@@ -321,14 +475,12 @@ pub(crate) fn extract_markdown_headers(
             });
 
             let level = if let Some(underline_node) = underline {
-                // Extract level from underline node type
                 if underline_node.kind() == "setext_h1_underline" {
                     1
                 } else {
                     2
                 }
             } else {
-                // Fallback: if no underline child found, default to H1
                 1
             };
 
@@ -336,17 +488,29 @@ pub(crate) fn extract_markdown_headers(
                 let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
                     SkimError::ParseError(format!("UTF-8 error in setext header: {}", e))
                 })?;
-                headers.push(header_text.to_string());
+                headers.push((header_text.to_string(), "setext_heading"));
             }
         }
 
-        // Add children to visit stack with incremented depth (depth-first traversal)
         let mut child_cursor = node.walk();
         for child in node.children(&mut child_cursor) {
             visit_stack.push((depth + 1, child));
         }
     }
 
-    // Join headers with newlines
-    Ok(headers.join("\n"))
+    // Build text and spans
+    let mut spans = Vec::with_capacity(headers.len());
+    let mut current_line = 0;
+
+    let texts: Vec<String> = headers
+        .into_iter()
+        .map(|(text, kind)| {
+            let line_count = text.lines().count().max(1);
+            spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
+            current_line += line_count;
+            text
+        })
+        .collect();
+
+    Ok((texts.join("\n"), spans))
 }

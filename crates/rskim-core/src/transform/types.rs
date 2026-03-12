@@ -4,6 +4,7 @@
 //!
 //! Token reduction target: 90-95%
 
+use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError};
 use tree_sitter::{Node, Tree};
 
@@ -34,16 +35,30 @@ const MAX_TYPE_DEFS: usize = 10_000;
 /// # Implementation Strategy
 ///
 /// Most aggressive mode. Extract only type system information.
+#[cfg(test)]
+#[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn transform_types(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &crate::TransformConfig,
+    config: &crate::TransformConfig,
 ) -> Result<String> {
+    let (text, _spans) = transform_types_with_spans(source, tree, language, config)?;
+    Ok(text)
+}
+
+/// Transform to types-only and return NodeSpan metadata for truncation
+pub(crate) fn transform_types_with_spans(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    _config: &crate::TransformConfig,
+) -> Result<(String, Vec<NodeSpan>)> {
     // ARCHITECTURE: Markdown types mode extracts ALL headers (H1-H6)
-    // (same as signatures mode - no type system in markdown)
     if language == Language::Markdown {
-        return crate::transform::structure::extract_markdown_headers(source, tree, 1, 6);
+        return crate::transform::structure::extract_markdown_headers_with_spans(
+            source, tree, 1, 6,
+        );
     }
 
     // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
@@ -55,8 +70,8 @@ pub(crate) fn transform_types(
         ))
     })?;
 
-    let mut type_defs = Vec::new();
-    collect_type_definitions(tree.root_node(), source, &node_types, &mut type_defs, 0)?;
+    let mut type_defs: Vec<(String, &'static str)> = Vec::new();
+    collect_type_definitions_with_kinds(tree.root_node(), source, &node_types, &mut type_defs, 0)?;
 
     // Check type definition count limit
     if type_defs.len() > MAX_TYPE_DEFS {
@@ -67,18 +82,39 @@ pub(crate) fn transform_types(
         )));
     }
 
-    Ok(type_defs.join("\n\n"))
+    // Build text and spans, tracking line offsets
+    // Types mode joins with \n\n (two newlines between defs)
+    let type_defs_count = type_defs.len();
+    let mut spans = Vec::with_capacity(type_defs_count);
+    let mut current_line = 0;
+
+    let texts: Vec<String> = type_defs
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (def, kind))| {
+            let line_count = def.lines().count().max(1);
+            spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
+            current_line += line_count;
+            // Account for the blank line separator between defs
+            if idx < type_defs_count - 1 {
+                current_line += 1; // \n\n adds one extra line
+            }
+            def
+        })
+        .collect();
+
+    Ok((texts.join("\n\n"), spans))
 }
 
-/// Recursively collect type definitions
-fn collect_type_definitions(
+/// Recursively collect type definitions with their node kind
+fn collect_type_definitions_with_kinds(
     node: Node,
     source: &str,
     node_types: &TypeNodeTypes,
-    type_defs: &mut Vec<String>,
+    type_defs: &mut Vec<(String, &'static str)>,
     depth: usize,
 ) -> Result<()> {
-    // SECURITY: Prevent stack overflow
+    // SECURITY: Prevent stack overflow from deeply nested or malicious input
     if depth > MAX_AST_DEPTH {
         return Err(SkimError::ParseError(format!(
             "Maximum AST depth exceeded: {} (possible malicious input)",
@@ -88,19 +124,17 @@ fn collect_type_definitions(
 
     let kind = node.kind();
 
-    // Check if this is a type definition node
     if is_type_node(kind, node_types) {
         if let Some(type_def) = extract_type_definition(node, source, node_types)? {
-            type_defs.push(type_def);
+            let static_kind = crate::transform::structure::to_static_node_kind(kind);
+            type_defs.push((type_def, static_kind));
         }
-        // Don't recurse into type definitions to avoid extracting nested content
         return Ok(());
     }
 
-    // Recursively process children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_type_definitions(child, source, node_types, type_defs, depth + 1)?;
+        collect_type_definitions_with_kinds(child, source, node_types, type_defs, depth + 1)?;
     }
 
     Ok(())
@@ -224,12 +258,13 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "class_declaration",
             struct_def: "",
         }),
+        // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(TypeNodeTypes {
-            type_alias: "", // Not applicable
-            interface: "",  // Not applicable
-            enum_def: "",   // Not applicable
-            class_decl: "", // Not applicable
-            struct_def: "", // Not applicable
+            type_alias: "",
+            interface: "",
+            enum_def: "",
+            class_decl: "",
+            struct_def: "",
         }),
         Language::Json => None,
         Language::Yaml => None,

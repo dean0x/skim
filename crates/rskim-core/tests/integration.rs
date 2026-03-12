@@ -5,7 +5,9 @@
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
 #![allow(clippy::expect_used)] // Expect is acceptable in tests
 
-use rskim_core::{transform, transform_auto, Language, Mode};
+use rskim_core::{
+    transform, transform_auto, transform_with_config, Language, Mode, TransformConfig,
+};
 use std::path::Path;
 
 // ============================================================================
@@ -1550,5 +1552,260 @@ fn test_python_minimal_class_level_comments_stripped() {
     assert!(
         result.contains("body comment"),
         "method body comment should be preserved"
+    );
+}
+
+// ============================================================================
+// Max Lines (AST-aware truncation) Tests
+// ============================================================================
+
+#[test]
+fn test_max_lines_output_never_exceeds_limit() {
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(5);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 5,
+        "Output should be at most 5 lines, got {}: {:?}",
+        line_count,
+        result,
+    );
+}
+
+#[test]
+fn test_max_lines_types_preferred_over_functions() {
+    // With structure mode and small max_lines, types should be prioritized
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(10);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    // Types and interfaces should be present (priority 5)
+    let has_type = result.contains("type UserId")
+        || result.contains("type ApiResponse")
+        || result.contains("interface User")
+        || result.contains("interface UserService");
+
+    assert!(
+        has_type,
+        "Should contain type definitions with max_lines=10: {:?}",
+        result,
+    );
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 10,
+        "Output should be at most 10 lines, got {}",
+        line_count,
+    );
+}
+
+#[test]
+fn test_max_lines_none_returns_full_output() {
+    let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
+
+    let result_full = transform(source, Language::TypeScript, Mode::Structure).unwrap();
+    let config = TransformConfig::with_mode(Mode::Structure);
+    let result_none = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    assert_eq!(
+        result_full, result_none,
+        "No max_lines should return identical output to transform()"
+    );
+}
+
+#[test]
+fn test_max_lines_short_file_passes_through() {
+    let source = "function add(a: number, b: number): number { return a + b; }\n";
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(100);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    // File shorter than max_lines should pass through unchanged (minus body replacement)
+    assert!(
+        result.contains("function add"),
+        "Short file should pass through: {:?}",
+        result,
+    );
+}
+
+#[test]
+fn test_max_lines_with_signatures_mode() {
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Signatures).with_max_lines(3);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 3,
+        "Signatures mode with max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count,
+        result,
+    );
+}
+
+#[test]
+fn test_max_lines_with_types_mode() {
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Types).with_max_lines(5);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 5,
+        "Types mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count,
+    );
+}
+
+#[test]
+fn test_max_lines_with_full_mode() {
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Full).with_max_lines(5);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 5,
+        "Full mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count,
+    );
+}
+
+#[test]
+fn test_max_lines_with_minimal_mode() {
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Minimal).with_max_lines(5);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 5,
+        "Minimal mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count,
+    );
+}
+
+#[test]
+fn test_max_lines_python() {
+    let source = include_str!("../../../tests/fixtures/python/mixed_priority.py");
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(5);
+    let result = transform_with_config(source, Language::Python, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 5,
+        "Python max_lines=5 should produce at most 5 lines, got {}: {:?}",
+        line_count,
+        result,
+    );
+
+    // Python omission markers should use # syntax
+    if result.contains("(truncated)") {
+        assert!(
+            result.contains("# ..."),
+            "Python omission markers should use # syntax: {:?}",
+            result,
+        );
+    }
+}
+
+#[test]
+fn test_max_lines_rust() {
+    let source = include_str!("../../../tests/fixtures/rust/mixed_priority.rs");
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(5);
+    let result = transform_with_config(source, Language::Rust, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 5,
+        "Rust max_lines=5 should produce at most 5 lines, got {}: {:?}",
+        line_count,
+        result,
+    );
+
+    // Rust omission markers should use // syntax
+    if result.contains("(truncated)") {
+        assert!(
+            result.contains("// ..."),
+            "Rust omission markers should use // syntax: {:?}",
+            result,
+        );
+    }
+}
+
+#[test]
+fn test_max_lines_json_simple_truncation() {
+    let source = r#"{
+  "users": [
+    {"id": 1, "name": "Alice"},
+    {"id": 2, "name": "Bob"}
+  ],
+  "config": {
+    "host": "localhost",
+    "port": 3000,
+    "debug": true
+  }
+}"#;
+
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(3);
+    let result = transform_with_config(source, Language::Json, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 3,
+        "JSON max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count,
+        result,
+    );
+}
+
+#[test]
+fn test_max_lines_yaml_simple_truncation() {
+    let source =
+        "apiVersion: v1\nkind: Service\nmetadata:\n  name: myservice\n  labels:\n    app: myapp\n";
+
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(3);
+    let result = transform_with_config(source, Language::Yaml, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 3,
+        "YAML max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count,
+        result,
+    );
+}
+
+#[test]
+fn test_max_lines_1_returns_at_least_one_meaningful_line() {
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(1);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    let line_count = result.lines().count();
+    assert!(
+        line_count <= 1,
+        "max_lines=1 should produce at most 1 line, got {}: {:?}",
+        line_count,
+        result,
+    );
+    assert!(
+        !result.trim().is_empty(),
+        "max_lines=1 should produce at least one meaningful line"
+    );
+}
+
+#[test]
+fn test_max_lines_omission_markers_present() {
+    let source = include_str!("../../../tests/fixtures/typescript/mixed_priority.ts");
+    let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(5);
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+
+    // The file is large enough that truncation should produce omission markers
+    assert!(
+        result.contains("// ... (truncated)"),
+        "Should contain TypeScript omission markers: {:?}",
+        result,
     );
 }

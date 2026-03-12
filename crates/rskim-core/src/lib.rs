@@ -156,6 +156,48 @@ pub fn transform_auto(source: &str, path: &std::path::Path, mode: Mode) -> Resul
     transform(source, language, mode)
 }
 
+/// Transform source code with automatic language detection and custom configuration
+///
+/// Convenience function that detects language from file extension and applies
+/// the provided configuration. Useful for applying max_lines truncation with
+/// auto-detected language.
+///
+/// # Arguments
+///
+/// * `source` - Source code as string slice
+/// * `path` - File path for language detection (NOT read from disk)
+/// * `config` - Full transformation configuration
+///
+/// # Errors
+///
+/// - `SkimError::UnsupportedLanguage` - Could not detect language from path
+/// - All errors from `transform_with_config()`
+///
+/// # Examples
+///
+/// ```no_run
+/// use rskim_core::{transform_auto_with_config, Mode, TransformConfig};
+/// use std::path::Path;
+///
+/// let config = TransformConfig::with_mode(Mode::Structure)
+///     .with_max_lines(50);
+///
+/// let source = "def hello(): pass";
+/// let path = Path::new("script.py");
+/// let result = transform_auto_with_config(source, path, &config)?;
+/// # Ok::<(), rskim_core::SkimError>(())
+/// ```
+pub fn transform_auto_with_config(
+    source: &str,
+    path: &std::path::Path,
+    config: &TransformConfig,
+) -> Result<String> {
+    let language = Language::from_path(path)
+        .ok_or_else(|| SkimError::UnsupportedLanguage(path.to_path_buf()))?;
+
+    transform_with_config(source, language, config)
+}
+
 /// Transform source code with full result metadata
 ///
 /// Returns `TransformResult` with optional token counts and timing.

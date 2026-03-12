@@ -61,17 +61,32 @@ fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Generate cache key from file path, mtime, and mode
-fn cache_key(path: &Path, mtime: SystemTime, mode: Mode) -> Result<String> {
+/// Generate cache key from file path, mtime, mode, and max_lines
+fn cache_key(
+    path: &Path,
+    mtime: SystemTime,
+    mode: Mode,
+    max_lines: Option<usize>,
+) -> Result<String> {
     // Get canonical path (resolves symlinks, relative paths)
     let canonical_path = path.canonicalize()?;
 
     // Convert mtime to seconds since UNIX epoch
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
-    // Create hash input: "path|mtime|mode"
+    // Create hash input: "path|mtime|mode|max_lines_or_none"
     let mode_str = format!("{:?}", mode);
-    let hash_input = format!("{}|{}|{}", canonical_path.display(), mtime_secs, mode_str);
+    let max_lines_str = match max_lines {
+        Some(n) => n.to_string(),
+        None => "none".to_string(),
+    };
+    let hash_input = format!(
+        "{}|{}|{}|{}",
+        canonical_path.display(),
+        mtime_secs,
+        mode_str,
+        max_lines_str,
+    );
 
     // Generate SHA256 hash
     let mut hasher = Sha256::new();
@@ -84,13 +99,17 @@ fn cache_key(path: &Path, mtime: SystemTime, mode: Mode) -> Result<String> {
 
 /// Read cached output if valid (mtime matches)
 /// Returns: (content, original_tokens, transformed_tokens)
-pub fn read_cache(path: &Path, mode: Mode) -> Option<(String, Option<usize>, Option<usize>)> {
+pub fn read_cache(
+    path: &Path,
+    mode: Mode,
+    max_lines: Option<usize>,
+) -> Option<(String, Option<usize>, Option<usize>)> {
     // Get file metadata
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
 
     // Generate cache key
-    let key = cache_key(path, mtime, mode).ok()?;
+    let key = cache_key(path, mtime, mode, max_lines).ok()?;
     let cache_dir = get_cache_dir().ok()?;
     let cache_file = cache_dir.join(format!("{}.json", key));
 
@@ -127,13 +146,14 @@ pub fn write_cache(
     content: &str,
     original_tokens: Option<usize>,
     transformed_tokens: Option<usize>,
+    max_lines: Option<usize>,
 ) -> Result<()> {
     // Get file metadata
     let metadata = fs::metadata(path)?;
     let mtime = metadata.modified()?;
 
     // Generate cache key
-    let key = cache_key(path, mtime, mode)?;
+    let key = cache_key(path, mtime, mode, max_lines)?;
     let cache_dir = get_cache_dir()?;
     let cache_file = cache_dir.join(format!("{}.json", key));
 
@@ -164,12 +184,21 @@ pub fn write_cache(
 }
 
 /// Clear entire cache directory
+///
+/// Removes all files inside the cache directory rather than the directory
+/// itself. This avoids ENOTEMPTY races when concurrent processes write
+/// cache entries during deletion.
 pub fn clear_cache() -> Result<()> {
     let cache_dir = get_cache_dir()?;
 
     if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir)?;
-        fs::create_dir_all(&cache_dir)?;
+        for entry in fs::read_dir(&cache_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 
     Ok(())
@@ -191,13 +220,21 @@ mod tests {
         let mtime = metadata.modified().unwrap();
 
         // Same inputs should produce same key
-        let key1 = cache_key(path, mtime, Mode::Structure).unwrap();
-        let key2 = cache_key(path, mtime, Mode::Structure).unwrap();
+        let key1 = cache_key(path, mtime, Mode::Structure, None).unwrap();
+        let key2 = cache_key(path, mtime, Mode::Structure, None).unwrap();
         assert_eq!(key1, key2);
 
         // Different mode should produce different key
-        let key3 = cache_key(path, mtime, Mode::Signatures).unwrap();
+        let key3 = cache_key(path, mtime, Mode::Signatures, None).unwrap();
         assert_ne!(key1, key3);
+
+        // Different max_lines should produce different key
+        let key4 = cache_key(path, mtime, Mode::Structure, Some(50)).unwrap();
+        assert_ne!(key1, key4);
+
+        // Same max_lines should produce same key
+        let key5 = cache_key(path, mtime, Mode::Structure, Some(50)).unwrap();
+        assert_eq!(key4, key5);
     }
 
     #[test]
@@ -207,20 +244,23 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         // Initially no cache
-        assert!(read_cache(&path, Mode::Structure).is_none());
+        assert!(read_cache(&path, Mode::Structure, None).is_none());
 
         // Write to cache with token counts
         let content = "transformed output";
-        write_cache(&path, Mode::Structure, content, Some(100), Some(50)).unwrap();
+        write_cache(&path, Mode::Structure, content, Some(100), Some(50), None).unwrap();
 
         // Read from cache
-        let (cached, orig_tokens, trans_tokens) = read_cache(&path, Mode::Structure).unwrap();
+        let (cached, orig_tokens, trans_tokens) = read_cache(&path, Mode::Structure, None).unwrap();
         assert_eq!(cached, content);
         assert_eq!(orig_tokens, Some(100));
         assert_eq!(trans_tokens, Some(50));
 
         // Different mode should not find cache
-        assert!(read_cache(&path, Mode::Signatures).is_none());
+        assert!(read_cache(&path, Mode::Signatures, None).is_none());
+
+        // Different max_lines should not find cache
+        assert!(read_cache(&path, Mode::Structure, Some(50)).is_none());
     }
 
     #[test]
@@ -239,8 +279,8 @@ mod tests {
         }
 
         // Write to cache
-        write_cache(&path, Mode::Structure, "cached v1", None, None).unwrap();
-        let (cached, _, _) = read_cache(&path, Mode::Structure).unwrap();
+        write_cache(&path, Mode::Structure, "cached v1", None, None, None).unwrap();
+        let (cached, _, _) = read_cache(&path, Mode::Structure, None).unwrap();
         assert_eq!(cached, "cached v1");
 
         // Sleep to ensure mtime resolution (some filesystems have 1-second resolution)
@@ -254,6 +294,6 @@ mod tests {
         }
 
         // Cache should be invalidated (mtime changed)
-        assert!(read_cache(&path, Mode::Structure).is_none());
+        assert!(read_cache(&path, Mode::Structure, None).is_none());
     }
 }
