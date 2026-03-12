@@ -147,7 +147,8 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::Java => "//",
         Language::Python => "#",
         Language::Markdown => "<!--",
-        Language::Json | Language::Yaml => "//",
+        Language::Json => "//",  // JSON has no comments; // is JSONC-compatible
+        Language::Yaml => "#",
     }
 }
 
