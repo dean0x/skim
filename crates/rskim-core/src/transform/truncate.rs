@@ -108,10 +108,10 @@ pub(crate) fn truncate_to_lines(
         })
     });
 
-    // Reserve budget for omission markers (estimate: at most one marker per gap)
-    let marker_budget = 2;
-    let effective_budget = if max_lines > marker_budget {
-        max_lines - marker_budget
+    // Reserve lines for omission markers (leading + trailing = 2 max)
+    const MARKER_RESERVE: usize = 2;
+    let effective_budget = if max_lines > MARKER_RESERVE {
+        max_lines - MARKER_RESERVE
     } else {
         // Very tight budget - try to fit at least one span
         1
@@ -122,20 +122,18 @@ pub(crate) fn truncate_to_lines(
     let mut lines_used: usize = 0;
 
     for &(_, _, span) in &scored {
-        let span_lines = span.line_count();
-
         // Clamp span end to actual line count
         let clamped_end = span.transformed_range.end.min(lines.len());
-        let clamped_lines = if clamped_end > span.transformed_range.start {
-            clamped_end - span.transformed_range.start
-        } else {
+        let clamped_lines = clamped_end.saturating_sub(span.transformed_range.start);
+
+        if clamped_lines == 0 {
             continue;
-        };
+        }
 
         if lines_used + clamped_lines <= effective_budget {
             selected.push(span);
             lines_used += clamped_lines;
-        } else if selected.is_empty() && span_lines > 0 {
+        } else if selected.is_empty() {
             // Fallback: if no span fits, take first max_lines of highest-priority span
             selected.push(span);
             break;
@@ -172,21 +170,9 @@ pub(crate) fn truncate_to_lines(
         }
 
         // Add lines from this span (may need to clamp for the fallback case)
-        let remaining_budget = if max_lines > result_lines.len() {
-            max_lines
-                - result_lines
-                    .len()
-                    // Reserve 1 for potential trailing marker
-                    .saturating_sub(1)
-        } else {
-            0
-        };
-
-        let span_end = if end - start > remaining_budget {
-            start + remaining_budget
-        } else {
-            end
-        };
+        // Reserve 1 line for a potential trailing omission marker
+        let remaining_budget = max_lines.saturating_sub(result_lines.len() + 1);
+        let span_end = end.min(start + remaining_budget);
 
         for line_idx in start..span_end {
             if line_idx < lines.len() {

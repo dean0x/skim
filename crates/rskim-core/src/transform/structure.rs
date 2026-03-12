@@ -161,7 +161,7 @@ pub(crate) fn transform_structure_with_spans(
     result.push_str(&source[last_pos..]);
 
     // Build NodeSpans from top-level AST children
-    let spans = build_spans_from_top_level_nodes(tree, source, &result, &offset_map);
+    let spans = build_spans_from_top_level_nodes(tree, &result, &offset_map);
 
     Ok((result, spans))
 }
@@ -271,7 +271,6 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
 /// to output line ranges using the offset map
 fn build_spans_from_top_level_nodes(
     tree: &Tree,
-    _source: &str,
     output: &str,
     offset_map: &[(usize, i64)],
 ) -> Vec<NodeSpan> {

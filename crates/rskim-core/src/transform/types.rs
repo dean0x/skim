@@ -104,43 +104,6 @@ pub(crate) fn transform_types_with_spans(
     Ok((texts.join("\n\n"), spans))
 }
 
-/// Recursively collect type definitions
-#[allow(dead_code)] // Kept as convenience, _with_kinds variant used by pipeline
-fn collect_type_definitions(
-    node: Node,
-    source: &str,
-    node_types: &TypeNodeTypes,
-    type_defs: &mut Vec<String>,
-    depth: usize,
-) -> Result<()> {
-    // SECURITY: Prevent stack overflow
-    if depth > MAX_AST_DEPTH {
-        return Err(SkimError::ParseError(format!(
-            "Maximum AST depth exceeded: {} (possible malicious input)",
-            MAX_AST_DEPTH
-        )));
-    }
-
-    let kind = node.kind();
-
-    // Check if this is a type definition node
-    if is_type_node(kind, node_types) {
-        if let Some(type_def) = extract_type_definition(node, source, node_types)? {
-            type_defs.push(type_def);
-        }
-        // Don't recurse into type definitions to avoid extracting nested content
-        return Ok(());
-    }
-
-    // Recursively process children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_type_definitions(child, source, node_types, type_defs, depth + 1)?;
-    }
-
-    Ok(())
-}
-
 /// Recursively collect type definitions with their node kind
 fn collect_type_definitions_with_kinds(
     node: Node,

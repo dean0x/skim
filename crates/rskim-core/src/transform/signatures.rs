@@ -97,41 +97,6 @@ pub(crate) fn transform_signatures_with_spans(
     Ok((texts.join("\n"), spans))
 }
 
-/// Recursively collect function/method signatures
-#[allow(dead_code)] // Kept as convenience, _with_kinds variant used by pipeline
-fn collect_signatures(
-    node: Node,
-    source: &str,
-    node_types: &SignatureNodeTypes,
-    signatures: &mut Vec<String>,
-    depth: usize,
-) -> Result<()> {
-    // SECURITY: Prevent stack overflow
-    if depth > MAX_AST_DEPTH {
-        return Err(SkimError::ParseError(format!(
-            "Maximum AST depth exceeded: {} (possible malicious input)",
-            MAX_AST_DEPTH
-        )));
-    }
-
-    let kind = node.kind();
-
-    // Check if this is a function/method node
-    if is_signature_node(kind, node_types) {
-        if let Some(sig) = extract_signature(node, source, node_types)? {
-            signatures.push(sig);
-        }
-    }
-
-    // Recursively process children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_signatures(child, source, node_types, signatures, depth + 1)?;
-    }
-
-    Ok(())
-}
-
 /// Recursively collect function/method signatures with their node kind
 fn collect_signatures_with_kinds(
     node: Node,

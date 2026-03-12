@@ -163,6 +163,15 @@ impl From<LanguageArg> for Language {
     }
 }
 
+/// Build a TransformConfig from mode and optional max_lines
+fn build_config(mode: Mode, max_lines: Option<usize>) -> TransformConfig {
+    let config = TransformConfig::with_mode(mode);
+    match max_lines {
+        Some(n) => config.with_max_lines(n),
+        None => config,
+    }
+}
+
 /// Options for processing a file (reduces function parameters)
 #[derive(Debug, Clone, Copy)]
 struct ProcessOptions {
@@ -316,13 +325,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     // Transform the file
     // ARCHITECTURE: Option B - Always try auto-detection first, use explicit_lang as fallback
     // This allows mixed-language directories while still supporting edge cases like .inc files
-    let config = {
-        let mut c = TransformConfig::with_mode(options.mode);
-        if let Some(n) = options.max_lines {
-            c = c.with_max_lines(n);
-        }
-        c
-    };
+    let config = build_config(options.mode, options.max_lines);
 
     let result = match transform_auto_with_config(&contents, path, &config) {
         Ok(output) => output,
@@ -651,13 +654,7 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
 
-        let config = {
-            let mut c = TransformConfig::with_mode(mode);
-            if let Some(n) = max_lines {
-                c = c.with_max_lines(n);
-            }
-            c
-        };
+        let config = build_config(mode, max_lines);
 
         let result = transform_with_config(&buffer, language, &config)?;
 

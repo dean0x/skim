@@ -148,33 +148,23 @@ impl Language {
             return Ok(source.to_string());
         }
 
-        match self {
-            Self::Json => {
-                // JSON uses serde_json, ignores transformation modes
-                let result = crate::transform::json::transform_json(source)?;
-                // Apply simple truncation for serde languages if max_lines is set
-                if let Some(max_lines) = config.max_lines {
-                    crate::transform::truncate::simple_line_truncate(&result, self, max_lines)
-                } else {
-                    Ok(result)
-                }
-            }
-            Self::Yaml => {
-                // YAML uses serde_yaml_ng, ignores transformation modes
-                let result = crate::transform::yaml::transform_yaml(source)?;
-                // Apply simple truncation for serde languages if max_lines is set
-                if let Some(max_lines) = config.max_lines {
-                    crate::transform::truncate::simple_line_truncate(&result, self, max_lines)
-                } else {
-                    Ok(result)
-                }
-            }
+        // Serde-based languages use their own parsers; tree-sitter languages
+        // handle truncation inside transform_tree.
+        let result = match self {
+            Self::Json => crate::transform::json::transform_json(source)?,
+            Self::Yaml => crate::transform::yaml::transform_yaml(source)?,
             _ => {
-                // Tree-sitter based languages (truncation handled in transform_tree)
                 let mut parser = Parser::new(self)?;
                 let tree = parser.parse(source)?;
-                crate::transform::transform_tree(source, &tree, self, config)
+                return crate::transform::transform_tree(source, &tree, self, config);
             }
+        };
+
+        // Apply simple line truncation for serde-based languages if max_lines is set
+        if let Some(max_lines) = config.max_lines {
+            crate::transform::truncate::simple_line_truncate(&result, self, max_lines)
+        } else {
+            Ok(result)
         }
     }
 }
