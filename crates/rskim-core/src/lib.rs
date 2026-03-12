@@ -57,7 +57,7 @@ mod types;
 ///
 /// * `source` - Source code as string slice (zero-copy)
 /// * `language` - Programming language for parsing
-/// * `mode` - Transformation mode (Structure, Signatures, Types, Full)
+/// * `mode` - Transformation mode (Structure, Signatures, Types, Full, Minimal)
 ///
 /// # Returns
 ///

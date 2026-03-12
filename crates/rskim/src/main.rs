@@ -54,7 +54,7 @@ struct Args {
 
     /// Transformation mode
     #[arg(short, long, value_enum, default_value = "structure")]
-    #[arg(help = "Transformation mode: structure, signatures, types, or full")]
+    #[arg(help = "Transformation mode: structure, signatures, types, full, or minimal")]
     mode: ModeArg,
 
     /// Override language detection (required for stdin, optional fallback otherwise)
@@ -98,6 +98,7 @@ enum ModeArg {
     Signatures,
     Types,
     Full,
+    Minimal,
 }
 
 impl From<ModeArg> for Mode {
@@ -107,6 +108,7 @@ impl From<ModeArg> for Mode {
             ModeArg::Signatures => Mode::Signatures,
             ModeArg::Types => Mode::Types,
             ModeArg::Full => Mode::Full,
+            ModeArg::Minimal => Mode::Minimal,
         }
     }
 }

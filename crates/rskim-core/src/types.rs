@@ -120,10 +120,18 @@ impl Language {
         }
     }
 
+    /// Returns true for languages that use serde-based parsing (JSON, YAML)
+    /// instead of tree-sitter. These languages passthrough in minimal mode.
+    pub(crate) fn is_serde_based(self) -> bool {
+        matches!(self, Self::Json | Self::Yaml)
+    }
+
     /// Transform source code for this language
     ///
     /// ARCHITECTURE: Encapsulates language-specific parsing strategy.
     /// - JSON: Uses serde_json parser
+    /// - YAML: Uses serde_yaml_ng parser
+    /// - Markdown in minimal mode: Passthrough (no comments to strip)
     /// - All others: Use tree-sitter parser
     ///
     /// This eliminates special-case conditionals in the main transform function.
@@ -131,6 +139,11 @@ impl Language {
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
     pub(crate) fn transform_source(self, source: &str, config: &TransformConfig) -> Result<String> {
+        // Minimal mode passthrough for serde-based and Markdown languages
+        if config.mode == Mode::Minimal && (self.is_serde_based() || self == Self::Markdown) {
+            return Ok(source.to_string());
+        }
+
         match self {
             Self::Json => {
                 // JSON uses serde_json, ignores transformation modes
@@ -204,6 +217,26 @@ pub enum Mode {
     ///
     /// Useful for testing and comparing with other modes.
     Full,
+
+    /// Minimal cleanup - strip non-doc comments, normalize blank lines
+    ///
+    /// Token reduction: ~15-30%
+    ///
+    /// Keeps:
+    /// - All code (function bodies, implementations, variables, imports)
+    /// - Doc comments (JSDoc `/** */`, Python docstrings, Rust `///`/`//!`, Go doc, Javadoc)
+    /// - Comments inside function bodies
+    /// - Shebangs (`#!/usr/bin/env python3`)
+    ///
+    /// Removes:
+    /// - Regular single-line comments (`//`, `#`) at module/class level
+    /// - Regular block comments (`/* */`) at module/class level
+    /// - Trailing whitespace left by comment removal
+    /// - Excessive blank lines (3+ consecutive -> 2)
+    ///
+    /// Passthrough (return source unchanged):
+    /// - JSON, YAML, Markdown
+    Minimal,
 }
 
 impl Mode {
@@ -214,6 +247,7 @@ impl Mode {
             "signatures" => Some(Self::Signatures),
             "types" => Some(Self::Types),
             "full" => Some(Self::Full),
+            "minimal" => Some(Self::Minimal),
             _ => None,
         }
     }
@@ -225,6 +259,7 @@ impl Mode {
             Self::Signatures => "signatures",
             Self::Types => "types",
             Self::Full => "full",
+            Self::Minimal => "minimal",
         }
     }
 }

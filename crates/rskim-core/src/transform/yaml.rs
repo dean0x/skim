@@ -474,7 +474,9 @@ development:
 
         // Should fail due to either serde_yaml_ng recursion limit or our depth limit
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result
+            .expect_err("Expected error for deep nesting")
+            .to_string();
         // Accept either our error message or serde_yaml_ng's recursion error
         assert!(
             err.contains("depth exceeded")
@@ -496,7 +498,9 @@ development:
         let result = transform_yaml(&yaml);
 
         assert!(result.is_err(), "Expected error for excessive keys");
-        let err = result.unwrap_err().to_string();
+        let err = result
+            .expect_err("Expected error for key count limit")
+            .to_string();
         assert!(
             err.contains("key count exceeded"),
             "Error message should mention key count limit, got: {}",

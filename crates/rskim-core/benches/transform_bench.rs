@@ -142,7 +142,13 @@ fn bench_scaling(c: &mut Criterion) {
 fn bench_mode_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("mode_comparison");
 
-    for mode in [Mode::Structure, Mode::Signatures, Mode::Types, Mode::Full] {
+    for mode in [
+        Mode::Structure,
+        Mode::Signatures,
+        Mode::Types,
+        Mode::Full,
+        Mode::Minimal,
+    ] {
         group.bench_with_input(
             BenchmarkId::new("typescript", format!("{:?}", mode)),
             &mode,
