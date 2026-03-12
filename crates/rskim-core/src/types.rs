@@ -141,20 +141,36 @@ impl Language {
     pub(crate) fn transform_source(self, source: &str, config: &TransformConfig) -> Result<String> {
         // Minimal mode passthrough for serde-based and Markdown languages
         if config.mode == Mode::Minimal && (self.is_serde_based() || self == Self::Markdown) {
+            // Apply simple truncation for passthrough if max_lines is set
+            if let Some(max_lines) = config.max_lines {
+                return crate::transform::truncate::simple_line_truncate(source, self, max_lines);
+            }
             return Ok(source.to_string());
         }
 
         match self {
             Self::Json => {
                 // JSON uses serde_json, ignores transformation modes
-                crate::transform::json::transform_json(source)
+                let result = crate::transform::json::transform_json(source)?;
+                // Apply simple truncation for serde languages if max_lines is set
+                if let Some(max_lines) = config.max_lines {
+                    crate::transform::truncate::simple_line_truncate(&result, self, max_lines)
+                } else {
+                    Ok(result)
+                }
             }
             Self::Yaml => {
                 // YAML uses serde_yaml_ng, ignores transformation modes
-                crate::transform::yaml::transform_yaml(source)
+                let result = crate::transform::yaml::transform_yaml(source)?;
+                // Apply simple truncation for serde languages if max_lines is set
+                if let Some(max_lines) = config.max_lines {
+                    crate::transform::truncate::simple_line_truncate(&result, self, max_lines)
+                } else {
+                    Ok(result)
+                }
             }
             _ => {
-                // Tree-sitter based languages
+                // Tree-sitter based languages (truncation handled in transform_tree)
                 let mut parser = Parser::new(self)?;
                 let tree = parser.parse(source)?;
                 crate::transform::transform_tree(source, &tree, self, config)
@@ -288,6 +304,16 @@ pub struct TransformConfig {
     /// their own caching. The CLI (rskim binary) implements caching separately
     /// and ignores this field. See: crates/rskim/src/cache.rs
     pub cache_enabled: bool,
+
+    /// Maximum output lines (AST-aware truncation)
+    ///
+    /// When set, truncates output to at most N lines using priority-based
+    /// selection that preserves AST node boundaries. Types and signatures
+    /// are kept over imports, which are kept over function bodies.
+    /// Omission markers are inserted between gaps.
+    ///
+    /// When None, no truncation is applied (full output).
+    pub max_lines: Option<usize>,
 }
 
 impl Default for TransformConfig {
@@ -296,6 +322,7 @@ impl Default for TransformConfig {
             mode: Mode::Structure,
             preserve_comments: true,
             cache_enabled: false,
+            max_lines: None,
         }
     }
 }
@@ -318,6 +345,15 @@ impl TransformConfig {
     /// Builder: Enable caching
     pub fn with_cache(mut self, enabled: bool) -> Self {
         self.cache_enabled = enabled;
+        self
+    }
+
+    /// Builder: Set maximum output lines (AST-aware truncation)
+    ///
+    /// When set, output is truncated to at most `n` lines using priority-based
+    /// selection that preserves AST node boundaries.
+    pub fn with_max_lines(mut self, n: usize) -> Self {
+        self.max_lines = Some(n);
         self
     }
 }
@@ -524,6 +560,15 @@ mod tests {
         assert_eq!(config.mode, Mode::Signatures);
         assert!(!config.preserve_comments);
         assert!(config.cache_enabled);
+        assert_eq!(config.max_lines, None);
+    }
+
+    #[test]
+    fn test_transform_config_with_max_lines() {
+        let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(50);
+
+        assert_eq!(config.mode, Mode::Structure);
+        assert_eq!(config.max_lines, Some(50));
     }
 
     #[test]

@@ -19,7 +19,9 @@ use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use rskim_core::{transform, transform_auto, Language, Mode};
+use rskim_core::{
+    transform_auto_with_config, transform_with_config, Language, Mode, TransformConfig,
+};
 
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
@@ -89,6 +91,18 @@ struct Args {
     /// Show token count statistics (output to stderr)
     #[arg(long, help = "Show token reduction statistics")]
     show_stats: bool,
+
+    /// Maximum output lines (AST-aware smart truncation)
+    ///
+    /// Truncates output to at most N lines using priority-based selection.
+    /// Types and signatures are kept over imports, which are kept over bodies.
+    /// Never cuts mid-signature or mid-type-definition.
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Truncate output to at most N lines (AST-aware)"
+    )]
+    max_lines: Option<usize>,
 }
 
 /// Mode argument (clap value_enum wrapper)
@@ -160,6 +174,8 @@ struct ProcessOptions {
     use_cache: bool,
     /// Whether to include original content for token counting
     include_original: bool,
+    /// Maximum output lines (AST-aware truncation)
+    max_lines: Option<usize>,
 }
 
 impl ProcessOptions {
@@ -169,12 +185,14 @@ impl ProcessOptions {
         explicit_lang: Option<Language>,
         use_cache: bool,
         include_original: bool,
+        max_lines: Option<usize>,
     ) -> Self {
         Self {
             mode,
             explicit_lang,
             use_cache,
             include_original,
+            max_lines,
         }
     }
 }
@@ -256,7 +274,7 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
 fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
     // Try to read from cache if enabled
     let cached_result = if options.use_cache {
-        cache::read_cache(path, options.mode)
+        cache::read_cache(path, options.mode, options.max_lines)
     } else {
         None
     };
@@ -298,12 +316,20 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     // Transform the file
     // ARCHITECTURE: Option B - Always try auto-detection first, use explicit_lang as fallback
     // This allows mixed-language directories while still supporting edge cases like .inc files
-    let result = match transform_auto(&contents, path, options.mode) {
+    let config = {
+        let mut c = TransformConfig::with_mode(options.mode);
+        if let Some(n) = options.max_lines {
+            c = c.with_max_lines(n);
+        }
+        c
+    };
+
+    let result = match transform_auto_with_config(&contents, path, &config) {
         Ok(output) => output,
         Err(e) => {
             // Auto-detection failed - use explicit language as fallback if provided
             if let Some(language) = options.explicit_lang {
-                transform(&contents, language, options.mode)?
+                transform_with_config(&contents, language, &config)?
             } else {
                 // No fallback available - propagate the auto-detection error
                 return Err(e.into());
@@ -327,7 +353,14 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     // Write to cache if enabled
     if options.use_cache {
         // Ignore cache write errors (don't fail transformation if caching fails)
-        let _ = cache::write_cache(path, options.mode, &result, orig_tokens, trans_tokens);
+        let _ = cache::write_cache(
+            path,
+            options.mode,
+            &result,
+            orig_tokens,
+            trans_tokens,
+            options.max_lines,
+        );
     }
 
     let original = if options.include_original {
@@ -352,6 +385,7 @@ struct MultiFileOptions {
     jobs: Option<usize>,
     use_cache: bool,
     show_stats: bool,
+    max_lines: Option<usize>,
 }
 
 /// Process multiple files (with parallel processing)
@@ -373,6 +407,7 @@ fn process_files(
         options.explicit_lang,
         options.use_cache,
         options.show_stats,
+        options.max_lines,
     );
 
     // Configure rayon thread pool if jobs specified
@@ -462,15 +497,7 @@ fn process_files(
 }
 
 /// Process multiple files matched by glob pattern (with parallel processing)
-fn process_glob(
-    pattern: &str,
-    mode: Mode,
-    explicit_lang: Option<Language>,
-    no_header: bool,
-    jobs: Option<usize>,
-    use_cache: bool,
-    show_stats: bool,
-) -> anyhow::Result<()> {
+fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::Result<()> {
     // Validate glob pattern for security
     validate_glob_pattern(pattern)?;
 
@@ -494,15 +521,6 @@ fn process_glob(
             true
         })
         .collect();
-
-    let options = MultiFileOptions {
-        mode,
-        explicit_lang,
-        no_header,
-        jobs,
-        use_cache,
-        show_stats,
-    };
 
     process_files(paths, &format!("pattern '{}'", pattern), options)
 }
@@ -559,25 +577,8 @@ fn collect_files_from_directory(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 /// Process all supported files in a directory recursively
-fn process_directory(
-    dir: &Path,
-    mode: Mode,
-    explicit_lang: Option<Language>,
-    no_header: bool,
-    jobs: Option<usize>,
-    use_cache: bool,
-    show_stats: bool,
-) -> anyhow::Result<()> {
+fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow::Result<()> {
     let paths = collect_files_from_directory(dir)?;
-
-    let options = MultiFileOptions {
-        mode,
-        explicit_lang,
-        no_header,
-        jobs,
-        use_cache,
-        show_stats,
-    };
 
     process_files(paths, &format!("directory '{}'", dir.display()), options)
 }
@@ -601,6 +602,16 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Validate --max-lines parameter
+    if let Some(max_lines) = args.max_lines {
+        if max_lines == 0 {
+            anyhow::bail!(
+                "--max-lines must be at least 1\n\
+                 Use --max-lines 1 to get a single line of output."
+            );
+        }
+    }
+
     // Handle clear-cache command
     if args.clear_cache {
         cache::clear_cache()?;
@@ -612,6 +623,7 @@ fn main() -> anyhow::Result<()> {
     let explicit_lang = args.language.map(Language::from);
     // Cache is enabled by default, disabled only if --no-cache is specified
     let use_cache = !args.no_cache;
+    let max_lines = args.max_lines;
 
     // File is required at this point (enforced by clap)
     let file = args.file.expect("FILE is required");
@@ -639,7 +651,15 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
 
-        let result = transform(&buffer, language, mode)?;
+        let config = {
+            let mut c = TransformConfig::with_mode(mode);
+            if let Some(n) = max_lines {
+                c = c.with_max_lines(n);
+            }
+            c
+        };
+
+        let result = transform_with_config(&buffer, language, &config)?;
 
         // Output transformed result
         let stdout = io::stdout();
@@ -662,33 +682,28 @@ fn main() -> anyhow::Result<()> {
 
     // Check if input is a directory
     let path = PathBuf::from(&file);
+
+    let multi_options = MultiFileOptions {
+        mode,
+        explicit_lang,
+        no_header: args.no_header,
+        jobs: args.jobs,
+        use_cache,
+        show_stats: args.show_stats,
+        max_lines,
+    };
+
     if path.is_dir() {
-        return process_directory(
-            &path,
-            mode,
-            explicit_lang,
-            args.no_header,
-            args.jobs,
-            use_cache,
-            args.show_stats,
-        );
+        return process_directory(&path, multi_options);
     }
 
     // Handle glob patterns
     if has_glob_pattern(&file) {
-        return process_glob(
-            &file,
-            mode,
-            explicit_lang,
-            args.no_header,
-            args.jobs,
-            use_cache,
-            args.show_stats,
-        );
+        return process_glob(&file, multi_options);
     }
 
     // Handle single file
-    let options = ProcessOptions::new(mode, explicit_lang, use_cache, args.show_stats);
+    let options = ProcessOptions::new(mode, explicit_lang, use_cache, args.show_stats, max_lines);
     let process_result = process_file(&path, options)?;
 
     // Output transformed result

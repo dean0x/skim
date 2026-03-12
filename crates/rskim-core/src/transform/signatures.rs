@@ -4,6 +4,7 @@
 //!
 //! Token reduction target: 85-92%
 
+use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError};
 use tree_sitter::{Node, Tree};
 
@@ -33,15 +34,29 @@ const MAX_SIGNATURES: usize = 10_000;
 ///
 /// Extract only callable signatures, one per line.
 /// More aggressive than structure mode - no bodies at all.
+#[allow(dead_code)] // Used by tests and as convenience wrapper
 pub(crate) fn transform_signatures(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &crate::TransformConfig,
+    config: &crate::TransformConfig,
 ) -> Result<String> {
+    let (text, _spans) = transform_signatures_with_spans(source, tree, language, config)?;
+    Ok(text)
+}
+
+/// Transform to signatures-only and return NodeSpan metadata for truncation
+pub(crate) fn transform_signatures_with_spans(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    _config: &crate::TransformConfig,
+) -> Result<(String, Vec<NodeSpan>)> {
     // ARCHITECTURE: Markdown signatures mode extracts ALL headers (H1-H6)
     if language == Language::Markdown {
-        return crate::transform::structure::extract_markdown_headers(source, tree, 1, 6);
+        return crate::transform::structure::extract_markdown_headers_with_spans(
+            source, tree, 1, 6,
+        );
     }
 
     // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
@@ -53,8 +68,8 @@ pub(crate) fn transform_signatures(
         ))
     })?;
 
-    let mut signatures = Vec::new();
-    collect_signatures(tree.root_node(), source, &node_types, &mut signatures, 0)?;
+    let mut signatures: Vec<(String, &'static str)> = Vec::new();
+    collect_signatures_with_kinds(tree.root_node(), source, &node_types, &mut signatures, 0)?;
 
     // Check signature count limit
     if signatures.len() > MAX_SIGNATURES {
@@ -65,10 +80,25 @@ pub(crate) fn transform_signatures(
         )));
     }
 
-    Ok(signatures.join("\n"))
+    // Build text and spans, tracking line offsets
+    let mut spans = Vec::with_capacity(signatures.len());
+    let mut current_line = 0;
+
+    let texts: Vec<String> = signatures
+        .iter()
+        .map(|(sig, kind)| {
+            let line_count = sig.lines().count().max(1);
+            spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
+            current_line += line_count;
+            sig.clone()
+        })
+        .collect();
+
+    Ok((texts.join("\n"), spans))
 }
 
 /// Recursively collect function/method signatures
+#[allow(dead_code)] // Kept as convenience, _with_kinds variant used by pipeline
 fn collect_signatures(
     node: Node,
     source: &str,
@@ -97,6 +127,38 @@ fn collect_signatures(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_signatures(child, source, node_types, signatures, depth + 1)?;
+    }
+
+    Ok(())
+}
+
+/// Recursively collect function/method signatures with their node kind
+fn collect_signatures_with_kinds(
+    node: Node,
+    source: &str,
+    node_types: &SignatureNodeTypes,
+    signatures: &mut Vec<(String, &'static str)>,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_AST_DEPTH {
+        return Err(SkimError::ParseError(format!(
+            "Maximum AST depth exceeded: {} (possible malicious input)",
+            MAX_AST_DEPTH
+        )));
+    }
+
+    let kind = node.kind();
+
+    if is_signature_node(kind, node_types) {
+        if let Some(sig) = extract_signature(node, source, node_types)? {
+            let static_kind = crate::transform::structure::to_static_node_kind(kind);
+            signatures.push((sig, static_kind));
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_signatures_with_kinds(child, source, node_types, signatures, depth + 1)?;
     }
 
     Ok(())

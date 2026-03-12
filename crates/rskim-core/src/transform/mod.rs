@@ -8,22 +8,31 @@ pub mod json;
 pub mod minimal;
 pub mod signatures;
 pub mod structure;
+pub(crate) mod truncate;
 pub mod types;
 pub(crate) mod utils;
 pub mod yaml;
 
 use crate::{Language, Mode, Result, TransformConfig};
 use tree_sitter::Tree;
+use truncate::NodeSpan;
+
+/// Internal result from mode-specific transforms that includes span metadata
+///
+/// ARCHITECTURE: Each transform mode returns its output text along with NodeSpan
+/// metadata describing which output lines correspond to which AST node kinds.
+/// This metadata is consumed by the truncation engine when --max-lines is set.
+type TransformOutput = (String, Vec<NodeSpan>);
 
 /// Transform AST based on configuration
 ///
 /// ARCHITECTURE: Dispatcher function that routes to mode-specific transformers.
+/// When max_lines is set, applies AST-aware truncation as a post-processing step.
 ///
-/// # Implementation Strategy (Week 2-3)
-///
-/// 1. Match on config.mode
-/// 2. Call appropriate transformer (structure, signatures, types)
-/// 3. Return transformed string
+/// Pipeline:
+/// 1. Route to mode-specific transformer -> (text, spans)
+/// 2. If max_lines set, apply truncation using spans
+/// 3. Return final text
 ///
 /// # Performance Notes
 ///
@@ -36,12 +45,47 @@ pub(crate) fn transform_tree(
     language: Language,
     config: &TransformConfig,
 ) -> Result<String> {
+    let (text, spans) = transform_tree_with_spans(source, tree, language, config)?;
+
+    // Apply truncation if max_lines is set
+    if let Some(max_lines) = config.max_lines {
+        truncate::truncate_to_lines(&text, &spans, language, max_lines)
+    } else {
+        Ok(text)
+    }
+}
+
+/// Transform AST and return both text and NodeSpan metadata
+///
+/// Internal function that dispatches to mode-specific transformers and collects
+/// span metadata for truncation.
+fn transform_tree_with_spans(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    config: &TransformConfig,
+) -> Result<TransformOutput> {
     match config.mode {
-        Mode::Structure => structure::transform_structure(source, tree, language, config),
-        Mode::Signatures => signatures::transform_signatures(source, tree, language, config),
-        Mode::Types => types::transform_types(source, tree, language, config),
-        Mode::Full => Ok(source.to_string()), // No transformation
-        Mode::Minimal => minimal::transform_minimal(source, tree, language, config),
+        Mode::Structure => {
+            structure::transform_structure_with_spans(source, tree, language, config)
+        }
+        Mode::Signatures => {
+            signatures::transform_signatures_with_spans(source, tree, language, config)
+        }
+        Mode::Types => types::transform_types_with_spans(source, tree, language, config),
+        Mode::Full => {
+            let text = source.to_string();
+            let line_count = text.lines().count();
+            let spans = vec![NodeSpan::new(0..line_count, "source_file")];
+            Ok((text, spans))
+        }
+        Mode::Minimal => {
+            let text = minimal::transform_minimal(source, tree, language, config)?;
+            let line_count = text.lines().count();
+            // Minimal mode preserves all code, so return a single span
+            let spans = vec![NodeSpan::new(0..line_count, "source_file")];
+            Ok((text, spans))
+        }
     }
 }
 
