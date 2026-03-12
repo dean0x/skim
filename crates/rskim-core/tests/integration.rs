@@ -1518,3 +1518,23 @@ fn test_minimal_token_reduction() {
         result.len()
     );
 }
+
+#[test]
+fn test_python_minimal_nested_function_body_comments() {
+    let source = "# top-level comment\ndef outer():\n    # comment in outer body\n    def inner():\n        # comment in inner body\n        return 1\n    return inner()\n";
+    let result = transform(source, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(!result.contains("top-level comment"), "top-level should be stripped");
+    assert!(result.contains("comment in outer body"), "outer body comment should be preserved");
+    assert!(result.contains("comment in inner body"), "inner body comment should be preserved");
+}
+
+#[test]
+fn test_python_minimal_class_level_comments_stripped() {
+    let source = "class Foo:\n    # class-level comment\n    def bar(self):\n        # body comment\n        pass\n";
+    let result = transform(source, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(!result.contains("class-level comment"), "class-level should be stripped");
+    assert!(result.contains("body comment"), "method body comment should be preserved");
+}
+

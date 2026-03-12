@@ -44,19 +44,31 @@ pub fn get_comment_suffix(language: Language) -> &'static str {
 
 /// Check if a node is inside a function/method body
 ///
-/// Walks up the AST via parent nodes looking for body/block nodes.
-/// Comments inside function bodies should be preserved in minimal mode.
+/// Walks up the AST via parent nodes looking for body/block nodes or
+/// function definition nodes. Comments inside function bodies should be
+/// preserved in minimal mode.
+///
+/// NOTE: In tree-sitter-python, comments inside function bodies are children
+/// of `function_definition`, not of `block`. We must also check for function
+/// definition ancestors to handle this correctly.
 ///
 /// # Arguments
 /// * `node` - The AST node to check
 /// * `language` - The language (determines which node types are "body" nodes)
 pub(crate) fn is_inside_function_body(node: Node, language: Language) -> bool {
     let body_kinds = get_body_node_kinds(language);
+    let fn_kinds = get_function_node_kinds(language);
     let mut current = node.parent();
 
     while let Some(parent) = current {
         let kind = parent.kind();
         if body_kinds.contains(&kind) {
+            return true;
+        }
+        // In some grammars (Python), comments are children of the function
+        // definition itself, not of the body block node. Check if any
+        // ancestor is a function definition.
+        if fn_kinds.contains(&kind) {
             return true;
         }
         current = parent.parent();
@@ -72,6 +84,23 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::Python | Language::Rust | Language::Go => &["block"],
         Language::Java => &["block", "constructor_body"],
         Language::Markdown | Language::Json | Language::Yaml => &[],
+    }
+}
+
+/// Get the node kinds that represent function/method definitions
+///
+/// Used to catch cases where comments are children of function definitions
+/// rather than their body blocks. In tree-sitter-python, comments inside
+/// function bodies are children of `function_definition`, not of `block`.
+///
+/// NOTE: `class_definition` is intentionally excluded — class-level
+/// comments (outside methods) should still be stripped.
+fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Python => &["function_definition"],
+        // Other languages correctly place comments inside body blocks,
+        // so no function-level check needed.
+        _ => &[],
     }
 }
 
