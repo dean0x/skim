@@ -562,9 +562,9 @@ mod tests {
         // spans gracefully via the final truncate(max_lines) enforcement.
         let text = "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\n";
         let spans = vec![
-            NodeSpan::new(0..3, "type_alias_declaration"),  // lines 0-2
-            NodeSpan::new(1..4, "type_alias_declaration"),  // lines 1-3 (overlaps with first)
-            NodeSpan::new(3..6, "function_declaration"),    // lines 3-5 (overlaps with second)
+            NodeSpan::new(0..3, "type_alias_declaration"), // lines 0-2
+            NodeSpan::new(1..4, "type_alias_declaration"), // lines 1-3 (overlaps with first)
+            NodeSpan::new(3..6, "function_declaration"),   // lines 3-5 (overlaps with second)
         ];
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 4).unwrap();
@@ -583,9 +583,9 @@ mod tests {
         // gap markers, and output should stay within budget.
         let text = "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\n";
         let spans = vec![
-            NodeSpan::new(0..2, "type_alias_declaration"),  // lines 0-1
-            NodeSpan::new(2..4, "type_alias_declaration"),  // lines 2-3 (adjacent)
-            NodeSpan::new(4..6, "function_declaration"),    // lines 4-5 (adjacent)
+            NodeSpan::new(0..2, "type_alias_declaration"), // lines 0-1
+            NodeSpan::new(2..4, "type_alias_declaration"), // lines 2-3 (adjacent)
+            NodeSpan::new(4..6, "function_declaration"),   // lines 4-5 (adjacent)
         ];
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 4).unwrap();

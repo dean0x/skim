@@ -83,7 +83,7 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
 ///
 /// Priority levels:
 /// - 5: Type definitions (type aliases, interfaces, structs, traits, enums,
-///       Python class_definition — Python classes ARE the type system)
+///   Python class_definition — Python classes ARE the type system)
 /// - 4: Function/method declarations and signatures
 /// - 3: Import statements and use declarations
 /// - 2: Class/module/impl containers (TS/JS class_declaration, Java class_declaration)
@@ -148,7 +148,7 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::Java => "//",
         Language::Python => "#",
         Language::Markdown => "<!--",
-        Language::Json => "//",  // JSON has no comments; // is JSONC-compatible
+        Language::Json => "//", // JSON has no comments; // is JSONC-compatible
         Language::Yaml => "#",
     }
 }
