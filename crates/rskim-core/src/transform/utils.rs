@@ -5,25 +5,6 @@
 use crate::Language;
 use tree_sitter::Node;
 
-/// Get the single-line comment prefix for a language
-///
-/// Returns the character(s) that start a single-line comment in the given language.
-pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
-    match language {
-        Language::Python => "#",
-        Language::Markdown => "<!--",
-        _ => "//",
-    }
-}
-
-/// Get the comment suffix for a language (non-empty only for Markdown)
-pub(crate) fn get_comment_suffix(language: Language) -> &'static str {
-    match language {
-        Language::Markdown => " -->",
-        _ => "",
-    }
-}
-
 /// Check if a node is inside a function/method body
 ///
 /// Walks up the AST via parent nodes looking for body/block nodes or
@@ -89,28 +70,5 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
         // Other languages correctly place comments inside body blocks,
         // so no function-level check needed.
         _ => &[],
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_comment_prefix() {
-        assert_eq!(get_comment_prefix(Language::TypeScript), "//");
-        assert_eq!(get_comment_prefix(Language::JavaScript), "//");
-        assert_eq!(get_comment_prefix(Language::Python), "#");
-        assert_eq!(get_comment_prefix(Language::Rust), "//");
-        assert_eq!(get_comment_prefix(Language::Go), "//");
-        assert_eq!(get_comment_prefix(Language::Java), "//");
-        assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
-    }
-
-    #[test]
-    fn test_comment_suffix() {
-        assert_eq!(get_comment_suffix(Language::Markdown), " -->");
-        assert_eq!(get_comment_suffix(Language::TypeScript), "");
-        assert_eq!(get_comment_suffix(Language::Python), "");
     }
 }

@@ -287,10 +287,9 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
             )));
         }
 
+        // Skip overlapping ranges, extending the removal window if needed
         if start < last_pos {
-            if end > last_pos {
-                last_pos = end;
-            }
+            last_pos = last_pos.max(end);
             continue;
         }
 
@@ -325,7 +324,6 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
 fn trim_and_normalize(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut consecutive_blanks: usize = 0;
-    let mut first = true;
 
     for line in source.lines() {
         let trimmed = line.trim_end();
@@ -338,11 +336,10 @@ fn trim_and_normalize(source: &str) -> String {
             consecutive_blanks = 0;
         }
 
-        if !first {
+        if !result.is_empty() {
             result.push('\n');
         }
         result.push_str(trimmed);
-        first = false;
     }
 
     if source.ends_with('\n') {
@@ -510,11 +507,14 @@ mod tests {
         // operators, integers, expression_statement wrappers), so 4500 lines is enough.
         let mut source = String::new();
         for i in 0..4500 {
-            source.push_str(&format!(
-                "x = {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {} + {}\n",
-                i, i+1, i+2, i+3, i+4, i+5, i+6, i+7, i+8, i+9,
-                i+10, i+11, i+12, i+13, i+14, i+15, i+16, i+17, i+18, i+19
-            ));
+            source.push_str("x = ");
+            for j in 0..20 {
+                if j > 0 {
+                    source.push_str(" + ");
+                }
+                source.push_str(&(i * 20 + j).to_string());
+            }
+            source.push('\n');
         }
 
         let mut parser = crate::Parser::new(Language::Python).unwrap();
