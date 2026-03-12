@@ -240,3 +240,33 @@ fn test_max_lines_show_stats_interaction() {
         stdout,
     );
 }
+
+#[test]
+fn test_max_lines_python_class_priority_over_functions() {
+    // Python class_definition should be priority 5 (type system),
+    // so classes appear before standalone functions when budget is tight.
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("test.py");
+    std::fs::write(
+        &file,
+        "import os\n\n\
+         def create_user(name: str) -> None:\n    pass\n\n\
+         class User:\n    def __init__(self, name: str):\n        self.name = name\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--max-lines")
+        .arg("5")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("class"),
+        "Python class should be kept over standalone function with tight budget: {:?}",
+        stdout,
+    );
+}

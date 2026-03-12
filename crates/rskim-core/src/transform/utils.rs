@@ -82,10 +82,11 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
 /// Higher scores are kept preferentially when truncating output.
 ///
 /// Priority levels:
-/// - 5: Type definitions (type aliases, interfaces, structs, traits, enums)
+/// - 5: Type definitions (type aliases, interfaces, structs, traits, enums,
+///       Python class_definition — Python classes ARE the type system)
 /// - 4: Function/method declarations and signatures
 /// - 3: Import statements and use declarations
-/// - 2: Class/module/impl declarations (containers)
+/// - 2: Class/module/impl containers (TS/JS class_declaration, Java class_declaration)
 /// - 1: Everything else (bodies, expressions, etc.)
 pub(crate) fn score_node_kind(kind: &str) -> u8 {
     match kind {
@@ -102,6 +103,7 @@ pub(crate) fn score_node_kind(kind: &str) -> u8 {
         | "type_item"
         | "type_alias_statement"
         | "type_declaration"
+        | "class_definition"  // Python: classes ARE the type system (no separate type/interface)
         | "atx_heading"
         | "setext_heading" => 5,
 
@@ -124,7 +126,6 @@ pub(crate) fn score_node_kind(kind: &str) -> u8 {
         "class_declaration"
         | "module_declaration"
         | "impl_item"
-        | "class_definition"
         | "class_specifier"
         | "namespace_definition"
         | "interface_type"
@@ -171,6 +172,7 @@ mod tests {
         assert_eq!(score_node_kind("struct_item"), 5);
         assert_eq!(score_node_kind("trait_item"), 5);
         assert_eq!(score_node_kind("enum_item"), 5);
+        assert_eq!(score_node_kind("class_definition"), 5); // Python classes = type system
         assert_eq!(score_node_kind("atx_heading"), 5);
     }
 
@@ -193,7 +195,6 @@ mod tests {
     fn test_score_node_kind_priority_2() {
         assert_eq!(score_node_kind("class_declaration"), 2);
         assert_eq!(score_node_kind("impl_item"), 2);
-        assert_eq!(score_node_kind("class_definition"), 2);
     }
 
     #[test]

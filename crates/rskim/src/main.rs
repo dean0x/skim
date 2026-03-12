@@ -316,7 +316,21 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     }
 
     // If we have cached result, return it with original content
+    // When cache was written without --show-stats, tokens are None.
+    // Compute them now if stats are requested (include_original=true).
     if let Some((content, orig_tokens, trans_tokens)) = cached_result {
+        let (orig_tokens, trans_tokens) =
+            if options.include_original && orig_tokens.is_none() {
+                match (
+                    tokens::count_tokens(&contents),
+                    tokens::count_tokens(&content),
+                ) {
+                    (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+                    _ => (None, None),
+                }
+            } else {
+                (orig_tokens, trans_tokens)
+            };
         return Ok(ProcessResult::new(
             content,
             Some(contents),

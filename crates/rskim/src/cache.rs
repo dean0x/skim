@@ -184,12 +184,21 @@ pub fn write_cache(
 }
 
 /// Clear entire cache directory
+///
+/// Removes all files inside the cache directory rather than the directory
+/// itself. This avoids ENOTEMPTY races when concurrent processes write
+/// cache entries during deletion.
 pub fn clear_cache() -> Result<()> {
     let cache_dir = get_cache_dir()?;
 
     if cache_dir.exists() {
-        fs::remove_dir_all(&cache_dir)?;
-        fs::create_dir_all(&cache_dir)?;
+        for entry in fs::read_dir(&cache_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 
     Ok(())
