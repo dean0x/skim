@@ -780,29 +780,26 @@ mod tests {
             NodeSpan::new(3..4, "expression_statement"),   // prio 1
         ];
 
-        // max_lines=3: content 3 (type+import+fn) + markers needed
-        // After select: type(5), fn(4), import(3) = 3 content. Markers: gap between each + trailing.
-        // If too many, should drop import (prio 3) before fn (prio 4)
+        // max_lines=3: greedy selects type(5)+fn(4)+import(3) = 3 content lines.
+        // Trailing marker (expr not selected) brings total to 4 > 3, triggering trim.
+        // Import (prio 3) is dropped first, but this creates a gap between type(0..1)
+        // and fn(2..3), adding a gap marker. Now 2 content + 2 markers = 4 > 3,
+        // so fn is also dropped. Final: type + trailing marker = 2 lines.
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 3).unwrap();
 
+        // Highest priority (type) must always be preserved
         assert!(
             result.contains("type A"),
             "Should keep highest priority (type): {:?}",
             result
         );
-        // If trimming happened, import should be dropped before function
-        if !result.contains("import B") && result.contains("fn foo()") {
-            // Correct: dropped import (prio 3) before function (prio 4)
-        } else if result.contains("import B") && result.contains("fn foo()") {
-            // All fit — also acceptable
-        } else {
-            panic!(
-                "Unexpected trimming result: expected import to be dropped before function, \
-                 or both to fit. Got: {:?}",
-                result
-            );
-        }
-        // Main assertion: output respects budget
+        // Import (prio 3) must never survive when function (prio 4) is dropped
+        assert!(
+            !result.contains("import B") || result.contains("fn foo()"),
+            "Import (prio 3) should be dropped before function (prio 4). Got: {:?}",
+            result
+        );
+        // Output respects budget
         assert!(result.lines().count() <= 3);
     }
 
