@@ -96,16 +96,15 @@ pub(crate) fn truncate_to_lines(
     }
 
     // Score and sort spans: priority desc, position asc (tie-break)
-    let mut scored: Vec<(u8, usize, &NodeSpan)> = valid_spans
+    let mut scored: Vec<(u8, &NodeSpan)> = valid_spans
         .iter()
-        .enumerate()
-        .map(|(idx, span)| (score_node_kind(span.node_kind), idx, *span))
+        .map(|span| (score_node_kind(span.node_kind), *span))
         .collect();
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0).then_with(|| {
-            a.2.transformed_range
+            a.1.transformed_range
                 .start
-                .cmp(&b.2.transformed_range.start)
+                .cmp(&b.1.transformed_range.start)
         })
     });
 
@@ -113,7 +112,7 @@ pub(crate) fn truncate_to_lines(
     let mut selected: Vec<(u8, &NodeSpan)> = Vec::new();
     let mut lines_used: usize = 0;
 
-    for &(priority, _, span) in &scored {
+    for &(priority, span) in &scored {
         let clamped_end = span.transformed_range.end.min(lines.len());
         let clamped_lines = clamped_end.saturating_sub(span.transformed_range.start);
 
