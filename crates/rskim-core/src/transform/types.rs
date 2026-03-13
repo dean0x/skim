@@ -4,7 +4,9 @@
 //!
 //! Token reduction target: 90-95%
 
+use crate::transform::structure::extract_markdown_headers_with_spans;
 use crate::transform::truncate::NodeSpan;
+use crate::transform::utils::to_static_node_kind;
 use crate::{Language, Result, SkimError};
 use tree_sitter::{Node, Tree};
 
@@ -56,9 +58,7 @@ pub(crate) fn transform_types_with_spans(
 ) -> Result<(String, Vec<NodeSpan>)> {
     // ARCHITECTURE: Markdown types mode extracts ALL headers (H1-H6)
     if language == Language::Markdown {
-        return crate::transform::structure::extract_markdown_headers_with_spans(
-            source, tree, 1, 6,
-        );
+        return extract_markdown_headers_with_spans(source, tree, 1, 6);
     }
 
     // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
@@ -126,7 +126,7 @@ fn collect_type_definitions_with_kinds(
 
     if is_type_node(kind, node_types) {
         if let Some(type_def) = extract_type_definition(node, source, node_types)? {
-            let static_kind = crate::transform::structure::to_static_node_kind(kind);
+            let static_kind = to_static_node_kind(kind);
             type_defs.push((type_def, static_kind));
         }
         return Ok(());
