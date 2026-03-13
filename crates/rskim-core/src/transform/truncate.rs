@@ -139,6 +139,11 @@ pub(crate) fn truncate_to_lines(
     let mut markers = count_markers(&selected_spans, lines.len());
 
     // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines
+    //
+    // Performance note: This loop is O(n^2) where n = number of selected spans.
+    // Vec::remove() is O(n) and count_markers() rescans the selection each iteration.
+    // This is acceptable because n is bounded by the number of top-level AST nodes,
+    // which is typically tens to low hundreds even for large files.
     while lines_used + markers > max_lines && selected.len() > 1 {
         // Find the span with lowest priority (tie-break: drop highest position first)
         let Some(drop_idx) = selected
@@ -790,6 +795,12 @@ mod tests {
             // Correct: dropped import (prio 3) before function (prio 4)
         } else if result.contains("import B") && result.contains("fn foo()") {
             // All fit — also acceptable
+        } else {
+            panic!(
+                "Unexpected trimming result: expected import to be dropped before function, \
+                 or both to fit. Got: {:?}",
+                result
+            );
         }
         // Main assertion: output respects budget
         assert!(result.lines().count() <= 3);
@@ -814,6 +825,12 @@ mod tests {
             // Correct tie-break: dropped higher position
         } else if result.contains("type A") && result.contains("type B") {
             // Both fit — acceptable
+        } else {
+            panic!(
+                "Unexpected tie-break result: expected type B (higher position) to be dropped \
+                 before type A, or both to fit. Got: {:?}",
+                result
+            );
         }
         assert!(result.lines().count() <= 2);
     }
