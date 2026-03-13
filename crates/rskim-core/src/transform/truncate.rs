@@ -157,13 +157,12 @@ pub(crate) fn truncate_to_lines(
             break; // unreachable: selected.len() > 1 guarantees Some
         };
 
-        let dropped = selected.remove(drop_idx);
-        let dropped_lines = dropped
-            .1
+        let (_, dropped_span) = selected.remove(drop_idx);
+        let dropped_lines = dropped_span
             .transformed_range
             .end
             .min(lines.len())
-            .saturating_sub(dropped.1.transformed_range.start);
+            .saturating_sub(dropped_span.transformed_range.start);
         lines_used -= dropped_lines;
 
         // Recalculate markers with updated selection
@@ -172,14 +171,11 @@ pub(crate) fn truncate_to_lines(
     }
 
     // Extract just the spans (already position-sorted from Step 2)
-    let mut selected: Vec<&NodeSpan> = selected.into_iter().map(|(_, s)| s).collect();
+    let selected: Vec<&NodeSpan> = selected.into_iter().map(|(_, s)| s).collect();
 
     if selected.is_empty() {
         return simple_line_truncate(text, language, max_lines);
     }
-
-    // Re-sort selected spans by position (reading order)
-    selected.sort_by_key(|s| s.transformed_range.start);
 
     // Build output with omission markers between gaps
     let prefix = get_comment_prefix(language);
@@ -302,10 +298,10 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
     }
 
     // Trailing marker (early return above guarantees non-empty)
-    let Some(last) = selected.last() else {
-        return count;
-    };
-    let last_end = last.transformed_range.end.min(total_lines);
+    let last_end = selected[selected.len() - 1]
+        .transformed_range
+        .end
+        .min(total_lines);
     if last_end < total_lines {
         count += 1;
     }
