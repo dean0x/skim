@@ -5,6 +5,7 @@
 //! Token reduction target: 70-80%
 
 use crate::transform::truncate::NodeSpan;
+use crate::transform::utils::to_static_node_kind;
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
@@ -331,61 +332,6 @@ fn build_spans_from_top_level_nodes(
     }
 
     spans
-}
-
-/// Map a tree-sitter node kind string to a static &str for use in NodeSpan
-///
-/// ARCHITECTURE: tree-sitter node kind strings have static lifetime tied to the
-/// grammar, but Rust can't prove this to the borrow checker. We map known kinds
-/// to static strings. Unknown kinds get "unknown" which has lowest priority.
-pub(crate) fn to_static_node_kind(kind: &str) -> &'static str {
-    match kind {
-        // Priority 5: Type definitions
-        "type_alias_declaration" => "type_alias_declaration",
-        "interface_declaration" => "interface_declaration",
-        "struct_item" => "struct_item",
-        "trait_item" => "trait_item",
-        "enum_item" => "enum_item",
-        "enum_declaration" => "enum_declaration",
-        "type_item" => "type_item",
-        "type_alias_statement" => "type_alias_statement",
-        "type_declaration" => "type_declaration",
-        "atx_heading" => "atx_heading",
-        "setext_heading" => "setext_heading",
-
-        // Priority 4: Functions
-        "function_declaration" => "function_declaration",
-        "function_item" => "function_item",
-        "method_declaration" => "method_declaration",
-        "function_definition" => "function_definition",
-        "method_definition" => "method_definition",
-        "arrow_function" => "arrow_function",
-        "function_expression" => "function_expression",
-
-        // Priority 3: Imports
-        "import_statement" => "import_statement",
-        "use_declaration" => "use_declaration",
-        "use_item" => "use_item",
-        "import_declaration" => "import_declaration",
-        "export_statement" => "export_statement",
-
-        // Priority 2: Containers
-        "class_declaration" => "class_declaration",
-        "class_definition" => "class_definition",
-        "module_declaration" => "module_declaration",
-        "impl_item" => "impl_item",
-
-        // Priority 1: Everything else
-        "program" => "program",
-        "source_file" => "source_file",
-        "expression_statement" => "expression_statement",
-        "lexical_declaration" => "lexical_declaration",
-        "variable_declaration" => "variable_declaration",
-        "comment" => "comment",
-        "line_comment" => "line_comment",
-        "block_comment" => "block_comment",
-        _ => "unknown",
-    }
 }
 
 /// Extract markdown headers within a level range

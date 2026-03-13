@@ -77,9 +77,13 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
 // Priority Scoring for AST-aware truncation
 // ============================================================================
 
-/// Score a tree-sitter node kind for truncation priority
+/// Single source of truth for node kind mapping and priority scoring
 ///
-/// Higher scores are kept preferentially when truncating output.
+/// Returns `(static_str, priority)` for any tree-sitter node kind string.
+///
+/// ARCHITECTURE: tree-sitter node kind strings have static lifetime tied to the
+/// grammar, but Rust can't prove this to the borrow checker. We map known kinds
+/// to static strings. Unknown kinds get `("unknown", 1)` (lowest priority).
 ///
 /// Priority levels:
 /// - 5: Type definitions (type aliases, interfaces, structs, traits, enums,
@@ -88,52 +92,81 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
 /// - 3: Import statements and use declarations
 /// - 2: Class/module/impl containers (TS/JS class_declaration, Java class_declaration)
 /// - 1: Everything else (bodies, expressions, etc.)
-pub(crate) fn score_node_kind(kind: &str) -> u8 {
+pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
     match kind {
         // Priority 5: Type definitions
-        "type_alias_declaration"
-        | "interface_declaration"
-        | "struct_item"
-        | "trait_item"
-        | "enum_item"
-        | "enum_declaration"
-        | "struct_specifier"
-        | "enum_specifier"
-        | "type_definition"
-        | "type_item"
-        | "type_alias_statement"
-        | "type_declaration"
-        | "class_definition"  // Python: classes ARE the type system (no separate type/interface)
-        | "atx_heading"
-        | "setext_heading" => 5,
+        "type_alias_declaration" => ("type_alias_declaration", 5),
+        "interface_declaration" => ("interface_declaration", 5),
+        "struct_item" => ("struct_item", 5),
+        "trait_item" => ("trait_item", 5),
+        "enum_item" => ("enum_item", 5),
+        "enum_declaration" => ("enum_declaration", 5),
+        "struct_specifier" => ("struct_specifier", 5),
+        "enum_specifier" => ("enum_specifier", 5),
+        "type_definition" => ("type_definition", 5),
+        "type_item" => ("type_item", 5),
+        "type_alias_statement" => ("type_alias_statement", 5),
+        "type_declaration" => ("type_declaration", 5),
+        "class_definition" => ("class_definition", 5), // Python: classes ARE the type system
+        "atx_heading" => ("atx_heading", 5),
+        "setext_heading" => ("setext_heading", 5),
 
         // Priority 4: Function/method declarations
-        "function_declaration"
-        | "function_item"
-        | "method_declaration"
-        | "function_definition"
-        | "method_definition"
-        | "declaration"
-        | "template_declaration"
-        | "arrow_function"
-        | "function_expression" => 4,
+        "function_declaration" => ("function_declaration", 4),
+        "function_item" => ("function_item", 4),
+        "method_declaration" => ("method_declaration", 4),
+        "function_definition" => ("function_definition", 4),
+        "method_definition" => ("method_definition", 4),
+        "declaration" => ("declaration", 4),
+        "template_declaration" => ("template_declaration", 4),
+        "arrow_function" => ("arrow_function", 4),
+        "function_expression" => ("function_expression", 4),
 
         // Priority 3: Import statements
-        "import_statement" | "use_declaration" | "import_declaration" | "preproc_include"
-        | "export_statement" | "use_item" => 3,
+        "import_statement" => ("import_statement", 3),
+        "use_declaration" => ("use_declaration", 3),
+        "import_declaration" => ("import_declaration", 3),
+        "preproc_include" => ("preproc_include", 3),
+        "export_statement" => ("export_statement", 3),
+        "use_item" => ("use_item", 3),
 
         // Priority 2: Class/module/impl containers
-        "class_declaration"
-        | "module_declaration"
-        | "impl_item"
-        | "class_specifier"
-        | "namespace_definition"
-        | "interface_type"
-        | "struct_type" => 2,
+        "class_declaration" => ("class_declaration", 2),
+        "module_declaration" => ("module_declaration", 2),
+        "impl_item" => ("impl_item", 2),
+        "class_specifier" => ("class_specifier", 2),
+        "namespace_definition" => ("namespace_definition", 2),
+        "interface_type" => ("interface_type", 2),
+        "struct_type" => ("struct_type", 2),
 
-        // Priority 1: Everything else
-        _ => 1,
+        // Priority 1: Known but low-priority kinds
+        "program" => ("program", 1),
+        "source_file" => ("source_file", 1),
+        "expression_statement" => ("expression_statement", 1),
+        "lexical_declaration" => ("lexical_declaration", 1),
+        "variable_declaration" => ("variable_declaration", 1),
+        "comment" => ("comment", 1),
+        "line_comment" => ("line_comment", 1),
+        "block_comment" => ("block_comment", 1),
+
+        // Unknown kinds
+        _ => ("unknown", 1),
     }
+}
+
+/// Map a tree-sitter node kind string to a static &str for use in NodeSpan
+///
+/// Wrapper around `node_kind_info()` — returns only the static string.
+pub(crate) fn to_static_node_kind(kind: &str) -> &'static str {
+    node_kind_info(kind).0
+}
+
+/// Score a tree-sitter node kind for truncation priority
+///
+/// Wrapper around `node_kind_info()` — returns only the priority score.
+/// Higher scores are kept preferentially when truncating output.
+pub(crate) fn score_node_kind(kind: &str) -> u8 {
+    node_kind_info(kind).1
 }
 
 /// Get the single-line comment prefix for a language
@@ -202,6 +235,98 @@ mod tests {
         assert_eq!(score_node_kind("source_file"), 1);
         assert_eq!(score_node_kind("expression_statement"), 1);
         assert_eq!(score_node_kind("unknown_node"), 1);
+    }
+
+    #[test]
+    fn test_node_kind_info_consistency() {
+        // For every known kind, verify:
+        // 1. to_static_node_kind returns the kind itself (not "unknown")
+        // 2. score_node_kind(to_static_node_kind(kind)) == score_node_kind(kind)
+        //    (scoring is idempotent through the mapping)
+        let known_kinds = [
+            // Priority 5
+            "type_alias_declaration",
+            "interface_declaration",
+            "struct_item",
+            "trait_item",
+            "enum_item",
+            "enum_declaration",
+            "struct_specifier",
+            "enum_specifier",
+            "type_definition",
+            "type_item",
+            "type_alias_statement",
+            "type_declaration",
+            "class_definition",
+            "atx_heading",
+            "setext_heading",
+            // Priority 4
+            "function_declaration",
+            "function_item",
+            "method_declaration",
+            "function_definition",
+            "method_definition",
+            "declaration",
+            "template_declaration",
+            "arrow_function",
+            "function_expression",
+            // Priority 3
+            "import_statement",
+            "use_declaration",
+            "import_declaration",
+            "preproc_include",
+            "export_statement",
+            "use_item",
+            // Priority 2
+            "class_declaration",
+            "module_declaration",
+            "impl_item",
+            "class_specifier",
+            "namespace_definition",
+            "interface_type",
+            "struct_type",
+            // Priority 1
+            "program",
+            "source_file",
+            "expression_statement",
+            "lexical_declaration",
+            "variable_declaration",
+            "comment",
+            "line_comment",
+            "block_comment",
+        ];
+
+        for kind in &known_kinds {
+            let static_str = to_static_node_kind(kind);
+            assert_ne!(
+                static_str, "unknown",
+                "Known kind '{}' should not map to 'unknown'",
+                kind
+            );
+            assert_eq!(
+                static_str, *kind,
+                "to_static_node_kind('{}') should return itself",
+                kind
+            );
+            assert_eq!(
+                score_node_kind(static_str),
+                score_node_kind(kind),
+                "Scoring should be idempotent through mapping for '{}'",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn test_class_definition_is_priority_5() {
+        // Python classes ARE the type system — verify class_definition gets Priority 5
+        // in both the mapping and the scoring
+        let (static_str, priority) = node_kind_info("class_definition");
+        assert_eq!(static_str, "class_definition");
+        assert_eq!(
+            priority, 5,
+            "class_definition should be Priority 5 (type-level)"
+        );
     }
 
     #[test]

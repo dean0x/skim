@@ -126,7 +126,7 @@ fn collect_type_definitions_with_kinds(
 
     if is_type_node(kind, node_types) {
         if let Some(type_def) = extract_type_definition(node, source, node_types)? {
-            let static_kind = crate::transform::structure::to_static_node_kind(kind);
+            let static_kind = crate::transform::utils::to_static_node_kind(kind);
             type_defs.push((type_def, static_kind));
         }
         return Ok(());

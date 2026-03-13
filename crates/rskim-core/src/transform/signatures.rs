@@ -118,7 +118,7 @@ fn collect_signatures_with_kinds(
 
     if is_signature_node(kind, node_types) {
         if let Some(sig) = extract_signature(node, source, node_types)? {
-            let static_kind = crate::transform::structure::to_static_node_kind(kind);
+            let static_kind = crate::transform::utils::to_static_node_kind(kind);
             signatures.push((sig, static_kind));
         }
     }

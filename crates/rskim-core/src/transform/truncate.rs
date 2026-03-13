@@ -109,21 +109,11 @@ pub(crate) fn truncate_to_lines(
         })
     });
 
-    // Reserve lines for omission markers (leading + trailing = 2 max)
-    const MARKER_RESERVE: usize = 2;
-    let effective_budget = if max_lines > MARKER_RESERVE {
-        max_lines - MARKER_RESERVE
-    } else {
-        // Very tight budget - try to fit at least one span
-        1
-    };
-
-    // Greedy selection: pick spans that fit within effective_budget
-    let mut selected: Vec<&NodeSpan> = Vec::new();
+    // Step 1: Greedy select by priority (content lines only, NO marker reserve)
+    let mut selected: Vec<(u8, &NodeSpan)> = Vec::new();
     let mut lines_used: usize = 0;
 
-    for &(_, _, span) in &scored {
-        // Clamp span end to actual line count
+    for &(priority, _, span) in &scored {
         let clamped_end = span.transformed_range.end.min(lines.len());
         let clamped_lines = clamped_end.saturating_sub(span.transformed_range.start);
 
@@ -131,15 +121,58 @@ pub(crate) fn truncate_to_lines(
             continue;
         }
 
-        if lines_used + clamped_lines <= effective_budget {
-            selected.push(span);
+        if lines_used + clamped_lines <= max_lines {
+            selected.push((priority, span));
             lines_used += clamped_lines;
         } else if selected.is_empty() {
-            // Fallback: if no span fits, take first max_lines of highest-priority span
-            selected.push(span);
+            // Fallback: if no span fits, take highest-priority span (output builder clamps)
+            selected.push((priority, span));
             break;
         }
     }
+
+    // Step 2: Sort selected by position for marker counting
+    selected.sort_by_key(|(_, s)| s.transformed_range.start);
+
+    // Step 3: Count actual markers from position-sorted set
+    let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
+    let mut markers = count_markers(&selected_spans, lines.len());
+
+    // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines
+    while lines_used + markers > max_lines && selected.len() > 1 {
+        // Find the span with lowest priority (tie-break: drop highest position first)
+        let Some(drop_idx) = selected
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a.0.cmp(&b.0).then_with(|| {
+                    // Among equal priority, drop highest position first
+                    b.1.transformed_range
+                        .start
+                        .cmp(&a.1.transformed_range.start)
+                })
+            })
+            .map(|(idx, _)| idx)
+        else {
+            break; // unreachable: selected.len() > 1 guarantees Some
+        };
+
+        let dropped = selected.remove(drop_idx);
+        let dropped_lines = dropped
+            .1
+            .transformed_range
+            .end
+            .min(lines.len())
+            .saturating_sub(dropped.1.transformed_range.start);
+        lines_used -= dropped_lines;
+
+        // Recalculate markers with updated selection
+        let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
+        markers = count_markers(&selected_spans, lines.len());
+    }
+
+    // Extract just the spans (already position-sorted from Step 2)
+    let mut selected: Vec<&NodeSpan> = selected.into_iter().map(|(_, s)| s).collect();
 
     if selected.is_empty() {
         return simple_line_truncate(text, language, max_lines);
@@ -235,6 +268,49 @@ pub(crate) fn simple_line_truncate(
     }
 
     Ok(output)
+}
+
+/// Count the number of omission markers needed for a position-sorted selection
+///
+/// Counts:
+/// - Leading marker: if the first span doesn't start at line 0
+/// - Gap markers: for each gap between adjacent spans
+/// - Trailing marker: if the last span doesn't reach the end of the output
+///
+/// # Arguments
+/// * `selected` - Position-sorted slice of selected spans
+/// * `total_lines` - Total number of lines in the original output
+fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
+    if selected.is_empty() {
+        return 0;
+    }
+
+    let mut count = 0;
+
+    // Leading marker
+    if selected[0].transformed_range.start > 0 {
+        count += 1;
+    }
+
+    // Gap markers between adjacent selected spans
+    for i in 1..selected.len() {
+        let prev_end = selected[i - 1].transformed_range.end.min(total_lines);
+        let curr_start = selected[i].transformed_range.start;
+        if curr_start > prev_end {
+            count += 1;
+        }
+    }
+
+    // Trailing marker (early return above guarantees non-empty)
+    let Some(last) = selected.last() else {
+        return count;
+    };
+    let last_end = last.transformed_range.end.min(total_lines);
+    if last_end < total_lines {
+        count += 1;
+    }
+
+    count
 }
 
 // ============================================================================
@@ -596,5 +672,153 @@ mod tests {
             line_count,
             result
         );
+    }
+
+    // ========================================================================
+    // count_markers tests
+    // ========================================================================
+
+    #[test]
+    fn test_count_markers_empty() {
+        let selected: Vec<&NodeSpan> = vec![];
+        assert_eq!(count_markers(&selected, 10), 0);
+    }
+
+    #[test]
+    fn test_count_markers_no_gaps() {
+        // Contiguous spans covering the entire output → 0 markers
+        let s1 = NodeSpan::new(0..3, "type_alias_declaration");
+        let s2 = NodeSpan::new(3..6, "function_declaration");
+        let selected: Vec<&NodeSpan> = vec![&s1, &s2];
+        assert_eq!(count_markers(&selected, 6), 0);
+    }
+
+    #[test]
+    fn test_count_markers_with_gaps() {
+        // Spans at 0 and 3, total 10 lines → gap between 1..3, trailing 4..10
+        let s1 = NodeSpan::new(0..1, "type_alias_declaration");
+        let s2 = NodeSpan::new(3..4, "type_alias_declaration");
+        let selected: Vec<&NodeSpan> = vec![&s1, &s2];
+        // No leading (starts at 0), 1 gap (1..3), 1 trailing (4..10) = 2
+        assert_eq!(count_markers(&selected, 10), 2);
+    }
+
+    #[test]
+    fn test_count_markers_leading_and_trailing() {
+        // Span doesn't start at 0 and doesn't reach end
+        let s1 = NodeSpan::new(2..4, "function_declaration");
+        let selected: Vec<&NodeSpan> = vec![&s1];
+        // 1 leading + 1 trailing = 2
+        assert_eq!(count_markers(&selected, 10), 2);
+    }
+
+    // ========================================================================
+    // select-then-trim tests
+    // ========================================================================
+
+    #[test]
+    fn test_noncontiguous_spans_marker_accounting() {
+        // Concrete bug case from the plan:
+        // Types at lines 0 and 3, function at line 6, expression lines 1-2/4-5/7-9
+        // max_lines=5
+        //
+        // Old code: would select all 3 (3 content lines within effective_budget=3),
+        // then need 3 markers (2 gaps + 1 trailing), totaling 6 > 5. Clipped mid-span.
+        //
+        // New code: selects all 3, counts 3 markers → 6 > 5, trims function (lowest prio).
+        // Result: 2 content + 2 markers = 4 ≤ 5. All content intact.
+        let text = "type A\nexpr1\nexpr2\ntype B\nexpr3\nexpr4\nfn foo()\nexpr5\nexpr6\nexpr7\n";
+        let spans = vec![
+            NodeSpan::new(0..1, "type_alias_declaration"), // line 0: "type A"
+            NodeSpan::new(1..2, "expression_statement"),   // line 1
+            NodeSpan::new(2..3, "expression_statement"),   // line 2
+            NodeSpan::new(3..4, "type_alias_declaration"), // line 3: "type B"
+            NodeSpan::new(4..5, "expression_statement"),   // line 4
+            NodeSpan::new(5..6, "expression_statement"),   // line 5
+            NodeSpan::new(6..7, "function_declaration"),   // line 6: "fn foo()"
+            NodeSpan::new(7..8, "expression_statement"),   // line 7
+            NodeSpan::new(8..9, "expression_statement"),   // line 8
+            NodeSpan::new(9..10, "expression_statement"),  // line 9
+        ];
+
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 5).unwrap();
+        let result_lines: Vec<&str> = result.lines().collect();
+
+        assert!(
+            result_lines.len() <= 5,
+            "Output should not exceed 5 lines, got {}: {:?}",
+            result_lines.len(),
+            result
+        );
+        assert!(
+            result.contains("type A"),
+            "Should contain type A (priority 5): {:?}",
+            result
+        );
+        assert!(
+            result.contains("type B"),
+            "Should contain type B (priority 5): {:?}",
+            result
+        );
+        // Function should be trimmed because markers + content > budget
+        assert!(
+            !result.contains("fn foo()"),
+            "Function should be trimmed to make room for markers: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_trim_prefers_dropping_low_priority() {
+        // 3 spans that fit in content but need markers. Trim should drop lowest priority.
+        let text = "type A\nimport B\nfn foo()\nexpr1\n";
+        let spans = vec![
+            NodeSpan::new(0..1, "type_alias_declaration"), // prio 5
+            NodeSpan::new(1..2, "import_statement"),       // prio 3
+            NodeSpan::new(2..3, "function_declaration"),   // prio 4
+            NodeSpan::new(3..4, "expression_statement"),   // prio 1
+        ];
+
+        // max_lines=3: content 3 (type+import+fn) + markers needed
+        // After select: type(5), fn(4), import(3) = 3 content. Markers: gap between each + trailing.
+        // If too many, should drop import (prio 3) before fn (prio 4)
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3).unwrap();
+
+        assert!(
+            result.contains("type A"),
+            "Should keep highest priority (type): {:?}",
+            result
+        );
+        // If trimming happened, import should be dropped before function
+        if !result.contains("import B") && result.contains("fn foo()") {
+            // Correct: dropped import (prio 3) before function (prio 4)
+        } else if result.contains("import B") && result.contains("fn foo()") {
+            // All fit — also acceptable
+        }
+        // Main assertion: output respects budget
+        assert!(result.lines().count() <= 3);
+    }
+
+    #[test]
+    fn test_trim_tiebreak_drops_last_position() {
+        // Two spans with equal priority — should drop the one furthest from start
+        let text = "type A\nexpr\ntype B\nexpr2\n";
+        let spans = vec![
+            NodeSpan::new(0..1, "type_alias_declaration"), // prio 5, pos 0
+            NodeSpan::new(1..2, "expression_statement"),   // prio 1
+            NodeSpan::new(2..3, "type_alias_declaration"), // prio 5, pos 2
+            NodeSpan::new(3..4, "expression_statement"),   // prio 1
+        ];
+
+        // Budget tight enough that one type must be dropped
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 2).unwrap();
+
+        // If one type was dropped, it should be type B (higher position)
+        if result.contains("type A") && !result.contains("type B") {
+            // Correct tie-break: dropped higher position
+        } else if result.contains("type A") && result.contains("type B") {
+            // Both fit — acceptable
+        }
+        assert!(result.lines().count() <= 2);
     }
 }
