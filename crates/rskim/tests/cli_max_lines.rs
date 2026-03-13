@@ -4,6 +4,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Get a command for the skim binary
@@ -269,4 +270,158 @@ fn test_max_lines_python_class_priority_over_functions() {
         "Python class should be kept over standalone function with tight budget: {:?}",
         stdout,
     );
+}
+
+// ============================================================================
+// Non-contiguous span / marker budget tests (issues #24, #25)
+//
+// These tests exercise the full CLI pipeline (parse -> transform -> truncate)
+// on real fixture files that produce non-contiguous selected spans when
+// truncated. This validates that the marker budget accounting correctly
+// reserves lines for omission markers between gaps.
+// ============================================================================
+
+/// Resolve path to a test fixture file relative to the workspace root
+fn fixture_path(relative: &str) -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // crates/rskim -> workspace root
+    path.pop();
+    path.pop();
+    path.join("tests/fixtures").join(relative)
+}
+
+#[test]
+fn test_max_lines_noncontiguous_spans_fixture() {
+    // mixed_priority.ts has types and interfaces interspersed with functions
+    // and variables. Under a tight --max-lines budget, the truncation engine
+    // selects high-priority spans (types, interfaces) and drops lower-priority
+    // ones (functions, variables), producing non-contiguous gaps that require
+    // omission markers. This test validates the fix from issues #24/#25:
+    // the marker budget must be accounted for so output never exceeds max_lines.
+    let fixture = fixture_path("typescript/mixed_priority.ts");
+    assert!(fixture.exists(), "Fixture file should exist: {:?}", fixture);
+
+    for budget in [5, 8, 10, 15] {
+        let output = skim_cmd()
+            .arg(fixture.to_str().unwrap())
+            .arg("--mode=structure")
+            .arg("--max-lines")
+            .arg(budget.to_string())
+            .arg("--no-cache")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "Should succeed with --max-lines={}: stderr={:?}",
+            budget,
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let line_count = stdout.lines().count();
+        assert!(
+            line_count <= budget,
+            "Output must not exceed --max-lines={}, got {} lines:\n{}",
+            budget,
+            line_count,
+            stdout,
+        );
+    }
+}
+
+#[test]
+fn test_max_lines_noncontiguous_spans_contain_markers() {
+    // With a tight budget on mixed_priority.ts, the output should contain
+    // omission markers between the non-contiguous selected spans.
+    let fixture = fixture_path("typescript/mixed_priority.ts");
+
+    let output = skim_cmd()
+        .arg(fixture.to_str().unwrap())
+        .arg("--mode=structure")
+        .arg("--max-lines")
+        .arg("10")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // The full structure output of mixed_priority.ts is ~17 lines (with blank
+    // lines). With budget=10, truncation must drop some spans and insert
+    // omission markers in the gaps.
+    assert!(
+        stdout.contains("// ... (truncated)"),
+        "Non-contiguous truncation should produce omission markers:\n{}",
+        stdout,
+    );
+}
+
+#[test]
+fn test_max_lines_noncontiguous_spans_preserve_high_priority() {
+    // Types and interfaces should be preserved over functions when budget
+    // is tight, because they have higher priority scores (5 vs 4).
+    let fixture = fixture_path("typescript/mixed_priority.ts");
+
+    let output = skim_cmd()
+        .arg(fixture.to_str().unwrap())
+        .arg("--mode=structure")
+        .arg("--max-lines")
+        .arg("10")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Type aliases have priority 5, should be kept
+    assert!(
+        stdout.contains("type UserId"),
+        "Type aliases (priority 5) should be preserved under tight budget:\n{}",
+        stdout,
+    );
+
+    // Interfaces have priority 5, should be kept (at least one)
+    assert!(
+        stdout.contains("interface"),
+        "Interfaces (priority 5) should be preserved under tight budget:\n{}",
+        stdout,
+    );
+}
+
+#[test]
+fn test_max_lines_noncontiguous_spans_rust_fixture() {
+    // Verify the same non-contiguous marker behavior works for Rust fixtures.
+    // mixed_priority.rs has type aliases, enums, traits, structs, impls,
+    // and functions -- a rich mix of priority levels.
+    let fixture = fixture_path("rust/mixed_priority.rs");
+    assert!(fixture.exists(), "Fixture file should exist: {:?}", fixture);
+
+    for budget in [5, 10, 15] {
+        let output = skim_cmd()
+            .arg(fixture.to_str().unwrap())
+            .arg("--mode=structure")
+            .arg("--max-lines")
+            .arg(budget.to_string())
+            .arg("--no-cache")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "Rust fixture should succeed with --max-lines={}: stderr={:?}",
+            budget,
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let line_count = stdout.lines().count();
+        assert!(
+            line_count <= budget,
+            "Rust output must not exceed --max-lines={}, got {} lines:\n{}",
+            budget,
+            line_count,
+            stdout,
+        );
+    }
 }
