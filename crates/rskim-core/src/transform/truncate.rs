@@ -367,21 +367,15 @@ where
         )
     };
 
-    // Binary search for max content lines that fit within budget (including marker)
-    let mut lo: usize = 0;
+    // Binary search for max content lines that fit within budget (including marker).
+    // Invariant: best is the largest number of content lines whose candidate
+    // (content + omission marker) fits within token_budget.
+    let mut lo: usize = 1;
     let mut hi: usize = lines.len();
     let mut best: usize = 0;
 
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
-
-        if mid == 0 {
-            // Zero content lines: check if just the marker fits
-            if count_tokens(&make_marker(lines.len())) <= token_budget {
-                best = 0;
-            }
-            break;
-        }
 
         // Build candidate: mid content lines + omission marker
         let marker = make_marker(lines.len() - mid);
@@ -393,15 +387,11 @@ where
             best = mid;
             lo = mid + 1;
         } else {
-            hi = mid.saturating_sub(1);
+            hi = mid - 1;
         }
     }
 
     // Build final output
-    if best >= lines.len() {
-        return Ok(text.to_string());
-    }
-
     let marker = make_marker(lines.len() - best);
 
     // Guard: if even the marker alone exceeds the budget, return empty string

@@ -185,11 +185,11 @@ impl From<LanguageArg> for Language {
 
 /// Build a TransformConfig from mode and optional max_lines
 fn build_config(mode: Mode, max_lines: Option<usize>) -> TransformConfig {
-    let config = TransformConfig::with_mode(mode);
-    match max_lines {
-        Some(n) => config.with_max_lines(n),
-        None => config,
+    let mut config = TransformConfig::with_mode(mode);
+    if let Some(n) = max_lines {
+        config = config.with_max_lines(n);
     }
+    config
 }
 
 /// Options for processing a file (reduces function parameters)
@@ -264,24 +264,12 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
 
 /// Cascade through transformation modes until output fits within token budget
 ///
-/// ARCHITECTURE: Tries each mode from starting_mode through increasingly aggressive
-/// modes. If no mode produces output within budget, applies line-based truncation
-/// as a final fallback. Diagnostics are emitted to stderr only when escalating
-/// beyond the starting mode.
+/// Tries each mode from `starting_mode` through increasingly aggressive modes.
+/// If no mode fits, applies line-based truncation as a final fallback.
+/// Diagnostics are emitted to stderr only when escalating beyond the starting mode.
 ///
 /// The `transform_fn` closure abstracts over how transformation is performed,
-/// allowing the same cascade logic for both file-based (auto-detect language)
-/// and stdin-based (explicit language) inputs.
-///
-/// # Arguments
-/// * `starting_mode` - The mode to start cascading from
-/// * `max_lines` - Optional max lines constraint (applied to each mode attempt)
-/// * `token_budget` - Target token count to fit within
-/// * `language` - Language for omission marker syntax in final fallback
-/// * `transform_fn` - Closure that transforms source using a given config
-///
-/// # Returns
-/// Tuple of (transformed_output, mode_used)
+/// allowing the same cascade logic for both file-based and stdin-based inputs.
 fn cascade_for_token_budget<F>(
     starting_mode: Mode,
     max_lines: Option<usize>,
@@ -324,10 +312,8 @@ where
         last_mode = mode;
     }
 
-    // Guard: if no mode produced output, bail with a clear error instead of
-    // misleadingly truncating an empty string. Currently unreachable because
-    // transform_fn always returns Ok(Some(...)), but protects against future
-    // callers that may return Ok(None).
+    // Guard: no mode produced output (defensive; transform_fn currently always
+    // returns Ok(Some(...)), but protects against future callers returning Ok(None)).
     if last_output.is_empty() {
         anyhow::bail!(
             "Token budget cascade: no transformation mode produced output. \
@@ -433,22 +419,11 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 
     // When token_budget is set, use cascade; otherwise single-mode transform
     let result = if let Some(budget) = options.token_budget {
-        // Determine language for omission marker comment syntax in truncation.
-        // In practice this unwrap_or is unreachable: if both explicit_lang and
-        // detect_language_from_path return None, then transform_auto_with_config
-        // (which uses the same Language::from_path) will also fail, causing the
-        // cascade to propagate an error before reaching truncation markers.
-        // TypeScript's "//" syntax is a safe default because it is valid in the
-        // majority of supported languages (TS, JS, Rust, Go, Java).
+        // Language for omission marker comment syntax in truncation fallback.
+        // Falls back to TypeScript (//) which is valid for most supported languages.
         let language = explicit_lang
             .or_else(|| rskim_core::detect_language_from_path(path))
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "[skim] warning: could not detect language for truncation markers, \
-                     using // syntax"
-                );
-                Language::TypeScript
-            });
+            .unwrap_or(Language::TypeScript);
 
         let (output, _mode_used) = cascade_for_token_budget(
             options.mode,
@@ -823,12 +798,9 @@ fn main() -> anyhow::Result<()> {
 
         // Output token statistics if requested
         if args.show_stats {
-            if let (Ok(orig_tokens), Ok(trans_tokens)) =
-                (tokens::count_tokens(&buffer), tokens::count_tokens(&result))
-            {
-                let stats = tokens::TokenStats::new(orig_tokens, trans_tokens);
-                eprintln!("\n[skim] {}", stats.format());
-            }
+            let orig = tokens::count_tokens(&buffer).ok();
+            let trans = tokens::count_tokens(&result).ok();
+            report_token_stats(orig, trans, "");
         }
 
         return Ok(());

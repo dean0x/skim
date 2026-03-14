@@ -22,6 +22,29 @@ fn fixture_path(relative: &str) -> PathBuf {
     path.join("tests/fixtures").join(relative)
 }
 
+/// Parse the transformed token count from --show-stats stderr output.
+///
+/// Stats format: "X tokens → Y tokens (Z% reduction)"
+/// Returns the Y value (transformed token count).
+fn parse_transformed_token_count(stderr: &str) -> usize {
+    let arrow_pos = stderr
+        .find('\u{2192}')
+        .unwrap_or_else(|| panic!("Expected '→' in stats output. stderr: {stderr:?}"));
+    let after_arrow = stderr[arrow_pos + '\u{2192}'.len_utf8()..].trim_start();
+    let token_str: String = after_arrow
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .collect();
+    assert!(
+        !token_str.is_empty(),
+        "Failed to parse token count after '→'. stderr: {stderr:?}",
+    );
+    token_str
+        .replace(',', "")
+        .parse()
+        .unwrap_or_else(|e| panic!("Invalid token count '{token_str}': {e}. stderr: {stderr:?}"))
+}
+
 // ============================================================================
 // Basic tests
 // ============================================================================
@@ -405,33 +428,7 @@ fn test_tokens_budget_invariant_with_fixture() {
     assert!(output.status.success());
 
     let stderr = String::from_utf8(output.stderr).unwrap();
-    // Parse "X tokens → Y tokens" from the stats output
-    // The transformed token count (Y) should be <= budget
-    let arrow_pos = stderr
-        .find('\u{2192}')
-        .unwrap_or_else(|| panic!(
-            "Expected stats output to contain '→' arrow character. stderr: {:?}",
-            stderr,
-        ));
-    // Find the number right after "→ " (3 bytes for UTF-8 arrow + 1 byte for space)
-    let after_arrow = &stderr[arrow_pos + 3..];
-    // Skip the leading space if present (the format is "→ {N}")
-    let after_arrow = after_arrow.trim_start();
-    let token_str: String = after_arrow
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == ',')
-        .collect();
-    assert!(
-        !token_str.is_empty(),
-        "Failed to parse token count from stats output after '→'. stderr: {:?}",
-        stderr,
-    );
-    let token_count: usize = token_str.replace(',', "").parse().unwrap_or_else(|e| {
-        panic!(
-            "Failed to parse token count '{}' as integer: {}. stderr: {:?}",
-            token_str, e, stderr,
-        );
-    });
+    let token_count = parse_transformed_token_count(&stderr);
     assert!(
         token_count <= budget,
         "Transformed tokens ({}) should be <= budget ({}). stderr: {:?}",
