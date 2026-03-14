@@ -268,6 +268,55 @@ impl Mode {
             Self::Minimal => "minimal",
         }
     }
+
+    /// Returns the aggressiveness ordering for cascade purposes
+    ///
+    /// Higher values mean more aggressive token reduction:
+    /// - Full(0): No transformation, 0% reduction
+    /// - Minimal(1): Strip non-doc comments, ~15-30% reduction
+    /// - Structure(2): Strip bodies, ~70-80% reduction
+    /// - Signatures(3): Signatures only, ~85-92% reduction
+    /// - Types(4): Types only, ~90-95% reduction
+    pub fn aggressiveness(self) -> u8 {
+        match self {
+            Self::Full => 0,
+            Self::Minimal => 1,
+            Self::Structure => 2,
+            Self::Signatures => 3,
+            Self::Types => 4,
+        }
+    }
+
+    /// Returns this mode and all more aggressive modes in cascade order
+    ///
+    /// Used by the token budget cascade: try each mode from least to most
+    /// aggressive until the output fits within the token budget.
+    ///
+    /// # Examples
+    /// ```
+    /// use rskim_core::Mode;
+    ///
+    /// let cascade = Mode::Structure.cascade_from_here();
+    /// assert_eq!(cascade, vec![Mode::Structure, Mode::Signatures, Mode::Types]);
+    ///
+    /// let cascade = Mode::Full.cascade_from_here();
+    /// assert_eq!(cascade, vec![Mode::Full, Mode::Minimal, Mode::Structure, Mode::Signatures, Mode::Types]);
+    /// ```
+    pub fn cascade_from_here(self) -> Vec<Self> {
+        let all_modes = [
+            Self::Full,
+            Self::Minimal,
+            Self::Structure,
+            Self::Signatures,
+            Self::Types,
+        ];
+        let threshold = self.aggressiveness();
+        all_modes
+            .iter()
+            .filter(|m| m.aggressiveness() >= threshold)
+            .copied()
+            .collect()
+    }
 }
 
 // ============================================================================
@@ -568,5 +617,127 @@ mod tests {
         result.transformed_tokens = Some(200);
 
         assert_eq!(result.reduction_percentage(), Some(80.0));
+    }
+
+    // ========================================================================
+    // Mode ordering and cascade tests
+    // ========================================================================
+
+    #[test]
+    fn test_mode_aggressiveness_ordering() {
+        assert_eq!(Mode::Full.aggressiveness(), 0);
+        assert_eq!(Mode::Minimal.aggressiveness(), 1);
+        assert_eq!(Mode::Structure.aggressiveness(), 2);
+        assert_eq!(Mode::Signatures.aggressiveness(), 3);
+        assert_eq!(Mode::Types.aggressiveness(), 4);
+    }
+
+    #[test]
+    fn test_mode_aggressiveness_monotonic() {
+        // Each subsequent mode is strictly more aggressive
+        let modes = [
+            Mode::Full,
+            Mode::Minimal,
+            Mode::Structure,
+            Mode::Signatures,
+            Mode::Types,
+        ];
+        for window in modes.windows(2) {
+            assert!(
+                window[0].aggressiveness() < window[1].aggressiveness(),
+                "{:?} should be less aggressive than {:?}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_cascade_from_full() {
+        let cascade = Mode::Full.cascade_from_here();
+        assert_eq!(
+            cascade,
+            vec![
+                Mode::Full,
+                Mode::Minimal,
+                Mode::Structure,
+                Mode::Signatures,
+                Mode::Types
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cascade_from_structure() {
+        let cascade = Mode::Structure.cascade_from_here();
+        assert_eq!(
+            cascade,
+            vec![Mode::Structure, Mode::Signatures, Mode::Types]
+        );
+    }
+
+    #[test]
+    fn test_cascade_from_signatures() {
+        let cascade = Mode::Signatures.cascade_from_here();
+        assert_eq!(cascade, vec![Mode::Signatures, Mode::Types]);
+    }
+
+    #[test]
+    fn test_cascade_from_types() {
+        let cascade = Mode::Types.cascade_from_here();
+        assert_eq!(cascade, vec![Mode::Types]);
+    }
+
+    #[test]
+    fn test_cascade_from_minimal() {
+        let cascade = Mode::Minimal.cascade_from_here();
+        assert_eq!(
+            cascade,
+            vec![
+                Mode::Minimal,
+                Mode::Structure,
+                Mode::Signatures,
+                Mode::Types
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cascade_always_includes_self() {
+        let all_modes = [
+            Mode::Full,
+            Mode::Minimal,
+            Mode::Structure,
+            Mode::Signatures,
+            Mode::Types,
+        ];
+        for mode in &all_modes {
+            let cascade = mode.cascade_from_here();
+            assert_eq!(
+                cascade[0], *mode,
+                "Cascade from {:?} should start with itself",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_cascade_always_ends_with_types() {
+        let all_modes = [
+            Mode::Full,
+            Mode::Minimal,
+            Mode::Structure,
+            Mode::Signatures,
+            Mode::Types,
+        ];
+        for mode in &all_modes {
+            let cascade = mode.cascade_from_here();
+            assert_eq!(
+                *cascade.last().unwrap_or(&Mode::Full),
+                Mode::Types,
+                "Cascade from {:?} should end with Types (most aggressive)",
+                mode
+            );
+        }
     }
 }

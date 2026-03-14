@@ -8,7 +8,7 @@ pub mod json;
 pub mod minimal;
 pub mod signatures;
 pub mod structure;
-pub(crate) mod truncate;
+pub mod truncate;
 pub mod types;
 pub(crate) mod utils;
 pub mod yaml;
