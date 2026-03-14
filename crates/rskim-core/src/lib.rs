@@ -37,6 +37,9 @@
 // Re-export core types for public API
 pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
+// Re-export token budget truncation for CLI crate
+pub use transform::truncate::truncate_to_token_budget;
+
 mod parser;
 mod transform;
 mod types;

@@ -61,12 +61,13 @@ fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Generate cache key from file path, mtime, mode, and max_lines
+/// Generate cache key from file path, mtime, mode, max_lines, and token_budget
 fn cache_key(
     path: &Path,
     mtime: SystemTime,
     mode: Mode,
     max_lines: Option<usize>,
+    token_budget: Option<usize>,
 ) -> Result<String> {
     // Get canonical path (resolves symlinks, relative paths)
     let canonical_path = path.canonicalize()?;
@@ -74,18 +75,15 @@ fn cache_key(
     // Convert mtime to seconds since UNIX epoch
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
-    // Create hash input: "path|mtime|mode|max_lines_or_none"
-    let mode_str = format!("{:?}", mode);
-    let max_lines_str = match max_lines {
-        Some(n) => n.to_string(),
-        None => "none".to_string(),
-    };
+    // Create hash input: "path|mtime|mode|max_lines_or_none|token_budget_or_none"
+    let fmt_opt = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
     let hash_input = format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{:?}|{}|{}",
         canonical_path.display(),
         mtime_secs,
-        mode_str,
-        max_lines_str,
+        mode,
+        fmt_opt(max_lines),
+        fmt_opt(token_budget),
     );
 
     // Generate SHA256 hash
@@ -103,13 +101,14 @@ pub fn read_cache(
     path: &Path,
     mode: Mode,
     max_lines: Option<usize>,
+    token_budget: Option<usize>,
 ) -> Option<(String, Option<usize>, Option<usize>)> {
     // Get file metadata
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
 
     // Generate cache key
-    let key = cache_key(path, mtime, mode, max_lines).ok()?;
+    let key = cache_key(path, mtime, mode, max_lines, token_budget).ok()?;
     let cache_dir = get_cache_dir().ok()?;
     let cache_file = cache_dir.join(format!("{}.json", key));
 
@@ -147,13 +146,14 @@ pub fn write_cache(
     original_tokens: Option<usize>,
     transformed_tokens: Option<usize>,
     max_lines: Option<usize>,
+    token_budget: Option<usize>,
 ) -> Result<()> {
     // Get file metadata
     let metadata = fs::metadata(path)?;
     let mtime = metadata.modified()?;
 
     // Generate cache key
-    let key = cache_key(path, mtime, mode, max_lines)?;
+    let key = cache_key(path, mtime, mode, max_lines, token_budget)?;
     let cache_dir = get_cache_dir()?;
     let cache_file = cache_dir.join(format!("{}.json", key));
 
@@ -220,21 +220,34 @@ mod tests {
         let mtime = metadata.modified().unwrap();
 
         // Same inputs should produce same key
-        let key1 = cache_key(path, mtime, Mode::Structure, None).unwrap();
-        let key2 = cache_key(path, mtime, Mode::Structure, None).unwrap();
+        let key1 = cache_key(path, mtime, Mode::Structure, None, None).unwrap();
+        let key2 = cache_key(path, mtime, Mode::Structure, None, None).unwrap();
         assert_eq!(key1, key2);
 
         // Different mode should produce different key
-        let key3 = cache_key(path, mtime, Mode::Signatures, None).unwrap();
+        let key3 = cache_key(path, mtime, Mode::Signatures, None, None).unwrap();
         assert_ne!(key1, key3);
 
         // Different max_lines should produce different key
-        let key4 = cache_key(path, mtime, Mode::Structure, Some(50)).unwrap();
+        let key4 = cache_key(path, mtime, Mode::Structure, Some(50), None).unwrap();
         assert_ne!(key1, key4);
 
         // Same max_lines should produce same key
-        let key5 = cache_key(path, mtime, Mode::Structure, Some(50)).unwrap();
+        let key5 = cache_key(path, mtime, Mode::Structure, Some(50), None).unwrap();
         assert_eq!(key4, key5);
+
+        // Different token_budget should produce different key
+        let key6 = cache_key(path, mtime, Mode::Structure, None, Some(500)).unwrap();
+        assert_ne!(key1, key6);
+
+        // Same token_budget should produce same key
+        let key7 = cache_key(path, mtime, Mode::Structure, None, Some(500)).unwrap();
+        assert_eq!(key6, key7);
+
+        // Different max_lines + token_budget combination
+        let key8 = cache_key(path, mtime, Mode::Structure, Some(50), Some(500)).unwrap();
+        assert_ne!(key4, key8);
+        assert_ne!(key6, key8);
     }
 
     #[test]
@@ -244,23 +257,76 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         // Initially no cache
-        assert!(read_cache(&path, Mode::Structure, None).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
 
         // Write to cache with token counts
         let content = "transformed output";
-        write_cache(&path, Mode::Structure, content, Some(100), Some(50), None).unwrap();
+        write_cache(
+            &path,
+            Mode::Structure,
+            content,
+            Some(100),
+            Some(50),
+            None,
+            None,
+        )
+        .unwrap();
 
         // Read from cache
-        let (cached, orig_tokens, trans_tokens) = read_cache(&path, Mode::Structure, None).unwrap();
+        let (cached, orig_tokens, trans_tokens) =
+            read_cache(&path, Mode::Structure, None, None).unwrap();
         assert_eq!(cached, content);
         assert_eq!(orig_tokens, Some(100));
         assert_eq!(trans_tokens, Some(50));
 
         // Different mode should not find cache
-        assert!(read_cache(&path, Mode::Signatures, None).is_none());
+        assert!(read_cache(&path, Mode::Signatures, None, None).is_none());
 
         // Different max_lines should not find cache
-        assert!(read_cache(&path, Mode::Structure, Some(50)).is_none());
+        assert!(read_cache(&path, Mode::Structure, Some(50), None).is_none());
+
+        // Different token_budget should not find cache
+        assert!(read_cache(&path, Mode::Structure, None, Some(500)).is_none());
+    }
+
+    #[test]
+    fn test_cache_read_write_with_token_budget() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "test content for token budget").unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let token_budget = Some(500);
+
+        // No cache initially
+        assert!(read_cache(&path, Mode::Structure, None, token_budget).is_none());
+
+        // Write with token_budget
+        write_cache(
+            &path,
+            Mode::Structure,
+            "budget-transformed output",
+            Some(200),
+            Some(80),
+            None,
+            token_budget,
+        )
+        .unwrap();
+
+        // Read with same token_budget succeeds
+        let (cached, orig_tokens, trans_tokens) =
+            read_cache(&path, Mode::Structure, None, token_budget).unwrap();
+        assert_eq!(cached, "budget-transformed output");
+        assert_eq!(orig_tokens, Some(200));
+        assert_eq!(trans_tokens, Some(80));
+
+        // Read without token_budget misses (different cache key)
+        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+
+        // Read with different token_budget misses
+        assert!(read_cache(&path, Mode::Structure, None, Some(1000)).is_none());
+
+        // Read with same budget + different mode misses
+        assert!(read_cache(&path, Mode::Signatures, None, token_budget).is_none());
     }
 
     #[test]
@@ -279,8 +345,8 @@ mod tests {
         }
 
         // Write to cache
-        write_cache(&path, Mode::Structure, "cached v1", None, None, None).unwrap();
-        let (cached, _, _) = read_cache(&path, Mode::Structure, None).unwrap();
+        write_cache(&path, Mode::Structure, "cached v1", None, None, None, None).unwrap();
+        let (cached, _, _) = read_cache(&path, Mode::Structure, None, None).unwrap();
         assert_eq!(cached, "cached v1");
 
         // Sleep to ensure mtime resolution (some filesystems have 1-second resolution)
@@ -294,6 +360,6 @@ mod tests {
         }
 
         // Cache should be invalidated (mtime changed)
-        assert!(read_cache(&path, Mode::Structure, None).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
     }
 }
