@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in benchmarks
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use rskim_core::{transform, Language, Mode};
+use rskim_core::{transform, truncate_to_token_budget, Language, Mode};
 
 // ============================================================================
 // Benchmark Fixtures
@@ -187,6 +187,43 @@ fn bench_language_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// Token Budget Truncation Benchmarks (B5)
+// ============================================================================
+
+fn bench_token_budget_truncation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("token_budget_truncation");
+
+    let word_count = |s: &str| -> usize { s.split_whitespace().count() };
+
+    for num_lines in [100, 500, 1000, 5000] {
+        // ~4 lines per function
+        let text = generate_large_typescript(num_lines / 4);
+        let total = word_count(&text);
+        // Budget = ~50% of total tokens to force binary search
+        let budget = total / 2;
+
+        group.bench_with_input(
+            BenchmarkId::new("lines", num_lines),
+            &(text, budget),
+            |b, (input, budget)| {
+                b.iter(|| {
+                    truncate_to_token_budget(
+                        black_box(input),
+                        Language::TypeScript,
+                        *budget,
+                        word_count,
+                        None,
+                    )
+                    .unwrap()
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_structure_mode,
@@ -194,6 +231,7 @@ criterion_group!(
     bench_types_mode,
     bench_scaling,
     bench_mode_comparison,
-    bench_language_comparison
+    bench_language_comparison,
+    bench_token_budget_truncation
 );
 criterion_main!(benches);

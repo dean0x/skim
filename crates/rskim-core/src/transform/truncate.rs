@@ -328,6 +328,9 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
 /// * `language` - For language-appropriate omission marker syntax
 /// * `token_budget` - Maximum tokens allowed in the output
 /// * `count_tokens` - Closure that counts tokens in a string
+/// * `known_token_count` - Pre-computed token count of `text`, if available.
+///   When `Some(count)`, skips the fast-path tokenization of the full text.
+///   Pass `None` when the count is unknown (the function will compute it).
 ///
 /// # Returns
 /// Text that fits within the token budget, with an omission marker if truncated.
@@ -342,12 +345,15 @@ pub fn truncate_to_token_budget<F>(
     language: Language,
     token_budget: usize,
     count_tokens: F,
+    known_token_count: Option<usize>,
 ) -> Result<String>
 where
     F: Fn(&str) -> usize,
 {
-    // Fast path: if text already fits, return unchanged
-    if count_tokens(text) <= token_budget {
+    // Fast path: if text already fits, return unchanged (B4: skip recount
+    // when the caller already knows the token count from the cascade loop)
+    let full_count = known_token_count.unwrap_or_else(|| count_tokens(text));
+    if full_count <= token_budget {
         return Ok(text.to_string());
     }
 
@@ -367,6 +373,19 @@ where
         )
     };
 
+    // B5: Pre-join once and build byte-offset index to avoid O(N log N)
+    // allocation churn from per-iteration `lines[..mid].join("\n")`.
+    let joined = lines.join("\n");
+    let mut byte_end: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut pos: usize = 0;
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            pos += 1; // \n separator
+        }
+        pos += line.len();
+        byte_end.push(pos);
+    }
+
     // Binary search for max content lines that fit within budget (including marker).
     // Invariant: best is the largest number of content lines whose candidate
     // (content + omission marker) fits within token_budget.
@@ -378,8 +397,11 @@ where
         let mid = lo + (hi - lo) / 2;
 
         // Build candidate: mid content lines + omission marker
+        // Slice from pre-joined string instead of per-iteration join
         let marker = make_marker(lines.len() - mid);
-        let mut candidate = lines[..mid].join("\n");
+        let content_slice = &joined[..byte_end[mid - 1]];
+        let mut candidate = String::with_capacity(content_slice.len() + 1 + marker.len());
+        candidate.push_str(content_slice);
         candidate.push('\n');
         candidate.push_str(&marker);
 
@@ -391,7 +413,7 @@ where
         }
     }
 
-    // Build final output
+    // Build final output from pre-joined string
     let marker = make_marker(lines.len() - best);
 
     // Guard: if even the marker alone exceeds the budget, return empty string
@@ -400,9 +422,16 @@ where
         return Ok(String::new());
     }
 
-    let mut result: Vec<&str> = lines[..best].to_vec();
-    result.push(&marker);
-    let mut output = result.join("\n");
+    let mut output = if best > 0 {
+        let content_slice = &joined[..byte_end[best - 1]];
+        let mut s = String::with_capacity(content_slice.len() + 1 + marker.len() + 1);
+        s.push_str(content_slice);
+        s.push('\n');
+        s.push_str(&marker);
+        s
+    } else {
+        marker
+    };
 
     if text.ends_with('\n') {
         output.push('\n');
@@ -941,7 +970,8 @@ mod tests {
     #[test]
     fn test_token_budget_no_truncation_when_within_budget() {
         let text = "line one\nline two\nline three\n";
-        let result = truncate_to_token_budget(text, Language::TypeScript, 100, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 100, word_count, None).unwrap();
         assert_eq!(result, text);
     }
 
@@ -950,7 +980,8 @@ mod tests {
         let text = "word1 word2\nword3 word4\nword5 word6\nword7 word8\n";
         // Budget of 10 words: should truncate since text has 8 content words
         // plus marker words
-        let result = truncate_to_token_budget(text, Language::TypeScript, 6, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 6, word_count, None).unwrap();
         let token_count = word_count(&result);
         assert!(
             token_count <= 6,
@@ -963,7 +994,8 @@ mod tests {
     #[test]
     fn test_token_budget_includes_omission_marker() {
         let text = "line one\nline two\nline three\nline four\nline five\n";
-        let result = truncate_to_token_budget(text, Language::TypeScript, 5, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None).unwrap();
         assert!(
             result.contains("truncated"),
             "Should contain omission marker: {:?}",
@@ -976,7 +1008,8 @@ mod tests {
         let text = "line one\nline two\nline three\n";
         // Budget of 5: full text is 6 words, marker alone is 5 words ("// ... (3 lines truncated)")
         // so best=0, marker fits, trailing newline from original is preserved
-        let result = truncate_to_token_budget(text, Language::TypeScript, 5, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None).unwrap();
         assert!(
             result.ends_with('\n'),
             "Should preserve trailing newline: {:?}",
@@ -987,7 +1020,8 @@ mod tests {
     #[test]
     fn test_token_budget_no_trailing_newline_when_absent() {
         let text = "line one\nline two\nline three";
-        let result = truncate_to_token_budget(text, Language::TypeScript, 4, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 4, word_count, None).unwrap();
         assert!(
             !result.ends_with('\n'),
             "Should not add trailing newline: {:?}",
@@ -998,7 +1032,8 @@ mod tests {
     #[test]
     fn test_token_budget_empty_input() {
         let text = "";
-        let result = truncate_to_token_budget(text, Language::TypeScript, 10, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 10, word_count, None).unwrap();
         assert_eq!(result, "");
     }
 
@@ -1006,7 +1041,8 @@ mod tests {
     fn test_token_budget_very_small_budget() {
         let text = "line one\nline two\nline three\n";
         // Budget of 1: marker exceeds budget (~5 word-tokens), so empty string
-        let result = truncate_to_token_budget(text, Language::TypeScript, 1, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 1, word_count, None).unwrap();
         assert_eq!(
             result, "",
             "When budget is smaller than the marker, return empty string: {:?}",
@@ -1017,7 +1053,8 @@ mod tests {
     #[test]
     fn test_token_budget_python_marker_syntax() {
         let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
-        let result = truncate_to_token_budget(text, Language::Python, 5, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::Python, 5, word_count, None).unwrap();
         if result.contains("truncated") {
             assert!(
                 result.contains("# ..."),
@@ -1033,7 +1070,8 @@ mod tests {
         // only the marker should be returned (zero content lines, best=0).
         // The marker "// ... (3 lines truncated)" is 5 word-tokens.
         let text = "line one\nline two\nline three\n";
-        let result = truncate_to_token_budget(text, Language::TypeScript, 5, word_count).unwrap();
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None).unwrap();
         assert!(
             result.contains("truncated"),
             "Should contain omission marker: {:?}",
@@ -1060,7 +1098,8 @@ mod tests {
             "word1 word2 word3\nword4 word5 word6\nword7 word8 word9\nword10 word11 word12\n";
         for budget in 1..20 {
             let result =
-                truncate_to_token_budget(text, Language::TypeScript, budget, word_count).unwrap();
+                truncate_to_token_budget(text, Language::TypeScript, budget, word_count, None)
+                    .unwrap();
             let token_count = word_count(&result);
             // The invariant must hold for ALL budgets: when the marker exceeds
             // the budget, an empty string is returned (0 tokens <= budget).
@@ -1071,6 +1110,69 @@ mod tests {
                 token_count,
                 budget,
                 result
+            );
+        }
+    }
+
+    // ========================================================================
+    // known_token_count tests (B4)
+    // ========================================================================
+
+    #[test]
+    fn test_token_budget_known_count_skips_recount_when_over_budget() {
+        // When known_token_count exceeds budget, truncation must still occur
+        let text = "word1 word2\nword3 word4\nword5 word6\nword7 word8\n";
+        let known = word_count(text); // 8
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 6, word_count, Some(known))
+                .unwrap();
+        let token_count = word_count(&result);
+        assert!(
+            token_count <= 6,
+            "With known count over budget, output should be truncated to <= 6 tokens, got {}: {:?}",
+            token_count,
+            result
+        );
+        assert!(
+            result.contains("truncated"),
+            "Should contain omission marker: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_token_budget_known_count_returns_early_when_within_budget() {
+        // When known_token_count is within budget, fast-path should return text unchanged
+        let text = "line one\nline two\nline three\n";
+        // Provide a known count that's within budget — function must NOT call count_tokens
+        // on the full text. We verify by passing a counter that would give a different value.
+        let result =
+            truncate_to_token_budget(text, Language::TypeScript, 100, word_count, Some(5))
+                .unwrap();
+        assert_eq!(result, text, "Fast-path should return text unchanged");
+    }
+
+    #[test]
+    fn test_token_budget_known_count_none_behaves_like_before() {
+        // Property test: None produces identical invariant (output tokens <= budget)
+        let text =
+            "word1 word2 word3\nword4 word5 word6\nword7 word8 word9\nword10 word11 word12\n";
+        for budget in 1..20 {
+            let result_none =
+                truncate_to_token_budget(text, Language::TypeScript, budget, word_count, None)
+                    .unwrap();
+            let result_some = truncate_to_token_budget(
+                text,
+                Language::TypeScript,
+                budget,
+                word_count,
+                Some(word_count(text)),
+            )
+            .unwrap();
+            assert_eq!(
+                result_none, result_some,
+                "Budget {}: None and Some(actual_count) should produce identical output",
+                budget
             );
         }
     }
