@@ -350,9 +350,16 @@ pub fn truncate_to_token_budget<F>(
 where
     F: Fn(&str) -> usize,
 {
-    // Fast path: if text already fits, return unchanged (B4: skip recount
-    // when the caller already knows the token count from the cascade loop)
+    // Fast path: if text already fits, return unchanged. When the caller
+    // already knows the token count from the cascade loop, this avoids a
+    // redundant full-text tokenization.
     let full_count = known_token_count.unwrap_or_else(|| count_tokens(text));
+    debug_assert!(
+        known_token_count.is_none() || known_token_count == Some(count_tokens(text)),
+        "known_token_count ({:?}) does not match actual count ({})",
+        known_token_count,
+        count_tokens(text),
+    );
     if full_count <= token_budget {
         return Ok(text.to_string());
     }
@@ -373,7 +380,7 @@ where
         )
     };
 
-    // B5: Pre-join once and build byte-offset index to avoid O(N log N)
+    // Pre-join once and build byte-offset index to avoid O(N log N)
     // allocation churn from per-iteration `lines[..mid].join("\n")`.
     let joined = lines.join("\n");
     let mut byte_end: Vec<usize> = Vec::with_capacity(lines.len());
@@ -1115,7 +1122,7 @@ mod tests {
     }
 
     // ========================================================================
-    // known_token_count tests (B4)
+    // known_token_count tests
     // ========================================================================
 
     #[test]
@@ -1142,14 +1149,38 @@ mod tests {
 
     #[test]
     fn test_token_budget_known_count_returns_early_when_within_budget() {
-        // When known_token_count is within budget, fast-path should return text unchanged
         let text = "line one\nline two\nline three\n";
-        // Provide a known count that's within budget — function must NOT call count_tokens
-        // on the full text. We verify by passing a counter that would give a different value.
-        let result =
-            truncate_to_token_budget(text, Language::TypeScript, 100, word_count, Some(5))
-                .unwrap();
+        let actual_count = word_count(text); // 6
+        // Track whether count_tokens was called on the full text via unwrap_or_else.
+        // The debug_assert! also calls count_tokens(text) for validation, so we use
+        // a call-count approach: fast-path should only invoke the counter once (from
+        // the debug_assert), not twice (debug_assert + unwrap_or_else).
+        let call_count = std::cell::Cell::new(0u32);
+        let counting_fn = |s: &str| -> usize {
+            if s == text {
+                call_count.set(call_count.get() + 1);
+            }
+            s.split_whitespace().count()
+        };
+        let result = truncate_to_token_budget(
+            text,
+            Language::TypeScript,
+            100,
+            counting_fn,
+            Some(actual_count),
+        )
+        .unwrap();
         assert_eq!(result, text, "Fast-path should return text unchanged");
+        // In debug builds the debug_assert! calls count_tokens(text) once.
+        // The fast-path unwrap_or_else should NOT call it (known_token_count is Some).
+        // So we expect at most 1 call (from debug_assert), not 2.
+        let calls = call_count.get();
+        assert!(
+            calls <= 1,
+            "count_tokens should not be called via unwrap_or_else when known_token_count is Some \
+             (expected <= 1 full-text call from debug_assert, got {})",
+            calls
+        );
     }
 
     #[test]

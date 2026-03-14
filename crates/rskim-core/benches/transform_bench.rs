@@ -188,7 +188,7 @@ fn bench_language_comparison(c: &mut Criterion) {
 }
 
 // ============================================================================
-// Token Budget Truncation Benchmarks (B5)
+// Token Budget Truncation Benchmarks
 // ============================================================================
 
 fn bench_token_budget_truncation(c: &mut Criterion) {
@@ -205,8 +205,8 @@ fn bench_token_budget_truncation(c: &mut Criterion) {
 
         group.bench_with_input(
             BenchmarkId::new("lines", num_lines),
-            &(text, budget),
-            |b, (input, budget)| {
+            &(text.clone(), budget, total),
+            |b, (input, budget, _total)| {
                 b.iter(|| {
                     truncate_to_token_budget(
                         black_box(input),
@@ -214,6 +214,24 @@ fn bench_token_budget_truncation(c: &mut Criterion) {
                         *budget,
                         word_count,
                         None,
+                    )
+                    .unwrap()
+                })
+            },
+        );
+
+        // Variant with known token count — exercises the fast-path skip
+        group.bench_with_input(
+            BenchmarkId::new("lines_known", num_lines),
+            &(text, budget, total),
+            |b, (input, budget, total)| {
+                b.iter(|| {
+                    truncate_to_token_budget(
+                        black_box(input),
+                        Language::TypeScript,
+                        *budget,
+                        word_count,
+                        Some(*total),
                     )
                     .unwrap()
                 })

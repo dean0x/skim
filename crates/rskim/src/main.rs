@@ -283,7 +283,7 @@ where
     let cascade = starting_mode.cascade_from_here();
     let mut last_output = String::new();
     let mut last_mode = starting_mode;
-    let mut last_token_count: usize = 0;
+    let mut last_token_count: Option<usize> = None;
 
     for &mode in cascade {
         let config = build_config(mode, max_lines);
@@ -311,7 +311,7 @@ where
 
         last_output = output;
         last_mode = mode;
-        last_token_count = token_count;
+        last_token_count = Some(token_count);
     }
 
     // Guard: no mode produced output (defensive; transform_fn currently always
@@ -339,7 +339,7 @@ where
                 usize::MAX
             })
         },
-        Some(last_token_count),
+        last_token_count,
     )?;
 
     Ok((truncated, last_mode))
