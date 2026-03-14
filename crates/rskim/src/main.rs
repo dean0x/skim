@@ -337,7 +337,7 @@ where
     Ok((truncated, last_mode))
 }
 
-/// Process a single file and return transformed content and optionally original content
+/// Process a single file and return transformed content with optional token statistics
 fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
     // Try to read from cache if enabled
     let cached_result = if options.use_cache {

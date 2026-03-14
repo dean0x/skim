@@ -400,13 +400,9 @@ where
         return Ok(String::new());
     }
 
-    let mut output = if best == 0 {
-        marker
-    } else {
-        let mut result: Vec<&str> = lines[..best].to_vec();
-        result.push(&marker);
-        result.join("\n")
-    };
+    let mut result: Vec<&str> = lines[..best].to_vec();
+    result.push(&marker);
+    let mut output = result.join("\n");
 
     if text.ends_with('\n') {
         output.push('\n');
