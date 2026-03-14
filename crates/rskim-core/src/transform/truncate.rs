@@ -1032,6 +1032,32 @@ mod tests {
     }
 
     #[test]
+    fn test_token_budget_marker_only_output() {
+        // When budget is big enough for the marker but not for any content lines,
+        // only the marker should be returned (zero content lines, best=0).
+        // The marker "// ... (3 lines truncated)" is 5 word-tokens.
+        let text = "line one\nline two\nline three\n";
+        let result = truncate_to_token_budget(text, Language::TypeScript, 5, word_count).unwrap();
+        assert!(
+            result.contains("truncated"),
+            "Should contain omission marker: {:?}",
+            result
+        );
+        assert!(
+            !result.contains("line one"),
+            "Should not contain any content lines: {:?}",
+            result
+        );
+        let token_count = word_count(&result);
+        assert!(
+            token_count <= 5,
+            "Marker-only output should be within budget, got {} tokens: {:?}",
+            token_count,
+            result
+        );
+    }
+
+    #[test]
     fn test_token_budget_output_invariant() {
         // The fundamental invariant: output tokens <= budget
         let text =

@@ -439,6 +439,50 @@ fn test_tokens_budget_invariant_with_fixture() {
 }
 
 #[test]
+fn test_tokens_with_mode_types_single_mode_cascade() {
+    // --mode=types has only one mode in the cascade [Types].
+    // With a tight budget, it must go directly to line truncation fallback.
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("test.ts");
+    std::fs::write(
+        &file,
+        "type UserId = string;\n\
+         type UserName = string;\n\
+         type UserEmail = string;\n\
+         type UserAge = number;\n\
+         type UserStatus = 'active' | 'inactive';\n\
+         interface User { id: UserId; name: UserName; email: UserEmail; }\n\
+         function createUser(name: string): User { return {} as User; }\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--mode=types")
+        .arg("--tokens")
+        .arg("15")
+        .arg("--show-stats")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Types mode with --tokens should succeed. stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let token_count = parse_transformed_token_count(&stderr);
+    assert!(
+        token_count <= 15,
+        "Output tokens ({}) should be <= budget (15). stderr: {:?}",
+        token_count,
+        stderr,
+    );
+}
+
+#[test]
 fn test_tokens_with_python_file() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.py");

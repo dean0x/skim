@@ -871,4 +871,120 @@ mod tests {
         assert!(!has_glob_pattern("file.ts"));
         assert!(!has_glob_pattern("src/main.rs"));
     }
+
+    // ========================================================================
+    // cascade_for_token_budget unit tests (S7)
+    // ========================================================================
+
+    /// Mock transform: returns the first N words from source for the matching mode.
+    fn mock_transform<'a>(
+        source: &'a str,
+        mode_sizes: &'a [(Mode, usize)],
+    ) -> impl Fn(&TransformConfig) -> anyhow::Result<Option<String>> + 'a {
+        move |config: &TransformConfig| {
+            for &(mode, size) in mode_sizes {
+                if config.mode == mode {
+                    let words: Vec<&str> = source.split_whitespace().take(size).collect();
+                    return Ok(Some(words.join(" ")));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn test_cascade_returns_first_mode_when_within_budget() {
+        // Structure output = 3 tokens, budget = 10 → no escalation
+        let source = "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10";
+        let mode_sizes = vec![
+            (Mode::Structure, 3),
+            (Mode::Signatures, 2),
+            (Mode::Types, 1),
+        ];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, None, 10, Language::TypeScript, transform)
+                .unwrap();
+
+        assert_eq!(mode_used, Mode::Structure);
+        assert_eq!(output, "word1 word2 word3");
+    }
+
+    #[test]
+    fn test_cascade_escalates_to_more_aggressive_mode() {
+        // Structure = 20 tokens (over budget), Signatures = 8 (within budget)
+        let source = "a b c d e f g h i j k l m n o p q r s t";
+        let mode_sizes = vec![
+            (Mode::Structure, 20),
+            (Mode::Signatures, 8),
+            (Mode::Types, 3),
+        ];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (_output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, None, 10, Language::TypeScript, transform)
+                .unwrap();
+
+        assert_eq!(mode_used, Mode::Signatures);
+    }
+
+    #[test]
+    fn test_cascade_falls_through_to_line_truncation() {
+        // All modes exceed budget → should hit line truncation fallback
+        let source = "a b c d e f g h i j k l m n o p q r s t";
+        let mode_sizes = vec![
+            (Mode::Structure, 20),
+            (Mode::Signatures, 15),
+            (Mode::Types, 12),
+        ];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, None, 5, Language::TypeScript, transform)
+                .unwrap();
+
+        // Should use the most aggressive mode that produced output
+        assert_eq!(mode_used, Mode::Types);
+        // Output should contain truncation marker or be within budget
+        let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
+        assert!(
+            token_count <= 5 || output.is_empty(),
+            "Final output should be within budget or empty, got {} tokens: {:?}",
+            token_count,
+            output
+        );
+    }
+
+    #[test]
+    fn test_cascade_single_mode_types() {
+        // Starting at Types → only one mode in cascade, must fit or truncate
+        let source = "a b c d e f g h i j";
+        let mode_sizes = vec![(Mode::Types, 5)];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Types, None, 10, Language::TypeScript, transform)
+                .unwrap();
+
+        assert_eq!(mode_used, Mode::Types);
+        assert_eq!(output, "a b c d e");
+    }
+
+    #[test]
+    fn test_cascade_errors_when_no_mode_produces_output() {
+        // All modes return None → should error
+        let transform = |_config: &TransformConfig| -> anyhow::Result<Option<String>> { Ok(None) };
+
+        let result =
+            cascade_for_token_budget(Mode::Structure, None, 100, Language::TypeScript, transform);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no transformation mode produced output"),
+        );
+    }
 }

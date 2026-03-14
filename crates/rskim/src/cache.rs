@@ -290,6 +290,46 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_read_write_with_token_budget() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "test content for token budget").unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let token_budget = Some(500);
+
+        // No cache initially
+        assert!(read_cache(&path, Mode::Structure, None, token_budget).is_none());
+
+        // Write with token_budget
+        write_cache(
+            &path,
+            Mode::Structure,
+            "budget-transformed output",
+            Some(200),
+            Some(80),
+            None,
+            token_budget,
+        )
+        .unwrap();
+
+        // Read with same token_budget succeeds
+        let (cached, orig_tokens, trans_tokens) =
+            read_cache(&path, Mode::Structure, None, token_budget).unwrap();
+        assert_eq!(cached, "budget-transformed output");
+        assert_eq!(orig_tokens, Some(200));
+        assert_eq!(trans_tokens, Some(80));
+
+        // Read without token_budget misses (different cache key)
+        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+
+        // Read with different token_budget misses
+        assert!(read_cache(&path, Mode::Structure, None, Some(1000)).is_none());
+
+        // Read with same budget + different mode misses
+        assert!(read_cache(&path, Mode::Signatures, None, token_budget).is_none());
+    }
+
+    #[test]
     fn test_cache_invalidation_on_mtime_change() {
         use std::fs::File;
         use std::io::Write as IoWrite;
