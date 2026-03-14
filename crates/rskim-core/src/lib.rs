@@ -41,7 +41,7 @@ pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, Tran
 pub use transform::truncate::truncate_to_token_budget;
 
 mod parser;
-pub mod transform;
+mod transform;
 mod types;
 
 // NOTE: Caching is implemented at the CLI layer (rskim binary), not in the core library.

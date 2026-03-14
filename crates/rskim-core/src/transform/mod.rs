@@ -4,14 +4,14 @@
 //! Each mode has its own transformation strategy.
 //! JSON is handled separately without tree-sitter.
 
-pub mod json;
-pub mod minimal;
-pub mod signatures;
-pub mod structure;
-pub mod truncate;
-pub mod types;
+pub(crate) mod json;
+pub(crate) mod minimal;
+pub(crate) mod signatures;
+pub(crate) mod structure;
+pub(crate) mod truncate;
+pub(crate) mod types;
 pub(crate) mod utils;
-pub mod yaml;
+pub(crate) mod yaml;
 
 use crate::{Language, Mode, Result, TransformConfig};
 use tree_sitter::Tree;

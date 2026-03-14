@@ -292,30 +292,32 @@ impl Mode {
     /// Used by the token budget cascade: try each mode from least to most
     /// aggressive until the output fits within the token budget.
     ///
+    /// Returns a static slice to avoid heap allocation on every call.
+    ///
     /// # Examples
     /// ```
     /// use rskim_core::Mode;
     ///
     /// let cascade = Mode::Structure.cascade_from_here();
-    /// assert_eq!(cascade, vec![Mode::Structure, Mode::Signatures, Mode::Types]);
+    /// assert_eq!(cascade, &[Mode::Structure, Mode::Signatures, Mode::Types]);
     ///
     /// let cascade = Mode::Full.cascade_from_here();
-    /// assert_eq!(cascade, vec![Mode::Full, Mode::Minimal, Mode::Structure, Mode::Signatures, Mode::Types]);
+    /// assert_eq!(cascade, &[Mode::Full, Mode::Minimal, Mode::Structure, Mode::Signatures, Mode::Types]);
     /// ```
-    pub fn cascade_from_here(self) -> Vec<Self> {
-        let all_modes = [
-            Self::Full,
-            Self::Minimal,
-            Self::Structure,
-            Self::Signatures,
-            Self::Types,
-        ];
-        let threshold = self.aggressiveness();
-        all_modes
-            .iter()
-            .filter(|m| m.aggressiveness() >= threshold)
-            .copied()
-            .collect()
+    pub fn cascade_from_here(self) -> &'static [Self] {
+        match self {
+            Self::Full => &[
+                Self::Full,
+                Self::Minimal,
+                Self::Structure,
+                Self::Signatures,
+                Self::Types,
+            ],
+            Self::Minimal => &[Self::Minimal, Self::Structure, Self::Signatures, Self::Types],
+            Self::Structure => &[Self::Structure, Self::Signatures, Self::Types],
+            Self::Signatures => &[Self::Signatures, Self::Types],
+            Self::Types => &[Self::Types],
+        }
     }
 }
 

@@ -296,17 +296,20 @@ where
     let mut last_output = String::new();
     let mut last_mode = starting_mode;
 
-    for mode in &cascade {
-        let config = build_config(*mode, max_lines);
+    for &mode in cascade {
+        let config = build_config(mode, max_lines);
 
         let Some(output) = transform_fn(&config)? else {
             continue;
         };
 
-        let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
+        let token_count = tokens::count_tokens(&output).unwrap_or_else(|e| {
+            eprintln!("[skim] warning: token counting failed, treating as over-budget: {e}");
+            usize::MAX
+        });
 
         if token_count <= token_budget {
-            if *mode != starting_mode {
+            if mode != starting_mode {
                 eprintln!(
                     "[skim] token budget: escalated from {} to {} mode ({} tokens)",
                     starting_mode.name(),
@@ -314,11 +317,22 @@ where
                     token_count,
                 );
             }
-            return Ok((output, *mode));
+            return Ok((output, mode));
         }
 
         last_output = output;
-        last_mode = *mode;
+        last_mode = mode;
+    }
+
+    // Guard: if no mode produced output, bail with a clear error instead of
+    // misleadingly truncating an empty string. Currently unreachable because
+    // transform_fn always returns Ok(Some(...)), but protects against future
+    // callers that may return Ok(None).
+    if last_output.is_empty() {
+        anyhow::bail!(
+            "Token budget cascade: no transformation mode produced output. \
+             Ensure the file is in a supported language or specify --language."
+        );
     }
 
     // Final fallback: line-based truncation of the most aggressive mode's output
@@ -328,7 +342,10 @@ where
     );
 
     let truncated = truncate_to_token_budget(&last_output, language, token_budget, |text| {
-        tokens::count_tokens(text).unwrap_or(usize::MAX)
+        tokens::count_tokens(text).unwrap_or_else(|e| {
+            eprintln!("[skim] warning: token counting failed in truncation fallback: {e}");
+            usize::MAX
+        })
     })?;
 
     Ok((truncated, last_mode))
@@ -343,33 +360,33 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
         None
     };
 
-    // If we have cached result with token counts, return without reading file
-    if let Some((ref content, orig_tokens, trans_tokens)) = cached_result {
+    // Handle cached result: consumes the Option in a single match to avoid
+    // cloning the cached content String. Covers both the fast-path (return
+    // without reading file) and the recompute-stats branch.
+    if let Some((content, orig_tokens, trans_tokens)) = cached_result {
+        // Fast path: cache has token counts and stats aren't needed -- skip file I/O
         if !options.compute_token_stats && orig_tokens.is_some() && trans_tokens.is_some() {
             return Ok(ProcessResult {
-                output: content.clone(),
+                output: content,
                 original_tokens: orig_tokens,
                 transformed_tokens: trans_tokens,
             });
         }
-    }
 
-    // Need to read the file (either for transformation or for token counting)
-    let contents = fs::read_to_string(path)?;
+        // Need to read the file for token counting of the original source
+        let contents = fs::read_to_string(path)?;
 
-    if contents.len() > MAX_INPUT_SIZE {
-        anyhow::bail!(
-            "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
-            contents.len(),
-            MAX_INPUT_SIZE,
-            MAX_INPUT_SIZE / 1024 / 1024
-        );
-    }
+        if contents.len() > MAX_INPUT_SIZE {
+            anyhow::bail!(
+                "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+                contents.len(),
+                MAX_INPUT_SIZE,
+                MAX_INPUT_SIZE / 1024 / 1024
+            );
+        }
 
-    // If we have cached result, return it.
-    // When cache was written without --show-stats, tokens are None.
-    // Compute them now if stats are requested.
-    if let Some((content, orig_tokens, trans_tokens)) = cached_result {
+        // When cache was written without --show-stats, tokens are None.
+        // Compute them now if stats are requested.
         let (orig_tokens, trans_tokens) = if options.compute_token_stats && orig_tokens.is_none() {
             match (
                 tokens::count_tokens(&contents),
@@ -388,6 +405,18 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
         });
     }
 
+    // No cache hit -- read the file for transformation
+    let contents = fs::read_to_string(path)?;
+
+    if contents.len() > MAX_INPUT_SIZE {
+        anyhow::bail!(
+            "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+            contents.len(),
+            MAX_INPUT_SIZE,
+            MAX_INPUT_SIZE / 1024 / 1024
+        );
+    }
+
     // ARCHITECTURE: Transform closure tries auto-detection first, explicit_lang as fallback.
     // This allows mixed-language directories while still supporting edge cases like .inc files.
     // Returns None when auto-detection fails and no explicit language is provided.
@@ -404,9 +433,22 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 
     // When token_budget is set, use cascade; otherwise single-mode transform
     let result = if let Some(budget) = options.token_budget {
+        // Determine language for omission marker comment syntax in truncation.
+        // In practice this unwrap_or is unreachable: if both explicit_lang and
+        // detect_language_from_path return None, then transform_auto_with_config
+        // (which uses the same Language::from_path) will also fail, causing the
+        // cascade to propagate an error before reaching truncation markers.
+        // TypeScript's "//" syntax is a safe default because it is valid in the
+        // majority of supported languages (TS, JS, Rust, Go, Java).
         let language = explicit_lang
             .or_else(|| rskim_core::detect_language_from_path(path))
-            .unwrap_or(Language::TypeScript); // Safe default for comment syntax
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "[skim] warning: could not detect language for truncation markers, \
+                     using // syntax"
+                );
+                Language::TypeScript
+            });
 
         let (output, _mode_used) = cascade_for_token_budget(
             options.mode,
@@ -488,7 +530,7 @@ fn process_files(
         mode: options.mode,
         explicit_lang: options.explicit_lang,
         use_cache: options.use_cache,
-        compute_token_stats: options.show_stats || options.token_budget.is_some(),
+        compute_token_stats: options.show_stats,
         max_lines: options.max_lines,
         token_budget: options.token_budget,
     };
@@ -780,14 +822,12 @@ fn main() -> anyhow::Result<()> {
         writer.flush()?;
 
         // Output token statistics if requested
-        if args.show_stats || token_budget.is_some() {
+        if args.show_stats {
             if let (Ok(orig_tokens), Ok(trans_tokens)) =
                 (tokens::count_tokens(&buffer), tokens::count_tokens(&result))
             {
-                if args.show_stats {
-                    let stats = tokens::TokenStats::new(orig_tokens, trans_tokens);
-                    eprintln!("\n[skim] {}", stats.format());
-                }
+                let stats = tokens::TokenStats::new(orig_tokens, trans_tokens);
+                eprintln!("\n[skim] {}", stats.format());
             }
         }
 
@@ -822,7 +862,7 @@ fn main() -> anyhow::Result<()> {
         mode,
         explicit_lang,
         use_cache,
-        compute_token_stats: args.show_stats || token_budget.is_some(),
+        compute_token_stats: args.show_stats,
         max_lines,
         token_budget,
     };

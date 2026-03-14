@@ -330,7 +330,13 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
 /// * `count_tokens` - Closure that counts tokens in a string
 ///
 /// # Returns
-/// Text that fits within the token budget, with an omission marker if truncated
+/// Text that fits within the token budget, with an omission marker if truncated.
+///
+/// # Minimum effective budget
+/// The omission marker itself consumes approximately 5-7 tokens (e.g.,
+/// `// ... (3 lines truncated)`). If the budget is smaller than the marker
+/// size, an empty string is returned rather than emitting a marker that
+/// would violate the budget invariant.
 pub fn truncate_to_token_budget<F>(
     text: &str,
     language: Language,
@@ -387,7 +393,7 @@ where
             best = mid;
             lo = mid + 1;
         } else {
-            hi = mid - 1;
+            hi = mid.saturating_sub(1);
         }
     }
 
@@ -397,6 +403,13 @@ where
     }
 
     let marker = make_marker(lines.len() - best);
+
+    // Guard: if even the marker alone exceeds the budget, return empty string
+    // rather than violating the token budget invariant.
+    if best == 0 && count_tokens(&marker) > token_budget {
+        return Ok(String::new());
+    }
+
     let mut output = if best == 0 {
         marker
     } else {
@@ -975,7 +988,9 @@ mod tests {
     #[test]
     fn test_token_budget_preserves_trailing_newline() {
         let text = "line one\nline two\nline three\n";
-        let result = truncate_to_token_budget(text, Language::TypeScript, 4, word_count).unwrap();
+        // Budget of 5: full text is 6 words, marker alone is 5 words ("// ... (3 lines truncated)")
+        // so best=0, marker fits, trailing newline from original is preserved
+        let result = truncate_to_token_budget(text, Language::TypeScript, 5, word_count).unwrap();
         assert!(
             result.ends_with('\n'),
             "Should preserve trailing newline: {:?}",
@@ -1004,13 +1019,11 @@ mod tests {
     #[test]
     fn test_token_budget_very_small_budget() {
         let text = "line one\nline two\nline three\n";
-        // Budget of 1: only marker should fit (or nothing)
+        // Budget of 1: marker exceeds budget (~5 word-tokens), so empty string
         let result = truncate_to_token_budget(text, Language::TypeScript, 1, word_count).unwrap();
-        let token_count = word_count(&result);
-        // The marker itself might exceed 1 word, but the function does its best
-        assert!(
-            token_count <= 10,
-            "Very small budget should produce minimal output: {:?}",
+        assert_eq!(
+            result, "",
+            "When budget is smaller than the marker, return empty string: {:?}",
             result
         );
     }
@@ -1037,18 +1050,16 @@ mod tests {
             let result =
                 truncate_to_token_budget(text, Language::TypeScript, budget, word_count).unwrap();
             let token_count = word_count(&result);
-            // With very small budgets the marker itself might exceed, but
-            // for reasonable budgets the invariant must hold
-            if budget >= 5 {
-                assert!(
-                    token_count <= budget,
-                    "Budget {}: output has {} word-tokens, expected <= {}: {:?}",
-                    budget,
-                    token_count,
-                    budget,
-                    result
-                );
-            }
+            // The invariant must hold for ALL budgets: when the marker exceeds
+            // the budget, an empty string is returned (0 tokens <= budget).
+            assert!(
+                token_count <= budget,
+                "Budget {}: output has {} word-tokens, expected <= {}: {:?}",
+                budget,
+                token_count,
+                budget,
+                result
+            );
         }
     }
 }
