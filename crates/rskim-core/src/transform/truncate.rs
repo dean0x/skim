@@ -354,33 +354,31 @@ where
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
+    let make_marker = |truncated_count: usize| {
+        format!(
+            "{} ... ({} lines truncated){}",
+            prefix, truncated_count, suffix
+        )
+    };
 
-    // Binary search for max lines that fit within budget (including marker)
+    // Binary search for max content lines that fit within budget (including marker)
     let mut lo: usize = 0;
     let mut hi: usize = lines.len();
-    // Best known number of content lines that fit (0 means nothing fits)
     let mut best: usize = 0;
 
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
 
         if mid == 0 {
-            // Zero content lines: just the marker
-            let marker = format!("{} ... ({} lines truncated){}", prefix, lines.len(), suffix);
-            if count_tokens(&marker) <= token_budget {
+            // Zero content lines: check if just the marker fits
+            if count_tokens(&make_marker(lines.len())) <= token_budget {
                 best = 0;
             }
-            // Cannot go lower than 0
             break;
         }
 
         // Build candidate: mid content lines + omission marker
-        let marker = format!(
-            "{} ... ({} lines truncated){}",
-            prefix,
-            lines.len() - mid,
-            suffix
-        );
+        let marker = make_marker(lines.len() - mid);
         let mut candidate = lines[..mid].join("\n");
         candidate.push('\n');
         candidate.push_str(&marker);
@@ -389,39 +387,24 @@ where
             best = mid;
             lo = mid + 1;
         } else {
-            if mid == 0 {
-                break;
-            }
             hi = mid - 1;
         }
     }
 
     // Build final output
     if best >= lines.len() {
-        // Shouldn't reach here (fast path above), but handle gracefully
         return Ok(text.to_string());
     }
 
-    if best == 0 {
-        // Only the marker fits
-        let marker = format!("{} ... ({} lines truncated){}", prefix, lines.len(), suffix);
-        let mut output = marker;
-        if text.ends_with('\n') {
-            output.push('\n');
-        }
-        return Ok(output);
-    }
+    let marker = make_marker(lines.len() - best);
+    let mut output = if best == 0 {
+        marker
+    } else {
+        let mut result: Vec<&str> = lines[..best].to_vec();
+        result.push(&marker);
+        result.join("\n")
+    };
 
-    let marker = format!(
-        "{} ... ({} lines truncated){}",
-        prefix,
-        lines.len() - best,
-        suffix
-    );
-    let mut result: Vec<&str> = lines[..best].to_vec();
-    result.push(&marker);
-
-    let mut output = result.join("\n");
     if text.ends_with('\n') {
         output.push('\n');
     }

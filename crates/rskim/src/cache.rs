@@ -76,22 +76,14 @@ fn cache_key(
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
     // Create hash input: "path|mtime|mode|max_lines_or_none|token_budget_or_none"
-    let mode_str = format!("{:?}", mode);
-    let max_lines_str = match max_lines {
-        Some(n) => n.to_string(),
-        None => "none".to_string(),
-    };
-    let token_budget_str = match token_budget {
-        Some(n) => n.to_string(),
-        None => "none".to_string(),
-    };
+    let fmt_opt = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
     let hash_input = format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{:?}|{}|{}",
         canonical_path.display(),
         mtime_secs,
-        mode_str,
-        max_lines_str,
-        token_budget_str,
+        mode,
+        fmt_opt(max_lines),
+        fmt_opt(token_budget),
     );
 
     // Generate SHA256 hash

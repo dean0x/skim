@@ -201,64 +201,23 @@ struct ProcessOptions {
     explicit_lang: Option<Language>,
     /// Whether to use cache
     use_cache: bool,
-    /// Whether to include original content for token counting
-    include_original: bool,
+    /// Whether to compute token statistics (for --show-stats)
+    compute_token_stats: bool,
     /// Maximum output lines (AST-aware truncation)
     max_lines: Option<usize>,
     /// Token budget for cascade mode
     token_budget: Option<usize>,
 }
 
-impl ProcessOptions {
-    /// Create new processing options
-    fn new(
-        mode: Mode,
-        explicit_lang: Option<Language>,
-        use_cache: bool,
-        include_original: bool,
-        max_lines: Option<usize>,
-        token_budget: Option<usize>,
-    ) -> Self {
-        Self {
-            mode,
-            explicit_lang,
-            use_cache,
-            include_original,
-            max_lines,
-            token_budget,
-        }
-    }
-}
-
-/// Result of processing a file (replaces tuple return)
+/// Result of processing a file
 #[derive(Debug)]
 struct ProcessResult {
     /// Transformed output
     output: String,
-    /// Original file content (if needed for token counting)
-    #[allow(dead_code)]
-    original: Option<String>,
     /// Original token count (if computed)
     original_tokens: Option<usize>,
     /// Transformed token count (if computed)
     transformed_tokens: Option<usize>,
-}
-
-impl ProcessResult {
-    /// Create a new ProcessResult
-    fn new(
-        output: String,
-        original: Option<String>,
-        original_tokens: Option<usize>,
-        transformed_tokens: Option<usize>,
-    ) -> Self {
-        Self {
-            output,
-            original,
-            original_tokens,
-            transformed_tokens,
-        }
-    }
 }
 
 /// Report token statistics to stderr if token counts are available
@@ -310,24 +269,29 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
 /// as a final fallback. Diagnostics are emitted to stderr only when escalating
 /// beyond the starting mode.
 ///
+/// The `transform_fn` closure abstracts over how transformation is performed,
+/// allowing the same cascade logic for both file-based (auto-detect language)
+/// and stdin-based (explicit language) inputs.
+///
 /// # Arguments
-/// * `source` - Source code content
-/// * `path` - File path for language detection
 /// * `starting_mode` - The mode to start cascading from
 /// * `max_lines` - Optional max lines constraint (applied to each mode attempt)
 /// * `token_budget` - Target token count to fit within
-/// * `explicit_lang` - Explicit language override (None for auto-detection)
+/// * `language` - Language for omission marker syntax in final fallback
+/// * `transform_fn` - Closure that transforms source using a given config
 ///
 /// # Returns
 /// Tuple of (transformed_output, mode_used)
-fn cascade_for_token_budget(
-    source: &str,
-    path: &Path,
+fn cascade_for_token_budget<F>(
     starting_mode: Mode,
     max_lines: Option<usize>,
     token_budget: usize,
-    explicit_lang: Option<Language>,
-) -> anyhow::Result<(String, Mode)> {
+    language: Language,
+    transform_fn: F,
+) -> anyhow::Result<(String, Mode)>
+where
+    F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
+{
     let cascade = starting_mode.cascade_from_here();
     let mut last_output = String::new();
     let mut last_mode = starting_mode;
@@ -335,23 +299,13 @@ fn cascade_for_token_budget(
     for mode in &cascade {
         let config = build_config(*mode, max_lines);
 
-        let output = match transform_auto_with_config(source, path, &config) {
-            Ok(o) => o,
-            Err(_) => {
-                // Auto-detection failed - use explicit language as fallback
-                if let Some(language) = explicit_lang {
-                    transform_with_config(source, language, &config)?
-                } else {
-                    continue;
-                }
-            }
+        let Some(output) = transform_fn(&config)? else {
+            continue;
         };
 
-        // Count tokens using tiktoken
         let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
 
         if token_count <= token_budget {
-            // Emit diagnostic if we escalated beyond starting mode
             if *mode != starting_mode {
                 eprintln!(
                     "[skim] token budget: escalated from {} to {} mode ({} tokens)",
@@ -368,57 +322,6 @@ fn cascade_for_token_budget(
     }
 
     // Final fallback: line-based truncation of the most aggressive mode's output
-    let language = explicit_lang
-        .or_else(|| rskim_core::detect_language_from_path(path))
-        .unwrap_or(Language::TypeScript); // Safe default for comment syntax
-
-    eprintln!(
-        "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
-        last_mode.name(),
-    );
-
-    let truncated = truncate_to_token_budget(&last_output, language, token_budget, |text| {
-        tokens::count_tokens(text).unwrap_or(usize::MAX)
-    })?;
-
-    Ok((truncated, last_mode))
-}
-
-/// Cascade through modes for stdin input (language already known)
-fn cascade_for_token_budget_stdin(
-    source: &str,
-    language: Language,
-    starting_mode: Mode,
-    max_lines: Option<usize>,
-    token_budget: usize,
-) -> anyhow::Result<(String, Mode)> {
-    let cascade = starting_mode.cascade_from_here();
-    let mut last_output = String::new();
-    let mut last_mode = starting_mode;
-
-    for mode in &cascade {
-        let config = build_config(*mode, max_lines);
-        let output = transform_with_config(source, language, &config)?;
-
-        let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
-
-        if token_count <= token_budget {
-            if *mode != starting_mode {
-                eprintln!(
-                    "[skim] token budget: escalated from {} to {} mode ({} tokens)",
-                    starting_mode.name(),
-                    mode.name(),
-                    token_count,
-                );
-            }
-            return Ok((output, *mode));
-        }
-
-        last_output = output;
-        last_mode = *mode;
-    }
-
-    // Final fallback: line-based truncation
     eprintln!(
         "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
         last_mode.name(),
@@ -442,13 +345,12 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 
     // If we have cached result with token counts, return without reading file
     if let Some((ref content, orig_tokens, trans_tokens)) = cached_result {
-        if !options.include_original && orig_tokens.is_some() && trans_tokens.is_some() {
-            return Ok(ProcessResult::new(
-                content.clone(),
-                None,
-                orig_tokens,
-                trans_tokens,
-            ));
+        if !options.compute_token_stats && orig_tokens.is_some() && trans_tokens.is_some() {
+            return Ok(ProcessResult {
+                output: content.clone(),
+                original_tokens: orig_tokens,
+                transformed_tokens: trans_tokens,
+            });
         }
     }
 
@@ -464,11 +366,11 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
         );
     }
 
-    // If we have cached result, return it with original content
+    // If we have cached result, return it.
     // When cache was written without --show-stats, tokens are None.
-    // Compute them now if stats are requested (include_original=true).
+    // Compute them now if stats are requested.
     if let Some((content, orig_tokens, trans_tokens)) = cached_result {
-        let (orig_tokens, trans_tokens) = if options.include_original && orig_tokens.is_none() {
+        let (orig_tokens, trans_tokens) = if options.compute_token_stats && orig_tokens.is_none() {
             match (
                 tokens::count_tokens(&contents),
                 tokens::count_tokens(&content),
@@ -479,47 +381,50 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
         } else {
             (orig_tokens, trans_tokens)
         };
-        return Ok(ProcessResult::new(
-            content,
-            Some(contents),
-            orig_tokens,
-            trans_tokens,
-        ));
+        return Ok(ProcessResult {
+            output: content,
+            original_tokens: orig_tokens,
+            transformed_tokens: trans_tokens,
+        });
     }
 
-    // Transform the file
-    // When token_budget is set, use cascade; otherwise single-mode transform
-    let result = if let Some(budget) = options.token_budget {
-        let (output, _mode_used) = cascade_for_token_budget(
-            &contents,
-            path,
-            options.mode,
-            options.max_lines,
-            budget,
-            options.explicit_lang,
-        )?;
-        output
-    } else {
-        // ARCHITECTURE: Option B - Always try auto-detection first, use explicit_lang as fallback
-        // This allows mixed-language directories while still supporting edge cases like .inc files
-        let config = build_config(options.mode, options.max_lines);
-
-        match transform_auto_with_config(&contents, path, &config) {
-            Ok(output) => output,
-            Err(e) => {
-                // Auto-detection failed - use explicit language as fallback if provided
-                if let Some(language) = options.explicit_lang {
-                    transform_with_config(&contents, language, &config)?
-                } else {
-                    // No fallback available - propagate the auto-detection error
-                    return Err(e.into());
-                }
-            }
+    // ARCHITECTURE: Transform closure tries auto-detection first, explicit_lang as fallback.
+    // This allows mixed-language directories while still supporting edge cases like .inc files.
+    // Returns None when auto-detection fails and no explicit language is provided.
+    let explicit_lang = options.explicit_lang;
+    let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
+        match transform_auto_with_config(&contents, path, config) {
+            Ok(output) => Ok(Some(output)),
+            Err(e) => match explicit_lang {
+                Some(language) => Ok(Some(transform_with_config(&contents, language, config)?)),
+                None => Err(e.into()),
+            },
         }
     };
 
+    // When token_budget is set, use cascade; otherwise single-mode transform
+    let result = if let Some(budget) = options.token_budget {
+        let language = explicit_lang
+            .or_else(|| rskim_core::detect_language_from_path(path))
+            .unwrap_or(Language::TypeScript); // Safe default for comment syntax
+
+        let (output, _mode_used) = cascade_for_token_budget(
+            options.mode,
+            options.max_lines,
+            budget,
+            language,
+            transform_file,
+        )?;
+        output
+    } else {
+        let config = build_config(options.mode, options.max_lines);
+        transform_file(&config)?.ok_or_else(|| {
+            anyhow::anyhow!("Language detection failed and no --language specified")
+        })?
+    };
+
     // Count tokens if stats are needed
-    let (orig_tokens, trans_tokens) = if options.include_original {
+    let (orig_tokens, trans_tokens) = if options.compute_token_stats {
         match (
             tokens::count_tokens(&contents),
             tokens::count_tokens(&result),
@@ -545,17 +450,11 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
         );
     }
 
-    let original = if options.include_original {
-        Some(contents)
-    } else {
-        None
-    };
-    Ok(ProcessResult::new(
-        result,
-        original,
-        orig_tokens,
-        trans_tokens,
-    ))
+    Ok(ProcessResult {
+        output: result,
+        original_tokens: orig_tokens,
+        transformed_tokens: trans_tokens,
+    })
 }
 
 /// Options for multi-file processing
@@ -585,15 +484,14 @@ fn process_files(
     }
 
     // Create process options
-    let include_original = options.show_stats || options.token_budget.is_some();
-    let process_options = ProcessOptions::new(
-        options.mode,
-        options.explicit_lang,
-        options.use_cache,
-        include_original,
-        options.max_lines,
-        options.token_budget,
-    );
+    let process_options = ProcessOptions {
+        mode: options.mode,
+        explicit_lang: options.explicit_lang,
+        use_cache: options.use_cache,
+        compute_token_stats: options.show_stats || options.token_budget.is_some(),
+        max_lines: options.max_lines,
+        token_budget: options.token_budget,
+    };
 
     // Configure rayon thread pool if jobs specified
     let results: Vec<_> = if let Some(num_jobs) = options.jobs {
@@ -866,7 +764,9 @@ fn main() -> anyhow::Result<()> {
         // Transform: use cascade when token budget is set, otherwise single-mode
         let result = if let Some(budget) = token_budget {
             let (output, _mode_used) =
-                cascade_for_token_budget_stdin(&buffer, language, mode, max_lines, budget)?;
+                cascade_for_token_budget(mode, max_lines, budget, language, |config| {
+                    Ok(Some(transform_with_config(&buffer, language, config)?))
+                })?;
             output
         } else {
             let config = build_config(mode, max_lines);
@@ -918,15 +818,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Handle single file
-    let include_original = args.show_stats || token_budget.is_some();
-    let options = ProcessOptions::new(
+    let options = ProcessOptions {
         mode,
         explicit_lang,
         use_cache,
-        include_original,
+        compute_token_stats: args.show_stats || token_budget.is_some(),
         max_lines,
         token_budget,
-    );
+    };
     let process_result = process_file(&path, options)?;
 
     // Output transformed result
