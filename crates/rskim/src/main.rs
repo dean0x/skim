@@ -980,11 +980,9 @@ mod tests {
             cascade_for_token_budget(Mode::Structure, None, 100, Language::TypeScript, transform);
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("no transformation mode produced output"),
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no transformation mode produced output"),);
     }
 }

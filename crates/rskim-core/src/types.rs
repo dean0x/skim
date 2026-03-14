@@ -313,7 +313,12 @@ impl Mode {
                 Self::Signatures,
                 Self::Types,
             ],
-            Self::Minimal => &[Self::Minimal, Self::Structure, Self::Signatures, Self::Types],
+            Self::Minimal => &[
+                Self::Minimal,
+                Self::Structure,
+                Self::Signatures,
+                Self::Types,
+            ],
             Self::Structure => &[Self::Structure, Self::Signatures, Self::Types],
             Self::Signatures => &[Self::Signatures, Self::Types],
             Self::Types => &[Self::Types],
