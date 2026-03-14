@@ -1060,8 +1060,7 @@ mod tests {
     #[test]
     fn test_token_budget_python_marker_syntax() {
         let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
-        let result =
-            truncate_to_token_budget(text, Language::Python, 5, word_count, None).unwrap();
+        let result = truncate_to_token_budget(text, Language::Python, 5, word_count, None).unwrap();
         if result.contains("truncated") {
             assert!(
                 result.contains("# ..."),
@@ -1150,7 +1149,7 @@ mod tests {
     #[test]
     fn test_token_budget_known_count_returns_early_when_within_budget() {
         let text = "line one\nline two\nline three\n";
-        let actual_count = word_count(text); // 6
+        let actual_count = word_count(text);
         // Track whether count_tokens was called on the full text via unwrap_or_else.
         // The debug_assert! also calls count_tokens(text) for validation, so we use
         // a call-count approach: fast-path should only invoke the counter once (from
