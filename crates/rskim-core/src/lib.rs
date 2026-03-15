@@ -37,9 +37,6 @@
 // Re-export core types for public API
 pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
-// Re-export token budget truncation for CLI crate
-pub use transform::truncate::truncate_to_token_budget;
-
 mod parser;
 mod transform;
 mod types;
@@ -232,10 +229,65 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 
     Ok(TransformResult {
         content,
-        original_tokens: None,    // TODO: Implement in Phase 3
-        transformed_tokens: None, // TODO: Implement in Phase 3
+        original_tokens: None, // Token counting is performed at the CLI layer (see rskim/src/tokens.rs)
+        transformed_tokens: None, // Token counting is performed at the CLI layer (see rskim/src/tokens.rs)
         duration_ms: Some(duration_ms),
     })
+}
+
+// ============================================================================
+// Token Budget Truncation
+// ============================================================================
+
+/// Truncate transformed output to fit within a token budget
+///
+/// Uses binary search to find the maximum number of lines that fit
+/// within the budget, then appends a language-appropriate omission marker.
+/// If the text already fits, it is returned unchanged.
+///
+/// # Arguments
+/// * `text` - Previously transformed output to truncate
+/// * `language` - Language for comment syntax in omission markers
+/// * `token_budget` - Maximum number of tokens allowed
+/// * `count_tokens` - Closure that counts tokens in a string slice
+/// * `known_token_count` - Pre-computed token count of `text`, if available.
+///   When `Some(count)`, skips the initial full-text tokenization.
+///   Pass `None` when the count is unknown.
+///
+/// # Returns
+/// Text fitting within the token budget, with omission marker if truncated.
+/// If `token_budget` is 0 or smaller than the omission marker itself (~5-7
+/// tokens), an empty string is returned rather than violating the budget
+/// invariant. Note: the CLI validates `token_budget >= 1`, but library
+/// consumers should handle the zero-budget case or validate upstream.
+///
+/// # Examples
+///
+/// ```
+/// use rskim_core::{truncate_to_token_budget, Language};
+///
+/// let output = "line 1\nline 2\nline 3\nline 4\nline 5";
+/// let word_count = |s: &str| -> usize { s.split_whitespace().count() };
+/// let truncated = truncate_to_token_budget(output, Language::TypeScript, 5, word_count, None)?;
+/// # Ok::<(), rskim_core::SkimError>(())
+/// ```
+pub fn truncate_to_token_budget<F>(
+    text: &str,
+    language: Language,
+    token_budget: usize,
+    count_tokens: F,
+    known_token_count: Option<usize>,
+) -> Result<String>
+where
+    F: Fn(&str) -> usize,
+{
+    transform::truncate::truncate_to_token_budget(
+        text,
+        language,
+        token_budget,
+        count_tokens,
+        known_token_count,
+    )
 }
 
 // ============================================================================
