@@ -1815,13 +1815,17 @@ fn test_max_lines_omission_markers_present() {
 // Token Budget Truncation (public API wrapper)
 // ============================================================================
 
-/// Exercises the public `rskim_core::truncate_to_token_budget` wrapper to
-/// ensure the delegation to the internal implementation is not broken.
+// Exercises the public `rskim_core::truncate_to_token_budget` wrapper to
+// ensure the delegation to the internal implementation is not broken.
+
+fn count_words(s: &str) -> usize {
+    s.split_whitespace().count()
+}
+
 #[test]
 fn test_truncate_to_token_budget_public_api_no_truncation() {
     let text = "line one\nline two\nline three\n";
-    let word_count = |s: &str| -> usize { s.split_whitespace().count() };
-    let result = truncate_to_token_budget(text, Language::TypeScript, 100, word_count, None)
+    let result = truncate_to_token_budget(text, Language::TypeScript, 100, count_words, None)
         .expect("truncate_to_token_budget should succeed");
     assert_eq!(result, text, "Text within budget should be returned unchanged");
 }
@@ -1829,10 +1833,9 @@ fn test_truncate_to_token_budget_public_api_no_truncation() {
 #[test]
 fn test_truncate_to_token_budget_public_api_truncates_over_budget() {
     let text = "word1 word2\nword3 word4\nword5 word6\nword7 word8\n";
-    let word_count = |s: &str| -> usize { s.split_whitespace().count() };
-    let result = truncate_to_token_budget(text, Language::TypeScript, 6, word_count, None)
+    let result = truncate_to_token_budget(text, Language::TypeScript, 6, count_words, None)
         .expect("truncate_to_token_budget should succeed");
-    let token_count = word_count(&result);
+    let token_count = count_words(&result);
     assert!(
         token_count <= 6,
         "Output should have at most 6 word-tokens, got {}: {:?}",
