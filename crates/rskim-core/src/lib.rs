@@ -229,8 +229,8 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 
     Ok(TransformResult {
         content,
-        original_tokens: None,    // TODO: Implement in Phase 3
-        transformed_tokens: None, // TODO: Implement in Phase 3
+        original_tokens: None,    // Token counting is performed at the CLI layer (see rskim/src/tokens.rs)
+        transformed_tokens: None, // Token counting is performed at the CLI layer (see rskim/src/tokens.rs)
         duration_ms: Some(duration_ms),
     })
 }
@@ -256,8 +256,10 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 ///
 /// # Returns
 /// Text fitting within the token budget, with omission marker if truncated.
-/// If the budget is smaller than the omission marker itself (~5-7 tokens),
-/// an empty string is returned rather than violating the budget invariant.
+/// If `token_budget` is 0 or smaller than the omission marker itself (~5-7
+/// tokens), an empty string is returned rather than violating the budget
+/// invariant. Note: the CLI validates `token_budget >= 1`, but library
+/// consumers should handle the zero-budget case or validate upstream.
 ///
 /// # Examples
 ///
