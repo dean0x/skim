@@ -317,30 +317,10 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
 // Token budget truncation (dependency-injected token counting)
 // ============================================================================
 
-/// Truncate already-transformed text to fit within a token budget
+/// Internal implementation of token-budget truncation.
 ///
-/// Uses binary search to find the maximum number of lines that fit within
-/// the budget (including an omission marker). The token counting function
-/// is injected as a closure so the core library stays free of tiktoken.
-///
-/// # Arguments
-/// * `text` - The transformed output text to truncate
-/// * `language` - For language-appropriate omission marker syntax
-/// * `token_budget` - Maximum tokens allowed in the output
-/// * `count_tokens` - Closure that counts tokens in a string
-/// * `known_token_count` - Pre-computed token count of `text`, if available.
-///   When `Some(count)`, skips the fast-path tokenization of the full text.
-///   Pass `None` when the count is unknown (the function will compute it).
-///
-/// # Returns
-/// Text that fits within the token budget, with an omission marker if truncated.
-///
-/// # Minimum effective budget
-/// The omission marker itself consumes approximately 5-7 tokens (e.g.,
-/// `// ... (3 lines truncated)`). If the budget is smaller than the marker
-/// size, an empty string is returned rather than emitting a marker that
-/// would violate the budget invariant.
-pub fn truncate_to_token_budget<F>(
+/// Public API surface is [`crate::truncate_to_token_budget`].
+pub(crate) fn truncate_to_token_budget<F>(
     text: &str,
     language: Language,
     token_budget: usize,
