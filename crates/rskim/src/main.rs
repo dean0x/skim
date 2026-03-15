@@ -262,6 +262,34 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a numeric CLI flag is within [1, max].
+///
+/// If `zero_hint` is non-empty, appends it to the zero-value error message.
+/// If empty (e.g. for `--jobs`), the zero-value message has no hint suffix.
+fn validate_bounded_arg(
+    value: Option<usize>,
+    flag_name: &str,
+    max: usize,
+    zero_hint: &str,
+    max_reason: &str,
+) -> anyhow::Result<()> {
+    if let Some(v) = value {
+        if v == 0 {
+            if zero_hint.is_empty() {
+                anyhow::bail!("{flag_name} must be at least 1");
+            } else {
+                anyhow::bail!("{flag_name} must be at least 1\n{zero_hint}");
+            }
+        }
+        if v > max {
+            anyhow::bail!(
+                "{flag_name} value too high: {v} (maximum: {max})\n{max_reason}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Cascade through transformation modes until output fits within token budget
 ///
 /// Tries each mode from `starting_mode` through increasingly aggressive modes.
@@ -694,57 +722,29 @@ fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow::Result<()
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Validate --jobs parameter to prevent resource exhaustion
-    if let Some(jobs) = args.jobs {
-        if jobs == 0 {
-            anyhow::bail!("--jobs must be at least 1");
-        }
-        if jobs > MAX_JOBS {
-            anyhow::bail!(
-                "--jobs value too high: {} (maximum: {})\n\
-                 Using too many threads can exhaust system resources.\n\
-                 Recommended: Use default (number of CPUs) or specify a moderate value.",
-                jobs,
-                MAX_JOBS
-            );
-        }
-    }
-
-    // Validate --max-lines parameter
-    if let Some(max_lines) = args.max_lines {
-        if max_lines == 0 {
-            anyhow::bail!(
-                "--max-lines must be at least 1\n\
-                 Use --max-lines 1 to get a single line of output."
-            );
-        }
-        if max_lines > MAX_MAX_LINES {
-            anyhow::bail!(
-                "--max-lines value too high: {} (maximum: {})\n\
-                 Files exceeding this limit should be processed without truncation.",
-                max_lines,
-                MAX_MAX_LINES
-            );
-        }
-    }
-
-    // Validate --tokens parameter
-    if let Some(token_budget) = args.tokens {
-        if token_budget == 0 {
-            anyhow::bail!(
-                "--tokens must be at least 1\n\
-                 Use --tokens 1 to get the minimum possible output."
-            );
-        }
-        if token_budget > MAX_TOKEN_BUDGET {
-            anyhow::bail!(
-                "--tokens value too high: {} (maximum: {})\n\
-                 This exceeds any reasonable LLM context window.",
-                token_budget,
-                MAX_TOKEN_BUDGET
-            );
-        }
-    }
+    // Validate numeric CLI flags
+    validate_bounded_arg(
+        args.jobs,
+        "--jobs",
+        MAX_JOBS,
+        "",
+        "Using too many threads can exhaust system resources.\n\
+         Recommended: Use default (number of CPUs) or specify a moderate value.",
+    )?;
+    validate_bounded_arg(
+        args.max_lines,
+        "--max-lines",
+        MAX_MAX_LINES,
+        "Use --max-lines 1 to get a single line of output.",
+        "Files exceeding this limit should be processed without truncation.",
+    )?;
+    validate_bounded_arg(
+        args.tokens,
+        "--tokens",
+        MAX_TOKEN_BUDGET,
+        "Use --tokens 1 to get the minimum possible output.",
+        "This exceeds any reasonable LLM context window.",
+    )?;
 
     // Handle clear-cache command
     if args.clear_cache {
