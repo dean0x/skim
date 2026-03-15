@@ -282,9 +282,7 @@ fn validate_bounded_arg(
             }
         }
         if v > max {
-            anyhow::bail!(
-                "{flag_name} value too high: {v} (maximum: {max})\n{max_reason}"
-            );
+            anyhow::bail!("{flag_name} value too high: {v} (maximum: {max})\n{max_reason}");
         }
     }
     Ok(())
@@ -443,12 +441,12 @@ fn read_and_validate(path: &Path) -> anyhow::Result<String> {
 /// Run transformation on file contents, using cascade or single-mode.
 ///
 /// Tries auto-detection first, falling back to `explicit_lang` if provided.
-/// Returns the transformed output string.
+/// Returns `(transformed_output, mode_used)`.
 fn run_transform(
     contents: &str,
     path: &Path,
     options: &ProcessOptions,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Mode)> {
     let explicit_lang = options.explicit_lang;
     let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
         match transform_auto_with_config(contents, path, config) {
@@ -465,18 +463,19 @@ fn run_transform(
             .or_else(|| rskim_core::detect_language_from_path(path))
             .unwrap_or(Language::TypeScript);
 
-        let (output, _mode_used) = cascade_for_token_budget(
+        cascade_for_token_budget(
             options.mode,
             options.max_lines,
             budget,
             language,
             transform_file,
-        )?;
-        Ok(output)
+        )
     } else {
         let config = build_config(options.mode, options.max_lines);
-        transform_file(&config)?
-            .ok_or_else(|| anyhow::anyhow!("Language detection failed and no --language specified"))
+        let output = transform_file(&config)?.ok_or_else(|| {
+            anyhow::anyhow!("Language detection failed and no --language specified")
+        })?;
+        Ok((output, options.mode))
     }
 }
 
@@ -489,7 +488,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 
     // Cache miss → read file, transform, count tokens, write cache
     let contents = read_and_validate(path)?;
-    let result = run_transform(&contents, path, &options)?;
+    let (result, mode_used) = run_transform(&contents, path, &options)?;
 
     let (orig_tokens, trans_tokens) = if options.show_stats {
         match (
@@ -504,6 +503,11 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     };
 
     if options.use_cache {
+        let effective_mode = if mode_used != options.mode {
+            Some(mode_used)
+        } else {
+            None
+        };
         let _ = cache::write_cache(
             path,
             options.mode,
@@ -512,6 +516,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
             trans_tokens,
             options.max_lines,
             options.token_budget,
+            effective_mode,
         );
     }
 

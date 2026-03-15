@@ -31,6 +31,9 @@ struct CacheEntry {
     /// Transformed token count (optional for backward compatibility)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transformed_tokens: Option<usize>,
+    /// Effective mode after cascade (only set when cascade selected a different mode)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effective_mode: Option<String>,
 }
 
 /// Get platform-specific cache directory (~/.cache/skim/ on Linux/macOS)
@@ -139,6 +142,7 @@ pub fn read_cache(
 }
 
 /// Write transformed output to cache
+#[allow(clippy::too_many_arguments)]
 pub fn write_cache(
     path: &Path,
     mode: Mode,
@@ -147,6 +151,7 @@ pub fn write_cache(
     transformed_tokens: Option<usize>,
     max_lines: Option<usize>,
     token_budget: Option<usize>,
+    effective_mode: Option<Mode>,
 ) -> Result<()> {
     // Get file metadata
     let metadata = fs::metadata(path)?;
@@ -166,6 +171,7 @@ pub fn write_cache(
         content: content.to_string(),
         original_tokens,
         transformed_tokens,
+        effective_mode: effective_mode.map(|m| format!("{:?}", m)),
     };
 
     // Write to cache file
@@ -269,6 +275,7 @@ mod tests {
             Some(50),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -309,6 +316,7 @@ mod tests {
             Some(80),
             None,
             token_budget,
+            None,
         )
         .unwrap();
 
@@ -345,7 +353,17 @@ mod tests {
         }
 
         // Write to cache
-        write_cache(&path, Mode::Structure, "cached v1", None, None, None, None).unwrap();
+        write_cache(
+            &path,
+            Mode::Structure,
+            "cached v1",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let (cached, _, _) = read_cache(&path, Mode::Structure, None, None).unwrap();
         assert_eq!(cached, "cached v1");
 
