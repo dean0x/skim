@@ -313,8 +313,10 @@ where
     let mut last_mode = starting_mode;
     let mut last_token_count: Option<usize> = None;
 
+    let mut config = build_config(starting_mode, max_lines);
+
     for &mode in cascade {
-        let config = build_config(mode, max_lines);
+        config.mode = mode;
 
         let Some(output) = transform_fn(&config)? else {
             continue;
