@@ -283,6 +283,7 @@ where
     let cascade = starting_mode.cascade_from_here();
     let mut last_output = String::new();
     let mut last_mode = starting_mode;
+    let mut last_token_count: Option<usize> = None;
 
     for &mode in cascade {
         let config = build_config(mode, max_lines);
@@ -310,6 +311,7 @@ where
 
         last_output = output;
         last_mode = mode;
+        last_token_count = Some(token_count);
     }
 
     // Guard: no mode produced output (defensive; transform_fn currently always
@@ -327,12 +329,18 @@ where
         last_mode.name(),
     );
 
-    let truncated = truncate_to_token_budget(&last_output, language, token_budget, |text| {
-        tokens::count_tokens(text).unwrap_or_else(|e| {
-            eprintln!("[skim] warning: token counting failed in truncation fallback: {e}");
-            usize::MAX
-        })
-    })?;
+    let truncated = truncate_to_token_budget(
+        &last_output,
+        language,
+        token_budget,
+        |text| {
+            tokens::count_tokens(text).unwrap_or_else(|e| {
+                eprintln!("[skim] warning: token counting failed in truncation fallback: {e}");
+                usize::MAX
+            })
+        },
+        last_token_count,
+    )?;
 
     Ok((truncated, last_mode))
 }
