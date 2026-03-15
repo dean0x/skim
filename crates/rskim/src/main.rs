@@ -192,7 +192,7 @@ fn build_config(mode: Mode, max_lines: Option<usize>) -> TransformConfig {
     config
 }
 
-/// Options for processing a file (reduces function parameters)
+/// Options for processing a single file
 #[derive(Debug, Clone, Copy)]
 struct ProcessOptions {
     /// Transformation mode
@@ -202,7 +202,7 @@ struct ProcessOptions {
     /// Whether to use cache
     use_cache: bool,
     /// Whether to compute token statistics (for --show-stats)
-    compute_token_stats: bool,
+    show_stats: bool,
     /// Maximum output lines (AST-aware truncation)
     max_lines: Option<usize>,
     /// Token budget for cascade mode
@@ -387,7 +387,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     // without reading file) and the recompute-stats branch.
     if let Some((content, orig_tokens, trans_tokens)) = cached_result {
         // Fast path: cache has token counts and stats aren't needed -- skip file I/O
-        if !options.compute_token_stats && orig_tokens.is_some() && trans_tokens.is_some() {
+        if !options.show_stats && orig_tokens.is_some() && trans_tokens.is_some() {
             return Ok(ProcessResult {
                 output: content,
                 original_tokens: orig_tokens,
@@ -409,7 +409,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 
         // When cache was written without --show-stats, tokens are None.
         // Compute them now if stats are requested.
-        let (orig_tokens, trans_tokens) = if options.compute_token_stats && orig_tokens.is_none() {
+        let (orig_tokens, trans_tokens) = if options.show_stats && orig_tokens.is_none() {
             match (
                 tokens::count_tokens(&contents),
                 tokens::count_tokens(&content),
@@ -477,7 +477,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     };
 
     // Count tokens if stats are needed
-    let (orig_tokens, trans_tokens) = if options.compute_token_stats {
+    let (orig_tokens, trans_tokens) = if options.show_stats {
         match (
             tokens::count_tokens(&contents),
             tokens::count_tokens(&result),
@@ -513,14 +513,9 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 /// Options for multi-file processing
 #[derive(Debug, Clone, Copy)]
 struct MultiFileOptions {
-    mode: Mode,
-    explicit_lang: Option<Language>,
+    process: ProcessOptions,
     no_header: bool,
     jobs: Option<usize>,
-    use_cache: bool,
-    show_stats: bool,
-    max_lines: Option<usize>,
-    token_budget: Option<usize>,
 }
 
 /// Process multiple files (with parallel processing)
@@ -536,15 +531,7 @@ fn process_files(
         anyhow::bail!("No files found: {}", source_description);
     }
 
-    // Create process options
-    let process_options = ProcessOptions {
-        mode: options.mode,
-        explicit_lang: options.explicit_lang,
-        use_cache: options.use_cache,
-        compute_token_stats: options.show_stats,
-        max_lines: options.max_lines,
-        token_budget: options.token_budget,
-    };
+    let process_options = options.process;
 
     // Configure rayon thread pool if jobs specified
     let results: Vec<_> = if let Some(num_jobs) = options.jobs {
@@ -589,7 +576,7 @@ fn process_files(
                 success_count += 1;
 
                 // Accumulate token counts if show_stats is enabled (use cached counts)
-                if options.show_stats {
+                if options.process.show_stats {
                     if let (Some(orig), Some(trans)) = (
                         process_result.original_tokens,
                         process_result.transformed_tokens,
@@ -620,7 +607,7 @@ fn process_files(
     }
 
     // Output token statistics if requested
-    if options.show_stats && total_original_tokens > 0 {
+    if options.process.show_stats && total_original_tokens > 0 {
         let suffix = format!(" across {} file(s)", success_count);
         report_token_stats(
             Some(total_original_tokens),
@@ -817,15 +804,19 @@ fn main() -> anyhow::Result<()> {
     // Check if input is a directory
     let path = PathBuf::from(&file);
 
-    let multi_options = MultiFileOptions {
+    let process_options = ProcessOptions {
         mode,
         explicit_lang,
-        no_header: args.no_header,
-        jobs: args.jobs,
         use_cache,
         show_stats: args.show_stats,
         max_lines,
         token_budget,
+    };
+
+    let multi_options = MultiFileOptions {
+        process: process_options,
+        no_header: args.no_header,
+        jobs: args.jobs,
     };
 
     if path.is_dir() {
@@ -838,15 +829,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Handle single file
-    let options = ProcessOptions {
-        mode,
-        explicit_lang,
-        use_cache,
-        compute_token_stats: args.show_stats,
-        max_lines,
-        token_budget,
-    };
-    let process_result = process_file(&path, options)?;
+    let process_result = process_file(&path, process_options)?;
 
     // Output transformed result
     let stdout = io::stdout();
