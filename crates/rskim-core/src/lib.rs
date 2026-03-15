@@ -229,7 +229,7 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 
     Ok(TransformResult {
         content,
-        original_tokens: None,    // Token counting is performed at the CLI layer (see rskim/src/tokens.rs)
+        original_tokens: None, // Token counting is performed at the CLI layer (see rskim/src/tokens.rs)
         transformed_tokens: None, // Token counting is performed at the CLI layer (see rskim/src/tokens.rs)
         duration_ms: Some(duration_ms),
     })

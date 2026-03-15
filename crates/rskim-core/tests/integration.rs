@@ -1827,7 +1827,10 @@ fn test_truncate_to_token_budget_public_api_no_truncation() {
     let text = "line one\nline two\nline three\n";
     let result = truncate_to_token_budget(text, Language::TypeScript, 100, count_words, None)
         .expect("truncate_to_token_budget should succeed");
-    assert_eq!(result, text, "Text within budget should be returned unchanged");
+    assert_eq!(
+        result, text,
+        "Text within budget should be returned unchanged"
+    );
 }
 
 #[test]
