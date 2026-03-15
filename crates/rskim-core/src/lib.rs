@@ -261,7 +261,7 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```
 /// use rskim_core::{truncate_to_token_budget, Language};
 ///
 /// let output = "line 1\nline 2\nline 3\nline 4\nline 5";

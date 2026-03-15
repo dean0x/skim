@@ -6,7 +6,8 @@
 #![allow(clippy::expect_used)] // Expect is acceptable in tests
 
 use rskim_core::{
-    transform, transform_auto, transform_with_config, Language, Mode, TransformConfig,
+    transform, transform_auto, transform_with_config, truncate_to_token_budget, Language, Mode,
+    TransformConfig,
 };
 use std::path::Path;
 
@@ -1806,6 +1807,41 @@ fn test_max_lines_omission_markers_present() {
     assert!(
         result.contains("// ... (truncated)"),
         "Should contain TypeScript omission markers: {:?}",
+        result,
+    );
+}
+
+// ============================================================================
+// Token Budget Truncation (public API wrapper)
+// ============================================================================
+
+/// Exercises the public `rskim_core::truncate_to_token_budget` wrapper to
+/// ensure the delegation to the internal implementation is not broken.
+#[test]
+fn test_truncate_to_token_budget_public_api_no_truncation() {
+    let text = "line one\nline two\nline three\n";
+    let word_count = |s: &str| -> usize { s.split_whitespace().count() };
+    let result = truncate_to_token_budget(text, Language::TypeScript, 100, word_count, None)
+        .expect("truncate_to_token_budget should succeed");
+    assert_eq!(result, text, "Text within budget should be returned unchanged");
+}
+
+#[test]
+fn test_truncate_to_token_budget_public_api_truncates_over_budget() {
+    let text = "word1 word2\nword3 word4\nword5 word6\nword7 word8\n";
+    let word_count = |s: &str| -> usize { s.split_whitespace().count() };
+    let result = truncate_to_token_budget(text, Language::TypeScript, 6, word_count, None)
+        .expect("truncate_to_token_budget should succeed");
+    let token_count = word_count(&result);
+    assert!(
+        token_count <= 6,
+        "Output should have at most 6 word-tokens, got {}: {:?}",
+        token_count,
+        result,
+    );
+    assert!(
+        result.contains("truncated"),
+        "Truncated output should contain omission marker: {:?}",
         result,
     );
 }
