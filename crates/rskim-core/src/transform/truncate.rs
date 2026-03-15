@@ -340,7 +340,7 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
 /// `// ... (3 lines truncated)`). If the budget is smaller than the marker
 /// size, an empty string is returned rather than emitting a marker that
 /// would violate the budget invariant.
-pub fn truncate_to_token_budget<F>(
+pub(crate) fn truncate_to_token_budget<F>(
     text: &str,
     language: Language,
     token_budget: usize,
