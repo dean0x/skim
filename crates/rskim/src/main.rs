@@ -373,63 +373,60 @@ where
     Ok((truncated, last_mode))
 }
 
-/// Process a single file and return transformed content with optional token statistics
-fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
-    // Try to read from cache if enabled
-    let cached_result = if options.use_cache {
+/// Try to return a result from cache, handling token recount when needed.
+///
+/// Returns `Some(ProcessResult)` on cache hit (fast-path or recomputed stats),
+/// `None` on cache miss. The caller only reads the file on cache miss.
+fn try_cached_result(
+    path: &Path,
+    options: &ProcessOptions,
+) -> anyhow::Result<Option<ProcessResult>> {
+    if !options.use_cache {
+        return Ok(None);
+    }
+
+    let Some((content, orig_tokens, trans_tokens)) =
         cache::read_cache(path, options.mode, options.max_lines, options.token_budget)
-    } else {
-        None
+    else {
+        return Ok(None);
     };
 
-    // Handle cached result: consumes the Option in a single match to avoid
-    // cloning the cached content String. Covers both the fast-path (return
-    // without reading file) and the recompute-stats branch.
-    if let Some((content, orig_tokens, trans_tokens)) = cached_result {
-        // Fast path: cache has token counts and stats aren't needed -- skip file I/O
-        if !options.show_stats && orig_tokens.is_some() && trans_tokens.is_some() {
-            return Ok(ProcessResult {
-                output: content,
-                original_tokens: orig_tokens,
-                transformed_tokens: trans_tokens,
-            });
-        }
-
-        // Need to read the file for token counting of the original source
-        let contents = fs::read_to_string(path)?;
-
-        if contents.len() > MAX_INPUT_SIZE {
-            anyhow::bail!(
-                "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
-                contents.len(),
-                MAX_INPUT_SIZE,
-                MAX_INPUT_SIZE / 1024 / 1024
-            );
-        }
-
-        // When cache was written without --show-stats, tokens are None.
-        // Compute them now if stats are requested.
-        let (orig_tokens, trans_tokens) = if options.show_stats && orig_tokens.is_none() {
-            match (
-                tokens::count_tokens(&contents),
-                tokens::count_tokens(&content),
-            ) {
-                (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
-                _ => (None, None),
-            }
-        } else {
-            (orig_tokens, trans_tokens)
-        };
-        return Ok(ProcessResult {
+    // Fast path: cache has token counts and stats aren't needed — skip file I/O
+    if !options.show_stats && orig_tokens.is_some() && trans_tokens.is_some() {
+        return Ok(Some(ProcessResult {
             output: content,
             original_tokens: orig_tokens,
             transformed_tokens: trans_tokens,
-        });
+        }));
     }
 
-    // No cache hit -- read the file for transformation
-    let contents = fs::read_to_string(path)?;
+    // Need to read the file for token counting of the original source
+    let contents = read_and_validate(path)?;
 
+    // When cache was written without --show-stats, tokens are None.
+    // Compute them now if stats are requested.
+    let (orig_tokens, trans_tokens) = if options.show_stats && orig_tokens.is_none() {
+        match (
+            tokens::count_tokens(&contents),
+            tokens::count_tokens(&content),
+        ) {
+            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+            _ => (None, None),
+        }
+    } else {
+        (orig_tokens, trans_tokens)
+    };
+
+    Ok(Some(ProcessResult {
+        output: content,
+        original_tokens: orig_tokens,
+        transformed_tokens: trans_tokens,
+    }))
+}
+
+/// Read a file and validate it doesn't exceed the maximum input size.
+fn read_and_validate(path: &Path) -> anyhow::Result<String> {
+    let contents = fs::read_to_string(path)?;
     if contents.len() > MAX_INPUT_SIZE {
         anyhow::bail!(
             "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
@@ -438,25 +435,30 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
             MAX_INPUT_SIZE / 1024 / 1024
         );
     }
+    Ok(contents)
+}
 
-    // ARCHITECTURE: Transform closure tries auto-detection first, explicit_lang as fallback.
-    // This allows mixed-language directories while still supporting edge cases like .inc files.
-    // Returns None when auto-detection fails and no explicit language is provided.
+/// Run transformation on file contents, using cascade or single-mode.
+///
+/// Tries auto-detection first, falling back to `explicit_lang` if provided.
+/// Returns the transformed output string.
+fn run_transform(
+    contents: &str,
+    path: &Path,
+    options: &ProcessOptions,
+) -> anyhow::Result<String> {
     let explicit_lang = options.explicit_lang;
     let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
-        match transform_auto_with_config(&contents, path, config) {
+        match transform_auto_with_config(contents, path, config) {
             Ok(output) => Ok(Some(output)),
             Err(e) => match explicit_lang {
-                Some(language) => Ok(Some(transform_with_config(&contents, language, config)?)),
+                Some(language) => Ok(Some(transform_with_config(contents, language, config)?)),
                 None => Err(e.into()),
             },
         }
     };
 
-    // When token_budget is set, use cascade; otherwise single-mode transform
-    let result = if let Some(budget) = options.token_budget {
-        // Language for omission marker comment syntax in truncation fallback.
-        // Falls back to TypeScript (//) which is valid for most supported languages.
+    if let Some(budget) = options.token_budget {
         let language = explicit_lang
             .or_else(|| rskim_core::detect_language_from_path(path))
             .unwrap_or(Language::TypeScript);
@@ -468,15 +470,25 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
             language,
             transform_file,
         )?;
-        output
+        Ok(output)
     } else {
         let config = build_config(options.mode, options.max_lines);
-        transform_file(&config)?.ok_or_else(|| {
-            anyhow::anyhow!("Language detection failed and no --language specified")
-        })?
-    };
+        transform_file(&config)?
+            .ok_or_else(|| anyhow::anyhow!("Language detection failed and no --language specified"))
+    }
+}
 
-    // Count tokens if stats are needed
+/// Process a single file and return transformed content with optional token statistics
+fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
+    // Cache hit → return early (fast-path or recomputed stats)
+    if let Some(result) = try_cached_result(path, &options)? {
+        return Ok(result);
+    }
+
+    // Cache miss → read file, transform, count tokens, write cache
+    let contents = read_and_validate(path)?;
+    let result = run_transform(&contents, path, &options)?;
+
     let (orig_tokens, trans_tokens) = if options.show_stats {
         match (
             tokens::count_tokens(&contents),
@@ -489,9 +501,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
         (None, None)
     };
 
-    // Write to cache if enabled
     if options.use_cache {
-        // Ignore cache write errors (don't fail transformation if caching fails)
         let _ = cache::write_cache(
             path,
             options.mode,
@@ -706,10 +716,8 @@ fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow::Result<()
     process_files(paths, &format!("directory '{}'", dir.display()), options)
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    // Validate numeric CLI flags
+/// Validate all numeric CLI flags (--jobs, --max-lines, --tokens)
+fn validate_args(args: &Args) -> anyhow::Result<()> {
     validate_bounded_arg(
         args.jobs,
         "--jobs",
@@ -732,6 +740,12 @@ fn main() -> anyhow::Result<()> {
         "Use --tokens 1 to get the minimum possible output.",
         "This exceeds any reasonable LLM context window.",
     )?;
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    validate_args(&args)?;
 
     // Handle clear-cache command
     if args.clear_cache {
