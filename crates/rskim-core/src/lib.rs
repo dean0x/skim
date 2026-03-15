@@ -258,8 +258,8 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 /// Text fitting within the token budget, with omission marker if truncated.
 /// If `token_budget` is 0 or smaller than the omission marker itself (~5-7
 /// tokens), an empty string is returned rather than violating the budget
-/// invariant. Note: the CLI validates `token_budget >= 1`, but library
-/// consumers should handle the zero-budget case or validate upstream.
+/// invariant. Callers should validate the budget upstream or handle the
+/// empty-string edge case.
 ///
 /// # Examples
 ///
