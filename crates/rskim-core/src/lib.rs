@@ -256,6 +256,8 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 ///
 /// # Returns
 /// Text fitting within the token budget, with omission marker if truncated.
+/// If the budget is smaller than the omission marker itself (~5-7 tokens),
+/// an empty string is returned rather than violating the budget invariant.
 ///
 /// # Examples
 ///
@@ -278,7 +280,11 @@ where
     F: Fn(&str) -> usize,
 {
     transform::truncate::truncate_to_token_budget(
-        text, language, token_budget, count_tokens, known_token_count,
+        text,
+        language,
+        token_budget,
+        count_tokens,
+        known_token_count,
     )
 }
 
