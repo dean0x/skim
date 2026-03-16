@@ -55,8 +55,8 @@ cargo test --all-features -- --nocapture
 cargo test test_typescript_structure
 ```
 
-**Test count:** 186 tests covering:
-- Language parsing (TypeScript, JavaScript, Python, Rust, Go, Java, Markdown, JSON, YAML)
+**Test count:** 400 tests covering:
+- Language parsing (TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML)
 - Transformation modes (structure, signatures, types, full)
 - CLI features (stdin, multi-file, glob, directory, caching)
 - Error handling (invalid files, unsupported languages, etc.)

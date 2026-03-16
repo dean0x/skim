@@ -242,6 +242,105 @@ public class UserService {
 }
 ```
 
+## C
+
+### Functions and Structs
+
+**Input:**
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+Point* create_point(int x, int y) {
+    Point* p = malloc(sizeof(Point));
+    p->x = x;
+    p->y = y;
+    return p;
+}
+
+void print_point(const Point* p) {
+    printf("(%d, %d)\n", p->x, p->y);
+}
+```
+
+**Output (structure mode):**
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+Point* create_point(int x, int y) { /* ... */ }
+
+void print_point(const Point* p) { /* ... */ }
+```
+
+## C++
+
+### Class with Templates
+
+**Input:**
+```cpp
+#include <vector>
+#include <string>
+
+template<typename T>
+class Container {
+public:
+    void add(const T& item) {
+        items_.push_back(item);
+    }
+
+    T get(size_t index) const {
+        return items_.at(index);
+    }
+
+    size_t size() const {
+        return items_.size();
+    }
+
+private:
+    std::vector<T> items_;
+};
+
+namespace utils {
+    std::string format_name(const std::string& first, const std::string& last) {
+        return first + " " + last;
+    }
+}
+```
+
+**Output (structure mode):**
+```cpp
+#include <vector>
+#include <string>
+
+template<typename T>
+class Container {
+public:
+    void add(const T& item) { /* ... */ }
+
+    T get(size_t index) const { /* ... */ }
+
+    size_t size() const { /* ... */ }
+
+private:
+    std::vector<T> items_;
+};
+
+namespace utils {
+    std::string format_name(const std::string& first, const std::string& last) { /* ... */ }
+}
+```
+
 ## Markdown
 
 ### Header Extraction
@@ -559,6 +658,82 @@ skim config.yaml --mode=full        # same as structure
 ```
 
 This is because YAML is data, not code, so there are no "signatures" or "types" to extract - only structure.
+
+## TOML
+
+TOML transformation extracts structure (keys and tables only) while stripping all values, similar to JSON and YAML. Useful for configuration files like `Cargo.toml`, `pyproject.toml`, etc.
+
+### Simple Config
+
+**Input:**
+```toml
+[package]
+name = "my-app"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0"
+tokio = { version = "1", features = ["full"] }
+```
+
+**Output:**
+```
+[package]
+name
+version
+edition
+
+[dependencies]
+serde
+tokio
+```
+
+### Nested Tables
+
+**Input:**
+```toml
+[workspace]
+members = ["crates/core", "crates/cli"]
+
+[workspace.metadata.dist]
+cargo-dist-version = "0.14.0"
+ci = ["github"]
+installers = ["shell", "npm"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+```
+
+**Output:**
+```
+[workspace]
+members
+
+[workspace.metadata.dist]
+cargo-dist-version
+ci
+installers
+
+[profile.release]
+lto
+codegen-units
+```
+
+### Mode Behavior
+
+TOML always uses structure extraction regardless of the `--mode` flag:
+
+```bash
+# All modes produce identical output for TOML
+skim config.toml                    # structure mode
+skim config.toml --mode=signatures  # same as structure
+skim config.toml --mode=types       # same as structure
+skim config.toml --mode=full        # same as structure
+```
+
+This is because TOML is data, not code, so there are no "signatures" or "types" to extract - only structure.
 
 ## Complex Examples
 

@@ -144,6 +144,45 @@ Error: YAML key count exceeded: 10001 (max: 10000). Possible malicious input.
 
 **Rationale**: Processing YAML with millions of keys could exhaust memory. The 10,000 key limit matches the JSON limit, ensuring consistent protection across data formats.
 
+### Max TOML Nesting Depth
+
+**Limit**: 500 levels
+
+**Purpose**: Prevents stack overflow on deeply nested TOML tables
+
+**Example of protected input:**
+```toml
+[level1.level2.level3]
+# ... 500+ levels deep
+```
+
+**Error message:**
+```
+Error: TOML nesting depth exceeded: 501 (max: 500). Possible malicious input.
+```
+
+**Note**: The toml crate has a default recursion limit which provides primary protection. Our 500-level limit provides a secondary validation layer for consistency with JSON and YAML.
+
+### Max TOML Keys
+
+**Limit**: 10,000 keys per file
+
+**Purpose**: Prevents memory exhaustion from TOML with millions of keys
+
+**Example of protected input:**
+```toml
+key0 = "value"
+key1 = "value"
+# ... 10,000+ keys total across all tables
+```
+
+**Error message:**
+```
+Error: TOML key count exceeded: 10001 (max: 10000). Possible malicious input.
+```
+
+**Rationale**: Processing TOML with millions of keys could exhaust memory. The 10,000 key limit matches the JSON and YAML limits, ensuring consistent protection across data formats.
+
 ### UTF-8 Validation
 
 **Protection**: Safe handling of multi-byte Unicode characters

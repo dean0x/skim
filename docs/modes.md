@@ -295,6 +295,16 @@ Need structure + signatures? → Use Structure mode (default)
 - Signatures: Keeps only function signatures from impls
 - Types: Keeps struct fields, enum variants, type aliases
 
+**For C:**
+- Structure: Keeps function signatures, struct/union definitions, typedefs, includes
+- Signatures: Keeps only function declarations/prototypes
+- Types: Keeps struct/union/enum definitions, typedefs
+
+**For C++:**
+- Structure: Keeps class declarations, method signatures, templates, namespaces
+- Signatures: Keeps only function/method signatures
+- Types: Keeps class declarations, struct definitions, template parameters
+
 ## Supported Languages
 
 | Language   | Status | Extensions         | Notes                    |
@@ -305,9 +315,12 @@ Need structure + signatures? → Use Structure mode (default)
 | Rust       | ✅     | `.rs`              | Up-to-date grammar       |
 | Go         | ✅     | `.go`              | Stable                   |
 | Java       | ✅     | `.java`            | Good coverage            |
+| C          | ✅     | `.c`, `.h`         | Full C11 support         |
+| C++        | ✅     | `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` | C++20 support |
 | Markdown   | ✅     | `.md`, `.markdown` | Header extraction        |
 | JSON       | ✅     | `.json`            | Structure extraction     |
 | YAML       | ✅     | `.yaml`, `.yml`    | Structure extraction     |
+| TOML       | ✅     | `.toml`            | Structure extraction     |
 
 ### Language-Specific Notes
 
@@ -331,6 +344,25 @@ Need structure + signatures? → Use Structure mode (default)
 - Example: `name: John` → `name`
 - Security limits: MAX_YAML_DEPTH=500, MAX_YAML_KEYS=10,000
 - Note: Anchors and aliases are resolved by the parser (not preserved)
+
+**C:**
+- Structure: Keeps function signatures, struct/union/enum definitions, typedefs, includes
+- Signatures: Keeps only function declarations/prototypes
+- Types: Keeps struct/union/enum definitions, typedefs
+- Preprocessor directives (#include, #define) preserved in structure mode
+
+**C++:**
+- Structure: Keeps class declarations, method signatures, templates, namespaces
+- Signatures: Keeps only function/method signatures
+- Types: Keeps class declarations, struct definitions, template parameters
+- Namespace blocks preserved with body stripping
+
+**TOML:**
+- All modes (structure/signatures/types/full) produce identical output
+- TOML is data, not code, so there are no "signatures" or "types" to extract
+- Extracts structure: keeps only keys and table names, strips all values
+- Example: `name = "my-app"` -> `name`
+- Security limits: MAX_TOML_DEPTH=500, MAX_TOML_KEYS=10,000
 
 ## Performance by Mode
 
