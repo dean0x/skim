@@ -506,16 +506,20 @@ fn test_json_edge_cases() {
 fn test_json_modes_identical() {
     let source = include_str!("../../../tests/fixtures/json/simple.json");
 
-    // All modes should produce same output for JSON (modes don't apply)
+    // Serde-based modes (Structure/Signatures/Types) all produce the same
+    // key-only structure extraction since there's no tree-sitter AST to
+    // differentiate modes.
     let structure = transform(source, Language::Json, Mode::Structure).unwrap();
     let signatures = transform(source, Language::Json, Mode::Signatures).unwrap();
     let types = transform(source, Language::Json, Mode::Types).unwrap();
-    let full = transform(source, Language::Json, Mode::Full).unwrap();
 
-    // NOTE: JSON ignores mode parameter, always does structure extraction
     assert_eq!(structure, signatures);
     assert_eq!(structure, types);
-    assert_eq!(structure, full);
+
+    // Full mode returns original source unchanged (documented contract)
+    let full = transform(source, Language::Json, Mode::Full).unwrap();
+    assert_eq!(full, source);
+    assert_ne!(full, structure, "Full mode should differ from structure extraction");
 }
 
 #[test]
@@ -778,16 +782,20 @@ fn test_yaml_anchors() {
 fn test_yaml_modes_identical() {
     let source = include_str!("../../../tests/fixtures/yaml/simple.yaml");
 
-    // All modes should produce same output for YAML (modes don't apply)
+    // Serde-based modes (Structure/Signatures/Types) all produce the same
+    // key-only structure extraction since there's no tree-sitter AST to
+    // differentiate modes.
     let structure = transform(source, Language::Yaml, Mode::Structure).unwrap();
     let signatures = transform(source, Language::Yaml, Mode::Signatures).unwrap();
     let types = transform(source, Language::Yaml, Mode::Types).unwrap();
-    let full = transform(source, Language::Yaml, Mode::Full).unwrap();
 
-    // NOTE: YAML ignores mode parameter, always does structure extraction
     assert_eq!(structure, signatures);
     assert_eq!(structure, types);
-    assert_eq!(structure, full);
+
+    // Full mode returns original source unchanged (documented contract)
+    let full = transform(source, Language::Yaml, Mode::Full).unwrap();
+    assert_eq!(full, source);
+    assert_ne!(full, structure, "Full mode should differ from structure extraction");
 }
 
 #[test]
@@ -2161,16 +2169,20 @@ fn test_toml_edge_cases() {
 fn test_toml_modes_identical() {
     let source = include_str!("../../../tests/fixtures/toml/simple.toml");
 
-    // TOML always performs key-only structure extraction regardless of mode
-    // (serde-based languages don't have tree-sitter AST to differentiate modes)
+    // TOML serde-based modes (Structure/Signatures/Types) all produce the same
+    // key-only structure extraction since there's no tree-sitter AST to
+    // differentiate modes.
     let structure = transform(source, Language::Toml, Mode::Structure).unwrap();
     let signatures = transform(source, Language::Toml, Mode::Signatures).unwrap();
     let types = transform(source, Language::Toml, Mode::Types).unwrap();
-    let full = transform(source, Language::Toml, Mode::Full).unwrap();
 
     assert_eq!(structure, signatures);
     assert_eq!(structure, types);
-    assert_eq!(structure, full);
+
+    // Full mode returns original source unchanged (documented contract)
+    let full = transform(source, Language::Toml, Mode::Full).unwrap();
+    assert_eq!(full, source);
+    assert_ne!(full, structure, "Full mode should differ from structure extraction");
 }
 
 #[test]

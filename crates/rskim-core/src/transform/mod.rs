@@ -2,13 +2,13 @@
 //!
 //! ARCHITECTURE: This module operates on tree-sitter Trees.
 //! Each mode has its own transformation strategy.
-//! JSON is handled separately without tree-sitter.
+//! JSON, YAML, and TOML are handled separately without tree-sitter (serde-based).
 
 pub(crate) mod json;
 pub(crate) mod minimal;
 pub(crate) mod signatures;
 pub(crate) mod structure;
-pub(crate) mod toml_transform;
+pub(crate) mod toml;
 pub(crate) mod truncate;
 pub(crate) mod types;
 pub(crate) mod utils;

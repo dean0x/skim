@@ -206,10 +206,17 @@ nested:
         .stdout
         .clone();
 
-    // All modes should produce identical output for YAML
+    // Serde-based modes (Structure/Signatures/Types) all produce the same
+    // key-only structure extraction for YAML
     assert_eq!(structure_output, signatures_output);
     assert_eq!(structure_output, types_output);
-    assert_eq!(structure_output, full_output);
+
+    // Full mode returns original source unchanged (documented contract)
+    assert_eq!(full_output, yaml_content.as_bytes());
+    assert_ne!(
+        full_output, structure_output,
+        "Full mode should differ from structure extraction"
+    );
 }
 
 // ============================================================================

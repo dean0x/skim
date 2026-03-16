@@ -108,6 +108,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "type_item" => ("type_item", 5),
         "type_alias_statement" => ("type_alias_statement", 5),
         "type_declaration" => ("type_declaration", 5),
+        "using_declaration" => ("using_declaration", 5),     // C++ using type aliases
+        "alias_declaration" => ("alias_declaration", 5),     // C++ `using Alias = Type;`
         "class_definition" => ("class_definition", 5), // Python: classes ARE the type system
         "atx_heading" => ("atx_heading", 5),
         "setext_heading" => ("setext_heading", 5),
@@ -261,6 +263,8 @@ mod tests {
             "type_item",
             "type_alias_statement",
             "type_declaration",
+            "using_declaration",
+            "alias_declaration",
             "class_definition",
             "atx_heading",
             "setext_heading",

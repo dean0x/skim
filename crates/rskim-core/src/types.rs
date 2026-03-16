@@ -56,6 +56,9 @@ impl Language {
             "md" | "markdown" => Some(Self::Markdown),
             "json" => Some(Self::Json),
             "yaml" | "yml" => Some(Self::Yaml),
+            // NOTE: .h files default to C, which is the more common case.
+            // C++ headers typically use .hpp/.hxx/.hh extensions.
+            // For .h files containing C++ code, use --language cpp to override.
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Self::Cpp),
             "toml" => Some(Self::Toml),
@@ -152,6 +155,14 @@ impl Language {
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
     pub(crate) fn transform_source(self, source: &str, config: &TransformConfig) -> Result<String> {
+        // Full mode: return original source unchanged (documented contract)
+        if config.mode == Mode::Full {
+            if let Some(max_lines) = config.max_lines {
+                return crate::transform::truncate::simple_line_truncate(source, self, max_lines);
+            }
+            return Ok(source.to_string());
+        }
+
         // Minimal mode passthrough for serde-based and Markdown languages
         if config.mode == Mode::Minimal && (self.is_serde_based() || self == Self::Markdown) {
             // Apply simple truncation for passthrough if max_lines is set
@@ -166,7 +177,7 @@ impl Language {
         let result = match self {
             Self::Json => crate::transform::json::transform_json(source)?,
             Self::Yaml => crate::transform::yaml::transform_yaml(source)?,
-            Self::Toml => crate::transform::toml_transform::transform_toml(source)?,
+            Self::Toml => crate::transform::toml::transform_toml(source)?,
             _ => {
                 let mut parser = Parser::new(self)?;
                 let tree = parser.parse(source)?;
