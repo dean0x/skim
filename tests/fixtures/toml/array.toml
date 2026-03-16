@@ -1,0 +1,24 @@
+tags = ["rust", "parser", "cli"]
+ports = [8080, 8443, 9090]
+
+[[users]]
+name = "Alice"
+email = "alice@example.com"
+role = "admin"
+
+[[users]]
+name = "Bob"
+email = "bob@example.com"
+role = "user"
+
+[[servers]]
+host = "web1.example.com"
+port = 80
+
+[servers.health]
+endpoint = "/health"
+interval = 30
+
+[[servers]]
+host = "web2.example.com"
+port = 443

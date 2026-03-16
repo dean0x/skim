@@ -194,7 +194,9 @@ fn find_class_body(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "class_body" | "declaration_list" | "block" => return Some(child),
+            "class_body" | "declaration_list" | "block" | "field_declaration_list" => {
+                return Some(child)
+            }
             _ => continue,
         }
     }
@@ -266,7 +268,22 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "",
             struct_def: "",
         }),
+        Language::C => Some(TypeNodeTypes {
+            type_alias: "type_definition",
+            interface: "",
+            enum_def: "enum_specifier",
+            class_decl: "",
+            struct_def: "struct_specifier",
+        }),
+        Language::Cpp => Some(TypeNodeTypes {
+            type_alias: "type_definition",
+            interface: "",
+            enum_def: "enum_specifier",
+            class_decl: "class_specifier",
+            struct_def: "struct_specifier",
+        }),
         Language::Json => None,
         Language::Yaml => None,
+        Language::Toml => None,
     }
 }

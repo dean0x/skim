@@ -8,6 +8,7 @@ pub(crate) mod json;
 pub(crate) mod minimal;
 pub(crate) mod signatures;
 pub(crate) mod structure;
+pub(crate) mod toml_transform;
 pub(crate) mod truncate;
 pub(crate) mod types;
 pub(crate) mod utils;

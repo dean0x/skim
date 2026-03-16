@@ -165,6 +165,10 @@ enum LanguageArg {
     Json,
     #[value(alias = "yml")]
     Yaml,
+    C,
+    #[value(alias = "c++", alias = "cxx")]
+    Cpp,
+    Toml,
 }
 
 impl From<LanguageArg> for Language {
@@ -179,6 +183,9 @@ impl From<LanguageArg> for Language {
             LanguageArg::Markdown => Language::Markdown,
             LanguageArg::Json => Language::Json,
             LanguageArg::Yaml => Language::Yaml,
+            LanguageArg::C => Language::C,
+            LanguageArg::Cpp => Language::Cpp,
+            LanguageArg::Toml => Language::Toml,
         }
     }
 }

@@ -53,12 +53,26 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
             interface: "",           // N/A for markdown
             type_alias: "",          // N/A for markdown
         }),
+        Language::C => Some(LanguageNodeTypes {
+            function: "function_definition",
+            class: "struct_specifier",
+            interface: "", // C has no interfaces
+            type_alias: "type_definition",
+        }),
+        Language::Cpp => Some(LanguageNodeTypes {
+            function: "function_definition",
+            class: "class_specifier",
+            interface: "", // C++ has no separate interface concept
+            type_alias: "type_definition",
+        }),
         // ARCHITECTURE: JSON uses serde_json parser, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
         Language::Json => None,
         // ARCHITECTURE: YAML uses serde_yaml parser, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
         Language::Yaml => None,
+        // ARCHITECTURE: TOML uses toml crate parser, not tree-sitter.
+        Language::Toml => None,
     }
 }
 

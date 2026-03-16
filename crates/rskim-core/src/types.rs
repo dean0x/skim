@@ -28,6 +28,9 @@ pub enum Language {
     Markdown,
     Json,
     Yaml,
+    C,
+    Cpp,
+    Toml,
 }
 
 impl Language {
@@ -53,6 +56,9 @@ impl Language {
             "md" | "markdown" => Some(Self::Markdown),
             "json" => Some(Self::Json),
             "yaml" | "yml" => Some(Self::Yaml),
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Self::Cpp),
+            "toml" => Some(Self::Toml),
             _ => None,
         }
     }
@@ -91,6 +97,9 @@ impl Language {
             Self::Markdown => "Markdown",
             Self::Json => "JSON",
             Self::Yaml => "YAML",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::Toml => "TOML",
         }
     }
 
@@ -117,13 +126,16 @@ impl Language {
             Self::Markdown => Some(tree_sitter_md::LANGUAGE.into()),
             Self::Json => None, // Uses serde_json, not tree-sitter
             Self::Yaml => None, // Uses serde_yaml_ng, not tree-sitter
+            Self::C => Some(tree_sitter_c::LANGUAGE.into()),
+            Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
+            Self::Toml => None, // Uses toml crate, not tree-sitter
         }
     }
 
-    /// Returns true for languages that use serde-based parsing (JSON, YAML)
+    /// Returns true for languages that use serde-based parsing (JSON, YAML, TOML)
     /// instead of tree-sitter. These languages passthrough in minimal mode.
     pub(crate) fn is_serde_based(self) -> bool {
-        matches!(self, Self::Json | Self::Yaml)
+        matches!(self, Self::Json | Self::Yaml | Self::Toml)
     }
 
     /// Transform source code for this language
@@ -153,6 +165,7 @@ impl Language {
         let result = match self {
             Self::Json => crate::transform::json::transform_json(source)?,
             Self::Yaml => crate::transform::yaml::transform_yaml(source)?,
+            Self::Toml => crate::transform::toml_transform::transform_toml(source)?,
             _ => {
                 let mut parser = Parser::new(self)?;
                 let tree = parser.parse(source)?;

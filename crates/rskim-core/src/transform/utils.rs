@@ -52,7 +52,8 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::TypeScript | Language::JavaScript => &["statement_block"],
         Language::Python | Language::Rust | Language::Go => &["block"],
         Language::Java => &["block", "constructor_body"],
-        Language::Markdown | Language::Json | Language::Yaml => &[],
+        Language::C | Language::Cpp => &["compound_statement"],
+        Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
 
@@ -178,11 +179,14 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::JavaScript
         | Language::Rust
         | Language::Go
-        | Language::Java => "//",
+        | Language::Java
+        | Language::C
+        | Language::Cpp => "//",
         Language::Python => "#",
         Language::Markdown => "<!--",
         Language::Json => "//", // JSON has no comments; // is JSONC-compatible
         Language::Yaml => "#",
+        Language::Toml => "#",
     }
 }
 

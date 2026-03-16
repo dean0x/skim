@@ -1851,3 +1851,434 @@ fn test_truncate_to_token_budget_public_api_truncates_over_budget() {
         result,
     );
 }
+
+// ============================================================================
+// C Tests
+// ============================================================================
+
+#[test]
+fn test_c_structure() {
+    let source = include_str!("../../../tests/fixtures/c/simple.c");
+    let result = transform(source, Language::C, Mode::Structure).unwrap();
+
+    // Should contain function signatures
+    assert!(result.contains("int add"));
+    assert!(result.contains("void greet"));
+
+    // Should NOT contain implementation
+    assert!(!result.contains("return a + b"));
+    assert!(result.contains("{ /* ... */ }"));
+}
+
+#[test]
+fn test_c_signatures() {
+    let source = include_str!("../../../tests/fixtures/c/simple.c");
+    let result = transform(source, Language::C, Mode::Signatures).unwrap();
+
+    // Should contain function signatures
+    assert!(result.contains("int add(int a, int b)"));
+    assert!(result.contains("void greet(const char* name)"));
+
+    // Should NOT contain function bodies
+    assert!(!result.contains("return a + b"));
+    assert!(!result.contains("printf"));
+}
+
+#[test]
+fn test_c_types() {
+    let source = include_str!("../../../tests/fixtures/c/types.c");
+    let result = transform(source, Language::C, Mode::Types).unwrap();
+
+    // Should contain type definitions
+    assert!(result.contains("struct Person"));
+    assert!(result.contains("enum Status"));
+    assert!(result.contains("typedef"));
+}
+
+#[test]
+fn test_c_full() {
+    let source = include_str!("../../../tests/fixtures/c/simple.c");
+    let result = transform(source, Language::C, Mode::Full).unwrap();
+
+    // Should be identical to input
+    assert_eq!(result, source);
+}
+
+#[test]
+fn test_c_minimal_strips_comments() {
+    let source = include_str!("../../../tests/fixtures/c/comments.c");
+    let result = transform(source, Language::C, Mode::Minimal).unwrap();
+
+    // Should strip standalone comments
+    assert!(
+        !result.contains("This is a standalone comment"),
+        "Standalone comments should be stripped"
+    );
+    assert!(
+        !result.contains("Block comment at module level"),
+        "Block comments at module level should be stripped"
+    );
+    assert!(
+        !result.contains("Regular comment between functions"),
+        "Regular comments should be stripped"
+    );
+
+    // Should keep all code
+    assert!(result.contains("int add(int a, int b)"));
+    assert!(result.contains("void greet(const char* name)"));
+
+    // Should keep body comments
+    assert!(result.contains("inside a function body"));
+}
+
+#[test]
+fn test_c_minimal_preserves_doxygen() {
+    let source = include_str!("../../../tests/fixtures/c/comments.c");
+    let result = transform(source, Language::C, Mode::Minimal).unwrap();
+
+    // Should preserve Doxygen /** comments
+    assert!(
+        result.contains("Adds two integers together"),
+        "Doxygen comments should be preserved"
+    );
+
+    // Should preserve /// doc comments
+    assert!(
+        result.contains("Doxygen single-line doc comment"),
+        "Doxygen /// comments should be preserved"
+    );
+}
+
+#[test]
+fn test_c_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/c/simple.c");
+
+    // .c extension
+    let result = transform_auto(source, Path::new("main.c"), Mode::Structure);
+    assert!(result.is_ok());
+    assert!(result.unwrap().contains("int add"));
+
+    // .h extension
+    let result = transform_auto(source, Path::new("main.h"), Mode::Structure);
+    assert!(result.is_ok());
+    assert!(result.unwrap().contains("int add"));
+}
+
+// ============================================================================
+// C++ Tests
+// ============================================================================
+
+#[test]
+fn test_cpp_structure() {
+    let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
+    let result = transform(source, Language::Cpp, Mode::Structure).unwrap();
+
+    // Should contain function signatures
+    assert!(result.contains("int add"));
+    assert!(result.contains("greet"));
+
+    // Should NOT contain implementation
+    assert!(!result.contains("return a + b"));
+    assert!(result.contains("{ /* ... */ }"));
+}
+
+#[test]
+fn test_cpp_signatures() {
+    let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
+    let result = transform(source, Language::Cpp, Mode::Signatures).unwrap();
+
+    // Should contain function signatures
+    assert!(result.contains("int add(int a, int b)"));
+    assert!(result.contains("greet"));
+
+    // Should NOT contain function bodies
+    assert!(!result.contains("return a + b"));
+}
+
+#[test]
+fn test_cpp_types() {
+    let source = include_str!("../../../tests/fixtures/cpp/types.cpp");
+    let result = transform(source, Language::Cpp, Mode::Types).unwrap();
+
+    // Should contain type definitions
+    assert!(result.contains("struct Point"));
+    assert!(result.contains("enum class Status"));
+    assert!(result.contains("class Animal"));
+}
+
+#[test]
+fn test_cpp_full() {
+    let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
+    let result = transform(source, Language::Cpp, Mode::Full).unwrap();
+
+    // Should be identical to input
+    assert_eq!(result, source);
+}
+
+#[test]
+fn test_cpp_minimal_strips_comments() {
+    let source = include_str!("../../../tests/fixtures/cpp/comments.cpp");
+    let result = transform(source, Language::Cpp, Mode::Minimal).unwrap();
+
+    // Should strip standalone comments
+    assert!(
+        !result.contains("This is a standalone comment"),
+        "Standalone comments should be stripped"
+    );
+    assert!(
+        !result.contains("Block comment at module level"),
+        "Block comments at module level should be stripped"
+    );
+    assert!(
+        !result.contains("Regular comment between declarations"),
+        "Regular comments should be stripped"
+    );
+
+    // Should keep all code
+    assert!(result.contains("class Calculator"));
+    assert!(result.contains("greet"));
+
+    // Should keep body comments
+    assert!(result.contains("body comment"));
+}
+
+#[test]
+fn test_cpp_minimal_preserves_doxygen() {
+    let source = include_str!("../../../tests/fixtures/cpp/comments.cpp");
+    let result = transform(source, Language::Cpp, Mode::Minimal).unwrap();
+
+    // Should preserve Doxygen /** comments
+    assert!(
+        result.contains("A simple calculator class"),
+        "Doxygen class comments should be preserved"
+    );
+
+    // Should preserve /// doc comments
+    assert!(
+        result.contains("Add a value"),
+        "Doxygen /// comments should be preserved"
+    );
+    assert!(
+        result.contains("Greet a person by name"),
+        "Doxygen /// comments should be preserved"
+    );
+}
+
+#[test]
+fn test_cpp_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
+
+    // .cpp extension
+    let result = transform_auto(source, Path::new("main.cpp"), Mode::Structure);
+    assert!(result.is_ok());
+
+    // .cc extension
+    let result = transform_auto(source, Path::new("main.cc"), Mode::Structure);
+    assert!(result.is_ok());
+
+    // .cxx extension
+    let result = transform_auto(source, Path::new("main.cxx"), Mode::Structure);
+    assert!(result.is_ok());
+
+    // .hpp extension
+    let result = transform_auto(source, Path::new("main.hpp"), Mode::Structure);
+    assert!(result.is_ok());
+
+    // .hxx extension
+    let result = transform_auto(source, Path::new("main.hxx"), Mode::Structure);
+    assert!(result.is_ok());
+
+    // .hh extension
+    let result = transform_auto(source, Path::new("main.hh"), Mode::Structure);
+    assert!(result.is_ok());
+}
+
+// ============================================================================
+// TOML Tests
+// ============================================================================
+
+#[test]
+fn test_toml_simple_structure() {
+    let source = include_str!("../../../tests/fixtures/toml/simple.toml");
+    let result = transform(source, Language::Toml, Mode::Structure).unwrap();
+
+    // Should contain keys
+    assert!(result.contains("name"));
+    assert!(result.contains("version"));
+    assert!(result.contains("description"));
+    assert!(result.contains("active"));
+
+    // Should NOT contain values
+    assert!(!result.contains("my-project"));
+    assert!(!result.contains("1.0.0"));
+    assert!(!result.contains("A sample project"));
+}
+
+#[test]
+fn test_toml_nested() {
+    let source = include_str!("../../../tests/fixtures/toml/nested.toml");
+    let result = transform(source, Language::Toml, Mode::Structure).unwrap();
+
+    // Should contain nested keys
+    assert!(result.contains("package"));
+    assert!(result.contains("server"));
+    assert!(result.contains("host"));
+    assert!(result.contains("port"));
+    assert!(result.contains("database"));
+    assert!(result.contains("url"));
+    assert!(result.contains("pool_size"));
+
+    // Should NOT contain values
+    assert!(!result.contains("rskim"));
+    assert!(!result.contains("localhost"));
+    assert!(!result.contains("8080"));
+    assert!(!result.contains("postgres://"));
+}
+
+#[test]
+fn test_toml_arrays() {
+    let source = include_str!("../../../tests/fixtures/toml/array.toml");
+    let result = transform(source, Language::Toml, Mode::Structure).unwrap();
+
+    // Should contain keys
+    assert!(result.contains("tags"));
+    assert!(result.contains("users"));
+    assert!(result.contains("servers"));
+
+    // Should NOT contain values
+    assert!(!result.contains("rust"));
+    assert!(!result.contains("Alice"));
+    assert!(!result.contains("Bob"));
+}
+
+#[test]
+fn test_toml_edge_cases() {
+    let source = include_str!("../../../tests/fixtures/toml/edge.toml");
+    let result = transform(source, Language::Toml, Mode::Structure).unwrap();
+
+    // Should contain section keys
+    assert!(result.contains("dates"));
+    assert!(result.contains("inline"));
+    assert!(result.contains("unicode"));
+    assert!(result.contains("deeply_nested"));
+    assert!(result.contains("multiline"));
+
+    // Should contain inline table keys
+    assert!(result.contains("point"));
+    assert!(result.contains("color"));
+}
+
+#[test]
+fn test_toml_modes_identical() {
+    let source = include_str!("../../../tests/fixtures/toml/simple.toml");
+
+    // All modes should produce same output for TOML (modes don't apply)
+    let structure = transform(source, Language::Toml, Mode::Structure).unwrap();
+    let signatures = transform(source, Language::Toml, Mode::Signatures).unwrap();
+    let types = transform(source, Language::Toml, Mode::Types).unwrap();
+    let full = transform(source, Language::Toml, Mode::Full).unwrap();
+
+    // NOTE: TOML ignores mode parameter, always does structure extraction
+    assert_eq!(structure, signatures);
+    assert_eq!(structure, types);
+    assert_eq!(structure, full);
+}
+
+#[test]
+fn test_toml_invalid() {
+    let source = "[invalid";
+    let result = transform(source, Language::Toml, Mode::Structure);
+
+    // Should return error for invalid TOML
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Invalid TOML"));
+}
+
+#[test]
+fn test_toml_minimal_passthrough() {
+    let source = include_str!("../../../tests/fixtures/toml/simple.toml");
+
+    // Minimal mode should passthrough TOML unchanged (like JSON/YAML)
+    let result = transform(source, Language::Toml, Mode::Minimal).unwrap();
+    assert_eq!(result, source);
+}
+
+#[test]
+fn test_toml_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/toml/simple.toml");
+    let path = Path::new("config.toml");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok());
+
+    let content = result.unwrap();
+    assert!(content.contains("name"));
+    assert!(!content.contains("my-project"));
+}
+
+#[test]
+fn test_toml_token_reduction() {
+    let source = include_str!("../../../tests/fixtures/toml/nested.toml");
+    let result = transform(source, Language::Toml, Mode::Structure).unwrap();
+
+    // TOML structure should be smaller than original
+    assert!(result.len() < source.len());
+}
+
+// ============================================================================
+// Language Detection Tests - C, C++, TOML
+// ============================================================================
+
+#[test]
+fn test_detect_c_extensions() {
+    use rskim_core::detect_language_from_path;
+
+    assert_eq!(
+        detect_language_from_path(Path::new("main.c")),
+        Some(Language::C)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.h")),
+        Some(Language::C)
+    );
+}
+
+#[test]
+fn test_detect_cpp_extensions() {
+    use rskim_core::detect_language_from_path;
+
+    assert_eq!(
+        detect_language_from_path(Path::new("main.cpp")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("main.cc")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("main.cxx")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.hpp")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.hxx")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.hh")),
+        Some(Language::Cpp)
+    );
+}
+
+#[test]
+fn test_detect_toml_extension() {
+    use rskim_core::detect_language_from_path;
+
+    assert_eq!(
+        detect_language_from_path(Path::new("Cargo.toml")),
+        Some(Language::Toml)
+    );
+}

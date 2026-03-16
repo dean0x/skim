@@ -120,8 +120,9 @@ fn is_comment_node(kind: &str, language: Language) -> bool {
             kind == "comment"
         }
         Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
-        // Markdown, JSON, YAML don't have comment nodes to strip
-        Language::Markdown | Language::Json | Language::Yaml => false,
+        Language::C | Language::Cpp => kind == "comment",
+        // Markdown, JSON, YAML, TOML don't have comment nodes to strip
+        Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
 }
 
@@ -165,8 +166,12 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
             // Javadoc comments start with /**
             text.starts_with("/**")
         }
-        // Markdown, JSON, YAML don't reach here
-        Language::Markdown | Language::Json | Language::Yaml => false,
+        Language::C | Language::Cpp => {
+            // Doxygen comments: /** or ///
+            text.starts_with("/**") || text.starts_with("///")
+        }
+        // Markdown, JSON, YAML, TOML don't reach here
+        Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
 }
 
