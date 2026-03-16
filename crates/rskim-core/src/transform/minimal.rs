@@ -116,11 +116,13 @@ fn is_shebang(node: Node, source: &str) -> bool {
 /// Check if a node kind represents a comment in the given language
 fn is_comment_node(kind: &str, language: Language) -> bool {
     match language {
-        Language::TypeScript | Language::JavaScript | Language::Python | Language::Go => {
-            kind == "comment"
-        }
+        Language::TypeScript
+        | Language::JavaScript
+        | Language::Python
+        | Language::Go
+        | Language::C
+        | Language::Cpp => kind == "comment",
         Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
-        Language::C | Language::Cpp => kind == "comment",
         // Markdown, JSON, YAML, TOML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }

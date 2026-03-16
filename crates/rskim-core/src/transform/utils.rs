@@ -340,7 +340,11 @@ mod tests {
         assert_eq!(get_comment_prefix(Language::Rust), "//");
         assert_eq!(get_comment_prefix(Language::Go), "//");
         assert_eq!(get_comment_prefix(Language::Java), "//");
+        assert_eq!(get_comment_prefix(Language::C), "//");
+        assert_eq!(get_comment_prefix(Language::Cpp), "//");
         assert_eq!(get_comment_prefix(Language::Python), "#");
+        assert_eq!(get_comment_prefix(Language::Yaml), "#");
+        assert_eq!(get_comment_prefix(Language::Toml), "#");
         assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
     }
 
@@ -348,6 +352,9 @@ mod tests {
     fn test_comment_suffix() {
         assert_eq!(get_comment_suffix(Language::TypeScript), "");
         assert_eq!(get_comment_suffix(Language::Python), "");
+        assert_eq!(get_comment_suffix(Language::C), "");
+        assert_eq!(get_comment_suffix(Language::Cpp), "");
+        assert_eq!(get_comment_suffix(Language::Toml), "");
         assert_eq!(get_comment_suffix(Language::Markdown), " -->");
     }
 }

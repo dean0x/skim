@@ -231,16 +231,10 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
             function: "atx_heading",
             method: "atx_heading",
         }),
-        Language::C => Some(SignatureNodeTypes {
+        Language::C | Language::Cpp => Some(SignatureNodeTypes {
             function: "function_definition",
             method: "function_definition",
         }),
-        Language::Cpp => Some(SignatureNodeTypes {
-            function: "function_definition",
-            method: "function_definition",
-        }),
-        Language::Json => None,
-        Language::Yaml => None,
-        Language::Toml => None,
+        Language::Json | Language::Yaml | Language::Toml => None,
     }
 }

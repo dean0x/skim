@@ -65,14 +65,9 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
             interface: "", // C++ has no separate interface concept
             type_alias: "type_definition",
         }),
-        // ARCHITECTURE: JSON uses serde_json parser, not tree-sitter.
+        // ARCHITECTURE: Serde-based languages use their own parsers, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
-        Language::Json => None,
-        // ARCHITECTURE: YAML uses serde_yaml parser, not tree-sitter.
-        // This is enforced by the Strategy Pattern in Language::transform_source().
-        Language::Yaml => None,
-        // ARCHITECTURE: TOML uses toml crate parser, not tree-sitter.
-        Language::Toml => None,
+        Language::Json | Language::Yaml | Language::Toml => None,
     }
 }
 

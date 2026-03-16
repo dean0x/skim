@@ -282,8 +282,6 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "class_specifier",
             struct_def: "struct_specifier",
         }),
-        Language::Json => None,
-        Language::Yaml => None,
-        Language::Toml => None,
+        Language::Json | Language::Yaml | Language::Toml => None,
     }
 }

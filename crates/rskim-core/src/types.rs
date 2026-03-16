@@ -143,8 +143,9 @@ impl Language {
     /// ARCHITECTURE: Encapsulates language-specific parsing strategy.
     /// - JSON: Uses serde_json parser
     /// - YAML: Uses serde_yaml_ng parser
-    /// - Markdown in minimal mode: Passthrough (no comments to strip)
-    /// - All others: Use tree-sitter parser
+    /// - TOML: Uses toml crate parser
+    /// - Serde-based + Markdown in minimal mode: Passthrough (no comments to strip)
+    /// - All others (C, C++, etc.): Use tree-sitter parser
     ///
     /// This eliminates special-case conditionals in the main transform function.
     ///

@@ -2068,29 +2068,18 @@ fn test_cpp_minimal_preserves_doxygen() {
 fn test_cpp_auto_detection() {
     let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
 
-    // .cpp extension
-    let result = transform_auto(source, Path::new("main.cpp"), Mode::Structure);
-    assert!(result.is_ok());
-
-    // .cc extension
-    let result = transform_auto(source, Path::new("main.cc"), Mode::Structure);
-    assert!(result.is_ok());
-
-    // .cxx extension
-    let result = transform_auto(source, Path::new("main.cxx"), Mode::Structure);
-    assert!(result.is_ok());
-
-    // .hpp extension
-    let result = transform_auto(source, Path::new("main.hpp"), Mode::Structure);
-    assert!(result.is_ok());
-
-    // .hxx extension
-    let result = transform_auto(source, Path::new("main.hxx"), Mode::Structure);
-    assert!(result.is_ok());
-
-    // .hh extension
-    let result = transform_auto(source, Path::new("main.hh"), Mode::Structure);
-    assert!(result.is_ok());
+    // All C++ extensions should detect as C++ and produce valid output
+    let extensions = [
+        "main.cpp", "main.cc", "main.cxx", "main.hpp", "main.hxx", "main.hh",
+    ];
+    for ext in extensions {
+        let result = transform_auto(source, Path::new(ext), Mode::Structure).unwrap();
+        assert!(
+            result.contains("int add"),
+            "Extension '{}' should produce valid C++ output",
+            ext
+        );
+    }
 }
 
 // ============================================================================
@@ -2172,13 +2161,13 @@ fn test_toml_edge_cases() {
 fn test_toml_modes_identical() {
     let source = include_str!("../../../tests/fixtures/toml/simple.toml");
 
-    // All modes should produce same output for TOML (modes don't apply)
+    // TOML always performs key-only structure extraction regardless of mode
+    // (serde-based languages don't have tree-sitter AST to differentiate modes)
     let structure = transform(source, Language::Toml, Mode::Structure).unwrap();
     let signatures = transform(source, Language::Toml, Mode::Signatures).unwrap();
     let types = transform(source, Language::Toml, Mode::Types).unwrap();
     let full = transform(source, Language::Toml, Mode::Full).unwrap();
 
-    // NOTE: TOML ignores mode parameter, always does structure extraction
     assert_eq!(structure, signatures);
     assert_eq!(structure, types);
     assert_eq!(structure, full);
