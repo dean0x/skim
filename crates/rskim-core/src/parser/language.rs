@@ -55,12 +55,8 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
         }),
         Language::C => Some(LanguageNodeTypes {
             function: "function_definition",
-            // C has no classes. struct_specifier serves as the closest equivalent
-            // for the parser's node type mapping. Note: the types.rs TypeNodeTypes
-            // correctly leaves class_decl empty since C structs are extracted via
-            // struct_def, not class_decl.
-            class: "struct_specifier",
-            interface: "", // C has no interfaces
+            class: "struct_specifier", // C has no classes; struct is closest equivalent
+            interface: "",             // C has no interfaces
             type_alias: "type_definition",
         }),
         Language::Cpp => Some(LanguageNodeTypes {

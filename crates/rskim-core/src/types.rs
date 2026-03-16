@@ -137,7 +137,7 @@ impl Language {
 
     /// Returns true for languages that use serde-based parsing (JSON, YAML, TOML)
     /// instead of tree-sitter. These languages passthrough in minimal mode.
-    pub(crate) fn is_serde_based(self) -> bool {
+    pub fn is_serde_based(self) -> bool {
         matches!(self, Self::Json | Self::Yaml | Self::Toml)
     }
 

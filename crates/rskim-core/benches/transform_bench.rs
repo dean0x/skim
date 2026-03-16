@@ -16,6 +16,9 @@ const SMALL_PY: &str = include_str!("../../../tests/fixtures/python/simple.py");
 const SMALL_RS: &str = include_str!("../../../tests/fixtures/rust/simple.rs");
 const SMALL_GO: &str = include_str!("../../../tests/fixtures/go/simple.go");
 const SMALL_JAVA: &str = include_str!("../../../tests/fixtures/java/Simple.java");
+const SMALL_C: &str = include_str!("../../../tests/fixtures/c/simple.c");
+const SMALL_CPP: &str = include_str!("../../../tests/fixtures/cpp/simple.cpp");
+const SMALL_TOML: &str = include_str!("../../../tests/fixtures/toml/simple.toml");
 
 // Medium complexity TypeScript
 const MEDIUM_TS: &str = include_str!("../../../tests/fixtures/typescript/types.ts");
@@ -26,7 +29,6 @@ fn generate_large_typescript(num_functions: usize) -> String {
     for i in 0..num_functions {
         result.push_str(&format!(
             "export function func{i}(a: number, b: number): number {{\n    return a + b;\n}}\n\n",
-            i = i
         ));
     }
     result
@@ -66,6 +68,21 @@ fn bench_structure_mode(c: &mut Criterion) {
     // Java
     group.bench_function("java_small", |b| {
         b.iter(|| transform(black_box(SMALL_JAVA), Language::Java, Mode::Structure).unwrap())
+    });
+
+    // C
+    group.bench_function("c_small", |b| {
+        b.iter(|| transform(black_box(SMALL_C), Language::C, Mode::Structure).unwrap())
+    });
+
+    // C++
+    group.bench_function("cpp_small", |b| {
+        b.iter(|| transform(black_box(SMALL_CPP), Language::Cpp, Mode::Structure).unwrap())
+    });
+
+    // TOML
+    group.bench_function("toml_small", |b| {
+        b.iter(|| transform(black_box(SMALL_TOML), Language::Toml, Mode::Structure).unwrap())
     });
 
     group.finish();
@@ -174,6 +191,9 @@ fn bench_language_comparison(c: &mut Criterion) {
         (Language::Rust, SMALL_RS),
         (Language::Go, SMALL_GO),
         (Language::Java, SMALL_JAVA),
+        (Language::C, SMALL_C),
+        (Language::Cpp, SMALL_CPP),
+        (Language::Toml, SMALL_TOML),
     ];
 
     for (lang, source) in languages {

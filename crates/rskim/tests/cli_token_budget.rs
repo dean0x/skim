@@ -535,3 +535,76 @@ fn test_tokens_with_rust_file() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+// ============================================================================
+// Serde-based language tests (S7 short-circuit)
+// ============================================================================
+
+#[test]
+fn test_tokens_with_toml_serde_language() {
+    // Serde-based languages (JSON, YAML, TOML) produce identical output
+    // for Structure/Signatures/Types modes. Verify --tokens works correctly.
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[server]\nhost = \"localhost\"\nport = 8080\n\n\
+         [database]\nurl = \"postgres://localhost/db\"\npool_size = 10\n\n\
+         [logging]\nlevel = \"info\"\nformat = \"json\"\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--tokens")
+        .arg("500")
+        .arg("--show-stats")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("tokens"),
+        "Should show token stats for TOML: {:?}",
+        stderr,
+    );
+
+    // Should NOT show cascade escalation (serde output is mode-independent)
+    assert!(
+        !stderr.contains("escalated"),
+        "TOML with generous budget should not cascade: {:?}",
+        stderr,
+    );
+}
+
+#[test]
+fn test_tokens_serde_tight_budget_truncates() {
+    // Verify serde language with very tight budget triggers truncation correctly
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[server]\nhost = \"localhost\"\nport = 8080\n\n\
+         [database]\nurl = \"postgres://localhost/db\"\npool_size = 10\n\n\
+         [logging]\nlevel = \"info\"\nformat = \"json\"\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--tokens")
+        .arg("5")
+        .arg("--show-stats")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "TOML with tight budget should succeed. stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

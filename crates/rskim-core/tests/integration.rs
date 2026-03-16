@@ -558,7 +558,10 @@ fn test_json_modes_identical() {
     // Full mode returns original source unchanged (documented contract)
     let full = transform(source, Language::Json, Mode::Full).unwrap();
     assert_eq!(full, source);
-    assert_ne!(full, structure, "Full mode should differ from structure extraction");
+    assert_ne!(
+        full, structure,
+        "Full mode should differ from structure extraction"
+    );
 }
 
 #[test]
@@ -834,7 +837,10 @@ fn test_yaml_modes_identical() {
     // Full mode returns original source unchanged (documented contract)
     let full = transform(source, Language::Yaml, Mode::Full).unwrap();
     assert_eq!(full, source);
-    assert_ne!(full, structure, "Full mode should differ from structure extraction");
+    assert_ne!(
+        full, structure,
+        "Full mode should differ from structure extraction"
+    );
 }
 
 #[test]
@@ -2173,11 +2179,11 @@ fn test_cpp_auto_detection() {
 fn test_c_malformed_syntax() {
     // tree-sitter is error-tolerant, should not crash on broken C code
     let sources = [
-        "int main( { { {",                    // Unclosed braces/parens
-        "struct Foo { int x",                  // Incomplete struct
-        "void func(int a, int",               // Incomplete parameter list
-        "#include <missing\nint broken(;",     // Incomplete include + bad declaration
-        "typedef struct {",                    // Incomplete typedef
+        "int main( { { {",                 // Unclosed braces/parens
+        "struct Foo { int x",              // Incomplete struct
+        "void func(int a, int",            // Incomplete parameter list
+        "#include <missing\nint broken(;", // Incomplete include + bad declaration
+        "typedef struct {",                // Incomplete typedef
     ];
     for source in sources {
         let result = transform(source, Language::C, Mode::Structure);
@@ -2194,11 +2200,11 @@ fn test_c_malformed_syntax() {
 fn test_cpp_malformed_syntax() {
     // tree-sitter is error-tolerant, should not crash on broken C++ code
     let sources = [
-        "class Foo { public:",                 // Incomplete class
-        "template<typename T",                 // Incomplete template
-        "namespace ns { struct S { int x",     // Unclosed namespace + struct
-        "void func() override {",              // Incomplete override function
-        "enum class Status { A, B,",           // Incomplete enum class
+        "class Foo { public:",             // Incomplete class
+        "template<typename T",             // Incomplete template
+        "namespace ns { struct S { int x", // Unclosed namespace + struct
+        "void func() override {",          // Incomplete override function
+        "enum class Status { A, B,",       // Incomplete enum class
     ];
     for source in sources {
         let result = transform(source, Language::Cpp, Mode::Structure);
@@ -2303,7 +2309,10 @@ fn test_toml_modes_identical() {
     // Full mode returns original source unchanged (documented contract)
     let full = transform(source, Language::Toml, Mode::Full).unwrap();
     assert_eq!(full, source);
-    assert_ne!(full, structure, "Full mode should differ from structure extraction");
+    assert_ne!(
+        full, structure,
+        "Full mode should differ from structure extraction"
+    );
 }
 
 #[test]

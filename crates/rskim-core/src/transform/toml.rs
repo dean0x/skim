@@ -142,7 +142,7 @@ fn format_array_value(arr: &[Value], depth: usize, key_count: &mut usize) -> Res
         return Ok(String::new()); // Empty array: just show key
     };
 
-    if let Value::Table(_) = first {
+    if first.is_table() {
         let structure = extract_structure(first, depth, key_count)?;
         if structure.is_empty() {
             Ok(String::new())
@@ -162,7 +162,7 @@ fn extract_array_structure(arr: &[Value], depth: usize, key_count: &mut usize) -
         return Ok("[]".to_string());
     };
 
-    if let Value::Table(_) = first {
+    if first.is_table() {
         extract_structure(first, depth, key_count)
     } else {
         Ok("[]".to_string())
