@@ -262,40 +262,40 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate a numeric CLI flag is within [1, max].
+/// Validate a numeric CLI flag is within `[1, max]`.
 ///
-/// If `zero_hint` is non-empty, appends it to the zero-value error message.
-/// If empty (e.g. for `--jobs`), the zero-value message has no hint suffix.
+/// `zero_hint` is appended to the zero-value error when present (e.g.
+/// "Use --max-lines 1 to get a single line of output."). Pass `None`
+/// for flags like `--jobs` where no extra guidance is needed.
 fn validate_bounded_arg(
     value: Option<usize>,
     flag_name: &str,
     max: usize,
-    zero_hint: &str,
+    zero_hint: Option<&str>,
     max_reason: &str,
 ) -> anyhow::Result<()> {
-    if let Some(v) = value {
-        if v == 0 {
-            if zero_hint.is_empty() {
-                anyhow::bail!("{flag_name} must be at least 1");
-            } else {
-                anyhow::bail!("{flag_name} must be at least 1\n{zero_hint}");
-            }
-        }
-        if v > max {
-            anyhow::bail!("{flag_name} value too high: {v} (maximum: {max})\n{max_reason}");
+    let Some(v) = value else {
+        return Ok(());
+    };
+
+    if v == 0 {
+        match zero_hint {
+            Some(hint) => anyhow::bail!("{flag_name} must be at least 1\n{hint}"),
+            None => anyhow::bail!("{flag_name} must be at least 1"),
         }
     }
+    if v > max {
+        anyhow::bail!("{flag_name} value too high: {v} (maximum: {max})\n{max_reason}");
+    }
+
     Ok(())
 }
 
-/// Cascade through transformation modes until output fits within token budget
+/// Cascade through transformation modes until output fits within `token_budget`.
 ///
 /// Tries each mode from `starting_mode` through increasingly aggressive modes.
 /// If no mode fits, applies line-based truncation as a final fallback.
 /// Diagnostics are emitted to stderr only when escalating beyond the starting mode.
-///
-/// The `transform_fn` closure abstracts over how transformation is performed,
-/// allowing the same cascade logic for both file-based and stdin-based inputs.
 fn cascade_for_token_budget<F>(
     starting_mode: Mode,
     max_lines: Option<usize>,
@@ -375,8 +375,9 @@ where
 
 /// Try to return a result from cache, handling token recount when needed.
 ///
-/// Returns `Some(ProcessResult)` on cache hit (fast-path or recomputed stats),
-/// `None` on cache miss. The caller only reads the file on cache miss.
+/// Returns `Some(ProcessResult)` on cache hit, `None` on cache miss.
+/// When stats are requested but the cached entry lacks token counts,
+/// the original file is read to compute them on the fly.
 fn try_cached_result(
     path: &Path,
     options: &ProcessOptions,
@@ -391,21 +392,11 @@ fn try_cached_result(
         return Ok(None);
     };
 
-    // Fast path: cache has token counts and stats aren't needed — skip file I/O
-    if !options.show_stats && orig_tokens.is_some() && trans_tokens.is_some() {
-        return Ok(Some(ProcessResult {
-            output: content,
-            original_tokens: orig_tokens,
-            transformed_tokens: trans_tokens,
-        }));
-    }
-
-    // Need to read the file for token counting of the original source
-    let contents = read_and_validate(path)?;
-
-    // When cache was written without --show-stats, tokens are None.
-    // Compute them now if stats are requested.
-    let (orig_tokens, trans_tokens) = if options.show_stats && orig_tokens.is_none() {
+    // If stats are requested but the cache entry was written without them,
+    // read the original file and count tokens for both source and output.
+    let needs_recount = options.show_stats && orig_tokens.is_none();
+    let (orig_tokens, trans_tokens) = if needs_recount {
+        let contents = read_and_validate(path)?;
         match (
             tokens::count_tokens(&contents),
             tokens::count_tokens(&content),
@@ -438,10 +429,8 @@ fn read_and_validate(path: &Path) -> anyhow::Result<String> {
     Ok(contents)
 }
 
-/// Run transformation on file contents, using cascade or single-mode.
-///
-/// Tries auto-detection first, falling back to `explicit_lang` if provided.
-/// Returns `(transformed_output, mode_used)`.
+/// Transform file contents, trying auto-detection first and falling back to
+/// `explicit_lang` when provided. Returns `(transformed_output, mode_used)`.
 fn run_transform(
     contents: &str,
     path: &Path,
@@ -481,12 +470,10 @@ fn run_transform(
 
 /// Process a single file and return transformed content with optional token statistics
 fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
-    // Cache hit → return early (fast-path or recomputed stats)
     if let Some(result) = try_cached_result(path, &options)? {
         return Ok(result);
     }
 
-    // Cache miss → read file, transform, count tokens, write cache
     let contents = read_and_validate(path)?;
     let (result, mode_used) = run_transform(&contents, path, &options)?;
 
@@ -503,11 +490,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
     };
 
     if options.use_cache {
-        let effective_mode = if mode_used != options.mode {
-            Some(mode_used)
-        } else {
-            None
-        };
+        let effective_mode = (mode_used != options.mode).then_some(mode_used);
         let _ = cache::write_cache(
             path,
             options.mode,
@@ -535,10 +518,10 @@ struct MultiFileOptions {
     jobs: Option<usize>,
 }
 
-/// Process multiple files (with parallel processing)
+/// Process multiple files with parallel processing via rayon.
 ///
-/// ARCHITECTURE: Generic file processor used by both glob and directory inputs.
-/// Handles parallel processing, error aggregation, and statistics.
+/// Used by both glob and directory inputs. Handles parallel execution,
+/// error aggregation, and accumulated token statistics.
 fn process_files(
     paths: Vec<PathBuf>,
     source_description: &str,
@@ -550,7 +533,6 @@ fn process_files(
 
     let process_options = options.process;
 
-    // Configure rayon thread pool if jobs specified
     let results: Vec<_> = if let Some(num_jobs) = options.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_jobs)
@@ -562,14 +544,12 @@ fn process_files(
                     .collect()
             })
     } else {
-        // Use default rayon thread pool (number of CPUs)
         paths
             .par_iter()
             .map(|path| (path, process_file(path, process_options)))
             .collect()
     };
 
-    // Write results to stdout (sequentially to maintain order)
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
 
@@ -581,10 +561,9 @@ fn process_files(
     for (idx, (path, result)) in results.iter().enumerate() {
         match result {
             Ok(process_result) => {
-                // Add file separator header (unless disabled)
                 if !options.no_header && paths.len() > 1 {
                     if idx > 0 {
-                        writeln!(writer)?; // Blank line between files
+                        writeln!(writer)?;
                     }
                     writeln!(writer, "// === {} ===", path.display())?;
                 }
@@ -592,7 +571,6 @@ fn process_files(
                 write!(writer, "{}", process_result.output)?;
                 success_count += 1;
 
-                // Accumulate token counts if show_stats is enabled (use cached counts)
                 if options.process.show_stats {
                     if let (Some(orig), Some(trans)) = (
                         process_result.original_tokens,
@@ -623,7 +601,6 @@ fn process_files(
         );
     }
 
-    // Output token statistics if requested
     if options.process.show_stats && total_original_tokens > 0 {
         let suffix = format!(" across {} file(s)", success_count);
         report_token_stats(
@@ -636,28 +613,23 @@ fn process_files(
     Ok(())
 }
 
-/// Process multiple files matched by glob pattern (with parallel processing)
+/// Process multiple files matched by glob pattern
 fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::Result<()> {
-    // Validate glob pattern for security
     validate_glob_pattern(pattern)?;
 
     let paths: Vec<_> = glob(pattern)?
         .filter_map(|entry| entry.ok())
         .filter(|p| {
-            // Only process regular files, not directories
             if !p.is_file() {
                 return false;
             }
-
-            // Security: Reject symlinks to prevent access to sensitive files
-            // A malicious user could create symlinks pointing to /etc/passwd, SSH keys, etc.
-            if let Ok(metadata) = p.symlink_metadata() {
-                if metadata.file_type().is_symlink() {
+            // Reject symlinks to prevent access to files outside the working tree
+            if let Ok(meta) = p.symlink_metadata() {
+                if meta.file_type().is_symlink() {
                     eprintln!("Warning: Skipping symlink: {}", p.display());
                     return false;
                 }
             }
-
             true
         })
         .collect();
@@ -665,13 +637,11 @@ fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::Result<()> 
     process_files(paths, &format!("pattern '{}'", pattern), options)
 }
 
-/// Collect all supported files from a directory recursively
+/// Collect all supported files from a directory recursively.
 ///
-/// ARCHITECTURE: Walks directory tree, filters for supported extensions.
-/// Uses Language::from_path() for extension validation.
+/// Walks the directory tree and filters for supported extensions
+/// using `Language::from_path()`.
 fn collect_files_from_directory(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    use std::fs;
-
     let mut files = Vec::new();
 
     fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
@@ -683,25 +653,19 @@ fn collect_files_from_directory(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
             let entry = entry?;
             let path = entry.path();
 
-            // Security: Reject symlinks to prevent access to sensitive files
-            // Use symlink_metadata() to check the link itself, not the target
+            // Reject symlinks to prevent access to files outside the working tree
             let symlink_metadata = path.symlink_metadata()?;
             if symlink_metadata.file_type().is_symlink() {
                 eprintln!("Warning: Skipping symlink: {}", path.display());
                 continue;
             }
 
-            // Get regular metadata for is_dir/is_file checks
             let metadata = entry.metadata()?;
 
             if metadata.is_dir() {
-                // Recurse into subdirectories
                 visit_dir(&path, files)?;
-            } else if metadata.is_file() {
-                // Check if file has supported extension
-                if Language::from_path(&path).is_some() {
-                    files.push(path);
-                }
+            } else if metadata.is_file() && Language::from_path(&path).is_some() {
+                files.push(path);
             }
         }
 
@@ -710,7 +674,6 @@ fn collect_files_from_directory(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
     visit_dir(dir, &mut files)?;
 
-    // Sort for deterministic output
     files.sort();
 
     Ok(files)
@@ -723,13 +686,13 @@ fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow::Result<()
     process_files(paths, &format!("directory '{}'", dir.display()), options)
 }
 
-/// Validate all numeric CLI flags (--jobs, --max-lines, --tokens)
+/// Validate all numeric CLI flags (`--jobs`, `--max-lines`, `--tokens`)
 fn validate_args(args: &Args) -> anyhow::Result<()> {
     validate_bounded_arg(
         args.jobs,
         "--jobs",
         MAX_JOBS,
-        "",
+        None,
         "Using too many threads can exhaust system resources.\n\
          Recommended: Use default (number of CPUs) or specify a moderate value.",
     )?;
@@ -737,14 +700,14 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         args.max_lines,
         "--max-lines",
         MAX_MAX_LINES,
-        "Use --max-lines 1 to get a single line of output.",
+        Some("Use --max-lines 1 to get a single line of output."),
         "Files exceeding this limit should be processed without truncation.",
     )?;
     validate_bounded_arg(
         args.tokens,
         "--tokens",
         MAX_TOKEN_BUDGET,
-        "Use --tokens 1 to get the minimum possible output.",
+        Some("Use --tokens 1 to get the minimum possible output."),
         "This exceeds any reasonable LLM context window.",
     )?;
     Ok(())
@@ -754,7 +717,6 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
-    // Handle clear-cache command
     if args.clear_cache {
         cache::clear_cache()?;
         println!("Cache cleared successfully");
@@ -763,15 +725,12 @@ fn main() -> anyhow::Result<()> {
 
     let mode = Mode::from(args.mode);
     let explicit_lang = args.language.map(Language::from);
-    // Cache is enabled by default, disabled only if --no-cache is specified
     let use_cache = !args.no_cache;
     let max_lines = args.max_lines;
     let token_budget = args.tokens;
 
-    // File is required at this point (enforced by clap)
-    let file = args.file.expect("FILE is required");
+    let file = args.file.expect("FILE is required (enforced by clap)");
 
-    // Handle stdin
     if file == "-" {
         let mut buffer = String::new();
         let bytes_read = io::stdin()
@@ -794,7 +753,6 @@ fn main() -> anyhow::Result<()> {
             )
         })?;
 
-        // Transform: use cascade when token budget is set, otherwise single-mode
         let result = if let Some(budget) = token_budget {
             let (output, _mode_used) =
                 cascade_for_token_budget(mode, max_lines, budget, language, |config| {
@@ -806,13 +764,11 @@ fn main() -> anyhow::Result<()> {
             transform_with_config(&buffer, language, &config)?
         };
 
-        // Output transformed result
         let stdout = io::stdout();
         let mut writer = BufWriter::new(stdout.lock());
         write!(writer, "{}", result)?;
         writer.flush()?;
 
-        // Output token statistics if requested
         if args.show_stats {
             let orig = tokens::count_tokens(&buffer).ok();
             let trans = tokens::count_tokens(&result).ok();
@@ -822,7 +778,6 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Check if input is a directory
     let path = PathBuf::from(&file);
 
     let process_options = ProcessOptions {
@@ -844,21 +799,17 @@ fn main() -> anyhow::Result<()> {
         return process_directory(&path, multi_options);
     }
 
-    // Handle glob patterns
     if has_glob_pattern(&file) {
         return process_glob(&file, multi_options);
     }
 
-    // Handle single file
     let process_result = process_file(&path, process_options)?;
 
-    // Output transformed result
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
     write!(writer, "{}", process_result.output)?;
     writer.flush()?;
 
-    // Output token statistics if requested (use cached counts)
     if args.show_stats {
         report_token_stats(
             process_result.original_tokens,

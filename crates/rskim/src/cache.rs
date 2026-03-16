@@ -36,13 +36,13 @@ struct CacheEntry {
     effective_mode: Option<String>,
 }
 
-/// Get platform-specific cache directory (~/.cache/skim/ on Linux/macOS)
+/// Returns the platform-specific cache directory (`~/.cache/skim/` on Linux/macOS),
+/// creating it with owner-only permissions if it does not yet exist.
 fn get_cache_dir() -> Result<PathBuf> {
     let cache_dir = dirs::cache_dir()
         .ok_or_else(|| anyhow::anyhow!("Failed to determine cache directory"))?
         .join("skim");
 
-    // Create cache directory with secure permissions (owner-only on Unix)
     #[cfg(unix)]
     {
         use std::fs::DirBuilder;
@@ -50,7 +50,7 @@ fn get_cache_dir() -> Result<PathBuf> {
 
         if !cache_dir.exists() {
             let mut builder = DirBuilder::new();
-            builder.mode(0o700); // rwx------ (owner-only)
+            builder.mode(0o700); // rwx------
             builder.recursive(true);
             builder.create(&cache_dir)?;
         }
@@ -72,13 +72,9 @@ fn cache_key(
     max_lines: Option<usize>,
     token_budget: Option<usize>,
 ) -> Result<String> {
-    // Get canonical path (resolves symlinks, relative paths)
     let canonical_path = path.canonicalize()?;
-
-    // Convert mtime to seconds since UNIX epoch
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
-    // Create hash input: "path|mtime|mode|max_lines_or_none|token_budget_or_none"
     let fmt_opt = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
     let hash_input = format!(
         "{}|{}|{:?}|{}|{}",
@@ -89,42 +85,32 @@ fn cache_key(
         fmt_opt(token_budget),
     );
 
-    // Generate SHA256 hash
     let mut hasher = Sha256::new();
     hasher.update(hash_input.as_bytes());
-    let hash = hasher.finalize();
 
-    // Convert to hex string
-    Ok(format!("{:x}", hash))
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Read cached output if valid (mtime matches)
-/// Returns: (content, original_tokens, transformed_tokens)
+/// Read cached output if valid (mtime matches).
+///
+/// Returns `(content, original_tokens, transformed_tokens)` on cache hit.
 pub fn read_cache(
     path: &Path,
     mode: Mode,
     max_lines: Option<usize>,
     token_budget: Option<usize>,
 ) -> Option<(String, Option<usize>, Option<usize>)> {
-    // Get file metadata
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
 
-    // Generate cache key
     let key = cache_key(path, mtime, mode, max_lines, token_budget).ok()?;
-    let cache_dir = get_cache_dir().ok()?;
-    let cache_file = cache_dir.join(format!("{}.json", key));
+    let cache_file = get_cache_dir().ok()?.join(format!("{key}.json"));
 
-    // Check if cache file exists
-    if !cache_file.exists() {
-        return None;
-    }
-
-    // Read cache file
     let cache_content = fs::read_to_string(&cache_file).ok()?;
     let entry: CacheEntry = serde_json::from_str(&cache_content).ok()?;
 
-    // Validate cache entry matches current file state
+    // Belt-and-suspenders validation: verify mtime/mode match even though
+    // they are already encoded in the cache key hash (guards against collisions).
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
     let mode_str = format!("{:?}", mode);
 
@@ -135,7 +121,6 @@ pub fn read_cache(
             entry.transformed_tokens,
         ))
     } else {
-        // Cache is stale, delete it
         let _ = fs::remove_file(&cache_file);
         None
     }
@@ -153,16 +138,12 @@ pub fn write_cache(
     token_budget: Option<usize>,
     effective_mode: Option<Mode>,
 ) -> Result<()> {
-    // Get file metadata
     let metadata = fs::metadata(path)?;
     let mtime = metadata.modified()?;
 
-    // Generate cache key
     let key = cache_key(path, mtime, mode, max_lines, token_budget)?;
-    let cache_dir = get_cache_dir()?;
-    let cache_file = cache_dir.join(format!("{}.json", key));
+    let cache_file = get_cache_dir()?.join(format!("{key}.json"));
 
-    // Create cache entry
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
     let entry = CacheEntry {
         path: path.display().to_string(),
@@ -171,19 +152,16 @@ pub fn write_cache(
         content: content.to_string(),
         original_tokens,
         transformed_tokens,
-        effective_mode: effective_mode.map(|m| format!("{:?}", m)),
+        effective_mode: effective_mode.map(|m| format!("{m:?}")),
     };
 
-    // Write to cache file
     let json = serde_json::to_string(&entry)?;
     fs::write(&cache_file, json)?;
 
-    // Set secure file permissions on Unix (owner read/write only)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&cache_file, perms)?;
+        fs::set_permissions(&cache_file, fs::Permissions::from_mode(0o600))?;
     }
 
     Ok(())
