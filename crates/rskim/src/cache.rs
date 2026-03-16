@@ -343,6 +343,45 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_stores_effective_mode() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "effective mode test content").unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        // Write with effective_mode set (simulates cascade escalation)
+        write_cache(&CacheWriteParams {
+            path: &path,
+            mode: Mode::Structure,
+            content: "escalated output",
+            original_tokens: Some(150),
+            transformed_tokens: Some(60),
+            max_lines: None,
+            token_budget: Some(100),
+            effective_mode: Some(Mode::Signatures),
+        })
+        .unwrap();
+
+        // Read back succeeds (effective_mode is diagnostic-only, not part of CacheHit)
+        let hit = read_cache(&path, Mode::Structure, None, Some(100)).unwrap();
+        assert_eq!(hit.content, "escalated output");
+        assert_eq!(hit.original_tokens, Some(150));
+        assert_eq!(hit.transformed_tokens, Some(60));
+
+        // Verify the effective_mode field was serialized in the raw JSON
+        let metadata = fs::metadata(&path).unwrap();
+        let mtime = metadata.modified().unwrap();
+        let key = cache_key(&path, mtime, Mode::Structure, None, Some(100)).unwrap();
+        let cache_file = get_cache_dir().unwrap().join(format!("{key}.json"));
+        let raw_json = fs::read_to_string(&cache_file).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(
+            raw["effective_mode"].as_str(),
+            Some("Signatures"),
+            "effective_mode should be serialized in cache entry JSON"
+        );
+    }
+
+    #[test]
     fn test_cache_invalidation_on_mtime_change() {
         use std::fs::File;
         use std::io::Write as IoWrite;

@@ -468,7 +468,7 @@ fn run_transform(
     }
 }
 
-/// Process a single file and return transformed content with optional token statistics
+/// Process a single file and return transformed content with optional token statistics.
 fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
     if let Some(result) = try_cached_result(path, &options)? {
         return Ok(result);
@@ -491,6 +491,7 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 
     if options.use_cache {
         let effective_mode = (mode_used != options.mode).then_some(mode_used);
+        // Cache write failures are non-fatal; don't fail the transformation.
         let _ = cache::write_cache(&cache::CacheWriteParams {
             path,
             mode: options.mode,
@@ -947,5 +948,74 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no transformation mode produced output"),);
+    }
+
+    // ========================================================================
+    // validate_bounded_arg unit tests (B3)
+    // ========================================================================
+
+    #[test]
+    fn test_validate_bounded_arg_none_passes() {
+        let result = validate_bounded_arg(None, "--test", 128, None, "reason");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_bounded_arg_valid_value_passes() {
+        let result = validate_bounded_arg(Some(4), "--test", 128, None, "reason");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_bounded_arg_at_max_passes() {
+        let result = validate_bounded_arg(Some(128), "--test", 128, None, "reason");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_bounded_arg_zero_without_hint() {
+        let result = validate_bounded_arg(Some(0), "--jobs", 128, None, "reason");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("--jobs must be at least 1"), "got: {msg}");
+        // Should NOT contain a hint line
+        assert_eq!(msg.lines().count(), 1, "expected single line, got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_bounded_arg_zero_with_hint() {
+        let result = validate_bounded_arg(
+            Some(0),
+            "--max-lines",
+            1_000_000,
+            Some("Use --max-lines 1 to get a single line of output."),
+            "reason",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("--max-lines must be at least 1"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("Use --max-lines 1"),
+            "expected hint in message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_bounded_arg_over_max() {
+        let result = validate_bounded_arg(Some(200), "--jobs", 128, None, "Too many threads.");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("200"), "expected value in message, got: {msg}");
+        assert!(
+            msg.contains("maximum: 128"),
+            "expected max in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("Too many threads."),
+            "expected reason in message, got: {msg}"
+        );
     }
 }
