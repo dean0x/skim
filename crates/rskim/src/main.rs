@@ -386,7 +386,7 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some((content, orig_tokens, trans_tokens)) =
+    let Some(hit) =
         cache::read_cache(path, options.mode, options.max_lines, options.token_budget)
     else {
         return Ok(None);
@@ -394,22 +394,22 @@ fn try_cached_result(
 
     // If stats are requested but the cache entry was written without them,
     // read the original file and count tokens for both source and output.
-    let needs_recount = options.show_stats && orig_tokens.is_none();
+    let needs_recount = options.show_stats && hit.original_tokens.is_none();
     let (orig_tokens, trans_tokens) = if needs_recount {
         let contents = read_and_validate(path)?;
         match (
             tokens::count_tokens(&contents),
-            tokens::count_tokens(&content),
+            tokens::count_tokens(&hit.content),
         ) {
             (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
             _ => (None, None),
         }
     } else {
-        (orig_tokens, trans_tokens)
+        (hit.original_tokens, hit.transformed_tokens)
     };
 
     Ok(Some(ProcessResult {
-        output: content,
+        output: hit.content,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
     }))
@@ -491,16 +491,16 @@ fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessR
 
     if options.use_cache {
         let effective_mode = (mode_used != options.mode).then_some(mode_used);
-        let _ = cache::write_cache(
+        let _ = cache::write_cache(&cache::CacheWriteParams {
             path,
-            options.mode,
-            &result,
-            orig_tokens,
-            trans_tokens,
-            options.max_lines,
-            options.token_budget,
+            mode: options.mode,
+            content: &result,
+            original_tokens: orig_tokens,
+            transformed_tokens: trans_tokens,
+            max_lines: options.max_lines,
+            token_budget: options.token_budget,
             effective_mode,
-        );
+        });
     }
 
     Ok(ProcessResult {

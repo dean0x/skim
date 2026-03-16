@@ -14,26 +14,60 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Cache entry with metadata for validation
+/// Cache entry with metadata for validation.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
-    /// Original file path (for debugging)
+    /// Original file path (for debugging).
     path: String,
-    /// File modification time (seconds since UNIX epoch)
+    /// File modification time (seconds since UNIX epoch).
     mtime_secs: u64,
-    /// Transformation mode
+    /// Transformation mode.
     mode: String,
-    /// Cached transformed output
+    /// Cached transformed output.
     content: String,
-    /// Original token count (optional for backward compatibility)
+    /// Original token count (optional for backward compatibility).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original_tokens: Option<usize>,
-    /// Transformed token count (optional for backward compatibility)
+    /// Transformed token count (optional for backward compatibility).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transformed_tokens: Option<usize>,
-    /// Effective mode after cascade (only set when cascade selected a different mode)
+    /// Diagnostic metadata: records the effective mode when cascade selected a
+    /// different mode than the one requested.  Written for post-hoc inspection
+    /// of cache entries (e.g. `jq .effective_mode ~/.cache/skim/*.json`) but
+    /// intentionally not returned by [`read_cache`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effective_mode: Option<String>,
+}
+
+/// Data returned on a successful cache lookup.
+#[derive(Debug)]
+pub struct CacheHit {
+    /// Transformed output content.
+    pub content: String,
+    /// Original token count (if available).
+    pub original_tokens: Option<usize>,
+    /// Transformed token count (if available).
+    pub transformed_tokens: Option<usize>,
+}
+
+/// Parameters for writing a cache entry.
+pub struct CacheWriteParams<'a> {
+    /// Path to the source file.
+    pub path: &'a Path,
+    /// Transformation mode used for the cache key.
+    pub mode: Mode,
+    /// Transformed output to cache.
+    pub content: &'a str,
+    /// Original token count (if computed).
+    pub original_tokens: Option<usize>,
+    /// Transformed token count (if computed).
+    pub transformed_tokens: Option<usize>,
+    /// Maximum output lines (part of cache key).
+    pub max_lines: Option<usize>,
+    /// Token budget (part of cache key).
+    pub token_budget: Option<usize>,
+    /// Effective mode after cascade (diagnostic metadata only).
+    pub effective_mode: Option<Mode>,
 }
 
 /// Returns the platform-specific cache directory (`~/.cache/skim/` on Linux/macOS),
@@ -48,12 +82,10 @@ fn get_cache_dir() -> Result<PathBuf> {
         use std::fs::DirBuilder;
         use std::os::unix::fs::DirBuilderExt;
 
-        if !cache_dir.exists() {
-            let mut builder = DirBuilder::new();
-            builder.mode(0o700); // rwx------
-            builder.recursive(true);
-            builder.create(&cache_dir)?;
-        }
+        let mut builder = DirBuilder::new();
+        builder.mode(0o700); // rwx------
+        builder.recursive(true);
+        builder.create(&cache_dir)?;
     }
 
     #[cfg(not(unix))]
@@ -64,7 +96,7 @@ fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Generate cache key from file path, mtime, mode, max_lines, and token_budget
+/// Generate cache key from file path, mtime, mode, max_lines, and token_budget.
 fn cache_key(
     path: &Path,
     mtime: SystemTime,
@@ -76,13 +108,11 @@ fn cache_key(
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
     let fmt_opt = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
+    let canonical_display = canonical_path.display();
+    let max_lines_str = fmt_opt(max_lines);
+    let token_budget_str = fmt_opt(token_budget);
     let hash_input = format!(
-        "{}|{}|{:?}|{}|{}",
-        canonical_path.display(),
-        mtime_secs,
-        mode,
-        fmt_opt(max_lines),
-        fmt_opt(token_budget),
+        "{canonical_display}|{mtime_secs}|{mode:?}|{max_lines_str}|{token_budget_str}",
     );
 
     let mut hasher = Sha256::new();
@@ -93,13 +123,13 @@ fn cache_key(
 
 /// Read cached output if valid (mtime matches).
 ///
-/// Returns `(content, original_tokens, transformed_tokens)` on cache hit.
+/// Returns a [`CacheHit`] on cache hit, `None` on miss.
 pub fn read_cache(
     path: &Path,
     mode: Mode,
     max_lines: Option<usize>,
     token_budget: Option<usize>,
-) -> Option<(String, Option<usize>, Option<usize>)> {
+) -> Option<CacheHit> {
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
 
@@ -112,47 +142,45 @@ pub fn read_cache(
     // Belt-and-suspenders validation: verify mtime/mode match even though
     // they are already encoded in the cache key hash (guards against collisions).
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
-    let mode_str = format!("{:?}", mode);
+    let mode_str = format!("{mode:?}");
 
     if entry.mtime_secs == mtime_secs && entry.mode == mode_str {
-        Some((
-            entry.content,
-            entry.original_tokens,
-            entry.transformed_tokens,
-        ))
+        Some(CacheHit {
+            content: entry.content,
+            original_tokens: entry.original_tokens,
+            transformed_tokens: entry.transformed_tokens,
+        })
     } else {
+        // Stale entry: best-effort cleanup.
         let _ = fs::remove_file(&cache_file);
         None
     }
 }
 
-/// Write transformed output to cache
-#[allow(clippy::too_many_arguments)]
-pub fn write_cache(
-    path: &Path,
-    mode: Mode,
-    content: &str,
-    original_tokens: Option<usize>,
-    transformed_tokens: Option<usize>,
-    max_lines: Option<usize>,
-    token_budget: Option<usize>,
-    effective_mode: Option<Mode>,
-) -> Result<()> {
-    let metadata = fs::metadata(path)?;
+/// Write transformed output to cache.
+pub fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
+    let metadata = fs::metadata(params.path)?;
     let mtime = metadata.modified()?;
 
-    let key = cache_key(path, mtime, mode, max_lines, token_budget)?;
+    let key = cache_key(
+        params.path,
+        mtime,
+        params.mode,
+        params.max_lines,
+        params.token_budget,
+    )?;
     let cache_file = get_cache_dir()?.join(format!("{key}.json"));
 
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let mode = params.mode;
     let entry = CacheEntry {
-        path: path.display().to_string(),
+        path: params.path.display().to_string(),
         mtime_secs,
-        mode: format!("{:?}", mode),
-        content: content.to_string(),
-        original_tokens,
-        transformed_tokens,
-        effective_mode: effective_mode.map(|m| format!("{m:?}")),
+        mode: format!("{mode:?}"),
+        content: params.content.to_string(),
+        original_tokens: params.original_tokens,
+        transformed_tokens: params.transformed_tokens,
+        effective_mode: params.effective_mode.map(|m| format!("{m:?}")),
     };
 
     let json = serde_json::to_string(&entry)?;
@@ -167,7 +195,7 @@ pub fn write_cache(
     Ok(())
 }
 
-/// Clear entire cache directory
+/// Clear entire cache directory.
 ///
 /// Removes all files inside the cache directory rather than the directory
 /// itself. This avoids ENOTEMPTY races when concurrent processes write
@@ -180,6 +208,7 @@ pub fn clear_cache() -> Result<()> {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() {
+                // Best-effort removal; ignore errors from concurrent access.
                 let _ = fs::remove_file(&path);
             }
         }
@@ -245,24 +274,23 @@ mod tests {
 
         // Write to cache with token counts
         let content = "transformed output";
-        write_cache(
-            &path,
-            Mode::Structure,
+        write_cache(&CacheWriteParams {
+            path: &path,
+            mode: Mode::Structure,
             content,
-            Some(100),
-            Some(50),
-            None,
-            None,
-            None,
-        )
+            original_tokens: Some(100),
+            transformed_tokens: Some(50),
+            max_lines: None,
+            token_budget: None,
+            effective_mode: None,
+        })
         .unwrap();
 
         // Read from cache
-        let (cached, orig_tokens, trans_tokens) =
-            read_cache(&path, Mode::Structure, None, None).unwrap();
-        assert_eq!(cached, content);
-        assert_eq!(orig_tokens, Some(100));
-        assert_eq!(trans_tokens, Some(50));
+        let hit = read_cache(&path, Mode::Structure, None, None).unwrap();
+        assert_eq!(hit.content, content);
+        assert_eq!(hit.original_tokens, Some(100));
+        assert_eq!(hit.transformed_tokens, Some(50));
 
         // Different mode should not find cache
         assert!(read_cache(&path, Mode::Signatures, None, None).is_none());
@@ -286,24 +314,23 @@ mod tests {
         assert!(read_cache(&path, Mode::Structure, None, token_budget).is_none());
 
         // Write with token_budget
-        write_cache(
-            &path,
-            Mode::Structure,
-            "budget-transformed output",
-            Some(200),
-            Some(80),
-            None,
+        write_cache(&CacheWriteParams {
+            path: &path,
+            mode: Mode::Structure,
+            content: "budget-transformed output",
+            original_tokens: Some(200),
+            transformed_tokens: Some(80),
+            max_lines: None,
             token_budget,
-            None,
-        )
+            effective_mode: None,
+        })
         .unwrap();
 
         // Read with same token_budget succeeds
-        let (cached, orig_tokens, trans_tokens) =
-            read_cache(&path, Mode::Structure, None, token_budget).unwrap();
-        assert_eq!(cached, "budget-transformed output");
-        assert_eq!(orig_tokens, Some(200));
-        assert_eq!(trans_tokens, Some(80));
+        let hit = read_cache(&path, Mode::Structure, None, token_budget).unwrap();
+        assert_eq!(hit.content, "budget-transformed output");
+        assert_eq!(hit.original_tokens, Some(200));
+        assert_eq!(hit.transformed_tokens, Some(80));
 
         // Read without token_budget misses (different cache key)
         assert!(read_cache(&path, Mode::Structure, None, None).is_none());
@@ -331,19 +358,19 @@ mod tests {
         }
 
         // Write to cache
-        write_cache(
-            &path,
-            Mode::Structure,
-            "cached v1",
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        write_cache(&CacheWriteParams {
+            path: &path,
+            mode: Mode::Structure,
+            content: "cached v1",
+            original_tokens: None,
+            transformed_tokens: None,
+            max_lines: None,
+            token_budget: None,
+            effective_mode: None,
+        })
         .unwrap();
-        let (cached, _, _) = read_cache(&path, Mode::Structure, None, None).unwrap();
-        assert_eq!(cached, "cached v1");
+        let hit = read_cache(&path, Mode::Structure, None, None).unwrap();
+        assert_eq!(hit.content, "cached v1");
 
         // Sleep to ensure mtime resolution (some filesystems have 1-second resolution)
         std::thread::sleep(std::time::Duration::from_secs(1));
