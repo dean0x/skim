@@ -386,8 +386,7 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some(hit) =
-        cache::read_cache(path, options.mode, options.max_lines, options.token_budget)
+    let Some(hit) = cache::read_cache(path, options.mode, options.max_lines, options.token_budget)
     else {
         return Ok(None);
     };
@@ -993,10 +992,7 @@ mod tests {
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("--max-lines must be at least 1"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("--max-lines must be at least 1"), "got: {msg}");
         assert!(
             msg.contains("Use --max-lines 1"),
             "expected hint in message, got: {msg}"

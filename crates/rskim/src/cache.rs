@@ -111,9 +111,8 @@ fn cache_key(
     let canonical_display = canonical_path.display();
     let max_lines_str = fmt_opt(max_lines);
     let token_budget_str = fmt_opt(token_budget);
-    let hash_input = format!(
-        "{canonical_display}|{mtime_secs}|{mode:?}|{max_lines_str}|{token_budget_str}",
-    );
+    let hash_input =
+        format!("{canonical_display}|{mtime_secs}|{mode:?}|{max_lines_str}|{token_budget_str}");
 
     let mut hasher = Sha256::new();
     hasher.update(hash_input.as_bytes());
