@@ -298,4 +298,35 @@ point = { x = 1, y = 2 }
             err
         );
     }
+
+    #[test]
+    fn test_depth_limit() {
+        // SECURITY TEST: Ensure deeply nested TOML is rejected (depth > 500)
+        // Build nested inline tables: key = { key = { key = { ... } } }
+        // Note: the toml crate may have its own recursion limit that fires
+        // before our MAX_TOML_DEPTH of 500. Either error is acceptable.
+        let mut toml_str = String::from("key = ");
+        for _ in 0..550 {
+            toml_str.push_str("{ nested = ");
+        }
+        toml_str.push_str("\"value\"");
+        for _ in 0..550 {
+            toml_str.push_str(" }");
+        }
+
+        let result = transform_toml(&toml_str);
+
+        // Should reject with depth or parse error
+        assert!(result.is_err(), "Expected error for deeply nested TOML");
+        let err_msg = result
+            .expect_err("Expected error for depth limit")
+            .to_string();
+        assert!(
+            err_msg.contains("depth exceeded")
+                || err_msg.contains("recursion limit")
+                || err_msg.contains("Invalid TOML"),
+            "Error message should mention depth/recursion limit or parse error, got: {}",
+            err_msg
+        );
+    }
 }

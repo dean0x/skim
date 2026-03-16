@@ -333,6 +333,45 @@ fn test_detect_language_from_path() {
         detect_language_from_path(Path::new("data.json")),
         Some(Language::Json)
     );
+    // C extensions
+    assert_eq!(
+        detect_language_from_path(Path::new("main.c")),
+        Some(Language::C)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.h")),
+        Some(Language::C)
+    );
+    // C++ extensions
+    assert_eq!(
+        detect_language_from_path(Path::new("main.cpp")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("main.cc")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("main.cxx")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.hpp")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.hxx")),
+        Some(Language::Cpp)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("header.hh")),
+        Some(Language::Cpp)
+    );
+    // TOML extension
+    assert_eq!(
+        detect_language_from_path(Path::new("Cargo.toml")),
+        Some(Language::Toml)
+    );
 }
 
 #[test]
@@ -1901,6 +1940,23 @@ fn test_c_types() {
     assert!(result.contains("struct Person"));
     assert!(result.contains("enum Status"));
     assert!(result.contains("typedef"));
+
+    // Should contain anonymous struct typedef (typedef struct { ... } Vector3)
+    assert!(
+        result.contains("Vector3"),
+        "Should extract anonymous struct typedef, got: {}",
+        result
+    );
+
+    // Should contain typedef enum (typedef enum { ... } LogLevel)
+    assert!(
+        result.contains("LogLevel"),
+        "Should extract typedef enum, got: {}",
+        result
+    );
+
+    // NOTE: union Value is not extracted because TypeNodeTypes does not include
+    // union_specifier. This is tracked as a known gap, not a test failure.
 }
 
 #[test]
@@ -2012,6 +2068,25 @@ fn test_cpp_types() {
     assert!(result.contains("struct Point"));
     assert!(result.contains("enum class Status"));
     assert!(result.contains("class Animal"));
+
+    // Should contain template class (template<typename T> class Container)
+    assert!(
+        result.contains("class Container"),
+        "Should extract template class, got: {}",
+        result
+    );
+
+    // Should contain namespace-scoped types (shapes::Circle, shapes::Rectangle)
+    assert!(
+        result.contains("struct Circle"),
+        "Should extract namespace-scoped Circle struct, got: {}",
+        result
+    );
+    assert!(
+        result.contains("struct Rectangle"),
+        "Should extract namespace-scoped Rectangle struct, got: {}",
+        result
+    );
 }
 
 #[test]
@@ -2086,6 +2161,52 @@ fn test_cpp_auto_detection() {
             result.contains("int add"),
             "Extension '{}' should produce valid C++ output",
             ext
+        );
+    }
+}
+
+// ============================================================================
+// C / C++ Malformed Syntax Tests (tree-sitter error tolerance)
+// ============================================================================
+
+#[test]
+fn test_c_malformed_syntax() {
+    // tree-sitter is error-tolerant, should not crash on broken C code
+    let sources = [
+        "int main( { { {",                    // Unclosed braces/parens
+        "struct Foo { int x",                  // Incomplete struct
+        "void func(int a, int",               // Incomplete parameter list
+        "#include <missing\nint broken(;",     // Incomplete include + bad declaration
+        "typedef struct {",                    // Incomplete typedef
+    ];
+    for source in sources {
+        let result = transform(source, Language::C, Mode::Structure);
+        assert!(
+            result.is_ok(),
+            "C malformed syntax should not crash, input: '{}', error: {:?}",
+            source,
+            result.err()
+        );
+    }
+}
+
+#[test]
+fn test_cpp_malformed_syntax() {
+    // tree-sitter is error-tolerant, should not crash on broken C++ code
+    let sources = [
+        "class Foo { public:",                 // Incomplete class
+        "template<typename T",                 // Incomplete template
+        "namespace ns { struct S { int x",     // Unclosed namespace + struct
+        "void func() override {",              // Incomplete override function
+        "enum class Status { A, B,",           // Incomplete enum class
+    ];
+    for source in sources {
+        let result = transform(source, Language::Cpp, Mode::Structure);
+        assert!(
+            result.is_ok(),
+            "C++ malformed syntax should not crash, input: '{}', error: {:?}",
+            source,
+            result.err()
         );
     }
 }
@@ -2224,6 +2345,35 @@ fn test_toml_token_reduction() {
 
     // TOML structure should be smaller than original
     assert!(result.len() < source.len());
+}
+
+#[test]
+fn test_toml_deeply_nested_security() {
+    // SECURITY TEST: Ensure deeply nested TOML is rejected (depth > 500)
+    // Build nested inline tables: key = { nested = { nested = { ... } } }
+    // Note: the toml crate may have its own recursion limit that fires
+    // before our MAX_TOML_DEPTH of 500. Either error is acceptable.
+    let mut toml_str = String::from("key = ");
+    for _ in 0..550 {
+        toml_str.push_str("{ nested = ");
+    }
+    toml_str.push_str("\"value\"");
+    for _ in 0..550 {
+        toml_str.push_str(" }");
+    }
+
+    let result = transform(&toml_str, Language::Toml, Mode::Structure);
+
+    // Should reject with depth or parse error
+    assert!(result.is_err(), "Expected error for deeply nested TOML");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("depth exceeded")
+            || err_msg.contains("recursion limit")
+            || err_msg.contains("Invalid TOML"),
+        "Error message should mention depth/recursion limit or parse error, got: {}",
+        err_msg
+    );
 }
 
 // ============================================================================
