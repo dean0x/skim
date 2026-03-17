@@ -497,6 +497,31 @@ fn test_cli_lang_and_language_equivalent() {
 }
 
 // ============================================================================
+// --lang Alias with File Argument Tests
+// ============================================================================
+
+#[test]
+fn test_cli_lang_alias_with_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.txt");
+    fs::write(
+        &file_path,
+        "function add(a: number, b: number): number { return a + b; }",
+    )
+    .unwrap();
+
+    // --lang alias should work with file arguments, not just stdin
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--lang=typescript")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("function add"))
+        .stdout(predicate::str::contains("{ /* ... */ }"));
+}
+
+// ============================================================================
 // --filename Tests
 // ============================================================================
 
@@ -538,6 +563,45 @@ fn test_cli_filename_detects_python() {
 }
 
 #[test]
+fn test_cli_filename_detects_go() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=main.go")
+        .write_stdin("func hello() int { return 42 }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("func hello()"))
+        .stdout(predicate::str::contains("{ /* ... */ }"));
+}
+
+#[test]
+fn test_cli_filename_detects_java() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=Main.java")
+        .write_stdin("class Main { int hello() { return 42; } }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("class Main"))
+        .stdout(predicate::str::contains("{ /* ... */ }"));
+}
+
+#[test]
+fn test_cli_filename_detects_json() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=config.json")
+        .write_stdin(r#"{"name": "skim", "version": "1.0.0", "nested": {"key": "value"}}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("name"))
+        .stdout(predicate::str::contains("version"));
+}
+
+#[test]
 fn test_cli_filename_language_override() {
     // --language takes priority over --filename
     Command::cargo_bin("skim")
@@ -561,7 +625,7 @@ fn test_cli_filename_no_extension_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "requires --language or --filename",
+            "unrecognized filename 'Makefile'",
         ));
 }
 
