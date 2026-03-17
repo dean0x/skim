@@ -247,6 +247,23 @@ fn report_token_stats(
     }
 }
 
+/// Write a single-input result to stdout and optionally report token stats to stderr.
+///
+/// Used by both `process_stdin` and the single-file path in `main()`.
+/// Multi-file paths use their own output logic in `process_files()`.
+fn write_result_and_stats(result: &ProcessResult, show_stats: bool) -> anyhow::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    write!(writer, "{}", result.output)?;
+    writer.flush()?;
+
+    if show_stats {
+        report_token_stats(result.original_tokens, result.transformed_tokens, "");
+    }
+
+    Ok(())
+}
+
 /// Check if path contains glob pattern characters
 fn has_glob_pattern(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('[')
@@ -576,6 +593,79 @@ fn run_transform(
     }
 }
 
+/// Process stdin input and return transformed content with optional token statistics.
+///
+/// Reads from stdin with a size limit, resolves the language from `--language` or
+/// `--filename`, transforms the source (with optional token-budget cascade), and
+/// computes token stats when `show_stats` is enabled.
+fn process_stdin(
+    options: ProcessOptions,
+    filename_hint: Option<&str>,
+) -> anyhow::Result<ProcessResult> {
+    let mut buffer = String::with_capacity(64 * 1024);
+    let bytes_read = io::stdin()
+        .take(MAX_INPUT_SIZE as u64 + 1)
+        .read_to_string(&mut buffer)?;
+
+    if bytes_read > MAX_INPUT_SIZE {
+        anyhow::bail!(
+            "Input too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+            bytes_read,
+            MAX_INPUT_SIZE,
+            MAX_INPUT_SIZE / 1024 / 1024
+        );
+    }
+
+    let filename_lang = filename_hint.and_then(|f| Language::from_path(Path::new(f)));
+
+    let language = options.explicit_lang.or(filename_lang).ok_or_else(|| {
+        if let Some(fname) = filename_hint {
+            anyhow::anyhow!(
+                "Language detection failed: unrecognized filename '{}'\n\
+                 Supported extensions: .ts, .tsx, .js, .jsx, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
+                 Hint: use --language to specify the language explicitly\n\
+                 Example: cat file | skim - --language=typescript",
+                fname
+            )
+        } else {
+            anyhow::anyhow!(
+                "Language detection failed: reading from stdin requires --language or --filename\n\
+                 Example: cat file.ts | skim - --language=typescript\n\
+                 Example: git show HEAD:main.rs | skim - --filename=main.rs"
+            )
+        }
+    })?;
+
+    let output = if let Some(budget) = options.token_budget {
+        let (output, _mode_used) = cascade_for_token_budget(
+            options.mode,
+            options.max_lines,
+            budget,
+            language,
+            |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
+        )?;
+        output
+    } else {
+        let config = build_config(options.mode, options.max_lines);
+        transform_with_config(&buffer, language, &config)?
+    };
+
+    let (orig_tokens, trans_tokens) = if options.show_stats {
+        match (tokens::count_tokens(&buffer), tokens::count_tokens(&output)) {
+            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(ProcessResult {
+        output,
+        original_tokens: orig_tokens,
+        transformed_tokens: trans_tokens,
+    })
+}
+
 /// Process a single file and return transformed content with optional token statistics.
 fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
     if let Some(result) = try_cached_result(path, &options)? {
@@ -848,71 +938,6 @@ fn main() -> anyhow::Result<()> {
 
     let file = args.file.expect("FILE is required (enforced by clap)");
 
-    if file == "-" {
-        let mut buffer = String::with_capacity(64 * 1024);
-        let bytes_read = io::stdin()
-            .take(MAX_INPUT_SIZE as u64 + 1)
-            .read_to_string(&mut buffer)?;
-
-        if bytes_read > MAX_INPUT_SIZE {
-            anyhow::bail!(
-                "Input too large: {} bytes exceeds maximum of {} bytes ({}MB)",
-                bytes_read,
-                MAX_INPUT_SIZE,
-                MAX_INPUT_SIZE / 1024 / 1024
-            );
-        }
-
-        let filename_lang = args
-            .filename
-            .as_ref()
-            .and_then(|f| Language::from_path(Path::new(f)));
-
-        let language = explicit_lang.or(filename_lang).ok_or_else(|| {
-            if let Some(ref fname) = args.filename {
-                anyhow::anyhow!(
-                    "Language detection failed: unrecognized filename '{}'\n\
-                     Supported extensions: .ts, .tsx, .js, .jsx, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
-                     Hint: use --language to specify the language explicitly\n\
-                     Example: cat file | skim - --language=typescript",
-                    fname
-                )
-            } else {
-                anyhow::anyhow!(
-                    "Language detection failed: reading from stdin requires --language or --filename\n\
-                     Example: cat file.ts | skim - --language=typescript\n\
-                     Example: git show HEAD:main.rs | skim - --filename=main.rs"
-                )
-            }
-        })?;
-
-        let result = if let Some(budget) = token_budget {
-            let (output, _mode_used) =
-                cascade_for_token_budget(mode, max_lines, budget, language, |config| {
-                    Ok(Some(transform_with_config(&buffer, language, config)?))
-                })?;
-            output
-        } else {
-            let config = build_config(mode, max_lines);
-            transform_with_config(&buffer, language, &config)?
-        };
-
-        let stdout = io::stdout();
-        let mut writer = BufWriter::new(stdout.lock());
-        write!(writer, "{}", result)?;
-        writer.flush()?;
-
-        if args.show_stats {
-            let orig = tokens::count_tokens(&buffer).ok();
-            let trans = tokens::count_tokens(&result).ok();
-            report_token_stats(orig, trans, "");
-        }
-
-        return Ok(());
-    }
-
-    let path = PathBuf::from(&file);
-
     let process_options = ProcessOptions {
         mode,
         explicit_lang,
@@ -921,6 +946,13 @@ fn main() -> anyhow::Result<()> {
         max_lines,
         token_budget,
     };
+
+    if file == "-" {
+        let result = process_stdin(process_options, args.filename.as_deref())?;
+        return write_result_and_stats(&result, args.show_stats);
+    }
+
+    let path = PathBuf::from(&file);
 
     let multi_options = MultiFileOptions {
         process: process_options,
@@ -936,22 +968,8 @@ fn main() -> anyhow::Result<()> {
         return process_glob(&file, multi_options);
     }
 
-    let process_result = process_file(&path, process_options)?;
-
-    let stdout = io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
-    write!(writer, "{}", process_result.output)?;
-    writer.flush()?;
-
-    if args.show_stats {
-        report_token_stats(
-            process_result.original_tokens,
-            process_result.transformed_tokens,
-            "",
-        );
-    }
-
-    Ok(())
+    let result = process_file(&path, process_options)?;
+    write_result_and_stats(&result, args.show_stats)
 }
 
 #[cfg(test)]
