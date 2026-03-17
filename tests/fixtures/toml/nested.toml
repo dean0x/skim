@@ -1,0 +1,18 @@
+[package]
+name = "rskim"
+version = "1.0.0"
+edition = "2021"
+
+[server]
+host = "localhost"
+port = 8080
+timeout = 30
+
+[server.tls]
+enabled = true
+cert_path = "/etc/ssl/cert.pem"
+
+[database]
+url = "postgres://localhost/mydb"
+pool_size = 10
+max_retries = 3

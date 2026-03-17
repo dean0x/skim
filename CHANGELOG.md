@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-03-16
+
+### Added
+- **C Language Support** - Extract structure from C source files using tree-sitter
+  - Full C11 support with excellent grammar coverage
+  - Automatic language detection for `.c` and `.h` files
+  - CLI support: `--language=c` for stdin processing
+  - Supports all transformation modes (structure/signatures/types/full)
+  - Function body stripping, struct/union/enum preservation
+  - Test fixtures: functions, structs, enums, pointers, preprocessor directives
+
+- **C++ Language Support** - Extract structure from C++ source files using tree-sitter
+  - C++20 support including templates, classes, namespaces
+  - Automatic language detection for `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` files
+  - CLI support: `--language=cpp` for stdin processing
+  - Supports all transformation modes (structure/signatures/types/full)
+  - Class/template/namespace preservation with body stripping
+  - Test fixtures: classes, templates, namespaces, inheritance, modern C++ features
+
+- **TOML Language Support** - Extract structure from TOML configuration files
+  - Strips all values, keeps only keys and nesting structure
+  - Automatic language detection for `.toml` files
+  - CLI support: `--language=toml` for stdin processing
+  - Security limits: MAX_TOML_DEPTH=500, MAX_TOML_KEYS=10,000
+  - Uses toml crate (Strategy Pattern for non-tree-sitter languages)
+  - All modes (structure/signatures/types) produce identical output (TOML is data, not code)
+  - Test fixtures: Cargo.toml-style configs, nested tables, arrays of tables
+
+### Testing
+- **400 total tests** - All passing (up from 186 in v0.8.0)
+  - New C language tests (CLI and integration)
+  - New C++ language tests (CLI and integration)
+  - New TOML language tests (CLI and integration)
+
 ## [0.8.0] - 2025-12-06
 
 ### Added
@@ -439,6 +473,8 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **0.9.0** (2026-03-16): C, C++, and TOML language support (12 languages total, 400 tests)
+- **0.8.0** (2025-12-06): YAML language support
 - **0.4.0** (2025-10-17): Multi-file glob support, caching, parallel processing, token counting (Phase 3 complete)
 - **0.3.3** (2025-10-16): CLI README branding and broken npx command fixes
 - **0.3.2** (2025-10-16): README documentation alignment fixes

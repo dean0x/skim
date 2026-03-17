@@ -165,6 +165,10 @@ enum LanguageArg {
     Json,
     #[value(alias = "yml")]
     Yaml,
+    C,
+    #[value(alias = "c++", alias = "cxx")]
+    Cpp,
+    Toml,
 }
 
 impl From<LanguageArg> for Language {
@@ -179,6 +183,9 @@ impl From<LanguageArg> for Language {
             LanguageArg::Markdown => Language::Markdown,
             LanguageArg::Json => Language::Json,
             LanguageArg::Yaml => Language::Yaml,
+            LanguageArg::C => Language::C,
+            LanguageArg::Cpp => Language::Cpp,
+            LanguageArg::Toml => Language::Toml,
         }
     }
 }
@@ -291,6 +298,40 @@ fn validate_bounded_arg(
     Ok(())
 }
 
+/// Count tokens, returning `usize::MAX` on failure (treats errors as over-budget).
+///
+/// Centralises the warning-on-error pattern used throughout the cascade logic.
+fn count_tokens_or_max(text: &str) -> usize {
+    tokens::count_tokens(text).unwrap_or_else(|e| {
+        eprintln!("[skim] warning: token counting failed, treating as over-budget: {e}");
+        usize::MAX
+    })
+}
+
+/// Apply line-based truncation as a final fallback when all modes exceed the budget.
+///
+/// Emits a diagnostic to stderr and delegates to `truncate_to_token_budget`.
+fn fallback_line_truncate(
+    output: &str,
+    language: Language,
+    token_budget: usize,
+    mode: Mode,
+    known_token_count: Option<usize>,
+) -> anyhow::Result<(String, Mode)> {
+    eprintln!(
+        "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
+        mode.name(),
+    );
+    let truncated = truncate_to_token_budget(
+        output,
+        language,
+        token_budget,
+        count_tokens_or_max,
+        known_token_count,
+    )?;
+    Ok((truncated, mode))
+}
+
 /// Cascade through transformation modes until output fits within `token_budget`.
 ///
 /// Tries each mode from `starting_mode` through increasingly aggressive modes.
@@ -313,6 +354,20 @@ where
 
     let mut config = build_config(starting_mode, max_lines);
 
+    // Serde-based languages produce at most 2 distinct outputs regardless of mode:
+    // - Full/Minimal: original source (passthrough)
+    // - Structure/Signatures/Types: structure-extracted (all identical)
+    // Short-circuit to avoid up to 3 redundant parse+transform cycles.
+    if language.is_serde_based() {
+        return cascade_serde(
+            starting_mode,
+            &mut config,
+            token_budget,
+            language,
+            &transform_fn,
+        );
+    }
+
     for &mode in cascade {
         config.mode = mode;
 
@@ -320,10 +375,7 @@ where
             continue;
         };
 
-        let token_count = tokens::count_tokens(&output).unwrap_or_else(|e| {
-            eprintln!("[skim] warning: token counting failed, treating as over-budget: {e}");
-            usize::MAX
-        });
+        let token_count = count_tokens_or_max(&output);
 
         if token_count <= token_budget {
             if mode != starting_mode {
@@ -351,26 +403,75 @@ where
         );
     }
 
-    // Final fallback: line-based truncation of the most aggressive mode's output
-    eprintln!(
-        "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
-        last_mode.name(),
-    );
-
-    let truncated = truncate_to_token_budget(
+    fallback_line_truncate(
         &last_output,
         language,
         token_budget,
-        |text| {
-            tokens::count_tokens(text).unwrap_or_else(|e| {
-                eprintln!("[skim] warning: token counting failed in truncation fallback: {e}");
-                usize::MAX
-            })
-        },
+        last_mode,
         last_token_count,
-    )?;
+    )
+}
 
-    Ok((truncated, last_mode))
+/// Serde-based cascade short-circuit for `cascade_for_token_budget`.
+///
+/// Serde languages (JSON, YAML, TOML) produce at most two distinct outputs:
+/// passthrough (Full/Minimal) and structure-extracted (Structure/Signatures/Types).
+/// This avoids up to 3 redundant parse+transform cycles in the generic cascade.
+fn cascade_serde<F>(
+    starting_mode: Mode,
+    config: &mut TransformConfig,
+    token_budget: usize,
+    language: Language,
+    transform_fn: &F,
+) -> anyhow::Result<(String, Mode)>
+where
+    F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
+{
+    // Try starting mode first
+    let first_output = transform_fn(config)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Token budget cascade: no transformation mode produced output. \
+                 Ensure the file is in a supported language or specify --language."
+        )
+    })?;
+
+    let first_tokens = count_tokens_or_max(&first_output);
+    if first_tokens <= token_budget {
+        return Ok((first_output, starting_mode));
+    }
+
+    // If starting at Full/Minimal, try structure-extracted (the only other distinct output)
+    if matches!(starting_mode, Mode::Full | Mode::Minimal) {
+        config.mode = Mode::Structure;
+        if let Some(extracted) = transform_fn(config)? {
+            let extracted_tokens = count_tokens_or_max(&extracted);
+            if extracted_tokens <= token_budget {
+                eprintln!(
+                    "[skim] token budget: escalated from {} to structure mode ({} tokens)",
+                    starting_mode.name(),
+                    extracted_tokens,
+                );
+                return Ok((extracted, Mode::Structure));
+            }
+            return fallback_line_truncate(
+                &extracted,
+                language,
+                token_budget,
+                Mode::Structure,
+                Some(extracted_tokens),
+            );
+        }
+    }
+
+    // Starting mode was already Structure/Signatures/Types, or structure extraction
+    // returned None (defensive). Fall back to line truncation on the first output.
+    fallback_line_truncate(
+        &first_output,
+        language,
+        token_budget,
+        starting_mode,
+        Some(first_tokens),
+    )
 }
 
 /// Try to return a result from cache, handling token recount when needed.

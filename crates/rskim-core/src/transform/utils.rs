@@ -52,7 +52,8 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::TypeScript | Language::JavaScript => &["statement_block"],
         Language::Python | Language::Rust | Language::Go => &["block"],
         Language::Java => &["block", "constructor_body"],
-        Language::Markdown | Language::Json | Language::Yaml => &[],
+        Language::C | Language::Cpp => &["compound_statement"],
+        Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
 
@@ -107,7 +108,9 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "type_item" => ("type_item", 5),
         "type_alias_statement" => ("type_alias_statement", 5),
         "type_declaration" => ("type_declaration", 5),
-        "class_definition" => ("class_definition", 5), // Python: classes ARE the type system
+        "using_declaration" => ("using_declaration", 5), // C++ using type aliases
+        "alias_declaration" => ("alias_declaration", 5), // C++ `using Alias = Type;`
+        "class_definition" => ("class_definition", 5),   // Python: classes ARE the type system
         "atx_heading" => ("atx_heading", 5),
         "setext_heading" => ("setext_heading", 5),
 
@@ -178,11 +181,14 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::JavaScript
         | Language::Rust
         | Language::Go
-        | Language::Java => "//",
+        | Language::Java
+        | Language::C
+        | Language::Cpp => "//",
         Language::Python => "#",
         Language::Markdown => "<!--",
         Language::Json => "//", // JSON has no comments; // is JSONC-compatible
         Language::Yaml => "#",
+        Language::Toml => "#",
     }
 }
 
@@ -257,6 +263,8 @@ mod tests {
             "type_item",
             "type_alias_statement",
             "type_declaration",
+            "using_declaration",
+            "alias_declaration",
             "class_definition",
             "atx_heading",
             "setext_heading",
@@ -336,7 +344,11 @@ mod tests {
         assert_eq!(get_comment_prefix(Language::Rust), "//");
         assert_eq!(get_comment_prefix(Language::Go), "//");
         assert_eq!(get_comment_prefix(Language::Java), "//");
+        assert_eq!(get_comment_prefix(Language::C), "//");
+        assert_eq!(get_comment_prefix(Language::Cpp), "//");
         assert_eq!(get_comment_prefix(Language::Python), "#");
+        assert_eq!(get_comment_prefix(Language::Yaml), "#");
+        assert_eq!(get_comment_prefix(Language::Toml), "#");
         assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
     }
 
@@ -344,6 +356,9 @@ mod tests {
     fn test_comment_suffix() {
         assert_eq!(get_comment_suffix(Language::TypeScript), "");
         assert_eq!(get_comment_suffix(Language::Python), "");
+        assert_eq!(get_comment_suffix(Language::C), "");
+        assert_eq!(get_comment_suffix(Language::Cpp), "");
+        assert_eq!(get_comment_suffix(Language::Toml), "");
         assert_eq!(get_comment_suffix(Language::Markdown), " -->");
     }
 }

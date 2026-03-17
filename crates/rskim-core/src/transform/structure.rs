@@ -266,8 +266,11 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             function: "atx_heading",
             method: "atx_heading",
         }),
-        Language::Json => None,
-        Language::Yaml => None,
+        Language::C | Language::Cpp => Some(NodeTypes {
+            function: "function_definition",
+            method: "function_definition",
+        }),
+        Language::Json | Language::Yaml | Language::Toml => None,
     }
 }
 

@@ -1,0 +1,24 @@
+# Edge cases for TOML parsing
+
+[empty_table]
+
+[dates]
+created = 2024-01-15T10:30:00Z
+modified = 2024-06-20
+
+[inline]
+point = { x = 1, y = 2 }
+color = { r = 255, g = 128, b = 0 }
+
+[unicode]
+greeting = "Hello, World!"
+emoji_key = "test"
+
+[deeply_nested]
+a.b.c.d = "deep value"
+
+[multiline]
+description = """
+This is a multiline
+string value
+"""

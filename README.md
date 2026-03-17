@@ -53,7 +53,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 
 - 🚀 **Fast** - 14.6ms for 3000-line files (powered by tree-sitter)
 - ⚡ **Cached** - 40-50x faster on repeated processing (enabled by default)
-- 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java, Markdown, JSON, YAML
+- 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
 - 🎯 **Multiple modes** - Structure, signatures, types, or full code
 - 📁 **Directory support** - Process entire directories recursively (`skim src/`)
 - 📂 **Multi-file** - Glob patterns (`src/**/*.ts`) with parallel processing
@@ -183,7 +183,7 @@ skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation
 ```
 
-**Note on JSON/YAML files:** JSON and YAML always use structure extraction regardless of mode. Since they are data (not code), there are no "signatures" or "types" to extract—only structure. All modes produce identical output for JSON and YAML files.
+**Note on JSON/YAML/TOML files:** JSON, YAML, and TOML always use structure extraction regardless of mode. Since they are data (not code), there are no "signatures" or "types" to extract—only structure. All modes produce identical output for these file types.
 
 📖 **[Detailed Mode Guide →](docs/modes.md)**
 
@@ -197,9 +197,12 @@ skim file.ts --mode full        # No transformation
 | Rust       | ✅     | `.rs`              | Up-to-date grammar              |
 | Go         | ✅     | `.go`              | Stable                          |
 | Java       | ✅     | `.java`            | Good coverage                   |
+| C          | ✅     | `.c`, `.h`         | Full C11 support                |
+| C++        | ✅     | `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` | C++20 support |
 | Markdown   | ✅     | `.md`, `.markdown` | Header extraction               |
 | JSON       | ✅     | `.json`            | Structure extraction (serde)    |
 | YAML       | ✅     | `.yaml`, `.yml`    | Multi-document support (serde)  |
+| TOML       | ✅     | `.toml`            | Structure extraction (toml)     |
 
 ## Examples
 
@@ -519,7 +522,7 @@ cargo bench
 **Current**: Production ready (v0.6.0+)
 
 ✅ **Implemented:**
-- TypeScript/JavaScript/Python/Rust/Go/Java/Markdown/JSON/YAML support
+- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/Markdown/JSON/YAML/TOML support
 - Structure/signatures/types/full modes
 - CLI with stdin support
 - **Directory support (`skim src/` - recursively processes all files)**
@@ -529,7 +532,7 @@ cargo bench
 - **Caching layer with mtime-based invalidation (enabled by default)**
 - **Token counting with `--show-stats` (GPT-3.5/GPT-4 compatible)**
 - DoS protections
-- Comprehensive test suite (151 tests passing)
+- Comprehensive test suite (400 tests passing)
 - Performance benchmarks (verified: 14.6ms for 3000-line files, 5ms cached)
 - npm and cargo distribution
 

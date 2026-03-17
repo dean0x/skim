@@ -116,12 +116,15 @@ fn is_shebang(node: Node, source: &str) -> bool {
 /// Check if a node kind represents a comment in the given language
 fn is_comment_node(kind: &str, language: Language) -> bool {
     match language {
-        Language::TypeScript | Language::JavaScript | Language::Python | Language::Go => {
-            kind == "comment"
-        }
+        Language::TypeScript
+        | Language::JavaScript
+        | Language::Python
+        | Language::Go
+        | Language::C
+        | Language::Cpp => kind == "comment",
         Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
-        // Markdown, JSON, YAML don't have comment nodes to strip
-        Language::Markdown | Language::Json | Language::Yaml => false,
+        // Markdown, JSON, YAML, TOML don't have comment nodes to strip
+        Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
 }
 
@@ -165,8 +168,12 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
             // Javadoc comments start with /**
             text.starts_with("/**")
         }
-        // Markdown, JSON, YAML don't reach here
-        Language::Markdown | Language::Json | Language::Yaml => false,
+        Language::C | Language::Cpp => {
+            // Doxygen comments: /** or ///
+            text.starts_with("/**") || text.starts_with("///")
+        }
+        // Markdown, JSON, YAML, TOML don't reach here
+        Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
 }
 

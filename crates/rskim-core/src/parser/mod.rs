@@ -33,6 +33,8 @@ mod tests {
             (Language::Rust, "fn test() {}"),
             (Language::Go, "func test() {}"),
             (Language::Java, "class Test { void test() {} }"),
+            (Language::C, "int test() { return 0; }"),
+            (Language::Cpp, "int test() { return 0; }"),
         ];
 
         for (language, source) in test_cases {

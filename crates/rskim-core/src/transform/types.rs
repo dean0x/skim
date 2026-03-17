@@ -125,6 +125,11 @@ fn collect_type_definitions_with_kinds(
     let kind = node.kind();
 
     if is_type_node(kind, node_types) {
+        // For C/C++ struct_specifier and enum_specifier, only extract actual definitions
+        // (nodes with a body), not bare type references like `struct Point` in return types.
+        if is_type_reference(kind, &node) {
+            return Ok(());
+        }
         if let Some(type_def) = extract_type_definition(node, source, node_types)? {
             let static_kind = to_static_node_kind(kind);
             type_defs.push((type_def, static_kind));
@@ -147,6 +152,26 @@ fn is_type_node(kind: &str, node_types: &TypeNodeTypes) -> bool {
         || kind == node_types.enum_def
         || kind == node_types.class_decl
         || kind == node_types.struct_def
+}
+
+/// Check if a C/C++ struct_specifier or enum_specifier is just a type
+/// reference (no body), not an actual definition. Only applies to these
+/// specific node kinds since they represent both definitions and references
+/// in C/C++ grammars. Other languages (Rust `enum_item`, TS `enum_declaration`)
+/// don't have this ambiguity.
+fn is_type_reference(kind: &str, node: &Node) -> bool {
+    if kind != "struct_specifier" && kind != "enum_specifier" {
+        return false;
+    }
+    // A definition has a body child (field_declaration_list, enumerator_list, etc.)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "field_declaration_list" | "enumerator_list" => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Extract type definition text from node
@@ -194,7 +219,9 @@ fn find_class_body(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "class_body" | "declaration_list" | "block" => return Some(child),
+            "class_body" | "declaration_list" | "block" | "field_declaration_list" => {
+                return Some(child)
+            }
             _ => continue,
         }
     }
@@ -266,7 +293,20 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "",
             struct_def: "",
         }),
-        Language::Json => None,
-        Language::Yaml => None,
+        Language::C => Some(TypeNodeTypes {
+            type_alias: "type_definition",
+            interface: "",
+            enum_def: "enum_specifier",
+            class_decl: "",
+            struct_def: "struct_specifier",
+        }),
+        Language::Cpp => Some(TypeNodeTypes {
+            type_alias: "type_definition",
+            interface: "",
+            enum_def: "enum_specifier",
+            class_decl: "class_specifier",
+            struct_def: "struct_specifier",
+        }),
+        Language::Json | Language::Yaml | Language::Toml => None,
     }
 }
