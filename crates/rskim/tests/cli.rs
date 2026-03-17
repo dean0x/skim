@@ -639,7 +639,7 @@ fn test_cli_filename_unknown_ext_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "requires --language or --filename",
+            "unrecognized filename 'foo.xyz'",
         ));
 }
 

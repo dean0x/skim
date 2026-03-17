@@ -69,7 +69,7 @@ struct Args {
 
     /// Override language detection (required for stdin unless --filename is given)
     #[arg(short, long, alias = "lang", value_enum)]
-    #[arg(help = "Programming language (or use --filename for auto-detection from stdin)")]
+    #[arg(help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)")]
     language: Option<LanguageArg>,
 
     /// Filename hint for language detection when reading from stdin
@@ -847,7 +847,7 @@ fn main() -> anyhow::Result<()> {
     let file = args.file.expect("FILE is required (enforced by clap)");
 
     if file == "-" {
-        let mut buffer = String::new();
+        let mut buffer = String::with_capacity(64 * 1024);
         let bytes_read = io::stdin()
             .take(MAX_INPUT_SIZE as u64 + 1)
             .read_to_string(&mut buffer)?;
@@ -867,11 +867,21 @@ fn main() -> anyhow::Result<()> {
             .and_then(|f| Language::from_path(Path::new(f)));
 
         let language = explicit_lang.or(filename_lang).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Language detection failed: reading from stdin requires --language or --filename\n\
-                 Example: cat file.ts | skim - --language=typescript\n\
-                 Example: git show HEAD:main.rs | skim - --filename=main.rs"
-            )
+            if let Some(ref fname) = args.filename {
+                anyhow::anyhow!(
+                    "Language detection failed: unrecognized filename '{}'\n\
+                     Supported extensions: .ts, .tsx, .js, .jsx, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
+                     Hint: use --language to specify the language explicitly\n\
+                     Example: cat file | skim - --language=typescript",
+                    fname
+                )
+            } else {
+                anyhow::anyhow!(
+                    "Language detection failed: reading from stdin requires --language or --filename\n\
+                     Example: cat file.ts | skim - --language=typescript\n\
+                     Example: git show HEAD:main.rs | skim - --filename=main.rs"
+                )
+            }
         })?;
 
         let result = if let Some(budget) = token_budget {
