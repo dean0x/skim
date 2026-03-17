@@ -44,17 +44,19 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
 #[command(name = "skim")]
 #[command(author, version, about, long_about = None)]
 #[command(after_help = "EXAMPLES:\n  \
-    skim file.ts                       Read TypeScript with structure mode (cached)\n  \
-    skim file.py --mode signatures     Extract Python signatures\n  \
-    skim file.rs | bat -l rust         Skim Rust and highlight\n  \
-    cat code.ts | skim - --lang=ts     Read from stdin (requires --language)\n  \
-    skim - -l python < script.py       Short form language flag\n  \
-    skim src/                          Process all files in directory recursively\n  \
-    skim 'src/**/*.ts'                 Process all TypeScript files (glob pattern)\n  \
-    skim '*.{js,ts}' --no-header       Process multiple files without headers\n  \
-    skim . --jobs 8                    Process current directory with 8 threads\n  \
-    skim file.ts --no-cache            Disable caching for pure transformation\n  \
-    skim --clear-cache                 Clear all cached files\n\n\
+    skim file.ts                             Read TypeScript with structure mode (cached)\n  \
+    skim file.py --mode signatures           Extract Python signatures\n  \
+    skim file.rs | bat -l rust               Skim Rust and highlight\n  \
+    cat code.ts | skim - --lang=ts           Read from stdin with --lang alias\n  \
+    skim - -l python < script.py             Short form language flag\n  \
+    git show HEAD:main.rs | skim - --filename=main.rs\n  \
+                                             Detect language from filename hint\n  \
+    skim src/                                Process all files in directory recursively\n  \
+    skim 'src/**/*.ts'                       Process all TypeScript files (glob pattern)\n  \
+    skim '*.{js,ts}' --no-header             Process multiple files without headers\n  \
+    skim . --jobs 8                          Process current directory with 8 threads\n  \
+    skim file.ts --no-cache                  Disable caching for pure transformation\n  \
+    skim --clear-cache                       Clear all cached files\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File, directory, or glob pattern to process (use '-' for stdin)
@@ -66,10 +68,18 @@ struct Args {
     #[arg(help = "Transformation mode: structure, signatures, types, full, or minimal")]
     mode: ModeArg,
 
-    /// Override language detection (required for stdin, optional fallback otherwise)
-    #[arg(short, long, value_enum)]
-    #[arg(help = "Programming language: typescript, python, rust, go, java")]
+    /// Override language detection (required for stdin unless --filename is given)
+    #[arg(short, long, alias = "lang", value_enum)]
+    #[arg(help = "Programming language (or use --filename for auto-detection from stdin)")]
     language: Option<LanguageArg>,
+
+    /// Filename hint for language detection when reading from stdin
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Filename hint for stdin language detection (e.g., main.rs)"
+    )]
+    filename: Option<String>,
 
     /// Force parsing even if language unsupported
     #[arg(long)]
@@ -811,6 +821,14 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         Some("Use --tokens 1 to get the minimum possible output."),
         "This exceeds any reasonable LLM context window.",
     )?;
+
+    if args.filename.is_some() && args.file.as_deref() != Some("-") {
+        anyhow::bail!(
+            "--filename is only valid when reading from stdin (file argument is '-')\n\
+             For files on disk, language is auto-detected from the file extension."
+        );
+    }
+
     Ok(())
 }
 
@@ -847,10 +865,16 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        let language = explicit_lang.ok_or_else(|| {
+        let filename_lang = args
+            .filename
+            .as_ref()
+            .and_then(|f| Language::from_path(Path::new(f)));
+
+        let language = explicit_lang.or(filename_lang).ok_or_else(|| {
             anyhow::anyhow!(
-                "Language detection failed: reading from stdin requires --language flag\n\
-                 Example: cat file.ts | skim - --language=typescript"
+                "Language detection failed: reading from stdin requires --language or --filename\n\
+                 Example: cat file.ts | skim - --language=typescript\n\
+                 Example: git show HEAD:main.rs | skim - --filename=main.rs"
             )
         })?;
 

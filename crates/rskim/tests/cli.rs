@@ -189,7 +189,7 @@ fn test_cli_stdin_without_language_fails() {
         .write_stdin("function test() {}")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("requires --language flag"));
+        .stderr(predicate::str::contains("requires --language or --filename"));
 }
 
 // ============================================================================
@@ -443,4 +443,226 @@ fn test_cli_minimal_mode_help_text() {
         .assert()
         .success()
         .stdout(predicate::str::contains("minimal"));
+}
+
+// ============================================================================
+// --lang Alias Tests
+// ============================================================================
+
+#[test]
+fn test_cli_lang_alias_stdin() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--lang=typescript")
+        .write_stdin("function add(a: number, b: number): number { return a + b; }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("function add"));
+}
+
+#[test]
+fn test_cli_lang_and_language_equivalent() {
+    let input = "function greet(name: string): string { return `Hello ${name}`; }";
+
+    let lang_output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--lang=typescript")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let language_output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--language=typescript")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(
+        lang_output, language_output,
+        "--lang and --language should produce identical output"
+    );
+}
+
+// ============================================================================
+// --filename Tests
+// ============================================================================
+
+#[test]
+fn test_cli_filename_detects_rust() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=main.rs")
+        .write_stdin("fn hello() { println!(\"hi\"); }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fn hello()"))
+        .stdout(predicate::str::contains("{ /* ... */ }"));
+}
+
+#[test]
+fn test_cli_filename_detects_typescript() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=app.ts")
+        .write_stdin("function greet(name: string): string { return name; }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("function greet"));
+}
+
+#[test]
+fn test_cli_filename_detects_python() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=script.py")
+        .write_stdin("def hello():\n    return 42")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("def hello()"));
+}
+
+#[test]
+fn test_cli_filename_language_override() {
+    // --language takes priority over --filename
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--language=python")
+        .arg("--filename=main.rs")
+        .write_stdin("def hello():\n    return 42")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("def hello()"));
+}
+
+#[test]
+fn test_cli_filename_no_extension_fails() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=Makefile")
+        .write_stdin("all: build")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --language or --filename"));
+}
+
+#[test]
+fn test_cli_filename_unknown_ext_fails() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=foo.xyz")
+        .write_stdin("some content")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --language or --filename"));
+}
+
+#[test]
+fn test_cli_filename_not_stdin_fails() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.ts");
+    fs::write(&file_path, "function test() { }").unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--filename=main.rs")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--filename is only valid when reading from stdin",
+        ));
+}
+
+#[test]
+fn test_cli_filename_with_path_prefix() {
+    // --filename with directory components should still detect language from extension
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=src/lib/main.rs")
+        .write_stdin("fn hello() { 42 }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fn hello()"));
+}
+
+// ============================================================================
+// BufWriter Streaming Tests
+// ============================================================================
+
+#[test]
+fn test_cli_stdin_large_input_streaming() {
+    // Generate 1000 TypeScript functions to verify streaming works with large input
+    let mut input = String::new();
+    for i in 0..1000 {
+        input.push_str(&format!(
+            "function func{}(x: number): number {{ return x + {}; }}\n",
+            i, i
+        ));
+    }
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--language=typescript")
+        .write_stdin(input)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let output_str = String::from_utf8(output).unwrap();
+
+    // Verify first and last functions appear in output
+    assert!(
+        output_str.contains("function func0"),
+        "First function should appear in output"
+    );
+    assert!(
+        output_str.contains("function func999"),
+        "Last function should appear in output"
+    );
+
+    // Verify bodies are stripped (structure mode is default)
+    assert!(
+        output_str.contains("{ /* ... */ }"),
+        "Function bodies should be replaced with placeholder"
+    );
+    assert!(
+        !output_str.contains("return x + 0"),
+        "Implementation details should be stripped"
+    );
+}
+
+#[test]
+fn test_cli_stdin_filename_with_mode() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=app.ts")
+        .arg("--mode=signatures")
+        .write_stdin(
+            "type UserId = string;\nfunction greet(name: string): string { return name; }",
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("function greet(name: string): string"))
+        .stdout(predicate::str::contains("return name").not());
 }
