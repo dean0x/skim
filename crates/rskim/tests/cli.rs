@@ -189,7 +189,9 @@ fn test_cli_stdin_without_language_fails() {
         .write_stdin("function test() {}")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("requires --language or --filename"));
+        .stderr(predicate::str::contains(
+            "requires --language or --filename",
+        ));
 }
 
 // ============================================================================
@@ -557,7 +559,9 @@ fn test_cli_filename_no_extension_fails() {
         .write_stdin("all: build")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("requires --language or --filename"));
+        .stderr(predicate::str::contains(
+            "requires --language or --filename",
+        ));
 }
 
 #[test]
@@ -569,7 +573,9 @@ fn test_cli_filename_unknown_ext_fails() {
         .write_stdin("some content")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("requires --language or --filename"));
+        .stderr(predicate::str::contains(
+            "requires --language or --filename",
+        ));
 }
 
 #[test]
@@ -658,11 +664,11 @@ fn test_cli_stdin_filename_with_mode() {
         .arg("-")
         .arg("--filename=app.ts")
         .arg("--mode=signatures")
-        .write_stdin(
-            "type UserId = string;\nfunction greet(name: string): string { return name; }",
-        )
+        .write_stdin("type UserId = string;\nfunction greet(name: string): string { return name; }")
         .assert()
         .success()
-        .stdout(predicate::str::contains("function greet(name: string): string"))
+        .stdout(predicate::str::contains(
+            "function greet(name: string): string",
+        ))
         .stdout(predicate::str::contains("return name").not());
 }
