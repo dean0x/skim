@@ -5,6 +5,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::time::Instant;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -608,8 +609,74 @@ fn test_cli_filename_with_path_prefix() {
         .stdout(predicate::str::contains("fn hello()"));
 }
 
+#[test]
+fn test_cli_filename_with_mode() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=app.ts")
+        .arg("--mode=signatures")
+        .write_stdin("type UserId = string;\nfunction greet(name: string): string { return name; }")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "function greet(name: string): string",
+        ))
+        .stdout(predicate::str::contains("return name").not());
+}
+
 // ============================================================================
-// BufWriter Streaming Tests
+// --filename + --mode Combined Tests
+// ============================================================================
+
+#[test]
+fn test_cli_filename_rust_signatures() {
+    // Key scenario: `git show HEAD:file.rs | skim --mode=signatures`
+    // Verifies --filename works with Rust code and --mode=signatures
+    let rust_code = r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub struct Calculator {
+    value: i32,
+}
+
+impl Calculator {
+    pub fn new(value: i32) -> Self {
+        Self { value }
+    }
+
+    pub fn compute(&self, x: i32) -> i32 {
+        self.value + x
+    }
+}
+"#;
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--filename=lib.rs")
+        .arg("--mode=signatures")
+        .write_stdin(rust_code)
+        .assert()
+        .success()
+        // Function signatures should appear
+        .stdout(predicate::str::contains(
+            "pub fn add(a: i32, b: i32) -> i32",
+        ))
+        .stdout(predicate::str::contains("pub fn new(value: i32) -> Self"))
+        .stdout(predicate::str::contains(
+            "pub fn compute(&self, x: i32) -> i32",
+        ))
+        // Implementation details should NOT appear
+        .stdout(predicate::str::contains("a + b").not())
+        .stdout(predicate::str::contains("Self { value }").not())
+        .stdout(predicate::str::contains("self.value + x").not());
+}
+
+// ============================================================================
+// Large Stdin Streaming Tests
 // ============================================================================
 
 #[test]
@@ -657,18 +724,37 @@ fn test_cli_stdin_large_input_streaming() {
     );
 }
 
+// ============================================================================
+// Performance Acceptance Tests
+// ============================================================================
+
 #[test]
-fn test_cli_stdin_filename_with_mode() {
+fn test_cli_stdin_large_input_completes_within_time_bound() {
+    // Performance acceptance criterion: large input (1000 functions) must complete
+    // within 5 seconds. This is extremely generous given the 50ms target for 1000-line
+    // files, but guards against gross regressions in the stdin/pipe path.
+    let mut input = String::new();
+    for i in 0..1000 {
+        input.push_str(&format!(
+            "function func{}(x: number): number {{ return x + {}; }}\n",
+            i, i
+        ));
+    }
+
+    let start = Instant::now();
+
     Command::cargo_bin("skim")
         .unwrap()
         .arg("-")
-        .arg("--filename=app.ts")
-        .arg("--mode=signatures")
-        .write_stdin("type UserId = string;\nfunction greet(name: string): string { return name; }")
+        .arg("--language=typescript")
+        .write_stdin(input)
         .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "function greet(name: string): string",
-        ))
-        .stdout(predicate::str::contains("return name").not());
+        .success();
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs() < 5,
+        "Processing 1000 functions via stdin took {:?}, which exceeds the 5s acceptance bound",
+        elapsed
+    );
 }
