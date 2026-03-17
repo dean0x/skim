@@ -49,8 +49,7 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim file.rs | bat -l rust               Skim Rust and highlight\n  \
     cat code.ts | skim - --lang=ts           Read from stdin with --lang alias\n  \
     skim - -l python < script.py             Short form language flag\n  \
-    git show HEAD:main.rs | skim - --filename=main.rs\n  \
-                                             Detect language from filename hint\n  \
+    skim - --filename=main.rs < main.rs      Detect language from filename hint\n  \
     skim src/                                Process all files in directory recursively\n  \
     skim 'src/**/*.ts'                       Process all TypeScript files (glob pattern)\n  \
     skim '*.{js,ts}' --no-header             Process multiple files without headers\n  \
@@ -74,11 +73,8 @@ struct Args {
     language: Option<LanguageArg>,
 
     /// Filename hint for language detection when reading from stdin
-    #[arg(
-        long,
-        value_name = "NAME",
-        help = "Filename hint for stdin language detection (e.g., main.rs)"
-    )]
+    #[arg(long, value_name = "NAME")]
+    #[arg(help = "Filename hint for stdin language detection (e.g., main.rs)")]
     filename: Option<String>,
 
     /// Force parsing even if language unsupported
