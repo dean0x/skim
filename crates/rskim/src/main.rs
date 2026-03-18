@@ -72,6 +72,13 @@ struct Args {
     #[arg(help = "Filename hint for stdin language detection (e.g., main.rs)")]
     filename: Option<String>,
 
+    /// Deprecated: accepted for backward compatibility but has no effect.
+    ///
+    /// This flag was dead code (never referenced in logic) and will be
+    /// removed in a future major version. Hidden from --help output.
+    #[arg(long, hide = true)]
+    _force: bool,
+
     /// Disable file headers when processing multiple files
     #[arg(long, help = "Don't print file path headers for multi-file output")]
     no_header: bool,
@@ -267,7 +274,9 @@ fn main() -> anyhow::Result<()> {
     let max_lines = args.max_lines;
     let token_budget = args.tokens;
 
-    let file = args.file.expect("FILE is required (enforced by clap)");
+    let file = args
+        .file
+        .ok_or_else(|| anyhow::anyhow!("FILE argument is required"))?;
 
     let process_options = process::ProcessOptions {
         mode,
