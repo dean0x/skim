@@ -41,33 +41,33 @@ struct CacheEntry {
 
 /// Data returned on a successful cache lookup.
 #[derive(Debug)]
-pub struct CacheHit {
+pub(crate) struct CacheHit {
     /// Transformed output content.
-    pub content: String,
+    pub(crate) content: String,
     /// Original token count (if available).
-    pub original_tokens: Option<usize>,
+    pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if available).
-    pub transformed_tokens: Option<usize>,
+    pub(crate) transformed_tokens: Option<usize>,
 }
 
 /// Parameters for writing a cache entry.
-pub struct CacheWriteParams<'a> {
+pub(crate) struct CacheWriteParams<'a> {
     /// Path to the source file.
-    pub path: &'a Path,
+    pub(crate) path: &'a Path,
     /// Transformation mode used for the cache key.
-    pub mode: Mode,
+    pub(crate) mode: Mode,
     /// Transformed output to cache.
-    pub content: &'a str,
+    pub(crate) content: &'a str,
     /// Original token count (if computed).
-    pub original_tokens: Option<usize>,
+    pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if computed).
-    pub transformed_tokens: Option<usize>,
+    pub(crate) transformed_tokens: Option<usize>,
     /// Maximum output lines (part of cache key).
-    pub max_lines: Option<usize>,
+    pub(crate) max_lines: Option<usize>,
     /// Token budget (part of cache key).
-    pub token_budget: Option<usize>,
+    pub(crate) token_budget: Option<usize>,
     /// Effective mode after cascade (diagnostic metadata only).
-    pub effective_mode: Option<Mode>,
+    pub(crate) effective_mode: Option<Mode>,
 }
 
 /// Returns the platform-specific cache directory (`~/.cache/skim/` on Linux/macOS),
@@ -107,12 +107,21 @@ fn cache_key(
     let canonical_path = path.canonicalize()?;
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
-    let fmt_opt = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
-    let canonical_display = canonical_path.display();
-    let max_lines_str = fmt_opt(max_lines);
-    let token_budget_str = fmt_opt(token_budget);
-    let hash_input =
-        format!("{canonical_display}|{mtime_secs}|{mode:?}|{max_lines_str}|{token_budget_str}");
+    fn fmt_opt(opt: Option<usize>) -> String {
+        match opt {
+            Some(n) => n.to_string(),
+            None => "none".to_string(),
+        }
+    }
+
+    let hash_input = format!(
+        "{}|{}|{:?}|{}|{}",
+        canonical_path.display(),
+        mtime_secs,
+        mode,
+        fmt_opt(max_lines),
+        fmt_opt(token_budget),
+    );
 
     let mut hasher = Sha256::new();
     hasher.update(hash_input.as_bytes());
@@ -123,7 +132,7 @@ fn cache_key(
 /// Read cached output if valid (mtime matches).
 ///
 /// Returns a [`CacheHit`] on cache hit, `None` on miss.
-pub fn read_cache(
+pub(crate) fn read_cache(
     path: &Path,
     mode: Mode,
     max_lines: Option<usize>,
@@ -157,7 +166,7 @@ pub fn read_cache(
 }
 
 /// Write transformed output to cache.
-pub fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
+pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
     let metadata = fs::metadata(params.path)?;
     let mtime = metadata.modified()?;
 
@@ -199,7 +208,7 @@ pub fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
 /// Removes all files inside the cache directory rather than the directory
 /// itself. This avoids ENOTEMPTY races when concurrent processes write
 /// cache entries during deletion.
-pub fn clear_cache() -> Result<()> {
+pub(crate) fn clear_cache() -> Result<()> {
     let cache_dir = get_cache_dir()?;
 
     if cache_dir.exists() {
