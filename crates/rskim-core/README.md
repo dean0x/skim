@@ -12,8 +12,8 @@ Core library for smart code reading and transformation.
 
 ## Features
 
-- **6 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java
-- **4 Transformation Modes**: Structure, Signatures, Types, Full
+- **12 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
+- **5 Transformation Modes**: Structure, Signatures, Types, Minimal, Full
 - **Fast**: 14.6ms for 3000-line files (verified benchmarks)
 - **Safe**: Built-in DoS protections and memory limits
 - **Zero-copy**: Efficient string slicing where possible
@@ -23,7 +23,7 @@ Core library for smart code reading and transformation.
 
 ```toml
 [dependencies]
-rskim-core = "0.3"
+rskim-core = "1.0"
 ```
 
 ## Usage
@@ -101,6 +101,12 @@ let result = transform_auto(
 | Rust | `.rs` | Full support |
 | Go | `.go` | Full support |
 | Java | `.java` | Full support |
+| C | `.c`, `.h` | Full support |
+| C++ | `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` | Full support |
+| Markdown | `.md`, `.markdown` | Full support |
+| JSON | `.json` | Full support |
+| YAML | `.yaml`, `.yml` | Full support |
+| TOML | `.toml` | Full support |
 
 ## Security
 

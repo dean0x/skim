@@ -67,11 +67,12 @@ skim --clear-cache
 
 ## Features
 
-- **6 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java
-- **4 Transformation Modes**: Structure, Signatures, Types, Full
+- **12 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
+- **5 Transformation Modes**: Structure, Signatures, Types, Minimal, Full
 - **Fast**: 14.6ms for 3000-line files (3x faster than target)
 - **Cached**: 40-50x speedup on repeated processing (enabled by default)
 - **Multi-file**: Glob patterns with parallel processing (`skim 'src/**/*.ts'`)
+- **Token Budget**: Cascade through modes to fit a target token count (`--tokens N`)
 - **Token Stats**: Show reduction statistics with `--show-stats`
 - **Streaming**: Outputs to stdout for pipe workflows
 - **Safe**: Built-in DoS protections
@@ -89,9 +90,13 @@ skim <FILE>
 ```bash
 Options:
   -m, --mode <MODE>         Transformation mode [default: structure]
-                            [possible values: structure, signatures, types, full]
-  -l, --language <LANGUAGE> Override language detection
-                            [possible values: typescript, javascript, python, rust, go, java]
+                            [possible values: structure, signatures, types, minimal, full]
+  -l, --language <LANGUAGE> Override language detection (alias: --lang)
+                            [possible values: typescript, javascript, python, rust, go, java,
+                             c, cpp, markdown, json, yaml, toml]
+      --filename <PATH>     Hint filename for stdin language detection
+      --tokens <N>          Target token budget (cascades through modes to fit)
+      --max-lines <N>       Maximum output lines (AST-aware truncation)
   -j, --jobs <JOBS>         Number of parallel jobs [default: number of CPUs]
       --no-header           Don't print file path headers for multi-file output
       --no-cache            Disable caching (caching is enabled by default)
@@ -234,6 +239,12 @@ cat *.py | skim - --language=python
 | Rust       | `.rs`              | ✅            |
 | Go         | `.go`              | ✅            |
 | Java       | `.java`            | ✅            |
+| C          | `.c`, `.h`         | ✅            |
+| C++        | `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` | ✅ |
+| Markdown   | `.md`, `.markdown` | ✅            |
+| JSON       | `.json`            | ✅            |
+| YAML       | `.yaml`, `.yml`    | ✅            |
+| TOML       | `.toml`            | ✅            |
 
 ## Performance
 

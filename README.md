@@ -519,7 +519,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: Production ready (v0.6.0+)
+**Current**: v1.0.0 — Stable
 
 ✅ **Implemented:**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/Markdown/JSON/YAML/TOML support

@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-03-18
+
+This is the first stable release. All publicly exported types and functions in `rskim-core` are
+considered stable from this version forward. Users on `rskim-core = "0.9"` should update their
+dependency to `rskim-core = "1.0"`.
+
+### Added
+- **Minimal Mode** (`--mode=minimal`) — aggressive transformation for maximum token reduction
+- **Token Budget** (`--tokens N`) — cascade through modes to fit a target token count
+- **Max Lines** (`--max-lines N`) — AST-aware smart truncation
+- **C Language Support** — full C11 with tree-sitter
+- **C++ Language Support** — C++20 including templates, namespaces, classes
+- **TOML Language Support** — serde-based structure extraction
+- **`--lang` alias** for `--language` flag
+- **`--filename` flag** for stdin language detection from path
+- **Skimmer plugin** for Claude Code — codebase orientation agent
+
+### Changed
+- Public API marked stable (`rskim-core` exports considered stable from this release)
+- Unified node-kind tables and marker budget handling
+- Encapsulated `truncate_to_token_budget` behind stable public API
+
+### Fixed
+- Eliminated redundant tokenization and binary search allocation churn
+- Wave 1 tech debt cleanup (from issue #28)
+
+### Performance
+- Token budget cascade avoids re-parsing and redundant token counting
+
+### Testing
+- 145 tests passing (134 unit + 11 doc-tests)
+- 12 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
+
 ## [0.9.0] - 2026-03-16
 
 ### Added
@@ -461,18 +494,9 @@ npx rskim file.ts  # no install required
 
 ---
 
-## Roadmap
-
-### v0.5.0 (Future)
-- **Streaming API** - Process large files incrementally
-- **Custom Modes** - User-defined transformation rules via config
-- **Watch Mode** - Auto-transform on file changes
-- **Language Server** - LSP integration for editor plugins
-
----
-
 ## Version History
 
+- **1.0.0** (2026-03-18): First stable release — minimal mode, token budgets, max-lines, C/C++/TOML, skimmer plugin
 - **0.9.0** (2026-03-16): C, C++, and TOML language support (12 languages total, 400 tests)
 - **0.8.0** (2025-12-06): YAML language support
 - **0.4.0** (2025-10-17): Multi-file glob support, caching, parallel processing, token counting (Phase 3 complete)
