@@ -8,5 +8,6 @@
   "license": "MIT",
   "keywords": ["codebase", "orientation", "structure", "code-reader"],
   "agents": ["./agents/skimmer.md"],
-  "commands": ["./commands/skim.md"]
+  "commands": ["./commands/skim.md"],
+  "skills": ["./skills/skim/"]
 }
