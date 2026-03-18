@@ -10,10 +10,17 @@ Skimmer is a Claude Code plugin that orients you in unfamiliar codebases. It use
 
 ## Install
 
-```
-/plugin marketplace add dean0x/skimmer
-/plugin install skimmer@dean0x-skimmer
-```
+1. **Add the marketplace** (registers the plugin catalog):
+
+   ```
+   /plugin marketplace add dean0x/skimmer
+   ```
+
+2. **Install the plugin**:
+
+   ```
+   /plugin install skimmer@dean0x-skimmer
+   ```
 
 ## Usage
 
