@@ -19,7 +19,7 @@ fn get_tokenizer() -> &'static CoreBPE {
 }
 
 /// Count tokens in text using cl100k_base encoding (GPT-3.5-turbo, GPT-4)
-pub fn count_tokens(text: &str) -> Result<usize> {
+pub(crate) fn count_tokens(text: &str) -> Result<usize> {
     let tokenizer = get_tokenizer();
     let tokens = tokenizer.encode_with_special_tokens(text);
     Ok(tokens.len())
@@ -27,16 +27,16 @@ pub fn count_tokens(text: &str) -> Result<usize> {
 
 /// Statistics for token reduction
 #[derive(Debug, Clone)]
-pub struct TokenStats {
+pub(crate) struct TokenStats {
     /// Original token count
-    pub original: usize,
+    pub(crate) original: usize,
     /// Transformed token count
-    pub transformed: usize,
+    pub(crate) transformed: usize,
 }
 
 impl TokenStats {
     /// Create new token stats
-    pub fn new(original: usize, transformed: usize) -> Self {
+    pub(crate) fn new(original: usize, transformed: usize) -> Self {
         Self {
             original,
             transformed,
@@ -44,7 +44,7 @@ impl TokenStats {
     }
 
     /// Calculate reduction percentage (negative if transformed is larger)
-    pub fn reduction_percentage(&self) -> f32 {
+    pub(crate) fn reduction_percentage(&self) -> f32 {
         if self.original == 0 {
             return 0.0;
         }
@@ -53,12 +53,12 @@ impl TokenStats {
 
     /// Get tokens saved
     #[allow(dead_code)]
-    pub fn tokens_saved(&self) -> usize {
+    pub(crate) fn tokens_saved(&self) -> usize {
         self.original.saturating_sub(self.transformed)
     }
 
     /// Format stats for display
-    pub fn format(&self) -> String {
+    pub(crate) fn format(&self) -> String {
         format!(
             "{} tokens → {} tokens ({:.1}% reduction)",
             format_number(self.original),
