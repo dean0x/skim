@@ -36,6 +36,7 @@ pub(crate) struct ProcessOptions {
 
 /// Result of processing a file
 #[derive(Debug)]
+#[must_use]
 pub(crate) struct ProcessResult {
     /// Transformed output
     pub(crate) output: String,
@@ -160,7 +161,13 @@ fn run_transform(
     if let Some(budget) = options.token_budget {
         let language = explicit_lang
             .or_else(|| detect_language_from_path(path))
-            .unwrap_or(Language::TypeScript);
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "[skim] warning: language detection failed for '{}', defaulting to TypeScript",
+                    path.display(),
+                );
+                Language::TypeScript
+            });
 
         cascade::cascade_for_token_budget(
             options.mode,
@@ -201,7 +208,7 @@ pub(crate) fn process_stdin(
         );
     }
 
-    let filename_lang = filename_hint.and_then(|f| Language::from_path(std::path::Path::new(f)));
+    let filename_lang = filename_hint.and_then(|f| Language::from_path(Path::new(f)));
 
     let language = options.explicit_lang.or(filename_lang).ok_or_else(|| {
         if let Some(fname) = filename_hint {
@@ -283,4 +290,82 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // count_token_pair tests
+    // ========================================================================
+
+    #[test]
+    fn count_token_pair_returns_some_for_valid_input() {
+        let (orig, trans) = count_token_pair("hello world", "hello");
+        assert!(orig.is_some(), "original tokens should be Some");
+        assert!(trans.is_some(), "transformed tokens should be Some");
+        assert!(
+            orig.unwrap() > trans.unwrap(),
+            "original should have more tokens than transformed"
+        );
+    }
+
+    #[test]
+    fn count_token_pair_returns_some_for_empty_strings() {
+        let (orig, trans) = count_token_pair("", "");
+        assert_eq!(orig, Some(0));
+        assert_eq!(trans, Some(0));
+    }
+
+    #[test]
+    fn count_token_pair_original_equals_transformed_for_identical_input() {
+        let text = "fn main() { println!(\"hello\"); }";
+        let (orig, trans) = count_token_pair(text, text);
+        assert_eq!(orig, trans);
+    }
+
+    // ========================================================================
+    // report_token_stats tests
+    // ========================================================================
+
+    #[test]
+    fn report_token_stats_does_not_panic_with_none_values() {
+        // Should be a no-op when tokens are None
+        report_token_stats(None, None, "");
+        report_token_stats(Some(100), None, "");
+        report_token_stats(None, Some(50), "");
+    }
+
+    #[test]
+    fn report_token_stats_does_not_panic_with_valid_values() {
+        // Should write to stderr without panicking
+        report_token_stats(Some(1000), Some(200), " (test)");
+    }
+
+    // ========================================================================
+    // read_and_validate tests
+    // ========================================================================
+
+    #[test]
+    fn read_and_validate_rejects_nonexistent_file() {
+        let result = read_and_validate(Path::new("/nonexistent/file.txt"));
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // ProcessResult #[must_use] compile-time guard
+    // ========================================================================
+
+    #[test]
+    fn process_result_fields_accessible() {
+        let result = ProcessResult {
+            output: "test".to_string(),
+            original_tokens: Some(10),
+            transformed_tokens: Some(5),
+        };
+        assert_eq!(result.output, "test");
+        assert_eq!(result.original_tokens, Some(10));
+        assert_eq!(result.transformed_tokens, Some(5));
+    }
 }
