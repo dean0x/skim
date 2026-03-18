@@ -27,6 +27,11 @@
 //! # Ok::<(), rskim_core::SkimError>(())
 //! ```
 //!
+//! # API Stability
+//!
+//! As of v1.0.0, all publicly exported types and functions are considered stable.
+//! Breaking changes will follow semver (major version bump).
+//!
 //! # Design Principles
 //!
 //! 1. **Zero-copy where possible** - Use `&str` slices, avoid allocations
@@ -34,7 +39,7 @@
 //! 3. **Dependency injection** - NO global state
 //! 4. **Type-first** - Complete type schema before implementation
 
-// Re-export core types for public API
+// Public API — stable as of v1.0.0
 pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
 mod parser;
