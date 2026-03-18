@@ -38,6 +38,32 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
         );
     }
 
+    // Reject Windows drive letter paths (e.g., "C:\..." or "D:/...")
+    if pattern.len() >= 3 {
+        let bytes = pattern.as_bytes();
+        if bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
+            anyhow::bail!(
+                "Glob pattern must be relative (absolute Windows path not allowed)\n\
+                 Pattern: {}\n\
+                 Use relative paths like 'src/**/*.ts' instead",
+                pattern
+            );
+        }
+    }
+
+    // Reject Windows UNC paths (e.g., "\\server\share")
+    if pattern.starts_with("\\\\") {
+        anyhow::bail!(
+            "Glob pattern must be relative (UNC path not allowed)\n\
+             Pattern: {}\n\
+             Use relative paths like 'src/**/*.ts' instead",
+            pattern
+        );
+    }
+
     // Reject patterns containing .. (parent directory traversal)
     if pattern.contains("..") {
         anyhow::bail!(
@@ -104,14 +130,13 @@ fn process_files(
                 write!(writer, "{}", process_result.output)?;
                 success_count += 1;
 
-                if options.process.show_stats {
-                    if let (Some(orig), Some(trans)) = (
-                        process_result.original_tokens,
-                        process_result.transformed_tokens,
-                    ) {
-                        total_original_tokens += orig;
-                        total_transformed_tokens += trans;
-                    }
+                if let (true, Some(orig), Some(trans)) = (
+                    options.process.show_stats,
+                    process_result.original_tokens,
+                    process_result.transformed_tokens,
+                ) {
+                    total_original_tokens += orig;
+                    total_transformed_tokens += trans;
                 }
             }
             Err(e) => {
@@ -231,5 +256,68 @@ mod tests {
         assert!(has_glob_pattern("file[123].rs"));
         assert!(!has_glob_pattern("file.ts"));
         assert!(!has_glob_pattern("src/main.rs"));
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_rejects_absolute_unix_paths() {
+        let result = validate_glob_pattern("/etc/passwd");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("cannot start with '/'"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_rejects_absolute_path_with_glob() {
+        let result = validate_glob_pattern("/src/**/*.ts");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("cannot start with '/'"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_rejects_parent_traversal() {
+        let result = validate_glob_pattern("../secret/*.ts");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("parent directory traversal"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_rejects_embedded_parent_traversal() {
+        let result = validate_glob_pattern("src/../../etc/passwd");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("parent directory traversal"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_rejects_windows_drive_paths() {
+        let result = validate_glob_pattern("C:\\Users\\*.ts");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("absolute Windows path"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_rejects_windows_unc_paths() {
+        let result = validate_glob_pattern("\\\\server\\share\\*.ts");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("UNC path"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_accepts_valid_relative_patterns() {
+        assert!(validate_glob_pattern("src/**/*.ts").is_ok());
+        assert!(validate_glob_pattern("*.rs").is_ok());
+        assert!(validate_glob_pattern("tests/fixtures/*.py").is_ok());
+        assert!(validate_glob_pattern("**/*.{js,ts}").is_ok());
+    }
+
+    #[test]
+    fn test_validate_glob_pattern_accepts_tilde_prefix() {
+        // Tilde is not expanded by the glob crate (treated as literal),
+        // so it is safe to allow as a relative pattern component.
+        assert!(validate_glob_pattern("~/*.ts").is_ok());
     }
 }
