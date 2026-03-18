@@ -1,0 +1,288 @@
+//! Single-file processing pipeline.
+//!
+//! Handles reading, transforming, caching, and outputting a single file or
+//! stdin stream. Multi-file orchestration lives in [`crate::multi`].
+
+use std::fs;
+use std::io::{self, BufWriter, Read, Write};
+use std::path::Path;
+
+use rskim_core::{
+    detect_language_from_path, transform_auto_with_config, transform_with_config, Language, Mode,
+    TransformConfig,
+};
+
+use crate::{cache, cascade, tokens};
+
+/// Maximum input size to prevent memory exhaustion (50MB)
+const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Options for processing a single file
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProcessOptions {
+    /// Transformation mode
+    pub(crate) mode: Mode,
+    /// Explicit language override (None for auto-detection)
+    pub(crate) explicit_lang: Option<Language>,
+    /// Whether to use cache
+    pub(crate) use_cache: bool,
+    /// Whether to compute token statistics (for --show-stats)
+    pub(crate) show_stats: bool,
+    /// Maximum output lines (AST-aware truncation)
+    pub(crate) max_lines: Option<usize>,
+    /// Token budget for cascade mode
+    pub(crate) token_budget: Option<usize>,
+}
+
+/// Result of processing a file
+#[derive(Debug)]
+pub(crate) struct ProcessResult {
+    /// Transformed output
+    pub(crate) output: String,
+    /// Original token count (if computed)
+    pub(crate) original_tokens: Option<usize>,
+    /// Transformed token count (if computed)
+    pub(crate) transformed_tokens: Option<usize>,
+}
+
+/// Report token statistics to stderr if token counts are available
+pub(crate) fn report_token_stats(
+    original_tokens: Option<usize>,
+    transformed_tokens: Option<usize>,
+    suffix: &str,
+) {
+    if let (Some(orig), Some(trans)) = (original_tokens, transformed_tokens) {
+        let stats = tokens::TokenStats::new(orig, trans);
+        eprintln!("\n[skim] {}{}", stats.format(), suffix);
+    }
+}
+
+/// Write a single-input result to stdout and optionally report token stats to stderr.
+///
+/// Used by both `process_stdin` and the single-file path in `main()`.
+/// Multi-file paths use their own output logic in `process_files()`.
+pub(crate) fn write_result_and_stats(
+    result: &ProcessResult,
+    show_stats: bool,
+) -> anyhow::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    write!(writer, "{}", result.output)?;
+    writer.flush()?;
+
+    if show_stats {
+        report_token_stats(result.original_tokens, result.transformed_tokens, "");
+    }
+
+    Ok(())
+}
+
+/// Try to return a result from cache, handling token recount when needed.
+///
+/// Returns `Some(ProcessResult)` on cache hit, `None` on cache miss.
+/// When stats are requested but the cached entry lacks token counts,
+/// the original file is read to compute them on the fly.
+fn try_cached_result(
+    path: &Path,
+    options: &ProcessOptions,
+) -> anyhow::Result<Option<ProcessResult>> {
+    if !options.use_cache {
+        return Ok(None);
+    }
+
+    let Some(hit) = cache::read_cache(path, options.mode, options.max_lines, options.token_budget)
+    else {
+        return Ok(None);
+    };
+
+    // If stats are requested but the cache entry was written without them,
+    // read the original file and count tokens for both source and output.
+    let needs_recount = options.show_stats && hit.original_tokens.is_none();
+    let (orig_tokens, trans_tokens) = if needs_recount {
+        let contents = read_and_validate(path)?;
+        match (
+            tokens::count_tokens(&contents),
+            tokens::count_tokens(&hit.content),
+        ) {
+            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+            _ => (None, None),
+        }
+    } else {
+        (hit.original_tokens, hit.transformed_tokens)
+    };
+
+    Ok(Some(ProcessResult {
+        output: hit.content,
+        original_tokens: orig_tokens,
+        transformed_tokens: trans_tokens,
+    }))
+}
+
+/// Read a file and validate it doesn't exceed the maximum input size.
+fn read_and_validate(path: &Path) -> anyhow::Result<String> {
+    let contents = fs::read_to_string(path)?;
+    if contents.len() > MAX_INPUT_SIZE {
+        anyhow::bail!(
+            "File too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+            contents.len(),
+            MAX_INPUT_SIZE,
+            MAX_INPUT_SIZE / 1024 / 1024
+        );
+    }
+    Ok(contents)
+}
+
+/// Transform file contents, trying auto-detection first and falling back to
+/// `explicit_lang` when provided. Returns `(transformed_output, mode_used)`.
+fn run_transform(
+    contents: &str,
+    path: &Path,
+    options: &ProcessOptions,
+) -> anyhow::Result<(String, Mode)> {
+    let explicit_lang = options.explicit_lang;
+    let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
+        match transform_auto_with_config(contents, path, config) {
+            Ok(output) => Ok(Some(output)),
+            Err(e) => match explicit_lang {
+                Some(language) => Ok(Some(transform_with_config(contents, language, config)?)),
+                None => Err(e.into()),
+            },
+        }
+    };
+
+    if let Some(budget) = options.token_budget {
+        let language = explicit_lang
+            .or_else(|| detect_language_from_path(path))
+            .unwrap_or(Language::TypeScript);
+
+        cascade::cascade_for_token_budget(
+            options.mode,
+            options.max_lines,
+            budget,
+            language,
+            transform_file,
+        )
+    } else {
+        let config = cascade::build_config(options.mode, options.max_lines);
+        let output = transform_file(&config)?.ok_or_else(|| {
+            anyhow::anyhow!("Language detection failed and no --language specified")
+        })?;
+        Ok((output, options.mode))
+    }
+}
+
+/// Process stdin input and return transformed content with optional token statistics.
+///
+/// Reads from stdin with a size limit, resolves the language from `--language` or
+/// `--filename`, transforms the source (with optional token-budget cascade), and
+/// computes token stats when `show_stats` is enabled.
+pub(crate) fn process_stdin(
+    options: ProcessOptions,
+    filename_hint: Option<&str>,
+) -> anyhow::Result<ProcessResult> {
+    let mut buffer = String::with_capacity(64 * 1024);
+    let bytes_read = io::stdin()
+        .take(MAX_INPUT_SIZE as u64 + 1)
+        .read_to_string(&mut buffer)?;
+
+    if bytes_read > MAX_INPUT_SIZE {
+        anyhow::bail!(
+            "Input too large: {} bytes exceeds maximum of {} bytes ({}MB)",
+            bytes_read,
+            MAX_INPUT_SIZE,
+            MAX_INPUT_SIZE / 1024 / 1024
+        );
+    }
+
+    let filename_lang = filename_hint.and_then(|f| Language::from_path(std::path::Path::new(f)));
+
+    let language = options.explicit_lang.or(filename_lang).ok_or_else(|| {
+        if let Some(fname) = filename_hint {
+            anyhow::anyhow!(
+                "Language detection failed: unrecognized filename '{}'\n\
+                 Supported extensions: .ts, .tsx, .js, .jsx, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
+                 Hint: use --language to specify the language explicitly\n\
+                 Example: cat file | skim - --language=typescript",
+                fname
+            )
+        } else {
+            anyhow::anyhow!(
+                "Language detection failed: reading from stdin requires --language or --filename\n\
+                 Example: cat file.ts | skim - --language=typescript\n\
+                 Example: git show HEAD:main.rs | skim - --filename=main.rs"
+            )
+        }
+    })?;
+
+    let output = if let Some(budget) = options.token_budget {
+        let (output, _mode_used) = cascade::cascade_for_token_budget(
+            options.mode,
+            options.max_lines,
+            budget,
+            language,
+            |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
+        )?;
+        output
+    } else {
+        let config = cascade::build_config(options.mode, options.max_lines);
+        transform_with_config(&buffer, language, &config)?
+    };
+
+    let (orig_tokens, trans_tokens) = if options.show_stats {
+        match (tokens::count_tokens(&buffer), tokens::count_tokens(&output)) {
+            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(ProcessResult {
+        output,
+        original_tokens: orig_tokens,
+        transformed_tokens: trans_tokens,
+    })
+}
+
+/// Process a single file and return transformed content with optional token statistics.
+pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
+    if let Some(result) = try_cached_result(path, &options)? {
+        return Ok(result);
+    }
+
+    let contents = read_and_validate(path)?;
+    let (result, mode_used) = run_transform(&contents, path, &options)?;
+
+    let (orig_tokens, trans_tokens) = if options.show_stats {
+        match (
+            tokens::count_tokens(&contents),
+            tokens::count_tokens(&result),
+        ) {
+            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    if options.use_cache {
+        let effective_mode = (mode_used != options.mode).then_some(mode_used);
+        // Cache write failures are non-fatal; don't fail the transformation.
+        let _ = cache::write_cache(&cache::CacheWriteParams {
+            path,
+            mode: options.mode,
+            content: &result,
+            original_tokens: orig_tokens,
+            transformed_tokens: trans_tokens,
+            max_lines: options.max_lines,
+            token_budget: options.token_budget,
+            effective_mode,
+        });
+    }
+
+    Ok(ProcessResult {
+        output: result,
+        original_tokens: orig_tokens,
+        transformed_tokens: trans_tokens,
+    })
+}
