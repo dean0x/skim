@@ -12,6 +12,7 @@ Skimmer is a Claude Code plugin that orients you in unfamiliar codebases. It use
 
 ```
 /plugin marketplace add dean0x/skimmer
+/plugin install skimmer@dean0x-skimmer
 ```
 
 ## Usage
@@ -23,6 +24,8 @@ Skimmer is a Claude Code plugin that orients you in unfamiliar codebases. It use
 # General codebase orientation
 /skim
 ```
+
+Claude also auto-invokes Skimmer when it detects you need codebase orientation — no command needed.
 
 **With a task description**, Skimmer focuses its search on files, functions, and patterns relevant to that task and suggests where to integrate.
 
@@ -45,13 +48,14 @@ Skimmer generates a structured report:
 
 ## How it works
 
-1. **Detect project type** from manifest files (`package.json`, `Cargo.toml`, etc.)
-2. **Map source directories** and skim them with `rskim --mode structure`
-3. **Search for task-relevant code** using Grep/Glob, then skim matches with `--mode signatures`
-4. **Identify integration points** — entry points, public exports, configuration patterns
-5. **Generate the orientation report**
+1. **Verify rskim** — checks `npx rskim --version` before starting
+2. **Detect project type** from manifest files (`package.json`, `Cargo.toml`, etc.)
+3. **Map source directories** and skim them with `npx rskim --mode structure`
+4. **Search for task-relevant code** using Grep/Glob for file discovery, then `npx rskim --mode signatures` for structure extraction
+5. **Identify integration points** — entry points, public exports, configuration patterns
+6. **Generate the orientation report**
 
-If `rskim` isn't available, the agent falls back to manual exploration using Glob, Grep, and Read.
+All source code reading goes through `rskim` — the agent never falls back to `cat` or `Read` for source files. If `rskim` isn't available, the agent reports the error and falls back to Glob/Grep for manual exploration.
 
 ## Requirements
 
