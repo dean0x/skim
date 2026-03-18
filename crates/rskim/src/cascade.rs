@@ -8,6 +8,10 @@ use rskim_core::{truncate_to_token_budget, Language, Mode, TransformConfig};
 
 use crate::tokens;
 
+/// Error message when no transformation mode produces output.
+const NO_OUTPUT_MSG: &str = "Token budget cascade: no transformation mode produced output. \
+    Ensure the file is in a supported language or specify --language.";
+
 /// Build a `TransformConfig` from mode and optional max_lines.
 pub(crate) fn build_config(mode: Mode, max_lines: Option<usize>) -> TransformConfig {
     let mut config = TransformConfig::with_mode(mode);
@@ -116,10 +120,7 @@ where
     // Guard: no mode produced output (defensive; transform_fn currently always
     // returns Ok(Some(...)), but protects against future callers returning Ok(None)).
     if last_output.is_empty() {
-        anyhow::bail!(
-            "Token budget cascade: no transformation mode produced output. \
-             Ensure the file is in a supported language or specify --language."
-        );
+        anyhow::bail!(NO_OUTPUT_MSG);
     }
 
     fallback_line_truncate(
@@ -146,13 +147,7 @@ fn cascade_serde<F>(
 where
     F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
 {
-    // Try starting mode first
-    let first_output = transform_fn(config)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Token budget cascade: no transformation mode produced output. \
-                 Ensure the file is in a supported language or specify --language."
-        )
-    })?;
+    let first_output = transform_fn(config)?.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
 
     let first_tokens = count_tokens_or_max(&first_output);
     if first_tokens <= token_budget {

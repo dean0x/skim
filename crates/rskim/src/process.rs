@@ -45,6 +45,19 @@ pub(crate) struct ProcessResult {
     pub(crate) transformed_tokens: Option<usize>,
 }
 
+/// Count tokens for both original and transformed text, returning `(None, None)` on failure.
+///
+/// Centralises the paired token-counting pattern used across the processing pipeline.
+fn count_token_pair(original: &str, transformed: &str) -> (Option<usize>, Option<usize>) {
+    match (
+        tokens::count_tokens(original),
+        tokens::count_tokens(transformed),
+    ) {
+        (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+        _ => (None, None),
+    }
+}
+
 /// Report token statistics to stderr if token counts are available
 pub(crate) fn report_token_stats(
     original_tokens: Option<usize>,
@@ -100,13 +113,7 @@ fn try_cached_result(
     let needs_recount = options.show_stats && hit.original_tokens.is_none();
     let (orig_tokens, trans_tokens) = if needs_recount {
         let contents = read_and_validate(path)?;
-        match (
-            tokens::count_tokens(&contents),
-            tokens::count_tokens(&hit.content),
-        ) {
-            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
-            _ => (None, None),
-        }
+        count_token_pair(&contents, &hit.content)
     } else {
         (hit.original_tokens, hit.transformed_tokens)
     };
@@ -229,10 +236,7 @@ pub(crate) fn process_stdin(
     };
 
     let (orig_tokens, trans_tokens) = if options.show_stats {
-        match (tokens::count_tokens(&buffer), tokens::count_tokens(&output)) {
-            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
-            _ => (None, None),
-        }
+        count_token_pair(&buffer, &output)
     } else {
         (None, None)
     };
@@ -254,13 +258,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     let (result, mode_used) = run_transform(&contents, path, &options)?;
 
     let (orig_tokens, trans_tokens) = if options.show_stats {
-        match (
-            tokens::count_tokens(&contents),
-            tokens::count_tokens(&result),
-        ) {
-            (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
-            _ => (None, None),
-        }
+        count_token_pair(&contents, &result)
     } else {
         (None, None)
     };
