@@ -117,10 +117,12 @@ fn process_files(
     let mut total_original_tokens = 0usize;
     let mut total_transformed_tokens = 0usize;
 
+    let show_headers = !options.no_header && paths.len() > 1;
+
     for (idx, (path, result)) in results.iter().enumerate() {
         match result {
             Ok(process_result) => {
-                if !options.no_header && paths.len() > 1 {
+                if show_headers {
                     if idx > 0 {
                         writeln!(writer)?;
                     }
@@ -130,8 +132,7 @@ fn process_files(
                 write!(writer, "{}", process_result.output)?;
                 success_count += 1;
 
-                if let (true, Some(orig), Some(trans)) = (
-                    options.process.show_stats,
+                if let (Some(orig), Some(trans)) = (
                     process_result.original_tokens,
                     process_result.transformed_tokens,
                 ) {

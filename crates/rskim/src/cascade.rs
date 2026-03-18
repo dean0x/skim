@@ -22,8 +22,6 @@ pub(crate) fn build_config(mode: Mode, max_lines: Option<usize>) -> TransformCon
 }
 
 /// Count tokens, returning `usize::MAX` on failure (treats errors as over-budget).
-///
-/// Centralises the warning-on-error pattern used throughout the cascade logic.
 fn count_tokens_or_max(text: &str) -> usize {
     tokens::count_tokens(text).unwrap_or_else(|e| {
         eprintln!("[skim] warning: token counting failed, treating as over-budget: {e}");
@@ -70,13 +68,6 @@ pub(crate) fn cascade_for_token_budget<F>(
 where
     F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
 {
-    let cascade = starting_mode.cascade_from_here();
-    let mut last_output: Option<String> = None;
-    let mut last_mode = starting_mode;
-    let mut last_token_count: Option<usize> = None;
-
-    let mut config = build_config(starting_mode, max_lines);
-
     // Serde-based languages produce at most 2 distinct outputs regardless of mode:
     // - Full/Minimal: original source (passthrough)
     // - Structure/Signatures/Types: structure-extracted (all identical)
@@ -84,15 +75,20 @@ where
     if language.is_serde_based() {
         return cascade_serde(
             starting_mode,
-            &mut config,
+            max_lines,
             token_budget,
             language,
             &transform_fn,
         );
     }
 
+    let cascade = starting_mode.cascade_from_here();
+    let mut last_output: Option<String> = None;
+    let mut last_mode = starting_mode;
+    let mut last_token_count: Option<usize> = None;
+
     for &mode in cascade {
-        config.mode = mode;
+        let config = build_config(mode, max_lines);
 
         let Some(output) = transform_fn(&config)? else {
             continue;
@@ -137,7 +133,7 @@ where
 /// This avoids up to 3 redundant parse+transform cycles in the generic cascade.
 fn cascade_serde<F>(
     starting_mode: Mode,
-    config: &mut TransformConfig,
+    max_lines: Option<usize>,
     token_budget: usize,
     language: Language,
     transform_fn: &F,
@@ -145,7 +141,8 @@ fn cascade_serde<F>(
 where
     F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
 {
-    let first_output = transform_fn(config)?.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
+    let config = build_config(starting_mode, max_lines);
+    let first_output = transform_fn(&config)?.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
 
     let first_tokens = count_tokens_or_max(&first_output);
     if first_tokens <= token_budget {
@@ -154,8 +151,8 @@ where
 
     // If starting at Full/Minimal, try structure-extracted (the only other distinct output)
     if matches!(starting_mode, Mode::Full | Mode::Minimal) {
-        config.mode = Mode::Structure;
-        if let Some(extracted) = transform_fn(config)? {
+        let structure_config = build_config(Mode::Structure, max_lines);
+        if let Some(extracted) = transform_fn(&structure_config)? {
             let extracted_tokens = count_tokens_or_max(&extracted);
             if extracted_tokens <= token_budget {
                 eprintln!(

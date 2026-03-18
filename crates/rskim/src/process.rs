@@ -149,39 +149,44 @@ fn run_transform(
 ) -> anyhow::Result<(String, Mode)> {
     let explicit_lang = options.explicit_lang;
     let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
-        match transform_auto_with_config(contents, path, config) {
-            Ok(output) => Ok(Some(output)),
-            Err(e) => match explicit_lang {
-                Some(language) => Ok(Some(transform_with_config(contents, language, config)?)),
-                None => Err(e.into()),
-            },
+        // Try auto-detection first; fall back to explicit language if provided.
+        let auto_result = transform_auto_with_config(contents, path, config);
+        if let Ok(output) = auto_result {
+            return Ok(Some(output));
         }
+        let Some(language) = explicit_lang else {
+            return Err(auto_result.unwrap_err().into());
+        };
+        Ok(Some(transform_with_config(contents, language, config)?))
     };
 
-    if let Some(budget) = options.token_budget {
-        let language = explicit_lang
-            .or_else(|| detect_language_from_path(path))
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "[skim] warning: language detection failed for '{}', defaulting to TypeScript",
-                    path.display(),
-                );
-                Language::TypeScript
-            });
+    match options.token_budget {
+        Some(budget) => {
+            let language = explicit_lang
+                .or_else(|| detect_language_from_path(path))
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "[skim] warning: language detection failed for '{}', defaulting to TypeScript",
+                        path.display(),
+                    );
+                    Language::TypeScript
+                });
 
-        cascade::cascade_for_token_budget(
-            options.mode,
-            options.max_lines,
-            budget,
-            language,
-            transform_file,
-        )
-    } else {
-        let config = cascade::build_config(options.mode, options.max_lines);
-        let output = transform_file(&config)?.ok_or_else(|| {
-            anyhow::anyhow!("Language detection failed and no --language specified")
-        })?;
-        Ok((output, options.mode))
+            cascade::cascade_for_token_budget(
+                options.mode,
+                options.max_lines,
+                budget,
+                language,
+                transform_file,
+            )
+        }
+        None => {
+            let config = cascade::build_config(options.mode, options.max_lines);
+            let output = transform_file(&config)?.ok_or_else(|| {
+                anyhow::anyhow!("Language detection failed and no --language specified")
+            })?;
+            Ok((output, options.mode))
+        }
     }
 }
 
@@ -228,18 +233,21 @@ pub(crate) fn process_stdin(
         }
     })?;
 
-    let output = if let Some(budget) = options.token_budget {
-        let (output, _mode_used) = cascade::cascade_for_token_budget(
-            options.mode,
-            options.max_lines,
-            budget,
-            language,
-            |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
-        )?;
-        output
-    } else {
-        let config = cascade::build_config(options.mode, options.max_lines);
-        transform_with_config(&buffer, language, &config)?
+    let output = match options.token_budget {
+        Some(budget) => {
+            let (output, _mode) = cascade::cascade_for_token_budget(
+                options.mode,
+                options.max_lines,
+                budget,
+                language,
+                |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
+            )?;
+            output
+        }
+        None => {
+            let config = cascade::build_config(options.mode, options.max_lines);
+            transform_with_config(&buffer, language, &config)?
+        }
     };
 
     let (orig_tokens, trans_tokens) = if options.show_stats {

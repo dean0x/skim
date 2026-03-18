@@ -107,12 +107,21 @@ fn cache_key(
     let canonical_path = path.canonicalize()?;
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
-    let fmt_opt = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
-    let canonical_display = canonical_path.display();
-    let max_lines_str = fmt_opt(max_lines);
-    let token_budget_str = fmt_opt(token_budget);
-    let hash_input =
-        format!("{canonical_display}|{mtime_secs}|{mode:?}|{max_lines_str}|{token_budget_str}");
+    fn fmt_opt(opt: Option<usize>) -> String {
+        match opt {
+            Some(n) => n.to_string(),
+            None => "none".to_string(),
+        }
+    }
+
+    let hash_input = format!(
+        "{}|{}|{:?}|{}|{}",
+        canonical_path.display(),
+        mtime_secs,
+        mode,
+        fmt_opt(max_lines),
+        fmt_opt(token_budget),
+    );
 
     let mut hasher = Sha256::new();
     hasher.update(hash_input.as_bytes());
