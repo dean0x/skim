@@ -71,7 +71,7 @@ where
     F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
 {
     let cascade = starting_mode.cascade_from_here();
-    let mut last_output = String::new();
+    let mut last_output: Option<String> = None;
     let mut last_mode = starting_mode;
     let mut last_token_count: Option<usize> = None;
 
@@ -112,16 +112,14 @@ where
             return Ok((output, mode));
         }
 
-        last_output = output;
+        last_output = Some(output);
         last_mode = mode;
         last_token_count = Some(token_count);
     }
 
     // Guard: no mode produced output (defensive; transform_fn currently always
     // returns Ok(Some(...)), but protects against future callers returning Ok(None)).
-    if last_output.is_empty() {
-        anyhow::bail!(NO_OUTPUT_MSG);
-    }
+    let last_output = last_output.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
 
     fallback_line_truncate(
         &last_output,
@@ -295,6 +293,90 @@ mod tests {
 
         let result =
             cascade_for_token_budget(Mode::Structure, None, 100, Language::TypeScript, transform);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no transformation mode produced output"),);
+    }
+
+    // ── Serde cascade path tests ────────────────────────────────────────
+
+    #[test]
+    fn test_serde_cascade_returns_starting_mode_when_within_budget() {
+        // Serde language (JSON) with Full mode output fitting within budget
+        let source = "a b c d e f g h i j";
+        let mode_sizes = vec![(Mode::Full, 5), (Mode::Structure, 3)];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Full, None, 10, Language::Json, transform).unwrap();
+
+        assert_eq!(mode_used, Mode::Full);
+        assert_eq!(output, "a b c d e");
+    }
+
+    #[test]
+    fn test_serde_cascade_escalates_from_full_to_structure() {
+        // Serde language: Full mode exceeds budget, Structure fits
+        let source = "a b c d e f g h i j k l m n o p q r s t";
+        let mode_sizes = vec![(Mode::Full, 20), (Mode::Structure, 5)];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Full, None, 10, Language::Json, transform).unwrap();
+
+        assert_eq!(mode_used, Mode::Structure);
+        assert_eq!(output, "a b c d e");
+    }
+
+    #[test]
+    fn test_serde_cascade_full_to_structure_exceeds_falls_to_truncation() {
+        // Serde language: both Full and Structure exceed budget, falls to line truncation
+        let source = "a b c d e f g h i j k l m n o p q r s t";
+        let mode_sizes = vec![(Mode::Full, 20), (Mode::Structure, 15)];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Full, None, 5, Language::Json, transform).unwrap();
+
+        assert_eq!(mode_used, Mode::Structure);
+        let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
+        assert!(
+            token_count <= 5 || output.is_empty(),
+            "Expected within budget or empty after truncation, got {} tokens: {:?}",
+            token_count,
+            output
+        );
+    }
+
+    #[test]
+    fn test_serde_cascade_structure_start_exceeds_falls_to_truncation() {
+        // Serde language starting at Structure: exceeds budget, falls to line truncation
+        let source = "a b c d e f g h i j k l m n o p q r s t";
+        let mode_sizes = vec![(Mode::Structure, 20)];
+        let transform = mock_transform(source, &mode_sizes);
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, None, 5, Language::Yaml, transform).unwrap();
+
+        assert_eq!(mode_used, Mode::Structure);
+        let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
+        assert!(
+            token_count <= 5 || output.is_empty(),
+            "Expected within budget or empty after truncation, got {} tokens: {:?}",
+            token_count,
+            output
+        );
+    }
+
+    #[test]
+    fn test_serde_cascade_errors_when_no_output() {
+        // Serde language where transform returns None for starting mode
+        let transform = |_config: &TransformConfig| -> anyhow::Result<Option<String>> { Ok(None) };
+
+        let result = cascade_for_token_budget(Mode::Full, None, 100, Language::Toml, transform);
 
         assert!(result.is_err());
         assert!(result
