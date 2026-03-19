@@ -11,6 +11,7 @@
 
 mod cache;
 mod cascade;
+mod cmd;
 mod multi;
 mod process;
 mod tokens;
@@ -19,6 +20,129 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use rskim_core::{Language, Mode};
+
+// ============================================================================
+// Pre-parse routing (subcommand disambiguation)
+// ============================================================================
+
+/// Resolved invocation after pre-parse disambiguation.
+enum Invocation {
+    /// Classic file/directory/glob/stdin operation (existing behavior).
+    FileOperation,
+    /// A known subcommand with its remaining args.
+    Subcommand { name: String, args: Vec<String> },
+}
+
+/// Returns true if `flag` is a flag that consumes the next token as its value.
+///
+/// SYNC NOTE: If you add a new flag with a value to `Args`, add it here too.
+/// Failure to sync only causes a bug if the flag's value happens to match a
+/// known subcommand name AND no file with that name exists on disk.
+fn is_flag_with_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--mode"
+            | "-m"
+            | "--language"
+            | "-l"
+            | "--lang"
+            | "--filename"
+            | "--jobs"
+            | "-j"
+            | "--max-lines"
+            | "--tokens"
+    )
+}
+
+/// Pre-parse `std::env::args()` to decide whether to route to a subcommand
+/// or fall through to the existing file operation path.
+///
+/// Disambiguation rules (priority-ordered, first match wins):
+///
+/// | Condition                                    | Route         |
+/// |----------------------------------------------|---------------|
+/// | No positional arg found                      | FileOperation |
+/// | `--` appears before first positional          | FileOperation |
+/// | Contains `.`                                  | FileOperation |
+/// | Contains `/` or `\`                           | FileOperation |
+/// | Is `-`                                        | FileOperation |
+/// | Contains `*`, `?`, or `[`                     | FileOperation |
+/// | Is known subcommand AND no file/dir on disk   | Subcommand    |
+/// | Everything else                               | FileOperation |
+fn resolve_invocation() -> Invocation {
+    let raw_args: Vec<String> = std::env::args().collect();
+    // Skip argv[0] (the binary name)
+    let args = &raw_args[1..];
+
+    let mut first_positional: Option<(usize, &str)> = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        // CRITICAL: `--` must be checked before `starts_with('-')`.
+        // Without this, `skim -- test` would skip `--`, find `test`,
+        // and incorrectly route to Subcommand.
+        if arg == "--" {
+            return Invocation::FileOperation;
+        }
+
+        if arg.starts_with('-') {
+            // Check for `--flag=value` (value embedded in same token — skip nothing)
+            if arg.contains('=') {
+                i += 1;
+                continue;
+            }
+            // Check if this flag consumes the next token
+            if is_flag_with_value(arg) {
+                i += 2; // skip flag + its value
+                continue;
+            }
+            // Boolean flag — skip it
+            i += 1;
+            continue;
+        }
+
+        // Found a positional argument
+        first_positional = Some((i, arg));
+        break;
+    }
+
+    let Some((pos_idx, positional)) = first_positional else {
+        return Invocation::FileOperation;
+    };
+
+    // File-like heuristics: if it looks like a file/path/glob, treat as file
+    if positional.contains('.')
+        || positional.contains('/')
+        || positional.contains('\\')
+        || positional == "-"
+        || positional.contains('*')
+        || positional.contains('?')
+        || positional.contains('[')
+    {
+        return Invocation::FileOperation;
+    }
+
+    // Known subcommand check — only if no file/dir with that name exists on disk
+    if cmd::is_known_subcommand(positional) {
+        let path = std::path::Path::new(positional);
+        if path.exists() {
+            // On-disk file/dir takes precedence (backward compat)
+            return Invocation::FileOperation;
+        }
+
+        let name = positional.to_string();
+        let remaining_args: Vec<String> = args[pos_idx + 1..].to_vec();
+        return Invocation::Subcommand {
+            name,
+            args: remaining_args,
+        };
+    }
+
+    // Unknown word — fall through to FileOperation (clap handles errors)
+    Invocation::FileOperation
+}
 
 /// Maximum number of parallel jobs (threads) to prevent resource exhaustion
 const MAX_JOBS: usize = 128;
@@ -49,6 +173,12 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim . --jobs 8                          Process current directory with 8 threads\n  \
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
+SUBCOMMANDS (planned):\n  \
+    init                                     Initialize skim configuration\n  \
+    test                                     Run test with output parsing\n  \
+    rewrite                                  Rewrite command output\n  \
+    git                                      Git integration helpers\n  \
+    build                                    Build with output parsing\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File, directory, or glob pattern to process (use '-' for stdin)
@@ -259,6 +389,20 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    match resolve_invocation() {
+        Invocation::FileOperation => run_file_operation(),
+        Invocation::Subcommand { name, args } => {
+            let exit_code = cmd::dispatch(&name, &args)?;
+            std::process::exit(exit_code);
+        }
+    }
+}
+
+/// Original main() body — file/directory/glob/stdin processing.
+///
+/// Extracted verbatim to keep the routing layer thin. All existing
+/// behavior is preserved byte-for-byte.
+fn run_file_operation() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
