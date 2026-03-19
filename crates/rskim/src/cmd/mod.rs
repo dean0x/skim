@@ -7,7 +7,7 @@
 /// Known subcommands that the pre-parse router will recognize.
 ///
 /// IMPORTANT: Only register subcommands we will actually implement.
-/// Keep this list exact — no broad patterns. See RTK lesson #336.
+/// Keep this list exact — no broad patterns. See GRANITE lesson #336.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &["init", "test", "rewrite", "git", "build"];
 
 /// Check whether `name` is a registered subcommand.
@@ -19,7 +19,7 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 ///
 /// Each handler receives the raw remaining args as `&[String]` (not
 /// pre-parsed) so it can do its own parsing — this avoids the class of
-/// rewrite-layer bugs found in RTK's arg handling.
+/// rewrite-layer bugs found in GRANITE's arg handling.
 #[allow(dead_code)]
 pub(crate) trait SubcommandHandler {
     fn execute(&self, args: &[String]) -> anyhow::Result<i32>;
@@ -29,7 +29,7 @@ pub(crate) trait SubcommandHandler {
 
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
-/// Exit code semantics (RTK lesson — exit code corruption is P1):
+/// Exit code semantics (GRANITE lesson — exit code corruption is P1):
 /// - `--help` / `-h`: prints description to stdout, returns 0
 /// - Otherwise: prints "not yet implemented" to stderr, returns 1
 pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<i32> {

@@ -398,10 +398,10 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Original main() body — file/directory/glob/stdin processing.
+/// File/directory/glob/stdin processing pipeline.
 ///
-/// Extracted verbatim to keep the routing layer thin. All existing
-/// behavior is preserved byte-for-byte.
+/// Parses CLI args via clap, validates constraints, then delegates to
+/// the appropriate processor (stdin, directory, glob, or single file).
 fn run_file_operation() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
@@ -412,23 +412,17 @@ fn run_file_operation() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mode = Mode::from(args.mode);
-    let explicit_lang = args.language.map(Language::from);
-    let use_cache = !args.no_cache;
-    let max_lines = args.max_lines;
-    let token_budget = args.tokens;
-
     let file = args
         .file
         .ok_or_else(|| anyhow::anyhow!("FILE argument is required"))?;
 
     let process_options = process::ProcessOptions {
-        mode,
-        explicit_lang,
-        use_cache,
+        mode: Mode::from(args.mode),
+        explicit_lang: args.language.map(Language::from),
+        use_cache: !args.no_cache,
         show_stats: args.show_stats,
-        max_lines,
-        token_budget,
+        max_lines: args.max_lines,
+        token_budget: args.tokens,
     };
 
     if file == "-" {
