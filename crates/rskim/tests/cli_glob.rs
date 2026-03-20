@@ -190,3 +190,109 @@ fn test_glob_brace_expansion() {
         .success()
         .stdout(predicate::str::contains("function ts"));
 }
+
+// ========================================================================
+// Gitignore support tests for glob patterns
+// ========================================================================
+
+/// Helper: create a minimal .git directory so the ignore crate recognises
+/// the directory as a git repository and applies .gitignore rules.
+fn init_fake_git_repo(dir: &std::path::Path) {
+    fs::create_dir_all(dir.join(".git")).unwrap();
+}
+
+#[test]
+fn test_glob_respects_gitignore() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    // .gitignore ignores the "build/" directory
+    fs::write(temp_dir.path().join(".gitignore"), "build/\n").unwrap();
+
+    // Create visible and ignored files
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::create_dir_all(temp_dir.path().join("build")).unwrap();
+    fs::write(
+        temp_dir.path().join("build/output.ts"),
+        "function output() {}",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("**/*.ts")
+        .current_dir(temp_dir.path())
+        .arg("--no-header")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        !stdout.contains("function output"),
+        "gitignored file should NOT be in output"
+    );
+}
+
+#[test]
+fn test_glob_no_ignore_includes_gitignored() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join(".gitignore"), "build/\n").unwrap();
+
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::create_dir_all(temp_dir.path().join("build")).unwrap();
+    fs::write(
+        temp_dir.path().join("build/output.ts"),
+        "function output() {}",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("**/*.ts")
+        .arg("--no-ignore")
+        .arg("--no-header")
+        .current_dir(temp_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        stdout.contains("function output"),
+        "with --no-ignore, gitignored file SHOULD be in output"
+    );
+}
+
+#[test]
+fn test_glob_no_ignore_hint_in_error() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    // Gitignore ignores all .ts files
+    fs::write(temp_dir.path().join(".gitignore"), "*.ts\n").unwrap();
+    fs::write(temp_dir.path().join("only.ts"), "function only() {}").unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("*.ts")
+        .current_dir(temp_dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No files found"))
+        .stderr(predicate::str::contains("--no-ignore"));
+}

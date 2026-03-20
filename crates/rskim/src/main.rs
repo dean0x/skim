@@ -230,6 +230,10 @@ struct Args {
     )]
     jobs: Option<usize>,
 
+    /// Don't respect .gitignore rules when scanning directories or globs
+    #[arg(long, help = "Don't respect .gitignore rules (include all files)")]
+    no_ignore: bool,
+
     /// Disable caching (caching is enabled by default for performance)
     #[arg(long, help = "Disable caching of transformed output")]
     no_cache: bool,
@@ -456,6 +460,7 @@ fn run_file_operation() -> anyhow::Result<()> {
         process: process_options,
         no_header: args.no_header,
         jobs: args.jobs,
+        no_ignore: args.no_ignore,
     };
 
     if path.is_dir() {
@@ -580,8 +585,13 @@ mod tests {
     /// Ensure boolean flags are NOT registered as value-consuming.
     #[test]
     fn test_is_flag_with_value_rejects_boolean_flags() {
-        let boolean_flags: &[&str] =
-            &["--no-header", "--no-cache", "--clear-cache", "--show-stats"];
+        let boolean_flags: &[&str] = &[
+            "--no-header",
+            "--no-ignore",
+            "--no-cache",
+            "--clear-cache",
+            "--show-stats",
+        ];
 
         for flag in boolean_flags {
             assert!(

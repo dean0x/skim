@@ -222,12 +222,30 @@ fn test_directory_skips_symlinks() {
             temp_dir.path().join("link.ts"),
         );
 
-        Command::cargo_bin("skim")
+        // The ignore crate silently skips symlinks (follow_links=false).
+        // Verify the real file is processed but the symlink is not duplicated.
+        let output = Command::cargo_bin("skim")
             .unwrap()
             .arg(temp_dir.path())
+            .arg("--no-header")
             .assert()
             .success()
-            .stderr(predicate::str::contains("Skipping symlink"));
+            .get_output()
+            .stdout
+            .clone();
+
+        let stdout = String::from_utf8(output).unwrap();
+        // The real file should be processed exactly once
+        assert!(
+            stdout.contains("function real"),
+            "real file should be in output"
+        );
+        // Count occurrences of "function real" to ensure symlink was not followed
+        let count = stdout.matches("function real").count();
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 occurrence (symlink should be skipped), got: {count}"
+        );
     }
 }
 
@@ -287,4 +305,229 @@ fn test_directory_current_directory() {
         .assert()
         .success()
         .stdout(predicate::str::contains("function test"));
+}
+
+// ========================================================================
+// Gitignore support tests
+// ========================================================================
+
+/// Helper: create a minimal .git directory so the ignore crate recognises
+/// the directory as a git repository and applies .gitignore rules.
+fn init_fake_git_repo(dir: &std::path::Path) {
+    fs::create_dir_all(dir.join(".git")).unwrap();
+}
+
+#[test]
+fn test_directory_respects_gitignore() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    // Create .gitignore that ignores the "ignored_dir/" directory
+    fs::write(temp_dir.path().join(".gitignore"), "ignored_dir/\n").unwrap();
+
+    // Create a visible file and an ignored file
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::create_dir_all(temp_dir.path().join("ignored_dir")).unwrap();
+    fs::write(
+        temp_dir.path().join("ignored_dir/secret.ts"),
+        "function secret() {}",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .arg("--no-header")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        !stdout.contains("function secret"),
+        "gitignored file should NOT be in output"
+    );
+}
+
+#[test]
+fn test_directory_no_ignore_includes_gitignored() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    fs::write(temp_dir.path().join(".gitignore"), "ignored_dir/\n").unwrap();
+
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::create_dir_all(temp_dir.path().join("ignored_dir")).unwrap();
+    fs::write(
+        temp_dir.path().join("ignored_dir/secret.ts"),
+        "function secret() {}",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .arg("--no-header")
+        .arg("--no-ignore")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        stdout.contains("function secret"),
+        "with --no-ignore, gitignored file SHOULD be in output"
+    );
+}
+
+#[test]
+fn test_directory_skips_hidden_files_by_default() {
+    let temp_dir = TempDir::new().unwrap();
+
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::write(temp_dir.path().join(".hidden.ts"), "function hidden() {}").unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .arg("--no-header")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        !stdout.contains("function hidden"),
+        "hidden file should NOT be in output by default"
+    );
+}
+
+#[test]
+fn test_directory_no_ignore_shows_hidden_files() {
+    let temp_dir = TempDir::new().unwrap();
+
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::write(temp_dir.path().join(".hidden.ts"), "function hidden() {}").unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .arg("--no-header")
+        .arg("--no-ignore")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        stdout.contains("function hidden"),
+        "with --no-ignore, hidden file SHOULD be in output"
+    );
+}
+
+#[test]
+fn test_directory_gitignore_without_git_repo() {
+    let temp_dir = TempDir::new().unwrap();
+    // Deliberately NO .git/ directory — .gitignore should still be respected
+    // because we configure require_git(false)
+
+    fs::write(temp_dir.path().join(".gitignore"), "ignored.ts\n").unwrap();
+
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::write(temp_dir.path().join("ignored.ts"), "function ignored() {}").unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .arg("--no-header")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        !stdout.contains("function ignored"),
+        ".gitignore should be respected even without .git/ directory"
+    );
+}
+
+#[test]
+fn test_directory_skips_hidden_directories() {
+    let temp_dir = TempDir::new().unwrap();
+
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::create_dir_all(temp_dir.path().join(".hidden_dir")).unwrap();
+    fs::write(
+        temp_dir.path().join(".hidden_dir/file.ts"),
+        "function in_hidden_dir() {}",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .arg("--no-header")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        !stdout.contains("function in_hidden_dir"),
+        "files in hidden directories should NOT be in output"
+    );
+}
+
+#[test]
+fn test_directory_no_ignore_hint_in_error() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    // Gitignore ignores all .ts files — so the directory has no processable files
+    fs::write(temp_dir.path().join(".gitignore"), "*.ts\n").unwrap();
+    fs::write(temp_dir.path().join("only.ts"), "function only() {}").unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No files found"))
+        .stderr(predicate::str::contains("--no-ignore"));
 }
