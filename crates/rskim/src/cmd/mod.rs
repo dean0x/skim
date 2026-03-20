@@ -23,9 +23,12 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
 /// Exit code semantics (GRANITE lesson — exit code corruption is P1):
-/// - `--help` / `-h`: prints description to stdout, returns 0
-/// - Otherwise: prints "not yet implemented" to stderr, returns 1
-pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<i32> {
+/// - `--help` / `-h`: prints description to stdout, returns SUCCESS
+/// - Otherwise: prints "not yet implemented" to stderr, returns FAILURE
+pub(crate) fn dispatch(
+    subcommand: &str,
+    args: &[String],
+) -> anyhow::Result<std::process::ExitCode> {
     if !is_known_subcommand(subcommand) {
         anyhow::bail!(
             "Unknown subcommand: '{subcommand}'\n\
@@ -43,7 +46,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<i32>
         println!();
         println!("  This subcommand is planned for a future release.");
         println!("  See: https://github.com/dean0x/skim/issues/19");
-        return Ok(0);
+        return Ok(std::process::ExitCode::SUCCESS);
     }
 
     eprintln!("skim {subcommand}: not yet implemented");
@@ -51,5 +54,5 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<i32>
     eprintln!("This subcommand is planned for a future release.");
     eprintln!("See: https://github.com/dean0x/skim/issues/19");
 
-    Ok(1)
+    Ok(std::process::ExitCode::FAILURE)
 }

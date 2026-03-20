@@ -55,6 +55,24 @@ fn is_flag_with_value(flag: &str) -> bool {
     )
 }
 
+/// Returns true if `token` looks like a file path, directory, or glob pattern
+/// rather than a subcommand name.
+///
+/// Heuristics (any match means file-like):
+/// - Contains `.` (file extension)
+/// - Contains `/` or `\` (path separator)
+/// - Is `-` (stdin)
+/// - Contains `*`, `?`, or `[` (glob metacharacter)
+fn looks_like_file_or_glob(token: &str) -> bool {
+    token.contains('.')
+        || token.contains('/')
+        || token.contains('\\')
+        || token == "-"
+        || token.contains('*')
+        || token.contains('?')
+        || token.contains('[')
+}
+
 /// Pre-parse `std::env::args()` to decide whether to route to a subcommand
 /// or fall through to the existing file operation path.
 ///
@@ -114,14 +132,7 @@ fn resolve_invocation() -> Invocation {
     };
 
     // File-like heuristics: if it looks like a file/path/glob, treat as file
-    if positional.contains('.')
-        || positional.contains('/')
-        || positional.contains('\\')
-        || positional == "-"
-        || positional.contains('*')
-        || positional.contains('?')
-        || positional.contains('[')
-    {
+    if looks_like_file_or_glob(positional) {
         return Invocation::FileOperation;
     }
 
@@ -390,14 +401,13 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let result = match resolve_invocation() {
-        Invocation::FileOperation => run_file_operation().map(|()| 0),
+    let result: anyhow::Result<ExitCode> = match resolve_invocation() {
+        Invocation::FileOperation => run_file_operation().map(|()| ExitCode::SUCCESS),
         Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args),
     };
 
     match result {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(code) => ExitCode::from(code as u8),
+        Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
             ExitCode::FAILURE
