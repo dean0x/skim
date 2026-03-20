@@ -18,6 +18,7 @@ mod tokens;
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use rskim_core::{Language, Mode};
 
@@ -388,13 +389,22 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
     match resolve_invocation() {
-        Invocation::FileOperation => run_file_operation(),
-        Invocation::Subcommand { name, args } => {
-            let exit_code = cmd::dispatch(&name, &args)?;
-            std::process::exit(exit_code);
-        }
+        Invocation::FileOperation => match run_file_operation() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Invocation::Subcommand { name, args } => match cmd::dispatch(&name, &args) {
+            Ok(code) => ExitCode::from(code as u8),
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -518,5 +528,96 @@ mod tests {
             msg.contains("Too many threads."),
             "expected reason in message, got: {msg}"
         );
+    }
+
+    // ========================================================================
+    // is_flag_with_value sync tests (batch-A flag-sync)
+    // ========================================================================
+
+    /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
+    /// is registered in `is_flag_with_value()`.
+    ///
+    /// If you add a new flag with a value to `Args`, this test will remind you
+    /// to register it in `is_flag_with_value()`.
+    #[test]
+    fn test_is_flag_with_value_covers_all_value_flags() {
+        // Exhaustive list of flags that consume the next token as a value.
+        // Derived from the `Args` struct fields that are NOT bool.
+        //
+        // UPDATE THIS LIST if you add/remove a value-consuming flag.
+        let value_flags: &[&str] = &[
+            "--mode",
+            "-m",
+            "--language",
+            "-l",
+            "--lang",       // alias for --language
+            "--filename",
+            "--jobs",
+            "-j",
+            "--max-lines",
+            "--tokens",
+        ];
+
+        for flag in value_flags {
+            assert!(
+                is_flag_with_value(flag),
+                "Value-consuming flag {flag} is NOT registered in is_flag_with_value(). \
+                 Add it to prevent subcommand mis-routing."
+            );
+        }
+    }
+
+    /// Ensure boolean flags are NOT registered as value-consuming.
+    #[test]
+    fn test_is_flag_with_value_rejects_boolean_flags() {
+        let boolean_flags: &[&str] = &[
+            "--no-header",
+            "--no-cache",
+            "--clear-cache",
+            "--show-stats",
+        ];
+
+        for flag in boolean_flags {
+            assert!(
+                !is_flag_with_value(flag),
+                "Boolean flag {flag} is incorrectly registered as value-consuming \
+                 in is_flag_with_value(). Remove it."
+            );
+        }
+    }
+
+    /// Behavioral test: a flag's value that matches a subcommand name must be
+    /// consumed as the flag's value, not treated as a subcommand.
+    ///
+    /// Example: `skim --mode test file.ts` should parse `test` as the value
+    /// for `--mode`, not route to the `test` subcommand.
+    #[test]
+    fn test_flag_value_matching_subcommand_is_consumed() {
+        // Verify "test" is actually a known subcommand (precondition)
+        assert!(
+            cmd::is_known_subcommand("test"),
+            "precondition: 'test' must be a known subcommand for this test"
+        );
+
+        // All value-consuming flags should consume "test" as their value,
+        // so resolve_invocation should never route to Subcommand when the
+        // flag is followed by a subcommand name as its value.
+        //
+        // We can't call resolve_invocation() directly (it reads env args),
+        // so we test the building blocks: is_flag_with_value must return
+        // true for every flag that takes a value, ensuring the pre-parser
+        // skips past the value token.
+        let value_flags: &[&str] = &[
+            "--mode", "-m", "--language", "-l", "--lang",
+            "--filename", "--jobs", "-j", "--max-lines", "--tokens",
+        ];
+
+        for flag in value_flags {
+            assert!(
+                is_flag_with_value(flag),
+                "If {flag} does not consume its value, `skim {flag} test` would \
+                 incorrectly route to the 'test' subcommand."
+            );
+        }
     }
 }
