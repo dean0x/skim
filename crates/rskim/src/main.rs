@@ -11,14 +11,150 @@
 
 mod cache;
 mod cascade;
+mod cmd;
 mod multi;
 mod process;
 mod tokens;
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use rskim_core::{Language, Mode};
+
+// ============================================================================
+// Pre-parse routing (subcommand disambiguation)
+// ============================================================================
+
+/// Resolved invocation after pre-parse disambiguation.
+enum Invocation {
+    /// Classic file/directory/glob/stdin operation (existing behavior).
+    FileOperation,
+    /// A known subcommand with its remaining args.
+    Subcommand { name: String, args: Vec<String> },
+}
+
+/// Returns true if `flag` is a flag that consumes the next token as its value.
+///
+/// SYNC NOTE: If you add a new flag with a value to `Args`, add it here too.
+/// Failure to sync only causes a bug if the flag's value happens to match a
+/// known subcommand name AND no file with that name exists on disk.
+fn is_flag_with_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--mode"
+            | "-m"
+            | "--language"
+            | "-l"
+            | "--lang"
+            | "--filename"
+            | "--jobs"
+            | "-j"
+            | "--max-lines"
+            | "--tokens"
+    )
+}
+
+/// Returns true if `token` looks like a file path, directory, or glob pattern
+/// rather than a subcommand name.
+///
+/// Heuristics (any match means file-like):
+/// - Contains `.` (file extension)
+/// - Contains `/` or `\` (path separator)
+/// - Is `-` (stdin)
+/// - Contains `*`, `?`, or `[` (glob metacharacter)
+fn looks_like_file_or_glob(token: &str) -> bool {
+    token.contains('.')
+        || token.contains('/')
+        || token.contains('\\')
+        || token == "-"
+        || token.contains('*')
+        || token.contains('?')
+        || token.contains('[')
+}
+
+/// Pre-parse `std::env::args()` to decide whether to route to a subcommand
+/// or fall through to the existing file operation path.
+///
+/// Disambiguation rules (priority-ordered, first match wins):
+///
+/// | Condition                                    | Route         |
+/// |----------------------------------------------|---------------|
+/// | No positional arg found                      | FileOperation |
+/// | `--` appears before first positional          | FileOperation |
+/// | Contains `.`                                  | FileOperation |
+/// | Contains `/` or `\`                           | FileOperation |
+/// | Is `-`                                        | FileOperation |
+/// | Contains `*`, `?`, or `[`                     | FileOperation |
+/// | Is known subcommand AND no file/dir on disk   | Subcommand    |
+/// | Everything else                               | FileOperation |
+fn resolve_invocation() -> Invocation {
+    let raw_args: Vec<String> = std::env::args().collect();
+    // Skip argv[0] (the binary name)
+    let args = &raw_args[1..];
+
+    let mut first_positional: Option<(usize, &str)> = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        // CRITICAL: `--` must be checked before `starts_with('-')`.
+        // Without this, `skim -- test` would skip `--`, find `test`,
+        // and incorrectly route to Subcommand.
+        if arg == "--" {
+            return Invocation::FileOperation;
+        }
+
+        if arg.starts_with('-') {
+            // Check for `--flag=value` (value embedded in same token — skip nothing)
+            if arg.contains('=') {
+                i += 1;
+                continue;
+            }
+            // Check if this flag consumes the next token
+            if is_flag_with_value(arg) {
+                i += 2; // skip flag + its value
+                continue;
+            }
+            // Boolean flag — skip it
+            i += 1;
+            continue;
+        }
+
+        // Found a positional argument
+        first_positional = Some((i, arg));
+        break;
+    }
+
+    let Some((pos_idx, positional)) = first_positional else {
+        return Invocation::FileOperation;
+    };
+
+    // File-like heuristics: if it looks like a file/path/glob, treat as file
+    if looks_like_file_or_glob(positional) {
+        return Invocation::FileOperation;
+    }
+
+    // Known subcommand check — only if no file/dir with that name exists on disk
+    if cmd::is_known_subcommand(positional) {
+        let path = std::path::Path::new(positional);
+        if path.exists() {
+            // On-disk file/dir takes precedence (backward compat)
+            return Invocation::FileOperation;
+        }
+
+        let name = positional.to_string();
+        let remaining_args: Vec<String> = args[pos_idx + 1..].to_vec();
+        return Invocation::Subcommand {
+            name,
+            args: remaining_args,
+        };
+    }
+
+    // Unknown word — fall through to FileOperation (clap handles errors)
+    Invocation::FileOperation
+}
 
 /// Maximum number of parallel jobs (threads) to prevent resource exhaustion
 const MAX_JOBS: usize = 128;
@@ -49,6 +185,12 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim . --jobs 8                          Process current directory with 8 threads\n  \
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
+SUBCOMMANDS (planned):\n  \
+    init                                     Initialize skim configuration\n  \
+    test                                     Run test with output parsing\n  \
+    rewrite                                  Rewrite command output\n  \
+    git                                      Git integration helpers\n  \
+    build                                    Build with output parsing\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File, directory, or glob pattern to process (use '-' for stdin)
@@ -258,7 +400,26 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> ExitCode {
+    let result: anyhow::Result<ExitCode> = match resolve_invocation() {
+        Invocation::FileOperation => run_file_operation().map(|()| ExitCode::SUCCESS),
+        Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args),
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// File/directory/glob/stdin processing pipeline.
+///
+/// Parses CLI args via clap, validates constraints, then delegates to
+/// the appropriate processor (stdin, directory, glob, or single file).
+fn run_file_operation() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
@@ -268,23 +429,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mode = Mode::from(args.mode);
-    let explicit_lang = args.language.map(Language::from);
-    let use_cache = !args.no_cache;
-    let max_lines = args.max_lines;
-    let token_budget = args.tokens;
-
     let file = args
         .file
         .ok_or_else(|| anyhow::anyhow!("FILE argument is required"))?;
 
     let process_options = process::ProcessOptions {
-        mode,
-        explicit_lang,
-        use_cache,
+        mode: Mode::from(args.mode),
+        explicit_lang: args.language.map(Language::from),
+        use_cache: !args.no_cache,
         show_stats: args.show_stats,
-        max_lines,
-        token_budget,
+        max_lines: args.max_lines,
+        token_budget: args.tokens,
     };
 
     if file == "-" {
@@ -380,5 +535,87 @@ mod tests {
             msg.contains("Too many threads."),
             "expected reason in message, got: {msg}"
         );
+    }
+
+    // ========================================================================
+    // is_flag_with_value sync tests (batch-A flag-sync)
+    // ========================================================================
+
+    /// Exhaustive list of flags that consume the next token as a value.
+    /// Derived from the `Args` struct fields that are NOT bool.
+    ///
+    /// UPDATE THIS LIST if you add/remove a value-consuming flag.
+    const VALUE_FLAGS: &[&str] = &[
+        "--mode",
+        "-m",
+        "--language",
+        "-l",
+        "--lang", // alias for --language
+        "--filename",
+        "--jobs",
+        "-j",
+        "--max-lines",
+        "--tokens",
+    ];
+
+    /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
+    /// is registered in `is_flag_with_value()`.
+    ///
+    /// If you add a new flag with a value to `Args`, this test will remind you
+    /// to register it in `is_flag_with_value()`.
+    #[test]
+    fn test_is_flag_with_value_covers_all_value_flags() {
+        for flag in VALUE_FLAGS {
+            assert!(
+                is_flag_with_value(flag),
+                "Value-consuming flag {flag} is NOT registered in is_flag_with_value(). \
+                 Add it to prevent subcommand mis-routing."
+            );
+        }
+    }
+
+    /// Ensure boolean flags are NOT registered as value-consuming.
+    #[test]
+    fn test_is_flag_with_value_rejects_boolean_flags() {
+        let boolean_flags: &[&str] =
+            &["--no-header", "--no-cache", "--clear-cache", "--show-stats"];
+
+        for flag in boolean_flags {
+            assert!(
+                !is_flag_with_value(flag),
+                "Boolean flag {flag} is incorrectly registered as value-consuming \
+                 in is_flag_with_value(). Remove it."
+            );
+        }
+    }
+
+    /// Behavioral test: a flag's value that matches a subcommand name must be
+    /// consumed as the flag's value, not treated as a subcommand.
+    ///
+    /// Example: `skim --mode test file.ts` should parse `test` as the value
+    /// for `--mode`, not route to the `test` subcommand.
+    #[test]
+    fn test_flag_value_matching_subcommand_is_consumed() {
+        // Verify "test" is actually a known subcommand (precondition)
+        assert!(
+            cmd::is_known_subcommand("test"),
+            "precondition: 'test' must be a known subcommand for this test"
+        );
+
+        // All value-consuming flags should consume "test" as their value,
+        // so resolve_invocation should never route to Subcommand when the
+        // flag is followed by a subcommand name as its value.
+        //
+        // We can't call resolve_invocation() directly (it reads env args),
+        // so we test the building blocks: is_flag_with_value must return
+        // true for every flag that takes a value, ensuring the pre-parser
+        // skips past the value token.
+        for flag in VALUE_FLAGS {
+            assert!(
+                is_flag_with_value(flag),
+                "If {flag} does not consume its value, `skim {flag} test` would \
+                 incorrectly route to the 'test' subcommand."
+            );
+        }
     }
 }
