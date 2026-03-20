@@ -294,10 +294,9 @@ jobs:
             npm install -g rskim
             ```
 
-            ### Via Homebrew (macOS)
+            ### Via Homebrew (macOS/Linux)
             ```bash
-            brew tap dean0x/tap
-            brew install rskim
+            brew install dean0x/tap/skim
             ```
 
             ### Via Binary
@@ -422,4 +421,4 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.HOMEBREW_TAP_TOKEN }}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/dean0x/homebrew-tap/dispatches \
-            -d '{"event_type":"update-formula","client_payload":{"formula":"rskim","version":"${{ steps.version.outputs.VERSION }}"}}'
+            -d '{"event_type":"update-formula","client_payload":{"formula":"skim","version":"${{ steps.version.outputs.VERSION }}"}}'

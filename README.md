@@ -72,6 +72,9 @@ npx rskim file.ts
 ### Install globally (recommended for regular use)
 
 ```bash
+# Via Homebrew (macOS/Linux)
+brew install dean0x/tap/skim
+
 # Via npm
 npm install -g rskim
 
