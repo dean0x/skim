@@ -266,7 +266,7 @@ fn collect_noise_ranges(
     if rules.strip_kinds.contains(&kind) {
         let start = node.start_byte();
         let end = node.end_byte();
-        let adjusted_start = adjust_python_type_start(language, kind, source, start);
+        let adjusted_start = adjust_type_start(language, kind, source, start);
         ranges.push((adjusted_start, end));
         return Ok(()); // Don't recurse into stripped nodes
     }
@@ -302,6 +302,12 @@ fn collect_noise_ranges(
         strip_python_self_param(node, source_bytes, ranges);
     }
 
+    // Handle Rust return type: `-> Type` is expressed as sibling `->` + type nodes
+    // under `function_item`, not as a single `return_type` wrapper node.
+    if language == Language::Rust && kind == "function_item" {
+        strip_rust_return_type(node, ranges);
+    }
+
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -320,17 +326,15 @@ fn collect_noise_ranges(
     Ok(())
 }
 
-/// Adjust the start position for Python type annotations to include their separators.
+/// Adjust the start position for type annotations to include their separators.
 ///
 /// Python's "type" node in `typed_parameter` does NOT include the `: ` separator,
-/// and "return_type" may have a leading space before ` -> type`. This extends the
-/// removal range to include these separators for clean output.
-fn adjust_python_type_start(language: Language, kind: &str, source: &str, start: usize) -> usize {
-    if language != Language::Python {
-        return start;
-    }
-    match kind {
-        "type" => {
+/// and "return_type" may have a leading space before ` -> type`. Rust's "return_type"
+/// node includes `-> Type` but not the leading space. This extends the removal range
+/// to include these separators for clean output.
+fn adjust_type_start(language: Language, kind: &str, source: &str, start: usize) -> usize {
+    match (language, kind) {
+        (Language::Python, "type") => {
             if start >= 2 && source.get(start - 2..start) == Some(": ") {
                 start - 2
             } else if start >= 1 && source.get(start - 1..start) == Some(":") {
@@ -339,7 +343,8 @@ fn adjust_python_type_start(language: Language, kind: &str, source: &str, start:
                 start
             }
         }
-        "return_type" => {
+        (Language::Python, "return_type") => {
+            // Consume leading space before `-> Type`
             if start >= 1 && source.get(start - 1..start) == Some(" ") {
                 start - 1
             } else {
@@ -409,6 +414,43 @@ fn extend_past_trailing_comma(
         }
     }
     end
+}
+
+/// Strip Rust return type from function signatures.
+///
+/// In Rust's tree-sitter grammar, `-> Type` is NOT wrapped in a `return_type` node.
+/// Instead, `->` and the type are sibling children of `function_item`. This function
+/// finds the `->` child and removes from its start through the end of the next sibling
+/// (the type node), including the leading space.
+fn strip_rust_return_type(function_node: Node, ranges: &mut Vec<(usize, usize)>) {
+    let mut cursor = function_node.walk();
+    let children: Vec<_> = function_node.children(&mut cursor).collect();
+
+    for (i, child) in children.iter().enumerate() {
+        if child.kind() == "->" {
+            // Find the type node that follows (next named sibling)
+            let end = if let Some(type_node) = children.get(i + 1) {
+                // The type node immediately follows `->`
+                if type_node.kind() != "block" {
+                    type_node.end_byte()
+                } else {
+                    child.end_byte()
+                }
+            } else {
+                child.end_byte()
+            };
+
+            // Include the leading space before `->`
+            let start = if child.start_byte() >= 1 {
+                child.start_byte() - 1
+            } else {
+                child.start_byte()
+            };
+
+            ranges.push((start, end));
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,6 +625,17 @@ mod tests {
         let result = transform(source, Language::Rust);
         assert!(!result.contains("where"), "where clause should be stripped");
         assert!(result.contains("fn process"), "function preserved");
+    }
+
+    #[test]
+    fn test_rust_pseudo_strips_return_type() {
+        let source = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            !result.contains("-> i32"),
+            "return type should be stripped, got: {result}"
+        );
+        assert!(result.contains("fn add"), "function preserved");
     }
 
     // ========================================================================
