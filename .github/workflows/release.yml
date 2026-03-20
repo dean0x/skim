@@ -296,8 +296,7 @@ jobs:
 
             ### Via Homebrew (macOS)
             ```bash
-            brew tap dean0x/tap
-            brew install rskim
+            brew install dean0x/tap/skim
             ```
 
             ### Via Binary
