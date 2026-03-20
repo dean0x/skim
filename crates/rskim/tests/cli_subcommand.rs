@@ -172,7 +172,8 @@ fn test_subcommand_short_help_exits_zero() {
 }
 
 #[test]
-fn test_all_known_subcommands_are_stubs() {
+fn test_unimplemented_subcommands_are_stubs() {
+    // "completions" is intentionally excluded — it is implemented, not a stub.
     for subcmd in &["init", "test", "rewrite", "git", "build"] {
         Command::cargo_bin("skim")
             .unwrap()
@@ -312,7 +313,8 @@ fn test_help_lists_subcommands() {
         .stdout(predicate::str::contains("SUBCOMMANDS"))
         .stdout(predicate::str::contains("init"))
         .stdout(predicate::str::contains("test"))
-        .stdout(predicate::str::contains("build"));
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("completions"));
 }
 
 // ============================================================================
