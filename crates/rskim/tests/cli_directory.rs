@@ -313,6 +313,8 @@ fn test_directory_current_directory() {
 
 /// Helper: create a minimal .git directory so the ignore crate recognises
 /// the directory as a git repository and applies .gitignore rules.
+///
+/// NOTE: Duplicated in `cli_glob.rs`. Keep both in sync.
 fn init_fake_git_repo(dir: &std::path::Path) {
     fs::create_dir_all(dir.join(".git")).unwrap();
 }
@@ -511,6 +513,61 @@ fn test_directory_skips_hidden_directories() {
     assert!(
         !stdout.contains("function in_hidden_dir"),
         "files in hidden directories should NOT be in output"
+    );
+}
+
+#[test]
+fn test_directory_nested_gitignore() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    // Root .gitignore ignores the "build/" directory
+    fs::write(temp_dir.path().join(".gitignore"), "build/\n").unwrap();
+
+    // Subdirectory .gitignore ignores *.generated.ts files
+    fs::create_dir_all(temp_dir.path().join("src")).unwrap();
+    fs::write(temp_dir.path().join("src/.gitignore"), "*.generated.ts\n").unwrap();
+
+    // Create files that should be visible
+    fs::write(temp_dir.path().join("src/app.ts"), "function app() {}").unwrap();
+
+    // Create files that should be ignored by root .gitignore
+    fs::create_dir_all(temp_dir.path().join("build")).unwrap();
+    fs::write(
+        temp_dir.path().join("build/bundle.ts"),
+        "function bundle() {}",
+    )
+    .unwrap();
+
+    // Create files that should be ignored by nested .gitignore
+    fs::write(
+        temp_dir.path().join("src/schema.generated.ts"),
+        "function generated() {}",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg(temp_dir.path())
+        .arg("--no-header")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function app"),
+        "non-ignored file should be in output"
+    );
+    assert!(
+        !stdout.contains("function bundle"),
+        "file in build/ should be excluded by root .gitignore"
+    );
+    assert!(
+        !stdout.contains("function generated"),
+        "*.generated.ts should be excluded by nested src/.gitignore"
     );
 }
 

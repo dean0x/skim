@@ -23,9 +23,16 @@ pub(crate) struct MultiFileOptions {
     pub(crate) no_ignore: bool,
 }
 
+/// Glob metacharacters recognised by skim.
+///
+/// Used for detecting glob patterns in user input and for splitting the
+/// static directory prefix from the glob suffix in [`glob_walk_root`].
+/// Defined once here and re-used in `main.rs::looks_like_file_or_glob`.
+pub(crate) const GLOB_METACHARACTERS: &[char] = &['*', '?', '[', '{'];
+
 /// Check if path contains glob pattern characters
 pub(crate) fn has_glob_pattern(path: &str) -> bool {
-    path.contains('*') || path.contains('?') || path.contains('[') || path.contains('{')
+    path.contains(GLOB_METACHARACTERS)
 }
 
 /// Validate glob pattern to prevent path traversal attacks
@@ -103,8 +110,8 @@ fn configure_walker(builder: &mut WalkBuilder, no_ignore: bool) {
 ///
 /// The walker needs a root directory to start from and an override pattern
 /// to filter files. We split on `/`, taking leading segments that contain no
-/// glob metacharacters (`*`, `?`, `[`, `{`), and join them as the root. The
-/// remainder becomes the override pattern.
+/// glob metacharacters ([`GLOB_METACHARACTERS`]), and join them as the root.
+/// The remainder becomes the override pattern.
 ///
 /// # Examples
 ///
@@ -116,15 +123,11 @@ fn configure_walker(builder: &mut WalkBuilder, no_ignore: bool) {
 /// "src/*.rs"          -> ("src",       "*.rs")
 /// ```
 fn glob_walk_root(pattern: &str) -> (&str, &str) {
-    fn is_glob_char(c: char) -> bool {
-        matches!(c, '*' | '?' | '[' | '{')
-    }
-
     let segments: Vec<&str> = pattern.split('/').collect();
     let mut static_count = 0;
 
     for segment in &segments {
-        if segment.contains(is_glob_char) {
+        if segment.contains(GLOB_METACHARACTERS) {
             break;
         }
         static_count += 1;
@@ -170,6 +173,10 @@ fn no_ignore_hint(no_ignore: bool) -> &'static str {
 /// Precondition: `paths` must be non-empty. Callers should validate and
 /// produce a descriptive error (with `--no-ignore` hint) before calling.
 fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Result<()> {
+    debug_assert!(
+        !paths.is_empty(),
+        "BUG: process_files called with empty paths"
+    );
     let process_options = options.process;
 
     let results: Vec<_> = if let Some(num_jobs) = options.jobs {
@@ -273,22 +280,20 @@ pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::
     let mut builder = WalkBuilder::new(walk_root);
     configure_walker(&mut builder, options.no_ignore);
 
-    let walk_root_path = Path::new(walk_root)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(walk_root));
-
+    // SECURITY: Symlink traversal is prevented by `follow_links(false)` on the
+    // walker (configured in `configure_walker`). Path traversal via `..` is
+    // rejected by `validate_glob_pattern`. Together these make `canonicalize()`
+    // unnecessary here, avoiding a syscall per file in the hot path.
     let paths: Vec<PathBuf> = builder
         .build()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .filter(|entry| {
-            let path = entry.path();
-            // Try canonical path first (resolves symlinks/`.`), fall back to literal
-            path.canonicalize()
+            entry
+                .path()
+                .strip_prefix(walk_root)
                 .ok()
-                .and_then(|c| c.strip_prefix(&walk_root_path).ok().map(PathBuf::from))
-                .or_else(|| path.strip_prefix(walk_root).ok().map(PathBuf::from))
-                .is_some_and(|rel| matcher.is_match(&rel))
+                .is_some_and(|rel| matcher.is_match(rel))
         })
         .map(|entry| entry.into_path())
         .collect();
@@ -309,6 +314,11 @@ pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::
 /// Uses `ignore::WalkBuilder` to walk the directory tree, respecting
 /// `.gitignore` and hidden file rules. Filters for supported extensions
 /// using `Language::from_path()`.
+///
+/// Walk errors (e.g. permission-denied on individual entries) are
+/// intentionally dropped via `filter_map(|e| e.ok())`. A single
+/// unreadable file should not abort traversal of an entire directory
+/// tree -- this matches ripgrep/fd behavior.
 fn collect_files_from_directory(dir: &Path, no_ignore: bool) -> Vec<PathBuf> {
     let mut builder = WalkBuilder::new(dir);
     configure_walker(&mut builder, no_ignore);

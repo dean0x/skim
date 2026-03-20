@@ -179,16 +179,34 @@ fn test_glob_brace_expansion() {
 
     fs::write(temp_dir.path().join("file.js"), "function js() {}").unwrap();
     fs::write(temp_dir.path().join("file.ts"), "function ts() {}").unwrap();
+    fs::write(temp_dir.path().join("file.py"), "def py(): pass").unwrap();
 
-    // Note: Brace expansion is usually handled by the shell, not the program
-    // This test validates that the pattern is processed correctly
-    Command::cargo_bin("skim")
+    // Brace expansion is handled by skim's glob engine (not the shell),
+    // so we test that *.{js,ts} matches both .js and .ts but not .py.
+    let output = Command::cargo_bin("skim")
         .unwrap()
-        .arg("*.ts")
+        .arg("*.{js,ts}")
+        .arg("--no-header")
         .current_dir(temp_dir.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("function ts"));
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function js"),
+        "brace expansion should match .js files"
+    );
+    assert!(
+        stdout.contains("function ts"),
+        "brace expansion should match .ts files"
+    );
+    assert!(
+        !stdout.contains("def py"),
+        "brace expansion should NOT match .py files"
+    );
 }
 
 // ========================================================================
@@ -197,6 +215,8 @@ fn test_glob_brace_expansion() {
 
 /// Helper: create a minimal .git directory so the ignore crate recognises
 /// the directory as a git repository and applies .gitignore rules.
+///
+/// NOTE: Duplicated in `cli_directory.rs`. Keep both in sync.
 fn init_fake_git_repo(dir: &std::path::Path) {
     fs::create_dir_all(dir.join(".git")).unwrap();
 }
@@ -275,6 +295,76 @@ fn test_glob_no_ignore_includes_gitignored() {
     assert!(
         stdout.contains("function output"),
         "with --no-ignore, gitignored file SHOULD be in output"
+    );
+}
+
+#[test]
+fn test_glob_skips_hidden_files() {
+    let temp_dir = TempDir::new().unwrap();
+
+    fs::write(temp_dir.path().join("visible.ts"), "function visible() {}").unwrap();
+    fs::write(temp_dir.path().join(".hidden.ts"), "function hidden() {}").unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("*.ts")
+        .arg("--no-header")
+        .current_dir(temp_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function visible"),
+        "visible file should be in output"
+    );
+    assert!(
+        !stdout.contains("function hidden"),
+        "hidden file should NOT be matched by glob"
+    );
+}
+
+#[test]
+fn test_glob_respects_file_pattern_gitignore() {
+    let temp_dir = TempDir::new().unwrap();
+    init_fake_git_repo(temp_dir.path());
+
+    // .gitignore ignores *.log files (file pattern, not directory pattern)
+    fs::write(temp_dir.path().join(".gitignore"), "*.log\n").unwrap();
+
+    fs::write(temp_dir.path().join("app.ts"), "function app() {}").unwrap();
+    // Create a .log file that also happens to be matched by **/*
+    fs::write(temp_dir.path().join("debug.log"), "some log content").unwrap();
+    // Create a .ts file whose name contains "log" to ensure the pattern
+    // only matches the extension, not substrings
+    fs::write(temp_dir.path().join("logger.ts"), "function logger() {}").unwrap();
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("*.*")
+        .arg("--no-header")
+        .current_dir(temp_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(
+        stdout.contains("function app"),
+        "app.ts should be in output"
+    );
+    assert!(
+        stdout.contains("function logger"),
+        "logger.ts should be in output (pattern is *.log, not *log*)"
+    );
+    assert!(
+        !stdout.contains("some log content"),
+        "debug.log should be excluded by .gitignore"
     );
 }
 

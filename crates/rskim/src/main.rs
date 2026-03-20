@@ -64,9 +64,9 @@ fn is_flag_with_value(flag: &str) -> bool {
 /// - Contains `.` (file extension)
 /// - Contains `/` or `\` (path separator)
 /// - Is `-` (stdin)
-/// - Contains `*`, `?`, `[`, or `{` (glob metacharacter)
+/// - Contains `*`, `?`, `[`, or `{` (glob metacharacter via [`multi::GLOB_METACHARACTERS`])
 fn looks_like_file_or_glob(token: &str) -> bool {
-    token == "-" || token.contains(['.', '/', '\\', '*', '?', '[', '{'])
+    token == "-" || token.contains(['.', '/', '\\']) || token.contains(multi::GLOB_METACHARACTERS)
 }
 
 /// Pre-parse `std::env::args()` to decide whether to route to a subcommand
@@ -81,7 +81,7 @@ fn looks_like_file_or_glob(token: &str) -> bool {
 /// | Contains `.`                                  | FileOperation |
 /// | Contains `/` or `\`                           | FileOperation |
 /// | Is `-`                                        | FileOperation |
-/// | Contains `*`, `?`, or `[`                     | FileOperation |
+/// | Contains `*`, `?`, `[`, or `{`                  | FileOperation |
 /// | Is known subcommand AND no file/dir on disk   | Subcommand    |
 /// | Everything else                               | FileOperation |
 fn resolve_invocation() -> Invocation {
