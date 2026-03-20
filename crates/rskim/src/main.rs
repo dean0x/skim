@@ -182,13 +182,12 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
 SUBCOMMANDS:\n  \
-    completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n\n\
-SUBCOMMANDS (planned):\n  \
-    init                                     Initialize skim configuration\n  \
-    test                                     Run test with output parsing\n  \
-    rewrite                                  Rewrite command output\n  \
-    git                                      Git integration helpers\n  \
-    build                                    Build with output parsing\n\n\
+    completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n  \
+    init                                     Initialize skim configuration (planned)\n  \
+    test                                     Run test with output parsing (planned)\n  \
+    rewrite                                  Rewrite command output (planned)\n  \
+    git                                      Git integration helpers (planned)\n  \
+    build                                    Build with output parsing (planned)\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File, directory, or glob pattern to process (use '-' for stdin)

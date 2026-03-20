@@ -304,7 +304,7 @@ impl PassthroughTruncator {
                 if mid == 0 {
                     break;
                 }
-                hi = mid - 1;
+                hi = mid.saturating_sub(1);
             }
         }
 
@@ -752,6 +752,36 @@ mod tests {
         assert_eq!(
             OutputMode::from_optional_exit_code(None),
             OutputMode::Verbose
+        );
+    }
+
+    #[test]
+    fn test_from_optional_some_zero_is_compact() {
+        assert_eq!(
+            OutputMode::from_optional_exit_code(Some(0)),
+            OutputMode::Compact
+        );
+    }
+
+    #[test]
+    fn test_from_optional_some_nonzero_is_verbose() {
+        assert_eq!(
+            OutputMode::from_optional_exit_code(Some(1)),
+            OutputMode::Verbose
+        );
+    }
+
+    #[test]
+    fn test_truncate_zero_budget_non_empty() {
+        let content = "line one\nline two\nline three";
+        let result = PassthroughTruncator::truncate_to_budget(content, 0).unwrap();
+        assert!(
+            result.contains("[... truncated 3 lines]"),
+            "expected truncation marker for 3 lines, got: {result}"
+        );
+        assert!(
+            !result.contains("line one"),
+            "expected no original content in zero-budget output, got: {result}"
         );
     }
 }

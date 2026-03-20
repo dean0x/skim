@@ -44,6 +44,14 @@ pub(crate) enum RunnerError {
     /// I/O error reading pipes.
     #[error(transparent)]
     Io(#[from] io::Error),
+
+    /// Failed to capture a child pipe (stdout or stderr was `None`).
+    #[error("failed to capture child {pipe}")]
+    PipeCaptureFailed { pipe: &'static str },
+
+    /// A reader thread panicked instead of returning normally.
+    #[error("{pipe} reader thread panicked")]
+    ReaderPanicked { pipe: &'static str },
 }
 
 /// A command runner with optional timeout support.
@@ -85,11 +93,11 @@ impl CommandRunner {
         let child_stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to capture child stdout"))?;
+            .ok_or(RunnerError::PipeCaptureFailed { pipe: "stdout" })?;
         let child_stderr = child
             .stderr
             .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to capture child stderr"))?;
+            .ok_or(RunnerError::PipeCaptureFailed { pipe: "stderr" })?;
 
         // Spawn concurrent reader threads to prevent pipe deadlocks.
         let stdout_handle = thread::spawn(move || read_pipe(child_stdout));
@@ -101,10 +109,10 @@ impl CommandRunner {
         // Join reader threads — propagate panics as anyhow errors.
         let stdout = stdout_handle
             .join()
-            .map_err(|_| anyhow::anyhow!("stdout reader thread panicked"))??;
+            .map_err(|_| RunnerError::ReaderPanicked { pipe: "stdout" })??;
         let stderr = stderr_handle
             .join()
-            .map_err(|_| anyhow::anyhow!("stderr reader thread panicked"))??;
+            .map_err(|_| RunnerError::ReaderPanicked { pipe: "stderr" })??;
 
         let duration = start.elapsed();
 
@@ -148,14 +156,38 @@ impl CommandRunner {
     }
 }
 
-/// Read an entire pipe into a lossy-UTF-8 String.
+/// Maximum bytes we will read from a single pipe (64 MiB).
 ///
-/// Uses `read_to_end` + `String::from_utf8_lossy` instead of `read_to_string`
-/// so that non-UTF-8 output (e.g., binary data from `/dev/zero`) does not
-/// cause an error.
+/// Prevents unbounded memory growth when a child process produces
+/// unexpectedly large output.
+const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read a pipe into a lossy-UTF-8 String, capped at [`MAX_OUTPUT_BYTES`].
+///
+/// Uses chunked reads (8 KiB) instead of `read_to_end` to enforce the size
+/// limit without requiring the OS to report exact pipe length up-front.
+/// Non-UTF-8 output (e.g., binary data from `/dev/zero`) is handled via
+/// `String::from_utf8_lossy`.
+///
+/// Returns an `io::Error` (kind `Other`) if the output exceeds the cap.
 fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
     let mut buf = Vec::new();
-    reader.read_to_end(&mut buf)?;
+    let mut chunk = [0u8; 8 * 1024];
+
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_OUTPUT_BYTES {
+            return Err(io::Error::other(format!(
+                "output exceeded {} byte limit",
+                MAX_OUTPUT_BYTES
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -286,6 +318,37 @@ mod tests {
             "Expected >= 131072 bytes, got {}",
             result.stdout.len()
         );
+    }
+
+    #[test]
+    fn read_pipe_enforces_max_output_limit() {
+        // Create a reader that produces bytes beyond MAX_OUTPUT_BYTES.
+        // We use a struct that yields an infinite stream of zeros.
+        struct InfiniteZeros;
+        impl Read for InfiniteZeros {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                // Fill the buffer with zeros.
+                for b in buf.iter_mut() {
+                    *b = 0;
+                }
+                Ok(buf.len())
+            }
+        }
+
+        let err = read_pipe(InfiniteZeros).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(
+            err.to_string().contains("byte limit"),
+            "Expected 'byte limit' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn read_pipe_accepts_output_under_limit() {
+        let data = vec![b'A'; 1024];
+        let result = read_pipe(std::io::Cursor::new(data)).unwrap();
+        assert_eq!(result.len(), 1024);
     }
 
     #[cfg(unix)]
