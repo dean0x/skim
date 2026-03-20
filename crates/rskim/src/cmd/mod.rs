@@ -15,17 +15,10 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
     KNOWN_SUBCOMMANDS.contains(&name)
 }
 
-/// Trait for future subcommand implementations (Phase B extensibility).
-///
-/// Each handler receives the raw remaining args as `&[String]` (not
-/// pre-parsed) so it can do its own parsing — this avoids the class of
-/// rewrite-layer bugs found in GRANITE's arg handling.
-#[allow(dead_code)]
-pub(crate) trait SubcommandHandler {
-    fn execute(&self, args: &[String]) -> anyhow::Result<i32>;
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
-}
+// Phase B extensibility: when subcommands are implemented, introduce a
+// `SubcommandHandler` trait here. Each handler should receive raw remaining
+// args as `&[String]` (not pre-parsed) so it can do its own parsing — this
+// avoids the class of rewrite-layer bugs found in GRANITE's arg handling.
 
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
@@ -34,7 +27,12 @@ pub(crate) trait SubcommandHandler {
 /// - Otherwise: prints "not yet implemented" to stderr, returns 1
 pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<i32> {
     if !is_known_subcommand(subcommand) {
-        anyhow::bail!("unknown subcommand: {subcommand}");
+        anyhow::bail!(
+            "Unknown subcommand: '{subcommand}'\n\
+             Available subcommands: {}\n\
+             Run 'skim --help' for usage information",
+            KNOWN_SUBCOMMANDS.join(", ")
+        );
     }
 
     // Check for --help / -h in remaining args
