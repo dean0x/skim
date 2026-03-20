@@ -64,9 +64,9 @@ fn is_flag_with_value(flag: &str) -> bool {
 /// - Contains `.` (file extension)
 /// - Contains `/` or `\` (path separator)
 /// - Is `-` (stdin)
-/// - Contains `*`, `?`, or `[` (glob metacharacter)
+/// - Contains `*`, `?`, `[`, or `{` (glob metacharacter)
 fn looks_like_file_or_glob(token: &str) -> bool {
-    token == "-" || token.contains(['.', '/', '\\', '*', '?', '['])
+    token == "-" || token.contains(['.', '/', '\\', '*', '?', '[', '{'])
 }
 
 /// Pre-parse `std::env::args()` to decide whether to route to a subcommand

@@ -25,7 +25,7 @@ pub(crate) struct MultiFileOptions {
 
 /// Check if path contains glob pattern characters
 pub(crate) fn has_glob_pattern(path: &str) -> bool {
-    path.contains('*') || path.contains('?') || path.contains('[')
+    path.contains('*') || path.contains('?') || path.contains('[') || path.contains('{')
 }
 
 /// Validate glob pattern to prevent path traversal attacks
@@ -85,16 +85,17 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
 /// global gitignore, `.git/info/exclude`, `.ignore` files, and skips hidden
 /// files/directories. When true, all ignore rules are disabled.
 fn configure_walker(builder: &mut WalkBuilder, no_ignore: bool) {
+    let respect_ignore = !no_ignore;
     builder
-        .hidden(!no_ignore) // skip hidden files unless --no-ignore
-        .git_ignore(!no_ignore) // respect .gitignore unless --no-ignore
-        .git_global(!no_ignore) // respect global gitignore unless --no-ignore
-        .git_exclude(!no_ignore) // respect .git/info/exclude unless --no-ignore
-        .ignore(!no_ignore) // respect .ignore files unless --no-ignore
-        .parents(!no_ignore) // respect parent directory ignores unless --no-ignore
-        .require_git(false) // respect .gitignore even outside git repos
-        .follow_links(false) // don't follow symlinks (safe default)
-        .sort_by_file_path(|a, b| a.cmp(b)); // deterministic order
+        .hidden(respect_ignore)
+        .git_ignore(respect_ignore)
+        .git_global(respect_ignore)
+        .git_exclude(respect_ignore)
+        .ignore(respect_ignore)
+        .parents(respect_ignore)
+        .require_git(false)
+        .follow_links(false)
+        .sort_by_file_path(|a, b| a.cmp(b));
 }
 
 /// Extract the static directory prefix and glob override pattern from a user
@@ -131,6 +132,12 @@ fn glob_walk_root(pattern: &str) -> (&str, &str) {
 
     if static_count == 0 {
         (".", pattern)
+    } else if static_count == segments.len() {
+        // All segments are static (no glob metacharacters). Treat the
+        // entire pattern as a root with a match-everything glob. This is
+        // defensive -- callers are expected to verify glob chars exist
+        // before calling, but we must not panic on unexpected input.
+        (pattern, "**")
     } else {
         // Find the byte offset where the glob portion starts
         let root_end: usize = segments[..static_count]
@@ -146,19 +153,23 @@ fn glob_walk_root(pattern: &str) -> (&str, &str) {
     }
 }
 
+/// Format a hint about `--no-ignore` when gitignore filtering is active.
+fn no_ignore_hint(no_ignore: bool) -> &'static str {
+    if no_ignore {
+        ""
+    } else {
+        "\nHint: Files may be excluded by .gitignore. Use --no-ignore to include all files."
+    }
+}
+
 /// Process multiple files with parallel processing via rayon.
 ///
 /// Used by both glob and directory inputs. Handles parallel execution,
 /// error aggregation, and accumulated token statistics.
-fn process_files(
-    paths: Vec<PathBuf>,
-    source_description: &str,
-    options: MultiFileOptions,
-) -> anyhow::Result<()> {
-    if paths.is_empty() {
-        anyhow::bail!("No files found: {}", source_description);
-    }
-
+///
+/// Precondition: `paths` must be non-empty. Callers should validate and
+/// produce a descriptive error (with `--no-ignore` hint) before calling.
+fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Result<()> {
     let process_options = options.process;
 
     let results: Vec<_> = if let Some(num_jobs) = options.jobs {
@@ -253,9 +264,6 @@ pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::
 
     let (walk_root, glob_pattern) = glob_walk_root(pattern);
 
-    // Build the glob matcher for filtering walk results.
-    // The glob pattern is relative to the walk root, so we match
-    // against paths relative to the walk root.
     let glob = GlobBuilder::new(glob_pattern)
         .literal_separator(false)
         .build()
@@ -272,35 +280,28 @@ pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::
     let paths: Vec<PathBuf> = builder
         .build()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .filter(|entry| {
-            // Match relative path against the glob pattern
             let path = entry.path();
-            if let Ok(canonical) = path.canonicalize() {
-                if let Ok(rel) = canonical.strip_prefix(&walk_root_path) {
-                    return matcher.is_match(rel);
-                }
-            }
-            // Fallback: try matching against path relative to walk root directly
-            if let Ok(rel) = path.strip_prefix(walk_root) {
-                return matcher.is_match(rel);
-            }
-            false
+            // Try canonical path first (resolves symlinks/`.`), fall back to literal
+            path.canonicalize()
+                .ok()
+                .and_then(|c| c.strip_prefix(&walk_root_path).ok().map(PathBuf::from))
+                .or_else(|| path.strip_prefix(walk_root).ok().map(PathBuf::from))
+                .is_some_and(|rel| matcher.is_match(&rel))
         })
         .map(|entry| entry.into_path())
         .collect();
 
-    let hint = if !options.no_ignore {
-        "\nHint: Files may be excluded by .gitignore. Use --no-ignore to include all files."
-    } else {
-        ""
-    };
-
     if paths.is_empty() {
-        anyhow::bail!("No files found: pattern '{}'{}", pattern, hint,);
+        anyhow::bail!(
+            "No files found: pattern '{}'{}",
+            pattern,
+            no_ignore_hint(options.no_ignore)
+        );
     }
 
-    process_files(paths, &format!("pattern '{}'", pattern), options)
+    process_files(paths, options)
 }
 
 /// Collect all supported files from a directory recursively.
@@ -308,36 +309,32 @@ pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::
 /// Uses `ignore::WalkBuilder` to walk the directory tree, respecting
 /// `.gitignore` and hidden file rules. Filters for supported extensions
 /// using `Language::from_path()`.
-fn collect_files_from_directory(dir: &Path, no_ignore: bool) -> anyhow::Result<Vec<PathBuf>> {
+fn collect_files_from_directory(dir: &Path, no_ignore: bool) -> Vec<PathBuf> {
     let mut builder = WalkBuilder::new(dir);
     configure_walker(&mut builder, no_ignore);
 
-    let files: Vec<PathBuf> = builder
+    builder
         .build()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .filter(|entry| Language::from_path(entry.path()).is_some())
         .map(|entry| entry.into_path())
-        .collect();
-
-    Ok(files)
+        .collect()
 }
 
 /// Process all supported files in a directory recursively
 pub(crate) fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow::Result<()> {
-    let paths = collect_files_from_directory(dir, options.no_ignore)?;
-
-    let hint = if !options.no_ignore {
-        "\nHint: Files may be excluded by .gitignore. Use --no-ignore to include all files."
-    } else {
-        ""
-    };
+    let paths = collect_files_from_directory(dir, options.no_ignore);
 
     if paths.is_empty() {
-        anyhow::bail!("No files found: directory '{}'{}", dir.display(), hint,);
+        anyhow::bail!(
+            "No files found: directory '{}'{}",
+            dir.display(),
+            no_ignore_hint(options.no_ignore)
+        );
     }
 
-    process_files(paths, &format!("directory '{}'", dir.display()), options)
+    process_files(paths, options)
 }
 
 #[cfg(test)]
@@ -350,6 +347,8 @@ mod tests {
         assert!(has_glob_pattern("src/**/*.js"));
         assert!(has_glob_pattern("file?.py"));
         assert!(has_glob_pattern("file[123].rs"));
+        assert!(has_glob_pattern("*.{js,ts}"));
+        assert!(has_glob_pattern("src/{a,b}.ts"));
         assert!(!has_glob_pattern("file.ts"));
         assert!(!has_glob_pattern("src/main.rs"));
     }
@@ -462,5 +461,13 @@ mod tests {
     #[test]
     fn test_glob_walk_root_bracket() {
         assert_eq!(glob_walk_root("src/file[123].ts"), ("src", "file[123].ts"));
+    }
+
+    #[test]
+    fn test_glob_walk_root_no_glob_chars_defensive() {
+        // Defensive: if no glob chars exist, treat the entire pattern as root
+        // with a match-everything glob. This should not happen in practice
+        // (callers check has_glob_pattern first), but must not panic.
+        assert_eq!(glob_walk_root("src/file.ts"), ("src/file.ts", "**"));
     }
 }
