@@ -69,7 +69,7 @@ impl TokenStats {
 }
 
 /// Format number with thousands separators
-fn format_number(n: usize) -> String {
+pub(crate) fn format_number(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::new();
 

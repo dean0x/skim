@@ -13,7 +13,9 @@ mod cache;
 mod cascade;
 mod cmd;
 mod multi;
+mod output;
 mod process;
+mod runner;
 mod tokens;
 
 use clap::Parser;
@@ -64,13 +66,7 @@ fn is_flag_with_value(flag: &str) -> bool {
 /// - Is `-` (stdin)
 /// - Contains `*`, `?`, or `[` (glob metacharacter)
 fn looks_like_file_or_glob(token: &str) -> bool {
-    token.contains('.')
-        || token.contains('/')
-        || token.contains('\\')
-        || token == "-"
-        || token.contains('*')
-        || token.contains('?')
-        || token.contains('[')
+    token == "-" || token.contains(['.', '/', '\\', '*', '?', '['])
 }
 
 /// Pre-parse `std::env::args()` to decide whether to route to a subcommand
@@ -185,6 +181,8 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim . --jobs 8                          Process current directory with 8 threads\n  \
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
+SUBCOMMANDS:\n  \
+    completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n\n\
 SUBCOMMANDS (planned):\n  \
     init                                     Initialize skim configuration\n  \
     test                                     Run test with output parsing\n  \
@@ -271,6 +269,14 @@ struct Args {
     tokens: Option<usize>,
 }
 
+/// Build the clap `Command` from `Args` for use by shell completion generation.
+///
+/// This exposes only the `Command`, not the `Args` struct itself. Used by
+/// `cmd/completions.rs` to build a synthetic completion-aware command.
+pub(crate) fn file_operation_command() -> clap::Command {
+    <Args as clap::CommandFactory>::command()
+}
+
 /// Mode argument (clap value_enum wrapper)
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum ModeArg {
@@ -353,10 +359,8 @@ fn validate_bounded_arg(
     };
 
     if v == 0 {
-        match zero_hint {
-            Some(hint) => anyhow::bail!("{flag_name} must be at least 1\n{hint}"),
-            None => anyhow::bail!("{flag_name} must be at least 1"),
-        }
+        let suffix = zero_hint.map_or(String::new(), |hint| format!("\n{hint}"));
+        anyhow::bail!("{flag_name} must be at least 1{suffix}");
     }
     if v > max {
         anyhow::bail!("{flag_name} value too high: {v} (maximum: {max})\n{max_reason}");

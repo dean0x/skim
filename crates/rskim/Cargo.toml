@@ -23,6 +23,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tiktoken-rs = { workspace = true }
+thiserror = { workspace = true }
+clap_complete = "4.5"
+strip-ansi-escapes = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2.0"

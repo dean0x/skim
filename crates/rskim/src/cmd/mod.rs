@@ -4,13 +4,16 @@
 //! backward compatibility with file-first invocations. Each subcommand
 //! is currently a stub that will be implemented in later Phase B tickets.
 
+mod completions;
+
 use std::process::ExitCode;
 
 /// Known subcommands that the pre-parse router will recognize.
 ///
 /// IMPORTANT: Only register subcommands we will actually implement.
 /// Keep this list exact — no broad patterns. See GRANITE lesson #336.
-pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &["init", "test", "rewrite", "git", "build"];
+pub(crate) const KNOWN_SUBCOMMANDS: &[&str] =
+    &["build", "completions", "git", "init", "rewrite", "test"];
 
 /// Check whether `name` is a registered subcommand.
 pub(crate) fn is_known_subcommand(name: &str) -> bool {
@@ -37,8 +40,13 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         );
     }
 
+    // Dispatch implemented subcommands
+    if subcommand == "completions" {
+        return completions::run(args);
+    }
+
     // Check for --help / -h in remaining args
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         println!("skim {subcommand}");
         println!();
         println!("  Status: not yet implemented");

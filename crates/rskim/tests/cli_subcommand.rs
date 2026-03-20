@@ -312,7 +312,8 @@ fn test_help_lists_subcommands() {
         .stdout(predicate::str::contains("SUBCOMMANDS"))
         .stdout(predicate::str::contains("init"))
         .stdout(predicate::str::contains("test"))
-        .stdout(predicate::str::contains("build"));
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("completions"));
 }
 
 // ============================================================================
