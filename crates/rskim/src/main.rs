@@ -390,21 +390,18 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
-    match resolve_invocation() {
-        Invocation::FileOperation => match run_file_operation() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("Error: {e:#}");
-                ExitCode::FAILURE
-            }
-        },
-        Invocation::Subcommand { name, args } => match cmd::dispatch(&name, &args) {
-            Ok(code) => ExitCode::from(code as u8),
-            Err(e) => {
-                eprintln!("Error: {e:#}");
-                ExitCode::FAILURE
-            }
-        },
+    let result = match resolve_invocation() {
+        Invocation::FileOperation => run_file_operation().map(|()| 0),
+        Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args),
+    };
+
+    match result {
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code as u8),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -534,6 +531,23 @@ mod tests {
     // is_flag_with_value sync tests (batch-A flag-sync)
     // ========================================================================
 
+    /// Exhaustive list of flags that consume the next token as a value.
+    /// Derived from the `Args` struct fields that are NOT bool.
+    ///
+    /// UPDATE THIS LIST if you add/remove a value-consuming flag.
+    const VALUE_FLAGS: &[&str] = &[
+        "--mode",
+        "-m",
+        "--language",
+        "-l",
+        "--lang", // alias for --language
+        "--filename",
+        "--jobs",
+        "-j",
+        "--max-lines",
+        "--tokens",
+    ];
+
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
     /// is registered in `is_flag_with_value()`.
     ///
@@ -541,24 +555,7 @@ mod tests {
     /// to register it in `is_flag_with_value()`.
     #[test]
     fn test_is_flag_with_value_covers_all_value_flags() {
-        // Exhaustive list of flags that consume the next token as a value.
-        // Derived from the `Args` struct fields that are NOT bool.
-        //
-        // UPDATE THIS LIST if you add/remove a value-consuming flag.
-        let value_flags: &[&str] = &[
-            "--mode",
-            "-m",
-            "--language",
-            "-l",
-            "--lang",       // alias for --language
-            "--filename",
-            "--jobs",
-            "-j",
-            "--max-lines",
-            "--tokens",
-        ];
-
-        for flag in value_flags {
+        for flag in VALUE_FLAGS {
             assert!(
                 is_flag_with_value(flag),
                 "Value-consuming flag {flag} is NOT registered in is_flag_with_value(). \
@@ -607,12 +604,7 @@ mod tests {
         // so we test the building blocks: is_flag_with_value must return
         // true for every flag that takes a value, ensuring the pre-parser
         // skips past the value token.
-        let value_flags: &[&str] = &[
-            "--mode", "-m", "--language", "-l", "--lang",
-            "--filename", "--jobs", "-j", "--max-lines", "--tokens",
-        ];
-
-        for flag in value_flags {
+        for flag in VALUE_FLAGS {
             assert!(
                 is_flag_with_value(flag),
                 "If {flag} does not consume its value, `skim {flag} test` would \
