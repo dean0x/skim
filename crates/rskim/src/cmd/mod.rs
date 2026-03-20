@@ -4,6 +4,8 @@
 //! backward compatibility with file-first invocations. Each subcommand
 //! is currently a stub that will be implemented in later Phase B tickets.
 
+use std::process::ExitCode;
+
 /// Known subcommands that the pre-parse router will recognize.
 ///
 /// IMPORTANT: Only register subcommands we will actually implement.
@@ -28,7 +30,7 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 pub(crate) fn dispatch(
     subcommand: &str,
     args: &[String],
-) -> anyhow::Result<std::process::ExitCode> {
+) -> anyhow::Result<ExitCode> {
     if !is_known_subcommand(subcommand) {
         anyhow::bail!(
             "Unknown subcommand: '{subcommand}'\n\
@@ -46,7 +48,7 @@ pub(crate) fn dispatch(
         println!();
         println!("  This subcommand is planned for a future release.");
         println!("  See: https://github.com/dean0x/skim/issues/19");
-        return Ok(std::process::ExitCode::SUCCESS);
+        return Ok(ExitCode::SUCCESS);
     }
 
     eprintln!("skim {subcommand}: not yet implemented");
@@ -54,5 +56,5 @@ pub(crate) fn dispatch(
     eprintln!("This subcommand is planned for a future release.");
     eprintln!("See: https://github.com/dean0x/skim/issues/19");
 
-    Ok(std::process::ExitCode::FAILURE)
+    Ok(ExitCode::FAILURE)
 }
