@@ -152,6 +152,11 @@ pub(crate) fn transform_pseudo_with_spans(
         0,
     )?;
 
+    // Reset node_count so the second pass gets a full budget.
+    // Without this, nodes counted in pass 1 eat into the MAX_AST_NODES
+    // limit for pass 2, effectively halving the allowed node count.
+    node_count = 0;
+
     // Step 2: Collect noise ranges per language rules
     collect_noise_ranges(
         tree.root_node(),
@@ -765,6 +770,60 @@ mod tests {
             err_msg.contains("Too many AST nodes"),
             "Expected 'Too many AST nodes' error, got: {}",
             err_msg
+        );
+    }
+
+    // ========================================================================
+    // Edge case tests
+    // ========================================================================
+
+    #[test]
+    fn test_pseudo_empty_input() {
+        let source = "";
+        let mut parser = Parser::new(Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = TransformConfig::with_mode(Mode::Pseudo);
+        let result = transform_pseudo(source, &tree, Language::TypeScript, &config).unwrap();
+        assert_eq!(result, "", "empty input should produce empty output");
+    }
+
+    #[test]
+    fn test_pseudo_overlapping_comment_and_noise_range() {
+        // A decorator with an inline comment: both should be stripped
+        let source =
+            "@staticmethod  # old helper\ndef helper(self, x: int) -> int:\n    return x\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            !result.contains("@staticmethod"),
+            "decorator should be stripped, got: {result}"
+        );
+        assert!(
+            !result.contains("# old helper"),
+            "inline comment should be stripped, got: {result}"
+        );
+        assert!(
+            !result.contains(": int"),
+            "type annotations should be stripped, got: {result}"
+        );
+        assert!(
+            result.contains("def helper(x)"),
+            "function preserved without self/types, got: {result}"
+        );
+        assert!(result.contains("return x"), "logic preserved");
+    }
+
+    #[test]
+    fn test_pseudo_markdown_passthrough() {
+        // Markdown in pseudo mode should return source unchanged (passthrough
+        // happens in Language::transform_source, not in transform_pseudo)
+        let source = "# Heading\n\nSome **bold** text.\n";
+        let config = TransformConfig::with_mode(Mode::Pseudo);
+        let result = Language::Markdown
+            .transform_source(source, &config)
+            .unwrap();
+        assert_eq!(
+            result, source,
+            "Markdown should pass through unchanged in pseudo mode"
         );
     }
 }

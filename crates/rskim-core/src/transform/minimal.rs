@@ -223,29 +223,31 @@ fn is_go_declaration(kind: &str) -> bool {
     )
 }
 
-/// Adjust a range to remove the entire line if the content is the only
+/// Adjust a range to remove the entire line if the range is the only
 /// non-whitespace content on that line.
 ///
-/// If the content occupies the full line (only whitespace before/after on same line),
-/// remove the entire line including the newline. Otherwise, just remove the content
+/// If the range occupies the full line (only whitespace before/after on same line),
+/// remove the entire line including the newline. Otherwise, just remove the range
 /// and any leading whitespace before it on the same line (for inline trailing content).
+///
+/// Used by both minimal mode (comment removal) and pseudo mode (noise removal).
 pub(crate) fn adjust_range_for_line_removal(
     source: &str,
     start: usize,
     end: usize,
 ) -> (usize, usize) {
-    // Find the start of the line containing this comment
+    // Find the start of the line containing this range
     let line_start = source[..start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
 
-    // Find the end of the line containing this comment
+    // Find the end of the line containing this range
     let line_end = source[end..]
         .find('\n')
         .map(|pos| end + pos + 1)
         .unwrap_or(source.len());
 
-    // Check if the comment is the only non-whitespace content on the line
-    let before_comment = &source[line_start..start];
-    let after_comment = if end < line_end {
+    // Check if the range is the only non-whitespace content on the line
+    let before_range = &source[line_start..start];
+    let after_range = if end < line_end {
         let after_end = if line_end > 0 && source.as_bytes().get(line_end - 1) == Some(&b'\n') {
             line_end - 1
         } else {
@@ -256,18 +258,18 @@ pub(crate) fn adjust_range_for_line_removal(
         ""
     };
 
-    let only_whitespace_before = before_comment.chars().all(|c| c.is_whitespace());
-    let only_whitespace_after = after_comment.chars().all(|c| c.is_whitespace());
+    let only_whitespace_before = before_range.chars().all(|c| c.is_whitespace());
+    let only_whitespace_after = after_range.chars().all(|c| c.is_whitespace());
 
     if only_whitespace_before && only_whitespace_after {
-        // Comment is the only content on this line - remove the entire line
+        // Range is the only content on this line - remove the entire line
         (line_start, line_end)
     } else if only_whitespace_after {
-        // Inline trailing comment: remove leading whitespace before the comment too
+        // Inline trailing range: remove leading whitespace before the range too
         let trimmed_start = source[line_start..start].trim_end().len() + line_start;
         (trimmed_start, end)
     } else {
-        // Comment is in the middle or start of a line with other content - just remove the comment
+        // Range is in the middle or start of a line with other content - just remove the range
         (start, end)
     }
 }
