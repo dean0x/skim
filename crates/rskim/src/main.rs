@@ -577,12 +577,8 @@ mod tests {
     /// Ensure boolean flags are NOT registered as value-consuming.
     #[test]
     fn test_is_flag_with_value_rejects_boolean_flags() {
-        let boolean_flags: &[&str] = &[
-            "--no-header",
-            "--no-cache",
-            "--clear-cache",
-            "--show-stats",
-        ];
+        let boolean_flags: &[&str] =
+            &["--no-header", "--no-cache", "--clear-cache", "--show-stats"];
 
         for flag in boolean_flags {
             assert!(

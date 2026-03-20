@@ -27,10 +27,7 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 /// Exit code semantics (GRANITE lesson — exit code corruption is P1):
 /// - `--help` / `-h`: prints description to stdout, returns SUCCESS
 /// - Otherwise: prints "not yet implemented" to stderr, returns FAILURE
-pub(crate) fn dispatch(
-    subcommand: &str,
-    args: &[String],
-) -> anyhow::Result<ExitCode> {
+pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<ExitCode> {
     if !is_known_subcommand(subcommand) {
         anyhow::bail!(
             "Unknown subcommand: '{subcommand}'\n\
