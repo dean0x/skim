@@ -164,15 +164,14 @@ pub(crate) fn transform_pseudo_with_spans(
         0,
     )?;
 
-    // Step 3: Sort and merge ranges
+    // Step 3: Sort, dedup, and adjust ranges for full line removal
     ranges.sort_unstable_by_key(|&(start, _)| start);
     ranges.dedup();
 
-    // Adjust ranges for full line removal where applicable
-    let mut final_ranges: Vec<(usize, usize)> = Vec::new();
-    for &(start, end) in &ranges {
-        final_ranges.push(adjust_range_for_line_removal(source, start, end));
-    }
+    let mut final_ranges: Vec<(usize, usize)> = ranges
+        .iter()
+        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end))
+        .collect();
 
     // Re-sort after adjustment (line-level adjustments can change ordering)
     final_ranges.sort_unstable_by_key(|&(start, _)| start);
@@ -203,30 +202,33 @@ fn collapse_whitespace(source: &str) -> String {
         let indent = &line[..indent_len];
         let content = line[indent_len..].trim_end();
 
-        // Collapse multiple spaces in content portion
-        let mut collapsed = String::with_capacity(content.len());
-        let mut prev_space = false;
-        for ch in content.chars() {
-            if ch == ' ' {
-                if !prev_space {
-                    collapsed.push(ch);
-                }
-                prev_space = true;
-            } else {
-                collapsed.push(ch);
-                prev_space = false;
-            }
-        }
-
-        // Trim leading space from collapsed content (artifact of removing inline elements
-        // like `pub ` which leaves a leading space)
-        let collapsed = collapsed.trim_start();
+        // Collapse multiple consecutive spaces in content, then trim leading space
+        // left behind by removing inline elements (e.g., `pub ` -> ` fn ...`)
+        let collapsed = collapse_consecutive_spaces(content);
 
         result.push_str(indent);
-        result.push_str(collapsed);
+        result.push_str(collapsed.trim_start());
         result.push('\n');
     }
 
+    result
+}
+
+/// Collapse runs of consecutive spaces into a single space
+fn collapse_consecutive_spaces(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch == ' ' {
+            if !prev_space {
+                result.push(ch);
+            }
+            prev_space = true;
+        } else {
+            result.push(ch);
+            prev_space = false;
+        }
+    }
     result
 }
 
@@ -252,7 +254,10 @@ fn collect_noise_ranges(
 
     // SECURITY: Prevent stack overflow from deeply nested AST
     if depth > MAX_AST_DEPTH {
-        return Ok(());
+        return Err(SkimError::ParseError(format!(
+            "Maximum AST depth exceeded: {} (possible malicious input)",
+            MAX_AST_DEPTH
+        )));
     }
 
     let kind = node.kind();
@@ -261,27 +266,8 @@ fn collect_noise_ranges(
     if rules.strip_kinds.contains(&kind) {
         let start = node.start_byte();
         let end = node.end_byte();
-
-        // For Python type annotations in typed_parameter, the "type" node
-        // does NOT include the colon separator. We need to extend to include `: ` before it.
-        if language == Language::Python && kind == "type" {
-            if start >= 2 && source.get(start - 2..start) == Some(": ") {
-                ranges.push((start - 2, end));
-            } else if start >= 1 && source.get(start - 1..start) == Some(":") {
-                ranges.push((start - 1, end));
-            } else {
-                ranges.push((start, end));
-            }
-        } else if language == Language::Python && kind == "return_type" {
-            // Python return_type includes ` -> type`, extend to consume leading space
-            if start >= 1 && source.get(start - 1..start) == Some(" ") {
-                ranges.push((start - 1, end));
-            } else {
-                ranges.push((start, end));
-            }
-        } else {
-            ranges.push((start, end));
-        }
+        let adjusted_start = adjust_python_type_start(language, kind, source, start);
+        ranges.push((adjusted_start, end));
         return Ok(()); // Don't recurse into stripped nodes
     }
 
@@ -294,14 +280,18 @@ fn collect_noise_ranges(
         }
     }
 
-    // Check for semicolon stripping (statement-terminating only)
+    // Check for semicolon stripping (statement-terminating only, not for-loop headers)
     if rules.strip_semicolons && kind == ";" {
-        // Only strip if parent is NOT a for-loop header
-        let parent_kind = node.parent().map(|p| p.kind()).unwrap_or("");
-        if parent_kind != "for_statement"
-            && parent_kind != "for_in_statement"
-            && parent_kind != "for_of_statement"
-        {
+        let is_for_loop = node
+            .parent()
+            .map(|p| {
+                matches!(
+                    p.kind(),
+                    "for_statement" | "for_in_statement" | "for_of_statement"
+                )
+            })
+            .unwrap_or(false);
+        if !is_for_loop {
             ranges.push((node.start_byte(), node.end_byte()));
             return Ok(());
         }
@@ -330,6 +320,36 @@ fn collect_noise_ranges(
     Ok(())
 }
 
+/// Adjust the start position for Python type annotations to include their separators.
+///
+/// Python's "type" node in `typed_parameter` does NOT include the `: ` separator,
+/// and "return_type" may have a leading space before ` -> type`. This extends the
+/// removal range to include these separators for clean output.
+fn adjust_python_type_start(language: Language, kind: &str, source: &str, start: usize) -> usize {
+    if language != Language::Python {
+        return start;
+    }
+    match kind {
+        "type" => {
+            if start >= 2 && source.get(start - 2..start) == Some(": ") {
+                start - 2
+            } else if start >= 1 && source.get(start - 1..start) == Some(":") {
+                start - 1
+            } else {
+                start
+            }
+        }
+        "return_type" => {
+            if start >= 1 && source.get(start - 1..start) == Some(" ") {
+                start - 1
+            } else {
+                start
+            }
+        }
+        _ => start,
+    }
+}
+
 /// Strip `self` or `cls` first parameter from Python method definitions
 fn strip_python_self_param(
     params_node: Node,
@@ -346,59 +366,49 @@ fn strip_python_self_param(
             continue;
         }
 
-        // Check if this is self or cls (plain identifier)
-        let text = child.utf8_text(source_bytes).unwrap_or("");
-        let is_self_param = kind == "identifier" && matches!(text, "self" | "cls");
-
-        // For typed_parameter, check the first child identifier
-        if kind == "typed_parameter" || kind == "default_parameter" {
-            let is_self_or_cls = {
+        // Determine if this first parameter is self/cls
+        let is_self_or_cls = match kind {
+            "identifier" => matches!(child.utf8_text(source_bytes).unwrap_or(""), "self" | "cls"),
+            "typed_parameter" | "default_parameter" => {
                 let mut inner_cursor = child.walk();
-                let result = child
+                // Bind to local before `inner_cursor` is dropped (tree-sitter lifetime)
+                let found = child
                     .children(&mut inner_cursor)
                     .next()
                     .and_then(|first_child| first_child.utf8_text(source_bytes).ok())
                     .is_some_and(|t| matches!(t, "self" | "cls"));
-                result
-            };
-            if is_self_or_cls {
-                // Remove the whole typed_parameter/default_parameter + trailing comma
-                let start = child.start_byte();
-                let mut end = child.end_byte();
-                // Check for trailing comma + optional space
-                if let Some(next) = children.get(i + 1) {
-                    if next.kind() == "," {
-                        end = next.end_byte();
-                        // Consume trailing space after comma
-                        if end < source_bytes.len() && source_bytes[end] == b' ' {
-                            end += 1;
-                        }
-                    }
-                }
-                ranges.push((start, end));
-                return;
+                found
             }
-        }
+            _ => false,
+        };
 
-        if is_self_param {
+        if is_self_or_cls {
             let start = child.start_byte();
-            let mut end = child.end_byte();
-            // Check for trailing `, `
-            if let Some(next) = children.get(i + 1) {
-                if next.kind() == "," {
-                    end = next.end_byte();
-                    // Consume trailing space after comma
-                    if end < source_bytes.len() && source_bytes[end] == b' ' {
-                        end += 1;
-                    }
-                }
-            }
+            let end = extend_past_trailing_comma(child.end_byte(), &children, i, source_bytes);
             ranges.push((start, end));
-            return;
         }
 
         break; // Only check first parameter
     }
+}
+
+/// Extend a removal range past a trailing comma and optional space
+fn extend_past_trailing_comma(
+    end: usize,
+    children: &[Node],
+    index: usize,
+    source_bytes: &[u8],
+) -> usize {
+    if let Some(next) = children.get(index + 1) {
+        if next.kind() == "," {
+            let comma_end = next.end_byte();
+            if comma_end < source_bytes.len() && source_bytes[comma_end] == b' ' {
+                return comma_end + 1;
+            }
+            return comma_end;
+        }
+    }
+    end
 }
 
 #[cfg(test)]
