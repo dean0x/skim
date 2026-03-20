@@ -188,13 +188,13 @@ fn test_all_known_subcommands_are_stubs() {
 // ============================================================================
 
 #[test]
-fn test_existing_file_named_as_subcommand_routes_to_file_operation() {
+fn test_full_path_to_file_named_as_subcommand_uses_separator_heuristic() {
     let dir = TempDir::new().unwrap();
     // Create a file called "init" (no extension) in the temp dir
     let file = dir.path().join("init");
     fs::write(&file, "fn setup() {}").unwrap();
 
-    // When we pass the full path, it contains "/" → FileOperation
+    // Full path contains "/" → routes via path-separator heuristic (never reaches path.exists())
     Command::cargo_bin("skim")
         .unwrap()
         .arg(&file)
@@ -206,7 +206,27 @@ fn test_existing_file_named_as_subcommand_routes_to_file_operation() {
 }
 
 #[test]
-fn test_existing_dir_named_as_subcommand_routes_to_file_operation() {
+fn test_bare_file_named_as_subcommand_routes_to_file_operation() {
+    let dir = TempDir::new().unwrap();
+    // Create a file called "init" (a known subcommand name) in the temp dir
+    let file = dir.path().join("init");
+    fs::write(&file, "fn setup() {}").unwrap();
+
+    // Pass bare "init" with cwd set so path.exists() finds the file on disk.
+    // This exercises the backward-compat precedence: on-disk file wins over subcommand.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("init")
+        .arg("-l")
+        .arg("rust")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fn setup"));
+}
+
+#[test]
+fn test_full_path_to_dir_named_as_subcommand_uses_separator_heuristic() {
     let dir = TempDir::new().unwrap();
     // Create a directory called "build" with a source file inside
     let build_dir = dir.path().join("build");
@@ -214,10 +234,29 @@ fn test_existing_dir_named_as_subcommand_routes_to_file_operation() {
     let file = build_dir.join("main.rs");
     fs::write(&file, "fn main() {}").unwrap();
 
-    // Full path contains "/" → FileOperation → directory processing
+    // Full path contains "/" → routes via path-separator heuristic (never reaches path.exists())
     Command::cargo_bin("skim")
         .unwrap()
         .arg(&build_dir)
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_bare_dir_named_as_subcommand_routes_to_file_operation() {
+    let dir = TempDir::new().unwrap();
+    // Create a directory called "build" (a known subcommand name) with a source file inside
+    let build_dir = dir.path().join("build");
+    fs::create_dir(&build_dir).unwrap();
+    let file = build_dir.join("main.rs");
+    fs::write(&file, "fn main() {}").unwrap();
+
+    // Pass bare "build" with cwd set so path.exists() finds the directory on disk.
+    // This exercises the backward-compat precedence: on-disk directory wins over subcommand.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("build")
         .assert()
         .success();
 }
