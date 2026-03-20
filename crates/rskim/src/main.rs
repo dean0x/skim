@@ -196,7 +196,7 @@ struct Args {
 
     /// Transformation mode
     #[arg(short, long, value_enum, default_value = "structure")]
-    #[arg(help = "Transformation mode: structure, signatures, types, full, or minimal")]
+    #[arg(help = "Transformation mode: structure, signatures, types, full, minimal, or pseudo")]
     mode: ModeArg,
 
     /// Override language detection (required for stdin unless --filename is given)
@@ -284,6 +284,8 @@ enum ModeArg {
     Types,
     Full,
     Minimal,
+    /// Pseudo mode — strips syntactic noise (types, visibility, decorators) while preserving logic
+    Pseudo,
 }
 
 impl From<ModeArg> for Mode {
@@ -294,6 +296,7 @@ impl From<ModeArg> for Mode {
             ModeArg::Types => Mode::Types,
             ModeArg::Full => Mode::Full,
             ModeArg::Minimal => Mode::Minimal,
+            ModeArg::Pseudo => Mode::Pseudo,
         }
     }
 }

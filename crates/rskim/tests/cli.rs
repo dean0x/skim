@@ -818,3 +818,89 @@ fn test_cli_stdin_large_input_completes_within_time_bound() {
         elapsed
     );
 }
+
+// ============================================================================
+// Pseudo Mode CLI Tests
+// ============================================================================
+
+#[test]
+fn test_cli_pseudo_mode() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.ts");
+    fs::write(
+        &file_path,
+        "export function add(a: number, b: number): number { return a + b; }",
+    )
+    .unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--mode")
+        .arg("pseudo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("function add"))
+        .stdout(predicate::str::contains("return a + b"))
+        // Type annotations should be stripped
+        .stdout(predicate::str::contains(": number").not())
+        // Export should be stripped
+        .stdout(predicate::str::contains("export").not());
+}
+
+#[test]
+fn test_cli_pseudo_mode_python() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.py");
+    fs::write(
+        &file_path,
+        "def greet(name: str) -> str:\n    return f\"Hello, {name}!\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--mode")
+        .arg("pseudo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("def greet(name)"))
+        .stdout(predicate::str::contains(": str").not())
+        .stdout(predicate::str::contains("-> str").not());
+}
+
+#[test]
+fn test_cli_pseudo_mode_rust() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("test.rs");
+    fs::write(
+        &file_path,
+        "pub fn hello() -> String {\n    \"world\".to_string()\n}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(&file_path)
+        .arg("--mode")
+        .arg("pseudo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fn hello"))
+        .stdout(predicate::str::contains("pub fn").not());
+}
+
+#[test]
+fn test_cli_pseudo_mode_stdin() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("-")
+        .arg("--lang=typescript")
+        .arg("--mode=pseudo")
+        .write_stdin("export const x: number = 42;\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("x = 42"))
+        .stdout(predicate::str::contains("export").not());
+}

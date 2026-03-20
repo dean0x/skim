@@ -160,7 +160,7 @@ skim - --language typescript   # Stdin (requires --language)
 ```
 
 **Common options:**
-- `-m, --mode` - Transformation mode: `structure` (default), `signatures`, `types`, `full`
+- `-m, --mode` - Transformation mode: `structure` (default), `signatures`, `types`, `full`, `minimal`, `pseudo`
 - `-l, --language` - Override auto-detection (required for stdin only)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
 - `--no-cache` - Disable caching
@@ -170,17 +170,20 @@ skim - --language typescript   # Stdin (requires --language)
 
 ## Transformation Modes
 
-Skim offers four modes with different levels of aggressiveness:
+Skim offers six modes with different levels of aggressiveness:
 
 | Mode       | Reduction | What's Kept                              | Use Case                   |
 |------------|-----------|------------------------------------------|----------------------------|
+| Full       | 0%        | Everything (original source)             | Testing/comparison         |
+| Minimal    | 15-30%    | All code, doc comments                   | Light cleanup              |
+| Pseudo     | 30-50%    | Logic flow, names, values                | LLM context with logic     |
 | Structure  | 70-80%    | Signatures, types, classes, imports      | Understanding architecture |
 | Signatures | 85-92%    | Only callable signatures                 | API documentation          |
 | Types      | 90-95%    | Only type definitions                    | Type system analysis       |
-| Full       | 0%        | Everything (original source)             | Testing/comparison         |
 
 ```bash
 skim file.ts --mode structure   # Default
+skim file.ts --mode pseudo      # Pseudocode (strips types, visibility, decorators)
 skim file.ts --mode signatures  # More aggressive
 skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation

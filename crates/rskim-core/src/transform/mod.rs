@@ -6,6 +6,7 @@
 
 pub(crate) mod json;
 pub(crate) mod minimal;
+pub(crate) mod pseudo;
 pub(crate) mod signatures;
 pub(crate) mod structure;
 pub(crate) mod toml;
@@ -74,6 +75,7 @@ fn transform_tree_with_spans(
             signatures::transform_signatures_with_spans(source, tree, language, config)
         }
         Mode::Types => types::transform_types_with_spans(source, tree, language, config),
+        Mode::Pseudo => pseudo::transform_pseudo_with_spans(source, tree, language, config),
         // ARCHITECTURE: Full and Minimal produce a single "source_file" span
         // inline (no _with_spans variant needed since there is no AST ranking).
         Mode::Full => {

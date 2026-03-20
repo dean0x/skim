@@ -10,10 +10,10 @@ use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
 
 /// Maximum AST recursion depth to prevent stack overflow attacks
-const MAX_AST_DEPTH: usize = 500;
+pub(crate) const MAX_AST_DEPTH: usize = 500;
 
 /// Maximum number of AST nodes to prevent memory exhaustion
-const MAX_AST_NODES: usize = 100_000;
+pub(crate) const MAX_AST_NODES: usize = 100_000;
 
 /// Transform source by stripping non-doc comments and normalizing blank lines
 ///
@@ -53,7 +53,7 @@ pub(crate) fn transform_minimal(
 /// # Security
 /// - Enforces MAX_AST_DEPTH to prevent stack overflow
 /// - Enforces MAX_AST_NODES to prevent memory exhaustion
-fn collect_removable_comments(
+pub(crate) fn collect_removable_comments(
     node: Node,
     source: &str,
     language: Language,
@@ -114,7 +114,7 @@ fn is_shebang(node: Node, source: &str) -> bool {
 }
 
 /// Check if a node kind represents a comment in the given language
-fn is_comment_node(kind: &str, language: Language) -> bool {
+pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
     match language {
         Language::TypeScript
         | Language::JavaScript
@@ -223,13 +223,17 @@ fn is_go_declaration(kind: &str) -> bool {
     )
 }
 
-/// Adjust a comment range to remove the entire line if the comment is the only
+/// Adjust a range to remove the entire line if the content is the only
 /// non-whitespace content on that line.
 ///
-/// If the comment occupies the full line (only whitespace before/after on same line),
-/// remove the entire line including the newline. Otherwise, just remove the comment
-/// and any leading whitespace before it on the same line (for inline trailing comments).
-fn adjust_range_for_line_removal(source: &str, start: usize, end: usize) -> (usize, usize) {
+/// If the content occupies the full line (only whitespace before/after on same line),
+/// remove the entire line including the newline. Otherwise, just remove the content
+/// and any leading whitespace before it on the same line (for inline trailing content).
+pub(crate) fn adjust_range_for_line_removal(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
     // Find the start of the line containing this comment
     let line_start = source[..start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
 
@@ -271,7 +275,7 @@ fn adjust_range_for_line_removal(source: &str, start: usize, end: usize) -> (usi
 /// Remove collected byte ranges from source
 ///
 /// Builds a new string by copying everything except the removed ranges.
-fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
+pub(crate) fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
     if ranges.is_empty() {
         return Ok(source.to_string());
     }
@@ -328,7 +332,7 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
 /// Combines two operations to avoid an extra allocation:
 /// 1. Trims trailing whitespace from each line
 /// 2. Normalizes blank lines: 3+ consecutive blank lines become 2
-fn trim_and_normalize(source: &str) -> String {
+pub(crate) fn trim_and_normalize(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut consecutive_blanks: usize = 0;
 
