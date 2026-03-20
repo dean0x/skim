@@ -348,7 +348,8 @@ impl FilterTransparencyHeader {
         let savings = if input_tokens == 0 || output_tokens >= input_tokens {
             0
         } else {
-            ((input_tokens - output_tokens) * 100) / input_tokens
+            // Use u128 to avoid overflow when (input - output) * 100 exceeds usize::MAX.
+            ((input_tokens - output_tokens) as u128 * 100 / input_tokens as u128) as usize
         };
 
         writeln!(
@@ -782,6 +783,146 @@ mod tests {
         assert!(
             !result.contains("line one"),
             "expected no original content in zero-budget output, got: {result}"
+        );
+    }
+
+    // ========================================================================
+    // Adversarial PassthroughCleaner tests
+    // ========================================================================
+
+    #[test]
+    fn test_collapse_trailing_cr() {
+        // "hello\r" → last segment after \r is empty, rfind non-empty → "hello"
+        assert_eq!(collapse_progress_lines("hello\r"), "hello");
+    }
+
+    #[test]
+    fn test_collapse_only_cr_no_newline() {
+        // "foo\rbar\rbaz" (no \n) → single line, split on \r, last non-empty → "baz"
+        assert_eq!(collapse_progress_lines("foo\rbar\rbaz"), "baz");
+    }
+
+    #[test]
+    fn test_collapse_mixed_cr_crlf() {
+        // "foo\rbar\r\nbaz" → normalize \r\n to \n → "foo\rbar\nbaz"
+        // First line "foo\rbar" → collapsed to "bar"
+        // Second line "baz" → unchanged
+        assert_eq!(collapse_progress_lines("foo\rbar\r\nbaz"), "bar\nbaz");
+    }
+
+    #[test]
+    fn test_collapse_reversed_line_ending() {
+        // "\n\r" is NOT a Windows line ending — the \r is on the next line
+        // "line1\n\rline2" → normalize (no \r\n found) → split on \n → ["line1", "\rline2"]
+        // Second line has \r: split → ["", "line2"], rfind non-empty → "line2"
+        assert_eq!(collapse_progress_lines("line1\n\rline2"), "line1\nline2");
+    }
+
+    #[test]
+    fn test_deduplicate_preserves_blank_lines() {
+        // Blank lines should never be deduplicated (they separate content blocks)
+        assert_eq!(deduplicate_consecutive_lines("a\n\n\nb"), "a\n\n\nb");
+    }
+
+    #[test]
+    fn test_deduplicate_trailing_whitespace_differs() {
+        // "hello" and "hello " are different strings — both should be kept
+        assert_eq!(
+            deduplicate_consecutive_lines("hello\nhello \nhello"),
+            "hello\nhello \nhello"
+        );
+    }
+
+    #[test]
+    fn test_clean_unicode_with_ansi() {
+        let input = "\x1b[31m🦀 hello\x1b[0m";
+        assert_eq!(strip_ansi(input), "🦀 hello");
+    }
+
+    #[test]
+    fn test_clean_8bit_color_codes() {
+        // 256-color ANSI: ESC[38;5;196m (foreground color 196 = bright red)
+        let input = "\x1b[38;5;196mred\x1b[0m";
+        assert_eq!(strip_ansi(input), "red");
+    }
+
+    // ========================================================================
+    // Adversarial PassthroughTruncator tests
+    // ========================================================================
+
+    #[test]
+    fn test_truncate_budget_one_token() {
+        // With budget of 1, almost all multi-token content should be truncated
+        let content = "This is a fairly long line with many words\nAnother line here\nAnd a third";
+        let result = PassthroughTruncator::truncate_to_budget(content, 1).unwrap();
+        assert!(
+            result.contains("[... truncated"),
+            "expected truncation marker with budget=1, got: {result}"
+        );
+        assert!(
+            result.len() < content.len(),
+            "expected shorter output with budget=1"
+        );
+    }
+
+    #[test]
+    fn test_truncate_unicode_char_boundaries() {
+        // Many multi-byte characters — binary search must not split a char
+        let content = "🦀".repeat(200);
+        let budget = 5;
+        let result = PassthroughTruncator::truncate_to_budget(&content, budget).unwrap();
+        // Must be valid UTF-8 (would panic on construction if not)
+        assert!(
+            result.contains("[... truncated"),
+            "expected truncation marker for long unicode content"
+        );
+    }
+
+    #[test]
+    fn test_truncate_only_blank_lines() {
+        // Input is only newlines — should not panic
+        let content = "\n\n\n\n\n";
+        let result = PassthroughTruncator::truncate_to_budget(content, 2).unwrap();
+        // Either fits (blank lines are cheap tokens) or truncates gracefully
+        assert!(!result.is_empty() || content.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_content_exactly_at_budget() {
+        // Content that fits exactly should be returned unchanged
+        let content = "hello";
+        let tokens = tokens::count_tokens(content).unwrap();
+        let result = PassthroughTruncator::truncate_to_budget(content, tokens).unwrap();
+        assert_eq!(
+            result, content,
+            "content at exact budget should be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_truncate_mixed_newline_styles() {
+        // Content with \r\n — truncator splits on \n, leaving \r at end of lines
+        let content = "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\nline8\r\nline9\r\nline10";
+        let result = PassthroughTruncator::truncate_to_budget(content, 5).unwrap();
+        // Should not panic and should produce valid output
+        assert!(!result.is_empty());
+    }
+
+    // ========================================================================
+    // Adversarial FilterTransparencyHeader tests
+    // ========================================================================
+
+    #[test]
+    fn test_header_large_token_no_overflow() {
+        // usize::MAX / 2 * 100 would overflow usize — verify no panic
+        let mut buf = Vec::new();
+        FilterTransparencyHeader::emit_to(&mut buf, "filter", "full", usize::MAX / 2, 0).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+
+        // Should produce ~100% savings without panic
+        assert!(
+            output.contains("100%") || output.contains("99%"),
+            "expected ~100% savings for huge input with zero output, got: {output}"
         );
     }
 }

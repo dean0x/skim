@@ -195,6 +195,22 @@ fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
 mod tests {
     use super::*;
 
+    /// A reader that produces exactly `remaining` bytes of `b'A'`, then EOF.
+    struct FixedSizeReader {
+        remaining: usize,
+    }
+
+    impl Read for FixedSizeReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.remaining);
+            for b in buf[..n].iter_mut() {
+                *b = b'A';
+            }
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_echo_captures_stdout() {
@@ -399,6 +415,108 @@ mod tests {
             result.duration < Duration::from_millis(50),
             "Expected dispatch overhead < 50ms, got {:?}",
             result.duration
+        );
+    }
+
+    // ========================================================================
+    // Adversarial edge cases
+    // ========================================================================
+
+    #[test]
+    fn run_empty_program_name_errors() {
+        let runner = CommandRunner::new(None);
+        let err = runner.run("", &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to execute"),
+            "Expected 'failed to execute' in error, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_stderr_with_zero_exit() {
+        let runner = CommandRunner::new(None);
+        let result = runner
+            .run("bash", &["-c", "echo warn >&2; exit 0"])
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            !result.stderr.is_empty(),
+            "Expected non-empty stderr with exit code 0"
+        );
+        assert!(result.stderr.contains("warn"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_timeout_zero_kills_immediately() {
+        let runner = CommandRunner::new(Some(Duration::ZERO));
+        let err = runner.run("sleep", &["10"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out"),
+            "Expected 'timed out' in error, got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_args_with_literal_backslash_n() {
+        let runner = CommandRunner::new(None);
+        // Pass a literal `\n` (backslash + n) as an argument.
+        // Since the runner doesn't use shell, echo should output it literally.
+        let result = runner.run("echo", &["line1\\nline2"]).unwrap();
+        assert!(
+            result.stdout.contains("line1\\nline2"),
+            "Expected literal backslash-n in output, got: {:?}",
+            result.stdout
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_binary_output_is_lossy() {
+        let runner = CommandRunner::new(Some(Duration::from_secs(10)));
+        let result = runner.run("head", &["-c", "1024", "/dev/urandom"]).unwrap();
+
+        assert!(
+            !result.stdout.is_empty(),
+            "Expected non-empty stdout from /dev/urandom"
+        );
+        // Binary data should be lossily converted — likely contains replacement chars
+        // (U+FFFD) for invalid UTF-8 sequences.
+        assert!(
+            result.stdout.contains('\u{FFFD}'),
+            "Expected replacement character in lossy output, got {} bytes",
+            result.stdout.len()
+        );
+    }
+
+    #[test]
+    fn read_pipe_at_exact_limit_succeeds() {
+        let reader = FixedSizeReader {
+            remaining: MAX_OUTPUT_BYTES,
+        };
+        let result = read_pipe(reader).unwrap();
+        assert_eq!(
+            result.len(),
+            MAX_OUTPUT_BYTES,
+            "Expected exactly MAX_OUTPUT_BYTES ({MAX_OUTPUT_BYTES}) chars"
+        );
+    }
+
+    #[test]
+    fn read_pipe_one_byte_over_limit_fails() {
+        let reader = FixedSizeReader {
+            remaining: MAX_OUTPUT_BYTES + 1,
+        };
+        let err = read_pipe(reader).unwrap_err();
+        assert!(
+            err.to_string().contains("byte limit"),
+            "Expected 'byte limit' in error, got: {}",
+            err
         );
     }
 }

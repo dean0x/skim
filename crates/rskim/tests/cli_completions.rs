@@ -2,6 +2,9 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
+use std::io::Write;
+use tempfile::TempDir;
 
 // ============================================================================
 // Successful generation
@@ -77,6 +80,123 @@ fn test_completions_include_subcommand_names() {
         .assert()
         .success()
         .stdout(predicate::str::contains("completions"));
+}
+
+// ============================================================================
+// Additional shell coverage
+// ============================================================================
+
+#[test]
+fn test_completions_powershell_outputs_valid_script() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("completions")
+        .arg("powershell")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn test_completions_elvish_outputs_valid_script() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("completions")
+        .arg("elvish")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+// ============================================================================
+// Case sensitivity
+// ============================================================================
+
+#[test]
+fn test_completions_case_sensitive_rejects_uppercase() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("completions")
+        .arg("BASH")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown shell"));
+}
+
+// ============================================================================
+// Extra args silently ignored by clap
+// ============================================================================
+
+#[test]
+fn test_completions_extra_args_ignored() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("completions")
+        .arg("bash")
+        .arg("extra")
+        .arg("junk")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complete"));
+}
+
+// ============================================================================
+// Syntax validation (pipe through shell -n)
+// ============================================================================
+
+#[test]
+fn test_completions_bash_syntax_valid() {
+    let completions_output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("completions")
+        .arg("bash")
+        .output()
+        .unwrap();
+    assert!(completions_output.status.success());
+
+    let mut child = std::process::Command::new("bash")
+        .arg("-n")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&completions_output.stdout)
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "bash -n rejected completions script: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+// ============================================================================
+// File-on-disk precedence (backward compatibility)
+// ============================================================================
+
+#[test]
+fn test_completions_file_on_disk_takes_precedence() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("completions");
+    fs::write(&file, "fn setup() {}").unwrap();
+
+    // When a file named "completions" exists on disk, the pre-parse router
+    // should route to file operation, NOT the completions subcommand.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .current_dir(dir.path())
+        .arg("completions")
+        .arg("-l")
+        .arg("rust")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fn setup"));
 }
 
 // ============================================================================
