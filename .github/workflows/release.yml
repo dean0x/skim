@@ -294,7 +294,7 @@ jobs:
             npm install -g rskim
             ```
 
-            ### Via Homebrew (macOS)
+            ### Via Homebrew (macOS/Linux)
             ```bash
             brew install dean0x/tap/skim
             ```
