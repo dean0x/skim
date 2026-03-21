@@ -273,13 +273,11 @@ fn handle_language_special_cases(node: Node, ctx: &mut NoiseWalkContext<'_>) -> 
         Language::Cpp if kind == "access_specifier" => {
             // `public:` is two siblings: access_specifier + `:`
             let start = node.start_byte();
-            let mut end = node.end_byte();
-            if let Some(next) = node.next_sibling() {
-                if next.kind() == ":" {
-                    end = next.end_byte();
-                }
-            }
-            let end = consume_trailing_whitespace(ctx.source_bytes, end);
+            let colon_end = node
+                .next_sibling()
+                .filter(|s| s.kind() == ":")
+                .map_or(node.end_byte(), |s| s.end_byte());
+            let end = consume_trailing_whitespace(ctx.source_bytes, colon_end);
             ctx.ranges.push((start, end));
             Some(Ok(())) // Skip recursion
         }
@@ -445,7 +443,8 @@ fn strip_python_self_param(
             "identifier" => matches!(child.utf8_text(source_bytes).unwrap_or(""), "self" | "cls"),
             "typed_parameter" | "default_parameter" => {
                 let mut inner_cursor = child.walk();
-                // Bind to local before `inner_cursor` is dropped (tree-sitter lifetime)
+                // Binding required: the iterator borrows `inner_cursor`, and without
+                // a named binding the temporary outlives the mutable borrow (E0597).
                 let found = child
                     .children(&mut inner_cursor)
                     .next()
