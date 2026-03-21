@@ -391,7 +391,12 @@ fn try_table_match(
             .chain(rule.rewrite_to.iter())
             .map(|s| s.to_string())
             .chain(toolchain.map(String::from))
-            .chain(middle.iter().chain(separator_and_after.iter()).map(|s| s.to_string()))
+            .chain(
+                middle
+                    .iter()
+                    .chain(separator_and_after.iter())
+                    .map(|s| s.to_string()),
+            )
             .collect();
 
         return Some(RewriteResult {
