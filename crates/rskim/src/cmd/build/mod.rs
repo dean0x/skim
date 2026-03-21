@@ -78,9 +78,12 @@ fn print_help() {
 
 /// Check whether user already passed a flag matching the given prefix.
 ///
-/// Returns `true` if any arg starts with `prefix`.
+/// Returns `true` if any arg equals `prefix` exactly or starts with
+/// `prefix=` (e.g., `--message-format=json`). This avoids false positives
+/// from hypothetical flags that share a common prefix.
 pub(super) fn user_has_flag(args: &[String], prefix: &str) -> bool {
-    args.iter().any(|a| a.starts_with(prefix))
+    args.iter()
+        .any(|a| a == prefix || a.starts_with(&format!("{prefix}=")))
 }
 
 /// Inject a flag before the `--` separator, or at the end if no separator exists.
@@ -121,7 +124,7 @@ pub(super) fn run_parsed_command(
 
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    let output = match run_with_env(&runner, program, &str_args, env_vars) {
+    let output = match runner.run_with_env(program, &str_args, env_vars) {
         Ok(output) => output,
         Err(e) => {
             let msg = e.to_string();
@@ -167,79 +170,4 @@ pub(super) fn run_parsed_command(
     };
 
     Ok(exit_code)
-}
-
-/// Execute a command with environment variable overrides.
-///
-/// Wraps `CommandRunner::run` with additional env vars set on the child process.
-fn run_with_env(
-    runner: &CommandRunner,
-    program: &str,
-    args: &[&str],
-    env_vars: &[(&str, &str)],
-) -> anyhow::Result<CommandOutput> {
-    if env_vars.is_empty() {
-        return runner.run(program, args);
-    }
-
-    // We need direct access to Command for env vars, so build it manually
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-
-    let start = Instant::now();
-
-    let mut cmd = Command::new(program);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|source| crate::runner::RunnerError::SpawnFailed {
-            program: program.to_string(),
-            source,
-        })?;
-
-    let child_stdout = child
-        .stdout
-        .take()
-        .ok_or(crate::runner::RunnerError::PipeCaptureFailed { pipe: "stdout" })?;
-    let child_stderr = child
-        .stderr
-        .take()
-        .ok_or(crate::runner::RunnerError::PipeCaptureFailed { pipe: "stderr" })?;
-
-    let stdout_handle = std::thread::spawn(move || -> std::io::Result<String> {
-        let mut buf = String::new();
-        let mut reader = std::io::BufReader::new(child_stdout);
-        reader.read_to_string(&mut buf)?;
-        Ok(buf)
-    });
-    let stderr_handle = std::thread::spawn(move || -> std::io::Result<String> {
-        let mut buf = String::new();
-        let mut reader = std::io::BufReader::new(child_stderr);
-        reader.read_to_string(&mut buf)?;
-        Ok(buf)
-    });
-
-    let status = child.wait()?;
-
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| crate::runner::RunnerError::ReaderPanicked { pipe: "stdout" })??;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| crate::runner::RunnerError::ReaderPanicked { pipe: "stderr" })??;
-
-    let duration = start.elapsed();
-
-    Ok(CommandOutput {
-        stdout,
-        stderr,
-        exit_code: status.code(),
-        duration,
-    })
 }

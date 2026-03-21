@@ -10,8 +10,8 @@
 //!
 //! - **Tier 3 (passthrough):** Return raw output when nothing can be parsed.
 
-use std::collections::BTreeMap;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -76,8 +76,12 @@ fn parse_tsc(output: &CommandOutput) -> ParseResult<BuildResult> {
     ParseResult::Passthrough(passthrough)
 }
 
-/// The tsc error line pattern: `file(line,col): error TSxxxx: message`
-const TSC_ERROR_PATTERN: &str = r"^(.+)\((\d+),(\d+)\): error (TS\d+): (.+)$";
+/// Compiled tsc error line pattern: `file(line,col): error TSxxxx: message`
+///
+/// Shared between tier 1 and tier 2 parsers. Compiled once via `LazyLock`.
+static TSC_ERROR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(.+)\((\d+),(\d+)\): error (TS\d+): (.+)$").expect("valid regex")
+});
 
 /// Tier 1: Parse tsc errors from stderr using regex.
 ///
@@ -87,19 +91,16 @@ const TSC_ERROR_PATTERN: &str = r"^(.+)\((\d+),(\d+)\): error (TS\d+): (.+)$";
 /// Returns `Full` if any lines match the tsc error pattern.
 /// Empty stderr is NOT handled here -- it is checked after tier 2 in `parse_tsc`.
 fn try_tier1_regex(stderr: &str) -> Option<ParseResult<BuildResult>> {
-    let re = Regex::new(TSC_ERROR_PATTERN).expect("valid regex");
-
     if stderr.trim().is_empty() {
         return None;
     }
 
     let mut error_count: usize = 0;
     let mut error_messages: Vec<String> = Vec::new();
-    let mut errors_by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut any_match = false;
 
     for line in stderr.lines() {
-        if let Some(caps) = re.captures(line) {
+        if let Some(caps) = TSC_ERROR_RE.captures(line) {
             any_match = true;
             error_count += 1;
 
@@ -108,12 +109,7 @@ fn try_tier1_regex(stderr: &str) -> Option<ParseResult<BuildResult>> {
             let ts_code = caps.get(4).map_or("", |m| m.as_str());
             let message = caps.get(5).map_or("", |m| m.as_str());
 
-            let formatted = format!("{ts_code}: {message} ({file}:{line_num})");
-            errors_by_file
-                .entry(file.to_string())
-                .or_default()
-                .push(formatted.clone());
-            error_messages.push(formatted);
+            error_messages.push(format!("{ts_code}: {message} ({file}:{line_num})"));
         }
     }
 
@@ -129,13 +125,11 @@ fn try_tier1_regex(stderr: &str) -> Option<ParseResult<BuildResult>> {
 ///
 /// Fallback in case tsc output goes to an unexpected stream.
 fn try_tier2_combined(combined: &str) -> Option<ParseResult<BuildResult>> {
-    let re = Regex::new(TSC_ERROR_PATTERN).expect("valid regex");
-
     let mut error_count: usize = 0;
     let mut error_messages: Vec<String> = Vec::new();
 
     for line in combined.lines() {
-        if let Some(caps) = re.captures(line) {
+        if let Some(caps) = TSC_ERROR_RE.captures(line) {
             error_count += 1;
 
             let file = caps.get(1).map_or("", |m| m.as_str());
