@@ -1,0 +1,319 @@
+//! Integration tests for `skim rewrite` subcommand (#43).
+//!
+//! Tests the end-to-end CLI behavior of the rewrite engine, covering
+//! standard prefix rewrites, env vars, cargo toolchain, compound commands,
+//! git skip-flags, suggest mode, stdin mode, and cat/head/tail handlers.
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+
+// ============================================================================
+// Standard rewrites
+// ============================================================================
+
+#[test]
+fn test_rewrite_cargo_test_with_separator() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cargo", "test", "--", "--nocapture"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo -- --nocapture"));
+}
+
+#[test]
+fn test_rewrite_ls_no_match() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "ls", "-la"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_cargo_build() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cargo", "build"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim build cargo"));
+}
+
+#[test]
+fn test_rewrite_go_test_with_path() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "go", "test", "./..."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test go ./..."));
+}
+
+#[test]
+fn test_rewrite_pytest_with_flag() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "pytest", "-v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test pytest -v"));
+}
+
+// ============================================================================
+// Env vars
+// ============================================================================
+
+#[test]
+fn test_rewrite_with_env_var() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "RUST_LOG=debug", "cargo", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("RUST_LOG=debug skim test cargo"));
+}
+
+// ============================================================================
+// Cargo toolchain
+// ============================================================================
+
+#[test]
+fn test_rewrite_cargo_toolchain_nightly() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cargo", "+nightly", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo +nightly"));
+}
+
+#[test]
+fn test_rewrite_env_var_with_toolchain() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "RUST_LOG=debug", "cargo", "+nightly", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "RUST_LOG=debug skim test cargo +nightly",
+        ));
+}
+
+// ============================================================================
+// Compound commands (exit 1)
+// ============================================================================
+
+#[test]
+fn test_rewrite_compound_and_and_rejected() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cargo", "test", "&&", "cargo", "build"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_compound_pipe_via_stdin_rejected() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test | head\n")
+        .assert()
+        .failure();
+}
+
+// ============================================================================
+// Git with skip flags
+// ============================================================================
+
+#[test]
+fn test_rewrite_git_log_format_skipped() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "log", "--format=%H"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_git_status_success() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git status"));
+}
+
+#[test]
+fn test_rewrite_git_diff_stat_skipped() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "diff", "--stat"])
+        .assert()
+        .failure();
+}
+
+// ============================================================================
+// Suggest mode
+// ============================================================================
+
+#[test]
+fn test_suggest_mode_match() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--suggest", "cargo", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"))
+        .stdout(predicate::str::contains("\"category\":\"test\""));
+}
+
+#[test]
+fn test_suggest_mode_no_match() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--suggest", "ls", "-la"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// Stdin mode
+// ============================================================================
+
+#[test]
+fn test_rewrite_stdin_cargo_test() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo"));
+}
+
+// ============================================================================
+// cat / head / tail
+// ============================================================================
+
+#[test]
+fn test_rewrite_cat_code_file() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cat", "src/main.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim src/main.rs --mode=pseudo"));
+}
+
+#[test]
+fn test_rewrite_cat_squeeze_blanks() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cat", "-s", "file.ts"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--mode=pseudo"));
+}
+
+#[test]
+fn test_rewrite_cat_line_numbers_rejected() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cat", "-n", "file.ts"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_head_with_count() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "head", "-20", "file.ts"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--max-lines"))
+        .stdout(predicate::str::contains("20"));
+}
+
+#[test]
+fn test_rewrite_head_n_space() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "head", "-n", "50", "file.py"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--max-lines"))
+        .stdout(predicate::str::contains("50"));
+}
+
+#[test]
+fn test_rewrite_tail_with_count() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "tail", "-20", "file.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--last-lines"))
+        .stdout(predicate::str::contains("20"));
+}
+
+#[test]
+fn test_rewrite_tail_non_code_rejected() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "tail", "-20", "data.csv"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_cat_non_code_rejected() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cat", "data.csv"])
+        .assert()
+        .failure();
+}
+
+// ============================================================================
+// Nextest
+// ============================================================================
+
+#[test]
+fn test_rewrite_nextest() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cargo", "nextest", "run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo"));
+}
+
+// ============================================================================
+// Help
+// ============================================================================
+
+#[test]
+fn test_rewrite_help() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim rewrite"))
+        .stdout(predicate::str::contains("--suggest"));
+}
+
+#[test]
+fn test_rewrite_short_help() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "-h"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim rewrite"));
+}

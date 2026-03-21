@@ -1,0 +1,1318 @@
+//! Command rewrite engine (#43)
+//!
+//! Rewrites common developer commands into skim equivalents using a two-layer
+//! rule system:
+//!
+//! **Layer 1 — Declarative prefix-swap table**: Ordered longest-prefix-first.
+//! Each rule maps a command prefix (e.g. `["cargo", "test"]`) to a skim
+//! equivalent (e.g. `["skim", "test", "cargo"]`), with optional skip-flags
+//! that suppress the rewrite when present.
+//!
+//! **Layer 2 — Custom handlers**: For commands requiring argument inspection
+//! (cat, head, tail) where simple prefix matching is insufficient.
+
+use std::io::{self, BufRead, IsTerminal};
+
+use serde::Serialize;
+
+// ============================================================================
+// Data structures
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RewriteCategory {
+    Test,
+    Build,
+    Git,
+    Read,
+}
+
+impl RewriteCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Build => "build",
+            Self::Git => "git",
+            Self::Read => "read",
+        }
+    }
+}
+
+struct RewriteRule {
+    prefix: &'static [&'static str],
+    rewrite_to: &'static [&'static str],
+    skip_if_flag_prefix: &'static [&'static str],
+    category: RewriteCategory,
+}
+
+#[derive(Debug)]
+struct RewriteResult {
+    tokens: Vec<String>,
+    category: RewriteCategory,
+}
+
+#[derive(Serialize)]
+struct SuggestOutput {
+    version: u8,
+    #[serde(rename = "match")]
+    is_match: bool,
+    original: String,
+    rewritten: String,
+    category: String,
+    confidence: String,
+    skim_hook_version: String,
+}
+
+// ============================================================================
+// Rule table (15 rules, ordered longest-prefix-first within same leading token)
+// ============================================================================
+
+const REWRITE_RULES: &[RewriteRule] = &[
+    // cargo (longest prefix first)
+    RewriteRule {
+        prefix: &["cargo", "nextest", "run"],
+        rewrite_to: &["skim", "test", "cargo"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["cargo", "test"],
+        rewrite_to: &["skim", "test", "cargo"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["cargo", "clippy"],
+        rewrite_to: &["skim", "build", "clippy"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+    RewriteRule {
+        prefix: &["cargo", "build"],
+        rewrite_to: &["skim", "build", "cargo"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+    // python (longest prefix first)
+    RewriteRule {
+        prefix: &["python3", "-m", "pytest"],
+        rewrite_to: &["skim", "test", "pytest"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["python", "-m", "pytest"],
+        rewrite_to: &["skim", "test", "pytest"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    // npx
+    RewriteRule {
+        prefix: &["npx", "vitest"],
+        rewrite_to: &["skim", "test", "vitest"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["npx", "tsc"],
+        rewrite_to: &["skim", "build", "tsc"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+    // bare commands
+    RewriteRule {
+        prefix: &["pytest"],
+        rewrite_to: &["skim", "test", "pytest"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["vitest"],
+        rewrite_to: &["skim", "test", "vitest"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["go", "test"],
+        rewrite_to: &["skim", "test", "go"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    // git
+    RewriteRule {
+        prefix: &["git", "status"],
+        rewrite_to: &["skim", "git", "status"],
+        skip_if_flag_prefix: &["--porcelain", "--short", "-s"],
+        category: RewriteCategory::Git,
+    },
+    RewriteRule {
+        prefix: &["git", "diff"],
+        rewrite_to: &["skim", "git", "diff"],
+        skip_if_flag_prefix: &["--stat", "--name-only", "--name-status", "--check"],
+        category: RewriteCategory::Git,
+    },
+    RewriteRule {
+        prefix: &["git", "log"],
+        rewrite_to: &["skim", "git", "log"],
+        skip_if_flag_prefix: &["--format", "--pretty", "--oneline"],
+        category: RewriteCategory::Git,
+    },
+    // tsc bare
+    RewriteRule {
+        prefix: &["tsc"],
+        rewrite_to: &["skim", "build", "tsc"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+];
+
+/// Compound command separators that prevent rewriting.
+const COMPOUND_SEPARATORS: &[&str] = &["|", "&&", "||", ";"];
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+/// Run the `rewrite` subcommand. Returns the process exit code.
+///
+/// Exit code semantics:
+/// - 0: rewrite found, printed to stdout
+/// - 1: no rewrite match (or compound command, or invalid input)
+pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
+    // Handle --help / -h
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_help();
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    // Check for --suggest flag (must be first non-help flag)
+    let suggest_mode = args.first().is_some_and(|a| a == "--suggest");
+
+    // Collect command tokens: skip leading --suggest if present
+    let positional_start = if suggest_mode { 1 } else { 0 };
+    let positional_args: Vec<&str> = args[positional_start..]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    // Get command tokens from positional args or stdin
+    let tokens: Vec<String> = if positional_args.is_empty() {
+        // Try reading from stdin if it's piped
+        if io::stdin().is_terminal() {
+            // No args and no piped stdin
+            if suggest_mode {
+                print_suggest_no_match("");
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            return Ok(std::process::ExitCode::FAILURE);
+        }
+        // Read one line from stdin and whitespace-split
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if suggest_mode {
+                print_suggest_no_match("");
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            return Ok(std::process::ExitCode::FAILURE);
+        }
+        trimmed.split_whitespace().map(String::from).collect()
+    } else {
+        positional_args.iter().map(|s| s.to_string()).collect()
+    };
+
+    if tokens.is_empty() {
+        if suggest_mode {
+            print_suggest_no_match("");
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+
+    let original = tokens.join(" ");
+
+    // Compound command check: reject if any token is a shell operator
+    if tokens
+        .iter()
+        .any(|t| COMPOUND_SEPARATORS.contains(&t.as_str()))
+    {
+        if suggest_mode {
+            print_suggest_no_match(&original);
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+
+    let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+    match try_rewrite(&token_refs) {
+        Some(result) => {
+            let rewritten = result.tokens.join(" ");
+            if suggest_mode {
+                print_suggest_match(&original, &rewritten, result.category);
+            } else {
+                println!("{rewritten}");
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        None => {
+            if suggest_mode {
+                print_suggest_no_match(&original);
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
+            Ok(std::process::ExitCode::FAILURE)
+        }
+    }
+}
+
+// ============================================================================
+// Core rewrite algorithm
+// ============================================================================
+
+/// Attempt to rewrite a tokenized command. Returns `Some(RewriteResult)` on
+/// match, `None` if no rewrite applies.
+fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // Compound command check: reject if any token is a shell operator
+    if tokens.iter().any(|t| COMPOUND_SEPARATORS.contains(t)) {
+        return None;
+    }
+
+    // Step 1: Strip leading env vars (KEY=VALUE pairs before the command)
+    let (env_vars, command_tokens) = strip_env_vars(tokens);
+
+    if command_tokens.is_empty() {
+        return None;
+    }
+
+    // Step 2: Strip cargo toolchain prefix (+nightly etc.)
+    let (toolchain, match_tokens) = strip_cargo_toolchain(&command_tokens);
+
+    // Step 3: Split at `--` separator
+    let (before_sep, separator_and_after) = split_at_separator(&match_tokens);
+
+    // Step 4: Try declarative table match
+    if let Some(result) = try_table_match(&env_vars, &before_sep, &separator_and_after, toolchain) {
+        return Some(result);
+    }
+
+    // Step 5: Try custom handlers (cat/head/tail) — these work on the full
+    // command_tokens (without env vars) since they handle separators internally
+    if let Some(result) = try_custom_handlers(&env_vars, &command_tokens) {
+        return Some(result);
+    }
+
+    None
+}
+
+/// Strip leading environment variable assignments from a token list.
+///
+/// Env vars match pattern: contains `=` and everything before `=` is
+/// `[A-Z0-9_]+` (all uppercase letters, digits, underscores).
+fn strip_env_vars<'a>(tokens: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let mut env_vars = Vec::new();
+    let mut rest_start = 0;
+
+    for token in tokens {
+        if let Some(eq_pos) = token.find('=') {
+            let key = &token[..eq_pos];
+            if !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            {
+                env_vars.push(*token);
+                rest_start += 1;
+                continue;
+            }
+        }
+        break;
+    }
+
+    let command_tokens = tokens[rest_start..].to_vec();
+    (env_vars, command_tokens)
+}
+
+/// Strip cargo toolchain prefix (e.g., `+nightly`).
+///
+/// If tokens[0] is "cargo" and tokens[1] starts with '+', strip tokens[1]
+/// for matching but preserve it for output reconstruction.
+fn strip_cargo_toolchain<'a>(tokens: &[&'a str]) -> (Option<&'a str>, Vec<&'a str>) {
+    if tokens.len() >= 2 && tokens[0] == "cargo" && tokens[1].starts_with('+') {
+        let toolchain = Some(tokens[1]);
+        let mut match_tokens = vec![tokens[0]];
+        match_tokens.extend_from_slice(&tokens[2..]);
+        (toolchain, match_tokens)
+    } else {
+        (None, tokens.to_vec())
+    }
+}
+
+/// Split tokens at the first `--` separator.
+///
+/// Returns (before_separator, separator_and_everything_after).
+fn split_at_separator<'a>(tokens: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    if let Some(pos) = tokens.iter().position(|t| *t == "--") {
+        let before = tokens[..pos].to_vec();
+        let after = tokens[pos..].to_vec();
+        (before, after)
+    } else {
+        (tokens.to_vec(), Vec::new())
+    }
+}
+
+/// Try matching against the declarative rule table.
+fn try_table_match(
+    env_vars: &[&str],
+    before_sep: &[&str],
+    separator_and_after: &[&str],
+    toolchain: Option<&str>,
+) -> Option<RewriteResult> {
+    for rule in REWRITE_RULES {
+        // Check if prefix matches
+        if before_sep.len() < rule.prefix.len() {
+            continue;
+        }
+        if before_sep[..rule.prefix.len()] != *rule.prefix {
+            continue;
+        }
+
+        // Middle args: everything between prefix and separator
+        let middle = &before_sep[rule.prefix.len()..];
+
+        // Check skip_if_flag_prefix: if any middle arg starts with a skip prefix
+        if !rule.skip_if_flag_prefix.is_empty()
+            && middle.iter().any(|arg| {
+                rule.skip_if_flag_prefix
+                    .iter()
+                    .any(|skip| arg.starts_with(skip))
+            })
+        {
+            return None;
+        }
+
+        // Build output: env_vars ++ rewrite_to ++ toolchain ++ middle ++ separator_and_after
+        let mut output: Vec<String> = Vec::new();
+        for ev in env_vars {
+            output.push(ev.to_string());
+        }
+        for tok in rule.rewrite_to {
+            output.push(tok.to_string());
+        }
+        if let Some(tc) = toolchain {
+            output.push(tc.to_string());
+        }
+        for tok in middle {
+            output.push(tok.to_string());
+        }
+        for tok in separator_and_after {
+            output.push(tok.to_string());
+        }
+
+        return Some(RewriteResult {
+            tokens: output,
+            category: rule.category,
+        });
+    }
+
+    None
+}
+
+/// Try custom handlers for cat, head, tail.
+fn try_custom_handlers(env_vars: &[&str], command_tokens: &[&str]) -> Option<RewriteResult> {
+    if command_tokens.is_empty() {
+        return None;
+    }
+
+    let result = match command_tokens[0] {
+        "cat" => try_rewrite_cat(&command_tokens[1..]),
+        "head" => try_rewrite_head(&command_tokens[1..]),
+        "tail" => try_rewrite_tail(&command_tokens[1..]),
+        _ => None,
+    };
+
+    result.map(|mut r| {
+        // Prepend env vars if present
+        if !env_vars.is_empty() {
+            let mut with_env: Vec<String> = env_vars.iter().map(|s| s.to_string()).collect();
+            with_env.extend(r.tokens);
+            r.tokens = with_env;
+        }
+        r
+    })
+}
+
+// ============================================================================
+// Custom handlers (cat, head, tail)
+// ============================================================================
+
+/// Check if a file path has a known code extension.
+///
+/// Extracts the extension from the path and checks against `Language::from_extension`.
+/// Does NOT check if the file exists on disk — this is pure string analysis.
+fn is_code_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(rskim_core::Language::from_extension)
+        .is_some()
+}
+
+/// Rewrite `cat` command.
+///
+/// Rules:
+/// - `cat file.ts` → `skim file.ts --mode=pseudo`
+/// - `cat -s file.ts` → `skim file.ts --mode=pseudo` (-s squeeze blanks: pseudo is better)
+/// - `cat -n file.ts` → None (line numbers)
+/// - `cat -b/-v/-e/-t/-A` → None (display flags)
+/// - `cat file1.ts file2.py` → `skim file1.ts file2.py --mode=pseudo --no-header`
+/// - `cat` (no file arg) → None
+/// - `cat non-code.txt` → None
+fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let mut files: Vec<&str> = Vec::new();
+    let mut has_unsupported_flag = false;
+
+    for arg in args {
+        if arg.starts_with('-') && *arg != "-" {
+            // Allow -s (squeeze blank lines), reject everything else
+            if *arg == "-s" {
+                continue;
+            }
+            has_unsupported_flag = true;
+            break;
+        }
+        files.push(arg);
+    }
+
+    if has_unsupported_flag || files.is_empty() {
+        return None;
+    }
+
+    // All files must be code files
+    if !files.iter().all(|f| is_code_file(f)) {
+        return None;
+    }
+
+    let mut tokens: Vec<String> = vec!["skim".to_string()];
+    for f in &files {
+        tokens.push(f.to_string());
+    }
+    tokens.push("--mode=pseudo".to_string());
+    if files.len() > 1 {
+        tokens.push("--no-header".to_string());
+    }
+
+    Some(RewriteResult {
+        tokens,
+        category: RewriteCategory::Read,
+    })
+}
+
+/// Parse a line count from head/tail -N or -n N or -nN style arguments.
+///
+/// Returns `(Some(count), remaining_file_args)` or `(None, remaining_file_args)`.
+/// Returns `Err` if an unrecognized flag is found.
+fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<&'a str>), ()> {
+    if args.is_empty() {
+        return Err(());
+    }
+
+    let mut count: Option<u64> = None;
+    let mut files: Vec<&'a str> = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i];
+
+        if arg == "-n" {
+            // -n N form: next arg is the count
+            i += 1;
+            if i >= args.len() {
+                return Err(());
+            }
+            count = args[i].parse::<u64>().ok();
+            if count.is_none() {
+                return Err(());
+            }
+        } else if let Some(rest) = arg.strip_prefix("-n") {
+            // -nN form: rest is the count
+            count = rest.parse::<u64>().ok();
+            if count.is_none() {
+                return Err(());
+            }
+        } else if arg.starts_with('-') && arg != "-" {
+            // Check for -N (bare number) like -20
+            let potential_num = &arg[1..];
+            if let Ok(n) = potential_num.parse::<u64>() {
+                count = Some(n);
+            } else {
+                // Unknown flag
+                return Err(());
+            }
+        } else {
+            files.push(arg);
+        }
+
+        i += 1;
+    }
+
+    if files.is_empty() {
+        return Err(());
+    }
+
+    Ok((count, files))
+}
+
+/// Rewrite `head` command.
+///
+/// Rules:
+/// - `head -20 file.ts` → `skim file.ts --mode=pseudo --max-lines 20`
+/// - `head -n 20 file.ts` → `skim file.ts --mode=pseudo --max-lines 20`
+/// - `head -n20 file.ts` → `skim file.ts --mode=pseudo --max-lines 20`
+/// - `head file.ts` → `skim file.ts --mode=pseudo`
+/// - `head -20 data.csv` → None (not code file)
+fn try_rewrite_head(args: &[&str]) -> Option<RewriteResult> {
+    let (count, files) = parse_line_count_and_files(args).ok()?;
+
+    // All files must be code files
+    if !files.iter().all(|f| is_code_file(f)) {
+        return None;
+    }
+
+    let mut tokens: Vec<String> = vec!["skim".to_string()];
+    for f in &files {
+        tokens.push(f.to_string());
+    }
+    tokens.push("--mode=pseudo".to_string());
+    if let Some(n) = count {
+        tokens.push("--max-lines".to_string());
+        tokens.push(n.to_string());
+    }
+
+    Some(RewriteResult {
+        tokens,
+        category: RewriteCategory::Read,
+    })
+}
+
+/// Rewrite `tail` command.
+///
+/// Rules:
+/// - `tail -20 file.rs` → `skim file.rs --mode=pseudo --last-lines 20`
+/// - `tail -n 20 file.rs` → `skim file.rs --mode=pseudo --last-lines 20`
+/// - `tail file.rs` → `skim file.rs --mode=pseudo`
+/// - `tail -20 data.csv` → None (not code file)
+fn try_rewrite_tail(args: &[&str]) -> Option<RewriteResult> {
+    let (count, files) = parse_line_count_and_files(args).ok()?;
+
+    // All files must be code files
+    if !files.iter().all(|f| is_code_file(f)) {
+        return None;
+    }
+
+    let mut tokens: Vec<String> = vec!["skim".to_string()];
+    for f in &files {
+        tokens.push(f.to_string());
+    }
+    tokens.push("--mode=pseudo".to_string());
+    if let Some(n) = count {
+        tokens.push("--last-lines".to_string());
+        tokens.push(n.to_string());
+    }
+
+    Some(RewriteResult {
+        tokens,
+        category: RewriteCategory::Read,
+    })
+}
+
+// ============================================================================
+// Suggest mode output
+// ============================================================================
+
+fn print_suggest_match(original: &str, rewritten: &str, category: RewriteCategory) {
+    let output = SuggestOutput {
+        version: 1,
+        is_match: true,
+        original: original.to_string(),
+        rewritten: rewritten.to_string(),
+        category: category.as_str().to_string(),
+        confidence: "exact".to_string(),
+        skim_hook_version: "1.0.0".to_string(),
+    };
+    // Serialization of a well-formed struct should not fail
+    if let Ok(json) = serde_json::to_string(&output) {
+        println!("{json}");
+    }
+}
+
+fn print_suggest_no_match(original: &str) {
+    let output = SuggestOutput {
+        version: 1,
+        is_match: false,
+        original: original.to_string(),
+        rewritten: String::new(),
+        category: String::new(),
+        confidence: String::new(),
+        skim_hook_version: "1.0.0".to_string(),
+    };
+    if let Ok(json) = serde_json::to_string(&output) {
+        println!("{json}");
+    }
+}
+
+// ============================================================================
+// Help text
+// ============================================================================
+
+fn print_help() {
+    println!("skim rewrite");
+    println!();
+    println!("  Rewrite common developer commands into skim equivalents");
+    println!();
+    println!("Usage: skim rewrite [--suggest] <COMMAND>...");
+    println!("       echo \"cargo test\" | skim rewrite [--suggest]");
+    println!();
+    println!("Options:");
+    println!("  --suggest    Output JSON suggestion instead of plain text");
+    println!("  --help, -h   Print help information");
+    println!();
+    println!("Examples:");
+    println!("  skim rewrite cargo test -- --nocapture");
+    println!("  skim rewrite git status");
+    println!("  skim rewrite cat src/main.rs");
+    println!("  echo \"pytest -v\" | skim rewrite --suggest");
+    println!();
+    println!("Exit codes:");
+    println!("  0  Rewrite found (or --suggest mode)");
+    println!("  1  No rewrite match");
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Prefix rule matches (all 15 rules)
+    // ========================================================================
+
+    #[test]
+    fn test_cargo_test() {
+        let result = try_rewrite(&["cargo", "test"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "cargo"]);
+    }
+
+    #[test]
+    fn test_cargo_test_with_trailing_args() {
+        let result = try_rewrite(&["cargo", "test", "--", "--nocapture"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "test", "cargo", "--", "--nocapture"]
+        );
+    }
+
+    #[test]
+    fn test_cargo_nextest_run() {
+        let result = try_rewrite(&["cargo", "nextest", "run"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "cargo"]);
+    }
+
+    #[test]
+    fn test_cargo_clippy() {
+        let result = try_rewrite(&["cargo", "clippy"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "build", "clippy"]);
+    }
+
+    #[test]
+    fn test_cargo_build() {
+        let result = try_rewrite(&["cargo", "build"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "build", "cargo"]);
+    }
+
+    #[test]
+    fn test_python3_m_pytest() {
+        let result = try_rewrite(&["python3", "-m", "pytest"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "pytest"]);
+    }
+
+    #[test]
+    fn test_python_m_pytest() {
+        let result = try_rewrite(&["python", "-m", "pytest"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "pytest"]);
+    }
+
+    #[test]
+    fn test_npx_vitest() {
+        let result = try_rewrite(&["npx", "vitest"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "vitest"]);
+    }
+
+    #[test]
+    fn test_npx_tsc() {
+        let result = try_rewrite(&["npx", "tsc"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "build", "tsc"]);
+    }
+
+    #[test]
+    fn test_bare_pytest() {
+        let result = try_rewrite(&["pytest"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "pytest"]);
+    }
+
+    #[test]
+    fn test_bare_pytest_with_flag() {
+        let result = try_rewrite(&["pytest", "-v"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "pytest", "-v"]);
+    }
+
+    #[test]
+    fn test_bare_vitest() {
+        let result = try_rewrite(&["vitest"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "vitest"]);
+    }
+
+    #[test]
+    fn test_go_test() {
+        let result = try_rewrite(&["go", "test"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "go"]);
+    }
+
+    #[test]
+    fn test_go_test_with_path() {
+        let result = try_rewrite(&["go", "test", "./..."]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "go", "./..."]);
+    }
+
+    #[test]
+    fn test_git_status() {
+        let result = try_rewrite(&["git", "status"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "git", "status"]);
+    }
+
+    #[test]
+    fn test_git_diff() {
+        let result = try_rewrite(&["git", "diff"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "git", "diff"]);
+    }
+
+    #[test]
+    fn test_git_log() {
+        let result = try_rewrite(&["git", "log"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "git", "log"]);
+    }
+
+    #[test]
+    fn test_bare_tsc() {
+        let result = try_rewrite(&["tsc"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "build", "tsc"]);
+    }
+
+    // ========================================================================
+    // Skip-flag behavior (git rules)
+    // ========================================================================
+
+    #[test]
+    fn test_git_status_with_porcelain_skipped() {
+        assert!(try_rewrite(&["git", "status", "--porcelain"]).is_none());
+    }
+
+    #[test]
+    fn test_git_status_with_short_skipped() {
+        assert!(try_rewrite(&["git", "status", "--short"]).is_none());
+    }
+
+    #[test]
+    fn test_git_status_with_s_skipped() {
+        assert!(try_rewrite(&["git", "status", "-s"]).is_none());
+    }
+
+    #[test]
+    fn test_git_diff_with_stat_skipped() {
+        assert!(try_rewrite(&["git", "diff", "--stat"]).is_none());
+    }
+
+    #[test]
+    fn test_git_diff_with_name_only_skipped() {
+        assert!(try_rewrite(&["git", "diff", "--name-only"]).is_none());
+    }
+
+    #[test]
+    fn test_git_diff_with_name_status_skipped() {
+        assert!(try_rewrite(&["git", "diff", "--name-status"]).is_none());
+    }
+
+    #[test]
+    fn test_git_diff_with_check_skipped() {
+        assert!(try_rewrite(&["git", "diff", "--check"]).is_none());
+    }
+
+    #[test]
+    fn test_git_log_with_format_skipped() {
+        assert!(try_rewrite(&["git", "log", "--format=%H"]).is_none());
+    }
+
+    #[test]
+    fn test_git_log_with_pretty_skipped() {
+        assert!(try_rewrite(&["git", "log", "--pretty=oneline"]).is_none());
+    }
+
+    #[test]
+    fn test_git_log_with_oneline_skipped() {
+        assert!(try_rewrite(&["git", "log", "--oneline"]).is_none());
+    }
+
+    // ========================================================================
+    // Env var stripping
+    // ========================================================================
+
+    #[test]
+    fn test_env_var_stripping() {
+        let result = try_rewrite(&["RUST_LOG=debug", "cargo", "test"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["RUST_LOG=debug", "skim", "test", "cargo"]
+        );
+    }
+
+    #[test]
+    fn test_multiple_env_vars() {
+        let result = try_rewrite(&["RUST_LOG=debug", "RUST_BACKTRACE=1", "cargo", "test"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec![
+                "RUST_LOG=debug",
+                "RUST_BACKTRACE=1",
+                "skim",
+                "test",
+                "cargo"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_env_var_only_is_no_match() {
+        assert!(try_rewrite(&["RUST_LOG=debug"]).is_none());
+    }
+
+    // ========================================================================
+    // Cargo toolchain stripping
+    // ========================================================================
+
+    #[test]
+    fn test_cargo_toolchain_nightly() {
+        let result = try_rewrite(&["cargo", "+nightly", "test"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "test", "cargo", "+nightly"]);
+    }
+
+    #[test]
+    fn test_cargo_toolchain_stable() {
+        let result = try_rewrite(&["cargo", "+stable", "build"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "build", "cargo", "+stable"]);
+    }
+
+    #[test]
+    fn test_cargo_toolchain_with_env_var() {
+        let result = try_rewrite(&["RUST_LOG=debug", "cargo", "+nightly", "test"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["RUST_LOG=debug", "skim", "test", "cargo", "+nightly"]
+        );
+    }
+
+    // ========================================================================
+    // -- separator preservation
+    // ========================================================================
+
+    #[test]
+    fn test_separator_preserved() {
+        let result = try_rewrite(&["cargo", "test", "--", "--nocapture"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "test", "cargo", "--", "--nocapture"]
+        );
+    }
+
+    #[test]
+    fn test_separator_with_middle_args() {
+        let result = try_rewrite(&["cargo", "test", "my_test", "--", "--nocapture"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "test", "cargo", "my_test", "--", "--nocapture"]
+        );
+    }
+
+    // ========================================================================
+    // Compound command rejection
+    // ========================================================================
+
+    #[test]
+    fn test_pipe_rejected() {
+        assert!(try_rewrite(&["cargo", "test", "|", "head"]).is_none());
+    }
+
+    #[test]
+    fn test_and_and_rejected() {
+        assert!(try_rewrite(&["cargo", "test", "&&", "cargo", "build"]).is_none());
+    }
+
+    #[test]
+    fn test_or_or_rejected() {
+        assert!(try_rewrite(&["cargo", "test", "||", "echo", "fail"]).is_none());
+    }
+
+    #[test]
+    fn test_semicolon_rejected() {
+        assert!(try_rewrite(&["cargo", "test", ";", "echo", "done"]).is_none());
+    }
+
+    // ========================================================================
+    // cat handler
+    // ========================================================================
+
+    #[test]
+    fn test_cat_single_code_file() {
+        let result = try_rewrite(&["cat", "file.ts"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "file.ts", "--mode=pseudo"]);
+    }
+
+    #[test]
+    fn test_cat_squeeze_blanks() {
+        let result = try_rewrite(&["cat", "-s", "file.ts"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "file.ts", "--mode=pseudo"]);
+    }
+
+    #[test]
+    fn test_cat_multi_code_files() {
+        let result = try_rewrite(&["cat", "file1.ts", "file2.py"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec![
+                "skim",
+                "file1.ts",
+                "file2.py",
+                "--mode=pseudo",
+                "--no-header"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cat_line_numbers_rejected() {
+        assert!(try_rewrite(&["cat", "-n", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_bare_rejected() {
+        assert!(try_rewrite(&["cat"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_non_code_rejected() {
+        assert!(try_rewrite(&["cat", "data.csv"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_non_code_txt_rejected() {
+        assert!(try_rewrite(&["cat", "readme.txt"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_mixed_code_and_non_code_rejected() {
+        assert!(try_rewrite(&["cat", "file.ts", "data.csv"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_b_flag_rejected() {
+        assert!(try_rewrite(&["cat", "-b", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_v_flag_rejected() {
+        assert!(try_rewrite(&["cat", "-v", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_e_flag_rejected() {
+        assert!(try_rewrite(&["cat", "-e", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_t_flag_rejected() {
+        assert!(try_rewrite(&["cat", "-t", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_cat_upper_a_flag_rejected() {
+        assert!(try_rewrite(&["cat", "-A", "file.ts"]).is_none());
+    }
+
+    // ========================================================================
+    // head handler
+    // ========================================================================
+
+    #[test]
+    fn test_head_dash_n() {
+        let result = try_rewrite(&["head", "-20", "file.ts"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "file.ts", "--mode=pseudo", "--max-lines", "20"]
+        );
+    }
+
+    #[test]
+    fn test_head_n_space() {
+        let result = try_rewrite(&["head", "-n", "20", "file.ts"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "file.ts", "--mode=pseudo", "--max-lines", "20"]
+        );
+    }
+
+    #[test]
+    fn test_head_n_no_space() {
+        let result = try_rewrite(&["head", "-n20", "file.ts"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "file.ts", "--mode=pseudo", "--max-lines", "20"]
+        );
+    }
+
+    #[test]
+    fn test_head_no_count() {
+        let result = try_rewrite(&["head", "file.ts"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "file.ts", "--mode=pseudo"]);
+    }
+
+    #[test]
+    fn test_head_non_code_rejected() {
+        assert!(try_rewrite(&["head", "-20", "data.csv"]).is_none());
+    }
+
+    // ========================================================================
+    // tail handler
+    // ========================================================================
+
+    #[test]
+    fn test_tail_dash_n() {
+        let result = try_rewrite(&["tail", "-20", "file.rs"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "file.rs", "--mode=pseudo", "--last-lines", "20"]
+        );
+    }
+
+    #[test]
+    fn test_tail_n_space() {
+        let result = try_rewrite(&["tail", "-n", "20", "file.rs"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "file.rs", "--mode=pseudo", "--last-lines", "20"]
+        );
+    }
+
+    #[test]
+    fn test_tail_no_count() {
+        let result = try_rewrite(&["tail", "file.rs"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "file.rs", "--mode=pseudo"]);
+    }
+
+    #[test]
+    fn test_tail_non_code_rejected() {
+        assert!(try_rewrite(&["tail", "-20", "data.csv"]).is_none());
+    }
+
+    // ========================================================================
+    // Empty input and no-match cases
+    // ========================================================================
+
+    #[test]
+    fn test_empty_input() {
+        assert!(try_rewrite(&[]).is_none());
+    }
+
+    #[test]
+    fn test_unknown_command() {
+        assert!(try_rewrite(&["ls", "-la"]).is_none());
+    }
+
+    #[test]
+    fn test_cd_not_rewritten() {
+        assert!(try_rewrite(&["cd", "src"]).is_none());
+    }
+
+    // ========================================================================
+    // Suggest mode output format
+    // ========================================================================
+
+    #[test]
+    fn test_suggest_match_json_format() {
+        let output = SuggestOutput {
+            version: 1,
+            is_match: true,
+            original: "cargo test".to_string(),
+            rewritten: "skim test cargo".to_string(),
+            category: "test".to_string(),
+            confidence: "exact".to_string(),
+            skim_hook_version: "1.0.0".to_string(),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["match"], true);
+        assert_eq!(parsed["original"], "cargo test");
+        assert_eq!(parsed["rewritten"], "skim test cargo");
+        assert_eq!(parsed["category"], "test");
+        assert_eq!(parsed["confidence"], "exact");
+    }
+
+    #[test]
+    fn test_suggest_no_match_json_format() {
+        let output = SuggestOutput {
+            version: 1,
+            is_match: false,
+            original: "ls -la".to_string(),
+            rewritten: String::new(),
+            category: String::new(),
+            confidence: String::new(),
+            skim_hook_version: "1.0.0".to_string(),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["match"], false);
+        assert_eq!(parsed["rewritten"], "");
+        assert_eq!(parsed["category"], "");
+    }
+
+    // ========================================================================
+    // Category assignment
+    // ========================================================================
+
+    #[test]
+    fn test_test_category_for_cargo_test() {
+        let result = try_rewrite(&["cargo", "test"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Test));
+    }
+
+    #[test]
+    fn test_build_category_for_cargo_build() {
+        let result = try_rewrite(&["cargo", "build"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Build));
+    }
+
+    #[test]
+    fn test_git_category_for_git_status() {
+        let result = try_rewrite(&["git", "status"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Git));
+    }
+
+    #[test]
+    fn test_read_category_for_cat() {
+        let result = try_rewrite(&["cat", "file.ts"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Read));
+    }
+
+    #[test]
+    fn test_read_category_for_head() {
+        let result = try_rewrite(&["head", "-20", "file.ts"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Read));
+    }
+
+    #[test]
+    fn test_read_category_for_tail() {
+        let result = try_rewrite(&["tail", "file.rs"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Read));
+    }
+
+    // ========================================================================
+    // is_code_file checks various extensions
+    // ========================================================================
+
+    #[test]
+    fn test_is_code_file_ts() {
+        assert!(is_code_file("file.ts"));
+    }
+
+    #[test]
+    fn test_is_code_file_py() {
+        assert!(is_code_file("file.py"));
+    }
+
+    #[test]
+    fn test_is_code_file_rs() {
+        assert!(is_code_file("src/main.rs"));
+    }
+
+    #[test]
+    fn test_is_code_file_go() {
+        assert!(is_code_file("main.go"));
+    }
+
+    #[test]
+    fn test_is_code_file_java() {
+        assert!(is_code_file("Main.java"));
+    }
+
+    #[test]
+    fn test_is_code_file_json() {
+        assert!(is_code_file("config.json"));
+    }
+
+    #[test]
+    fn test_is_not_code_file_csv() {
+        assert!(!is_code_file("data.csv"));
+    }
+
+    #[test]
+    fn test_is_not_code_file_txt() {
+        assert!(!is_code_file("readme.txt"));
+    }
+
+    #[test]
+    fn test_is_not_code_file_no_extension() {
+        assert!(!is_code_file("Makefile"));
+    }
+
+    // ========================================================================
+    // Git skip-flag prefix matching (starts_with behavior)
+    // ========================================================================
+
+    #[test]
+    fn test_git_log_format_with_value_skipped() {
+        // --format=%H starts with --format
+        assert!(try_rewrite(&["git", "log", "--format=%H"]).is_none());
+    }
+
+    #[test]
+    fn test_git_log_pretty_with_value_skipped() {
+        // --pretty=oneline starts with --pretty
+        assert!(try_rewrite(&["git", "log", "--pretty=oneline"]).is_none());
+    }
+
+    // ========================================================================
+    // Env var edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_lowercase_key_not_env_var() {
+        // lowercase=value is not an env var (must be uppercase)
+        assert!(try_rewrite(&["foo=bar", "cargo", "test"]).is_none());
+    }
+
+    #[test]
+    fn test_env_var_with_numbers() {
+        let result = try_rewrite(&["VAR_123=abc", "cargo", "test"]).unwrap();
+        assert_eq!(result.tokens[0], "VAR_123=abc");
+    }
+}

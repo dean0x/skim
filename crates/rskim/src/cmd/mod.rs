@@ -5,6 +5,7 @@
 //! is currently a stub that will be implemented in later Phase B tickets.
 
 mod completions;
+mod rewrite;
 
 use std::process::ExitCode;
 
@@ -43,6 +44,10 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
     // Dispatch implemented subcommands
     if subcommand == "completions" {
         return completions::run(args);
+    }
+    if subcommand == "rewrite" {
+        let exit_code = rewrite::run(args)?;
+        return Ok(exit_code);
     }
 
     // Check for --help / -h in remaining args
