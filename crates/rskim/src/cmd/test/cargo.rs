@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -24,6 +25,14 @@ use crate::cmd::{inject_flag_before_separator, run_parsed_command_with_mode, use
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
+
+// Static regex patterns compiled once via LazyLock (avoids per-call compilation).
+static RE_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());
+static RE_FAILED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+failed").unwrap());
+static RE_SKIPPED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+skipped").unwrap());
+static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"test result: \w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored").unwrap()
+});
 
 /// Run `skim test cargo [args...]`.
 ///
@@ -41,7 +50,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     // For standard cargo test (not nextest), inject --message-format=json
     // to suppress human-formatted build progress on stdout. This makes the
     // test harness text output cleaner to parse. Skip if user already set it.
-    if !is_nextest && !user_has_flag(&cmd_args, "--message-format") {
+    if !is_nextest && !user_has_flag(&cmd_args, &["--message-format"]) {
         inject_flag_before_separator(&mut cmd_args, "--message-format=json");
     }
 
@@ -57,18 +66,17 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "cargo",
         &cmd_args,
         &[("CARGO_TERM_COLOR", "never")],
-        "cargo install cargo",
+        "Install Rust via https://rustup.rs",
         use_stdin,
-        parse,
+        move |output, _args| parse_impl(output, is_nextest),
     )
 }
 
 /// Three-tier parse function.
 ///
-/// Receives the `CommandOutput` and original args, returns `ParseResult<TestResult>`.
-fn parse(output: &CommandOutput, args: &[String]) -> ParseResult<TestResult> {
-    let is_nextest = args.iter().any(|a| a == "nextest");
-
+/// Receives the `CommandOutput` and a pre-computed `is_nextest` flag (captured
+/// from the original user args in `run()` to avoid re-detecting from modified args).
+fn parse_impl(output: &CommandOutput, is_nextest: bool) -> ParseResult<TestResult> {
     if is_nextest {
         // Tier 1: nextest text state machine
         if let Some(result) = try_parse_nextest(&output.stdout) {
@@ -259,13 +267,15 @@ fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
             continue;
         }
 
-        // If we're in a STDOUT capture block, accumulate lines
+        // If we're in a STDOUT capture block, accumulate lines.
+        // Use trim_end() instead of trim() to preserve leading whitespace
+        // in assertion messages and formatted output.
         if in_stdout_block {
             if let Some((_, ref mut captured)) = current_stdout_capture {
                 if !captured.is_empty() {
                     captured.push('\n');
                 }
-                captured.push_str(trimmed);
+                captured.push_str(line.trim_end());
                 continue;
             }
         }
@@ -418,23 +428,27 @@ fn parse_nextest_summary(line: &str) -> Option<(usize, usize, usize, Option<u64>
         }
     }
 
-    // Parse "N passed", "N failed", "N skipped" from the summary
-    let re_passed = Regex::new(r"(\d+)\s+passed").ok()?;
-    let re_failed = Regex::new(r"(\d+)\s+failed").ok()?;
-    let re_skipped = Regex::new(r"(\d+)\s+skipped").ok()?;
+    // Parse "N passed", "N failed", "N skipped" from the summary.
+    // Uses static LazyLock regexes to avoid per-call compilation.
+    let mut any_matched = false;
 
-    if let Some(caps) = re_passed.captures(line) {
+    if let Some(caps) = RE_PASSED.captures(line) {
+        any_matched = true;
         passed = caps[1].parse().unwrap_or(0);
     }
-    if let Some(caps) = re_failed.captures(line) {
+    if let Some(caps) = RE_FAILED.captures(line) {
+        any_matched = true;
         failed = caps[1].parse().unwrap_or(0);
     }
-    if let Some(caps) = re_skipped.captures(line) {
+    if let Some(caps) = RE_SKIPPED.captures(line) {
+        any_matched = true;
         skipped = caps[1].parse().unwrap_or(0);
     }
 
-    // At least one count must be present for a valid summary
-    if passed > 0 || failed > 0 || skipped > 0 {
+    // At least one count field must have matched for a valid summary.
+    // This correctly handles zero-count summaries (e.g., "0 passed, 0 skipped"
+    // when all tests are filtered out) by tracking regex matches, not values.
+    if any_matched {
         Some((passed, failed, skipped, duration_ms))
     } else {
         None
@@ -452,16 +466,12 @@ fn parse_nextest_summary(line: &str) -> Option<(usize, usize, usize, Option<u64>
 ///
 /// This function finds ALL such lines and aggregates the totals.
 fn try_parse_regex(text: &str) -> Option<TestResult> {
-    let re =
-        Regex::new(r"test result: \w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored")
-            .ok()?;
-
     let mut total_passed: usize = 0;
     let mut total_failed: usize = 0;
     let mut total_ignored: usize = 0;
     let mut found = false;
 
-    for caps in re.captures_iter(text) {
+    for caps in RE_CARGO_SUMMARY.captures_iter(text) {
         found = true;
         total_passed += caps[1].parse::<usize>().unwrap_or(0);
         total_failed += caps[2].parse::<usize>().unwrap_or(0);
@@ -603,7 +613,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Three-tier integration via parse()
+    // Three-tier integration via parse_impl()
     // ========================================================================
 
     #[test]
@@ -615,7 +625,7 @@ mod tests {
             exit_code: Some(0),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse(&output, &[]);
+        let result = parse_impl(&output, false);
         assert!(
             result.is_full(),
             "Expected Full parse result, got {}",
@@ -631,7 +641,7 @@ mod tests {
             exit_code: Some(0),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse(&output, &[]);
+        let result = parse_impl(&output, false);
         assert!(
             result.is_degraded(),
             "Expected Degraded parse result, got {}",
@@ -647,7 +657,7 @@ mod tests {
             exit_code: Some(1),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse(&output, &[]);
+        let result = parse_impl(&output, false);
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
@@ -669,7 +679,7 @@ mod tests {
             "--nocapture".to_string(),
         ];
         assert!(
-            user_has_flag(&args, "--message-format"),
+            user_has_flag(&args, &["--message-format"]),
             "Should detect existing --message-format flag"
         );
     }
@@ -678,7 +688,7 @@ mod tests {
     fn test_flag_injection_not_triggered_for_different_flag() {
         let args = vec!["test".to_string(), "--release".to_string()];
         assert!(
-            !user_has_flag(&args, "--message-format"),
+            !user_has_flag(&args, &["--message-format"]),
             "Should not detect --message-format when only --release is present"
         );
     }

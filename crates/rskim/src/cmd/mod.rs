@@ -31,12 +31,16 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 // Shared helpers for subcommand parsers
 // ============================================================================
 
-/// Check whether the user-supplied args already contain a flag (prefix match).
+/// Check whether the user-supplied args already contain any of the given flags.
 ///
-/// Matches both `--flag` and `--flag=value` forms.
-pub(crate) fn user_has_flag(args: &[String], flag_prefix: &str) -> bool {
-    args.iter()
-        .any(|a| a == flag_prefix || a.starts_with(&format!("{flag_prefix}=")))
+/// Accepts multiple flag prefixes (e.g., `&["--color", "-c"]`) for checking
+/// equivalent flag aliases. Matches both `--flag` and `--flag=value` forms.
+pub(crate) fn user_has_flag(args: &[String], flags: &[&str]) -> bool {
+    args.iter().any(|a| {
+        flags
+            .iter()
+            .any(|flag| a == flag || a.starts_with(&format!("{flag}=")))
+    })
 }
 
 /// Inject a flag before the `--` separator, or at the end if no separator exists.
@@ -96,10 +100,20 @@ pub(crate) fn run_parsed_command_with_mode<T>(
 where
     T: AsRef<str>,
 {
+    /// Maximum bytes we will read from stdin (64 MiB), consistent with the
+    /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
+    const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+
     let output = if use_stdin {
-        // Piped stdin mode: read stdin instead of executing the command
+        // Piped stdin mode: read stdin instead of executing the command.
+        // Size-limited to prevent unbounded memory growth from runaway pipes.
         let mut stdin_buf = String::new();
-        io::stdin().read_to_string(&mut stdin_buf)?;
+        let bytes_read = io::stdin()
+            .take(MAX_STDIN_BYTES)
+            .read_to_string(&mut stdin_buf)?;
+        if bytes_read as u64 >= MAX_STDIN_BYTES {
+            anyhow::bail!("stdin input exceeded 64 MiB limit");
+        }
         CommandOutput {
             stdout: stdin_buf,
             stderr: String::new(),
@@ -125,6 +139,15 @@ where
         }
     };
 
+    // Strip ANSI escape codes from output before parsing. Even with NO_COLOR=1
+    // set on the child process, some tools may still emit escape sequences.
+    // This is a cheap, universally useful safety net for all parsers.
+    let output = CommandOutput {
+        stdout: crate::output::strip_ansi(&output.stdout),
+        stderr: crate::output::strip_ansi(&output.stderr),
+        ..output
+    };
+
     let result = parse(&output, args);
 
     // Emit markers (warnings/notices) to stderr
@@ -143,13 +166,11 @@ where
     }
     stdout_handle.flush()?;
 
-    // Map exit code: use underlying process exit code
+    // Map exit code: preserve full 0-255 exit code granularity from the
+    // underlying process. This maintains documented semantics (0=success,
+    // 1=error, 2=parse error, 3=unsupported language) for downstream consumers.
     let code = output.exit_code.unwrap_or(1);
-    Ok(if code == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
 /// Dispatch a subcommand by name. Returns the process exit code.

@@ -94,6 +94,16 @@ impl CommandRunner {
 
         let mut cmd = Command::new(program);
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        // Set NO_COLOR=1 by default to suppress ANSI escape codes from child
+        // processes. This is the standard convention (https://no-color.org/)
+        // and ensures parsers receive clean text. Callers can override by
+        // passing NO_COLOR in env_overrides.
+        let caller_sets_no_color = env.iter().any(|(k, _)| *k == "NO_COLOR");
+        if !caller_sets_no_color {
+            cmd.env("NO_COLOR", "1");
+        }
+
         for (key, value) in env {
             cmd.env(key, value);
         }
