@@ -11,6 +11,7 @@
 
 use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -22,12 +23,15 @@ use crate::runner::CommandRunner;
 // Public entry point
 // ============================================================================
 
-/// Run vitest with the given args, or read piped stdin, and parse the output.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+/// Run vitest/jest with the given args, or read piped stdin, and parse the output.
+///
+/// `program` is the runner binary name (e.g. `"vitest"` or `"jest"`), used when
+/// stdin is not piped and we need to spawn the process directly.
+pub(crate) fn run(program: &str, args: &[String]) -> anyhow::Result<ExitCode> {
     let raw_output = if stdin_has_data() {
         read_stdin()?
     } else {
-        run_vitest(args)?
+        run_vitest(program, args)?
     };
 
     let result = parse(&raw_output);
@@ -67,28 +71,57 @@ fn stdin_has_data() -> bool {
     !io::stdin().is_terminal()
 }
 
-/// Read all of stdin into a String.
+/// Maximum bytes we will read from stdin (64 MiB).
+///
+/// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
+/// memory growth when a large file is accidentally piped in.
+const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read stdin into a String, capped at [`MAX_STDIN_BYTES`].
+///
+/// Uses chunked reads (8 KiB) instead of `read_to_string` to enforce the size
+/// limit incrementally. Non-UTF-8 input is handled via `String::from_utf8_lossy`.
 fn read_stdin() -> anyhow::Result<String> {
-    let mut buf = String::new();
-    io::stdin().read_to_string(&mut buf)?;
-    Ok(buf)
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    loop {
+        let n = handle.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_STDIN_BYTES {
+            anyhow::bail!("stdin exceeded {} byte limit", MAX_STDIN_BYTES);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Execute vitest with the user's args, injecting `--reporter=json` if not already set.
-fn run_vitest(args: &[String]) -> anyhow::Result<String> {
+/// Execute the test runner with the user's args, injecting `--reporter=json` if
+/// not already set.
+///
+/// `program` is the binary to invoke (e.g. `"vitest"` or `"jest"`).
+fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     let mut final_args: Vec<String> = args.to_vec();
 
     if !user_has_flag(args, "--reporter") {
-        final_args.push("--reporter=json".to_string());
+        // Jest uses `--json` instead of `--reporter=json`
+        if program == "jest" {
+            final_args.push("--json".to_string());
+        } else {
+            final_args.push("--reporter=json".to_string());
+        }
     }
 
     let arg_refs: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
 
     let runner = CommandRunner::new(None);
-    let output = runner.run("vitest", &arg_refs).map_err(|e| {
+    let output = runner.run(program, &arg_refs).map_err(|e| {
         anyhow::anyhow!(
-            "failed to run vitest: {e}\n\
-             Hint: Install vitest with: npm install -D vitest"
+            "failed to run {program}: {e}\n\
+             Hint: Install {program} with: npm install -D {program}"
         )
     })?;
 
@@ -172,10 +205,25 @@ struct VitestAssertion {
 ///
 /// Handles pnpm workspace resolution lines, dotenv loading messages, and other
 /// prefix noise by using brace-balance counting to find the outermost JSON object.
+/// If the first balanced `{...}` candidate is not valid Vitest JSON (e.g., a
+/// `{project}` tag in a pnpm log), subsequent candidates are tried.
 fn try_parse_json(raw: &str) -> Option<TestResult> {
     let cleaned = crate::output::strip_ansi(raw);
-    let json_str = extract_json_by_brace_balance(&cleaned)?;
-    let parsed: VitestJson = serde_json::from_str(json_str).ok()?;
+
+    // Iterate over brace-balanced candidates until one parses as Vitest JSON.
+    let mut search_from = 0;
+    let parsed: VitestJson = loop {
+        let json_str = extract_json_by_brace_balance_from(&cleaned, search_from)?;
+        if let Ok(v) = serde_json::from_str::<VitestJson>(json_str) {
+            break v;
+        }
+        // Advance past this candidate's starting `{` and try the next one.
+        let candidate_start = cleaned[search_from..]
+            .find(json_str)
+            .map(|off| search_from + off)
+            .unwrap_or(search_from);
+        search_from = candidate_start + 1;
+    };
 
     let mut entries = Vec::new();
     for suite in &parsed.test_results {
@@ -211,14 +259,42 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
     Some(TestResult::new(summary, entries))
 }
 
-/// Extract the outermost JSON object from a string using brace-balance counting.
+/// Extract a brace-balanced JSON object from the input, starting the scan at
+/// byte offset `search_from`.
 ///
-/// Scans forward for the first `{`, then counts braces (respecting string literals
-/// to avoid being confused by `{` and `}` inside quoted strings) to find the
-/// matching closing `}`. Returns the substring if found.
-fn extract_json_by_brace_balance(input: &str) -> Option<&str> {
+/// Scans for each `{` from `search_from` onward, then counts braces (respecting
+/// string literals to avoid being confused by `{` and `}` inside quoted strings)
+/// to find the matching closing `}`. If a `{` does not produce a balanced pair,
+/// scanning continues from the next `{` candidate.
+fn extract_json_by_brace_balance_from(input: &str, search_from: usize) -> Option<&str> {
     let bytes = input.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut pos = search_from;
+
+    while pos < bytes.len() {
+        let start = pos + bytes[pos..].iter().position(|&b| b == b'{')?;
+
+        if let Some(end) = find_balanced_end(bytes, start) {
+            return Some(&input[start..=end]);
+        }
+
+        // This `{` didn't balance -- advance past it and try the next one.
+        pos = start + 1;
+    }
+
+    None
+}
+
+/// Convenience wrapper: extract from the beginning of the input.
+#[cfg(test)]
+fn extract_json_by_brace_balance(input: &str) -> Option<&str> {
+    extract_json_by_brace_balance_from(input, 0)
+}
+
+/// Starting from `bytes[start]` (which must be `b'{'`), scan forward using
+/// brace-balance counting with string-literal awareness. Returns the index of
+/// the matching `}` if found, or `None` if the braces never balance.
+fn find_balanced_end(bytes: &[u8], start: usize) -> Option<usize> {
+    debug_assert_eq!(bytes[start], b'{');
 
     let mut depth: usize = 0;
     let mut in_string = false;
@@ -250,7 +326,7 @@ fn extract_json_by_brace_balance(input: &str) -> Option<&str> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(&input[start..=i]);
+                    return Some(i);
                 }
             }
             _ => {}
@@ -266,14 +342,28 @@ fn extract_json_by_brace_balance(input: &str) -> Option<&str> {
 // Tier 2: Regex fallback
 // ============================================================================
 
+/// Vitest pipe-format summary regex (compiled once).
+///
+/// Matches: "Tests  3 passed | 0 failed | 3 total"
+static PIPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Tests\s+(\d+)\s+passed\s*\|\s*(\d+)\s+failed\s*\|\s*(\d+)\s+total")
+        .expect("PIPE_RE is a valid regex")
+});
+
+/// Jest comma-format summary regex (compiled once).
+///
+/// Matches: "Tests: 5 passed, 2 failed, 7 total"
+static COMMA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Tests:\s+(\d+)\s+passed(?:,\s+(\d+)\s+failed)?(?:,\s+(\d+)\s+total)?")
+        .expect("COMMA_RE is a valid regex")
+});
+
 /// Try to parse test summary from plain text output using regex patterns.
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
     let cleaned = crate::output::strip_ansi(raw);
 
     // Pattern 1: "Tests  3 passed | 0 failed | 3 total"
-    let pipe_re =
-        Regex::new(r"Tests\s+(\d+)\s+passed\s*\|\s*(\d+)\s+failed\s*\|\s*(\d+)\s+total").ok()?;
-    if let Some(caps) = pipe_re.captures(&cleaned) {
+    if let Some(caps) = PIPE_RE.captures(&cleaned) {
         let pass: usize = caps[1].parse().ok()?;
         let fail: usize = caps[2].parse().ok()?;
         let total: usize = caps[3].parse().ok()?;
@@ -289,9 +379,7 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
     }
 
     // Pattern 2: "Tests:\s+N passed(?:,\s+N failed)?(?:,\s+N total)?"
-    let comma_re =
-        Regex::new(r"Tests:\s+(\d+)\s+passed(?:,\s+(\d+)\s+failed)?(?:,\s+(\d+)\s+total)?").ok()?;
-    if let Some(caps) = comma_re.captures(&cleaned) {
+    if let Some(caps) = COMMA_RE.captures(&cleaned) {
         let pass: usize = caps[1].parse().ok()?;
         let fail: usize = caps
             .get(2)
@@ -463,6 +551,88 @@ mod tests {
     fn test_brace_balance_unclosed_brace() {
         let input = r#"{"key": "value"#;
         assert!(extract_json_by_brace_balance(input).is_none());
+    }
+
+    #[test]
+    fn test_brace_balance_deeply_nested() {
+        // 20 levels of nesting -- verifies brace counter handles deep structures
+        let mut json = String::new();
+        for _ in 0..20 {
+            json.push_str(r#"{"d":"#);
+        }
+        json.push('1');
+        for _ in 0..20 {
+            json.push('}');
+        }
+
+        let input = format!("prefix noise {json} trailing");
+        let extracted = extract_json_by_brace_balance(&input).unwrap();
+        assert_eq!(extracted, json);
+
+        // Verify it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(extracted).unwrap();
+        assert!(parsed.is_object());
+    }
+
+    #[test]
+    fn test_brace_balance_prefix_noise_with_unbalanced_brace() {
+        // Prefix contains a truly unbalanced `{` (no matching `}` before the JSON).
+        // The retry logic should skip past the unbalanced brace and find the real JSON.
+        let input = "some output { incomplete prefix\n\
+                     {\"numPassedTests\":1,\"numFailedTests\":0,\"numPendingTests\":0,\"testResults\":[]}";
+        let extracted = extract_json_by_brace_balance(input).unwrap();
+        assert!(
+            extracted.starts_with(r#"{"numPassedTests""#),
+            "should skip the unbalanced prefix brace and find the JSON object, got: {extracted}"
+        );
+
+        // Verify it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(extracted).unwrap();
+        assert_eq!(parsed["numPassedTests"], 1);
+    }
+
+    #[test]
+    fn test_brace_balance_prefix_balanced_non_json() {
+        // Prefix contains a balanced `{...}` that is not valid JSON (e.g., `{project}`).
+        // The brace extractor returns it since it balances, but serde rejects it.
+        // The `try_parse_json` retry loop then finds the real JSON as the next candidate.
+        let input = r#"{project} output
+{"numTotalTestSuites":1,"numPassedTestSuites":1,"numFailedTestSuites":0,"numPassedTests":1,"numFailedTests":0,"numPendingTests":0,"testResults":[]}"#;
+
+        // At the brace-balance level, `{project}` is the first balanced match.
+        let extracted = extract_json_by_brace_balance(input).unwrap();
+        assert_eq!(extracted, "{project}");
+
+        // Through the full parser, serde rejects `{project}` and the retry loop
+        // advances to find the real JSON as the next candidate.
+        let result = parse(input);
+        assert!(
+            result.is_full(),
+            "expected Full after serde rejects prefix, got {}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(test_result) = result {
+            assert_eq!(test_result.summary.pass, 1);
+            assert_eq!(test_result.summary.fail, 0);
+        }
+    }
+
+    #[test]
+    fn test_tier1_ansi_encoded_json() {
+        // JSON wrapped in ANSI escape codes (e.g., vitest with colored output)
+        let input = "\x1b[1m\x1b[32m{\"numTotalTestSuites\":1,\"numPassedTestSuites\":1,\"numFailedTestSuites\":0,\"numPassedTests\":2,\"numFailedTests\":0,\"numPendingTests\":0,\"testResults\":[{\"assertionResults\":[{\"status\":\"passed\",\"fullName\":\"test_a\",\"failureMessages\":[]},{\"status\":\"passed\",\"fullName\":\"test_b\",\"failureMessages\":[]}]}]}\x1b[0m";
+        let result = parse(input);
+
+        assert!(
+            result.is_full(),
+            "expected Full for ANSI-wrapped JSON, got {}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(test_result) = result {
+            assert_eq!(test_result.summary.pass, 2);
+            assert_eq!(test_result.summary.fail, 0);
+            assert_eq!(test_result.entries.len(), 2);
+        }
     }
 
     // ========================================================================

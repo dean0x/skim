@@ -26,7 +26,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     match runner {
         "go" => go::run(runner_args),
-        "vitest" | "jest" => vitest::run(runner_args),
+        "vitest" | "jest" => vitest::run(runner, runner_args),
         _ => {
             eprintln!(
                 "skim test: unknown runner '{runner}'\n\
@@ -55,4 +55,5 @@ fn print_help() {
     println!("  skim test vitest               Run vitest");
     println!("  skim test vitest --run math    Run specific vitest");
     println!("  skim test jest                 Run jest");
+    println!("  jest --json | skim test jest   Pipe jest output");
 }
