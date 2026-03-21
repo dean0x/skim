@@ -230,8 +230,12 @@ struct Args {
     )]
     jobs: Option<usize>,
 
-    /// Don't respect .gitignore rules when scanning directories or globs
-    #[arg(long, help = "Don't respect .gitignore rules (include all files)")]
+    /// Don't respect .gitignore rules when scanning directories or globs.
+    /// Also includes hidden files and directories (dotfiles) that are excluded by default.
+    #[arg(
+        long,
+        help = "Don't respect .gitignore rules (include all files, including hidden/dotfiles)"
+    )]
     no_ignore: bool,
 
     /// Disable caching (caching is enabled by default for performance)
