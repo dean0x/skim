@@ -227,44 +227,76 @@ pub(crate) fn transform_pseudo_with_spans(
 /// Collapse whitespace artifacts from inline removal:
 /// - Multiple consecutive spaces in content portion -> single space
 /// - Trailing whitespace on lines is trimmed
-/// - Leading indentation is preserved
+/// - Leading spaces left by inline removal are trimmed
+/// - Indentation is preserved
 fn collapse_whitespace(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
 
     for line in source.lines() {
-        // Find the indentation
         let indent_len = line.len() - line.trim_start().len();
-        let indent = &line[..indent_len];
         let content = line[indent_len..].trim_end();
 
-        // Collapse multiple consecutive spaces in content, then trim leading space
-        // left behind by removing inline elements (e.g., `pub ` -> ` fn ...`)
-        let collapsed = collapse_consecutive_spaces(content);
+        result.push_str(&line[..indent_len]);
 
-        result.push_str(indent);
-        result.push_str(collapsed.trim_start());
+        // Collapse consecutive spaces and trim leading space from content inline
+        let mut prev_space = false;
+        let mut leading = true;
+        for ch in content.chars() {
+            if ch == ' ' {
+                if !prev_space && !leading {
+                    result.push(ch);
+                }
+                prev_space = true;
+            } else {
+                leading = false;
+                result.push(ch);
+                prev_space = false;
+            }
+        }
         result.push('\n');
     }
 
     result
 }
 
-/// Collapse runs of consecutive spaces into a single space
-fn collapse_consecutive_spaces(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut prev_space = false;
-    for ch in s.chars() {
-        if ch == ' ' {
-            if !prev_space {
-                result.push(ch);
-            }
-            prev_space = true;
-        } else {
-            result.push(ch);
-            prev_space = false;
+/// Handle language-specific AST patterns that require multi-node context.
+///
+/// Returns `Some(Ok(()))` to skip recursion (C++ cases — stripped nodes are leaf-like),
+/// `Some(Err(...))` to propagate errors, or `None` to continue normal recursion.
+fn handle_language_special_cases(node: Node, ctx: &mut NoiseWalkContext<'_>) -> Option<Result<()>> {
+    let kind = node.kind();
+    match ctx.language {
+        Language::Rust if matches!(kind, "function_item" | "function_signature_item") => {
+            strip_rust_return_type(node, ctx.ranges);
+            None // Continue recursion — function children (params, body) still need processing
         }
+        Language::Cpp if kind == "access_specifier" => {
+            // `public:` is two siblings: access_specifier + `:`
+            let start = node.start_byte();
+            let mut end = node.end_byte();
+            if let Some(next) = node.next_sibling() {
+                if next.kind() == ":" {
+                    end = next.end_byte();
+                }
+            }
+            let end = consume_trailing_whitespace(ctx.source_bytes, end);
+            ctx.ranges.push((start, end));
+            Some(Ok(())) // Skip recursion
+        }
+        Language::Cpp if kind == "template_parameter_list" => {
+            // `template<typename T>` is two siblings: `template` keyword + parameter list
+            let mut start = node.start_byte();
+            if let Some(prev) = node.prev_sibling() {
+                if prev.kind() == "template" {
+                    start = prev.start_byte();
+                }
+            }
+            let end = consume_trailing_whitespace(ctx.source_bytes, node.end_byte());
+            ctx.ranges.push((start, end));
+            Some(Ok(())) // Skip recursion
+        }
+        _ => None,
     }
-    result
 }
 
 fn collect_noise_ranges(
@@ -349,47 +381,9 @@ fn collect_noise_ranges(
         strip_python_self_param(node, ctx.source_bytes, ctx.ranges);
     }
 
-    // Handle Rust return type: `-> Type` is expressed as sibling `->` + type nodes
-    // under `function_item` / `function_signature_item`, not as a single `return_type`
-    // wrapper node. `function_signature_item` is the node kind for trait method decls.
-    if ctx.language == Language::Rust && matches!(kind, "function_item" | "function_signature_item")
-    {
-        strip_rust_return_type(node, ctx.ranges);
-        // Does NOT return early — function_item children (params, body) still need processing
-        // via the recursion below. This differs from C++ handlers which strip leaf-like
-        // sibling groups and return early.
-    }
-
-    // Handle C++ access_specifier: `public:` in tree-sitter is two siblings —
-    // `access_specifier` ("public") and `:`. Strip both together.
-    if ctx.language == Language::Cpp && kind == "access_specifier" {
-        let start = node.start_byte();
-        let mut end = node.end_byte();
-        // The `:` is the next sibling
-        if let Some(next) = node.next_sibling() {
-            if next.kind() == ":" {
-                end = next.end_byte();
-            }
-        }
-        let end = consume_trailing_whitespace(ctx.source_bytes, end);
-        ctx.ranges.push((start, end));
-        return Ok(());
-    }
-
-    // Handle C++ template_parameter_list: `template<typename T>` in tree-sitter has
-    // `template` keyword as prev sibling and `template_parameter_list` as a separate
-    // node. Strip the `template` keyword along with the parameter list.
-    if ctx.language == Language::Cpp && kind == "template_parameter_list" {
-        let mut start = node.start_byte();
-        // The `template` keyword is the prev sibling
-        if let Some(prev) = node.prev_sibling() {
-            if prev.kind() == "template" {
-                start = prev.start_byte();
-            }
-        }
-        let end = consume_trailing_whitespace(ctx.source_bytes, node.end_byte());
-        ctx.ranges.push((start, end));
-        return Ok(());
+    // Handle language-specific multi-node patterns (Rust return types, C++ siblings)
+    if let Some(result) = handle_language_special_cases(node, ctx) {
+        return result;
     }
 
     // Recurse into children
@@ -416,19 +410,15 @@ fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize
         (Language::Python, "type" | "return_type") => {
             // Python return type: ` -> int` — consume the ` -> ` separator.
             // Python parameter type: `a: int` — consume the `: ` separator.
-            // Check longest patterns first for correct greedy match.
+            // Ordered longest-first for greedy match
+            const SEPARATORS: &[&[u8]] = &[b" -> ", b"-> ", b"->", b": ", b":"];
             let prefix = source.get(start.saturating_sub(4)..start).unwrap_or(b"");
-            if prefix.len() >= 4 && prefix.ends_with(b" -> ") {
-                start.saturating_sub(4)
-            } else if prefix.len() >= 3 && prefix.ends_with(b"-> ") {
-                start.saturating_sub(3)
-            } else if prefix.len() >= 2 && (prefix.ends_with(b"->") || prefix.ends_with(b": ")) {
-                start.saturating_sub(2)
-            } else if !prefix.is_empty() && prefix.ends_with(b":") {
-                start.saturating_sub(1)
-            } else {
-                start
+            for sep in SEPARATORS {
+                if prefix.ends_with(sep) {
+                    return start.saturating_sub(sep.len());
+                }
             }
+            start
         }
         _ => start,
     }
