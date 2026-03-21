@@ -155,58 +155,46 @@ impl Language {
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
     pub(crate) fn transform_source(self, source: &str, config: &TransformConfig) -> Result<String> {
-        // Full mode: return original source unchanged (documented contract)
-        let result = if config.mode == Mode::Full {
-            if let Some(max_lines) = config.max_lines {
-                crate::transform::truncate::simple_line_truncate(source, self, max_lines)?
-            } else {
-                source.to_string()
-            }
-        }
-        // Minimal/Pseudo mode passthrough for serde-based and Markdown languages
-        else if matches!(config.mode, Mode::Minimal | Mode::Pseudo)
-            && (self.is_serde_based() || self == Self::Markdown)
-        {
-            // Apply simple truncation for passthrough if max_lines is set
-            if let Some(max_lines) = config.max_lines {
-                crate::transform::truncate::simple_line_truncate(source, self, max_lines)?
-            } else {
-                source.to_string()
-            }
+        debug_assert!(
+            !(config.max_lines.is_some() && config.last_lines.is_some()),
+            "max_lines and last_lines are mutually exclusive"
+        );
+
+        // Passthrough: Full mode (all languages) or Minimal/Pseudo for
+        // serde-based and Markdown languages (no noise to strip).
+        let is_passthrough = config.mode == Mode::Full
+            || (matches!(config.mode, Mode::Minimal | Mode::Pseudo)
+                && (self.is_serde_based() || self == Self::Markdown));
+
+        let (result, tree_sitter_handled) = if is_passthrough {
+            (source.to_string(), false)
         } else {
             // Serde-based languages use their own parsers; tree-sitter languages
             // handle truncation inside transform_tree.
             match self {
-                Self::Json => {
-                    let r = crate::transform::json::transform_json(source)?;
-                    if let Some(max_lines) = config.max_lines {
-                        crate::transform::truncate::simple_line_truncate(&r, self, max_lines)?
-                    } else {
-                        r
-                    }
-                }
-                Self::Yaml => {
-                    let r = crate::transform::yaml::transform_yaml(source)?;
-                    if let Some(max_lines) = config.max_lines {
-                        crate::transform::truncate::simple_line_truncate(&r, self, max_lines)?
-                    } else {
-                        r
-                    }
-                }
-                Self::Toml => {
-                    let r = crate::transform::toml::transform_toml(source)?;
-                    if let Some(max_lines) = config.max_lines {
-                        crate::transform::truncate::simple_line_truncate(&r, self, max_lines)?
-                    } else {
-                        r
-                    }
-                }
+                Self::Json => (crate::transform::json::transform_json(source)?, false),
+                Self::Yaml => (crate::transform::yaml::transform_yaml(source)?, false),
+                Self::Toml => (crate::transform::toml::transform_toml(source)?, false),
                 _ => {
                     let mut parser = Parser::new(self)?;
                     let tree = parser.parse(source)?;
-                    crate::transform::transform_tree(source, &tree, self, config)?
+                    let r = crate::transform::transform_tree(source, &tree, self, config)?;
+                    (r, true)
                 }
             }
+        };
+
+        // Apply max_lines as unified post-processing for non-tree-sitter paths.
+        // Tree-sitter languages handle truncation inside transform_tree via
+        // AST-aware priority selection, so we skip them here.
+        let result = if !tree_sitter_handled {
+            if let Some(max_lines) = config.max_lines {
+                crate::transform::truncate::simple_line_truncate(&result, self, max_lines)?
+            } else {
+                result
+            }
+        } else {
+            result
         };
 
         // Apply last_lines truncation as a post-processing step

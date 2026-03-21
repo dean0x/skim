@@ -279,23 +279,23 @@ pub(crate) fn simple_last_line_truncate(
     language: Language,
     n: usize,
 ) -> Result<String> {
-    let lines: Vec<&str> = text.lines().collect();
+    let total = text.lines().count();
 
-    if lines.len() <= n {
+    if total <= n {
         return Ok(text.to_string());
     }
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
-    let omitted = lines.len() - n + 1;
+    let content_lines = n.saturating_sub(1);
+    let omitted = total - n + 1;
     let marker = format!("{} ... ({} lines above){}", prefix, omitted, suffix);
 
-    // Take last (n - 1) lines, prepend marker
-    let content_lines = n.saturating_sub(1);
-    let start = lines.len() - content_lines;
+    // Skip to the tail without collecting all lines into a Vec
+    let skip = total - content_lines;
     let mut result: Vec<&str> = Vec::with_capacity(n);
     result.push(&marker);
-    result.extend_from_slice(&lines[start..]);
+    result.extend(text.lines().skip(skip));
 
     let mut output = result.join("\n");
     if text.ends_with('\n') {
