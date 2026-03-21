@@ -1142,27 +1142,24 @@ mod tests {
     fn test_rust_special_case_continues_recursion_into_body() {
         // Rust function_item returns None (continue recursion), so children like
         // visibility_modifier and mutable_specifier inside params should still be stripped
-        let source = "pub fn update(&mut self, value: i32) -> bool {\n    self.val = value;\n    true\n}\n";
+        let source =
+            "pub fn update(&mut self, value: i32) -> bool {\n    self.val = value;\n    true\n}\n";
         let result = transform(source, Language::Rust);
-        // Visibility stripped (child processing happened)
         assert!(
             !result.contains("pub "),
             "pub should be stripped via child recursion, got: {result}"
         );
-        // Mutable specifier stripped (child processing happened)
         assert!(
             !result.contains("mut "),
             "mut should be stripped via child recursion, got: {result}"
         );
-        // Return type stripped (special case processed it)
         assert!(
             !result.contains("-> bool"),
-            "return type should be stripped, got: {result}"
+            "return type should be stripped by special case, got: {result}"
         );
-        // Body is preserved (recursion continued past function_item)
         assert!(
             result.contains("self.val = value"),
-            "function body should be preserved, got: {result}"
+            "function body should be preserved (recursion continued), got: {result}"
         );
     }
 
@@ -1194,7 +1191,8 @@ mod tests {
     fn test_cpp_template_parameter_list_skips_recursion() {
         // C++ template_parameter_list returns Some(Ok(())) — both `template` keyword
         // and `<typename T>` are removed without recursing into the parameter list
-        let source = "template<typename K, typename V>\nclass Map {\npublic:\n    V get(K key);\n};\n";
+        let source =
+            "template<typename K, typename V>\nclass Map {\npublic:\n    V get(K key);\n};\n";
         let result = transform(source, Language::Cpp);
         assert!(
             !result.contains("template"),
@@ -1215,24 +1213,13 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_collapse_whitespace_leading_spaces_after_indent() {
-        // Content starts with spaces after indent — exercises the `leading` flag.
-        // This simulates what happens when an inline modifier is stripped from
-        // indented code, e.g., `    pub fn` becomes `     fn` (extra leading space).
-        let result = collapse_whitespace("     fn add() {}\n");
-        // The 5-space indent is preserved as-is (it's indentation), and `fn` is
-        // the content portion with no leading space to trim
-        assert_eq!(result, "     fn add() {}\n");
-    }
-
-    #[test]
-    fn test_collapse_whitespace_leading_flag_trims_content_start() {
-        // After indent detection, if content starts with spaces, `leading` flag
-        // causes them to be skipped. Simulate: indent=4, then " fn" as content.
+    fn test_collapse_whitespace_preserves_indent_when_modifier_stripped() {
+        // When an inline modifier is stripped (e.g., `    pub fn` -> `     fn`),
+        // the extra space becomes part of indentation and is preserved.
+        // The `leading` flag skips any content-leading spaces after indent detection.
         let result = collapse_whitespace("    fn add() {}\n");
-        assert_eq!(result, "    fn add() {}\n");
+        assert_eq!(result, "    fn add() {}\n", "normal 4-space indent");
 
-        // Now with extra space at content start (leading flag active)
         let result = collapse_whitespace("     fn add() {}\n");
         assert_eq!(
             result, "     fn add() {}\n",
@@ -1273,26 +1260,19 @@ mod tests {
     }
 
     #[test]
-    fn test_collapse_whitespace_content_leading_space_stripped() {
-        // After stripping an inline keyword, content may start with space.
-        // e.g., "    " (4 indent) + " fn add()" (content starts with space)
-        // The `leading` flag should skip the initial space in content.
-        // However, since indent detection uses trim_start(), the 5th space
-        // becomes part of indentation, not content.
-        // The real scenario is when remove_ranges leaves a gap:
-        // Original: "export function add()" -> after removal: " function add()"
-        // Here indent=0, content=" function add()" -> leading flag strips the space.
+    fn test_collapse_whitespace_leading_spaces_become_indent() {
+        // When remove_ranges leaves a gap (e.g., "export function" -> " function"),
+        // trim_start() treats the leading spaces as indentation, not content.
         let result = collapse_whitespace(" function add()\n");
         assert_eq!(
             result, " function add()\n",
             "single leading space is part of indent"
         );
 
-        // Multiple spaces at content start (after 0 indent)
         let result = collapse_whitespace("  function add()\n");
         assert_eq!(
             result, "  function add()\n",
-            "two spaces treated as indentation"
+            "two leading spaces treated as indentation"
         );
     }
 }
