@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -98,9 +99,19 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 /// Check whether the user has specified a flag (exact match or prefix with `=`).
 ///
 /// Handles both `-json` and `-json=true` as well as `-v` and `-v=true`.
+/// Treats `-flag=false` as the flag NOT being set, since the user is
+/// explicitly disabling it.
 fn user_has_flag(args: &[String], flag: &str) -> bool {
-    args.iter()
-        .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    args.iter().any(|a| {
+        if a == flag {
+            return true;
+        }
+        if let Some(value) = a.strip_prefix(&format!("{flag}=")) {
+            // -v=false means the flag is NOT set
+            return value != "false";
+        }
+        false
+    })
 }
 
 // ============================================================================
@@ -180,6 +191,8 @@ fn try_parse_ndjson(output: &str) -> Option<TestResult> {
                     test_outcomes.insert(key, TestOutcome::Skip);
                 }
                 "output" => {
+                    // Output is bounded by CommandRunner's 64 MiB cap on total
+                    // process output. Within that, per-test accumulation is acceptable.
                     if let Some(text) = event.get("Output").and_then(|v| v.as_str()) {
                         test_outputs.entry(key).or_default().push(text.to_string());
                     }
@@ -265,23 +278,36 @@ fn try_parse_ndjson(output: &str) -> Option<TestResult> {
 // Tier 2: Regex fallback
 // ============================================================================
 
+/// Matches `--- PASS/FAIL/SKIP: TestName` lines in go test verbose output.
+static TEST_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"---\s+(PASS|FAIL|SKIP):\s+(\S+)").unwrap());
+
+/// Matches `ok  package/name  0.123s` summary lines.
+static SUMMARY_OK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"ok\s+(\S+)\s+([\d.]+)s").unwrap());
+
 /// Parse go test output using regex patterns on `--- PASS/FAIL/SKIP` lines.
 ///
 /// Falls back from NDJSON when the output is plain text (e.g., user ran
 /// `go test` without `-json`, or piped non-JSON input).
+///
+/// Known limitations compared to Tier 1:
+/// - Test names are not package-prefixed because `--- PASS/FAIL/SKIP` lines
+///   do not include package info. Package is extracted from `ok` summary lines
+///   when available and prepended.
+/// - Failure details are not collected. Tier 2 cannot reliably extract failure
+///   output from plain text.
 fn try_parse_regex(output: &str) -> Option<TestResult> {
-    let test_re = Regex::new(r"---\s+(PASS|FAIL|SKIP):\s+(\S+)").unwrap();
-    let summary_ok_re = Regex::new(r"ok\s+(\S+)\s+([\d.]+)s").unwrap();
-    let summary_fail_re = Regex::new(r"FAIL\s+(\S+)").unwrap();
-
     let mut entries: Vec<TestEntry> = Vec::new();
     let mut pass_count: usize = 0;
     let mut fail_count: usize = 0;
     let mut skip_count: usize = 0;
     let mut total_duration_secs: f64 = 0.0;
+    // Extract package name from `ok` summary lines for prefixing test names.
+    let mut package_name: Option<String> = None;
 
     for line in output.lines() {
-        if let Some(caps) = test_re.captures(line) {
+        if let Some(caps) = TEST_RE.captures(line) {
             let outcome_str = caps.get(1).unwrap().as_str();
             let name = caps.get(2).unwrap().as_str().to_string();
 
@@ -304,12 +330,16 @@ fn try_parse_regex(output: &str) -> Option<TestResult> {
             entries.push(TestEntry {
                 name,
                 outcome,
+                // Tier 2 cannot reliably extract failure details from plain text.
                 detail: None,
             });
         }
 
-        // Extract duration from summary line
-        if let Some(caps) = summary_ok_re.captures(line) {
+        // Extract duration and package name from summary line
+        if let Some(caps) = SUMMARY_OK_RE.captures(line) {
+            if package_name.is_none() {
+                package_name = Some(caps.get(1).unwrap().as_str().to_string());
+            }
             if let Ok(secs) = caps.get(2).unwrap().as_str().parse::<f64>() {
                 total_duration_secs += secs;
             }
@@ -317,13 +347,14 @@ fn try_parse_regex(output: &str) -> Option<TestResult> {
     }
 
     if entries.is_empty() {
-        // Check for package-level FAIL without individual test results
-        let has_fail = summary_fail_re.is_match(output);
-        if !has_fail {
-            return None;
-        }
-        // Package failed but no individual test lines — cannot extract entries
         return None;
+    }
+
+    // Prefix test names with package when available (matching Tier 1 format).
+    if let Some(ref pkg) = package_name {
+        for entry in &mut entries {
+            entry.name = format!("{pkg}::{}", entry.name);
+        }
     }
 
     let duration_ms = if total_duration_secs > 0.0 {
@@ -513,6 +544,20 @@ mod tests {
                 test_result.summary.duration_ms.is_some(),
                 "expected duration to be present from ok line"
             );
+
+            // Verify test names are package-prefixed from ok summary line
+            assert!(
+                test_result
+                    .entries
+                    .iter()
+                    .all(|e| e.name.starts_with("example.com/pkg::")),
+                "expected all Tier 2 test names to be package-prefixed, got: {:?}",
+                test_result
+                    .entries
+                    .iter()
+                    .map(|e| &e.name)
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -678,6 +723,69 @@ mod tests {
 
         if let ParseResult::Degraded(test_result, _) = &result {
             assert_eq!(test_result.summary.skip, 1, "expected 1 skipped test");
+            // Verify package prefix from ok summary line
+            assert_eq!(
+                test_result.entries[0].name, "example.com/pkg::TestSkipped",
+                "expected package-prefixed name"
+            );
         }
+    }
+
+    // ========================================================================
+    // `--` separator and flag edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_separator_flag_injection() {
+        // When `--` is present, `-json` must be injected before it so the
+        // Go toolchain sees the flag, while args after `--` pass through.
+        let args = vec![
+            "./...".to_string(),
+            "--".to_string(),
+            "-run".to_string(),
+            "TestFoo".to_string(),
+        ];
+
+        let mut go_args: Vec<String> = vec!["test".to_string()];
+        if !user_has_flag(&args, "-json") && !user_has_flag(&args, "-v") {
+            if let Some(sep_pos) = args.iter().position(|a| a == "--") {
+                go_args.extend_from_slice(&args[..sep_pos]);
+                go_args.push("-json".to_string());
+                go_args.extend_from_slice(&args[sep_pos..]);
+            } else {
+                go_args.push("-json".to_string());
+                go_args.extend_from_slice(&args);
+            }
+        } else {
+            go_args.extend_from_slice(&args);
+        }
+
+        // -json should appear before `--`
+        let json_pos = go_args.iter().position(|a| a == "-json").unwrap();
+        let sep_pos = go_args.iter().position(|a| a == "--").unwrap();
+        assert!(
+            json_pos < sep_pos,
+            "expected -json (pos {json_pos}) before -- (pos {sep_pos}), got: {go_args:?}"
+        );
+    }
+
+    #[test]
+    fn test_v_equals_false_still_injects_json() {
+        // `-v=false` explicitly disables verbose mode, so -json should be injected.
+        let args = vec!["-v=false".to_string(), "./...".to_string()];
+        assert!(
+            !user_has_flag(&args, "-v"),
+            "expected -v=false to NOT be detected as -v"
+        );
+    }
+
+    #[test]
+    fn test_v_equals_true_skips_json_injection() {
+        // `-v=true` enables verbose mode, so -json should NOT be injected.
+        let args = vec!["-v=true".to_string(), "./...".to_string()];
+        assert!(
+            user_has_flag(&args, "-v"),
+            "expected -v=true to be detected as -v"
+        );
     }
 }
