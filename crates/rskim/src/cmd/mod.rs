@@ -46,8 +46,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         return completions::run(args);
     }
     if subcommand == "rewrite" {
-        let exit_code = rewrite::run(args)?;
-        return Ok(exit_code);
+        return rewrite::run(args);
     }
 
     // Check for --help / -h in remaining args

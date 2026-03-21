@@ -28,17 +28,6 @@ enum RewriteCategory {
     Read,
 }
 
-impl RewriteCategory {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Test => "test",
-            Self::Build => "build",
-            Self::Git => "git",
-            Self::Read => "read",
-        }
-    }
-}
-
 struct RewriteRule {
     prefix: &'static [&'static str],
     rewrite_to: &'static [&'static str],
@@ -53,15 +42,26 @@ struct RewriteResult {
 }
 
 #[derive(Serialize)]
-struct SuggestOutput {
+struct SuggestOutput<'a> {
     version: u8,
     #[serde(rename = "match")]
     is_match: bool,
-    original: String,
-    rewritten: String,
-    category: String,
-    confidence: String,
-    skim_hook_version: String,
+    original: &'a str,
+    rewritten: &'a str,
+    #[serde(serialize_with = "serialize_category")]
+    category: Option<RewriteCategory>,
+    confidence: &'a str,
+    skim_hook_version: &'a str,
+}
+
+fn serialize_category<S: serde::Serializer>(
+    cat: &Option<RewriteCategory>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match cat {
+        Some(c) => c.serialize(serializer),
+        None => serializer.serialize_str(""),
+    }
 }
 
 // ============================================================================
@@ -200,9 +200,8 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
     let tokens: Vec<String> = if positional_args.is_empty() {
         // Try reading from stdin if it's piped
         if io::stdin().is_terminal() {
-            // No args and no piped stdin
             if suggest_mode {
-                print_suggest_no_match("");
+                print_suggest("", None);
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             return Ok(std::process::ExitCode::FAILURE);
@@ -213,7 +212,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if suggest_mode {
-                print_suggest_no_match("");
+                print_suggest("", None);
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             return Ok(std::process::ExitCode::FAILURE);
@@ -225,7 +224,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
 
     if tokens.is_empty() {
         if suggest_mode {
-            print_suggest_no_match("");
+            print_suggest("", None);
             return Ok(std::process::ExitCode::SUCCESS);
         }
         return Ok(std::process::ExitCode::FAILURE);
@@ -239,7 +238,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
         .any(|t| COMPOUND_SEPARATORS.contains(&t.as_str()))
     {
         if suggest_mode {
-            print_suggest_no_match(&original);
+            print_suggest(&original, None);
             return Ok(std::process::ExitCode::SUCCESS);
         }
         return Ok(std::process::ExitCode::FAILURE);
@@ -250,7 +249,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
         Some(result) => {
             let rewritten = result.tokens.join(" ");
             if suggest_mode {
-                print_suggest_match(&original, &rewritten, result.category);
+                print_suggest(&original, Some((&rewritten, result.category)));
             } else {
                 println!("{rewritten}");
             }
@@ -258,7 +257,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
         }
         None => {
             if suggest_mode {
-                print_suggest_no_match(&original);
+                print_suggest(&original, None);
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             Ok(std::process::ExitCode::FAILURE)
@@ -295,18 +294,9 @@ fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
     // Step 3: Split at `--` separator
     let (before_sep, separator_and_after) = split_at_separator(&match_tokens);
 
-    // Step 4: Try declarative table match
-    if let Some(result) = try_table_match(&env_vars, &before_sep, &separator_and_after, toolchain) {
-        return Some(result);
-    }
-
-    // Step 5: Try custom handlers (cat/head/tail) — these work on the full
-    // command_tokens (without env vars) since they handle separators internally
-    if let Some(result) = try_custom_handlers(&env_vars, &command_tokens) {
-        return Some(result);
-    }
-
-    None
+    // Step 4: Try declarative table match, then custom handlers (cat/head/tail)
+    try_table_match(&env_vars, &before_sep, &separator_and_after, toolchain)
+        .or_else(|| try_custom_handlers(&env_vars, &command_tokens))
 }
 
 /// Strip leading environment variable assignments from a token list.
@@ -396,22 +386,13 @@ fn try_table_match(
         }
 
         // Build output: env_vars ++ rewrite_to ++ toolchain ++ middle ++ separator_and_after
-        let mut output: Vec<String> = Vec::new();
-        for ev in env_vars {
-            output.push(ev.to_string());
-        }
-        for tok in rule.rewrite_to {
-            output.push(tok.to_string());
-        }
-        if let Some(tc) = toolchain {
-            output.push(tc.to_string());
-        }
-        for tok in middle {
-            output.push(tok.to_string());
-        }
-        for tok in separator_and_after {
-            output.push(tok.to_string());
-        }
+        let output: Vec<String> = env_vars
+            .iter()
+            .chain(rule.rewrite_to.iter())
+            .map(|s| s.to_string())
+            .chain(toolchain.map(String::from))
+            .chain(middle.iter().chain(separator_and_after.iter()).map(|s| s.to_string()))
+            .collect();
 
         return Some(RewriteResult {
             tokens: output,
@@ -502,9 +483,7 @@ fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
     }
 
     let mut tokens: Vec<String> = vec!["skim".to_string()];
-    for f in &files {
-        tokens.push(f.to_string());
-    }
+    tokens.extend(files.iter().map(|f| f.to_string()));
     tokens.push("--mode=pseudo".to_string());
     if files.len() > 1 {
         tokens.push("--no-header".to_string());
@@ -571,6 +550,31 @@ fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<
     Ok((count, files))
 }
 
+/// Shared rewrite logic for head/tail commands.
+///
+/// Parses line count and file arguments, validates all files are code files,
+/// and builds the skim command with the appropriate line-limit flag.
+fn try_rewrite_head_tail(args: &[&str], line_flag: &str) -> Option<RewriteResult> {
+    let (count, files) = parse_line_count_and_files(args).ok()?;
+
+    if !files.iter().all(|f| is_code_file(f)) {
+        return None;
+    }
+
+    let mut tokens: Vec<String> = vec!["skim".to_string()];
+    tokens.extend(files.iter().map(|f| f.to_string()));
+    tokens.push("--mode=pseudo".to_string());
+    if let Some(n) = count {
+        tokens.push(line_flag.to_string());
+        tokens.push(n.to_string());
+    }
+
+    Some(RewriteResult {
+        tokens,
+        category: RewriteCategory::Read,
+    })
+}
+
 /// Rewrite `head` command.
 ///
 /// Rules:
@@ -580,27 +584,7 @@ fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<
 /// - `head file.ts` → `skim file.ts --mode=pseudo`
 /// - `head -20 data.csv` → None (not code file)
 fn try_rewrite_head(args: &[&str]) -> Option<RewriteResult> {
-    let (count, files) = parse_line_count_and_files(args).ok()?;
-
-    // All files must be code files
-    if !files.iter().all(|f| is_code_file(f)) {
-        return None;
-    }
-
-    let mut tokens: Vec<String> = vec!["skim".to_string()];
-    for f in &files {
-        tokens.push(f.to_string());
-    }
-    tokens.push("--mode=pseudo".to_string());
-    if let Some(n) = count {
-        tokens.push("--max-lines".to_string());
-        tokens.push(n.to_string());
-    }
-
-    Some(RewriteResult {
-        tokens,
-        category: RewriteCategory::Read,
-    })
+    try_rewrite_head_tail(args, "--max-lines")
 }
 
 /// Rewrite `tail` command.
@@ -611,62 +595,27 @@ fn try_rewrite_head(args: &[&str]) -> Option<RewriteResult> {
 /// - `tail file.rs` → `skim file.rs --mode=pseudo`
 /// - `tail -20 data.csv` → None (not code file)
 fn try_rewrite_tail(args: &[&str]) -> Option<RewriteResult> {
-    let (count, files) = parse_line_count_and_files(args).ok()?;
-
-    // All files must be code files
-    if !files.iter().all(|f| is_code_file(f)) {
-        return None;
-    }
-
-    let mut tokens: Vec<String> = vec!["skim".to_string()];
-    for f in &files {
-        tokens.push(f.to_string());
-    }
-    tokens.push("--mode=pseudo".to_string());
-    if let Some(n) = count {
-        tokens.push("--last-lines".to_string());
-        tokens.push(n.to_string());
-    }
-
-    Some(RewriteResult {
-        tokens,
-        category: RewriteCategory::Read,
-    })
+    try_rewrite_head_tail(args, "--last-lines")
 }
 
 // ============================================================================
 // Suggest mode output
 // ============================================================================
 
-fn print_suggest_match(original: &str, rewritten: &str, category: RewriteCategory) {
+fn print_suggest(original: &str, result: Option<(&str, RewriteCategory)>) {
     let output = SuggestOutput {
         version: 1,
-        is_match: true,
-        original: original.to_string(),
-        rewritten: rewritten.to_string(),
-        category: category.as_str().to_string(),
-        confidence: "exact".to_string(),
-        skim_hook_version: "1.0.0".to_string(),
+        is_match: result.is_some(),
+        original,
+        rewritten: result.map_or("", |(r, _)| r),
+        category: result.map(|(_, c)| c),
+        confidence: if result.is_some() { "exact" } else { "" },
+        skim_hook_version: "1.0.0",
     };
-    // Serialization of a well-formed struct should not fail
-    if let Ok(json) = serde_json::to_string(&output) {
-        println!("{json}");
-    }
-}
-
-fn print_suggest_no_match(original: &str) {
-    let output = SuggestOutput {
-        version: 1,
-        is_match: false,
-        original: original.to_string(),
-        rewritten: String::new(),
-        category: String::new(),
-        confidence: String::new(),
-        skim_hook_version: "1.0.0".to_string(),
-    };
-    if let Ok(json) = serde_json::to_string(&output) {
-        println!("{json}");
-    }
+    // Struct contains only primitive types (&str, u8, bool) — serialization cannot fail.
+    let json = serde_json::to_string(&output)
+        .expect("BUG: SuggestOutput serialization failed — struct contains only primitive types");
+    println!("{json}");
 }
 
 // ============================================================================
@@ -1161,11 +1110,11 @@ mod tests {
         let output = SuggestOutput {
             version: 1,
             is_match: true,
-            original: "cargo test".to_string(),
-            rewritten: "skim test cargo".to_string(),
-            category: "test".to_string(),
-            confidence: "exact".to_string(),
-            skim_hook_version: "1.0.0".to_string(),
+            original: "cargo test",
+            rewritten: "skim test cargo",
+            category: Some(RewriteCategory::Test),
+            confidence: "exact",
+            skim_hook_version: "1.0.0",
         };
         let json = serde_json::to_string(&output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1182,11 +1131,11 @@ mod tests {
         let output = SuggestOutput {
             version: 1,
             is_match: false,
-            original: "ls -la".to_string(),
-            rewritten: String::new(),
-            category: String::new(),
-            confidence: String::new(),
-            skim_hook_version: "1.0.0".to_string(),
+            original: "ls -la",
+            rewritten: "",
+            category: None,
+            confidence: "",
+            skim_hook_version: "1.0.0",
         };
         let json = serde_json::to_string(&output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
