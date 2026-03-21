@@ -1,0 +1,9 @@
+============================= test session starts ==============================
+collected 6 items
+
+tests/test_a.py ..s                                                       [ 50%]
+tests/test_b.py .F.                                                       [100%]
+
+=========================== short test summary info ============================
+FAILED tests/test_b.py::test_two - assert 1 == 2
+============== 4 passed, 1 failed, 1 skipped in 0.20s =============
