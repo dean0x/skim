@@ -16,7 +16,7 @@ use super::minimal::{
 };
 
 /// Bundled parameters for the recursive noise walker to avoid parameter explosion
-struct WalkContext<'a> {
+struct NoiseWalkContext<'a> {
     source: &'a str,
     source_bytes: &'a [u8],
     language: Language,
@@ -29,6 +29,12 @@ struct WalkContext<'a> {
 /// After stripping a keyword or node, trailing spaces remain in the source.
 /// This helper advances the end position past those spaces to prevent artifacts
 /// like `" fn ..."` when `pub` is removed from `pub fn ...`.
+///
+/// ARCHITECTURE: This is layer 1 of a two-layer whitespace strategy. It handles
+/// byte-level space consumption at range-collection time (before removal). The
+/// downstream `collapse_whitespace` pass (layer 2) handles any remaining artifacts
+/// after all ranges are removed — collapsing multi-space runs, trimming trailing
+/// whitespace, and stripping leading spaces left by inline removals.
 fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
     let mut pos = end;
     while pos < source.len() && source[pos] == b' ' {
@@ -183,7 +189,7 @@ pub(crate) fn transform_pseudo_with_spans(
     // Single-pass collection: comments AND noise ranges in one AST walk
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut node_count: usize = 0;
-    let mut ctx = WalkContext {
+    let mut ctx = NoiseWalkContext {
         source,
         source_bytes: source.as_bytes(),
         language,
@@ -263,24 +269,24 @@ fn collapse_consecutive_spaces(s: &str) -> String {
 
 fn collect_noise_ranges(
     node: Node,
-    ctx: &mut WalkContext<'_>,
+    ctx: &mut NoiseWalkContext<'_>,
     rules: &PseudoRules,
     depth: usize,
 ) -> Result<()> {
+    // SECURITY: Prevent stack overflow from deeply nested AST
+    if depth > MAX_AST_DEPTH {
+        return Err(SkimError::ParseError(format!(
+            "Maximum AST depth exceeded: {} (possible malicious input)",
+            MAX_AST_DEPTH
+        )));
+    }
+
     // SECURITY: Prevent memory exhaustion from excessive nodes
     *ctx.node_count += 1;
     if *ctx.node_count > MAX_AST_NODES {
         return Err(SkimError::ParseError(format!(
             "Too many AST nodes: {} (max: {}). Possible malicious input.",
             *ctx.node_count, MAX_AST_NODES
-        )));
-    }
-
-    // SECURITY: Prevent stack overflow from deeply nested AST
-    if depth > MAX_AST_DEPTH {
-        return Err(SkimError::ParseError(format!(
-            "Maximum AST depth exceeded: {} (possible malicious input)",
-            MAX_AST_DEPTH
         )));
     }
 
@@ -349,6 +355,9 @@ fn collect_noise_ranges(
     if ctx.language == Language::Rust && matches!(kind, "function_item" | "function_signature_item")
     {
         strip_rust_return_type(node, ctx.ranges);
+        // Does NOT return early — function_item children (params, body) still need processing
+        // via the recursion below. This differs from C++ handlers which strip leaf-like
+        // sibling groups and return early.
     }
 
     // Handle C++ access_specifier: `public:` in tree-sitter is two siblings —
@@ -400,19 +409,23 @@ fn collect_noise_ranges(
 /// extends the removal range backward to include these separators for clean output.
 fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize) -> usize {
     match (language, kind) {
+        // NOTE: In Python's tree-sitter grammar, both parameter types (`a: int`)
+        // and return types (`-> int`) use node kind `"type"`. The `"return_type"`
+        // arm is kept for defensive compatibility but does not match in practice
+        // (tree-sitter uses `return_type` as a field name, not a node kind).
         (Language::Python, "type" | "return_type") => {
             // Python return type: ` -> int` — consume the ` -> ` separator.
             // Python parameter type: `a: int` — consume the `: ` separator.
             // Check longest patterns first for correct greedy match.
             let prefix = source.get(start.saturating_sub(4)..start).unwrap_or(b"");
             if prefix.len() >= 4 && prefix.ends_with(b" -> ") {
-                start - 4
+                start.saturating_sub(4)
             } else if prefix.len() >= 3 && prefix.ends_with(b"-> ") {
-                start - 3
+                start.saturating_sub(3)
             } else if prefix.len() >= 2 && (prefix.ends_with(b"->") || prefix.ends_with(b": ")) {
-                start - 2
+                start.saturating_sub(2)
             } else if !prefix.is_empty() && prefix.ends_with(b":") {
-                start - 1
+                start.saturating_sub(1)
             } else {
                 start
             }
@@ -507,11 +520,7 @@ fn strip_rust_return_type(function_node: Node, ranges: &mut Vec<(usize, usize)>)
             };
 
             // Include the leading space before `->`
-            let start = if child.start_byte() >= 1 {
-                child.start_byte() - 1
-            } else {
-                child.start_byte()
-            };
+            let start = child.start_byte().saturating_sub(1);
 
             ranges.push((start, end));
             return;
@@ -992,16 +1001,18 @@ mod tests {
             result.contains("class Simple"),
             "class name preserved, got: {result}"
         );
-        // Check that indented lines don't have extra leading spaces
+        // Assert exact indentation levels: 0, 4, or 8 spaces for non-empty lines
         for line in result.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("int ") {
-                // Indented member declarations should have consistent indentation
-                assert!(
-                    !line.starts_with("      "),
-                    "member should not have excessive indentation from stripped keywords, got: {result}"
-                );
+            if line.is_empty() {
+                continue;
             }
+            let indent = line.len() - line.trim_start().len();
+            assert!(
+                indent == 0 || indent == 4 || indent == 8,
+                "expected indentation of 0, 4, or 8 spaces but got {} for line: {:?}, full output: {result}",
+                indent,
+                line
+            );
         }
     }
 
@@ -1036,6 +1047,102 @@ mod tests {
         assert!(
             result.contains("def bar(y):"),
             "second function clean, got: {result}"
+        );
+    }
+
+    // ========================================================================
+    // Unit tests for helper functions (TEST-2)
+    // ========================================================================
+
+    #[test]
+    fn test_consume_trailing_whitespace_basic() {
+        let source = b"pub fn add()";
+        // After "pub" (byte 3), consume trailing spaces
+        assert_eq!(consume_trailing_whitespace(source, 3), 4);
+    }
+
+    #[test]
+    fn test_consume_trailing_whitespace_multiple_spaces() {
+        let source = b"pub   fn add()";
+        assert_eq!(consume_trailing_whitespace(source, 3), 6);
+    }
+
+    #[test]
+    fn test_consume_trailing_whitespace_no_spaces() {
+        let source = b"pubfn";
+        assert_eq!(consume_trailing_whitespace(source, 3), 3);
+    }
+
+    #[test]
+    fn test_consume_trailing_whitespace_at_end() {
+        let source = b"pub";
+        assert_eq!(consume_trailing_whitespace(source, 3), 3);
+    }
+
+    #[test]
+    fn test_consume_trailing_whitespace_stops_at_newline() {
+        let source = b"pub \nfn";
+        // Should consume the space but stop before newline
+        assert_eq!(consume_trailing_whitespace(source, 3), 4);
+    }
+
+    #[test]
+    fn test_is_inline_modifier_kind_positives() {
+        assert!(is_inline_modifier_kind("lifetime"));
+        assert!(is_inline_modifier_kind("mutable_specifier"));
+        assert!(is_inline_modifier_kind("visibility_modifier"));
+        assert!(is_inline_modifier_kind("readonly"));
+        assert!(is_inline_modifier_kind("abstract"));
+    }
+
+    #[test]
+    fn test_is_inline_modifier_kind_negatives() {
+        assert!(!is_inline_modifier_kind("type_annotation"));
+        assert!(!is_inline_modifier_kind("decorator"));
+        assert!(!is_inline_modifier_kind("identifier"));
+        assert!(!is_inline_modifier_kind("function_item"));
+        assert!(!is_inline_modifier_kind(""));
+    }
+
+    // ========================================================================
+    // Negative/preservation tests (TEST-3)
+    // ========================================================================
+
+    #[test]
+    fn test_python_arrow_in_string_literal_preserved() {
+        // Verify that `->` inside a string literal is NOT consumed by adjust_type_start
+        let source = "def describe():\n    return \"maps A -> B\"\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            result.contains("->"),
+            "arrow inside string literal should be preserved, got: {result}"
+        );
+        assert!(
+            result.contains("\"maps A -> B\""),
+            "string content should be unchanged, got: {result}"
+        );
+    }
+
+    // ========================================================================
+    // C++ template function test (TEST-4)
+    // ========================================================================
+
+    #[test]
+    fn test_cpp_pseudo_strips_template_function() {
+        // Test template function (not class) — current tests only cover template class
+        let source = "template<typename T>\nT max_val(T a, T b) {\n    return a > b ? a : b;\n}\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            !result.contains("template"),
+            "template keyword should be stripped from function, got: {result}"
+        );
+        assert!(
+            !result.contains("<typename T>"),
+            "template parameter list should be stripped from function, got: {result}"
+        );
+        assert!(
+            result.contains("max_val"),
+            "function name preserved, got: {result}"
         );
     }
 }
