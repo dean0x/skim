@@ -227,44 +227,73 @@ pub(crate) fn transform_pseudo_with_spans(
 /// Collapse whitespace artifacts from inline removal:
 /// - Multiple consecutive spaces in content portion -> single space
 /// - Trailing whitespace on lines is trimmed
-/// - Leading indentation is preserved
+/// - Leading spaces left by inline removal are trimmed
+/// - Indentation is preserved
 fn collapse_whitespace(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
 
     for line in source.lines() {
-        // Find the indentation
         let indent_len = line.len() - line.trim_start().len();
-        let indent = &line[..indent_len];
         let content = line[indent_len..].trim_end();
 
-        // Collapse multiple consecutive spaces in content, then trim leading space
-        // left behind by removing inline elements (e.g., `pub ` -> ` fn ...`)
-        let collapsed = collapse_consecutive_spaces(content);
+        result.push_str(&line[..indent_len]);
 
-        result.push_str(indent);
-        result.push_str(collapsed.trim_start());
+        // State machine: `leading` skips initial spaces after indent,
+        // `prev_space` collapses consecutive space runs to single space.
+        let mut prev_space = false;
+        let mut leading = true;
+        for ch in content.chars() {
+            if ch == ' ' {
+                if !prev_space && !leading {
+                    result.push(ch);
+                }
+                prev_space = true;
+            } else {
+                leading = false;
+                result.push(ch);
+                prev_space = false;
+            }
+        }
         result.push('\n');
     }
 
     result
 }
 
-/// Collapse runs of consecutive spaces into a single space
-fn collapse_consecutive_spaces(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut prev_space = false;
-    for ch in s.chars() {
-        if ch == ' ' {
-            if !prev_space {
-                result.push(ch);
-            }
-            prev_space = true;
-        } else {
-            result.push(ch);
-            prev_space = false;
+/// Handle language-specific AST patterns that require multi-node context.
+///
+/// Returns `Some(Ok(()))` to skip recursion (C++ cases — stripped nodes are leaf-like),
+/// `Some(Err(...))` to propagate errors, or `None` to continue normal recursion.
+fn handle_language_special_cases(node: Node, ctx: &mut NoiseWalkContext<'_>) -> Option<Result<()>> {
+    let kind = node.kind();
+    match ctx.language {
+        Language::Rust if matches!(kind, "function_item" | "function_signature_item") => {
+            strip_rust_return_type(node, ctx.ranges);
+            None // Continue recursion — function children (params, body) still need processing
         }
+        Language::Cpp if kind == "access_specifier" => {
+            // `public:` is two siblings: access_specifier + `:`
+            let start = node.start_byte();
+            let colon_end = node
+                .next_sibling()
+                .filter(|s| s.kind() == ":")
+                .map_or(node.end_byte(), |s| s.end_byte());
+            let end = consume_trailing_whitespace(ctx.source_bytes, colon_end);
+            ctx.ranges.push((start, end));
+            Some(Ok(())) // Skip recursion
+        }
+        Language::Cpp if kind == "template_parameter_list" => {
+            // `template<typename T>` is two siblings: `template` keyword + parameter list
+            let template_start = node
+                .prev_sibling()
+                .filter(|s| s.kind() == "template")
+                .map_or(node.start_byte(), |s| s.start_byte());
+            let end = consume_trailing_whitespace(ctx.source_bytes, node.end_byte());
+            ctx.ranges.push((template_start, end));
+            Some(Ok(())) // Skip recursion
+        }
+        _ => None,
     }
-    result
 }
 
 fn collect_noise_ranges(
@@ -349,47 +378,9 @@ fn collect_noise_ranges(
         strip_python_self_param(node, ctx.source_bytes, ctx.ranges);
     }
 
-    // Handle Rust return type: `-> Type` is expressed as sibling `->` + type nodes
-    // under `function_item` / `function_signature_item`, not as a single `return_type`
-    // wrapper node. `function_signature_item` is the node kind for trait method decls.
-    if ctx.language == Language::Rust && matches!(kind, "function_item" | "function_signature_item")
-    {
-        strip_rust_return_type(node, ctx.ranges);
-        // Does NOT return early — function_item children (params, body) still need processing
-        // via the recursion below. This differs from C++ handlers which strip leaf-like
-        // sibling groups and return early.
-    }
-
-    // Handle C++ access_specifier: `public:` in tree-sitter is two siblings —
-    // `access_specifier` ("public") and `:`. Strip both together.
-    if ctx.language == Language::Cpp && kind == "access_specifier" {
-        let start = node.start_byte();
-        let mut end = node.end_byte();
-        // The `:` is the next sibling
-        if let Some(next) = node.next_sibling() {
-            if next.kind() == ":" {
-                end = next.end_byte();
-            }
-        }
-        let end = consume_trailing_whitespace(ctx.source_bytes, end);
-        ctx.ranges.push((start, end));
-        return Ok(());
-    }
-
-    // Handle C++ template_parameter_list: `template<typename T>` in tree-sitter has
-    // `template` keyword as prev sibling and `template_parameter_list` as a separate
-    // node. Strip the `template` keyword along with the parameter list.
-    if ctx.language == Language::Cpp && kind == "template_parameter_list" {
-        let mut start = node.start_byte();
-        // The `template` keyword is the prev sibling
-        if let Some(prev) = node.prev_sibling() {
-            if prev.kind() == "template" {
-                start = prev.start_byte();
-            }
-        }
-        let end = consume_trailing_whitespace(ctx.source_bytes, node.end_byte());
-        ctx.ranges.push((start, end));
-        return Ok(());
+    // Handle language-specific multi-node patterns (Rust return types, C++ siblings)
+    if let Some(result) = handle_language_special_cases(node, ctx) {
+        return result;
     }
 
     // Recurse into children
@@ -416,19 +407,15 @@ fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize
         (Language::Python, "type" | "return_type") => {
             // Python return type: ` -> int` — consume the ` -> ` separator.
             // Python parameter type: `a: int` — consume the `: ` separator.
-            // Check longest patterns first for correct greedy match.
+            // Ordered longest-first for greedy match
+            const SEPARATORS: &[&[u8]] = &[b" -> ", b"-> ", b"->", b": ", b":"];
             let prefix = source.get(start.saturating_sub(4)..start).unwrap_or(b"");
-            if prefix.len() >= 4 && prefix.ends_with(b" -> ") {
-                start.saturating_sub(4)
-            } else if prefix.len() >= 3 && prefix.ends_with(b"-> ") {
-                start.saturating_sub(3)
-            } else if prefix.len() >= 2 && (prefix.ends_with(b"->") || prefix.ends_with(b": ")) {
-                start.saturating_sub(2)
-            } else if !prefix.is_empty() && prefix.ends_with(b":") {
-                start.saturating_sub(1)
-            } else {
-                start
+            for sep in SEPARATORS {
+                if prefix.ends_with(sep) {
+                    return start.saturating_sub(sep.len());
+                }
             }
+            start
         }
         _ => start,
     }
@@ -455,7 +442,8 @@ fn strip_python_self_param(
             "identifier" => matches!(child.utf8_text(source_bytes).unwrap_or(""), "self" | "cls"),
             "typed_parameter" | "default_parameter" => {
                 let mut inner_cursor = child.walk();
-                // Bind to local before `inner_cursor` is dropped (tree-sitter lifetime)
+                // Binding required: the iterator borrows `inner_cursor`, and without
+                // a named binding the temporary outlives the mutable borrow (E0597).
                 let found = child
                     .children(&mut inner_cursor)
                     .next()
@@ -1143,6 +1131,148 @@ mod tests {
         assert!(
             result.contains("max_val"),
             "function name preserved, got: {result}"
+        );
+    }
+
+    // ========================================================================
+    // handle_language_special_cases behavioral contract tests (ISSUE-1)
+    // ========================================================================
+
+    #[test]
+    fn test_rust_special_case_continues_recursion_into_body() {
+        // Rust function_item returns None (continue recursion), so children like
+        // visibility_modifier and mutable_specifier inside params should still be stripped
+        let source =
+            "pub fn update(&mut self, value: i32) -> bool {\n    self.val = value;\n    true\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            !result.contains("pub "),
+            "pub should be stripped via child recursion, got: {result}"
+        );
+        assert!(
+            !result.contains("mut "),
+            "mut should be stripped via child recursion, got: {result}"
+        );
+        assert!(
+            !result.contains("-> bool"),
+            "return type should be stripped by special case, got: {result}"
+        );
+        assert!(
+            result.contains("self.val = value"),
+            "function body should be preserved (recursion continued), got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_cpp_access_specifier_skips_recursion() {
+        // C++ access_specifier returns Some(Ok(())) — the entire `public:` is removed
+        // and no recursion into children occurs
+        let source = "class Widget {\npublic:\n    void draw();\nprotected:\n    int x_;\n};\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            !result.contains("public"),
+            "public access specifier fully stripped, got: {result}"
+        );
+        assert!(
+            !result.contains("protected"),
+            "protected access specifier fully stripped, got: {result}"
+        );
+        assert!(
+            !result.lines().any(|l| l.trim() == ":"),
+            "no orphaned colons, got: {result}"
+        );
+        assert!(
+            result.contains("void draw()"),
+            "member declarations preserved, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_cpp_template_parameter_list_skips_recursion() {
+        // C++ template_parameter_list returns Some(Ok(())) — both `template` keyword
+        // and `<typename T>` are removed without recursing into the parameter list
+        let source =
+            "template<typename K, typename V>\nclass Map {\npublic:\n    V get(K key);\n};\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            !result.contains("template"),
+            "template keyword stripped, got: {result}"
+        );
+        assert!(
+            !result.contains("<typename"),
+            "template parameters stripped, got: {result}"
+        );
+        assert!(
+            result.contains("class Map"),
+            "class declaration preserved, got: {result}"
+        );
+    }
+
+    // ========================================================================
+    // collapse_whitespace edge case tests (ISSUE-2, ISSUE-5)
+    // ========================================================================
+
+    #[test]
+    fn test_collapse_whitespace_preserves_indent_when_modifier_stripped() {
+        // When an inline modifier is stripped (e.g., `    pub fn` -> `     fn`),
+        // the extra space becomes part of indentation and is preserved.
+        // The `leading` flag skips any content-leading spaces after indent detection.
+        let result = collapse_whitespace("    fn add() {}\n");
+        assert_eq!(result, "    fn add() {}\n", "normal 4-space indent");
+
+        let result = collapse_whitespace("     fn add() {}\n");
+        assert_eq!(
+            result, "     fn add() {}\n",
+            "5-space indent preserved as indentation"
+        );
+    }
+
+    #[test]
+    fn test_collapse_whitespace_empty_lines() {
+        let result = collapse_whitespace("line one\n\nline two\n");
+        assert_eq!(result, "line one\n\nline two\n");
+    }
+
+    #[test]
+    fn test_collapse_whitespace_whitespace_only_lines() {
+        // Whitespace-only lines: indent portion is kept, content is empty
+        let result = collapse_whitespace("    \n  \n\n");
+        // After trim_end on content (empty), only indent remains, then newline
+        assert_eq!(result, "    \n  \n\n");
+    }
+
+    #[test]
+    fn test_collapse_whitespace_multiline_mixed_patterns() {
+        let input = "fn foo() {\n    let  x  =  1\n\n     return  x\n}\n";
+        let result = collapse_whitespace(input);
+        // Line 1: no extra spaces
+        // Line 2: indent=4, "let  x  =  1" -> "let x = 1"
+        // Line 3: empty
+        // Line 4: indent=5, "return  x" -> "return x"
+        // Line 5: no indent, "}"
+        assert_eq!(result, "fn foo() {\n    let x = 1\n\n     return x\n}\n");
+    }
+
+    #[test]
+    fn test_collapse_whitespace_trailing_spaces_trimmed() {
+        let result = collapse_whitespace("fn foo()   \n");
+        assert_eq!(result, "fn foo()\n", "trailing spaces should be trimmed");
+    }
+
+    #[test]
+    fn test_collapse_whitespace_leading_spaces_become_indent() {
+        // When remove_ranges leaves a gap (e.g., "export function" -> " function"),
+        // trim_start() treats the leading spaces as indentation, not content.
+        let result = collapse_whitespace(" function add()\n");
+        assert_eq!(
+            result, " function add()\n",
+            "single leading space is part of indent"
+        );
+
+        let result = collapse_whitespace("  function add()\n");
+        assert_eq!(
+            result, "  function add()\n",
+            "two leading spaces treated as indentation"
         );
     }
 }
