@@ -269,6 +269,23 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     let original = tokens.join(" ");
 
+    // Fast path: if no compound operator chars are present, skip split_compound
+    // entirely and avoid the second tokenization pass.
+    let has_operator_chars = original.contains("&&")
+        || original.contains("||")
+        || original.contains(';')
+        || original.contains('|');
+    if !has_operator_chars {
+        let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+        let result = try_rewrite(&token_refs);
+        let rewritten = result.as_ref().map(|r| r.tokens.join(" "));
+        let match_info = result
+            .as_ref()
+            .zip(rewritten.as_ref())
+            .map(|(r, s)| (s.as_str(), r.category));
+        return emit_result(suggest_mode, &original, match_info, false);
+    }
+
     // Split into compound segments (or simple if no operators found)
     match split_compound(&original) {
         CompoundSplitResult::Bail => emit_result(suggest_mode, &original, None, false),
@@ -528,6 +545,10 @@ fn split_compound(input: &str) -> CompoundSplitResult {
                 continue;
             }
             QuoteState::DoubleQuote => {
+                if ch == '\\' && i + 1 < len {
+                    i += 2; // skip escaped char (e.g., \")
+                    continue;
+                }
                 if ch == '"' {
                     quote_state = QuoteState::None;
                 }
@@ -571,16 +592,18 @@ fn split_compound(input: &str) -> CompoundSplitResult {
             return CompoundSplitResult::Bail;
         }
 
-        // Bail on subshell: $(
-        if ch == '$' && i + 1 < len && chars[i + 1] == '(' {
+        // Bail on subshell $( and variable expansion ${
+        if ch == '$' && i + 1 < len && (chars[i + 1] == '(' || chars[i + 1] == '{') {
             return CompoundSplitResult::Bail;
         }
 
         // Only check operators at paren_depth == 0
         if paren_depth == 0 {
-            // Check for && (but not & after > which is redirect 2>&1)
+            // Check for &&
             if ch == '&' && i + 1 < len && chars[i + 1] == '&' {
-                // Make sure this isn't preceded by '>' (redirect like 2>&1)
+                // Guard against >&N redirect patterns (e.g., 2>&1).
+                // When '>' immediately precedes '&', this is a file descriptor
+                // redirect, not the start of '&&'.
                 if i > 0 && chars[i - 1] == '>' {
                     i += 1;
                     continue;
@@ -745,14 +768,11 @@ fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResul
 
     let first = &segments[0];
 
-    // Skip if the first command starts with a pipe-excluded source
-    let first_cmd = first.tokens.iter().find(|t| {
-        // Skip env vars to find the actual command
-        !t.contains('=')
-            || t.chars()
-                .take_while(|c| *c != '=')
-                .any(|c| c.is_ascii_lowercase())
-    });
+    // Skip env vars to find the actual command name, reusing the canonical
+    // strip_env_vars logic (all-uppercase key before '=').
+    let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
+    let env_split = strip_env_vars(&token_refs);
+    let first_cmd = first.tokens.get(env_split);
     if let Some(cmd) = first_cmd {
         if PIPE_EXCLUDED_SOURCES.contains(&cmd.as_str()) {
             return None;
@@ -2010,5 +2030,108 @@ mod tests {
         assert!(joined.contains("skim test cargo"));
         assert!(joined.contains("&&"));
         assert!(joined.contains("skim build cargo"));
+    }
+
+    // ========================================================================
+    // Operators without spaces (#77)
+    // ========================================================================
+
+    #[test]
+    fn test_split_compound_and_and_no_spaces() {
+        match split_compound("cargo test&&cargo build") {
+            CompoundSplitResult::Compound(segments) => {
+                assert_eq!(segments.len(), 2);
+                assert_eq!(segments[0].tokens, vec!["cargo", "test"]);
+                assert_eq!(segments[0].trailing_operator, Some(CompoundOp::And));
+                assert_eq!(segments[1].tokens, vec!["cargo", "build"]);
+                assert_eq!(segments[1].trailing_operator, None);
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Escaped quotes in double-quoted strings (#77)
+    // ========================================================================
+
+    #[test]
+    fn test_split_compound_escaped_double_quotes_not_split() {
+        // echo "say \"hello\"" && cargo test — the escaped quotes inside the
+        // double-quoted string should NOT end the quote, so && outside is the
+        // real operator.
+        match split_compound(r#"echo "say \"hello\"" && cargo test"#) {
+            CompoundSplitResult::Compound(segments) => {
+                assert_eq!(segments.len(), 2);
+                // First segment includes the entire echo with escaped quotes
+                assert!(segments[0].tokens.join(" ").contains("echo"));
+                assert_eq!(segments[0].trailing_operator, Some(CompoundOp::And));
+                assert_eq!(segments[1].tokens, vec!["cargo", "test"]);
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Mixed pipe + sequential operators (#77)
+    // ========================================================================
+
+    #[test]
+    fn test_split_compound_mixed_pipe_and_sequential() {
+        // cargo test && cargo build | head — has both && and |
+        match split_compound("cargo test && cargo build | head") {
+            CompoundSplitResult::Compound(segments) => {
+                assert_eq!(segments.len(), 3);
+                assert_eq!(segments[0].tokens, vec!["cargo", "test"]);
+                assert_eq!(segments[0].trailing_operator, Some(CompoundOp::And));
+                assert_eq!(segments[1].tokens, vec!["cargo", "build"]);
+                assert_eq!(segments[1].trailing_operator, Some(CompoundOp::Pipe));
+                assert_eq!(segments[2].tokens, vec!["head"]);
+                assert_eq!(segments[2].trailing_operator, None);
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Empty segments from leading/trailing operators (#77)
+    // ========================================================================
+
+    #[test]
+    fn test_split_compound_trailing_and_and_no_empty_segment() {
+        // Trailing && should not produce an empty final segment
+        match split_compound("cargo test &&") {
+            CompoundSplitResult::Compound(segments) => {
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].tokens, vec!["cargo", "test"]);
+                assert_eq!(segments[0].trailing_operator, Some(CompoundOp::And));
+            }
+            other => panic!("Expected Compound with 1 segment, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_split_compound_leading_and_and_no_empty_segment() {
+        // Leading && should not produce an empty first segment
+        match split_compound("&& cargo test") {
+            CompoundSplitResult::Compound(segments) => {
+                assert_eq!(segments.len(), 1);
+                assert_eq!(segments[0].tokens, vec!["cargo", "test"]);
+                // Last segment has no trailing operator
+                assert_eq!(segments[0].trailing_operator, None);
+            }
+            other => panic!("Expected Compound with 1 segment, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Variable expansion bail (#77)
+    // ========================================================================
+
+    #[test]
+    fn test_split_compound_variable_expansion_bails() {
+        match split_compound("${CARGO:-cargo} test && echo done") {
+            CompoundSplitResult::Bail => {}
+            other => panic!("Expected Bail for variable expansion, got {:?}", other),
+        }
     }
 }
