@@ -139,10 +139,11 @@ fn test_known_subcommand_routes_to_stub() {
 
 #[test]
 fn test_subcommand_with_args_routes_to_stub() {
+    // "init" is a stub subcommand — passing args still returns "not yet implemented"
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
-        .arg("cargo")
+        .arg("init")
+        .arg("something")
         .assert()
         .failure()
         .stderr(predicate::str::contains("not yet implemented"));
@@ -173,8 +174,8 @@ fn test_subcommand_short_help_exits_zero() {
 
 #[test]
 fn test_unimplemented_subcommands_are_stubs() {
-    // "completions", "rewrite", "git", and "build" are intentionally excluded — they are implemented, not stubs.
-    for subcmd in &["init", "test"] {
+    // "completions", "rewrite", "git", "build", and "test" are intentionally excluded — they are implemented, not stubs.
+    for subcmd in &["init"] {
         Command::cargo_bin("skim")
             .unwrap()
             .arg(subcmd)

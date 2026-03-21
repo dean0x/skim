@@ -8,6 +8,7 @@ mod build;
 mod completions;
 mod git;
 mod rewrite;
+mod test;
 
 use std::process::ExitCode;
 
@@ -49,6 +50,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "completions" => return completions::run(args),
         "git" => return git::run(args),
         "rewrite" => return rewrite::run(args),
+        "test" => return test::run(args),
         _ => {}
     }
 

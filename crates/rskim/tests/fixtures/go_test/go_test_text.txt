@@ -1,0 +1,5 @@
+=== RUN   TestAdd
+--- PASS: TestAdd (0.00s)
+=== RUN   TestSub
+--- PASS: TestSub (0.00s)
+ok      example.com/pkg 0.005s
