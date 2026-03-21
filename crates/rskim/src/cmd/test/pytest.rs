@@ -18,14 +18,17 @@
 //! pytest ... | skim test pytest       # Parse piped stdin
 //! ```
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use regex::Regex;
 
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
-use crate::output::ParseResult;
+use crate::output::{strip_ansi, ParseResult};
 use crate::runner::{CommandOutput, CommandRunner};
 
 // ============================================================================
@@ -40,6 +43,12 @@ use crate::runner::{CommandOutput, CommandRunner};
 ///   to running pytest (handles test harness environments where stdin is a
 ///   pipe with no data)
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+    // Intercept --help/-h: show skim's pytest help, then forward to real pytest
+    // so the user sees both skim's flags and pytest's own options.
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_pytest_help();
+    }
+
     let output = if io::stdin().is_terminal() {
         // Terminal: always run pytest
         let final_args = build_args(args);
@@ -59,7 +68,10 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     };
 
     let combined = combine_output(&output);
-    let result = parse(&combined);
+    // Strip ANSI escape codes before parsing so color sequences (e.g.,
+    // `pytest --color=yes`) do not interfere with string matching.
+    let cleaned = strip_ansi(&combined);
+    let result = parse(&cleaned);
 
     emit_result(&result, &output)?;
 
@@ -83,6 +95,28 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     };
 
     Ok(code)
+}
+
+/// Print skim's pytest-specific help to stdout.
+///
+/// This is shown before forwarding `--help` to real pytest so the user
+/// sees both skim's behavior and pytest's own flags.
+fn print_pytest_help() {
+    println!("skim test pytest [ARGS...]");
+    println!();
+    println!("  Run pytest and parse its output into a structured summary.");
+    println!();
+    println!("  BEHAVIOR:");
+    println!("    - Injects --tb=short and -q unless you override them");
+    println!("    - Parses output into PASS/FAIL/SKIP counts with failure details");
+    println!("    - Supports piped input: pytest ... | skim test pytest");
+    println!();
+    println!("  FLAGS MANAGED BY SKIM:");
+    println!("    --tb=short     Injected unless --tb is already set");
+    println!("    -q             Injected unless -q/-v/--quiet/--verbose is set");
+    println!();
+    println!("--- pytest native help follows ---");
+    println!();
 }
 
 // ============================================================================
@@ -130,12 +164,32 @@ fn run_pytest(args: &[&str]) -> anyhow::Result<CommandOutput> {
         .map_err(|e| anyhow::anyhow!("{e}\n\nHint: Is pytest installed? Try: pip install pytest"))
 }
 
-/// Read all of stdin into a synthetic [`CommandOutput`].
+/// Maximum bytes we will read from stdin (64 MiB).
+///
+/// Consistent with `CommandRunner::read_pipe`'s `MAX_OUTPUT_BYTES` limit.
+const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read stdin into a synthetic [`CommandOutput`], capped at [`MAX_STDIN_BYTES`].
+///
+/// Uses chunked reads (8 KiB) to enforce the size limit without requiring the
+/// OS to report exact pipe length up-front.
 fn read_stdin() -> anyhow::Result<CommandOutput> {
-    let mut buf = String::new();
-    io::stdin().read_to_string(&mut buf)?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    loop {
+        let n = handle.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_STDIN_BYTES {
+            anyhow::bail!("stdin exceeded {} byte limit", MAX_STDIN_BYTES);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
     Ok(CommandOutput {
-        stdout: buf,
+        stdout: String::from_utf8_lossy(&buf).into_owned(),
         stderr: String::new(),
         exit_code: None,
         duration: Duration::ZERO,
@@ -145,12 +199,13 @@ fn read_stdin() -> anyhow::Result<CommandOutput> {
 /// Combine stdout and stderr into a single string for parsing.
 ///
 /// Pytest writes test output to stdout and some warnings/errors to stderr.
-/// We combine them so the parser can see everything.
-fn combine_output(output: &CommandOutput) -> String {
+/// We combine them so the parser can see everything. Returns a `Cow` to
+/// avoid cloning stdout when stderr is empty (the common case).
+fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
     if output.stderr.is_empty() {
-        output.stdout.clone()
+        Cow::Borrowed(&output.stdout)
     } else {
-        format!("{}\n{}", output.stdout, output.stderr)
+        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
     }
 }
 
@@ -177,18 +232,68 @@ fn parse(output: &str) -> ParseResult<TestResult> {
     ParseResult::Passthrough(output.to_string())
 }
 
-/// Summary regex pattern matching pytest's final summary line.
+/// Regex matching the pytest summary line structure.
 ///
-/// Handles both verbose and quiet output formats:
-/// - Verbose: `============================== 5 passed in 0.12s ===============================`
-/// - Quiet:   `2 passed in 0.00s`
-/// - Mixed:   `============== 4 passed, 1 failed, 1 skipped in 0.20s =============`
+/// Matches lines like:
+/// - `============================== 5 passed in 0.12s ===============================`
+/// - `=== 3 failed in 0.15s ===`
+/// - `============== 4 passed, 1 failed, 1 skipped in 0.20s =============`
+/// - `1 failed, 2 error in 0.30s`
 ///
-/// The `=+` prefix/suffix are optional to support quiet mode output.
-fn summary_regex() -> Regex {
-    Regex::new(
-        r"=*\s*(\d+)\s+passed(?:,\s+(\d+)\s+failed)?(?:,\s+(\d+)\s+skipped)?(?:,\s+(\d+)\s+error)?\s+in\s+[\d.]+s\s*=*"
-    ).expect("summary regex is valid")
+/// The pattern matches `in <duration>s` at the end, with optional `=` padding.
+/// Individual counts (passed/failed/skipped/error) are extracted by a separate
+/// per-pair regex so that "passed" is not required.
+static SUMMARY_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"=*\s*(?:\d+\s+(?:passed|failed|skipped|error)(?:,\s+)?)+\s+in\s+([\d.]+)s\s*=*")
+        .expect("summary line regex is valid")
+});
+
+/// Regex extracting individual `N category` pairs from a summary line.
+static SUMMARY_PAIR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\d+)\s+(passed|failed|skipped|error)").expect("summary pair regex is valid")
+});
+
+/// Parsed summary counts extracted from a pytest summary line.
+struct SummaryCounts {
+    pass: usize,
+    fail: usize,
+    skip: usize,
+    duration_ms: Option<u64>,
+}
+
+/// Try to parse the pytest summary line, extracting counts and duration.
+///
+/// Returns `None` if the line does not match the summary pattern.
+fn parse_summary_line(line: &str) -> Option<SummaryCounts> {
+    let line_caps = SUMMARY_LINE_RE.captures(line)?;
+
+    // Extract duration from the capture group
+    let duration_ms = line_caps.get(1).and_then(|m| {
+        let secs: f64 = m.as_str().parse().ok()?;
+        Some((secs * 1000.0) as u64)
+    });
+
+    let mut pass: usize = 0;
+    let mut fail: usize = 0;
+    let mut skip: usize = 0;
+
+    for caps in SUMMARY_PAIR_RE.captures_iter(line) {
+        let count: usize = caps[1].parse().unwrap_or(0);
+        match &caps[2] {
+            "passed" => pass = count,
+            "failed" => fail += count,
+            "skipped" => skip = count,
+            "error" => fail += count,
+            _ => {}
+        }
+    }
+
+    Some(SummaryCounts {
+        pass,
+        fail,
+        skip,
+        duration_ms,
+    })
 }
 
 // ============================================================================
@@ -201,7 +306,6 @@ fn summary_regex() -> Regex {
 /// from "short test summary" lines, collects failure output, and validates against
 /// the summary line.
 fn tier1_parse(output: &str) -> Option<TestResult> {
-    let re = summary_regex();
     let mut entries: Vec<TestEntry> = Vec::new();
     let mut in_failures = false;
     let mut in_summary_info = false;
@@ -209,18 +313,14 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
     let mut current_failure_detail: Vec<String> = Vec::new();
 
     // Track summary values
-    let mut summary_match: Option<(usize, usize, usize)> = None; // (pass, fail, skip)
+    let mut summary_counts: Option<SummaryCounts> = None;
 
     for line in output.lines() {
         let trimmed = line.trim();
 
         // Detect summary line
-        if let Some(caps) = re.captures(trimmed) {
-            let pass: usize = caps.get(1).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-            let fail: usize = caps.get(2).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-            let skip: usize = caps.get(3).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-            let error: usize = caps.get(4).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-            summary_match = Some((pass, fail + error, skip));
+        if let Some(counts) = parse_summary_line(trimmed) {
+            summary_counts = Some(counts);
             continue;
         }
 
@@ -350,13 +450,20 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
     );
 
     // Must have found a summary line to be a tier 1 result
-    let (pass, fail, skip) = summary_match?;
+    let counts = summary_counts?;
+
+    // Deduplicate entries by test name. When pytest outputs verbose mode AND
+    // a FAILURES section AND "short test summary info", the same test can
+    // appear multiple times. Keep the first occurrence (which has the richest
+    // detail from the FAILURES section).
+    let mut seen = HashSet::new();
+    entries.retain(|e| seen.insert(e.name.clone()));
 
     let summary = TestSummary {
-        pass,
-        fail,
-        skip,
-        duration_ms: None,
+        pass: counts.pass,
+        fail: counts.fail,
+        skip: counts.skip,
+        duration_ms: counts.duration_ms,
     };
 
     Some(TestResult::new(summary, entries))
@@ -401,20 +508,13 @@ fn flush_failure(
 ///
 /// Does not attempt to extract individual test entries — only counts.
 fn tier2_parse(output: &str) -> Option<TestResult> {
-    let re = summary_regex();
-
     for line in output.lines() {
-        if let Some(caps) = re.captures(line.trim()) {
-            let pass: usize = caps.get(1).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-            let fail: usize = caps.get(2).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-            let skip: usize = caps.get(3).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-            let error: usize = caps.get(4).map_or(0, |m| m.as_str().parse().unwrap_or(0));
-
+        if let Some(counts) = parse_summary_line(line.trim()) {
             let summary = TestSummary {
-                pass,
-                fail: fail + error,
-                skip,
-                duration_ms: None,
+                pass: counts.pass,
+                fail: counts.fail,
+                skip: counts.skip,
+                duration_ms: counts.duration_ms,
             };
 
             return Some(TestResult::new(summary, vec![]));
@@ -686,34 +786,169 @@ mod tests {
     }
 
     // ========================================================================
-    // Summary regex edge cases
+    // Summary parsing edge cases
     // ========================================================================
 
     #[test]
-    fn test_summary_regex_passed_only() {
-        let re = summary_regex();
+    fn test_summary_passed_only() {
         let line =
             "============================== 5 passed in 0.12s ===============================";
-        let caps = re.captures(line).expect("should match");
-        assert_eq!(caps.get(1).unwrap().as_str(), "5");
-        assert!(caps.get(2).is_none()); // no failed
-        assert!(caps.get(3).is_none()); // no skipped
+        let counts = parse_summary_line(line).expect("should match");
+        assert_eq!(counts.pass, 5);
+        assert_eq!(counts.fail, 0);
+        assert_eq!(counts.skip, 0);
+        assert_eq!(counts.duration_ms, Some(120));
     }
 
     #[test]
-    fn test_summary_regex_all_groups() {
-        let re = summary_regex();
+    fn test_summary_all_groups() {
         let line = "======= 10 passed, 2 failed, 3 skipped, 1 error in 1.50s =======";
-        let caps = re.captures(line).expect("should match");
-        assert_eq!(caps.get(1).unwrap().as_str(), "10");
-        assert_eq!(caps.get(2).unwrap().as_str(), "2");
-        assert_eq!(caps.get(3).unwrap().as_str(), "3");
-        assert_eq!(caps.get(4).unwrap().as_str(), "1");
+        let counts = parse_summary_line(line).expect("should match");
+        assert_eq!(counts.pass, 10);
+        assert_eq!(counts.fail, 3); // 2 failed + 1 error
+        assert_eq!(counts.skip, 3);
+        assert_eq!(counts.duration_ms, Some(1500));
     }
 
     #[test]
-    fn test_summary_regex_no_match_on_garbage() {
-        let re = summary_regex();
-        assert!(re.captures("hello world").is_none());
+    fn test_summary_no_match_on_garbage() {
+        assert!(parse_summary_line("hello world").is_none());
+    }
+
+    #[test]
+    fn test_summary_failed_only_no_passed() {
+        let line = "=== 3 failed in 0.15s ===";
+        let counts = parse_summary_line(line).expect("should match failed-only summary");
+        assert_eq!(counts.pass, 0, "no passed tests");
+        assert_eq!(counts.fail, 3, "3 failed tests");
+        assert_eq!(counts.skip, 0, "no skipped tests");
+        assert_eq!(counts.duration_ms, Some(150));
+    }
+
+    #[test]
+    fn test_summary_failed_and_error_no_passed() {
+        let line = "=== 1 failed, 2 error in 0.30s ===";
+        let counts = parse_summary_line(line).expect("should match failed+error summary");
+        assert_eq!(counts.pass, 0);
+        assert_eq!(counts.fail, 3); // 1 failed + 2 error
+        assert_eq!(counts.skip, 0);
+        assert_eq!(counts.duration_ms, Some(300));
+    }
+
+    #[test]
+    fn test_summary_duration_extraction() {
+        let line = "============== 4 passed, 1 failed, 1 skipped in 0.20s =============";
+        let counts = parse_summary_line(line).expect("should match");
+        assert_eq!(counts.duration_ms, Some(200));
+    }
+
+    #[test]
+    fn test_summary_quiet_mode_no_equals() {
+        // Quiet mode can produce summary without === padding
+        let line = "2 passed in 0.00s";
+        let counts = parse_summary_line(line).expect("should match quiet mode");
+        assert_eq!(counts.pass, 2);
+        assert_eq!(counts.fail, 0);
+        assert_eq!(counts.duration_ms, Some(0));
+    }
+
+    // ========================================================================
+    // All-failures fixture test
+    // ========================================================================
+
+    #[test]
+    fn test_tier1_all_failures() {
+        let input = load_fixture("pytest_all_fail.txt");
+        let result = parse(&input);
+
+        assert!(
+            result.is_full(),
+            "expected Full for all-failures output, got {:?}",
+            result.tier_name()
+        );
+
+        if let ParseResult::Full(tr) = &result {
+            assert_eq!(tr.summary.pass, 0, "expected 0 passed");
+            assert_eq!(tr.summary.fail, 3, "expected 3 failed");
+            assert_eq!(tr.summary.skip, 0, "expected 0 skipped");
+            assert!(
+                tr.summary.duration_ms.is_some(),
+                "duration should be extracted"
+            );
+
+            // Should have failure entries
+            let fail_entries: Vec<_> = tr
+                .entries
+                .iter()
+                .filter(|e| e.outcome == TestOutcome::Fail)
+                .collect();
+            assert!(
+                !fail_entries.is_empty(),
+                "expected at least one FAIL entry for all-failures fixture"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Duration extraction tests
+    // ========================================================================
+
+    #[test]
+    fn test_tier1_extracts_duration() {
+        let input = load_fixture("pytest_pass.txt");
+        let result = parse(&input);
+
+        if let ParseResult::Full(tr) = &result {
+            assert!(
+                tr.summary.duration_ms.is_some(),
+                "duration_ms should be populated from summary line"
+            );
+            assert_eq!(tr.summary.duration_ms, Some(120));
+        }
+    }
+
+    #[test]
+    fn test_tier2_extracts_duration() {
+        let input = "============== 4 passed, 1 failed, 1 skipped in 0.20s ==============";
+        let tier2_result = tier2_parse(input);
+        assert!(tier2_result.is_some());
+        let tr = tier2_result.unwrap();
+        assert_eq!(tr.summary.duration_ms, Some(200));
+    }
+
+    // ========================================================================
+    // Deduplication tests
+    // ========================================================================
+
+    #[test]
+    fn test_tier1_deduplicates_entries() {
+        // Simulate verbose output with short test summary where the same
+        // fully-qualified test name appears both as a verbose FAILED line
+        // and in the "short test summary info" section.
+        let input = "\
+tests/test_a.py::test_one PASSED
+tests/test_b.py::test_two FAILED
+=========================== short test summary info ============================
+FAILED tests/test_b.py::test_two - assert 1 == 2
+========================= 1 passed, 1 failed in 0.10s =========================";
+
+        let result = parse(input);
+        if let ParseResult::Full(tr) = &result {
+            // tests/test_b.py::test_two should appear exactly once despite
+            // being in both the verbose output and the short summary.
+            let fail_entries: Vec<_> = tr
+                .entries
+                .iter()
+                .filter(|e| e.outcome == TestOutcome::Fail)
+                .collect();
+            assert_eq!(
+                fail_entries.len(),
+                1,
+                "test_two should be deduplicated to a single entry, got {}",
+                fail_entries.len()
+            );
+            // The first occurrence (from verbose line) should be kept
+            assert_eq!(fail_entries[0].name, "tests/test_b.py::test_two");
+        }
     }
 }

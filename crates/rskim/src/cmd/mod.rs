@@ -1,8 +1,17 @@
 //! Subcommand infrastructure for skim CLI.
 //!
 //! Provides pre-parse routing for optional subcommands while keeping
-//! backward compatibility with file-first invocations. Each subcommand
-//! is currently a stub that will be implemented in later Phase B tickets.
+//! backward compatibility with file-first invocations.
+//!
+//! ## Parser ownership model
+//!
+//! Each parser (e.g., `test::pytest`) owns its full pipeline: argument
+//! building, execution, stdin reading, ANSI stripping, output parsing,
+//! and result emission. Shared helpers were intentionally removed because
+//! parsers have divergent needs (e.g., pytest injects `--tb=short` while
+//! cargo test does not, pytest combines stdout+stderr while others may
+//! not). Keeping each parser self-contained avoids coupling and makes it
+//! trivial to add new runners without modifying shared code.
 
 mod build;
 mod completions;
