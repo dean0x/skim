@@ -15,13 +15,19 @@ pub(crate) const MAX_AST_DEPTH: usize = 500;
 /// Maximum number of AST nodes to prevent memory exhaustion
 pub(crate) const MAX_AST_NODES: usize = 100_000;
 
+/// Bundled parameters for the recursive comment walker to avoid parameter explosion
+pub(crate) struct CommentWalkContext<'a> {
+    pub(crate) ranges: &'a mut Vec<(usize, usize)>,
+    pub(crate) node_count: &'a mut usize,
+}
+
 /// Transform source by stripping non-doc comments and normalizing blank lines
 ///
 /// Two-pass algorithm:
 /// 1. Walk AST collecting byte ranges of non-doc comment nodes to remove
 ///    (skip doc comments, skip comments inside function bodies, skip shebangs)
-/// 2. Remove collected ranges from source, then trim trailing whitespace and
-///    normalize blank lines (3+ consecutive -> 2) in a single fused pass
+/// 2. Adjust ranges for full-line removal, then remove from source
+/// 3. Trim trailing whitespace and normalize blank lines (3+ consecutive -> 2)
 pub(crate) fn transform_minimal(
     source: &str,
     tree: &Tree,
@@ -29,26 +35,32 @@ pub(crate) fn transform_minimal(
     _config: &TransformConfig,
 ) -> Result<String> {
     let mut ranges_to_remove: Vec<(usize, usize)> = Vec::new();
-    let mut node_count = 0;
-    collect_removable_comments(
-        tree.root_node(),
-        source,
-        language,
-        &mut ranges_to_remove,
-        &mut node_count,
-        0,
-    )?;
+    let mut node_count: usize = 0;
+    let mut ctx = CommentWalkContext {
+        ranges: &mut ranges_to_remove,
+        node_count: &mut node_count,
+    };
+    collect_removable_comments(tree.root_node(), source, language, &mut ctx, 0)?;
 
-    ranges_to_remove.sort_unstable_by_key(|&(start, _)| start);
-    ranges_to_remove.dedup();
+    // Adjust ranges for full-line removal, sort, and dedup
+    let mut final_ranges: Vec<(usize, usize)> = ctx
+        .ranges
+        .iter()
+        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end))
+        .collect();
+    final_ranges.sort_unstable_by_key(|&(start, _)| start);
+    final_ranges.dedup();
 
-    let after_removal = remove_ranges(source, &ranges_to_remove)?;
+    let after_removal = remove_ranges(source, &final_ranges)?;
     let normalized = trim_and_normalize(&after_removal);
 
     Ok(normalized)
 }
 
 /// Recursively collect byte ranges of comment nodes that should be removed
+///
+/// Collects raw (unadjusted) byte ranges. Line-level adjustment is applied
+/// by the caller after collection, matching the pattern used by pseudo.rs.
 ///
 /// # Security
 /// - Enforces MAX_AST_DEPTH to prevent stack overflow
@@ -57,8 +69,7 @@ pub(crate) fn collect_removable_comments(
     node: Node,
     source: &str,
     language: Language,
-    ranges: &mut Vec<(usize, usize)>,
-    node_count: &mut usize,
+    ctx: &mut CommentWalkContext<'_>,
     depth: usize,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested AST
@@ -70,32 +81,21 @@ pub(crate) fn collect_removable_comments(
     }
 
     // SECURITY: Prevent memory exhaustion from excessive nodes
-    *node_count += 1;
-    if *node_count > MAX_AST_NODES {
+    *ctx.node_count += 1;
+    if *ctx.node_count > MAX_AST_NODES {
         return Err(SkimError::ParseError(format!(
             "Too many AST nodes: {} (max: {}). Possible malicious input.",
-            *node_count, MAX_AST_NODES
+            *ctx.node_count, MAX_AST_NODES
         )));
     }
 
-    let kind = node.kind();
-
-    if is_comment_node(kind, language) {
-        let should_preserve = is_shebang(node, source)
-            || is_inside_function_body(node, language)
-            || is_doc_comment(node, source, language);
-
-        if !should_preserve {
-            let start = node.start_byte();
-            let end = node.end_byte();
-            let (adjusted_start, adjusted_end) = adjust_range_for_line_removal(source, start, end);
-            ranges.push((adjusted_start, adjusted_end));
-        }
+    if is_removable_comment(node, source, language) {
+        ctx.ranges.push((node.start_byte(), node.end_byte()));
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_removable_comments(child, source, language, ranges, node_count, depth + 1)?;
+        collect_removable_comments(child, source, language, ctx, depth + 1)?;
     }
 
     Ok(())
@@ -126,6 +126,23 @@ pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
         // Markdown, JSON, YAML, TOML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
+}
+
+/// Check if a comment node should be removed (not a doc comment, shebang, or in-body comment)
+///
+/// Combines `is_comment_node` with doc-comment filtering, shebang detection, and
+/// function-body detection. Returns true if the node is a comment that should be stripped.
+///
+/// Used by both minimal mode (via `collect_removable_comments`) and pseudo mode
+/// (inlined into `collect_noise_ranges` for single-pass processing).
+pub(crate) fn is_removable_comment(node: Node, source: &str, language: Language) -> bool {
+    if !is_comment_node(node.kind(), language) {
+        return false;
+    }
+    let should_preserve = is_shebang(node, source)
+        || is_inside_function_body(node, language)
+        || is_doc_comment(node, source, language);
+    !should_preserve
 }
 
 /// Check if a comment node is a doc comment that should be preserved

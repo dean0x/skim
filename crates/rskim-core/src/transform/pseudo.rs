@@ -11,9 +11,18 @@ use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
 
 use super::minimal::{
-    adjust_range_for_line_removal, collect_removable_comments, remove_ranges, trim_and_normalize,
+    adjust_range_for_line_removal, is_removable_comment, remove_ranges, trim_and_normalize,
     MAX_AST_DEPTH, MAX_AST_NODES,
 };
+
+/// Bundled parameters for the recursive noise walker to avoid parameter explosion
+struct WalkContext<'a> {
+    source: &'a str,
+    source_bytes: &'a [u8],
+    language: Language,
+    ranges: &'a mut Vec<(usize, usize)>,
+    node_count: &'a mut usize,
+}
 
 /// Per-language rules for what constitutes "noise" in pseudo mode
 struct PseudoRules {
@@ -138,42 +147,25 @@ pub(crate) fn transform_pseudo_with_spans(
     _config: &TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
     let rules = get_pseudo_rules(language);
-    let source_bytes = source.as_bytes();
 
-    // Step 1: Collect removable comments (reuse from minimal)
+    // Single-pass collection: comments AND noise ranges in one AST walk
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut node_count: usize = 0;
-    collect_removable_comments(
-        tree.root_node(),
+    let mut ctx = WalkContext {
         source,
+        source_bytes: source.as_bytes(),
         language,
-        &mut ranges,
-        &mut node_count,
-        0,
-    )?;
+        ranges: &mut ranges,
+        node_count: &mut node_count,
+    };
+    collect_noise_ranges(tree.root_node(), &mut ctx, &rules, 0)?;
 
-    // Reset node_count so the second pass gets a full budget.
-    // Without this, nodes counted in pass 1 eat into the MAX_AST_NODES
-    // limit for pass 2, effectively halving the allowed node count.
-    node_count = 0;
+    // Sort, dedup, and adjust ranges for full line removal
+    ctx.ranges.sort_unstable_by_key(|&(start, _)| start);
+    ctx.ranges.dedup();
 
-    // Step 2: Collect noise ranges per language rules
-    collect_noise_ranges(
-        tree.root_node(),
-        source,
-        source_bytes,
-        language,
-        &rules,
-        &mut ranges,
-        &mut node_count,
-        0,
-    )?;
-
-    // Step 3: Sort, dedup, and adjust ranges for full line removal
-    ranges.sort_unstable_by_key(|&(start, _)| start);
-    ranges.dedup();
-
-    let mut final_ranges: Vec<(usize, usize)> = ranges
+    let mut final_ranges: Vec<(usize, usize)> = ctx
+        .ranges
         .iter()
         .map(|&(start, end)| adjust_range_for_line_removal(source, start, end))
         .collect();
@@ -183,7 +175,7 @@ pub(crate) fn transform_pseudo_with_spans(
 
     let result = remove_ranges(source, &final_ranges)?;
 
-    // Step 4: Post-process — collapse whitespace artifacts and normalize
+    // Post-process — collapse whitespace artifacts and normalize
     let result = collapse_whitespace(&result);
     let result = trim_and_normalize(&result);
 
@@ -237,23 +229,18 @@ fn collapse_consecutive_spaces(s: &str) -> String {
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn collect_noise_ranges(
     node: Node,
-    source: &str,
-    source_bytes: &[u8],
-    language: Language,
+    ctx: &mut WalkContext<'_>,
     rules: &PseudoRules,
-    ranges: &mut Vec<(usize, usize)>,
-    node_count: &mut usize,
     depth: usize,
 ) -> Result<()> {
     // SECURITY: Prevent memory exhaustion from excessive nodes
-    *node_count += 1;
-    if *node_count > MAX_AST_NODES {
+    *ctx.node_count += 1;
+    if *ctx.node_count > MAX_AST_NODES {
         return Err(SkimError::ParseError(format!(
             "Too many AST nodes: {} (max: {}). Possible malicious input.",
-            *node_count, MAX_AST_NODES
+            *ctx.node_count, MAX_AST_NODES
         )));
     }
 
@@ -267,20 +254,27 @@ fn collect_noise_ranges(
 
     let kind = node.kind();
 
+    // Check for removable comments (merged from former separate pass).
+    // Uses the same doc-comment/shebang/function-body filtering as minimal mode.
+    if is_removable_comment(node, ctx.source, ctx.language) {
+        ctx.ranges.push((node.start_byte(), node.end_byte()));
+        return Ok(()); // Comments have no children to recurse into
+    }
+
     // Check if this node kind should be stripped
     if rules.strip_kinds.contains(&kind) {
         let start = node.start_byte();
         let end = node.end_byte();
-        let adjusted_start = adjust_type_start(language, kind, source, start);
-        ranges.push((adjusted_start, end));
+        let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source, start);
+        ctx.ranges.push((adjusted_start, end));
         return Ok(()); // Don't recurse into stripped nodes
     }
 
     // Check for keyword stripping (leaf nodes only)
     if node.child_count() == 0 {
-        let text = node.utf8_text(source_bytes).unwrap_or("");
+        let text = node.utf8_text(ctx.source_bytes).unwrap_or("");
         if rules.strip_keywords.contains(&text) {
-            ranges.push((node.start_byte(), node.end_byte()));
+            ctx.ranges.push((node.start_byte(), node.end_byte()));
             return Ok(());
         }
     }
@@ -297,35 +291,26 @@ fn collect_noise_ranges(
             })
             .unwrap_or(false);
         if !is_for_loop {
-            ranges.push((node.start_byte(), node.end_byte()));
+            ctx.ranges.push((node.start_byte(), node.end_byte()));
             return Ok(());
         }
     }
 
     // Handle Python self/cls removal
     if rules.strip_self_param && kind == "parameters" {
-        strip_python_self_param(node, source_bytes, ranges);
+        strip_python_self_param(node, ctx.source_bytes, ctx.ranges);
     }
 
     // Handle Rust return type: `-> Type` is expressed as sibling `->` + type nodes
     // under `function_item`, not as a single `return_type` wrapper node.
-    if language == Language::Rust && kind == "function_item" {
-        strip_rust_return_type(node, ranges);
+    if ctx.language == Language::Rust && kind == "function_item" {
+        strip_rust_return_type(node, ctx.ranges);
     }
 
     // Recurse into children
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_noise_ranges(
-            child,
-            source,
-            source_bytes,
-            language,
-            rules,
-            ranges,
-            node_count,
-            depth + 1,
-        )?;
+        collect_noise_ranges(child, ctx, rules, depth + 1)?;
     }
 
     Ok(())
@@ -779,11 +764,7 @@ mod tests {
 
     #[test]
     fn test_pseudo_empty_input() {
-        let source = "";
-        let mut parser = Parser::new(Language::TypeScript).unwrap();
-        let tree = parser.parse(source).unwrap();
-        let config = TransformConfig::with_mode(Mode::Pseudo);
-        let result = transform_pseudo(source, &tree, Language::TypeScript, &config).unwrap();
+        let result = transform("", Language::TypeScript);
         assert_eq!(result, "", "empty input should produce empty output");
     }
 
