@@ -2442,3 +2442,223 @@ fn test_detect_toml_extension() {
         Some(Language::Toml)
     );
 }
+
+// ============================================================================
+// Pseudo Mode Integration Tests
+// ============================================================================
+
+#[test]
+fn test_typescript_pseudo() {
+    let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
+    let result = transform(source, Language::TypeScript, Mode::Pseudo).unwrap();
+
+    // Should strip type annotations
+    assert!(
+        !result.contains(": number"),
+        "type annotations should be stripped"
+    );
+    assert!(
+        !result.contains(": string"),
+        "type annotations should be stripped"
+    );
+
+    // Should strip export keyword
+    assert!(
+        !result.contains("export "),
+        "export keyword should be stripped"
+    );
+
+    // Should preserve function names and logic
+    assert!(
+        result.contains("function add"),
+        "function names should be preserved"
+    );
+    assert!(
+        result.contains("function greet"),
+        "function names should be preserved"
+    );
+    assert!(
+        result.contains("return"),
+        "return statements should be preserved"
+    );
+}
+
+#[test]
+fn test_python_pseudo() {
+    let source = include_str!("../../../tests/fixtures/python/simple.py");
+    let result = transform(source, Language::Python, Mode::Pseudo).unwrap();
+
+    // Should strip type annotations
+    assert!(
+        !result.contains(": int"),
+        "type annotations should be stripped"
+    );
+    assert!(
+        !result.contains(": str"),
+        "type annotations should be stripped"
+    );
+    assert!(
+        !result.contains("-> int"),
+        "return types should be stripped"
+    );
+    assert!(
+        !result.contains("-> str"),
+        "return types should be stripped"
+    );
+
+    // Should strip self parameter
+    assert!(
+        !result.contains("self,"),
+        "self parameter should be stripped"
+    );
+
+    // Should preserve function names and logic
+    assert!(
+        result.contains("def calculate_sum"),
+        "function names preserved"
+    );
+    assert!(
+        result.contains("def greet_user"),
+        "function names preserved"
+    );
+    assert!(result.contains("class Calculator"), "class preserved");
+}
+
+#[test]
+fn test_rust_pseudo() {
+    let source = include_str!("../../../tests/fixtures/rust/simple.rs");
+    let result = transform(source, Language::Rust, Mode::Pseudo).unwrap();
+
+    // Should strip visibility modifiers
+    assert!(
+        !result.contains("pub fn"),
+        "pub modifier should be stripped from functions"
+    );
+
+    // Should preserve function names and logic
+    assert!(result.contains("fn add"), "function names preserved");
+    assert!(result.contains("fn greet"), "function names preserved");
+    assert!(result.contains("struct Calculator"), "struct preserved");
+    assert!(result.contains("impl Calculator"), "impl preserved");
+}
+
+#[test]
+fn test_java_pseudo() {
+    let source = include_str!("../../../tests/fixtures/java/Simple.java");
+    let result = transform(source, Language::Java, Mode::Pseudo).unwrap();
+
+    // Should strip visibility modifiers
+    assert!(
+        !result.contains("public class"),
+        "public modifier should be stripped"
+    );
+    assert!(
+        !result.contains("private int"),
+        "private modifier should be stripped"
+    );
+
+    // Should preserve class name and methods
+    assert!(result.contains("class Simple"), "class name preserved");
+    assert!(result.contains("int add(int a, int b)"), "method preserved");
+}
+
+#[test]
+fn test_c_pseudo() {
+    let source = include_str!("../../../tests/fixtures/c/simple.c");
+    let result = transform(source, Language::C, Mode::Pseudo).unwrap();
+
+    // Should preserve function names
+    assert!(result.contains("int add"), "function preserved");
+    assert!(result.contains("void greet"), "function preserved");
+
+    // Should preserve struct
+    assert!(result.contains("struct Point"), "struct preserved");
+}
+
+#[test]
+fn test_cpp_pseudo() {
+    let source = include_str!("../../../tests/fixtures/cpp/simple.cpp");
+    let result = transform(source, Language::Cpp, Mode::Pseudo).unwrap();
+
+    // Should strip access specifiers
+    assert!(
+        !result.contains("public:"),
+        "access specifier should be stripped"
+    );
+    assert!(
+        !result.contains("private:"),
+        "access specifier should be stripped"
+    );
+
+    // Should preserve class structure
+    assert!(result.contains("class Calculator"), "class preserved");
+    assert!(result.contains("class Shape"), "class preserved");
+}
+
+#[test]
+fn test_go_pseudo() {
+    let source = include_str!("../../../tests/fixtures/go/simple.go");
+    let result = transform(source, Language::Go, Mode::Pseudo).unwrap();
+
+    // Go pseudo is conservative — should preserve most code
+    assert!(result.contains("func Add"), "function preserved");
+    assert!(result.contains("func Greet"), "function preserved");
+    assert!(
+        result.contains("type Calculator struct"),
+        "struct preserved"
+    );
+}
+
+#[test]
+fn test_pseudo_passthrough_for_json() {
+    // JSON should pass through unchanged in pseudo mode
+    let source = "{\"name\": \"test\", \"value\": 42}";
+    let result = transform(source, Language::Json, Mode::Pseudo).unwrap();
+    assert_eq!(
+        result, source,
+        "JSON should pass through unchanged in pseudo mode"
+    );
+}
+
+#[test]
+fn test_pseudo_passthrough_for_yaml() {
+    let source = "name: test\nvalue: 42\n";
+    let result = transform(source, Language::Yaml, Mode::Pseudo).unwrap();
+    assert_eq!(
+        result, source,
+        "YAML should pass through unchanged in pseudo mode"
+    );
+}
+
+#[test]
+fn test_pseudo_passthrough_for_toml() {
+    let source = "name = \"test\"\nvalue = 42\n";
+    let result = transform(source, Language::Toml, Mode::Pseudo).unwrap();
+    assert_eq!(
+        result, source,
+        "TOML should pass through unchanged in pseudo mode"
+    );
+}
+
+#[test]
+fn test_pseudo_with_config() {
+    let config = TransformConfig::with_mode(Mode::Pseudo);
+    let source = "export function add(a: number, b: number): number { return a + b; }";
+    let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
+    assert!(!result.contains("export"), "export stripped via config API");
+    assert!(
+        !result.contains(": number"),
+        "type annotations stripped via config API"
+    );
+}
+
+#[test]
+fn test_pseudo_auto_detection() {
+    let source = "pub fn hello() -> String { \"world\".to_string() }\n";
+    let result = transform_auto(source, Path::new("test.rs"), Mode::Pseudo).unwrap();
+    assert!(
+        !result.contains("pub "),
+        "visibility stripped via auto-detection"
+    );
+    assert!(result.contains("fn hello"), "function preserved");
+}

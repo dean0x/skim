@@ -149,8 +149,8 @@ where
         return Ok((first_output, starting_mode));
     }
 
-    // If starting at Full/Minimal, try structure-extracted (the only other distinct output)
-    if matches!(starting_mode, Mode::Full | Mode::Minimal) {
+    // If starting at Full/Minimal/Pseudo, try structure-extracted (the only other distinct output)
+    if matches!(starting_mode, Mode::Full | Mode::Minimal | Mode::Pseudo) {
         let structure_config = build_config(Mode::Structure, max_lines);
         if let Some(extracted) = transform_fn(&structure_config)? {
             let extracted_tokens = count_tokens_or_max(&extracted);

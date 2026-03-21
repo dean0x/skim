@@ -1,15 +1,17 @@
 # Transformation Modes
 
-Skim offers four transformation modes, each with different levels of aggressiveness and use cases. Choose the mode based on how much information you need to preserve.
+Skim offers six transformation modes, each with different levels of aggressiveness and use cases. Choose the mode based on how much information you need to preserve.
 
 ## Mode Comparison
 
 | Mode       | Token Reduction | What's Kept                              | What's Removed              |
 |------------|-----------------|------------------------------------------|-----------------------------|
+| Full       | 0%              | Everything (original source)             | Nothing                     |
+| Minimal    | 15-30%          | All code, doc comments                   | Non-doc comments            |
+| Pseudo     | 30-50%          | Logic flow, names, values                | Types, visibility, decorators, semicolons |
 | Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
-| Full       | 0%              | Everything (original source)             | Nothing                     |
 
 ## Structure Mode (Default)
 
@@ -249,12 +251,110 @@ skim file.ts --mode full
 - Verification workflows
 - When you need the full source but want consistent tooling
 
+## Pseudo Mode
+
+### Overview
+
+**Token reduction: 30-50%**
+
+Pseudo mode strips syntactic noise (type annotations, visibility modifiers, decorators, semicolons) while preserving all logic flow. The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
+
+### What's Preserved
+
+- All logic (function bodies, control flow, expressions)
+- Function and method names
+- Class and struct definitions (names and structure)
+- String literals and values
+- Import statements
+
+### What's Removed
+
+- Type annotations (`: number`, `: int`, `-> str`)
+- Type parameters and generics (`<T>`, `<'a>`)
+- Visibility modifiers (`pub`, `public`, `private`, `protected`, `static`, `final`)
+- Decorators and attributes (`@Override`, `#[derive(Debug)]`)
+- Statement-terminating semicolons (preserves for-loop semicolons)
+- Language-specific noise (lifetimes, where clauses, mutable specifiers)
+- Non-doc comments (same as Minimal mode)
+- Python `self`/`cls` first parameter
+
+### Usage
+
+```bash
+skim file.ts --mode pseudo
+skim file.py --mode pseudo
+skim file.rs --mode pseudo
+```
+
+### Example
+
+**Input (TypeScript):**
+```typescript
+export function processUser(id: string, options: ProcessOptions): Promise<User> {
+    const user = await db.find(id);
+    if (!user) throw new NotFoundError();
+    return transform(user, options);
+}
+```
+
+**Output:**
+```
+function processUser(id, options) {
+    user = await db.find(id)
+    if (!user) throw new NotFoundError()
+    return transform(user, options)
+}
+```
+
+**Input (Python):**
+```python
+@cache
+def calculate(self, x: int, y: int) -> float:
+    result = x * y / 100
+    return result
+```
+
+**Output:**
+```python
+def calculate(x, y):
+    result = x * y / 100
+    return result
+```
+
+### Per-Language Stripping Rules
+
+| Language   | What's Stripped                                                                 |
+|------------|--------------------------------------------------------------------------------|
+| TypeScript | Type annotations, type params, decorators, `export`, `readonly`, `abstract`, `;` |
+| JavaScript | Decorators, `export`, `;`                                                      |
+| Python     | Type annotations, return types, decorators, `self`/`cls` first param           |
+| Rust       | Visibility, lifetimes, type params, where clauses, attributes, `mut`, `;`      |
+| Go         | Conservative (no stripping) — Go types are integral to understanding           |
+| Java       | Visibility modifiers, annotations, type params, `throws`, `;`                  |
+| C          | `static`/`extern`/`const`/`volatile`, `;`                                      |
+| C++        | Access specifiers, template params, `virtual`/`override`/`final`/`noexcept`, `;` |
+
+### Use Cases
+
+- **LLM context with logic** - When the AI needs to follow program flow, not just see signatures
+- **Code review** - Focus on logic changes without type annotation noise
+- **Pseudocode generation** - Convert typed code to readable pseudocode
+- **Teaching** - Show algorithm logic without language ceremony
+
+### Best For
+
+- When you need more detail than Structure mode but less noise than Full/Minimal
+- Reviewing logic changes in PRs
+- Explaining algorithms to non-experts in a specific language
+
 ## Choosing the Right Mode
 
 ### Decision Tree
 
 ```
 Need implementation details? → Use Full mode
+    ↓ No
+Need logic flow without type noise? → Use Pseudo mode
     ↓ No
 Need only types/interfaces? → Use Types mode
     ↓ No
@@ -275,7 +375,10 @@ Need structure + signatures? → Use Structure mode (default)
 | Create type stubs                 | Signatures       |
 | Maximum token reduction           | Types            |
 | LLM context (balanced)            | Structure        |
+| LLM context (with logic flow)     | Pseudo           |
 | LLM context (aggressive)          | Signatures       |
+| Code review (logic focus)         | Pseudo           |
+| Pseudocode generation             | Pseudo           |
 | Testing/debugging                 | Full             |
 
 ### By Language Features

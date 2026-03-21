@@ -10,18 +10,24 @@ use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
 
 /// Maximum AST recursion depth to prevent stack overflow attacks
-const MAX_AST_DEPTH: usize = 500;
+pub(crate) const MAX_AST_DEPTH: usize = 500;
 
 /// Maximum number of AST nodes to prevent memory exhaustion
-const MAX_AST_NODES: usize = 100_000;
+pub(crate) const MAX_AST_NODES: usize = 100_000;
+
+/// Bundled parameters for the recursive comment walker to avoid parameter explosion
+pub(crate) struct CommentWalkContext<'a> {
+    pub(crate) ranges: &'a mut Vec<(usize, usize)>,
+    pub(crate) node_count: &'a mut usize,
+}
 
 /// Transform source by stripping non-doc comments and normalizing blank lines
 ///
 /// Two-pass algorithm:
 /// 1. Walk AST collecting byte ranges of non-doc comment nodes to remove
 ///    (skip doc comments, skip comments inside function bodies, skip shebangs)
-/// 2. Remove collected ranges from source, then trim trailing whitespace and
-///    normalize blank lines (3+ consecutive -> 2) in a single fused pass
+/// 2. Adjust ranges for full-line removal, then remove from source
+/// 3. Trim trailing whitespace and normalize blank lines (3+ consecutive -> 2)
 pub(crate) fn transform_minimal(
     source: &str,
     tree: &Tree,
@@ -29,20 +35,23 @@ pub(crate) fn transform_minimal(
     _config: &TransformConfig,
 ) -> Result<String> {
     let mut ranges_to_remove: Vec<(usize, usize)> = Vec::new();
-    let mut node_count = 0;
-    collect_removable_comments(
-        tree.root_node(),
-        source,
-        language,
-        &mut ranges_to_remove,
-        &mut node_count,
-        0,
-    )?;
+    let mut node_count: usize = 0;
+    let mut ctx = CommentWalkContext {
+        ranges: &mut ranges_to_remove,
+        node_count: &mut node_count,
+    };
+    collect_removable_comments(tree.root_node(), source, language, &mut ctx, 0)?;
 
-    ranges_to_remove.sort_unstable_by_key(|&(start, _)| start);
-    ranges_to_remove.dedup();
+    // Adjust ranges for full-line removal, sort, and dedup
+    let mut final_ranges: Vec<(usize, usize)> = ctx
+        .ranges
+        .iter()
+        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end))
+        .collect();
+    final_ranges.sort_unstable_by_key(|&(start, _)| start);
+    final_ranges.dedup();
 
-    let after_removal = remove_ranges(source, &ranges_to_remove)?;
+    let after_removal = remove_ranges(source, &final_ranges)?;
     let normalized = trim_and_normalize(&after_removal);
 
     Ok(normalized)
@@ -50,15 +59,17 @@ pub(crate) fn transform_minimal(
 
 /// Recursively collect byte ranges of comment nodes that should be removed
 ///
+/// Collects raw (unadjusted) byte ranges. Line-level adjustment is applied
+/// by the caller after collection, matching the pattern used by pseudo.rs.
+///
 /// # Security
 /// - Enforces MAX_AST_DEPTH to prevent stack overflow
 /// - Enforces MAX_AST_NODES to prevent memory exhaustion
-fn collect_removable_comments(
+pub(crate) fn collect_removable_comments(
     node: Node,
     source: &str,
     language: Language,
-    ranges: &mut Vec<(usize, usize)>,
-    node_count: &mut usize,
+    ctx: &mut CommentWalkContext<'_>,
     depth: usize,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested AST
@@ -70,32 +81,21 @@ fn collect_removable_comments(
     }
 
     // SECURITY: Prevent memory exhaustion from excessive nodes
-    *node_count += 1;
-    if *node_count > MAX_AST_NODES {
+    *ctx.node_count += 1;
+    if *ctx.node_count > MAX_AST_NODES {
         return Err(SkimError::ParseError(format!(
             "Too many AST nodes: {} (max: {}). Possible malicious input.",
-            *node_count, MAX_AST_NODES
+            *ctx.node_count, MAX_AST_NODES
         )));
     }
 
-    let kind = node.kind();
-
-    if is_comment_node(kind, language) {
-        let should_preserve = is_shebang(node, source)
-            || is_inside_function_body(node, language)
-            || is_doc_comment(node, source, language);
-
-        if !should_preserve {
-            let start = node.start_byte();
-            let end = node.end_byte();
-            let (adjusted_start, adjusted_end) = adjust_range_for_line_removal(source, start, end);
-            ranges.push((adjusted_start, adjusted_end));
-        }
+    if is_removable_comment(node, source, language) {
+        ctx.ranges.push((node.start_byte(), node.end_byte()));
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_removable_comments(child, source, language, ranges, node_count, depth + 1)?;
+        collect_removable_comments(child, source, language, ctx, depth + 1)?;
     }
 
     Ok(())
@@ -114,7 +114,7 @@ fn is_shebang(node: Node, source: &str) -> bool {
 }
 
 /// Check if a node kind represents a comment in the given language
-fn is_comment_node(kind: &str, language: Language) -> bool {
+pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
     match language {
         Language::TypeScript
         | Language::JavaScript
@@ -126,6 +126,23 @@ fn is_comment_node(kind: &str, language: Language) -> bool {
         // Markdown, JSON, YAML, TOML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
+}
+
+/// Check if a comment node should be removed (not a doc comment, shebang, or in-body comment)
+///
+/// Combines `is_comment_node` with doc-comment filtering, shebang detection, and
+/// function-body detection. Returns true if the node is a comment that should be stripped.
+///
+/// Used by both minimal mode (via `collect_removable_comments`) and pseudo mode
+/// (inlined into `collect_noise_ranges` for single-pass processing).
+pub(crate) fn is_removable_comment(node: Node, source: &str, language: Language) -> bool {
+    if !is_comment_node(node.kind(), language) {
+        return false;
+    }
+    let should_preserve = is_shebang(node, source)
+        || is_inside_function_body(node, language)
+        || is_doc_comment(node, source, language);
+    !should_preserve
 }
 
 /// Check if a comment node is a doc comment that should be preserved
@@ -223,25 +240,31 @@ fn is_go_declaration(kind: &str) -> bool {
     )
 }
 
-/// Adjust a comment range to remove the entire line if the comment is the only
+/// Adjust a range to remove the entire line if the range is the only
 /// non-whitespace content on that line.
 ///
-/// If the comment occupies the full line (only whitespace before/after on same line),
-/// remove the entire line including the newline. Otherwise, just remove the comment
-/// and any leading whitespace before it on the same line (for inline trailing comments).
-fn adjust_range_for_line_removal(source: &str, start: usize, end: usize) -> (usize, usize) {
-    // Find the start of the line containing this comment
+/// If the range occupies the full line (only whitespace before/after on same line),
+/// remove the entire line including the newline. Otherwise, just remove the range
+/// and any leading whitespace before it on the same line (for inline trailing content).
+///
+/// Used by both minimal mode (comment removal) and pseudo mode (noise removal).
+pub(crate) fn adjust_range_for_line_removal(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> (usize, usize) {
+    // Find the start of the line containing this range
     let line_start = source[..start].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
 
-    // Find the end of the line containing this comment
+    // Find the end of the line containing this range
     let line_end = source[end..]
         .find('\n')
         .map(|pos| end + pos + 1)
         .unwrap_or(source.len());
 
-    // Check if the comment is the only non-whitespace content on the line
-    let before_comment = &source[line_start..start];
-    let after_comment = if end < line_end {
+    // Check if the range is the only non-whitespace content on the line
+    let before_range = &source[line_start..start];
+    let after_range = if end < line_end {
         let after_end = if line_end > 0 && source.as_bytes().get(line_end - 1) == Some(&b'\n') {
             line_end - 1
         } else {
@@ -252,18 +275,18 @@ fn adjust_range_for_line_removal(source: &str, start: usize, end: usize) -> (usi
         ""
     };
 
-    let only_whitespace_before = before_comment.chars().all(|c| c.is_whitespace());
-    let only_whitespace_after = after_comment.chars().all(|c| c.is_whitespace());
+    let only_whitespace_before = before_range.chars().all(|c| c.is_whitespace());
+    let only_whitespace_after = after_range.chars().all(|c| c.is_whitespace());
 
     if only_whitespace_before && only_whitespace_after {
-        // Comment is the only content on this line - remove the entire line
+        // Range is the only content on this line - remove the entire line
         (line_start, line_end)
     } else if only_whitespace_after {
-        // Inline trailing comment: remove leading whitespace before the comment too
+        // Inline trailing range: remove leading whitespace before the range too
         let trimmed_start = source[line_start..start].trim_end().len() + line_start;
         (trimmed_start, end)
     } else {
-        // Comment is in the middle or start of a line with other content - just remove the comment
+        // Range is in the middle or start of a line with other content - just remove the range
         (start, end)
     }
 }
@@ -271,7 +294,7 @@ fn adjust_range_for_line_removal(source: &str, start: usize, end: usize) -> (usi
 /// Remove collected byte ranges from source
 ///
 /// Builds a new string by copying everything except the removed ranges.
-fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
+pub(crate) fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
     if ranges.is_empty() {
         return Ok(source.to_string());
     }
@@ -328,7 +351,7 @@ fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<String> {
 /// Combines two operations to avoid an extra allocation:
 /// 1. Trims trailing whitespace from each line
 /// 2. Normalizes blank lines: 3+ consecutive blank lines become 2
-fn trim_and_normalize(source: &str) -> String {
+pub(crate) fn trim_and_normalize(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut consecutive_blanks: usize = 0;
 

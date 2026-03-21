@@ -147,7 +147,7 @@ impl Language {
     /// - JSON: Uses serde_json parser
     /// - YAML: Uses serde_yaml_ng parser
     /// - TOML: Uses toml crate parser
-    /// - Serde-based + Markdown in minimal mode: Passthrough (no comments to strip)
+    /// - Serde-based + Markdown in minimal/pseudo mode: Passthrough (no noise to strip)
     /// - All others (C, C++, etc.): Use tree-sitter parser
     ///
     /// This eliminates special-case conditionals in the main transform function.
@@ -163,8 +163,10 @@ impl Language {
             return Ok(source.to_string());
         }
 
-        // Minimal mode passthrough for serde-based and Markdown languages
-        if config.mode == Mode::Minimal && (self.is_serde_based() || self == Self::Markdown) {
+        // Minimal/Pseudo mode passthrough for serde-based and Markdown languages
+        if matches!(config.mode, Mode::Minimal | Mode::Pseudo)
+            && (self.is_serde_based() || self == Self::Markdown)
+        {
             // Apply simple truncation for passthrough if max_lines is set
             if let Some(max_lines) = config.max_lines {
                 return crate::transform::truncate::simple_line_truncate(source, self, max_lines);
@@ -268,6 +270,30 @@ pub enum Mode {
     /// Passthrough (return source unchanged):
     /// - JSON, YAML, Markdown
     Minimal,
+
+    /// Pseudo mode - strips syntactic noise while preserving logic flow
+    ///
+    /// Token reduction: ~30-50%
+    ///
+    /// Produces pseudocode-like output by removing type annotations, visibility
+    /// modifiers, decorators, semicolons, and other syntactic noise while keeping
+    /// all logic flow (function bodies, control flow, expressions).
+    ///
+    /// Keeps:
+    /// - All logic (function bodies, control flow, expressions)
+    /// - Function/method/class names
+    /// - String literals and values
+    ///
+    /// Removes:
+    /// - Type annotations and type parameters
+    /// - Visibility modifiers (pub, public, private, etc.)
+    /// - Decorators and attributes
+    /// - Statement-terminating semicolons
+    /// - Language-specific noise (lifetimes, where clauses, etc.)
+    ///
+    /// Passthrough (return source unchanged):
+    /// - JSON, YAML, TOML, Markdown
+    Pseudo,
 }
 
 impl Mode {
@@ -279,6 +305,7 @@ impl Mode {
             "types" => Some(Self::Types),
             "full" => Some(Self::Full),
             "minimal" => Some(Self::Minimal),
+            "pseudo" => Some(Self::Pseudo),
             _ => None,
         }
     }
@@ -291,6 +318,7 @@ impl Mode {
             Self::Types => "types",
             Self::Full => "full",
             Self::Minimal => "minimal",
+            Self::Pseudo => "pseudo",
         }
     }
 
@@ -299,16 +327,18 @@ impl Mode {
     /// Higher values mean more aggressive token reduction:
     /// - Full(0): No transformation, 0% reduction
     /// - Minimal(1): Strip non-doc comments, ~15-30% reduction
-    /// - Structure(2): Strip bodies, ~70-80% reduction
-    /// - Signatures(3): Signatures only, ~85-92% reduction
-    /// - Types(4): Types only, ~90-95% reduction
+    /// - Pseudo(2): Strip syntactic noise, ~30-50% reduction
+    /// - Structure(3): Strip bodies, ~70-80% reduction
+    /// - Signatures(4): Signatures only, ~85-92% reduction
+    /// - Types(5): Types only, ~90-95% reduction
     pub fn aggressiveness(self) -> u8 {
         match self {
             Self::Full => 0,
             Self::Minimal => 1,
-            Self::Structure => 2,
-            Self::Signatures => 3,
-            Self::Types => 4,
+            Self::Pseudo => 2,
+            Self::Structure => 3,
+            Self::Signatures => 4,
+            Self::Types => 5,
         }
     }
 
@@ -327,23 +357,26 @@ impl Mode {
     /// assert_eq!(cascade, &[Mode::Structure, Mode::Signatures, Mode::Types]);
     ///
     /// let cascade = Mode::Full.cascade_from_here();
-    /// assert_eq!(cascade, &[Mode::Full, Mode::Minimal, Mode::Structure, Mode::Signatures, Mode::Types]);
+    /// assert_eq!(cascade, &[Mode::Full, Mode::Minimal, Mode::Pseudo, Mode::Structure, Mode::Signatures, Mode::Types]);
     /// ```
     pub fn cascade_from_here(self) -> &'static [Self] {
         match self {
             Self::Full => &[
                 Self::Full,
                 Self::Minimal,
+                Self::Pseudo,
                 Self::Structure,
                 Self::Signatures,
                 Self::Types,
             ],
             Self::Minimal => &[
                 Self::Minimal,
+                Self::Pseudo,
                 Self::Structure,
                 Self::Signatures,
                 Self::Types,
             ],
+            Self::Pseudo => &[Self::Pseudo, Self::Structure, Self::Signatures, Self::Types],
             Self::Structure => &[Self::Structure, Self::Signatures, Self::Types],
             Self::Signatures => &[Self::Signatures, Self::Types],
             Self::Types => &[Self::Types],
@@ -619,6 +652,8 @@ mod tests {
     fn test_mode_parse() {
         assert_eq!(Mode::parse("structure"), Some(Mode::Structure));
         assert_eq!(Mode::parse("STRUCTURE"), Some(Mode::Structure));
+        assert_eq!(Mode::parse("pseudo"), Some(Mode::Pseudo));
+        assert_eq!(Mode::parse("PSEUDO"), Some(Mode::Pseudo));
         assert_eq!(Mode::parse("invalid"), None);
     }
 
@@ -659,9 +694,10 @@ mod tests {
     fn test_mode_aggressiveness_ordering() {
         assert_eq!(Mode::Full.aggressiveness(), 0);
         assert_eq!(Mode::Minimal.aggressiveness(), 1);
-        assert_eq!(Mode::Structure.aggressiveness(), 2);
-        assert_eq!(Mode::Signatures.aggressiveness(), 3);
-        assert_eq!(Mode::Types.aggressiveness(), 4);
+        assert_eq!(Mode::Pseudo.aggressiveness(), 2);
+        assert_eq!(Mode::Structure.aggressiveness(), 3);
+        assert_eq!(Mode::Signatures.aggressiveness(), 4);
+        assert_eq!(Mode::Types.aggressiveness(), 5);
     }
 
     #[test]
@@ -670,6 +706,7 @@ mod tests {
         let modes = [
             Mode::Full,
             Mode::Minimal,
+            Mode::Pseudo,
             Mode::Structure,
             Mode::Signatures,
             Mode::Types,
@@ -692,6 +729,7 @@ mod tests {
             vec![
                 Mode::Full,
                 Mode::Minimal,
+                Mode::Pseudo,
                 Mode::Structure,
                 Mode::Signatures,
                 Mode::Types
@@ -727,6 +765,7 @@ mod tests {
             cascade,
             vec![
                 Mode::Minimal,
+                Mode::Pseudo,
                 Mode::Structure,
                 Mode::Signatures,
                 Mode::Types
@@ -735,10 +774,20 @@ mod tests {
     }
 
     #[test]
+    fn test_cascade_from_pseudo() {
+        let cascade = Mode::Pseudo.cascade_from_here();
+        assert_eq!(
+            cascade,
+            vec![Mode::Pseudo, Mode::Structure, Mode::Signatures, Mode::Types]
+        );
+    }
+
+    #[test]
     fn test_cascade_always_includes_self() {
         let all_modes = [
             Mode::Full,
             Mode::Minimal,
+            Mode::Pseudo,
             Mode::Structure,
             Mode::Signatures,
             Mode::Types,
@@ -758,6 +807,7 @@ mod tests {
         let all_modes = [
             Mode::Full,
             Mode::Minimal,
+            Mode::Pseudo,
             Mode::Structure,
             Mode::Signatures,
             Mode::Types,
