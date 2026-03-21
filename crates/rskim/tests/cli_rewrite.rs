@@ -101,26 +101,77 @@ fn test_rewrite_env_var_with_toolchain() {
 }
 
 // ============================================================================
-// Compound commands (exit 1)
+// Compound commands (#45)
 // ============================================================================
 
 #[test]
-fn test_rewrite_compound_and_and_rejected() {
+fn test_rewrite_compound_and_and() {
+    // Both segments should be rewritten
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "cargo", "test", "&&", "cargo", "build"])
         .assert()
-        .failure();
+        .success()
+        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains("&&"))
+        .stdout(predicate::str::contains("skim build cargo"));
 }
 
 #[test]
-fn test_rewrite_compound_pipe_via_stdin_rejected() {
+fn test_rewrite_compound_pipe() {
+    // Only the first segment (output producer) should be rewritten
     Command::cargo_bin("skim")
         .unwrap()
         .arg("rewrite")
         .write_stdin("cargo test | head\n")
         .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains("|"))
+        .stdout(predicate::str::contains("head"));
+}
+
+#[test]
+fn test_rewrite_compound_semicolon() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "cargo", "test", ";", "echo", "done"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains(";"))
+        .stdout(predicate::str::contains("echo done"));
+}
+
+#[test]
+fn test_rewrite_compound_bail_on_subshell() {
+    // $( triggers bail — exit 1
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("$(command) && cargo test\n")
+        .assert()
         .failure();
+}
+
+#[test]
+fn test_rewrite_compound_suggest_mode() {
+    // Suggest mode should include compound: true for compound commands
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--suggest",
+            "cargo",
+            "test",
+            "&&",
+            "cargo",
+            "build",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"))
+        .stdout(predicate::str::contains("\"compound\":true"));
 }
 
 // ============================================================================
