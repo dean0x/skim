@@ -1,0 +1,5 @@
+    Starting 5 tests across 2 test binaries
+        PASS [   0.003s] rskim lib::tests::test_a
+        PASS [   0.002s] rskim lib::tests::test_b
+        PASS [   0.001s] rskim lib::tests::test_c
+     Summary [   0.010s] 3 tests run: 3 passed, 0 skipped

@@ -139,9 +139,10 @@ fn test_known_subcommand_routes_to_stub() {
 
 #[test]
 fn test_subcommand_with_args_routes_to_stub() {
+    // "test" is now implemented, so use "build" as the stub example
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
+        .arg("build")
         .arg("cargo")
         .assert()
         .failure()
@@ -173,8 +174,8 @@ fn test_subcommand_short_help_exits_zero() {
 
 #[test]
 fn test_unimplemented_subcommands_are_stubs() {
-    // "completions" and "rewrite" are intentionally excluded — they are implemented, not stubs.
-    for subcmd in &["init", "test", "git", "build"] {
+    // "completions", "rewrite", and "test" are intentionally excluded — they are implemented, not stubs.
+    for subcmd in &["init", "git", "build"] {
         Command::cargo_bin("skim")
             .unwrap()
             .arg(subcmd)

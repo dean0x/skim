@@ -1,0 +1,11 @@
+    Starting 3 tests across 1 test binary
+        PASS [   0.003s] rskim lib::tests::test_a
+        FAIL [   0.006s] rskim lib::tests::test_b
+--- STDOUT:              rskim lib::tests::test_b ---
+assertion failed: expected 2, got 3
+
+--- STDERR:              rskim lib::tests::test_b ---
+
+        FAIL [   0.002s] rskim lib::tests::test_b
+     Summary [   0.010s] 3 tests run: 1 passed, 1 failed, 1 skipped
+     Finished in 0.010s

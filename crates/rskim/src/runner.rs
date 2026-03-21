@@ -77,17 +77,31 @@ impl CommandRunner {
     /// Returns [`CommandOutput`] on success or an error if the program cannot
     /// be spawned, times out, or pipe I/O fails.
     pub(crate) fn run(&self, program: &str, args: &[&str]) -> anyhow::Result<CommandOutput> {
+        self.run_with_env(program, args, &[])
+    }
+
+    /// Execute `program` with `args` and additional environment variables,
+    /// capturing stdout and stderr.
+    ///
+    /// Each `(key, value)` pair in `env` is set on the child process.
+    pub(crate) fn run_with_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<CommandOutput> {
         let start = Instant::now();
 
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| RunnerError::SpawnFailed {
-                program: program.to_string(),
-                source,
-            })?;
+        let mut cmd = Command::new(program);
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+
+        let mut child = cmd.spawn().map_err(|source| RunnerError::SpawnFailed {
+            program: program.to_string(),
+            source,
+        })?;
 
         // Take pipes BEFORE spawning reader threads — avoids borrowing child later.
         let child_stdout = child
