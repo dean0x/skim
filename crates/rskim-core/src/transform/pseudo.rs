@@ -24,6 +24,35 @@ struct WalkContext<'a> {
     node_count: &'a mut usize,
 }
 
+/// Extend a byte position forward to consume trailing spaces (not past newline).
+///
+/// After stripping a keyword or node, trailing spaces remain in the source.
+/// This helper advances the end position past those spaces to prevent artifacts
+/// like `" fn ..."` when `pub` is removed from `pub fn ...`.
+fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
+    let mut pos = end;
+    while pos < source.len() && source[pos] == b' ' {
+        pos += 1;
+    }
+    pos
+}
+
+/// Returns true for node kinds that act as inline modifiers preceding another token.
+///
+/// When these kinds are stripped, the trailing space between the modifier and the next
+/// token should also be consumed. For example, stripping `'a` from `&'a str` should
+/// produce `&str` (not `& str`), and stripping `mut` from `&mut self` should produce
+/// `& self`.
+///
+/// Type annotations and decorators are NOT inline modifiers — their trailing spaces
+/// may belong to surrounding syntax (e.g., `: number = 42`).
+fn is_inline_modifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "lifetime" | "mutable_specifier" | "visibility_modifier" | "readonly" | "abstract"
+    )
+}
+
 /// Per-language rules for what constitutes "noise" in pseudo mode
 struct PseudoRules {
     /// AST node kinds to strip entirely
@@ -108,7 +137,10 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_self_param: false,
         },
         Language::Cpp => PseudoRules {
-            strip_kinds: &["access_specifier", "template_parameter_list"],
+            // NOTE: access_specifier and template_parameter_list are handled
+            // as special cases in collect_noise_ranges because they require
+            // consuming adjacent sibling nodes (`:` and `template` keyword).
+            strip_kinds: &[],
             strip_keywords: &[
                 "static", "extern", "const", "volatile", "virtual", "override", "final", "noexcept",
             ],
@@ -265,7 +297,16 @@ fn collect_noise_ranges(
     if rules.strip_kinds.contains(&kind) {
         let start = node.start_byte();
         let end = node.end_byte();
-        let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source, start);
+        let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source_bytes, start);
+        // Consume trailing whitespace only for inline modifiers (lifetime, mut, visibility,
+        // etc.) where the space separates the modifier from the next token. Do NOT consume
+        // for type annotations — their trailing space may belong to assignment syntax
+        // (e.g., `: number = 42` → `= 42` needs the space before `=`).
+        let end = if is_inline_modifier_kind(kind) {
+            consume_trailing_whitespace(ctx.source_bytes, end)
+        } else {
+            end
+        };
         ctx.ranges.push((adjusted_start, end));
         return Ok(()); // Don't recurse into stripped nodes
     }
@@ -274,7 +315,8 @@ fn collect_noise_ranges(
     if node.child_count() == 0 {
         let text = node.utf8_text(ctx.source_bytes).unwrap_or("");
         if rules.strip_keywords.contains(&text) {
-            ctx.ranges.push((node.start_byte(), node.end_byte()));
+            let end = consume_trailing_whitespace(ctx.source_bytes, node.end_byte());
+            ctx.ranges.push((node.start_byte(), end));
             return Ok(());
         }
     }
@@ -302,9 +344,43 @@ fn collect_noise_ranges(
     }
 
     // Handle Rust return type: `-> Type` is expressed as sibling `->` + type nodes
-    // under `function_item`, not as a single `return_type` wrapper node.
-    if ctx.language == Language::Rust && kind == "function_item" {
+    // under `function_item` / `function_signature_item`, not as a single `return_type`
+    // wrapper node. `function_signature_item` is the node kind for trait method decls.
+    if ctx.language == Language::Rust && matches!(kind, "function_item" | "function_signature_item")
+    {
         strip_rust_return_type(node, ctx.ranges);
+    }
+
+    // Handle C++ access_specifier: `public:` in tree-sitter is two siblings —
+    // `access_specifier` ("public") and `:`. Strip both together.
+    if ctx.language == Language::Cpp && kind == "access_specifier" {
+        let start = node.start_byte();
+        let mut end = node.end_byte();
+        // The `:` is the next sibling
+        if let Some(next) = node.next_sibling() {
+            if next.kind() == ":" {
+                end = next.end_byte();
+            }
+        }
+        let end = consume_trailing_whitespace(ctx.source_bytes, end);
+        ctx.ranges.push((start, end));
+        return Ok(());
+    }
+
+    // Handle C++ template_parameter_list: `template<typename T>` in tree-sitter has
+    // `template` keyword as prev sibling and `template_parameter_list` as a separate
+    // node. Strip the `template` keyword along with the parameter list.
+    if ctx.language == Language::Cpp && kind == "template_parameter_list" {
+        let mut start = node.start_byte();
+        // The `template` keyword is the prev sibling
+        if let Some(prev) = node.prev_sibling() {
+            if prev.kind() == "template" {
+                start = prev.start_byte();
+            }
+        }
+        let end = consume_trailing_whitespace(ctx.source_bytes, node.end_byte());
+        ctx.ranges.push((start, end));
+        return Ok(());
     }
 
     // Recurse into children
@@ -318,24 +394,24 @@ fn collect_noise_ranges(
 
 /// Adjust the start position for type annotations to include their separators.
 ///
-/// Python's "type" node in `typed_parameter` does NOT include the `: ` separator,
-/// and "return_type" may have a leading space before ` -> type`. Rust's "return_type"
-/// node includes `-> Type` but not the leading space. This extends the removal range
-/// to include these separators for clean output.
-fn adjust_type_start(language: Language, kind: &str, source: &str, start: usize) -> usize {
+/// Python's "type" node in `typed_parameter` does NOT include the `: ` separator.
+/// Python's "return_type" node does NOT include the ` -> ` separator — the `->` is
+/// a separate anonymous sibling node BEFORE the `return_type` / `type` node. This
+/// extends the removal range backward to include these separators for clean output.
+fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize) -> usize {
     match (language, kind) {
-        (Language::Python, "type") => {
-            if start >= 2 && source.get(start - 2..start) == Some(": ") {
+        (Language::Python, "type" | "return_type") => {
+            // Python return type: ` -> int` — consume the ` -> ` separator.
+            // Python parameter type: `a: int` — consume the `: ` separator.
+            // Check longest patterns first for correct greedy match.
+            let prefix = source.get(start.saturating_sub(4)..start).unwrap_or(b"");
+            if prefix.len() >= 4 && prefix.ends_with(b" -> ") {
+                start - 4
+            } else if prefix.len() >= 3 && prefix.ends_with(b"-> ") {
+                start - 3
+            } else if prefix.len() >= 2 && (prefix.ends_with(b"->") || prefix.ends_with(b": ")) {
                 start - 2
-            } else if start >= 1 && source.get(start - 1..start) == Some(":") {
-                start - 1
-            } else {
-                start
-            }
-        }
-        (Language::Python, "return_type") => {
-            // Consume leading space before `-> Type`
-            if start >= 1 && source.get(start - 1..start) == Some(" ") {
+            } else if !prefix.is_empty() && prefix.ends_with(b":") {
                 start - 1
             } else {
                 start
@@ -805,6 +881,161 @@ mod tests {
         assert_eq!(
             result, source,
             "Markdown should pass through unchanged in pseudo mode"
+        );
+    }
+
+    // ========================================================================
+    // Regression tests: output quality bug fixes
+    // ========================================================================
+
+    #[test]
+    fn test_python_pseudo_no_arrow_residue() {
+        // BUG 1: Python return type stripping left `-> ` residue
+        let source = "def calculate_sum(a: int, b: int) -> int:\n    return a + b\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            !result.contains("->"),
+            "return type arrow should be fully stripped, got: {result}"
+        );
+        assert!(
+            result.contains("def calculate_sum(a, b):"),
+            "function signature should be clean, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_cpp_pseudo_no_orphaned_colon() {
+        // BUG 2: C++ access specifier stripping left orphaned `:`
+        let source = "class Foo {\npublic:\n    int bar();\nprivate:\n    int baz_;\n};\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            !result.contains("public"),
+            "access specifier keyword should be stripped, got: {result}"
+        );
+        assert!(
+            !result.lines().any(|l| l.trim() == ":"),
+            "orphaned colon should not remain, got: {result}"
+        );
+        assert!(
+            result.contains("int bar()"),
+            "member declarations preserved, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_cpp_pseudo_no_orphaned_template() {
+        // BUG 3: C++ template_parameter_list stripping left orphaned `template`
+        let source = "template<typename T>\nclass Container {\npublic:\n    T value;\n};\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            !result.contains("template"),
+            "template keyword should be stripped along with parameter list, got: {result}"
+        );
+        assert!(
+            result.contains("class Container"),
+            "class declaration preserved, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_trait_return_type() {
+        // BUG 4: Rust trait method return types were not stripped
+        let source =
+            "pub trait Compute {\n    fn compute(&self, value: i32) -> i32;\n    fn reset(&mut self);\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            !result.contains("-> i32"),
+            "trait method return type should be stripped, got: {result}"
+        );
+        assert!(
+            result.contains("fn compute"),
+            "trait method name preserved, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_lifetime_no_space() {
+        // BUG 6: Stripping lifetime from `&'a str` left `& str` (extra space)
+        let source = "pub fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {\n    if x.len() > y.len() { x } else { y }\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            !result.contains("& str"),
+            "lifetime removal should not leave extra space in references, got: {result}"
+        );
+        assert!(
+            result.contains("&str"),
+            "reference types should be clean, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_pseudo_no_leading_space() {
+        // BUG 5: Stripping `export` left leading space on next token
+        let source = "export function add(a: number, b: number): number {\n    return a + b;\n}\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            !result.starts_with(' '),
+            "output should not start with a leading space, got: {result}"
+        );
+        assert!(
+            result.contains("function add(a, b)"),
+            "function signature clean after export removal, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_java_pseudo_no_leading_spaces() {
+        // BUG 5: Stripping `public static final` left leading spaces
+        let source = "public class Simple {\n    private int value;\n    public static final int MAX = 100;\n    public int add(int a, int b) {\n        return a + b;\n    }\n}\n";
+        let result = transform(source, Language::Java);
+        assert!(
+            result.contains("class Simple"),
+            "class name preserved, got: {result}"
+        );
+        // Check that indented lines don't have extra leading spaces
+        for line in result.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("int ") {
+                // Indented member declarations should have consistent indentation
+                assert!(
+                    !line.starts_with("      "),
+                    "member should not have excessive indentation from stripped keywords, got: {result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_c_pseudo_const_no_space() {
+        // BUG 7: Stripping `const` left leading space before type
+        let source = "const char* greeting = \"hello\";\n";
+        let result = transform(source, Language::C);
+        assert!(
+            !result.starts_with(' '),
+            "const removal should not leave leading space, got: {result}"
+        );
+        assert!(
+            result.contains("char* greeting"),
+            "declaration preserved after const removal, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_python_pseudo_multiple_return_types() {
+        // Ensure multiple functions with return types all get clean output
+        let source = "def foo(x: int) -> str:\n    return str(x)\n\ndef bar(y: str) -> int:\n    return int(y)\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            !result.contains("->"),
+            "all return type arrows should be stripped, got: {result}"
+        );
+        assert!(
+            result.contains("def foo(x):"),
+            "first function clean, got: {result}"
+        );
+        assert!(
+            result.contains("def bar(y):"),
+            "second function clean, got: {result}"
         );
     }
 }
