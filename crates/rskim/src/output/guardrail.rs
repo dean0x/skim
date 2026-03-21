@@ -50,46 +50,40 @@ const MIN_RAW_SIZE_FOR_GUARDRAIL: usize = 256;
 ///
 /// On trigger: writes `[skim:guardrail] compressed output larger than raw; emitting raw`
 /// to the writer and returns `Triggered { output: raw }`.
+///
+/// Takes ownership of both strings to avoid unnecessary cloning on the fast path.
 pub(crate) fn apply(
-    raw: &str,
-    compressed: &str,
+    raw: String,
+    compressed: String,
     writer: &mut impl Write,
 ) -> Result<GuardrailOutcome> {
     // Tier 0: Skip for tiny files — transformation overhead is expected
     if raw.len() < MIN_RAW_SIZE_FOR_GUARDRAIL {
-        return Ok(GuardrailOutcome::Passed {
-            output: compressed.to_string(),
-        });
+        return Ok(GuardrailOutcome::Passed { output: compressed });
     }
 
     // Tier 1: Byte fast path
     if compressed.len() <= raw.len() {
-        return Ok(GuardrailOutcome::Passed {
-            output: compressed.to_string(),
-        });
+        return Ok(GuardrailOutcome::Passed { output: compressed });
     }
 
     // Tier 2: Token slow path
-    let raw_tokens = crate::tokens::count_tokens(raw)?;
-    let compressed_tokens = crate::tokens::count_tokens(compressed)?;
+    let raw_tokens = crate::tokens::count_tokens(&raw)?;
+    let compressed_tokens = crate::tokens::count_tokens(&compressed)?;
 
     if compressed_tokens > raw_tokens {
         writeln!(
             writer,
             "[skim:guardrail] compressed output larger than raw; emitting raw"
         )?;
-        Ok(GuardrailOutcome::Triggered {
-            output: raw.to_string(),
-        })
+        Ok(GuardrailOutcome::Triggered { output: raw })
     } else {
-        Ok(GuardrailOutcome::Passed {
-            output: compressed.to_string(),
-        })
+        Ok(GuardrailOutcome::Passed { output: compressed })
     }
 }
 
 /// Convenience wrapper: apply the guardrail with stderr as the warning writer.
-pub(crate) fn apply_to_stderr(raw: &str, compressed: &str) -> Result<GuardrailOutcome> {
+pub(crate) fn apply_to_stderr(raw: String, compressed: String) -> Result<GuardrailOutcome> {
     apply(raw, compressed, &mut io::stderr())
 }
 
@@ -103,10 +97,10 @@ mod tests {
 
     #[test]
     fn test_pass_when_compressed_shorter() {
-        let raw = "function hello() { return 'world'; }";
-        let compressed = "function hello()";
+        let raw = "function hello() { return 'world'; }".to_string();
+        let compressed = "function hello()".to_string();
         let mut buf = Vec::new();
-        let outcome = apply(raw, compressed, &mut buf).unwrap();
+        let outcome = apply(raw, compressed.clone(), &mut buf).unwrap();
         assert!(!outcome.was_triggered());
         assert_eq!(outcome.into_output(), compressed);
         assert!(buf.is_empty(), "No warning should be emitted");
@@ -114,10 +108,10 @@ mod tests {
 
     #[test]
     fn test_pass_when_compressed_equal_length() {
-        let raw = "hello world";
-        let compressed = "hello world";
+        let raw = "hello world".to_string();
+        let compressed = "hello world".to_string();
         let mut buf = Vec::new();
-        let outcome = apply(raw, compressed, &mut buf).unwrap();
+        let outcome = apply(raw, compressed.clone(), &mut buf).unwrap();
         assert!(!outcome.was_triggered());
         assert_eq!(outcome.into_output(), compressed);
     }
@@ -125,11 +119,11 @@ mod tests {
     #[test]
     fn test_skip_for_tiny_files() {
         // Files below MIN_RAW_SIZE_FOR_GUARDRAIL should always pass
-        let raw = "x";
+        let raw = "x".to_string();
         let compressed =
-            "this is a much longer string that has many more tokens than the raw input";
+            "this is a much longer string that has many more tokens than the raw input".to_string();
         let mut buf = Vec::new();
-        let outcome = apply(raw, compressed, &mut buf).unwrap();
+        let outcome = apply(raw, compressed.clone(), &mut buf).unwrap();
         assert!(!outcome.was_triggered(), "Tiny files should skip guardrail");
         assert_eq!(outcome.into_output(), compressed);
     }
@@ -140,7 +134,7 @@ mod tests {
         let raw = "x".repeat(300);
         let compressed_content = "this is a much longer string with many more tokens ".repeat(20);
         let mut buf = Vec::new();
-        let outcome = apply(&raw, &compressed_content, &mut buf).unwrap();
+        let outcome = apply(raw.clone(), compressed_content, &mut buf).unwrap();
         assert!(outcome.was_triggered());
         assert_eq!(outcome.into_output(), raw);
         let warning = String::from_utf8(buf).unwrap();
@@ -154,9 +148,9 @@ mod tests {
     fn test_pass_when_bytes_larger_but_tokens_smaller() {
         // Compressed has more bytes (padding/whitespace) but potentially fewer tokens
         // This is an edge case -- we use a string with many spaces (which tokenize cheaply)
-        let raw = "abcdefghij";
+        let raw = "abcdefghij".to_string();
         // More bytes (spaces are cheap tokens) but fewer tokens
-        let compressed = "a b c d e f g h i j k";
+        let compressed = "a b c d e f g h i j k".to_string();
         let mut buf = Vec::new();
         let outcome = apply(raw, compressed, &mut buf).unwrap();
         // The outcome depends on actual token counts. This test verifies
@@ -167,7 +161,7 @@ mod tests {
     #[test]
     fn test_empty_inputs() {
         let mut buf = Vec::new();
-        let outcome = apply("", "", &mut buf).unwrap();
+        let outcome = apply(String::new(), String::new(), &mut buf).unwrap();
         assert!(!outcome.was_triggered());
         assert_eq!(outcome.into_output(), "");
     }

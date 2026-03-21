@@ -244,7 +244,7 @@ pub(crate) fn process_stdin(
         }
     })?;
 
-    let output = match options.token_budget {
+    let transformed = match options.token_budget {
         Some(budget) => {
             let (output, _mode) = cascade::cascade_for_token_budget(
                 options.mode,
@@ -262,17 +262,29 @@ pub(crate) fn process_stdin(
         }
     };
 
+    // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
+    // Same protection as process_file; token counting happens after so stats reflect
+    // the final output.
+    let (final_output, guardrail_triggered) =
+        if options.mode != Mode::Full && options.token_budget.is_none() {
+            let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
+            let triggered = outcome.was_triggered();
+            (outcome.into_output(), triggered)
+        } else {
+            (transformed, false)
+        };
+
     let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&buffer, &output)
+        count_token_pair(&buffer, &final_output)
     } else {
         (None, None)
     };
 
     Ok(ProcessResult {
-        output,
+        output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
-        guardrail_triggered: false,
+        guardrail_triggered,
     })
 }
 
@@ -285,21 +297,22 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     let contents = read_and_validate(path)?;
     let (result, mode_used) = run_transform(&contents, path, &options)?;
 
-    let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&contents, &result)
-    } else {
-        (None, None)
-    };
-
-    // Apply output guardrail: if compressed output is larger than raw, emit raw instead
+    // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
+    // Token counting happens AFTER this decision so stats reflect the final output.
     let (final_output, guardrail_triggered) =
         if options.mode != Mode::Full && options.token_budget.is_none() {
-            let outcome = crate::output::guardrail::apply_to_stderr(&contents, &result)?;
+            let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
             let triggered = outcome.was_triggered();
             (outcome.into_output(), triggered)
         } else {
             (result, false)
         };
+
+    let (orig_tokens, trans_tokens) = if options.show_stats {
+        count_token_pair(&contents, &final_output)
+    } else {
+        (None, None)
+    };
 
     // Cache the transform result (post-guardrail). Cache write failures are
     // non-fatal; don't fail the transformation.
