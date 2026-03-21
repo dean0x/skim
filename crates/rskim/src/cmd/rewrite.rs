@@ -201,11 +201,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let tokens: Vec<String> = if positional_args.is_empty() {
         // Try reading from stdin if it's piped
         if io::stdin().is_terminal() {
-            if suggest_mode {
-                print_suggest("", None);
-                return Ok(ExitCode::SUCCESS);
-            }
-            return Ok(ExitCode::FAILURE);
+            return emit_result(suggest_mode, "", None);
         }
         // Read one line from stdin, capped at 4 KiB to prevent unbounded allocation.
         // Uses take() to bound memory before reading, so even input without a newline
@@ -214,11 +210,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         io::BufReader::new(io::stdin().lock().take(4096)).read_line(&mut line)?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            if suggest_mode {
-                print_suggest("", None);
-                return Ok(ExitCode::SUCCESS);
-            }
-            return Ok(ExitCode::FAILURE);
+            return emit_result(suggest_mode, "", None);
         }
         trimmed.split_whitespace().map(String::from).collect()
     } else {
@@ -226,11 +218,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     };
 
     if tokens.is_empty() {
-        if suggest_mode {
-            print_suggest("", None);
-            return Ok(ExitCode::SUCCESS);
-        }
-        return Ok(ExitCode::FAILURE);
+        return emit_result(suggest_mode, "", None);
     }
 
     let original = tokens.join(" ");
@@ -240,31 +228,40 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         .iter()
         .any(|t| COMPOUND_SEPARATORS.contains(&t.as_str()))
     {
-        if suggest_mode {
-            print_suggest(&original, None);
-            return Ok(ExitCode::SUCCESS);
-        }
-        return Ok(ExitCode::FAILURE);
+        return emit_result(suggest_mode, &original, None);
     }
 
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-    match try_rewrite(&token_refs) {
-        Some(result) => {
-            let rewritten = result.tokens.join(" ");
-            if suggest_mode {
-                print_suggest(&original, Some((&rewritten, result.category)));
-            } else {
-                println!("{rewritten}");
-            }
+    let result = try_rewrite(&token_refs);
+    let rewritten = result.as_ref().map(|r| r.tokens.join(" "));
+    let match_info = result
+        .as_ref()
+        .zip(rewritten.as_ref())
+        .map(|(r, s)| (s.as_str(), r.category));
+
+    emit_result(suggest_mode, &original, match_info)
+}
+
+/// Emit the final result of a rewrite attempt.
+///
+/// In suggest mode, always prints JSON and returns SUCCESS.
+/// In normal mode, prints the rewritten command on match (SUCCESS) or
+/// returns FAILURE silently on no match.
+fn emit_result(
+    suggest_mode: bool,
+    original: &str,
+    result: Option<(&str, RewriteCategory)>,
+) -> anyhow::Result<ExitCode> {
+    if suggest_mode {
+        print_suggest(original, result);
+        return Ok(ExitCode::SUCCESS);
+    }
+    match result {
+        Some((rewritten, _)) => {
+            println!("{rewritten}");
             Ok(ExitCode::SUCCESS)
         }
-        None => {
-            if suggest_mode {
-                print_suggest(&original, None);
-                return Ok(ExitCode::SUCCESS);
-            }
-            Ok(ExitCode::FAILURE)
-        }
+        None => Ok(ExitCode::FAILURE),
     }
 }
 
@@ -285,30 +282,35 @@ fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
     }
 
     // Step 1: Strip leading env vars (KEY=VALUE pairs before the command)
-    let (env_vars, command_tokens) = strip_env_vars(tokens);
+    let env_split = strip_env_vars(tokens);
+    let env_vars = &tokens[..env_split];
+    let command_tokens = &tokens[env_split..];
 
     if command_tokens.is_empty() {
         return None;
     }
 
     // Step 2: Strip cargo toolchain prefix (+nightly etc.)
-    let (toolchain, match_tokens) = strip_cargo_toolchain(&command_tokens);
+    let (toolchain, match_tokens) = strip_cargo_toolchain(command_tokens);
 
     // Step 3: Split at `--` separator
-    let (before_sep, separator_and_after) = split_at_separator(&match_tokens);
+    let sep_pos = split_at_separator(&match_tokens);
+    let before_sep = &match_tokens[..sep_pos];
+    let separator_and_after = &match_tokens[sep_pos..];
 
     // Step 4: Try declarative table match, then custom handlers (cat/head/tail)
-    try_table_match(&env_vars, &before_sep, &separator_and_after, toolchain)
-        .or_else(|| try_custom_handlers(&env_vars, &command_tokens))
+    try_table_match(env_vars, before_sep, separator_and_after, toolchain)
+        .or_else(|| try_custom_handlers(env_vars, command_tokens))
 }
 
-/// Strip leading environment variable assignments from a token list.
+/// Return the index of the first non-env-var token.
 ///
 /// Env vars match pattern: contains `=` and everything before `=` is
 /// `[A-Z0-9_]+` (all uppercase letters, digits, underscores).
-fn strip_env_vars<'a>(tokens: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
-    let mut env_vars = Vec::new();
-    let mut rest_start = 0;
+/// Callers can slice `tokens[..index]` for env vars and `tokens[index..]`
+/// for the command, avoiding a Vec allocation.
+fn strip_env_vars(tokens: &[&str]) -> usize {
+    let mut count = 0;
 
     for token in tokens {
         if let Some(eq_pos) = token.find('=') {
@@ -318,16 +320,14 @@ fn strip_env_vars<'a>(tokens: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
                     .chars()
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
             {
-                env_vars.push(*token);
-                rest_start += 1;
+                count += 1;
                 continue;
             }
         }
         break;
     }
 
-    let command_tokens = tokens[rest_start..].to_vec();
-    (env_vars, command_tokens)
+    count
 }
 
 /// Strip cargo toolchain prefix (e.g., `+nightly`).
@@ -345,17 +345,16 @@ fn strip_cargo_toolchain<'a>(tokens: &[&'a str]) -> (Option<&'a str>, Vec<&'a st
     }
 }
 
-/// Split tokens at the first `--` separator.
+/// Find the index of the first `--` separator.
 ///
-/// Returns (before_separator, separator_and_everything_after).
-fn split_at_separator<'a>(tokens: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
-    if let Some(pos) = tokens.iter().position(|t| *t == "--") {
-        let before = tokens[..pos].to_vec();
-        let after = tokens[pos..].to_vec();
-        (before, after)
-    } else {
-        (tokens.to_vec(), Vec::new())
-    }
+/// Returns the position of `--` if found, or `tokens.len()` if absent.
+/// Callers can slice `tokens[..index]` for before and `tokens[index..]`
+/// for separator-and-after, avoiding a Vec allocation.
+fn split_at_separator(tokens: &[&str]) -> usize {
+    tokens
+        .iter()
+        .position(|t| *t == "--")
+        .unwrap_or(tokens.len())
 }
 
 /// Try matching against the declarative rule table.
@@ -618,6 +617,31 @@ fn print_suggest(original: &str, result: Option<(&str, RewriteCategory)>) {
     let json = serde_json::to_string(&output)
         .expect("BUG: SuggestOutput serialization failed — struct contains only primitive types");
     println!("{json}");
+}
+
+// ============================================================================
+// Clap Command definition (shared with completions.rs)
+// ============================================================================
+
+/// Build the clap `Command` definition for the rewrite subcommand.
+///
+/// Used by `completions.rs` to generate accurate shell completions without
+/// duplicating the argument definitions.
+pub(super) fn command() -> clap::Command {
+    clap::Command::new("rewrite")
+        .about("Rewrite common developer commands into skim equivalents")
+        .arg(
+            clap::Arg::new("suggest")
+                .long("suggest")
+                .action(clap::ArgAction::SetTrue)
+                .help("Output JSON suggestion instead of plain text"),
+        )
+        .arg(
+            clap::Arg::new("command")
+                .value_name("COMMAND")
+                .num_args(1..)
+                .help("Command to rewrite"),
+        )
 }
 
 // ============================================================================

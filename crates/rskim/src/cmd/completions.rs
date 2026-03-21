@@ -67,22 +67,8 @@ fn build_full_command() -> Command {
         );
     cmd = cmd.subcommand(completions_sub);
 
-    // Add the rewrite subcommand with its --suggest flag and positional COMMAND arg
-    let rewrite_sub = Command::new("rewrite")
-        .about("Rewrite common developer commands into skim equivalents")
-        .arg(
-            Arg::new("suggest")
-                .long("suggest")
-                .action(clap::ArgAction::SetTrue)
-                .help("Output JSON suggestion instead of plain text"),
-        )
-        .arg(
-            Arg::new("command")
-                .value_name("COMMAND")
-                .num_args(1..)
-                .help("Command to rewrite"),
-        );
-    cmd = cmd.subcommand(rewrite_sub);
+    // Add the rewrite subcommand (definition lives in rewrite.rs to avoid duplication)
+    cmd = cmd.subcommand(super::rewrite::command());
 
     // Subcommands with full arg definitions added above — skip in the stub loop.
     const IMPLEMENTED_SUBCOMMANDS: &[&str] = &["completions", "rewrite"];
