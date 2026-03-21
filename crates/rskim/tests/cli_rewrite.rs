@@ -294,6 +294,32 @@ fn test_rewrite_nextest() {
 }
 
 // ============================================================================
+// Suggest mode + stdin
+// ============================================================================
+
+#[test]
+fn test_suggest_mode_stdin_match() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--suggest"])
+        .write_stdin("cargo test\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_suggest_mode_stdin_no_match() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--suggest"])
+        .write_stdin("ls -la\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
 // Help
 // ============================================================================
 

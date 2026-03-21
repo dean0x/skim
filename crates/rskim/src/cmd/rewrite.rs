@@ -1290,4 +1290,79 @@ mod tests {
         let result = try_rewrite(&["VAR_123=abc", "cargo", "test"]).unwrap();
         assert_eq!(result.tokens[0], "VAR_123=abc");
     }
+
+    // ========================================================================
+    // Env var preservation for cat/head/tail handlers
+    // ========================================================================
+
+    #[test]
+    fn test_env_var_with_cat() {
+        let result = try_rewrite(&["PAGER=less", "cat", "file.ts"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["PAGER=less", "skim", "file.ts", "--mode=pseudo"]
+        );
+    }
+
+    #[test]
+    fn test_env_var_with_head() {
+        let result = try_rewrite(&["RUST_LOG=debug", "head", "-20", "file.ts"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec![
+                "RUST_LOG=debug",
+                "skim",
+                "file.ts",
+                "--mode=pseudo",
+                "--max-lines",
+                "20"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_env_var_with_tail() {
+        let result = try_rewrite(&["VAR=value", "tail", "-10", "file.rs"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec![
+                "VAR=value",
+                "skim",
+                "file.rs",
+                "--mode=pseudo",
+                "--last-lines",
+                "10"
+            ]
+        );
+    }
+
+    // ========================================================================
+    // parse_line_count_and_files edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_head_n_without_value() {
+        // -n expects a number, but "file.ts" is not a number
+        assert!(parse_line_count_and_files(&["-n", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_head_n_non_numeric() {
+        assert!(parse_line_count_and_files(&["-n", "abc", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_head_unknown_flag_c() {
+        assert!(parse_line_count_and_files(&["-c", "100", "file.ts"]).is_none());
+    }
+
+    #[test]
+    fn test_tail_unknown_flag_f() {
+        assert!(parse_line_count_and_files(&["-f", "file.rs"]).is_none());
+    }
+
+    #[test]
+    fn test_head_long_flag_bytes() {
+        assert!(parse_line_count_and_files(&["--bytes", "100", "file.ts"]).is_none());
+    }
 }
