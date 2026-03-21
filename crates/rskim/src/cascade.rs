@@ -8,21 +8,30 @@ use rskim_core::{truncate_to_token_budget, Language, Mode, TransformConfig};
 
 use crate::tokens;
 
+/// Groups the three optional truncation parameters that frequently travel
+/// together through cascade and cache functions.  Prevents accidental
+/// transposition of same-typed `Option<usize>` positional parameters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TruncationOptions {
+    /// Maximum output lines (AST-aware truncation).
+    pub(crate) max_lines: Option<usize>,
+    /// Last N lines truncation (mutually exclusive with `max_lines`).
+    pub(crate) last_lines: Option<usize>,
+    /// Token budget for cascade mode.
+    pub(crate) token_budget: Option<usize>,
+}
+
 /// Error message when no transformation mode produces output.
 const NO_OUTPUT_MSG: &str = "Token budget cascade: no transformation mode produced output. \
     Ensure the file is in a supported language or specify --language.";
 
-/// Build a `TransformConfig` from mode and optional max_lines/last_lines.
-pub(crate) fn build_config(
-    mode: Mode,
-    max_lines: Option<usize>,
-    last_lines: Option<usize>,
-) -> TransformConfig {
+/// Build a `TransformConfig` from mode and truncation options.
+pub(crate) fn build_config(mode: Mode, trunc: &TruncationOptions) -> TransformConfig {
     let mut config = TransformConfig::with_mode(mode);
-    if let Some(n) = max_lines {
+    if let Some(n) = trunc.max_lines {
         config = config.with_max_lines(n);
     }
-    if let Some(n) = last_lines {
+    if let Some(n) = trunc.last_lines {
         config = config.with_last_lines(n);
     }
     config
@@ -67,8 +76,7 @@ fn fallback_line_truncate(
 /// Diagnostics are emitted to stderr only when escalating beyond the starting mode.
 pub(crate) fn cascade_for_token_budget<F>(
     starting_mode: Mode,
-    max_lines: Option<usize>,
-    last_lines: Option<usize>,
+    trunc: &TruncationOptions,
     token_budget: usize,
     language: Language,
     transform_fn: F,
@@ -81,14 +89,7 @@ where
     // - Structure/Signatures/Types: structure-extracted (all identical)
     // Short-circuit to avoid up to 3 redundant parse+transform cycles.
     if language.is_serde_based() {
-        return cascade_serde(
-            starting_mode,
-            max_lines,
-            last_lines,
-            token_budget,
-            language,
-            &transform_fn,
-        );
+        return cascade_serde(starting_mode, trunc, token_budget, language, &transform_fn);
     }
 
     let cascade = starting_mode.cascade_from_here();
@@ -97,7 +98,7 @@ where
     let mut last_token_count: Option<usize> = None;
 
     for &mode in cascade {
-        let config = build_config(mode, max_lines, last_lines);
+        let config = build_config(mode, trunc);
 
         let Some(output) = transform_fn(&config)? else {
             continue;
@@ -142,8 +143,7 @@ where
 /// This avoids up to 3 redundant parse+transform cycles in the generic cascade.
 fn cascade_serde<F>(
     starting_mode: Mode,
-    max_lines: Option<usize>,
-    last_lines: Option<usize>,
+    trunc: &TruncationOptions,
     token_budget: usize,
     language: Language,
     transform_fn: &F,
@@ -151,7 +151,7 @@ fn cascade_serde<F>(
 where
     F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
 {
-    let config = build_config(starting_mode, max_lines, last_lines);
+    let config = build_config(starting_mode, trunc);
     let first_output = transform_fn(&config)?.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
 
     let first_tokens = count_tokens_or_max(&first_output);
@@ -161,7 +161,7 @@ where
 
     // If starting at Full/Minimal/Pseudo, try structure-extracted (the only other distinct output)
     if matches!(starting_mode, Mode::Full | Mode::Minimal | Mode::Pseudo) {
-        let structure_config = build_config(Mode::Structure, max_lines, last_lines);
+        let structure_config = build_config(Mode::Structure, trunc);
         if let Some(extracted) = transform_fn(&structure_config)? {
             let extracted_tokens = count_tokens_or_max(&extracted);
             if extracted_tokens <= token_budget {
@@ -225,15 +225,11 @@ mod tests {
         ];
         let transform = mock_transform(source, &mode_sizes);
 
-        let (output, mode_used) = cascade_for_token_budget(
-            Mode::Structure,
-            None,
-            None,
-            10,
-            Language::TypeScript,
-            transform,
-        )
-        .unwrap();
+        let trunc = TruncationOptions::default();
+
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "word1 word2 word3");
@@ -249,16 +245,11 @@ mod tests {
             (Mode::Types, 3),
         ];
         let transform = mock_transform(source, &mode_sizes);
+        let trunc = TruncationOptions::default();
 
-        let (_output, mode_used) = cascade_for_token_budget(
-            Mode::Structure,
-            None,
-            None,
-            10,
-            Language::TypeScript,
-            transform,
-        )
-        .unwrap();
+        let (_output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Signatures);
     }
@@ -273,16 +264,11 @@ mod tests {
             (Mode::Types, 12),
         ];
         let transform = mock_transform(source, &mode_sizes);
+        let trunc = TruncationOptions::default();
 
-        let (output, mode_used) = cascade_for_token_budget(
-            Mode::Structure,
-            None,
-            None,
-            5,
-            Language::TypeScript,
-            transform,
-        )
-        .unwrap();
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::TypeScript, transform)
+                .unwrap();
 
         // Should use the most aggressive mode that produced output
         assert_eq!(mode_used, Mode::Types);
@@ -303,8 +289,10 @@ mod tests {
         let mode_sizes = vec![(Mode::Types, 5)];
         let transform = mock_transform(source, &mode_sizes);
 
+        let trunc = TruncationOptions::default();
+
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Types, None, None, 10, Language::TypeScript, transform)
+            cascade_for_token_budget(Mode::Types, &trunc, 10, Language::TypeScript, transform)
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Types);
@@ -316,10 +304,11 @@ mod tests {
         // All modes return None → should error
         let transform = |_config: &TransformConfig| -> anyhow::Result<Option<String>> { Ok(None) };
 
+        let trunc = TruncationOptions::default();
+
         let result = cascade_for_token_budget(
             Mode::Structure,
-            None,
-            None,
+            &trunc,
             100,
             Language::TypeScript,
             transform,
@@ -341,9 +330,10 @@ mod tests {
         let mode_sizes = vec![(Mode::Full, 5), (Mode::Structure, 3)];
         let transform = mock_transform(source, &mode_sizes);
 
+        let trunc = TruncationOptions::default();
+
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, None, None, 10, Language::Json, transform)
-                .unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Full);
         assert_eq!(output, "a b c d e");
@@ -355,10 +345,10 @@ mod tests {
         let source = "a b c d e f g h i j k l m n o p q r s t";
         let mode_sizes = vec![(Mode::Full, 20), (Mode::Structure, 5)];
         let transform = mock_transform(source, &mode_sizes);
+        let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, None, None, 10, Language::Json, transform)
-                .unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "a b c d e");
@@ -371,8 +361,10 @@ mod tests {
         let mode_sizes = vec![(Mode::Full, 20), (Mode::Structure, 15)];
         let transform = mock_transform(source, &mode_sizes);
 
+        let trunc = TruncationOptions::default();
+
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, None, None, 5, Language::Json, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 5, Language::Json, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
@@ -391,8 +383,10 @@ mod tests {
         let mode_sizes = vec![(Mode::Structure, 20)];
         let transform = mock_transform(source, &mode_sizes);
 
+        let trunc = TruncationOptions::default();
+
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, None, None, 5, Language::Yaml, transform)
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Yaml, transform)
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
@@ -410,8 +404,9 @@ mod tests {
         // Serde language where transform returns None for starting mode
         let transform = |_config: &TransformConfig| -> anyhow::Result<Option<String>> { Ok(None) };
 
-        let result =
-            cascade_for_token_budget(Mode::Full, None, None, 100, Language::Toml, transform);
+        let trunc = TruncationOptions::default();
+
+        let result = cascade_for_token_budget(Mode::Full, &trunc, 100, Language::Toml, transform);
 
         assert!(result.is_err());
         assert!(result

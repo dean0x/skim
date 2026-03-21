@@ -12,7 +12,7 @@ use rskim_core::{
     TransformConfig,
 };
 
-use crate::{cache, cascade, tokens};
+use crate::{cache, cascade, cascade::TruncationOptions, tokens};
 
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
@@ -28,12 +28,8 @@ pub(crate) struct ProcessOptions {
     pub(crate) use_cache: bool,
     /// Whether to compute token statistics (for --show-stats)
     pub(crate) show_stats: bool,
-    /// Maximum output lines (AST-aware truncation)
-    pub(crate) max_lines: Option<usize>,
-    /// Last N lines truncation (mutually exclusive with max_lines)
-    pub(crate) last_lines: Option<usize>,
-    /// Token budget for cascade mode
-    pub(crate) token_budget: Option<usize>,
+    /// Truncation options (max_lines, last_lines, token_budget)
+    pub(crate) trunc: TruncationOptions,
 }
 
 /// Result of processing a file
@@ -108,13 +104,7 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some(hit) = cache::read_cache(
-        path,
-        options.mode,
-        options.max_lines,
-        options.last_lines,
-        options.token_budget,
-    ) else {
+    let Some(hit) = cache::read_cache(path, options.mode, &options.trunc) else {
         return Ok(None);
     };
 
@@ -170,7 +160,7 @@ fn run_transform(
         Ok(Some(transform_with_config(contents, language, config)?))
     };
 
-    match options.token_budget {
+    match options.trunc.token_budget {
         Some(budget) => {
             let language = explicit_lang
                 .or_else(|| detect_language_from_path(path))
@@ -184,15 +174,14 @@ fn run_transform(
 
             cascade::cascade_for_token_budget(
                 options.mode,
-                options.max_lines,
-                options.last_lines,
+                &options.trunc,
                 budget,
                 language,
                 transform_file,
             )
         }
         None => {
-            let config = cascade::build_config(options.mode, options.max_lines, options.last_lines);
+            let config = cascade::build_config(options.mode, &options.trunc);
             let output = transform_file(&config)?.ok_or_else(|| {
                 anyhow::anyhow!("Language detection failed and no --language specified")
             })?;
@@ -244,12 +233,11 @@ pub(crate) fn process_stdin(
         }
     })?;
 
-    let transformed = match options.token_budget {
+    let transformed = match options.trunc.token_budget {
         Some(budget) => {
             let (output, _mode) = cascade::cascade_for_token_budget(
                 options.mode,
-                options.max_lines,
-                options.last_lines,
+                &options.trunc,
                 budget,
                 language,
                 |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
@@ -257,7 +245,7 @@ pub(crate) fn process_stdin(
             output
         }
         None => {
-            let config = cascade::build_config(options.mode, options.max_lines, options.last_lines);
+            let config = cascade::build_config(options.mode, &options.trunc);
             transform_with_config(&buffer, language, &config)?
         }
     };
@@ -266,7 +254,7 @@ pub(crate) fn process_stdin(
     // Same protection as process_file; token counting happens after so stats reflect
     // the final output.
     let (final_output, guardrail_triggered) =
-        if options.mode != Mode::Full && options.token_budget.is_none() {
+        if options.mode != Mode::Full && options.trunc.token_budget.is_none() {
             let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
             let triggered = outcome.was_triggered();
             (outcome.into_output(), triggered)
@@ -300,7 +288,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Token counting happens AFTER this decision so stats reflect the final output.
     let (final_output, guardrail_triggered) =
-        if options.mode != Mode::Full && options.token_budget.is_none() {
+        if options.mode != Mode::Full && options.trunc.token_budget.is_none() {
             let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
             let triggered = outcome.was_triggered();
             (outcome.into_output(), triggered)
@@ -324,9 +312,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             content: &final_output,
             original_tokens: orig_tokens,
             transformed_tokens: trans_tokens,
-            max_lines: options.max_lines,
-            last_lines: options.last_lines,
-            token_budget: options.token_budget,
+            trunc: options.trunc,
             effective_mode,
         });
     }

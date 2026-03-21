@@ -475,9 +475,11 @@ fn run_file_operation() -> anyhow::Result<()> {
         explicit_lang: args.language.map(Language::from),
         use_cache: !args.no_cache,
         show_stats: args.show_stats,
-        max_lines: args.max_lines,
-        last_lines: args.last_lines,
-        token_budget: args.tokens,
+        trunc: cascade::TruncationOptions {
+            max_lines: args.max_lines,
+            last_lines: args.last_lines,
+            token_budget: args.tokens,
+        },
     };
 
     if file == "-" {
