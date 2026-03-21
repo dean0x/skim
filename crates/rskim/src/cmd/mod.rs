@@ -42,11 +42,10 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
     }
 
     // Dispatch implemented subcommands
-    if subcommand == "completions" {
-        return completions::run(args);
-    }
-    if subcommand == "rewrite" {
-        return rewrite::run(args);
+    match subcommand {
+        "completions" => return completions::run(args),
+        "rewrite" => return rewrite::run(args),
+        _ => {}
     }
 
     // Check for --help / -h in remaining args
