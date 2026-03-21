@@ -1,0 +1,5 @@
+abc1234 feat: add new parser (2 hours ago) <Alice>
+def5678 fix: resolve edge case in tokenizer (5 hours ago) <Bob>
+789abcd refactor: clean up transform module (1 day ago) <Alice>
+012efgh docs: update README with examples (2 days ago) <Charlie>
+345ijkl chore: bump dependencies (3 days ago) <Bob>

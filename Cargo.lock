@@ -840,6 +840,7 @@ dependencies = [
  "ignore",
  "predicates",
  "rayon",
+ "regex",
  "rskim-core",
  "serde",
  "serde_json",
