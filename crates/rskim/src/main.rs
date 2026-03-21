@@ -186,7 +186,7 @@ SUBCOMMANDS:\n  \
     completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n  \
     init                                     Initialize skim configuration (planned)\n  \
     test                                     Run test with output parsing (planned)\n  \
-    rewrite                                  Rewrite command output (planned)\n  \
+    rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
     git                                      Git integration helpers (planned)\n  \
     build                                    Build with output parsing (planned)\n\n\
 For more info: https://github.com/dean0x/skim")]
