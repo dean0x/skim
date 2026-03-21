@@ -11,7 +11,8 @@
 //! **Layer 2 — Custom handlers**: For commands requiring argument inspection
 //! (cat, head, tail) where simple prefix matching is insufficient.
 
-use std::io::{self, BufRead, IsTerminal};
+use std::io::{self, BufRead, IsTerminal, Read};
+use std::process::ExitCode;
 
 use serde::Serialize;
 
@@ -179,11 +180,11 @@ const COMPOUND_SEPARATORS: &[&str] = &["|", "&&", "||", ";"];
 /// Exit code semantics:
 /// - 0: rewrite found, printed to stdout
 /// - 1: no rewrite match (or compound command, or invalid input)
-pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
+pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     // Handle --help / -h
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
-        return Ok(std::process::ExitCode::SUCCESS);
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Check for --suggest flag (must be first non-help flag)
@@ -202,20 +203,22 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
         if io::stdin().is_terminal() {
             if suggest_mode {
                 print_suggest("", None);
-                return Ok(std::process::ExitCode::SUCCESS);
+                return Ok(ExitCode::SUCCESS);
             }
-            return Ok(std::process::ExitCode::FAILURE);
+            return Ok(ExitCode::FAILURE);
         }
-        // Read one line from stdin and whitespace-split
+        // Read one line from stdin, capped at 4 KiB to prevent unbounded allocation.
+        // Uses take() to bound memory before reading, so even input without a newline
+        // cannot cause unbounded allocation.
         let mut line = String::new();
-        io::stdin().lock().read_line(&mut line)?;
+        io::BufReader::new(io::stdin().lock().take(4096)).read_line(&mut line)?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if suggest_mode {
                 print_suggest("", None);
-                return Ok(std::process::ExitCode::SUCCESS);
+                return Ok(ExitCode::SUCCESS);
             }
-            return Ok(std::process::ExitCode::FAILURE);
+            return Ok(ExitCode::FAILURE);
         }
         trimmed.split_whitespace().map(String::from).collect()
     } else {
@@ -225,9 +228,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
     if tokens.is_empty() {
         if suggest_mode {
             print_suggest("", None);
-            return Ok(std::process::ExitCode::SUCCESS);
+            return Ok(ExitCode::SUCCESS);
         }
-        return Ok(std::process::ExitCode::FAILURE);
+        return Ok(ExitCode::FAILURE);
     }
 
     let original = tokens.join(" ");
@@ -239,9 +242,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
     {
         if suggest_mode {
             print_suggest(&original, None);
-            return Ok(std::process::ExitCode::SUCCESS);
+            return Ok(ExitCode::SUCCESS);
         }
-        return Ok(std::process::ExitCode::FAILURE);
+        return Ok(ExitCode::FAILURE);
     }
 
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
@@ -253,14 +256,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
             } else {
                 println!("{rewritten}");
             }
-            Ok(std::process::ExitCode::SUCCESS)
+            Ok(ExitCode::SUCCESS)
         }
         None => {
             if suggest_mode {
                 print_suggest(&original, None);
-                return Ok(std::process::ExitCode::SUCCESS);
+                return Ok(ExitCode::SUCCESS);
             }
-            Ok(std::process::ExitCode::FAILURE)
+            Ok(ExitCode::FAILURE)
         }
     }
 }
@@ -502,11 +505,11 @@ fn try_rewrite_cat(args: &[&str]) -> Option<RewriteResult> {
 
 /// Parse a line count from head/tail -N or -n N or -nN style arguments.
 ///
-/// Returns `(Some(count), remaining_file_args)` or `(None, remaining_file_args)`.
-/// Returns `Err` if an unrecognized flag is found.
-fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<&'a str>), ()> {
+/// Returns `Some((count, files))` on success, `None` if no files found or
+/// an unrecognized flag is encountered.
+fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Option<(Option<u64>, Vec<&'a str>)> {
     if args.is_empty() {
-        return Err(());
+        return None;
     }
 
     let mut count: Option<u64> = None;
@@ -520,18 +523,12 @@ fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<
             // -n N form: next arg is the count
             i += 1;
             if i >= args.len() {
-                return Err(());
+                return None;
             }
-            count = args[i].parse::<u64>().ok();
-            if count.is_none() {
-                return Err(());
-            }
+            count = Some(args[i].parse::<u64>().ok()?);
         } else if let Some(rest) = arg.strip_prefix("-n") {
             // -nN form: rest is the count
-            count = rest.parse::<u64>().ok();
-            if count.is_none() {
-                return Err(());
-            }
+            count = Some(rest.parse::<u64>().ok()?);
         } else if arg.starts_with('-') && arg != "-" {
             // Check for -N (bare number) like -20
             let potential_num = &arg[1..];
@@ -539,7 +536,7 @@ fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<
                 count = Some(n);
             } else {
                 // Unknown flag
-                return Err(());
+                return None;
             }
         } else {
             files.push(arg);
@@ -549,10 +546,10 @@ fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<
     }
 
     if files.is_empty() {
-        return Err(());
+        return None;
     }
 
-    Ok((count, files))
+    Some((count, files))
 }
 
 /// Shared rewrite logic for head/tail commands.
@@ -560,7 +557,7 @@ fn parse_line_count_and_files<'a>(args: &[&'a str]) -> Result<(Option<u64>, Vec<
 /// Parses line count and file arguments, validates all files are code files,
 /// and builds the skim command with the appropriate line-limit flag.
 fn try_rewrite_head_tail(args: &[&str], line_flag: &str) -> Option<RewriteResult> {
-    let (count, files) = parse_line_count_and_files(args).ok()?;
+    let (count, files) = parse_line_count_and_files(args)?;
 
     if !files.iter().all(|f| is_code_file(f)) {
         return None;
