@@ -64,6 +64,8 @@ pub(crate) struct CacheWriteParams<'a> {
     pub(crate) transformed_tokens: Option<usize>,
     /// Maximum output lines (part of cache key).
     pub(crate) max_lines: Option<usize>,
+    /// Last N lines truncation (part of cache key).
+    pub(crate) last_lines: Option<usize>,
     /// Token budget (part of cache key).
     pub(crate) token_budget: Option<usize>,
     /// Effective mode after cascade (diagnostic metadata only).
@@ -96,12 +98,13 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Generate cache key from file path, mtime, mode, max_lines, and token_budget.
+/// Generate cache key from file path, mtime, mode, max_lines, last_lines, and token_budget.
 fn cache_key(
     path: &Path,
     mtime: SystemTime,
     mode: Mode,
     max_lines: Option<usize>,
+    last_lines: Option<usize>,
     token_budget: Option<usize>,
 ) -> Result<String> {
     let canonical_path = path.canonicalize()?;
@@ -115,11 +118,12 @@ fn cache_key(
     }
 
     let hash_input = format!(
-        "{}|{}|{:?}|{}|{}",
+        "{}|{}|{:?}|{}|{}|{}",
         canonical_path.display(),
         mtime_secs,
         mode,
         fmt_opt(max_lines),
+        fmt_opt(last_lines),
         fmt_opt(token_budget),
     );
 
@@ -136,12 +140,13 @@ pub(crate) fn read_cache(
     path: &Path,
     mode: Mode,
     max_lines: Option<usize>,
+    last_lines: Option<usize>,
     token_budget: Option<usize>,
 ) -> Option<CacheHit> {
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
 
-    let key = cache_key(path, mtime, mode, max_lines, token_budget).ok()?;
+    let key = cache_key(path, mtime, mode, max_lines, last_lines, token_budget).ok()?;
     let cache_file = get_cache_dir().ok()?.join(format!("{key}.json"));
 
     let cache_content = fs::read_to_string(&cache_file).ok()?;
@@ -175,6 +180,7 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
         mtime,
         params.mode,
         params.max_lines,
+        params.last_lines,
         params.token_budget,
     )?;
     let cache_file = get_cache_dir()?.join(format!("{key}.json"));
@@ -241,34 +247,42 @@ mod tests {
         let mtime = metadata.modified().unwrap();
 
         // Same inputs should produce same key
-        let key1 = cache_key(path, mtime, Mode::Structure, None, None).unwrap();
-        let key2 = cache_key(path, mtime, Mode::Structure, None, None).unwrap();
+        let key1 = cache_key(path, mtime, Mode::Structure, None, None, None).unwrap();
+        let key2 = cache_key(path, mtime, Mode::Structure, None, None, None).unwrap();
         assert_eq!(key1, key2);
 
         // Different mode should produce different key
-        let key3 = cache_key(path, mtime, Mode::Signatures, None, None).unwrap();
+        let key3 = cache_key(path, mtime, Mode::Signatures, None, None, None).unwrap();
         assert_ne!(key1, key3);
 
         // Different max_lines should produce different key
-        let key4 = cache_key(path, mtime, Mode::Structure, Some(50), None).unwrap();
+        let key4 = cache_key(path, mtime, Mode::Structure, Some(50), None, None).unwrap();
         assert_ne!(key1, key4);
 
         // Same max_lines should produce same key
-        let key5 = cache_key(path, mtime, Mode::Structure, Some(50), None).unwrap();
+        let key5 = cache_key(path, mtime, Mode::Structure, Some(50), None, None).unwrap();
         assert_eq!(key4, key5);
 
         // Different token_budget should produce different key
-        let key6 = cache_key(path, mtime, Mode::Structure, None, Some(500)).unwrap();
+        let key6 = cache_key(path, mtime, Mode::Structure, None, None, Some(500)).unwrap();
         assert_ne!(key1, key6);
 
         // Same token_budget should produce same key
-        let key7 = cache_key(path, mtime, Mode::Structure, None, Some(500)).unwrap();
+        let key7 = cache_key(path, mtime, Mode::Structure, None, None, Some(500)).unwrap();
         assert_eq!(key6, key7);
 
         // Different max_lines + token_budget combination
-        let key8 = cache_key(path, mtime, Mode::Structure, Some(50), Some(500)).unwrap();
+        let key8 = cache_key(path, mtime, Mode::Structure, Some(50), None, Some(500)).unwrap();
         assert_ne!(key4, key8);
         assert_ne!(key6, key8);
+
+        // Different last_lines should produce different key
+        let key9 = cache_key(path, mtime, Mode::Structure, None, Some(10), None).unwrap();
+        assert_ne!(key1, key9);
+
+        // Same last_lines should produce same key
+        let key10 = cache_key(path, mtime, Mode::Structure, None, Some(10), None).unwrap();
+        assert_eq!(key9, key10);
     }
 
     #[test]
@@ -278,7 +292,7 @@ mod tests {
         let path = temp_file.path().to_path_buf();
 
         // Initially no cache
-        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None, None).is_none());
 
         // Write to cache with token counts
         let content = "transformed output";
@@ -289,25 +303,29 @@ mod tests {
             original_tokens: Some(100),
             transformed_tokens: Some(50),
             max_lines: None,
+            last_lines: None,
             token_budget: None,
             effective_mode: None,
         })
         .unwrap();
 
         // Read from cache
-        let hit = read_cache(&path, Mode::Structure, None, None).unwrap();
+        let hit = read_cache(&path, Mode::Structure, None, None, None).unwrap();
         assert_eq!(hit.content, content);
         assert_eq!(hit.original_tokens, Some(100));
         assert_eq!(hit.transformed_tokens, Some(50));
 
         // Different mode should not find cache
-        assert!(read_cache(&path, Mode::Signatures, None, None).is_none());
+        assert!(read_cache(&path, Mode::Signatures, None, None, None).is_none());
 
         // Different max_lines should not find cache
-        assert!(read_cache(&path, Mode::Structure, Some(50), None).is_none());
+        assert!(read_cache(&path, Mode::Structure, Some(50), None, None).is_none());
+
+        // Different last_lines should not find cache
+        assert!(read_cache(&path, Mode::Structure, None, Some(10), None).is_none());
 
         // Different token_budget should not find cache
-        assert!(read_cache(&path, Mode::Structure, None, Some(500)).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None, Some(500)).is_none());
     }
 
     #[test]
@@ -319,7 +337,7 @@ mod tests {
         let token_budget = Some(500);
 
         // No cache initially
-        assert!(read_cache(&path, Mode::Structure, None, token_budget).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None, token_budget).is_none());
 
         // Write with token_budget
         write_cache(&CacheWriteParams {
@@ -329,25 +347,26 @@ mod tests {
             original_tokens: Some(200),
             transformed_tokens: Some(80),
             max_lines: None,
+            last_lines: None,
             token_budget,
             effective_mode: None,
         })
         .unwrap();
 
         // Read with same token_budget succeeds
-        let hit = read_cache(&path, Mode::Structure, None, token_budget).unwrap();
+        let hit = read_cache(&path, Mode::Structure, None, None, token_budget).unwrap();
         assert_eq!(hit.content, "budget-transformed output");
         assert_eq!(hit.original_tokens, Some(200));
         assert_eq!(hit.transformed_tokens, Some(80));
 
         // Read without token_budget misses (different cache key)
-        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None, None).is_none());
 
         // Read with different token_budget misses
-        assert!(read_cache(&path, Mode::Structure, None, Some(1000)).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None, Some(1000)).is_none());
 
         // Read with same budget + different mode misses
-        assert!(read_cache(&path, Mode::Signatures, None, token_budget).is_none());
+        assert!(read_cache(&path, Mode::Signatures, None, None, token_budget).is_none());
     }
 
     #[test]
@@ -364,13 +383,14 @@ mod tests {
             original_tokens: Some(150),
             transformed_tokens: Some(60),
             max_lines: None,
+            last_lines: None,
             token_budget: Some(100),
             effective_mode: Some(Mode::Signatures),
         })
         .unwrap();
 
         // Read back succeeds (effective_mode is diagnostic-only, not part of CacheHit)
-        let hit = read_cache(&path, Mode::Structure, None, Some(100)).unwrap();
+        let hit = read_cache(&path, Mode::Structure, None, None, Some(100)).unwrap();
         assert_eq!(hit.content, "escalated output");
         assert_eq!(hit.original_tokens, Some(150));
         assert_eq!(hit.transformed_tokens, Some(60));
@@ -378,7 +398,7 @@ mod tests {
         // Verify the effective_mode field was serialized in the raw JSON
         let metadata = fs::metadata(&path).unwrap();
         let mtime = metadata.modified().unwrap();
-        let key = cache_key(&path, mtime, Mode::Structure, None, Some(100)).unwrap();
+        let key = cache_key(&path, mtime, Mode::Structure, None, None, Some(100)).unwrap();
         let cache_file = get_cache_dir().unwrap().join(format!("{key}.json"));
         let raw_json = fs::read_to_string(&cache_file).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
@@ -412,11 +432,12 @@ mod tests {
             original_tokens: None,
             transformed_tokens: None,
             max_lines: None,
+            last_lines: None,
             token_budget: None,
             effective_mode: None,
         })
         .unwrap();
-        let hit = read_cache(&path, Mode::Structure, None, None).unwrap();
+        let hit = read_cache(&path, Mode::Structure, None, None, None).unwrap();
         assert_eq!(hit.content, "cached v1");
 
         // Sleep to ensure mtime resolution (some filesystems have 1-second resolution)
@@ -430,6 +451,6 @@ mod tests {
         }
 
         // Cache should be invalidated (mtime changed)
-        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+        assert!(read_cache(&path, Mode::Structure, None, None, None).is_none());
     }
 }

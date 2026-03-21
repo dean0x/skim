@@ -108,7 +108,7 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some(hit) = cache::read_cache(path, options.mode, options.max_lines, options.token_budget)
+    let Some(hit) = cache::read_cache(path, options.mode, options.max_lines, options.last_lines, options.token_budget)
     else {
         return Ok(None);
     };
@@ -286,21 +286,6 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         (None, None)
     };
 
-    if options.use_cache {
-        let effective_mode = (mode_used != options.mode).then_some(mode_used);
-        // Cache write failures are non-fatal; don't fail the transformation.
-        let _ = cache::write_cache(&cache::CacheWriteParams {
-            path,
-            mode: options.mode,
-            content: &result,
-            original_tokens: orig_tokens,
-            transformed_tokens: trans_tokens,
-            max_lines: options.max_lines,
-            token_budget: options.token_budget,
-            effective_mode,
-        });
-    }
-
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead
     let (final_output, guardrail_triggered) =
         if options.mode != Mode::Full && options.token_budget.is_none() {
@@ -311,11 +296,10 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             (result, false)
         };
 
-    // Cache the pre-guardrail result (cache should store the transform output,
-    // not the guardrail fallback, since the guardrail may not trigger next time).
+    // Cache the transform result (post-guardrail). Cache write failures are
+    // non-fatal; don't fail the transformation.
     if options.use_cache {
         let effective_mode = (mode_used != options.mode).then_some(mode_used);
-        // Cache write failures are non-fatal; don't fail the transformation.
         let _ = cache::write_cache(&cache::CacheWriteParams {
             path,
             mode: options.mode,
@@ -323,6 +307,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             original_tokens: orig_tokens,
             transformed_tokens: trans_tokens,
             max_lines: options.max_lines,
+            last_lines: options.last_lines,
             token_budget: options.token_budget,
             effective_mode,
         });
