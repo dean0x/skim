@@ -6,11 +6,28 @@
 //! output is passed through unmodified.
 
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
 use crate::output::canonical::GitResult;
 use crate::runner::CommandRunner;
+
+// ============================================================================
+// Compiled regexes (compiled once, reused across calls)
+// ============================================================================
+
+/// Matches diff stat lines: " file | 42 +++++---"
+static STAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\|\s+(\d+)\s+([+-]+)").unwrap());
+
+/// Matches diff stat summary lines: "3 files changed, ..."
+static SUMMARY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+)\s+files?\s+changed").unwrap());
+
+/// Matches binary diff stat lines: " file.bin | Bin 0 -> 1234 bytes"
+static BINARY_STAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\|\s+Bin\s+").unwrap());
 
 // ============================================================================
 // Public entry point
@@ -117,7 +134,11 @@ fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
         }
 
         // Boolean global flags
-        if arg == "--no-pager" || arg == "--bare" || arg == "--no-replace-objects" {
+        if arg == "--no-pager"
+            || arg == "--bare"
+            || arg == "--no-replace-objects"
+            || arg == "--no-optional-locks"
+        {
             global_flags.push(arg.clone());
             i += 1;
             continue;
@@ -136,8 +157,23 @@ fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
 // ============================================================================
 
 /// Check whether any of `flags` appears in `args`.
+///
+/// Supports both exact matches (`--oneline`) and prefix matches with `=`
+/// (`--format=%H` matches `--format`). This is consistent with the rewrite
+/// engine's `skip_if_flag_prefix` behavior.
 fn user_has_flag(args: &[String], flags: &[&str]) -> bool {
-    args.iter().any(|a| flags.contains(&a.as_str()))
+    args.iter().any(|a| {
+        flags
+            .iter()
+            .any(|&f| a.as_str() == f || a.starts_with(&format!("{f}=")))
+    })
+}
+
+/// Check whether the user has specified a limit flag (`-n`, `--max-count`).
+fn has_limit_flag(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "-n" || a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
+    })
 }
 
 /// Convert an optional exit code to an ExitCode.
@@ -171,11 +207,10 @@ fn run_passthrough(
 }
 
 /// Run a git command and parse its output with the given parser function.
-fn run_parsed_command<F>(
-    global_flags: &[String],
-    subcmd_args: &[String],
-    parser: F,
-) -> anyhow::Result<ExitCode>
+///
+/// Callers are responsible for baking global flags into `subcmd_args` before
+/// calling this function.
+fn run_parsed_command<F>(subcmd_args: &[String], parser: F) -> anyhow::Result<ExitCode>
 where
     F: FnOnce(&str) -> GitResult,
 {
@@ -194,7 +229,6 @@ where
         return Ok(exit_code_to_process(output.exit_code));
     }
 
-    let _ = global_flags; // consumed during arg building by callers
     let result = parser(&output.stdout);
     println!("{result}");
 
@@ -222,7 +256,7 @@ fn run_status(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCo
     ]);
     full_args.extend_from_slice(args);
 
-    run_parsed_command(global_flags, &full_args, parse_status)
+    run_parsed_command(&full_args, parse_status)
 }
 
 /// Parse porcelain v2 status output into a compressed GitResult.
@@ -346,12 +380,23 @@ fn extract_xy(line: &str) -> String {
     line.split_whitespace().nth(1).unwrap_or("..").to_string()
 }
 
-/// Extract the last path component from a porcelain v2 line.
-/// For type 1 entries: "1 XY sub mH mI mW hH hI <path>"
-/// For unmerged: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>"
+/// Extract the path from a porcelain v2 line using fixed field counts.
+///
+/// Type 1 entries: "1 XY sub mH mI mW hH hI <path>" (8 fields before path)
+/// Unmerged entries: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>" (10 fields before path)
+///
+/// Uses `splitn` with the correct field count so paths with spaces are preserved.
 fn extract_last_path(line: &str) -> String {
-    // The path is the last whitespace-separated field
-    line.split_whitespace().last().unwrap_or("").to_string()
+    let field_count = if line.starts_with('u') {
+        // Unmerged: 10 fixed fields + path
+        11
+    } else {
+        // Type 1: 8 fixed fields + path
+        9
+    };
+
+    let fields: Vec<&str> = line.splitn(field_count, ' ').collect();
+    fields.last().unwrap_or(&"").to_string()
 }
 
 /// Extract the renamed path from a porcelain v2 type 2 entry.
@@ -398,7 +443,7 @@ fn worktree_prefix(c: char) -> &'static str {
 /// Flag-aware passthrough: if user has `--stat`, `--name-only`, or
 /// `--name-status`, output is already compact — pass through unmodified.
 fn run_diff(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCode> {
-    if user_has_flag(args, &["--stat", "--name-only", "--name-status"]) {
+    if user_has_flag(args, &["--stat", "--name-only", "--name-status", "--check"]) {
         return run_passthrough(global_flags, "diff", args);
     }
 
@@ -406,7 +451,7 @@ fn run_diff(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCode
     full_args.extend(["diff".to_string(), "--stat".to_string()]);
     full_args.extend_from_slice(args);
 
-    run_parsed_command(global_flags, &full_args, parse_diff_stat)
+    run_parsed_command(&full_args, parse_diff_stat)
 }
 
 /// Parse `git diff --stat` output into a compressed GitResult.
@@ -414,11 +459,8 @@ fn parse_diff_stat(output: &str) -> GitResult {
     let mut file_stats: Vec<String> = Vec::new();
     let mut summary_line = String::new();
 
-    let stat_re = Regex::new(r"^\s*(.+?)\s+\|\s+(\d+)\s+([+-]+)").unwrap();
-    let summary_re = Regex::new(r"(\d+)\s+files?\s+changed").unwrap();
-
     for line in output.lines() {
-        if let Some(caps) = stat_re.captures(line) {
+        if let Some(caps) = STAT_RE.captures(line) {
             let file = caps.get(1).map_or("", |m| m.as_str()).trim();
             let count = caps.get(2).map_or("", |m| m.as_str());
             let changes = caps.get(3).map_or("", |m| m.as_str());
@@ -426,7 +468,14 @@ fn parse_diff_stat(output: &str) -> GitResult {
             continue;
         }
 
-        if summary_re.is_match(line) {
+        // Binary files appear as "file.bin | Bin 0 -> 1234 bytes"
+        if let Some(caps) = BINARY_STAT_RE.captures(line) {
+            let file = caps.get(1).map_or("", |m| m.as_str()).trim();
+            file_stats.push(format!("{file} | Bin"));
+            continue;
+        }
+
+        if SUMMARY_RE.is_match(line) {
             summary_line = line.trim().to_string();
         }
     }
@@ -455,21 +504,16 @@ fn run_log(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCode>
         return run_passthrough(global_flags, "log", args);
     }
 
-    // Check if user already has -n or --max-count
-    let has_limit = args.iter().any(|a| {
-        a == "-n" || a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
-    });
-
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["log".to_string(), "--format=%h %s (%cr) <%an>".to_string()]);
 
-    if !has_limit {
+    if !has_limit_flag(args) {
         full_args.extend(["-n".to_string(), "20".to_string()]);
     }
 
     full_args.extend_from_slice(args);
 
-    run_parsed_command(global_flags, &full_args, parse_log)
+    run_parsed_command(&full_args, parse_log)
 }
 
 /// Parse formatted `git log` output into a compressed GitResult.
@@ -753,27 +797,135 @@ mod tests {
     #[test]
     fn test_log_detects_n_flag() {
         let args: Vec<String> = vec!["-n".into(), "10".into()];
-        let has_limit = args.iter().any(|a| {
-            a == "-n" || a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
-        });
-        assert!(has_limit);
+        assert!(has_limit_flag(&args));
     }
 
     #[test]
     fn test_log_detects_max_count() {
         let args: Vec<String> = vec!["--max-count=5".into()];
-        let has_limit = args.iter().any(|a| {
-            a == "-n" || a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
-        });
-        assert!(has_limit);
+        assert!(has_limit_flag(&args));
     }
 
     #[test]
     fn test_log_no_limit_flag() {
         let args: Vec<String> = vec!["--all".into()];
-        let has_limit = args.iter().any(|a| {
-            a == "-n" || a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
-        });
-        assert!(!has_limit);
+        assert!(!has_limit_flag(&args));
+    }
+
+    // ========================================================================
+    // Paths with spaces in git status
+    // ========================================================================
+
+    #[test]
+    fn test_extract_last_path_with_spaces() {
+        // Type 1 entry with space in path: 8 fixed fields + path
+        let line = "1 M. N... 100644 100644 100644 abc1234 def5678 src/my file.rs";
+        assert_eq!(extract_last_path(line), "src/my file.rs");
+    }
+
+    #[test]
+    fn test_parse_status_path_with_spaces() {
+        let output = "# branch.head main\n\
+                      1 M. N... 100644 100644 100644 abc1234 def5678 src/my file.rs\n";
+        let result = parse_status(output);
+        assert!(
+            result.details.iter().any(|d| d.contains("my file.rs")),
+            "expected path with spaces in details, got: {:?}",
+            result.details
+        );
+    }
+
+    // ========================================================================
+    // Prefix-match passthrough (--format=%H, --porcelain=v2)
+    // ========================================================================
+
+    #[test]
+    fn test_log_passthrough_with_format_equals() {
+        assert!(user_has_flag(
+            &["--format=%H".to_string()],
+            &["--format", "--pretty", "--oneline"]
+        ));
+    }
+
+    #[test]
+    fn test_status_passthrough_with_porcelain_v2() {
+        assert!(user_has_flag(
+            &["--porcelain=v2".to_string()],
+            &["--porcelain", "--short", "-s"]
+        ));
+    }
+
+    // ========================================================================
+    // Unmerged entries in status
+    // ========================================================================
+
+    #[test]
+    fn test_parse_status_unmerged_entries() {
+        let output = "# branch.head main\n\
+                      u UU N... 100644 100644 100644 100644 abc1234 def5678 ghi9012 src/conflict.rs\n";
+        let result = parse_status(output);
+        assert!(
+            result.summary.contains("unmerged"),
+            "expected 'unmerged' in summary, got: {}",
+            result.summary
+        );
+        assert!(
+            result
+                .details
+                .iter()
+                .any(|d| d.contains("unmerged:") && d.contains("conflict.rs")),
+            "expected unmerged detail for conflict.rs, got: {:?}",
+            result.details
+        );
+    }
+
+    // ========================================================================
+    // Binary files in diff stat
+    // ========================================================================
+
+    #[test]
+    fn test_parse_diff_stat_binary_files() {
+        let output = " src/main.rs   | 15 +++++++++------\n\
+                       image.png     | Bin 0 -> 1234 bytes\n\
+                       2 files changed, 10 insertions(+), 5 deletions(-)\n";
+        let result = parse_diff_stat(output);
+        assert_eq!(
+            result.details.len(),
+            2,
+            "expected 2 file stat entries (1 text + 1 binary), got: {:?}",
+            result.details
+        );
+        assert!(
+            result
+                .details
+                .iter()
+                .any(|d| d.contains("image.png") && d.contains("Bin")),
+            "expected binary file entry, got: {:?}",
+            result.details
+        );
+    }
+
+    // ========================================================================
+    // --no-optional-locks global flag
+    // ========================================================================
+
+    #[test]
+    fn test_split_with_no_optional_locks() {
+        let args: Vec<String> = vec!["--no-optional-locks".into(), "status".into()];
+        let (global, rest) = split_global_flags(&args);
+        assert_eq!(global, vec!["--no-optional-locks"]);
+        assert_eq!(rest, vec!["status"]);
+    }
+
+    // ========================================================================
+    // --check passthrough for diff
+    // ========================================================================
+
+    #[test]
+    fn test_diff_passthrough_with_check() {
+        assert!(user_has_flag(
+            &["--check".to_string()],
+            &["--stat", "--name-only", "--name-status", "--check"]
+        ));
     }
 }
