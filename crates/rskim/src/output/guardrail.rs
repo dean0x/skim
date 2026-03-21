@@ -144,8 +144,9 @@ mod tests {
         );
     }
 
+    // Input < MIN_RAW_SIZE_FOR_GUARDRAIL (256 bytes), so Tier 0 skips all checks
     #[test]
-    fn test_pass_when_bytes_larger_but_tokens_smaller() {
+    fn test_tiny_file_skips_guardrail_even_when_compressed_larger() {
         // Compressed has more bytes (padding/whitespace) but potentially fewer tokens
         // This is an edge case -- we use a string with many spaces (which tokenize cheaply)
         let raw = "abcdefghij".to_string();

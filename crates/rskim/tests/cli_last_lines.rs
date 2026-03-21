@@ -4,6 +4,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
 use tempfile::TempDir;
 
 /// Get a command for the skim binary
@@ -168,4 +169,71 @@ fn test_last_lines_with_pseudo_mode() {
         line_count,
         stdout,
     );
+}
+
+#[test]
+fn test_last_lines_with_glob_pattern() {
+    let dir = TempDir::new().unwrap();
+
+    // Create two multi-line TypeScript files
+    fs::write(
+        dir.path().join("file1.ts"),
+        "type A = string;\ntype B = number;\nfunction foo(): void {}\nfunction bar(): void {}\nconst x = 1;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("file2.ts"),
+        "type C = boolean;\ntype D = string;\nfunction baz(): void {}\nfunction qux(): void {}\nconst y = 2;\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg("*.ts")
+        .arg("--last-lines")
+        .arg("3")
+        .arg("--mode=full")
+        .arg("--no-cache")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap_or_default();
+    assert!(
+        output.status.success(),
+        "Glob with --last-lines should succeed. stderr: {:?}",
+        stderr,
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Each file section in multi-file output gets a header line (// === file.ts ===)
+    // followed by the per-file output. Verify that per-file content respects the
+    // last-lines limit by checking each section individually.
+    let sections: Vec<&str> = stdout.split("// === ").filter(|s| !s.is_empty()).collect();
+    assert!(
+        sections.len() >= 2,
+        "Should have at least 2 file sections in glob output, got {}: {:?}",
+        sections.len(),
+        stdout,
+    );
+
+    for section in &sections {
+        // Each section starts with "filename.ts ===\n" header, then content lines.
+        // Trailing empty lines are file separators, not content, so trim them.
+        let content_lines: Vec<&str> = section
+            .lines()
+            .skip(1) // skip the header line (e.g., "file1.ts ===")
+            .collect::<Vec<_>>();
+        let content_count = content_lines
+            .iter()
+            .rev()
+            .skip_while(|l| l.is_empty())
+            .count();
+        assert!(
+            content_count <= 3,
+            "Each file section should have at most 3 content lines, got {}: {:?}",
+            content_count,
+            section,
+        );
+    }
 }

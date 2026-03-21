@@ -7,8 +7,11 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
+
+static TEE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Configuration for tee behavior
 pub(crate) struct TeeConfig {
@@ -75,7 +78,8 @@ fn save_tee_to_dir(
         .unwrap_or_default()
         .as_secs();
     let pid = std::process::id();
-    let filename = format!("{epoch_secs}_{pid}.txt");
+    let seq = TEE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = format!("{epoch_secs}_{pid}_{seq}.txt");
     let file_path = tee_dir.join(filename);
 
     // Truncate if exceeds max_file_size (ensure we don't split a UTF-8 char)
@@ -135,7 +139,9 @@ pub(crate) fn rotate_tee_files(tee_dir: &Path, max_files: usize) -> Result<()> {
 
     let to_remove = files.len() - max_files;
     for path in files.iter().take(to_remove) {
-        let _ = fs::remove_file(path);
+        if let Err(e) = fs::remove_file(path) {
+            eprintln!("[skim:tee] failed to remove {}: {e}", path.display());
+        }
     }
 
     Ok(())
