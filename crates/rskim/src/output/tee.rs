@@ -78,9 +78,13 @@ fn save_tee_to_dir(
     let filename = format!("{epoch_secs}_{pid}.txt");
     let file_path = tee_dir.join(filename);
 
-    // Truncate if exceeds max_file_size
+    // Truncate if exceeds max_file_size (ensure we don't split a UTF-8 char)
     let content = if raw_output.len() > config.max_file_size {
-        &raw_output[..config.max_file_size]
+        let mut boundary = config.max_file_size;
+        while boundary > 0 && !raw_output.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        &raw_output[..boundary]
     } else {
         raw_output
     };

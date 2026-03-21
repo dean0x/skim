@@ -108,8 +108,13 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some(hit) = cache::read_cache(path, options.mode, options.max_lines, options.last_lines, options.token_budget)
-    else {
+    let Some(hit) = cache::read_cache(
+        path,
+        options.mode,
+        options.max_lines,
+        options.last_lines,
+        options.token_budget,
+    ) else {
         return Ok(None);
     };
 

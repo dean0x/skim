@@ -91,14 +91,16 @@ impl TestResult {
     }
 
     fn render(summary: &TestSummary, entries: &[TestEntry]) -> String {
+        use std::fmt::Write;
+
         let mut output = format!("{summary}");
 
         if summary.fail > 0 {
             for entry in entries {
                 if entry.outcome == TestOutcome::Fail {
-                    output.push_str(&format!("\n  FAIL: {}", entry.name));
+                    let _ = write!(output, "\n  FAIL: {}", entry.name);
                     if let Some(detail) = &entry.detail {
-                        output.push_str(&format!("\n        {detail}"));
+                        let _ = write!(output, "\n        {detail}");
                     }
                 }
             }
@@ -154,9 +156,11 @@ impl GitResult {
     }
 
     fn render(operation: &str, summary: &str, details: &[String]) -> String {
+        use std::fmt::Write;
+
         let mut output = format!("[{operation}] {summary}");
         for detail in details {
-            output.push_str(&format!("\n  {detail}"));
+            let _ = write!(output, "\n  {detail}");
         }
         output
     }
@@ -231,15 +235,17 @@ impl BuildResult {
         duration_ms: Option<u64>,
         error_messages: &[String],
     ) -> String {
+        use std::fmt::Write;
+
         let status = if success { "BUILD OK" } else { "BUILD FAILED" };
         let mut output = format!("{status} | warnings: {warnings} | errors: {errors}");
         if let Some(ms) = duration_ms {
-            output.push_str(&format!(" | {}ms", format_with_commas(ms)));
+            let _ = write!(output, " | {}ms", format_with_commas(ms));
         }
 
         if !success {
             for msg in error_messages {
-                output.push_str(&format!("\n  {msg}"));
+                let _ = write!(output, "\n  {msg}");
             }
         }
 
@@ -263,17 +269,11 @@ impl fmt::Display for BuildResult {
 // Helpers
 // ============================================================================
 
-/// Format a u64 with comma-separated thousands
+/// Format a u64 with comma-separated thousands.
+///
+/// Delegates to [`crate::tokens::format_number`] to avoid duplication.
 fn format_with_commas(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (count, ch) in s.chars().rev().enumerate() {
-        if count > 0 && count % 3 == 0 {
-            result.push(',');
-        }
-        result.push(ch);
-    }
-    result.chars().rev().collect()
+    crate::tokens::format_number(n as usize)
 }
 
 // ============================================================================
