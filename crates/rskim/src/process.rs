@@ -12,7 +12,7 @@ use rskim_core::{
     TransformConfig,
 };
 
-use crate::{cache, cascade, tokens};
+use crate::{cache, cascade, cascade::TruncationOptions, tokens};
 
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
@@ -28,10 +28,8 @@ pub(crate) struct ProcessOptions {
     pub(crate) use_cache: bool,
     /// Whether to compute token statistics (for --show-stats)
     pub(crate) show_stats: bool,
-    /// Maximum output lines (AST-aware truncation)
-    pub(crate) max_lines: Option<usize>,
-    /// Token budget for cascade mode
-    pub(crate) token_budget: Option<usize>,
+    /// Truncation options (max_lines, last_lines, token_budget)
+    pub(crate) trunc: TruncationOptions,
 }
 
 /// Result of processing a file
@@ -44,6 +42,8 @@ pub(crate) struct ProcessResult {
     pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if computed)
     pub(crate) transformed_tokens: Option<usize>,
+    /// Whether the output guardrail was triggered (compressed > raw)
+    pub(crate) guardrail_triggered: bool,
 }
 
 /// Count tokens for both original and transformed text, returning `(None, None)` on failure.
@@ -104,8 +104,7 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some(hit) = cache::read_cache(path, options.mode, options.max_lines, options.token_budget)
-    else {
+    let Some(hit) = cache::read_cache(path, options.mode, &options.trunc) else {
         return Ok(None);
     };
 
@@ -123,6 +122,7 @@ fn try_cached_result(
         output: hit.content,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
+        guardrail_triggered: false,
     }))
 }
 
@@ -160,7 +160,7 @@ fn run_transform(
         Ok(Some(transform_with_config(contents, language, config)?))
     };
 
-    match options.token_budget {
+    match options.trunc.token_budget {
         Some(budget) => {
             let language = explicit_lang
                 .or_else(|| detect_language_from_path(path))
@@ -174,14 +174,14 @@ fn run_transform(
 
             cascade::cascade_for_token_budget(
                 options.mode,
-                options.max_lines,
+                &options.trunc,
                 budget,
                 language,
                 transform_file,
             )
         }
         None => {
-            let config = cascade::build_config(options.mode, options.max_lines);
+            let config = cascade::build_config(options.mode, &options.trunc);
             let output = transform_file(&config)?.ok_or_else(|| {
                 anyhow::anyhow!("Language detection failed and no --language specified")
             })?;
@@ -233,11 +233,11 @@ pub(crate) fn process_stdin(
         }
     })?;
 
-    let output = match options.token_budget {
+    let transformed = match options.trunc.token_budget {
         Some(budget) => {
             let (output, _mode) = cascade::cascade_for_token_budget(
                 options.mode,
-                options.max_lines,
+                &options.trunc,
                 budget,
                 language,
                 |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
@@ -245,21 +245,34 @@ pub(crate) fn process_stdin(
             output
         }
         None => {
-            let config = cascade::build_config(options.mode, options.max_lines);
+            let config = cascade::build_config(options.mode, &options.trunc);
             transform_with_config(&buffer, language, &config)?
         }
     };
 
+    // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
+    // Same protection as process_file; token counting happens after so stats reflect
+    // the final output.
+    let (final_output, guardrail_triggered) =
+        if options.mode != Mode::Full && options.trunc.token_budget.is_none() {
+            let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
+            let triggered = outcome.was_triggered();
+            (outcome.into_output(), triggered)
+        } else {
+            (transformed, false)
+        };
+
     let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&buffer, &output)
+        count_token_pair(&buffer, &final_output)
     } else {
         (None, None)
     };
 
     Ok(ProcessResult {
-        output,
+        output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
+        guardrail_triggered,
     })
 }
 
@@ -272,31 +285,43 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     let contents = read_and_validate(path)?;
     let (result, mode_used) = run_transform(&contents, path, &options)?;
 
+    // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
+    // Token counting happens AFTER this decision so stats reflect the final output.
+    let (final_output, guardrail_triggered) =
+        if options.mode != Mode::Full && options.trunc.token_budget.is_none() {
+            let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
+            let triggered = outcome.was_triggered();
+            (outcome.into_output(), triggered)
+        } else {
+            (result, false)
+        };
+
     let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&contents, &result)
+        count_token_pair(&contents, &final_output)
     } else {
         (None, None)
     };
 
+    // Cache the transform result (post-guardrail). Cache write failures are
+    // non-fatal; don't fail the transformation.
     if options.use_cache {
         let effective_mode = (mode_used != options.mode).then_some(mode_used);
-        // Cache write failures are non-fatal; don't fail the transformation.
         let _ = cache::write_cache(&cache::CacheWriteParams {
             path,
             mode: options.mode,
-            content: &result,
+            content: &final_output,
             original_tokens: orig_tokens,
             transformed_tokens: trans_tokens,
-            max_lines: options.max_lines,
-            token_budget: options.token_budget,
+            trunc: options.trunc,
             effective_mode,
         });
     }
 
     Ok(ProcessResult {
-        output: result,
+        output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
+        guardrail_triggered,
     })
 }
 
@@ -371,9 +396,11 @@ mod tests {
             output: "test".to_string(),
             original_tokens: Some(10),
             transformed_tokens: Some(5),
+            guardrail_triggered: false,
         };
         assert_eq!(result.output, "test");
         assert_eq!(result.original_tokens, Some(10));
         assert_eq!(result.transformed_tokens, Some(5));
+        assert!(!result.guardrail_triggered);
     }
 }

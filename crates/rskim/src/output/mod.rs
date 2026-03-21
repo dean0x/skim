@@ -7,6 +7,10 @@
 // Infrastructure module — consumers arrive in later Phase B tickets.
 #![allow(dead_code)]
 
+pub(crate) mod canonical;
+pub(crate) mod guardrail;
+pub(crate) mod tee;
+
 use std::io::{self, Write};
 
 use crate::tokens;

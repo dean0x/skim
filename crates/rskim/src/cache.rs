@@ -14,6 +14,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::cascade::TruncationOptions;
+
 /// Cache entry with metadata for validation.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
@@ -62,17 +64,15 @@ pub(crate) struct CacheWriteParams<'a> {
     pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if computed).
     pub(crate) transformed_tokens: Option<usize>,
-    /// Maximum output lines (part of cache key).
-    pub(crate) max_lines: Option<usize>,
-    /// Token budget (part of cache key).
-    pub(crate) token_budget: Option<usize>,
+    /// Truncation options (max_lines, last_lines, token_budget) -- part of cache key.
+    pub(crate) trunc: TruncationOptions,
     /// Effective mode after cascade (diagnostic metadata only).
     pub(crate) effective_mode: Option<Mode>,
 }
 
 /// Returns the platform-specific cache directory (`~/.cache/skim/` on Linux/macOS),
 /// creating it with owner-only permissions if it does not yet exist.
-fn get_cache_dir() -> Result<PathBuf> {
+pub(crate) fn get_cache_dir() -> Result<PathBuf> {
     let cache_dir = dirs::cache_dir()
         .ok_or_else(|| anyhow::anyhow!("Failed to determine cache directory"))?
         .join("skim");
@@ -96,13 +96,12 @@ fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Generate cache key from file path, mtime, mode, max_lines, and token_budget.
+/// Generate cache key from file path, mtime, mode, and truncation options.
 fn cache_key(
     path: &Path,
     mtime: SystemTime,
     mode: Mode,
-    max_lines: Option<usize>,
-    token_budget: Option<usize>,
+    trunc: &TruncationOptions,
 ) -> Result<String> {
     let canonical_path = path.canonicalize()?;
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
@@ -115,12 +114,13 @@ fn cache_key(
     }
 
     let hash_input = format!(
-        "{}|{}|{:?}|{}|{}",
+        "{}|{}|{:?}|{}|{}|{}",
         canonical_path.display(),
         mtime_secs,
         mode,
-        fmt_opt(max_lines),
-        fmt_opt(token_budget),
+        fmt_opt(trunc.max_lines),
+        fmt_opt(trunc.last_lines),
+        fmt_opt(trunc.token_budget),
     );
 
     let mut hasher = Sha256::new();
@@ -132,16 +132,11 @@ fn cache_key(
 /// Read cached output if valid (mtime matches).
 ///
 /// Returns a [`CacheHit`] on cache hit, `None` on miss.
-pub(crate) fn read_cache(
-    path: &Path,
-    mode: Mode,
-    max_lines: Option<usize>,
-    token_budget: Option<usize>,
-) -> Option<CacheHit> {
+pub(crate) fn read_cache(path: &Path, mode: Mode, trunc: &TruncationOptions) -> Option<CacheHit> {
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
 
-    let key = cache_key(path, mtime, mode, max_lines, token_budget).ok()?;
+    let key = cache_key(path, mtime, mode, trunc).ok()?;
     let cache_file = get_cache_dir().ok()?.join(format!("{key}.json"));
 
     let cache_content = fs::read_to_string(&cache_file).ok()?;
@@ -170,13 +165,7 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
     let metadata = fs::metadata(params.path)?;
     let mtime = metadata.modified()?;
 
-    let key = cache_key(
-        params.path,
-        mtime,
-        params.mode,
-        params.max_lines,
-        params.token_budget,
-    )?;
+    let key = cache_key(params.path, mtime, params.mode, &params.trunc)?;
     let cache_file = get_cache_dir()?.join(format!("{key}.json"));
 
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
@@ -240,35 +229,62 @@ mod tests {
         let metadata = fs::metadata(path).unwrap();
         let mtime = metadata.modified().unwrap();
 
+        let default_trunc = TruncationOptions::default();
+
         // Same inputs should produce same key
-        let key1 = cache_key(path, mtime, Mode::Structure, None, None).unwrap();
-        let key2 = cache_key(path, mtime, Mode::Structure, None, None).unwrap();
+        let key1 = cache_key(path, mtime, Mode::Structure, &default_trunc).unwrap();
+        let key2 = cache_key(path, mtime, Mode::Structure, &default_trunc).unwrap();
         assert_eq!(key1, key2);
 
         // Different mode should produce different key
-        let key3 = cache_key(path, mtime, Mode::Signatures, None, None).unwrap();
+        let key3 = cache_key(path, mtime, Mode::Signatures, &default_trunc).unwrap();
         assert_ne!(key1, key3);
 
         // Different max_lines should produce different key
-        let key4 = cache_key(path, mtime, Mode::Structure, Some(50), None).unwrap();
+        let trunc_max = TruncationOptions {
+            max_lines: Some(50),
+            ..Default::default()
+        };
+        let key4 = cache_key(path, mtime, Mode::Structure, &trunc_max).unwrap();
         assert_ne!(key1, key4);
 
         // Same max_lines should produce same key
-        let key5 = cache_key(path, mtime, Mode::Structure, Some(50), None).unwrap();
+        let key5 = cache_key(path, mtime, Mode::Structure, &trunc_max).unwrap();
         assert_eq!(key4, key5);
 
         // Different token_budget should produce different key
-        let key6 = cache_key(path, mtime, Mode::Structure, None, Some(500)).unwrap();
+        let trunc_budget = TruncationOptions {
+            token_budget: Some(500),
+            ..Default::default()
+        };
+        let key6 = cache_key(path, mtime, Mode::Structure, &trunc_budget).unwrap();
         assert_ne!(key1, key6);
 
         // Same token_budget should produce same key
-        let key7 = cache_key(path, mtime, Mode::Structure, None, Some(500)).unwrap();
+        let key7 = cache_key(path, mtime, Mode::Structure, &trunc_budget).unwrap();
         assert_eq!(key6, key7);
 
         // Different max_lines + token_budget combination
-        let key8 = cache_key(path, mtime, Mode::Structure, Some(50), Some(500)).unwrap();
+        let trunc_both = TruncationOptions {
+            max_lines: Some(50),
+            token_budget: Some(500),
+            ..Default::default()
+        };
+        let key8 = cache_key(path, mtime, Mode::Structure, &trunc_both).unwrap();
         assert_ne!(key4, key8);
         assert_ne!(key6, key8);
+
+        // Different last_lines should produce different key
+        let trunc_last = TruncationOptions {
+            last_lines: Some(10),
+            ..Default::default()
+        };
+        let key9 = cache_key(path, mtime, Mode::Structure, &trunc_last).unwrap();
+        assert_ne!(key1, key9);
+
+        // Same last_lines should produce same key
+        let key10 = cache_key(path, mtime, Mode::Structure, &trunc_last).unwrap();
+        assert_eq!(key9, key10);
     }
 
     #[test]
@@ -276,9 +292,10 @@ mod tests {
         let mut temp_file = NamedTempFile::new().unwrap();
         write!(temp_file, "test content").unwrap();
         let path = temp_file.path().to_path_buf();
+        let default_trunc = TruncationOptions::default();
 
         // Initially no cache
-        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+        assert!(read_cache(&path, Mode::Structure, &default_trunc).is_none());
 
         // Write to cache with token counts
         let content = "transformed output";
@@ -288,26 +305,40 @@ mod tests {
             content,
             original_tokens: Some(100),
             transformed_tokens: Some(50),
-            max_lines: None,
-            token_budget: None,
+            trunc: default_trunc,
             effective_mode: None,
         })
         .unwrap();
 
         // Read from cache
-        let hit = read_cache(&path, Mode::Structure, None, None).unwrap();
+        let hit = read_cache(&path, Mode::Structure, &default_trunc).unwrap();
         assert_eq!(hit.content, content);
         assert_eq!(hit.original_tokens, Some(100));
         assert_eq!(hit.transformed_tokens, Some(50));
 
         // Different mode should not find cache
-        assert!(read_cache(&path, Mode::Signatures, None, None).is_none());
+        assert!(read_cache(&path, Mode::Signatures, &default_trunc).is_none());
 
         // Different max_lines should not find cache
-        assert!(read_cache(&path, Mode::Structure, Some(50), None).is_none());
+        let trunc_max = TruncationOptions {
+            max_lines: Some(50),
+            ..Default::default()
+        };
+        assert!(read_cache(&path, Mode::Structure, &trunc_max).is_none());
+
+        // Different last_lines should not find cache
+        let trunc_last = TruncationOptions {
+            last_lines: Some(10),
+            ..Default::default()
+        };
+        assert!(read_cache(&path, Mode::Structure, &trunc_last).is_none());
 
         // Different token_budget should not find cache
-        assert!(read_cache(&path, Mode::Structure, None, Some(500)).is_none());
+        let trunc_budget = TruncationOptions {
+            token_budget: Some(500),
+            ..Default::default()
+        };
+        assert!(read_cache(&path, Mode::Structure, &trunc_budget).is_none());
     }
 
     #[test]
@@ -316,10 +347,13 @@ mod tests {
         write!(temp_file, "test content for token budget").unwrap();
         let path = temp_file.path().to_path_buf();
 
-        let token_budget = Some(500);
+        let trunc = TruncationOptions {
+            token_budget: Some(500),
+            ..Default::default()
+        };
 
         // No cache initially
-        assert!(read_cache(&path, Mode::Structure, None, token_budget).is_none());
+        assert!(read_cache(&path, Mode::Structure, &trunc).is_none());
 
         // Write with token_budget
         write_cache(&CacheWriteParams {
@@ -328,26 +362,30 @@ mod tests {
             content: "budget-transformed output",
             original_tokens: Some(200),
             transformed_tokens: Some(80),
-            max_lines: None,
-            token_budget,
+            trunc,
             effective_mode: None,
         })
         .unwrap();
 
         // Read with same token_budget succeeds
-        let hit = read_cache(&path, Mode::Structure, None, token_budget).unwrap();
+        let hit = read_cache(&path, Mode::Structure, &trunc).unwrap();
         assert_eq!(hit.content, "budget-transformed output");
         assert_eq!(hit.original_tokens, Some(200));
         assert_eq!(hit.transformed_tokens, Some(80));
 
         // Read without token_budget misses (different cache key)
-        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+        let default_trunc = TruncationOptions::default();
+        assert!(read_cache(&path, Mode::Structure, &default_trunc).is_none());
 
         // Read with different token_budget misses
-        assert!(read_cache(&path, Mode::Structure, None, Some(1000)).is_none());
+        let trunc_1000 = TruncationOptions {
+            token_budget: Some(1000),
+            ..Default::default()
+        };
+        assert!(read_cache(&path, Mode::Structure, &trunc_1000).is_none());
 
         // Read with same budget + different mode misses
-        assert!(read_cache(&path, Mode::Signatures, None, token_budget).is_none());
+        assert!(read_cache(&path, Mode::Signatures, &trunc).is_none());
     }
 
     #[test]
@@ -356,6 +394,11 @@ mod tests {
         write!(temp_file, "effective mode test content").unwrap();
         let path = temp_file.path().to_path_buf();
 
+        let trunc = TruncationOptions {
+            token_budget: Some(100),
+            ..Default::default()
+        };
+
         // Write with effective_mode set (simulates cascade escalation)
         write_cache(&CacheWriteParams {
             path: &path,
@@ -363,14 +406,13 @@ mod tests {
             content: "escalated output",
             original_tokens: Some(150),
             transformed_tokens: Some(60),
-            max_lines: None,
-            token_budget: Some(100),
+            trunc,
             effective_mode: Some(Mode::Signatures),
         })
         .unwrap();
 
         // Read back succeeds (effective_mode is diagnostic-only, not part of CacheHit)
-        let hit = read_cache(&path, Mode::Structure, None, Some(100)).unwrap();
+        let hit = read_cache(&path, Mode::Structure, &trunc).unwrap();
         assert_eq!(hit.content, "escalated output");
         assert_eq!(hit.original_tokens, Some(150));
         assert_eq!(hit.transformed_tokens, Some(60));
@@ -378,7 +420,7 @@ mod tests {
         // Verify the effective_mode field was serialized in the raw JSON
         let metadata = fs::metadata(&path).unwrap();
         let mtime = metadata.modified().unwrap();
-        let key = cache_key(&path, mtime, Mode::Structure, None, Some(100)).unwrap();
+        let key = cache_key(&path, mtime, Mode::Structure, &trunc).unwrap();
         let cache_file = get_cache_dir().unwrap().join(format!("{key}.json"));
         let raw_json = fs::read_to_string(&cache_file).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
@@ -396,6 +438,7 @@ mod tests {
 
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
+        let default_trunc = TruncationOptions::default();
 
         // Write initial content
         {
@@ -411,12 +454,11 @@ mod tests {
             content: "cached v1",
             original_tokens: None,
             transformed_tokens: None,
-            max_lines: None,
-            token_budget: None,
+            trunc: default_trunc,
             effective_mode: None,
         })
         .unwrap();
-        let hit = read_cache(&path, Mode::Structure, None, None).unwrap();
+        let hit = read_cache(&path, Mode::Structure, &default_trunc).unwrap();
         assert_eq!(hit.content, "cached v1");
 
         // Sleep to ensure mtime resolution (some filesystems have 1-second resolution)
@@ -430,6 +472,6 @@ mod tests {
         }
 
         // Cache should be invalidated (mtime changed)
-        assert!(read_cache(&path, Mode::Structure, None, None).is_none());
+        assert!(read_cache(&path, Mode::Structure, &default_trunc).is_none());
     }
 }
