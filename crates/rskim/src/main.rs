@@ -64,9 +64,9 @@ fn is_flag_with_value(flag: &str) -> bool {
 /// - Contains `.` (file extension)
 /// - Contains `/` or `\` (path separator)
 /// - Is `-` (stdin)
-/// - Contains `*`, `?`, or `[` (glob metacharacter)
+/// - Contains `*`, `?`, `[`, or `{` (glob metacharacter via [`multi::GLOB_METACHARACTERS`])
 fn looks_like_file_or_glob(token: &str) -> bool {
-    token == "-" || token.contains(['.', '/', '\\', '*', '?', '['])
+    token == "-" || token.contains(['.', '/', '\\']) || token.contains(multi::GLOB_METACHARACTERS)
 }
 
 /// Pre-parse `std::env::args()` to decide whether to route to a subcommand
@@ -81,7 +81,7 @@ fn looks_like_file_or_glob(token: &str) -> bool {
 /// | Contains `.`                                  | FileOperation |
 /// | Contains `/` or `\`                           | FileOperation |
 /// | Is `-`                                        | FileOperation |
-/// | Contains `*`, `?`, or `[`                     | FileOperation |
+/// | Contains `*`, `?`, `[`, or `{`                  | FileOperation |
 /// | Is known subcommand AND no file/dir on disk   | Subcommand    |
 /// | Everything else                               | FileOperation |
 fn resolve_invocation() -> Invocation {
@@ -229,6 +229,14 @@ struct Args {
         help = "Number of parallel jobs for multi-file processing"
     )]
     jobs: Option<usize>,
+
+    /// Don't respect .gitignore rules when scanning directories or globs.
+    /// Also includes hidden files and directories (dotfiles) that are excluded by default.
+    #[arg(
+        long,
+        help = "Don't respect .gitignore rules (include all files, including hidden/dotfiles)"
+    )]
+    no_ignore: bool,
 
     /// Disable caching (caching is enabled by default for performance)
     #[arg(long, help = "Disable caching of transformed output")]
@@ -456,6 +464,7 @@ fn run_file_operation() -> anyhow::Result<()> {
         process: process_options,
         no_header: args.no_header,
         jobs: args.jobs,
+        no_ignore: args.no_ignore,
     };
 
     if path.is_dir() {
@@ -580,8 +589,13 @@ mod tests {
     /// Ensure boolean flags are NOT registered as value-consuming.
     #[test]
     fn test_is_flag_with_value_rejects_boolean_flags() {
-        let boolean_flags: &[&str] =
-            &["--no-header", "--no-cache", "--clear-cache", "--show-stats"];
+        let boolean_flags: &[&str] = &[
+            "--no-header",
+            "--no-ignore",
+            "--no-cache",
+            "--clear-cache",
+            "--show-stats",
+        ];
 
         for flag in boolean_flags {
             assert!(
