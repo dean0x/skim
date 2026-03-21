@@ -72,7 +72,7 @@ pub(crate) struct CacheWriteParams<'a> {
 
 /// Returns the platform-specific cache directory (`~/.cache/skim/` on Linux/macOS),
 /// creating it with owner-only permissions if it does not yet exist.
-fn get_cache_dir() -> Result<PathBuf> {
+pub(crate) fn get_cache_dir() -> Result<PathBuf> {
     let cache_dir = dirs::cache_dir()
         .ok_or_else(|| anyhow::anyhow!("Failed to determine cache directory"))?
         .join("skim");

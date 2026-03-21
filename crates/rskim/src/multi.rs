@@ -201,6 +201,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
 
     let mut success_count = 0;
     let mut error_count = 0;
+    let mut guardrail_count = 0usize;
     let mut total_original_tokens = 0usize;
     let mut total_transformed_tokens = 0usize;
 
@@ -218,6 +219,10 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
 
                 write!(writer, "{}", process_result.output)?;
                 success_count += 1;
+
+                if process_result.guardrail_triggered {
+                    guardrail_count += 1;
+                }
 
                 if let (Some(orig), Some(trans)) = (
                     process_result.original_tokens,
@@ -244,6 +249,14 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         eprintln!(
             "\nProcessed {} file(s) successfully, {} failed",
             success_count, error_count
+        );
+    }
+
+    if guardrail_count > 0 {
+        let total = success_count + error_count;
+        eprintln!(
+            "[skim:guardrail] triggered on {}/{} files",
+            guardrail_count, total
         );
     }
 

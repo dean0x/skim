@@ -156,40 +156,62 @@ impl Language {
     /// Returns parsing or transformation errors specific to the language.
     pub(crate) fn transform_source(self, source: &str, config: &TransformConfig) -> Result<String> {
         // Full mode: return original source unchanged (documented contract)
-        if config.mode == Mode::Full {
+        let result = if config.mode == Mode::Full {
             if let Some(max_lines) = config.max_lines {
-                return crate::transform::truncate::simple_line_truncate(source, self, max_lines);
+                crate::transform::truncate::simple_line_truncate(source, self, max_lines)?
+            } else {
+                source.to_string()
             }
-            return Ok(source.to_string());
         }
-
         // Minimal/Pseudo mode passthrough for serde-based and Markdown languages
-        if matches!(config.mode, Mode::Minimal | Mode::Pseudo)
+        else if matches!(config.mode, Mode::Minimal | Mode::Pseudo)
             && (self.is_serde_based() || self == Self::Markdown)
         {
             // Apply simple truncation for passthrough if max_lines is set
             if let Some(max_lines) = config.max_lines {
-                return crate::transform::truncate::simple_line_truncate(source, self, max_lines);
+                crate::transform::truncate::simple_line_truncate(source, self, max_lines)?
+            } else {
+                source.to_string()
             }
-            return Ok(source.to_string());
-        }
-
-        // Serde-based languages use their own parsers; tree-sitter languages
-        // handle truncation inside transform_tree.
-        let result = match self {
-            Self::Json => crate::transform::json::transform_json(source)?,
-            Self::Yaml => crate::transform::yaml::transform_yaml(source)?,
-            Self::Toml => crate::transform::toml::transform_toml(source)?,
-            _ => {
-                let mut parser = Parser::new(self)?;
-                let tree = parser.parse(source)?;
-                return crate::transform::transform_tree(source, &tree, self, config);
+        } else {
+            // Serde-based languages use their own parsers; tree-sitter languages
+            // handle truncation inside transform_tree.
+            match self {
+                Self::Json => {
+                    let r = crate::transform::json::transform_json(source)?;
+                    if let Some(max_lines) = config.max_lines {
+                        crate::transform::truncate::simple_line_truncate(&r, self, max_lines)?
+                    } else {
+                        r
+                    }
+                }
+                Self::Yaml => {
+                    let r = crate::transform::yaml::transform_yaml(source)?;
+                    if let Some(max_lines) = config.max_lines {
+                        crate::transform::truncate::simple_line_truncate(&r, self, max_lines)?
+                    } else {
+                        r
+                    }
+                }
+                Self::Toml => {
+                    let r = crate::transform::toml::transform_toml(source)?;
+                    if let Some(max_lines) = config.max_lines {
+                        crate::transform::truncate::simple_line_truncate(&r, self, max_lines)?
+                    } else {
+                        r
+                    }
+                }
+                _ => {
+                    let mut parser = Parser::new(self)?;
+                    let tree = parser.parse(source)?;
+                    crate::transform::transform_tree(source, &tree, self, config)?
+                }
             }
         };
 
-        // Apply simple line truncation for serde-based languages if max_lines is set
-        if let Some(max_lines) = config.max_lines {
-            crate::transform::truncate::simple_line_truncate(&result, self, max_lines)
+        // Apply last_lines truncation as a post-processing step
+        if let Some(n) = config.last_lines {
+            crate::transform::truncate::simple_last_line_truncate(&result, self, n)
         } else {
             Ok(result)
         }
@@ -418,6 +440,15 @@ pub struct TransformConfig {
     ///
     /// When None, no truncation is applied (full output).
     pub max_lines: Option<usize>,
+
+    /// Last N lines truncation
+    ///
+    /// When set, keeps only the last N lines of output, prepending a
+    /// language-appropriate truncation marker. Mutually exclusive with
+    /// `max_lines` (enforced at CLI level).
+    ///
+    /// When None, no last-lines truncation is applied.
+    pub last_lines: Option<usize>,
 }
 
 impl Default for TransformConfig {
@@ -427,6 +458,7 @@ impl Default for TransformConfig {
             preserve_comments: true,
             cache_enabled: false,
             max_lines: None,
+            last_lines: None,
         }
     }
 }
@@ -458,6 +490,15 @@ impl TransformConfig {
     /// selection that preserves AST node boundaries.
     pub fn with_max_lines(mut self, n: usize) -> Self {
         self.max_lines = Some(n);
+        self
+    }
+
+    /// Builder: Set last-N-lines truncation
+    ///
+    /// When set, keeps only the last `n` lines of output, prepending a
+    /// language-appropriate truncation marker.
+    pub fn with_last_lines(mut self, n: usize) -> Self {
+        self.last_lines = Some(n);
         self
     }
 }
@@ -675,6 +716,15 @@ mod tests {
 
         assert_eq!(config.mode, Mode::Structure);
         assert_eq!(config.max_lines, Some(50));
+    }
+
+    #[test]
+    fn test_transform_config_with_last_lines() {
+        let config = TransformConfig::with_mode(Mode::Structure).with_last_lines(10);
+
+        assert_eq!(config.mode, Mode::Structure);
+        assert_eq!(config.last_lines, Some(10));
+        assert_eq!(config.max_lines, None);
     }
 
     #[test]

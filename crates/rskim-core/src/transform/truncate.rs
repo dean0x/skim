@@ -270,6 +270,41 @@ pub(crate) fn simple_line_truncate(
     Ok(output)
 }
 
+/// Simple last-line truncation: keeps only the last N lines of output
+///
+/// Takes the last (N-1) lines plus a truncation marker indicating how many
+/// lines were omitted above. Uses language-appropriate comment syntax.
+pub(crate) fn simple_last_line_truncate(
+    text: &str,
+    language: Language,
+    n: usize,
+) -> Result<String> {
+    let lines: Vec<&str> = text.lines().collect();
+
+    if lines.len() <= n {
+        return Ok(text.to_string());
+    }
+
+    let prefix = get_comment_prefix(language);
+    let suffix = get_comment_suffix(language);
+    let omitted = lines.len() - n + 1;
+    let marker = format!("{} ... ({} lines above){}", prefix, omitted, suffix);
+
+    // Take last (n - 1) lines, prepend marker
+    let content_lines = n.saturating_sub(1);
+    let start = lines.len() - content_lines;
+    let mut result: Vec<&str> = Vec::with_capacity(n);
+    result.push(&marker);
+    result.extend_from_slice(&lines[start..]);
+
+    let mut output = result.join("\n");
+    if text.ends_with('\n') {
+        output.push('\n');
+    }
+
+    Ok(output)
+}
+
 /// Count the number of omission markers needed for a position-sorted selection
 ///
 /// Counts:
@@ -1185,5 +1220,88 @@ mod tests {
                 budget
             );
         }
+    }
+
+    // ========================================================================
+    // simple_last_line_truncate tests
+    // ========================================================================
+
+    #[test]
+    fn test_last_line_no_truncation_when_within_budget() {
+        let text = "line 1\nline 2\nline 3\n";
+        let result = simple_last_line_truncate(text, Language::TypeScript, 5).unwrap();
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_last_line_no_truncation_when_exact() {
+        let text = "line 1\nline 2\nline 3\n";
+        let result = simple_last_line_truncate(text, Language::TypeScript, 3).unwrap();
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_last_line_truncation_keeps_last_lines() {
+        let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        let result = simple_last_line_truncate(text, Language::TypeScript, 3).unwrap();
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines.len(), 3);
+        assert!(result_lines[0].contains("... (3 lines above)"));
+        assert_eq!(result_lines[1], "line 4");
+        assert_eq!(result_lines[2], "line 5");
+    }
+
+    #[test]
+    fn test_last_line_truncation_preserves_trailing_newline() {
+        let text = "line 1\nline 2\nline 3\nline 4\n";
+        let result = simple_last_line_truncate(text, Language::TypeScript, 2).unwrap();
+        assert!(
+            result.ends_with('\n'),
+            "Should preserve trailing newline: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_last_line_truncation_no_trailing_newline() {
+        let text = "line 1\nline 2\nline 3\nline 4";
+        let result = simple_last_line_truncate(text, Language::TypeScript, 2).unwrap();
+        assert!(
+            !result.ends_with('\n'),
+            "Should not add trailing newline: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_last_line_truncation_python_marker() {
+        let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
+        let result = simple_last_line_truncate(text, Language::Python, 2).unwrap();
+        assert!(
+            result.contains("# ... (2 lines above)"),
+            "Python should use # for marker: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_last_line_truncation_markdown_marker() {
+        let text = "# H1\n## H2\n## H3\n## H4\n";
+        let result = simple_last_line_truncate(text, Language::Markdown, 2).unwrap();
+        assert!(
+            result.contains("<!-- ... (3 lines above) -->"),
+            "Markdown should use HTML comment for marker: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_last_line_truncation_single_line_budget() {
+        let text = "line 1\nline 2\nline 3\n";
+        let result = simple_last_line_truncate(text, Language::TypeScript, 1).unwrap();
+        let result_lines: Vec<&str> = result.lines().collect();
+        // With n=1: marker only (n-1 = 0 content lines)
+        assert_eq!(result_lines.len(), 1);
+        assert!(result_lines[0].contains("... (3 lines above)"));
     }
 }

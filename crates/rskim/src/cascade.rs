@@ -12,11 +12,18 @@ use crate::tokens;
 const NO_OUTPUT_MSG: &str = "Token budget cascade: no transformation mode produced output. \
     Ensure the file is in a supported language or specify --language.";
 
-/// Build a `TransformConfig` from mode and optional max_lines.
-pub(crate) fn build_config(mode: Mode, max_lines: Option<usize>) -> TransformConfig {
+/// Build a `TransformConfig` from mode and optional max_lines/last_lines.
+pub(crate) fn build_config(
+    mode: Mode,
+    max_lines: Option<usize>,
+    last_lines: Option<usize>,
+) -> TransformConfig {
     let mut config = TransformConfig::with_mode(mode);
     if let Some(n) = max_lines {
         config = config.with_max_lines(n);
+    }
+    if let Some(n) = last_lines {
+        config = config.with_last_lines(n);
     }
     config
 }
@@ -61,6 +68,7 @@ fn fallback_line_truncate(
 pub(crate) fn cascade_for_token_budget<F>(
     starting_mode: Mode,
     max_lines: Option<usize>,
+    last_lines: Option<usize>,
     token_budget: usize,
     language: Language,
     transform_fn: F,
@@ -76,6 +84,7 @@ where
         return cascade_serde(
             starting_mode,
             max_lines,
+            last_lines,
             token_budget,
             language,
             &transform_fn,
@@ -88,7 +97,7 @@ where
     let mut last_token_count: Option<usize> = None;
 
     for &mode in cascade {
-        let config = build_config(mode, max_lines);
+        let config = build_config(mode, max_lines, last_lines);
 
         let Some(output) = transform_fn(&config)? else {
             continue;
@@ -134,6 +143,7 @@ where
 fn cascade_serde<F>(
     starting_mode: Mode,
     max_lines: Option<usize>,
+    last_lines: Option<usize>,
     token_budget: usize,
     language: Language,
     transform_fn: &F,
@@ -141,7 +151,7 @@ fn cascade_serde<F>(
 where
     F: Fn(&TransformConfig) -> anyhow::Result<Option<String>>,
 {
-    let config = build_config(starting_mode, max_lines);
+    let config = build_config(starting_mode, max_lines, last_lines);
     let first_output = transform_fn(&config)?.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
 
     let first_tokens = count_tokens_or_max(&first_output);
@@ -151,7 +161,7 @@ where
 
     // If starting at Full/Minimal/Pseudo, try structure-extracted (the only other distinct output)
     if matches!(starting_mode, Mode::Full | Mode::Minimal | Mode::Pseudo) {
-        let structure_config = build_config(Mode::Structure, max_lines);
+        let structure_config = build_config(Mode::Structure, max_lines, last_lines);
         if let Some(extracted) = transform_fn(&structure_config)? {
             let extracted_tokens = count_tokens_or_max(&extracted);
             if extracted_tokens <= token_budget {
@@ -215,9 +225,15 @@ mod tests {
         ];
         let transform = mock_transform(source, &mode_sizes);
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, None, 10, Language::TypeScript, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            None,
+            None,
+            10,
+            Language::TypeScript,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "word1 word2 word3");
@@ -234,9 +250,15 @@ mod tests {
         ];
         let transform = mock_transform(source, &mode_sizes);
 
-        let (_output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, None, 10, Language::TypeScript, transform)
-                .unwrap();
+        let (_output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            None,
+            None,
+            10,
+            Language::TypeScript,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Signatures);
     }
@@ -252,9 +274,15 @@ mod tests {
         ];
         let transform = mock_transform(source, &mode_sizes);
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, None, 5, Language::TypeScript, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            None,
+            None,
+            5,
+            Language::TypeScript,
+            transform,
+        )
+        .unwrap();
 
         // Should use the most aggressive mode that produced output
         assert_eq!(mode_used, Mode::Types);
@@ -276,7 +304,7 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Types, None, 10, Language::TypeScript, transform)
+            cascade_for_token_budget(Mode::Types, None, None, 10, Language::TypeScript, transform)
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Types);
@@ -288,8 +316,14 @@ mod tests {
         // All modes return None → should error
         let transform = |_config: &TransformConfig| -> anyhow::Result<Option<String>> { Ok(None) };
 
-        let result =
-            cascade_for_token_budget(Mode::Structure, None, 100, Language::TypeScript, transform);
+        let result = cascade_for_token_budget(
+            Mode::Structure,
+            None,
+            None,
+            100,
+            Language::TypeScript,
+            transform,
+        );
 
         assert!(result.is_err());
         assert!(result
@@ -308,7 +342,8 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, None, 10, Language::Json, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, None, None, 10, Language::Json, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Full);
         assert_eq!(output, "a b c d e");
@@ -322,7 +357,8 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, None, 10, Language::Json, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, None, None, 10, Language::Json, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "a b c d e");
@@ -336,7 +372,7 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, None, 5, Language::Json, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, None, None, 5, Language::Json, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
@@ -356,7 +392,8 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, None, 5, Language::Yaml, transform).unwrap();
+            cascade_for_token_budget(Mode::Structure, None, None, 5, Language::Yaml, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
@@ -373,7 +410,8 @@ mod tests {
         // Serde language where transform returns None for starting mode
         let transform = |_config: &TransformConfig| -> anyhow::Result<Option<String>> { Ok(None) };
 
-        let result = cascade_for_token_budget(Mode::Full, None, 100, Language::Toml, transform);
+        let result =
+            cascade_for_token_budget(Mode::Full, None, None, 100, Language::Toml, transform);
 
         assert!(result.is_err());
         assert!(result

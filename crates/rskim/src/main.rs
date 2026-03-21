@@ -53,6 +53,7 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--jobs"
             | "-j"
             | "--max-lines"
+            | "--last-lines"
             | "--tokens"
     )
 }
@@ -262,6 +263,14 @@ struct Args {
     )]
     max_lines: Option<usize>,
 
+    /// Keep only the last N lines of output
+    ///
+    /// Keeps the last N lines of output, prepending a language-appropriate
+    /// truncation marker indicating how many lines were omitted above.
+    /// Mutually exclusive with --max-lines.
+    #[arg(long, value_name = "N", help = "Keep only the last N lines of output")]
+    last_lines: Option<usize>,
+
     /// Token budget - cascade through modes until output fits within N tokens
     ///
     /// Progressively applies more aggressive modes (full -> minimal -> structure
@@ -379,7 +388,7 @@ fn validate_bounded_arg(
     Ok(())
 }
 
-/// Validate all numeric CLI flags (`--jobs`, `--max-lines`, `--tokens`)
+/// Validate all numeric CLI flags (`--jobs`, `--max-lines`, `--last-lines`, `--tokens`)
 fn validate_args(args: &Args) -> anyhow::Result<()> {
     validate_bounded_arg(
         args.jobs,
@@ -397,12 +406,26 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         "Files exceeding this limit should be processed without truncation.",
     )?;
     validate_bounded_arg(
+        args.last_lines,
+        "--last-lines",
+        MAX_MAX_LINES,
+        Some("Use --last-lines 1 to get a single line of output."),
+        "Files exceeding this limit should be processed without truncation.",
+    )?;
+    validate_bounded_arg(
         args.tokens,
         "--tokens",
         MAX_TOKEN_BUDGET,
         Some("Use --tokens 1 to get the minimum possible output."),
         "This exceeds any reasonable LLM context window.",
     )?;
+
+    if args.max_lines.is_some() && args.last_lines.is_some() {
+        anyhow::bail!(
+            "--max-lines and --last-lines are mutually exclusive\n\
+             Use --max-lines to keep the first N lines, or --last-lines to keep the last N lines."
+        );
+    }
 
     if args.filename.is_some() && args.file.as_deref() != Some("-") {
         anyhow::bail!(
@@ -453,6 +476,7 @@ fn run_file_operation() -> anyhow::Result<()> {
         use_cache: !args.no_cache,
         show_stats: args.show_stats,
         max_lines: args.max_lines,
+        last_lines: args.last_lines,
         token_budget: args.tokens,
     };
 
@@ -570,6 +594,7 @@ mod tests {
         "--jobs",
         "-j",
         "--max-lines",
+        "--last-lines",
         "--tokens",
     ];
 
