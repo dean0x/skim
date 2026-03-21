@@ -1,0 +1,6 @@
+ WARN  Issues with peer dependencies found
+.../node_modules/.pnpm/vitest@1.0.0/node_modules/vitest
+└── @vitest/runner 1.0.0
+Packages are hard linked from the content-addressable store
+
+{"numTotalTestSuites":1,"numPassedTestSuites":1,"numFailedTestSuites":0,"numPassedTests":2,"numFailedTests":0,"numPendingTests":0,"testResults":[{"assertionResults":[{"status":"passed","fullName":"test_a","failureMessages":[]},{"status":"passed","fullName":"test_b","failureMessages":[]}]}]}
