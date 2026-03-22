@@ -171,9 +171,8 @@ fn user_has_flag(args: &[String], flags: &[&str]) -> bool {
 
 /// Check whether the user has specified a limit flag (`-n`, `--max-count`).
 fn has_limit_flag(args: &[String]) -> bool {
-    args.iter().any(|a| {
-        a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
-    })
+    args.iter()
+        .any(|a| a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count="))
 }
 
 /// Convert an optional exit code to an ExitCode.
