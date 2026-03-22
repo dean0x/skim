@@ -1,0 +1,16 @@
+============================= test session starts ==============================
+collected 3 items
+
+tests/test_math.py .F.                                                    [100%]
+
+=================================== FAILURES ===================================
+________________________________ test_divide ___________________________________
+
+    def test_divide():
+>       assert divide(1, 0) == 0
+E       ZeroDivisionError: division by zero
+
+tests/test_math.py:10: ZeroDivisionError
+=========================== short test summary info ============================
+FAILED tests/test_math.py::test_divide - ZeroDivisionError: division by zero
+========================= 2 passed, 1 failed in 0.15s =========================

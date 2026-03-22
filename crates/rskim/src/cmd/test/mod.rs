@@ -1,15 +1,16 @@
-//! Test subcommand dispatcher (#48, #49)
+//! Test subcommand dispatcher (#47, #48, #49)
 //!
 //! Routes `skim test <runner> [args...]` to the appropriate test parser.
-//! Currently supported runners: `go`, `vitest`, `jest`.
+//! Currently supported runners: `go`, `vitest`, `jest`, `pytest`.
 
 pub(crate) mod go;
+mod pytest;
 pub(crate) mod vitest;
 
 use std::process::ExitCode;
 
 /// Known test runners that `skim test` can dispatch to.
-const KNOWN_RUNNERS: &[&str] = &["go", "vitest", "jest"];
+const KNOWN_RUNNERS: &[&str] = &["go", "vitest", "jest", "pytest"];
 
 /// Entry point for `skim test <runner> [args...]`.
 ///
@@ -27,6 +28,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     match runner {
         "go" => go::run(runner_args),
         "vitest" | "jest" => vitest::run(runner, runner_args),
+        "pytest" => pytest::run(runner_args),
         _ => {
             eprintln!(
                 "skim test: unknown runner '{runner}'\n\
@@ -51,9 +53,8 @@ fn print_help() {
     println!();
     println!("Examples:");
     println!("  skim test go ./...             Run all Go tests");
-    println!("  skim test go -run TestFoo      Run specific Go test");
     println!("  skim test vitest               Run vitest");
-    println!("  skim test vitest --run math    Run specific vitest");
     println!("  skim test jest                 Run jest");
-    println!("  jest --json | skim test jest   Pipe jest output");
+    println!("  skim test pytest               Run pytest");
+    println!("  pytest ... | skim test pytest  Pipe pytest output");
 }

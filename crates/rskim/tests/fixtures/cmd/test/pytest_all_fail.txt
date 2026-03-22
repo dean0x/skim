@@ -1,0 +1,32 @@
+============================= test session starts ==============================
+collected 3 items
+
+tests/test_math.py FFF                                                   [100%]
+
+=================================== FAILURES ===================================
+_________________________________ test_add _________________________________
+
+    def test_add():
+>       assert add(1, 1) == 3
+E       AssertionError: assert 2 == 3
+
+tests/test_math.py:4: AssertionError
+________________________________ test_subtract ________________________________
+
+    def test_subtract():
+>       assert subtract(5, 3) == 1
+E       AssertionError: assert 2 == 1
+
+tests/test_math.py:8: AssertionError
+________________________________ test_multiply ________________________________
+
+    def test_multiply():
+>       assert multiply(2, 3) == 7
+E       AssertionError: assert 6 == 7
+
+tests/test_math.py:12: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_math.py::test_add - AssertionError: assert 2 == 3
+FAILED tests/test_math.py::test_subtract - AssertionError: assert 2 == 1
+FAILED tests/test_math.py::test_multiply - AssertionError: assert 6 == 7
+=== 3 failed in 0.15s ===
