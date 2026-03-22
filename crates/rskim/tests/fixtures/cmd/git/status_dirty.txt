@@ -1,0 +1,11 @@
+# branch.oid abc123def456789
+# branch.head main
+# branch.upstream origin/main
+# branch.ab +1 -0
+1 M. N... 100644 100644 100644 abc1234 def5678 src/main.rs
+1 .M N... 100644 100644 100644 abc1234 def5678 src/lib.rs
+1 A. N... 000000 100644 100644 0000000 abc1234 src/new_file.rs
+1 .D N... 100644 000000 000000 abc1234 0000000 src/old_file.rs
+2 R. N... 100644 100644 100644 abc1234 def5678 R100 src/renamed.rs	src/original.rs
+? untracked_file.txt
+? another_untracked.txt
