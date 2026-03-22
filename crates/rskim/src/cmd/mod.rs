@@ -37,9 +37,9 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 /// equivalent flag aliases. Matches both `--flag` and `--flag=value` forms.
 pub(crate) fn user_has_flag(args: &[String], flags: &[&str]) -> bool {
     args.iter().any(|a| {
-        flags
-            .iter()
-            .any(|flag| a == flag || a.starts_with(&format!("{flag}=")))
+        flags.iter().any(|flag| {
+            a == flag || (a.starts_with(flag) && a.as_bytes().get(flag.len()) == Some(&b'='))
+        })
     })
 }
 
