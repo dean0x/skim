@@ -5,7 +5,9 @@
 //! helper functions used by subcommand parsers (arg inspection, flag injection,
 //! command execution with three-tier parse degradation).
 
+mod build;
 mod completions;
+mod git;
 mod rewrite;
 mod test;
 
@@ -190,9 +192,11 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
 
     // Dispatch implemented subcommands
     match subcommand {
+        "build" => return build::run(args),
         "completions" => return completions::run(args),
+        "git" => return git::run(args),
         "rewrite" => return rewrite::run(args),
-        "test" => return test::dispatch(args),
+        "test" => return test::run(args),
         _ => {}
     }
 

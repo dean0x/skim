@@ -80,31 +80,24 @@ impl CommandRunner {
         self.run_with_env(program, args, &[])
     }
 
-    /// Execute `program` with `args` and additional environment variables,
+    /// Execute `program` with `args` and environment variable overrides,
     /// capturing stdout and stderr.
     ///
-    /// Each `(key, value)` pair in `env` is set on the child process.
+    /// Reuses the same timeout, output-size cap, and pipe-capture logic as
+    /// [`run`](Self::run). Pass an empty slice for `env_vars` when no
+    /// overrides are needed.
     pub(crate) fn run_with_env(
         &self,
         program: &str,
         args: &[&str],
-        env: &[(&str, &str)],
+        env_vars: &[(&str, &str)],
     ) -> anyhow::Result<CommandOutput> {
         let start = Instant::now();
 
         let mut cmd = Command::new(program);
         cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        // Set NO_COLOR=1 by default to suppress ANSI escape codes from child
-        // processes. This is the standard convention (https://no-color.org/)
-        // and ensures parsers receive clean text. Callers can override by
-        // passing NO_COLOR in env_overrides.
-        let caller_sets_no_color = env.iter().any(|(k, _)| *k == "NO_COLOR");
-        if !caller_sets_no_color {
-            cmd.env("NO_COLOR", "1");
-        }
-
-        for (key, value) in env {
+        for (key, value) in env_vars {
             cmd.env(key, value);
         }
 
