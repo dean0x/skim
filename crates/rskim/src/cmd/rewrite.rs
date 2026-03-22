@@ -1067,8 +1067,15 @@ fn run_hook_mode() -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Tokenize and attempt rewrite (same logic as normal mode)
-    let tokens: Vec<String> = command.split_whitespace().map(String::from).collect();
+    // Check for compound operator characters on the original string directly,
+    // before tokenizing, to avoid unnecessary allocations on the hot path.
+    let has_operator_chars = command.contains("&&")
+        || command.contains("||")
+        || command.contains(';')
+        || command.contains('|');
+
+    // Tokenize into Vec<&str> (borrowing from `command`) to avoid String allocations.
+    let tokens: Vec<&str> = command.split_whitespace().collect();
     if tokens.is_empty() {
         audit_hook(&command, false, "");
         return Ok(ExitCode::SUCCESS);
@@ -1077,14 +1084,8 @@ fn run_hook_mode() -> anyhow::Result<ExitCode> {
     let original = tokens.join(" ");
 
     // Fast path for non-compound commands
-    let has_operator_chars = original.contains("&&")
-        || original.contains("||")
-        || original.contains(';')
-        || original.contains('|');
-
     let rewritten = if !has_operator_chars {
-        let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-        try_rewrite(&token_refs).map(|r| r.tokens.join(" "))
+        try_rewrite(&tokens).map(|r| r.tokens.join(" "))
     } else {
         match split_compound(&original) {
             CompoundSplitResult::Bail => None,
@@ -1109,9 +1110,9 @@ fn run_hook_mode() -> anyhow::Result<ExitCode> {
                     },
                 },
             };
-            // Struct contains only String fields — serialization cannot fail.
-            let json_out =
-                serde_json::to_string(&response).expect("BUG: HookResponse serialization failed");
+            // Struct contains only String fields -- serialization is infallible in practice,
+            // but we propagate the error rather than panicking in the hook path.
+            let json_out = serde_json::to_string(&response)?;
             println!("{json_out}");
         }
         None => {
@@ -1197,9 +1198,12 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
     }
 }
 
-/// Get the skim cache directory (`~/.cache/skim/`).
+/// Get the skim cache directory, respecting platform conventions and `$XDG_CACHE_HOME`.
+///
+/// Uses `dirs::cache_dir()` (which respects `$XDG_CACHE_HOME` on Linux) rather
+/// than hardcoding `~/.cache/`, consistent with `crate::cache::get_cache_dir()`.
 fn cache_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cache").join("skim"))
+    dirs::cache_dir().map(|c| c.join("skim"))
 }
 
 /// Get today's date as YYYY-MM-DD string.

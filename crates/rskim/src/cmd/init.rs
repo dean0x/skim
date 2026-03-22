@@ -12,6 +12,7 @@
 //! permission system evaluate independently.
 
 use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -271,7 +272,12 @@ fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
 }
 
 /// Try to extract the skim version from the hook script referenced in a settings entry.
+///
+/// SECURITY: Validates that the resolved script path is within the expected
+/// `{config_dir}/hooks/` directory to prevent arbitrary file reads via
+/// attacker-controlled settings.json in `--project` mode.
 fn extract_hook_version_from_entry(entry: &serde_json::Value, config_dir: &Path) -> Option<String> {
+    let hooks_dir = config_dir.join("hooks");
     let hooks = entry.get("hooks")?.as_array()?;
     for hook in hooks {
         let cmd = hook.get("command")?.as_str()?;
@@ -280,9 +286,19 @@ fn extract_hook_version_from_entry(entry: &serde_json::Value, config_dir: &Path)
             let script_path = if cmd.starts_with('/') || cmd.starts_with('.') {
                 PathBuf::from(cmd)
             } else {
-                config_dir.join("hooks").join(HOOK_SCRIPT_NAME)
+                hooks_dir.join(HOOK_SCRIPT_NAME)
             };
-            if let Ok(contents) = std::fs::read_to_string(script_path) {
+
+            // Validate the resolved path is within the expected hooks directory.
+            // canonicalize() resolves symlinks and ".." to get the real path.
+            let canonical = std::fs::canonicalize(&script_path).ok()?;
+            let canonical_hooks_dir = std::fs::canonicalize(&hooks_dir).ok()?;
+            if !canonical.starts_with(&canonical_hooks_dir) {
+                // Path escapes the hooks directory -- skip version extraction.
+                return None;
+            }
+
+            if let Ok(contents) = std::fs::read_to_string(&canonical) {
                 for line in contents.lines() {
                     if let Some(ver) = line.strip_prefix("# skim-hook v").or_else(|| {
                         line.strip_prefix("export SKIM_HOOK_VERSION=\"")
@@ -301,6 +317,79 @@ fn extract_hook_version_from_entry(entry: &serde_json::Value, config_dir: &Path)
 // Config directory resolution (B6)
 // ============================================================================
 
+/// Remove skim hook entries and marketplace registration from a settings.json value.
+///
+/// 1. Removes skim entries from `hooks.PreToolUse` array
+/// 2. Cleans up empty arrays/objects
+/// 3. Removes `skim` from `extraKnownMarketplaces`
+fn remove_skim_from_settings(settings: &mut serde_json::Value) {
+    let obj = match settings.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
+
+    // Remove skim from PreToolUse
+    let hooks_empty = obj
+        .get_mut("hooks")
+        .and_then(|h| h.as_object_mut())
+        .map(|hooks_obj| {
+            let ptu_empty = hooks_obj
+                .get_mut("PreToolUse")
+                .and_then(|ptu| ptu.as_array_mut())
+                .map(|arr| {
+                    arr.retain(|entry| !has_skim_hook_entry(entry));
+                    arr.is_empty()
+                })
+                .unwrap_or(false);
+            if ptu_empty {
+                hooks_obj.remove("PreToolUse");
+            }
+            hooks_obj.is_empty()
+        })
+        .unwrap_or(false);
+    if hooks_empty {
+        obj.remove("hooks");
+    }
+
+    // Remove from extraKnownMarketplaces
+    let mkts_empty = obj
+        .get_mut("extraKnownMarketplaces")
+        .and_then(|m| m.as_object_mut())
+        .map(|mkts_obj| {
+            mkts_obj.remove("skim");
+            mkts_obj.is_empty()
+        })
+        .unwrap_or(false);
+    if mkts_empty {
+        obj.remove("extraKnownMarketplaces");
+    }
+}
+
+/// Resolve a symlink to its absolute target path.
+///
+/// `read_link()` can return relative paths. This helper joins the relative
+/// target with the symlink's parent directory, then canonicalizes to get an
+/// absolute path.
+fn resolve_symlink(link: &Path) -> anyhow::Result<PathBuf> {
+    let target = std::fs::read_link(link)?;
+    if target.is_absolute() {
+        Ok(target)
+    } else {
+        let parent = link.parent().ok_or_else(|| {
+            anyhow::anyhow!("symlink has no parent directory: {}", link.display())
+        })?;
+        let resolved = parent.join(&target);
+        std::fs::canonicalize(&resolved).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve symlink {} -> {}: {}",
+                link.display(),
+                resolved.display(),
+                e
+            )
+        })
+    }
+}
+
 fn resolve_config_dir(project: bool) -> anyhow::Result<PathBuf> {
     if project {
         Ok(std::env::current_dir()?.join(".claude"))
@@ -317,6 +406,71 @@ fn resolve_config_dir(project: bool) -> anyhow::Result<PathBuf> {
 // Install flow
 // ============================================================================
 
+/// Resolved install options from interactive prompts or --yes defaults.
+struct InstallOptions {
+    /// Whether to use project scope (overrides flags.project when user selects it interactively).
+    project: bool,
+    /// Whether to install the marketplace entry.
+    install_marketplace: bool,
+    /// Whether confirmation was already handled by the prompting phase.
+    skip_confirmation: bool,
+}
+
+/// Prompt the user for install options (scope and marketplace).
+///
+/// In non-interactive mode (--yes), returns defaults immediately.
+/// Returns `None` if the user chose project scope interactively (requires re-detection).
+fn prompt_install_options(
+    flags: &InitFlags,
+    state: &DetectedState,
+) -> anyhow::Result<InstallOptions> {
+    if flags.yes {
+        return Ok(InstallOptions {
+            project: flags.project,
+            install_marketplace: true,
+            skip_confirmation: true,
+        });
+    }
+
+    let mut use_project = flags.project;
+    let mut skip_confirmation = false;
+
+    // Scope prompt (informational -- scope is already determined by --project flag)
+    if !flags.project {
+        println!("  ? Where should skim install the hook?");
+        println!("    [1] Global (~/.claude/settings.json)  [recommended]");
+        println!("    [2] Project (.claude/settings.json)");
+        let choice = prompt_choice("  Choice [1]: ", 1, &[1, 2])?;
+        if choice == 2 {
+            println!();
+            println!("  Tip: use `skim init --project` to skip this prompt next time.");
+            use_project = true;
+            // User already made a deliberate scope choice -- skip confirmation later
+            skip_confirmation = true;
+        }
+        println!();
+    }
+
+    // Plugin prompt
+    let install_marketplace = if !state.marketplace_installed {
+        println!("  ? Install the Skimmer plugin? (codebase orientation agent)");
+        println!("    Adds /skim command and auto-orientation for new codebases");
+        println!("    [1] Yes  [recommended]");
+        println!("    [2] No");
+        let choice = prompt_choice("  Choice [1]: ", 1, &[1, 2])?;
+        println!();
+        choice == 1
+    } else {
+        true
+    };
+
+    Ok(InstallOptions {
+        project: use_project,
+        install_marketplace,
+        skip_confirmation,
+    })
+}
+
 fn run_install(flags: &InitFlags) -> anyhow::Result<ExitCode> {
     let state = detect_state(flags)?;
 
@@ -326,6 +480,90 @@ fn run_install(flags: &InitFlags) -> anyhow::Result<ExitCode> {
     println!();
 
     // Print detected state
+    print_detected_state(&state);
+
+    // Already up to date check
+    if state.hook_installed
+        && state.hook_version.as_deref() == Some(&state.skim_version)
+        && state.marketplace_installed
+    {
+        println!("  Already up to date. Nothing to do.");
+        println!();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Dual-scope warning
+    if let Some(ref warning) = state.dual_scope_warning {
+        println!("  WARNING: {warning}");
+        println!();
+    }
+
+    // Prompt for options (or use defaults for --yes)
+    let options = prompt_install_options(flags, &state)?;
+
+    // If user changed scope interactively, re-detect state with the new scope
+    let (state, flags_override);
+    if options.project != flags.project {
+        flags_override = InitFlags {
+            project: options.project,
+            yes: flags.yes,
+            dry_run: flags.dry_run,
+            uninstall: false,
+        };
+        state = detect_state(&flags_override)?;
+    } else {
+        flags_override = InitFlags {
+            project: flags.project,
+            yes: flags.yes,
+            dry_run: flags.dry_run,
+            uninstall: false,
+        };
+        state = detect_state(&flags_override)?;
+    }
+
+    // Print summary
+    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    println!("  Summary:");
+    if !state.hook_installed || state.hook_version.as_deref() != Some(&state.skim_version) {
+        println!("    * Create hook script: {}", hook_script_path.display());
+        println!(
+            "    * Patch settings: {} (add PreToolUse hook)",
+            state.settings_path.display()
+        );
+    }
+    if options.install_marketplace && !state.marketplace_installed {
+        println!("    * Register marketplace: skim (dean0x/skim)");
+    }
+    println!();
+
+    // Confirmation (skip if user already confirmed via scope change or --yes)
+    if !flags.yes && !options.skip_confirmation && !confirm_proceed()? {
+        println!("  Cancelled.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if flags_override.dry_run {
+        print_dry_run_actions(&state, options.install_marketplace);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Execute installation
+    execute_install(&state, options.install_marketplace)?;
+
+    println!();
+    println!("  Done! skim is now active in Claude Code.");
+    println!();
+    if options.install_marketplace {
+        println!("  Next step -- install the Skimmer plugin in Claude Code:");
+        println!("    /install skimmer@skim");
+        println!();
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Print the detected state summary to stdout.
+fn print_detected_state(state: &DetectedState) {
     println!("  Checking current state...");
     println!(
         "  {} skim binary: {} (v{})",
@@ -361,136 +599,6 @@ fn run_install(flags: &InitFlags) -> anyhow::Result<ExitCode> {
         hook_label
     );
     println!();
-
-    // Already up to date check
-    if state.hook_installed
-        && state.hook_version.as_deref() == Some(&state.skim_version)
-        && state.marketplace_installed
-    {
-        println!("  Already up to date. Nothing to do.");
-        println!();
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Dual-scope warning
-    if let Some(ref warning) = state.dual_scope_warning {
-        println!("  WARNING: {warning}");
-        println!();
-    }
-
-    // Interactive prompts (or defaults for --yes)
-    let install_marketplace = if flags.yes {
-        true
-    } else {
-        // Scope prompt (informational — scope is already determined by --project flag)
-        if !flags.project {
-            println!("  ? Where should skim install the hook?");
-            println!("    [1] Global (~/.claude/settings.json)  [recommended]");
-            println!("    [2] Project (.claude/settings.json)");
-            let choice = prompt_choice("  Choice [1]: ", 1, &[1, 2])?;
-            if choice == 2 {
-                // User chose project but didn't pass --project flag
-                // Re-run with project scope
-                println!();
-                println!("  Tip: use `skim init --project` to skip this prompt next time.");
-                let project_flags = InitFlags {
-                    project: true,
-                    yes: flags.yes,
-                    dry_run: flags.dry_run,
-                    uninstall: false,
-                };
-                return run_install_inner(&project_flags);
-            }
-            println!();
-        }
-
-        // Plugin prompt
-        if !state.marketplace_installed {
-            println!("  ? Install the Skimmer plugin? (codebase orientation agent)");
-            println!("    Adds /skim command and auto-orientation for new codebases");
-            println!("    [1] Yes  [recommended]");
-            println!("    [2] No");
-            let choice = prompt_choice("  Choice [1]: ", 1, &[1, 2])?;
-            println!();
-            choice == 1
-        } else {
-            true
-        }
-    };
-
-    // Print summary
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-    println!("  Summary:");
-    if !state.hook_installed || state.hook_version.as_deref() != Some(&state.skim_version) {
-        println!("    * Create hook script: {}", hook_script_path.display());
-        println!(
-            "    * Patch settings: {} (add PreToolUse hook)",
-            state.settings_path.display()
-        );
-    }
-    if install_marketplace && !state.marketplace_installed {
-        println!("    * Register marketplace: skim (dean0x/skim)");
-    }
-    println!();
-
-    // Confirmation
-    if !flags.yes && !confirm_proceed()? {
-        println!("  Cancelled.");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    if flags.dry_run {
-        print_dry_run_actions(&state, install_marketplace);
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Execute installation
-    execute_install(&state, install_marketplace)?;
-
-    println!();
-    println!("  Done! skim is now active in Claude Code.");
-    println!();
-    if install_marketplace {
-        println!("  Next step -- install the Skimmer plugin in Claude Code:");
-        println!("    /install skimmer@skim");
-        println!();
-    }
-
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Inner install function for when user changes scope interactively.
-fn run_install_inner(flags: &InitFlags) -> anyhow::Result<ExitCode> {
-    let state = detect_state(flags)?;
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-
-    println!();
-    println!("  Summary:");
-    println!("    * Create hook script: {}", hook_script_path.display());
-    println!(
-        "    * Patch settings: {} (add PreToolUse hook)",
-        state.settings_path.display()
-    );
-    println!("    * Register marketplace: skim (dean0x/skim)");
-    println!();
-
-    // No confirmation needed — already confirmed scope change
-
-    if flags.dry_run {
-        print_dry_run_actions(&state, true);
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    execute_install(&state, true)?;
-
-    println!();
-    println!("  Done! skim is now active in Claude Code.");
-    println!();
-    println!("  Next step -- install the Skimmer plugin in Claude Code:");
-    println!("    /install skimmer@skim");
-    println!();
-
-    Ok(ExitCode::SUCCESS)
 }
 
 fn execute_install(state: &DetectedState, install_marketplace: bool) -> anyhow::Result<()> {
@@ -563,14 +671,19 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
         version = state.skim_version,
     );
 
-    std::fs::write(&script_path, script_content)?;
+    // Atomic write: write to tmp, then rename to final path.
+    // A crash mid-write produces a tmp file instead of a truncated script.
+    let tmp_path = hooks_dir.join(format!("{HOOK_SCRIPT_NAME}.tmp"));
+    std::fs::write(&tmp_path, script_content)?;
 
-    // Set executable permissions
+    // Set executable permissions on the tmp file before renaming
     #[cfg(unix)]
     {
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&script_path, perms)?;
+        std::fs::set_permissions(&tmp_path, perms)?;
     }
+
+    std::fs::rename(&tmp_path, &script_path)?;
 
     Ok(())
 }
@@ -587,7 +700,7 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
 
     // Resolve symlinks before writing (don't replace symlink with regular file)
     let real_settings_path = if state.settings_path.is_symlink() {
-        std::fs::read_link(&state.settings_path)?
+        resolve_symlink(&state.settings_path)?
     } else {
         state.settings_path.clone()
     };
@@ -761,7 +874,7 @@ fn run_uninstall(flags: &InitFlags) -> anyhow::Result<ExitCode> {
     if settings_has_hook {
         // Resolve symlinks
         let real_path = if settings_path.is_symlink() {
-            std::fs::read_link(&settings_path)?
+            resolve_symlink(&settings_path)?
         } else {
             settings_path.clone()
         };
@@ -769,36 +882,7 @@ fn run_uninstall(flags: &InitFlags) -> anyhow::Result<ExitCode> {
         let contents = std::fs::read_to_string(&real_path)?;
         let mut settings: serde_json::Value = serde_json::from_str(&contents)?;
 
-        if let Some(obj) = settings.as_object_mut() {
-            // Remove skim from PreToolUse
-            if let Some(hooks) = obj.get_mut("hooks") {
-                if let Some(hooks_obj) = hooks.as_object_mut() {
-                    if let Some(ptu) = hooks_obj.get_mut("PreToolUse") {
-                        if let Some(arr) = ptu.as_array_mut() {
-                            arr.retain(|entry| !has_skim_hook_entry(entry));
-                            // Clean up empty array
-                            if arr.is_empty() {
-                                hooks_obj.remove("PreToolUse");
-                            }
-                        }
-                    }
-                    // Clean up empty hooks object
-                    if hooks_obj.is_empty() {
-                        obj.remove("hooks");
-                    }
-                }
-            }
-
-            // Remove from extraKnownMarketplaces
-            if let Some(mkts) = obj.get_mut("extraKnownMarketplaces") {
-                if let Some(mkts_obj) = mkts.as_object_mut() {
-                    mkts_obj.remove("skim");
-                    if mkts_obj.is_empty() {
-                        obj.remove("extraKnownMarketplaces");
-                    }
-                }
-            }
-        }
+        remove_skim_from_settings(&mut settings);
 
         // Atomic write
         let pretty = serde_json::to_string_pretty(&settings)?;
