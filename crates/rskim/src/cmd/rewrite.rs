@@ -1164,10 +1164,14 @@ fn check_hook_version_mismatch() {
     let _ = std::fs::write(&stamp_path, &today);
 }
 
+/// Maximum audit log size before truncation (10 MiB).
+const AUDIT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 /// A3: Audit logging for hook invocations.
 ///
 /// When `SKIM_HOOK_AUDIT=1`, appends a JSON line to `~/.cache/skim/hook-audit.log`.
-/// Failures are silently ignored (never break the hook).
+/// The log is truncated when it exceeds [`AUDIT_LOG_MAX_BYTES`] to prevent unbounded
+/// disk growth. Failures are silently ignored (never break the hook).
 fn audit_hook(original: &str, matched: bool, rewritten: &str) {
     if std::env::var("SKIM_HOOK_AUDIT").as_deref() != Ok("1") {
         return;
@@ -1177,6 +1181,13 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
         Some(dir) => dir.join("hook-audit.log"),
         None => return,
     };
+
+    // Truncate if the log exceeds the size limit (best-effort)
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() >= AUDIT_LOG_MAX_BYTES {
+            let _ = std::fs::write(&log_path, b"");
+        }
+    }
 
     // Build JSON line
     let entry = serde_json::json!({
