@@ -173,8 +173,8 @@ fn test_subcommand_short_help_exits_zero() {
 
 #[test]
 fn test_unimplemented_subcommands_are_stubs() {
-    // "completions", "rewrite", and "git" are intentionally excluded — they are implemented, not stubs.
-    for subcmd in &["init", "test", "build"] {
+    // "completions", "rewrite", "git", and "build" are intentionally excluded — they are implemented, not stubs.
+    for subcmd in &["init", "test"] {
         Command::cargo_bin("skim")
             .unwrap()
             .arg(subcmd)

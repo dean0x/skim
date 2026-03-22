@@ -1,0 +1,2 @@
+{"reason":"compiler-artifact","package_id":"rskim 1.0.0","manifest_path":"/tmp/Cargo.toml","target":{"name":"skim"},"profile":{"opt_level":"0","debuginfo":2},"features":[],"filenames":["/tmp/target/debug/skim"],"executable":"/tmp/target/debug/skim","fresh":false}
+{"reason":"build-finished","success":true}

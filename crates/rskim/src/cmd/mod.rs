@@ -4,6 +4,7 @@
 //! backward compatibility with file-first invocations. Each subcommand
 //! is currently a stub that will be implemented in later Phase B tickets.
 
+mod build;
 mod completions;
 mod git;
 mod rewrite;
@@ -44,6 +45,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
 
     // Dispatch implemented subcommands
     match subcommand {
+        "build" => return build::run(args),
         "completions" => return completions::run(args),
         "git" => return git::run(args),
         "rewrite" => return rewrite::run(args),
