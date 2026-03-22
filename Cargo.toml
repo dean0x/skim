@@ -33,7 +33,7 @@ sha2 = "0.10"
 tiktoken-rs = "0.7"
 clap_complete = "4.5"
 strip-ansi-escapes = "0.2"
-regex = "1.11"
+regex = "1"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"
