@@ -168,33 +168,30 @@ fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     let mut hook_version = None;
     let mut marketplace_installed = false;
 
-    if settings_exists {
-        if let Ok(contents) = std::fs::read_to_string(&settings_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                // Check for existing hook
-                if let Some(hooks) = json.get("hooks").and_then(|h| h.get("PreToolUse")) {
-                    if let Some(arr) = hooks.as_array() {
-                        for entry in arr {
-                            if has_skim_hook_entry(entry) {
-                                hook_installed = true;
-                                // Try to extract version from hook script
-                                hook_version = extract_hook_version_from_entry(entry, &config_dir);
-                            }
-                        }
-                    }
-                }
-                // Check for marketplace
-                if let Some(mkts) = json.get("extraKnownMarketplaces") {
-                    if mkts.get("skim").is_some() {
-                        marketplace_installed = true;
-                    }
+    if let Some(json) = read_settings_json(&settings_path) {
+        if let Some(arr) = json
+            .get("hooks")
+            .and_then(|h| h.get("PreToolUse"))
+            .and_then(|v| v.as_array())
+        {
+            for entry in arr {
+                if has_skim_hook_entry(entry) {
+                    hook_installed = true;
+                    hook_version = extract_hook_version_from_entry(entry, &config_dir);
                 }
             }
+        }
+        if json
+            .get("extraKnownMarketplaces")
+            .and_then(|m| m.get("skim"))
+            .is_some()
+        {
+            marketplace_installed = true;
         }
     }
 
     // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(flags, &config_dir)?;
+    let dual_scope_warning = check_dual_scope(flags)?;
 
     Ok(DetectedState {
         skim_binary,
@@ -209,7 +206,7 @@ fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     })
 }
 
-fn check_dual_scope(flags: &InitFlags, _current_dir: &Path) -> anyhow::Result<Option<String>> {
+fn check_dual_scope(flags: &InitFlags) -> anyhow::Result<Option<String>> {
     let other_dir = if flags.project {
         // Installing project-level, check global
         resolve_config_dir(false)?
@@ -222,54 +219,55 @@ fn check_dual_scope(flags: &InitFlags, _current_dir: &Path) -> anyhow::Result<Op
     };
 
     let other_settings = other_dir.join(SETTINGS_FILE);
-    if !other_settings.exists() {
+    let has_hook = read_settings_json(&other_settings)
+        .and_then(|json| {
+            json.get("hooks")?
+                .get("PreToolUse")?
+                .as_array()
+                .map(|arr| arr.iter().any(has_skim_hook_entry))
+        })
+        .unwrap_or(false);
+
+    if !has_hook {
         return Ok(None);
     }
 
-    if let Ok(contents) = std::fs::read_to_string(&other_settings) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-            if let Some(hooks) = json.get("hooks").and_then(|h| h.get("PreToolUse")) {
-                if let Some(arr) = hooks.as_array() {
-                    for entry in arr {
-                        if has_skim_hook_entry(entry) {
-                            let scope = if flags.project {
-                                "globally"
-                            } else {
-                                "in project"
-                            };
-                            let path = other_settings.display();
-                            let uninstall_scope = if flags.project {
-                                "--global"
-                            } else {
-                                "--project"
-                            };
-                            return Ok(Some(format!(
-                                "skim hook is also installed {scope} ({path})\n  \
-                                 Both hooks will fire, but this is harmless -- the second is a no-op.\n  \
-                                 To remove: skim init {uninstall_scope} --uninstall"
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let scope = if flags.project {
+        "globally"
+    } else {
+        "in project"
+    };
+    let uninstall_scope = if flags.project {
+        "--global"
+    } else {
+        "--project"
+    };
+    let path = other_settings.display();
+    Ok(Some(format!(
+        "skim hook is also installed {scope} ({path})\n  \
+         Both hooks will fire, but this is harmless -- the second is a no-op.\n  \
+         To remove: skim init {uninstall_scope} --uninstall"
+    )))
+}
 
-    Ok(None)
+/// Read and parse a settings.json file, returning `None` on any failure.
+fn read_settings_json(path: &Path) -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 /// Check if a PreToolUse entry contains a skim hook (substring match on "skim-rewrite").
 fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
-    if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
-        for hook in hooks {
-            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                if cmd.contains("skim-rewrite") {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|cmd| cmd.contains("skim-rewrite"))
+            })
+        })
 }
 
 /// Try to extract the skim version from the hook script referenced in a settings entry.
@@ -436,17 +434,9 @@ fn run_install(flags: &InitFlags) -> anyhow::Result<ExitCode> {
     println!();
 
     // Confirmation
-    if !flags.yes {
-        print!("  ? Proceed? [Y/n] ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if !trimmed.is_empty() && trimmed != "y" && trimmed != "yes" {
-            println!("  Cancelled.");
-            return Ok(ExitCode::SUCCESS);
-        }
-        println!();
+    if !flags.yes && !confirm_proceed()? {
+        println!("  Cancelled.");
+        return Ok(ExitCode::SUCCESS);
     }
 
     if flags.dry_run {
@@ -642,29 +632,16 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     let hook_script_str = hook_script_path.display().to_string();
 
-    // Ensure hooks object exists
-    if !obj.contains_key("hooks") {
-        obj.insert(
-            "hooks".to_string(),
-            serde_json::Value::Object(serde_json::Map::new()),
-        );
-    }
+    // Ensure hooks.PreToolUse array exists
     let hooks = obj
-        .get_mut("hooks")
-        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks' is not an object"))?;
 
-    // Ensure PreToolUse array exists
-    if !hooks.contains_key("PreToolUse") {
-        hooks.insert(
-            "PreToolUse".to_string(),
-            serde_json::Value::Array(Vec::new()),
-        );
-    }
     let pre_tool_use = hooks
-        .get_mut("PreToolUse")
-        .unwrap()
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks.PreToolUse' is not an array"))?;
 
@@ -684,15 +661,9 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
 
     // Add marketplace (if opted in)
     if install_marketplace {
-        if !obj.contains_key("extraKnownMarketplaces") {
-            obj.insert(
-                "extraKnownMarketplaces".to_string(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-        }
         let marketplaces = obj
-            .get_mut("extraKnownMarketplaces")
-            .unwrap()
+            .entry("extraKnownMarketplaces")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
             .as_object_mut()
             .ok_or_else(|| {
                 anyhow::anyhow!("settings.json 'extraKnownMarketplaces' is not an object")
@@ -737,27 +708,14 @@ fn run_uninstall(flags: &InitFlags) -> anyhow::Result<ExitCode> {
     let hook_script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
     // Check if anything is installed
-    let settings_has_hook = if settings_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&settings_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                if let Some(hooks) = json.get("hooks").and_then(|h| h.get("PreToolUse")) {
-                    if let Some(arr) = hooks.as_array() {
-                        arr.iter().any(has_skim_hook_entry)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let settings_has_hook = read_settings_json(&settings_path)
+        .and_then(|json| {
+            json.get("hooks")?
+                .get("PreToolUse")?
+                .as_array()
+                .map(|arr| arr.iter().any(has_skim_hook_entry))
+        })
+        .unwrap_or(false);
 
     let script_exists = hook_script_path.exists();
 
@@ -779,16 +737,10 @@ fn run_uninstall(flags: &InitFlags) -> anyhow::Result<ExitCode> {
             println!("    * Delete {}", hook_script_path.display());
         }
         println!();
-        print!("  ? Proceed? [Y/n] ");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if !trimmed.is_empty() && trimmed != "y" && trimmed != "yes" {
+        if !confirm_proceed()? {
             println!("  Cancelled.");
             return Ok(ExitCode::SUCCESS);
         }
-        println!();
     }
 
     if flags.dry_run {
@@ -922,6 +874,20 @@ fn prompt_choice(prompt: &str, default: u32, valid: &[u32]) -> anyhow::Result<u3
         Ok(n) if valid.contains(&n) => Ok(n),
         _ => Ok(default),
     }
+}
+
+/// Prompt the user with "Proceed? [Y/n]" and return `true` if confirmed.
+fn confirm_proceed() -> anyhow::Result<bool> {
+    print!("  ? Proceed? [Y/n] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim().to_lowercase();
+    let confirmed = trimmed.is_empty() || trimmed == "y" || trimmed == "yes";
+    if confirmed {
+        println!();
+    }
+    Ok(confirmed)
 }
 
 fn check_mark(ok: bool) -> &'static str {
