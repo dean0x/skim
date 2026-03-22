@@ -6,9 +6,7 @@
 //! - **Tier 1 (text state machine):** Scans all output lines, counting PASSED/FAILED/
 //!   SKIPPED/ERROR outcomes and extracting individual test names. Requires the summary
 //!   line to produce a `Full` result.
-//! - **Tier 2 (regex on summary only):** Falls back to regex matching on the summary
-//!   line alone when tier 1 fails. Produces a `Degraded` result.
-//! - **Tier 3 (passthrough):** Returns raw output unmodified when no summary can be
+//! - **Tier 2 (passthrough):** Returns raw output unmodified when no summary can be
 //!   found at all.
 //!
 //! ## Usage
@@ -215,20 +213,14 @@ fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
 
 /// Parse pytest output using three-tier degradation.
 ///
-/// Returns `Full` if tier 1 succeeds, `Degraded` if only tier 2 matches,
-/// or `Passthrough` if neither can extract structured data.
+/// Returns `Full` if tier 1 succeeds, or `Passthrough` if no summary line is found.
 fn parse(output: &str) -> ParseResult<TestResult> {
     // Tier 1: full text state machine
     if let Some(result) = tier1_parse(output) {
         return ParseResult::Full(result);
     }
 
-    // Tier 2: regex on summary line only
-    if let Some(result) = tier2_parse(output) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
-    }
-
-    // Tier 3: passthrough
+    // Tier 2: passthrough
     ParseResult::Passthrough(output.to_string())
 }
 
@@ -501,30 +493,6 @@ fn flush_failure(
 }
 
 // ============================================================================
-// Tier 2: Regex fallback
-// ============================================================================
-
-/// Tier 2: Extract summary from regex match on summary line only.
-///
-/// Does not attempt to extract individual test entries — only counts.
-fn tier2_parse(output: &str) -> Option<TestResult> {
-    for line in output.lines() {
-        if let Some(counts) = parse_summary_line(line.trim()) {
-            let summary = TestSummary {
-                pass: counts.pass,
-                fail: counts.fail,
-                skip: counts.skip,
-                duration_ms: counts.duration_ms,
-            };
-
-            return Some(TestResult::new(summary, vec![]));
-        }
-    }
-
-    None
-}
-
-// ============================================================================
 // Output emission
 // ============================================================================
 
@@ -649,47 +617,8 @@ mod tests {
         }
     }
 
-    // ========================================================================
-    // Tier 2 tests
-    // ========================================================================
-
     #[test]
-    fn test_tier2_summary_only() {
-        // Just the summary line, no other pytest output
-        let input = "============== 4 passed, 1 failed, 1 skipped in 0.20s ==============";
-        let _result = parse(input);
-
-        // Tier 1 will also match (summary line is enough for tier 1 too).
-        // Test tier2 directly to verify it works independently.
-        let tier2_result = tier2_parse(input);
-        assert!(tier2_result.is_some(), "tier 2 should match summary line");
-
-        let tr = tier2_result.unwrap();
-        assert_eq!(tr.summary.pass, 4);
-        assert_eq!(tr.summary.fail, 1);
-        assert_eq!(tr.summary.skip, 1);
-    }
-
-    #[test]
-    fn test_tier2_degraded_result() {
-        // Garbage output with only a summary line embedded somewhere
-        let input = "some random output\n\
-                     blah blah\n\
-                     ============== 3 passed in 0.10s ==============\n\
-                     more stuff";
-        let _result = parse(input);
-
-        // Tier 1 also matches here since summary regex matches.
-        // Test tier 2 independently:
-        let tier2_result = tier2_parse(input);
-        assert!(tier2_result.is_some());
-        let tr = tier2_result.unwrap();
-        assert_eq!(tr.summary.pass, 3);
-        assert_eq!(tr.summary.fail, 0);
-    }
-
-    #[test]
-    fn test_tier3_passthrough() {
+    fn test_passthrough() {
         let input = "totally unrelated output\nno pytest here";
         let result = parse(input);
         assert!(
@@ -908,12 +837,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tier2_extracts_duration() {
+    fn test_summary_line_extracts_duration() {
         let input = "============== 4 passed, 1 failed, 1 skipped in 0.20s ==============";
-        let tier2_result = tier2_parse(input);
-        assert!(tier2_result.is_some());
-        let tr = tier2_result.unwrap();
-        assert_eq!(tr.summary.duration_ms, Some(200));
+        let counts = parse_summary_line(input);
+        assert!(counts.is_some());
+        let counts = counts.unwrap();
+        assert_eq!(counts.duration_ms, Some(200));
     }
 
     // ========================================================================

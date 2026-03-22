@@ -139,19 +139,11 @@ fn test_known_subcommand_routes_to_stub() {
 
 #[test]
 fn test_subcommand_with_args_routes_to_stub() {
-<<<<<<< HEAD
     // "init" is a stub subcommand — passing args still returns "not yet implemented"
     Command::cargo_bin("skim")
         .unwrap()
         .arg("init")
         .arg("something")
-=======
-    // Use "build" (still a stub) — "test" is now implemented (#47).
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg("build")
-        .arg("cargo")
->>>>>>> f5618be (feat: add pytest parser with three-tier degradation (#47))
         .assert()
         .failure()
         .stderr(predicate::str::contains("not yet implemented"));
