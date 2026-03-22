@@ -706,6 +706,88 @@ fn test_hook_missing_command_field() {
 }
 
 // ============================================================================
+// Hook mode — compound commands (#45)
+// ============================================================================
+
+#[test]
+fn test_hook_compound_command_rewrite() {
+    // Send a compound command (&&) through hook mode — first segment should be rewritten
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--hook"])
+        .write_stdin(hook_payload("cargo test && cargo clippy"))
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    let rewritten = json["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap();
+    assert!(
+        rewritten.contains("skim test cargo"),
+        "First segment should be rewritten, got: {rewritten}"
+    );
+    assert!(
+        rewritten.contains("&&"),
+        "Compound operator should be preserved, got: {rewritten}"
+    );
+}
+
+#[test]
+fn test_hook_pipe_command_passthrough() {
+    // Pipe command where neither segment matches a rewrite rule — empty output
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--hook"])
+        .write_stdin(hook_payload("echo hello | grep world"))
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "Non-matching pipe command should produce empty stdout, got: {stdout}"
+    );
+}
+
+// ============================================================================
+// Hook mode — version mismatch warning (#44 A2)
+// ============================================================================
+
+#[test]
+fn test_hook_version_mismatch_warning() {
+    // Set SKIM_HOOK_VERSION to a value that differs from the compiled version,
+    // triggering the version mismatch warning on stderr.
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--hook"])
+        .env("SKIM_HOOK_VERSION", "0.0.1")
+        .write_stdin(hook_payload("cargo test"))
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("version mismatch"),
+        "Should warn about version mismatch on stderr, got: {stderr}"
+    );
+
+    // The rewrite should still succeed despite the warning
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        json["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("skim test cargo"),
+        "Rewrite should succeed despite version mismatch warning"
+    );
+}
+
+// ============================================================================
 // Help text
 // ============================================================================
 
