@@ -172,7 +172,7 @@ fn user_has_flag(args: &[String], flags: &[&str]) -> bool {
 /// Check whether the user has specified a limit flag (`-n`, `--max-count`).
 fn has_limit_flag(args: &[String]) -> bool {
     args.iter().any(|a| {
-        a == "-n" || a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
+        a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count=")
     })
 }
 
@@ -402,15 +402,16 @@ fn extract_last_path(line: &str) -> String {
 /// Extract the renamed path from a porcelain v2 type 2 entry.
 /// Format: "2 XY sub mH mI mW hH hI X_score <path>\t<origPath>"
 fn extract_renamed_path(line: &str) -> String {
-    // Tab-separated: before tab is the main entry, path is embedded
-    if let Some(tab_pos) = line.find('\t') {
-        let before_tab = &line[..tab_pos];
-        let after_tab = &line[tab_pos + 1..];
-        let new_path = before_tab.split_whitespace().last().unwrap_or("");
-        format!("{after_tab} -> {new_path}")
-    } else {
-        line.split_whitespace().last().unwrap_or("").to_string()
-    }
+    // Porcelain v2 type-2 entries always contain a tab separator:
+    // "2 XY sub mH mI mW hH hI X_score <path>\t<origPath>"
+    let tab_pos = line
+        .find('\t')
+        .expect("porcelain v2 type-2 entries always contain a tab");
+    let before_tab = &line[..tab_pos];
+    let after_tab = &line[tab_pos + 1..];
+    // Field 10 (0-indexed 9) is the new path; use splitn to preserve spaces in path
+    let new_path = before_tab.splitn(10, ' ').last().unwrap_or("");
+    format!("{after_tab} -> {new_path}")
 }
 
 /// Map index status character to a display prefix.
