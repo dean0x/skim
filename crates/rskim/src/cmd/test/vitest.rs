@@ -106,13 +106,12 @@ fn read_stdin() -> anyhow::Result<String> {
 fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     let mut final_args: Vec<String> = args.to_vec();
 
-    if !user_has_flag(args, "--reporter") {
-        // Jest uses `--json` instead of `--reporter=json`
-        if program == "jest" {
+    if program == "jest" {
+        if !user_has_flag(args, "--json") {
             final_args.push("--json".to_string());
-        } else {
-            final_args.push("--reporter=json".to_string());
         }
+    } else if !user_has_flag(args, "--reporter") {
+        final_args.push("--reporter=json".to_string());
     }
 
     let arg_refs: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
