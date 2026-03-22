@@ -251,8 +251,20 @@ fn check_dual_scope(flags: &InitFlags) -> anyhow::Result<Option<String>> {
     )))
 }
 
+/// Maximum settings.json size we'll read (10 MB). Anything larger is almost
+/// certainly not a real Claude Code settings file and could cause OOM.
+const MAX_SETTINGS_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Read and parse a settings.json file, returning `None` on any failure.
+///
+/// Rejects files larger than [`MAX_SETTINGS_SIZE`] to prevent OOM from
+/// maliciously crafted settings files (especially in `--project` mode where
+/// the file is under repository control).
 fn read_settings_json(path: &Path) -> Option<serde_json::Value> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_SETTINGS_SIZE {
+        return None;
+    }
     let contents = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&contents).ok()
 }
@@ -705,8 +717,22 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
         state.settings_path.clone()
     };
 
-    // Read existing settings or start fresh
-    let mut settings: serde_json::Value = if state.settings_exists {
+    // Read existing settings or start fresh.
+    // Re-check file existence here instead of using cached `state.settings_exists`
+    // to avoid TOCTOU race between detect_state() and this write path.
+    let settings_exists_now = real_settings_path.exists();
+    let mut settings: serde_json::Value = if settings_exists_now {
+        // Guard against oversized files (e.g., attacker-controlled .claude/settings.json)
+        let file_size = std::fs::metadata(&real_settings_path)?.len();
+        if file_size > MAX_SETTINGS_SIZE {
+            anyhow::bail!(
+                "settings.json is too large ({} bytes, max {} bytes): {}\n\
+                 hint: This does not look like a valid Claude Code settings file",
+                file_size,
+                MAX_SETTINGS_SIZE,
+                real_settings_path.display()
+            );
+        }
         let contents = std::fs::read_to_string(&real_settings_path)?;
         if contents.trim().is_empty() {
             // Empty file — treat as {}
@@ -729,8 +755,8 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json root is not an object"))?;
 
-    // Back up existing file
-    if state.settings_exists {
+    // Back up existing file (use fresh check, not cached state)
+    if settings_exists_now {
         let backup_path = state.config_dir.join(SETTINGS_BACKUP);
         std::fs::copy(&real_settings_path, &backup_path)?;
         println!(
@@ -879,6 +905,17 @@ fn run_uninstall(flags: &InitFlags) -> anyhow::Result<ExitCode> {
             settings_path.clone()
         };
 
+        // Guard against oversized files
+        let file_size = std::fs::metadata(&real_path)?.len();
+        if file_size > MAX_SETTINGS_SIZE {
+            anyhow::bail!(
+                "settings.json is too large ({} bytes, max {} bytes): {}\n\
+                 hint: This does not look like a valid Claude Code settings file",
+                file_size,
+                MAX_SETTINGS_SIZE,
+                real_path.display()
+            );
+        }
         let contents = std::fs::read_to_string(&real_path)?;
         let mut settings: serde_json::Value = serde_json::from_str(&contents)?;
 
