@@ -1,4 +1,4 @@
-//! Command rewrite engine (#43)
+//! Command rewrite engine (#43, #44)
 //!
 //! Rewrites common developer commands into skim equivalents using a two-layer
 //! rule system:
@@ -10,6 +10,11 @@
 //!
 //! **Layer 2 — Custom handlers**: For commands requiring argument inspection
 //! (cat, head, tail) where simple prefix matching is insufficient.
+//!
+//! **Hook mode** (`--hook`): Runs as a Claude Code PreToolUse hook. Reads JSON
+//! from stdin, extracts `tool_input.command`, rewrites if matched, and emits
+//! hook-protocol JSON. Never sets `permissionDecision` — skim only sets
+//! `updatedInput` and lets Claude Code's permission system evaluate independently.
 
 use std::io::{self, BufRead, IsTerminal, Read};
 use std::process::ExitCode;
@@ -102,6 +107,29 @@ struct SuggestOutput<'a> {
     confidence: &'a str,
     compound: bool,
     skim_hook_version: &'a str,
+}
+
+// ---- Hook response types (#44) ----
+// SECURITY INVARIANT: No `permissionDecision` field. Skim only sets `updatedInput`
+// and lets Claude Code's permission system evaluate independently.
+
+#[derive(Serialize)]
+struct HookResponse {
+    #[serde(rename = "hookSpecificOutput")]
+    hook_specific_output: HookSpecificOutput,
+}
+
+#[derive(Serialize)]
+struct HookSpecificOutput {
+    #[serde(rename = "hookEventName")]
+    hook_event_name: String,
+    #[serde(rename = "updatedInput")]
+    updated_input: UpdatedInput,
+}
+
+#[derive(Serialize)]
+struct UpdatedInput {
+    command: String,
 }
 
 fn serialize_category<S: serde::Serializer>(
@@ -224,13 +252,18 @@ const REWRITE_RULES: &[RewriteRule] = &[
 /// Run the `rewrite` subcommand. Returns the process exit code.
 ///
 /// Exit code semantics:
-/// - 0: rewrite found, printed to stdout
+/// - 0: rewrite found, printed to stdout (or hook mode always)
 /// - 1: no rewrite match (or compound command, or invalid input)
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     // Handle --help / -h
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // Hook mode: run as Claude Code PreToolUse hook (#44)
+    if args.iter().any(|a| a == "--hook") {
+        return run_hook_mode();
     }
 
     // Check for --suggest flag (must be first non-help flag)
@@ -972,6 +1005,235 @@ fn try_rewrite_tail(args: &[&str]) -> Option<RewriteResult> {
 }
 
 // ============================================================================
+// Hook mode (#44) — Claude Code PreToolUse integration
+// ============================================================================
+
+/// Maximum bytes to read from stdin in hook mode (64 KiB).
+/// Hook payloads are small JSON objects; this prevents unbounded allocation.
+const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
+
+/// Run as a Claude Code PreToolUse hook.
+///
+/// Protocol:
+/// 1. Read JSON from stdin (bounded)
+/// 2. Extract `tool_input.command`
+/// 3. On parse/extract failure: exit 0, empty stdout (passthrough)
+/// 4. Run command through rewrite logic
+/// 5. On match: emit hook response JSON, exit 0
+/// 6. On no match: exit 0, empty stdout (passthrough)
+///
+/// SECURITY INVARIANT: Never sets `permissionDecision`. Only sets `updatedInput`.
+fn run_hook_mode() -> anyhow::Result<ExitCode> {
+    // A2: Version mismatch check — rate-limited daily warning
+    check_hook_version_mismatch();
+
+    // Read stdin (bounded)
+    let mut stdin_buf = String::new();
+    let bytes_read = io::stdin()
+        .lock()
+        .take(HOOK_MAX_STDIN_BYTES)
+        .read_to_string(&mut stdin_buf);
+
+    let stdin_buf = match bytes_read {
+        Ok(_) => stdin_buf,
+        Err(_) => return Ok(ExitCode::SUCCESS), // passthrough on read failure
+    };
+
+    // Parse as JSON
+    let json: serde_json::Value = match serde_json::from_str(&stdin_buf) {
+        Ok(v) => v,
+        Err(_) => {
+            audit_hook("", false, "");
+            return Ok(ExitCode::SUCCESS); // passthrough on parse failure
+        }
+    };
+
+    // Extract tool_input.command
+    let command = match json
+        .get("tool_input")
+        .and_then(|ti| ti.get("command"))
+        .and_then(|c| c.as_str())
+    {
+        Some(cmd) => cmd.to_string(),
+        None => {
+            audit_hook("", false, "");
+            return Ok(ExitCode::SUCCESS); // passthrough on missing field
+        }
+    };
+
+    // If already starts with "skim " — already rewritten, passthrough
+    if command.starts_with("skim ") {
+        audit_hook(&command, false, "");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Tokenize and attempt rewrite (same logic as normal mode)
+    let tokens: Vec<String> = command.split_whitespace().map(String::from).collect();
+    if tokens.is_empty() {
+        audit_hook(&command, false, "");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let original = tokens.join(" ");
+
+    // Fast path for non-compound commands
+    let has_operator_chars = original.contains("&&")
+        || original.contains("||")
+        || original.contains(';')
+        || original.contains('|');
+
+    let rewritten = if !has_operator_chars {
+        let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+        try_rewrite(&token_refs).map(|r| r.tokens.join(" "))
+    } else {
+        match split_compound(&original) {
+            CompoundSplitResult::Bail => None,
+            CompoundSplitResult::Simple(simple_tokens) => {
+                let token_refs: Vec<&str> = simple_tokens.iter().map(|s| s.as_str()).collect();
+                try_rewrite(&token_refs).map(|r| r.tokens.join(" "))
+            }
+            CompoundSplitResult::Compound(segments) => {
+                try_rewrite_compound(&segments).map(|r| r.tokens.join(" "))
+            }
+        }
+    };
+
+    match rewritten {
+        Some(ref rewritten_cmd) => {
+            audit_hook(&command, true, rewritten_cmd);
+            let response = HookResponse {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PreToolUse".to_string(),
+                    updated_input: UpdatedInput {
+                        command: rewritten_cmd.clone(),
+                    },
+                },
+            };
+            // Struct contains only String fields — serialization cannot fail.
+            let json_out =
+                serde_json::to_string(&response).expect("BUG: HookResponse serialization failed");
+            println!("{json_out}");
+        }
+        None => {
+            audit_hook(&command, false, "");
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A2: Check for version mismatch between hook script and binary.
+///
+/// If `SKIM_HOOK_VERSION` is set and differs from the compiled version,
+/// emit a daily warning to stderr. Rate-limited via stamp file.
+fn check_hook_version_mismatch() {
+    let hook_version = match std::env::var("SKIM_HOOK_VERSION") {
+        Ok(v) => v,
+        Err(_) => return, // not set — nothing to check
+    };
+
+    let compiled_version = env!("CARGO_PKG_VERSION");
+    if hook_version == compiled_version {
+        return; // versions match
+    }
+
+    // Rate limit: warn at most once per day
+    let stamp_path = match cache_dir() {
+        Some(dir) => dir.join(".hook-version-warned"),
+        None => return,
+    };
+
+    let today = today_date_string();
+
+    // Check if we already warned today
+    if let Ok(contents) = std::fs::read_to_string(&stamp_path) {
+        if contents.trim() == today {
+            return; // already warned today
+        }
+    }
+
+    // Emit warning
+    eprintln!(
+        "warning: skim hook version mismatch (hook script: v{hook_version}, binary: v{compiled_version})"
+    );
+    eprintln!("hint: run `skim init --yes` to update the hook script");
+
+    // Update stamp file (best-effort)
+    let _ = std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
+    let _ = std::fs::write(&stamp_path, &today);
+}
+
+/// A3: Audit logging for hook invocations.
+///
+/// When `SKIM_HOOK_AUDIT=1`, appends a JSON line to `~/.cache/skim/hook-audit.log`.
+/// Failures are silently ignored (never break the hook).
+fn audit_hook(original: &str, matched: bool, rewritten: &str) {
+    if std::env::var("SKIM_HOOK_AUDIT").as_deref() != Ok("1") {
+        return;
+    }
+
+    let log_path = match cache_dir() {
+        Some(dir) => dir.join("hook-audit.log"),
+        None => return,
+    };
+
+    // Build JSON line
+    let entry = serde_json::json!({
+        "timestamp": today_date_string(),
+        "original": original,
+        "matched": matched,
+        "rewritten": rewritten,
+    });
+
+    // Append (best-effort)
+    let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", entry);
+    }
+}
+
+/// Get the skim cache directory (`~/.cache/skim/`).
+fn cache_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cache").join("skim"))
+}
+
+/// Get today's date as YYYY-MM-DD string.
+fn today_date_string() -> String {
+    // Use SystemTime to avoid pulling in chrono dependency
+    let now = std::time::SystemTime::now();
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Convert to days since epoch, then to date components
+    let days = secs / 86400;
+    // Simple date calculation (good enough for stamp file purposes)
+    let (year, month, day) = days_to_date(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days_since_epoch + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+// ============================================================================
 // Suggest mode output
 // ============================================================================
 
@@ -1010,6 +1272,12 @@ pub(super) fn command() -> clap::Command {
                 .help("Output JSON suggestion instead of plain text"),
         )
         .arg(
+            clap::Arg::new("hook")
+                .long("hook")
+                .action(clap::ArgAction::SetTrue)
+                .help("Run as Claude Code PreToolUse hook (reads JSON from stdin)"),
+        )
+        .arg(
             clap::Arg::new("command")
                 .value_name("COMMAND")
                 .num_args(1..)
@@ -1028,9 +1296,11 @@ fn print_help() {
     println!();
     println!("Usage: skim rewrite [--suggest] <COMMAND>...");
     println!("       echo \"cargo test\" | skim rewrite [--suggest]");
+    println!("       skim rewrite --hook  (Claude Code PreToolUse hook mode)");
     println!();
     println!("Options:");
     println!("  --suggest    Output JSON suggestion instead of plain text");
+    println!("  --hook       Run as Claude Code PreToolUse hook (reads JSON from stdin)");
     println!("  --help, -h   Print help information");
     println!();
     println!("Examples:");
@@ -1039,8 +1309,12 @@ fn print_help() {
     println!("  skim rewrite cat src/main.rs");
     println!("  echo \"pytest -v\" | skim rewrite --suggest");
     println!();
+    println!("Hook mode:");
+    println!("  Reads Claude Code PreToolUse JSON from stdin, rewrites command if");
+    println!("  matched, and emits hook-protocol JSON. Never sets permissionDecision.");
+    println!();
     println!("Exit codes:");
-    println!("  0  Rewrite found (or --suggest mode)");
+    println!("  0  Rewrite found (or --suggest/--hook mode)");
     println!("  1  No rewrite match");
 }
 
