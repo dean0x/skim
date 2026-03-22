@@ -119,6 +119,28 @@ fn test_piped_mixed() {
 }
 
 #[test]
+fn test_piped_all_failures() {
+    let fixture = include_str!("fixtures/cmd/test/pytest_all_fail.txt");
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["test", "pytest"])
+        .write_stdin(fixture)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("PASS: 0"),
+        "expected PASS: 0 in output, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("FAIL: 3"),
+        "expected FAIL: 3 in output, got: {stdout}"
+    );
+}
+
+#[test]
 fn test_piped_passthrough_for_garbage() {
     Command::cargo_bin("skim")
         .unwrap()
