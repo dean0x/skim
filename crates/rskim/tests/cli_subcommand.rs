@@ -127,26 +127,27 @@ fn test_double_dash_before_subcommand_name_routes_to_file_operation() {
 // ============================================================================
 
 #[test]
-fn test_known_subcommand_routes_to_stub() {
-    // "init" is a known subcommand, no file named "init" exists
+fn test_known_subcommand_init_is_implemented() {
+    // "init" is a known, implemented subcommand — help should work
     Command::cargo_bin("skim")
         .unwrap()
         .arg("init")
+        .arg("--help")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .success()
+        .stdout(predicate::str::contains("skim init"));
 }
 
 #[test]
-fn test_subcommand_with_args_routes_to_stub() {
-    // "init" is a stub subcommand — passing args still returns "not yet implemented"
+fn test_subcommand_init_with_unknown_flag_fails() {
+    // "init" with an unknown flag should fail gracefully
     Command::cargo_bin("skim")
         .unwrap()
         .arg("init")
-        .arg("something")
+        .arg("--nonexistent-flag")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("unknown flag"));
 }
 
 #[test]
@@ -158,7 +159,7 @@ fn test_subcommand_help_exits_zero() {
         .assert()
         .success()
         .stdout(predicate::str::contains("skim init"))
-        .stdout(predicate::str::contains("not yet implemented"));
+        .stdout(predicate::str::contains("Install skim"));
 }
 
 #[test]
@@ -172,18 +173,8 @@ fn test_subcommand_short_help_exits_zero() {
         .stdout(predicate::str::contains("skim build"));
 }
 
-#[test]
-fn test_unimplemented_subcommands_are_stubs() {
-    // "completions", "rewrite", "git", "build", and "test" are intentionally excluded — they are implemented, not stubs.
-    for subcmd in &["init"] {
-        Command::cargo_bin("skim")
-            .unwrap()
-            .arg(subcmd)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("not yet implemented"));
-    }
-}
+// All known subcommands are now implemented — no stubs remaining.
+// Previously tested init as a stub; now it's fully implemented (#44).
 
 // ============================================================================
 // File-named-as-subcommand precedence

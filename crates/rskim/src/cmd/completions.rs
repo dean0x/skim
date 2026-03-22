@@ -70,8 +70,11 @@ fn build_full_command() -> Command {
     // Add the rewrite subcommand (definition lives in rewrite.rs to avoid duplication)
     cmd = cmd.subcommand(super::rewrite::command());
 
+    // Add the init subcommand (definition lives in init.rs to avoid duplication)
+    cmd = cmd.subcommand(super::init::command());
+
     // Subcommands with full arg definitions added above — skip in the stub loop.
-    const IMPLEMENTED_SUBCOMMANDS: &[&str] = &["completions", "rewrite"];
+    const IMPLEMENTED_SUBCOMMANDS: &[&str] = &["completions", "init", "rewrite"];
 
     // Add stub subcommands for all OTHER known subcommands
     for name in super::KNOWN_SUBCOMMANDS {

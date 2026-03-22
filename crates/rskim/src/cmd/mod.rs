@@ -8,6 +8,7 @@
 mod build;
 mod completions;
 mod git;
+mod init;
 mod rewrite;
 mod test;
 
@@ -195,6 +196,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "build" => return build::run(args),
         "completions" => return completions::run(args),
         "git" => return git::run(args),
+        "init" => return init::run(args),
         "rewrite" => return rewrite::run(args),
         "test" => return test::run(args),
         _ => {}
