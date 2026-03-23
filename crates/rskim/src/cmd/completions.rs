@@ -73,8 +73,11 @@ fn build_full_command() -> Command {
     // Add the init subcommand (definition lives in init.rs to avoid duplication)
     cmd = cmd.subcommand(super::init::command());
 
+    // Add the discover subcommand (definition lives in discover.rs to avoid duplication)
+    cmd = cmd.subcommand(super::discover::command());
+
     // Subcommands with full arg definitions added above — skip in the stub loop.
-    const IMPLEMENTED_SUBCOMMANDS: &[&str] = &["completions", "init", "rewrite"];
+    const IMPLEMENTED_SUBCOMMANDS: &[&str] = &["completions", "discover", "init", "rewrite"];
 
     // Add stub subcommands for all OTHER known subcommands
     for name in super::KNOWN_SUBCOMMANDS {

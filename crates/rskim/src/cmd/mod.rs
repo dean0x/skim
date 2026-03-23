@@ -7,9 +7,11 @@
 
 mod build;
 mod completions;
+mod discover;
 mod git;
 mod init;
 mod rewrite;
+mod session;
 mod test;
 
 use std::io::{self, IsTerminal, Read, Write};
@@ -22,8 +24,15 @@ use crate::runner::{CommandOutput, CommandRunner};
 ///
 /// IMPORTANT: Only register subcommands we will actually implement.
 /// Keep this list exact — no broad patterns. See GRANITE lesson #336.
-pub(crate) const KNOWN_SUBCOMMANDS: &[&str] =
-    &["build", "completions", "git", "init", "rewrite", "test"];
+pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "build",
+    "completions",
+    "discover",
+    "git",
+    "init",
+    "rewrite",
+    "test",
+];
 
 /// Check whether `name` is a registered subcommand.
 pub(crate) fn is_known_subcommand(name: &str) -> bool {
@@ -195,6 +204,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
     match subcommand {
         "build" => return build::run(args),
         "completions" => return completions::run(args),
+        "discover" => return discover::run(args),
         "git" => return git::run(args),
         "init" => return init::run(args),
         "rewrite" => return rewrite::run(args),
