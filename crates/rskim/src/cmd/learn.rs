@@ -1277,4 +1277,152 @@ mod tests {
             "echo hello echo world"
         );
     }
+
+    // ---- classify_correction edge cases ----
+
+    #[test]
+    fn test_classify_same_length_single_non_flag_diff() {
+        // edit_dist ≤ 3, same token count, single diff on non-flag token
+        let result = classify_correction("cargo test mytest", "cargo test urtest");
+        assert_eq!(result, Some(PatternType::FlagTypo));
+    }
+
+    #[test]
+    fn test_classify_same_length_multiple_diffs() {
+        // edit_dist ≤ 3, same token count, multiple token diffs → FlagTypo
+        let result = classify_correction("cargo tst rskim", "cargo test skim");
+        assert_eq!(result, Some(PatternType::FlagTypo));
+    }
+
+    #[test]
+    fn test_classify_shared_prefix_more_failed_tokens() {
+        // Shared first 2 tokens, edit_dist > 3, more failed tokens → WrongFlag
+        let result = classify_correction(
+            "cargo test --release --verbose --all",
+            "cargo test --profile release",
+        );
+        assert_eq!(result, Some(PatternType::WrongFlag));
+    }
+
+    #[test]
+    fn test_classify_command_typo_edit_distance_2() {
+        // First token edit distance exactly 2 (crago → cargo)
+        let result = classify_correction("crago test", "cargo test");
+        assert_eq!(result, Some(PatternType::FlagTypo));
+    }
+
+    #[test]
+    fn test_classify_whitespace_only_diff() {
+        // BUG: whitespace-only difference (tokens identical after split_whitespace)
+        // currently falls through to FlagTypo — will be fixed to None in refactor.
+        let result = classify_correction("cargo  test", "cargo test");
+        assert_eq!(result, Some(PatternType::FlagTypo));
+    }
+
+    #[test]
+    fn test_classify_shared_prefix_fewer_failed_tokens() {
+        // Shared first 2 tokens, edit_dist > 3, fewer failed → MissingArg
+        let result = classify_correction("cargo test --lib", "cargo test --lib --release -v");
+        assert_eq!(result, Some(PatternType::MissingArg));
+    }
+
+    #[test]
+    fn test_classify_shared_prefix_equal_tokens() {
+        // Shared first 2 tokens, edit_dist > 3, equal count → WrongFlag
+        let result = classify_correction(
+            "cargo test --debug --extra",
+            "cargo test --release --opt",
+        );
+        assert_eq!(result, Some(PatternType::WrongFlag));
+    }
+
+    #[test]
+    fn test_classify_single_token_no_match() {
+        // Single shared token, insufficient for prefix match, edit_dist > 3
+        let result = classify_correction("cargo", "cargo test --release");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_classify_edit_dist_more_failed_tokens() {
+        // edit_dist ≤ 3, more failed tokens → FlagTypo (fall-through)
+        let result = classify_correction("cargo test -v", "cargo test");
+        assert_eq!(result, Some(PatternType::FlagTypo));
+    }
+
+    // ---- detect_corrections edge cases ----
+
+    #[test]
+    fn test_detect_corrections_multiple_pairs() {
+        // Two separate fail-fix pairs → 2 corrections
+        let inv1 =
+            make_bash_invocation("carg test", "error: command not found", true, "sess1");
+        let inv2 = make_bash_invocation("cargo test", "ok. 5 passed", false, "sess1");
+        let inv3 =
+            make_bash_invocation("cargo tset", "error: command not found", true, "sess1");
+        let inv4 = make_bash_invocation("cargo test", "ok. 5 passed", false, "sess1");
+        let invocations = vec![&inv1, &inv2, &inv3, &inv4];
+        let corrections = detect_corrections(&invocations);
+        assert_eq!(corrections.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_corrections_skips_no_result() {
+        // Failed command with result: None should be skipped entirely
+        let inv = ToolInvocation {
+            tool_name: "Bash".to_string(),
+            input: ToolInput::Bash {
+                command: "carg test".to_string(),
+            },
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            session_id: "sess1".to_string(),
+            agent: AgentKind::ClaudeCode,
+            result: None,
+        };
+        let inv2 = make_bash_invocation("cargo test", "ok", false, "sess1");
+        let invocations = vec![&inv, &inv2];
+        let corrections = detect_corrections(&invocations);
+        assert!(corrections.is_empty());
+    }
+
+    #[test]
+    fn test_detect_corrections_candidate_no_result_skipped() {
+        // Candidate with result: None is skipped; fix after it is still found
+        let failed =
+            make_bash_invocation("carg test", "error: command not found", true, "sess1");
+        let no_result = ToolInvocation {
+            tool_name: "Bash".to_string(),
+            input: ToolInput::Bash {
+                command: "cargo test".to_string(),
+            },
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            session_id: "sess1".to_string(),
+            agent: AgentKind::ClaudeCode,
+            result: None,
+        };
+        let fix = make_bash_invocation("cargo test", "ok. 5 passed", false, "sess1");
+        let invocations = vec![&failed, &no_result, &fix];
+        let corrections = detect_corrections(&invocations);
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].successful_command, "cargo test");
+    }
+
+    #[test]
+    fn test_detect_corrections_tdd_cycle_excluded() {
+        // TDD cycle (same command alternates fail/pass 3+ times) → no corrections
+        let inv1 =
+            make_bash_invocation("cargo test", "FAILED. 1 failed", true, "sess1");
+        let inv2 =
+            make_bash_invocation("cargo test", "ok. 1 passed; 0 failed", false, "sess1");
+        let inv3 =
+            make_bash_invocation("cargo test", "FAILED. 1 failed", true, "sess1");
+        let inv4 =
+            make_bash_invocation("cargo test", "ok. 1 passed; 0 failed", false, "sess1");
+        let invocations = vec![&inv1, &inv2, &inv3, &inv4];
+        let corrections = detect_corrections(&invocations);
+        assert!(
+            corrections.is_empty(),
+            "TDD cycles should not produce corrections"
+        );
+    }
 }
