@@ -325,11 +325,30 @@ fn classify_correction(failed: &str, success: &str) -> Option<PatternType> {
 }
 
 /// Simple Levenshtein distance implementation.
+///
+/// Includes length guards to prevent DoS from very long inputs:
+/// - Caps input length at 500 chars (returns length difference for longer strings)
+/// - Early-exits if length difference > 10 (obviously dissimilar)
 fn levenshtein(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
+    const MAX_INPUT_LEN: usize = 500;
+    const MAX_LEN_DIFF: usize = 10;
+
+    let a_chars: Vec<char> = a.chars().take(MAX_INPUT_LEN + 1).collect();
+    let b_chars: Vec<char> = b.chars().take(MAX_INPUT_LEN + 1).collect();
     let m = a_chars.len();
     let n = b_chars.len();
+
+    // If either input exceeds max length, return length difference as a
+    // conservative estimate (will always exceed any reasonable threshold).
+    if m > MAX_INPUT_LEN || n > MAX_INPUT_LEN {
+        return m.abs_diff(n).max(MAX_LEN_DIFF + 1);
+    }
+
+    // Early-exit: obviously dissimilar strings
+    let len_diff = m.abs_diff(n);
+    if len_diff > MAX_LEN_DIFF {
+        return len_diff;
+    }
 
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
 
@@ -362,11 +381,26 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// Heuristic: does the output content look like a command error?
 ///
-/// Checks for common error indicators in command output. Deliberately
-/// excludes "0 failed" which appears in successful test output like
-/// "test result: ok. 5 passed; 0 failed".
+/// Checks for common error indicators in command output. Only examines
+/// the first 1KB to avoid allocating a full lowercase copy of large output.
+///
+/// Uses prefix patterns for "error" to avoid false positives on benign
+/// output like "0 errors generated" or filenames containing "error".
 fn looks_like_error(content: &str) -> bool {
-    let lower = content.to_lowercase();
+    // Limit analysis to first 1KB to avoid large allocations
+    const MAX_CHECK_LEN: usize = 1024;
+    let check_content = if content.len() > MAX_CHECK_LEN {
+        // Find a safe UTF-8 boundary near the limit
+        let mut end = MAX_CHECK_LEN;
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        &content[..end]
+    } else {
+        content
+    };
+
+    let lower = check_content.to_lowercase();
 
     // Quick exclusion: "0 failed" is a success indicator in test output
     let has_failed = if lower.contains("failed") {
@@ -376,15 +410,24 @@ fn looks_like_error(content: &str) -> bool {
         false
     };
 
-    lower.contains("error")
+    // Use prefix patterns to avoid matching benign occurrences like
+    // "0 errors generated", "error_handler.rs", etc.
+    let has_error = lower.starts_with("error:")
+        || lower.starts_with("error[")
+        || lower.contains("\nerror:")
+        || lower.contains("\nerror[")
+        || lower.contains(": error:")
+        || lower.contains(": error[");
+
+    has_error
         || lower.contains("not found")
         || lower.contains("no such file")
         || lower.contains("permission denied")
         || lower.contains("command not found")
         || has_failed
         || lower.starts_with("fatal:")
-        || (content.contains("FAILED") && !lower.contains("0 failed"))
-        || content.contains("Exit code")
+        || (check_content.contains("FAILED") && !lower.contains("0 failed"))
+        || check_content.contains("Exit code")
 }
 
 // ============================================================================
@@ -523,11 +566,53 @@ fn generate_rules_content(corrections: &[CorrectionPair]) -> String {
             pair.occurrences,
             if pair.occurrences == 1 { "" } else { "s" },
         ));
-        output.push_str(&format!("Instead of: `{}`\n", pair.failed_command));
-        output.push_str(&format!("Use: `{}`\n\n", pair.successful_command));
+        output.push_str(&format!(
+            "Instead of: `{}`\n",
+            sanitize_command_for_rules(&pair.failed_command)
+        ));
+        output.push_str(&format!(
+            "Use: `{}`\n\n",
+            sanitize_command_for_rules(&pair.successful_command)
+        ));
     }
 
     output
+}
+
+/// Sanitize a command string for safe inclusion in a markdown rules file.
+///
+/// Prevents prompt injection by:
+/// - Truncating to 200 chars (commands longer than this are not useful rules)
+/// - Escaping backticks to prevent breaking out of inline code
+/// - Stripping markdown heading markers at line start
+/// - Collapsing to single line
+fn sanitize_command_for_rules(cmd: &str) -> String {
+    const MAX_COMMAND_LEN: usize = 200;
+
+    // Collapse to single line, trim whitespace
+    let single_line: String = cmd
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect::<String>();
+    let single_line = single_line.trim();
+
+    // Truncate to max length
+    let truncated = if single_line.len() > MAX_COMMAND_LEN {
+        let mut end = MAX_COMMAND_LEN;
+        while end > 0 && !single_line.is_char_boundary(end) {
+            end -= 1;
+        }
+        &single_line[..end]
+    } else {
+        single_line
+    };
+
+    // Escape backticks to prevent breaking out of inline code blocks
+    // Strip leading '#' to prevent markdown heading injection
+    let sanitized = truncated.replace('`', "'");
+    let sanitized = sanitized.trim_start_matches('#').trim_start();
+
+    sanitized.to_string()
 }
 
 /// Write the rules file to `.claude/rules/cli-corrections.md`.
@@ -1131,5 +1216,93 @@ mod tests {
     fn test_parse_args_agent_missing_value() {
         let result = parse_args(&["--agent".to_string()]);
         assert!(result.is_err());
+    }
+
+    // ---- levenshtein guards ----
+
+    #[test]
+    fn test_levenshtein_large_length_difference() {
+        // Length difference > 10 should early-exit with the difference
+        let short = "abc";
+        let long = "abcdefghijklmnop"; // 16 chars, diff = 13
+        assert_eq!(levenshtein(short, long), 13);
+    }
+
+    #[test]
+    fn test_levenshtein_oversized_input() {
+        // Inputs exceeding 500 chars should return a large value
+        let long_a: String = "a".repeat(600);
+        let long_b: String = "b".repeat(600);
+        let result = levenshtein(&long_a, &long_b);
+        assert!(result > 10, "oversized inputs should return large distance");
+    }
+
+    #[test]
+    fn test_levenshtein_normal_inputs_unchanged() {
+        // Normal-length inputs should still compute correctly
+        assert_eq!(levenshtein("cargo", "cargo"), 0);
+        assert_eq!(levenshtein("carg", "cargo"), 1);
+        assert_eq!(levenshtein("ab", "cd"), 2);
+    }
+
+    // ---- looks_like_error tightened matching ----
+
+    #[test]
+    fn test_looks_like_error_benign_error_word() {
+        // "0 errors generated" should NOT be detected as error
+        assert!(!looks_like_error("0 errors generated"));
+        // Filename containing "error" should NOT match
+        assert!(!looks_like_error("Compiling error_handler.rs"));
+    }
+
+    #[test]
+    fn test_looks_like_error_real_error_patterns() {
+        // Rust compiler error format
+        assert!(looks_like_error("error[E0308]: mismatched types"));
+        // Prefixed error on second line
+        assert!(looks_like_error("some output\nerror: aborting due to previous error"));
+        // Colon-prefixed error
+        assert!(looks_like_error("rustc: error: could not compile"));
+    }
+
+    // ---- sanitize_command_for_rules ----
+
+    #[test]
+    fn test_sanitize_command_for_rules_basic() {
+        assert_eq!(sanitize_command_for_rules("cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn test_sanitize_command_for_rules_backticks() {
+        // Backticks should be escaped to prevent breaking inline code
+        assert_eq!(
+            sanitize_command_for_rules("echo `whoami`"),
+            "echo 'whoami'"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_command_for_rules_heading_injection() {
+        // Leading '#' should be stripped to prevent heading injection
+        assert_eq!(
+            sanitize_command_for_rules("# Injected heading"),
+            "Injected heading"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_command_for_rules_truncation() {
+        let long_cmd = "x".repeat(300);
+        let result = sanitize_command_for_rules(&long_cmd);
+        assert!(result.len() <= 200);
+    }
+
+    #[test]
+    fn test_sanitize_command_for_rules_newlines() {
+        // Multi-line commands should be collapsed
+        assert_eq!(
+            sanitize_command_for_rules("echo hello\necho world"),
+            "echo hello echo world"
+        );
     }
 }
