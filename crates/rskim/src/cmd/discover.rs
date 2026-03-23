@@ -6,7 +6,7 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use super::session::{self, AgentKind, ToolInput, ToolInvocation};
+use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
 
 /// Run the discover subcommand.
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
@@ -125,34 +125,6 @@ fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
     }
 
     Ok(config)
-}
-
-/// Parse a human-readable duration string into a SystemTime in the past.
-/// Supports: Nd (days), Nh (hours), Nw (weeks).
-fn parse_duration_ago(s: &str) -> anyhow::Result<std::time::SystemTime> {
-    let s = s.trim();
-    let (num_str, unit) = if let Some(stripped) = s.strip_suffix('d') {
-        (stripped, "d")
-    } else if let Some(stripped) = s.strip_suffix('h') {
-        (stripped, "h")
-    } else if let Some(stripped) = s.strip_suffix('w') {
-        (stripped, "w")
-    } else {
-        anyhow::bail!("invalid duration format: '{s}' (expected Nd, Nh, or Nw)");
-    };
-
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid number in duration: '{s}'"))?;
-
-    let secs = match unit {
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 7 * 86400,
-        _ => unreachable!(),
-    };
-
-    Ok(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
 }
 
 // ---- Analysis ----

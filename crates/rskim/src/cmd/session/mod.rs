@@ -7,7 +7,9 @@
 mod claude;
 pub(crate) mod types;
 
-pub(crate) use types::{AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation};
+pub(crate) use types::{
+    parse_duration_ago, AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation,
+};
 
 // ============================================================================
 // SessionProvider trait

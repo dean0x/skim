@@ -77,7 +77,9 @@ fn test_rewrite_npx_vitest_with_args() {
         .args(["rewrite", "npx", "vitest", "--reporter=json", "--run"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test vitest --reporter=json --run"));
+        .stdout(predicate::str::contains(
+            "skim test vitest --reporter=json --run",
+        ));
 }
 
 #[test]
@@ -153,7 +155,9 @@ fn test_rewrite_cargo_clippy_with_args() {
         .args(["rewrite", "cargo", "clippy", "--", "-W", "clippy::pedantic"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build clippy -- -W clippy::pedantic"));
+        .stdout(predicate::str::contains(
+            "skim build clippy -- -W clippy::pedantic",
+        ));
 }
 
 // ============================================================================
@@ -164,7 +168,15 @@ fn test_rewrite_cargo_clippy_with_args() {
 fn test_rewrite_three_segment_compound() {
     skim_cmd()
         .args([
-            "rewrite", "--suggest", "cargo", "test", "&&", "cargo", "build", "&&", "cargo",
+            "rewrite",
+            "--suggest",
+            "cargo",
+            "test",
+            "&&",
+            "cargo",
+            "build",
+            "&&",
+            "cargo",
             "clippy",
         ])
         .assert()
