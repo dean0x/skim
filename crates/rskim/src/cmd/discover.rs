@@ -19,8 +19,8 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     let providers = session::get_providers(config.agent_filter);
     if providers.is_empty() {
-        eprintln!("No AI agent sessions found.");
-        eprintln!("hint: skim discover scans for Claude Code sessions in ~/.claude/projects/");
+        println!("No AI agent sessions found.");
+        println!("hint: skim discover scans for Claude Code sessions in ~/.claude/projects/");
         return Ok(ExitCode::SUCCESS);
     }
 

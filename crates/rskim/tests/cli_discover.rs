@@ -74,7 +74,7 @@ fn test_discover_no_agent_dir() {
         .env("SKIM_PROJECTS_DIR", nonexistent.to_str().unwrap())
         .assert()
         .success()
-        .stderr(predicate::str::contains("No AI agent sessions found"));
+        .stdout(predicate::str::contains("No AI agent sessions found"));
 }
 
 #[test]

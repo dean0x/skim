@@ -208,8 +208,8 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "completions" => return completions::run(args),
         "discover" => return discover::run(args),
         "git" => return git::run(args),
-        "learn" => return learn::run(args),
         "init" => return init::run(args),
+        "learn" => return learn::run(args),
         "rewrite" => return rewrite::run(args),
         "test" => return test::run(args),
         _ => {}
