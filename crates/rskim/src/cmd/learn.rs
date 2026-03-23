@@ -364,6 +364,18 @@ fn levenshtein(a: &str, b: &str) -> usize {
 // Error detection
 // ============================================================================
 
+/// Truncate a string to at most `max_len` bytes at a valid UTF-8 boundary.
+fn truncate_utf8(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        return s;
+    }
+    let mut end = max_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Heuristic: does the output content look like a command error?
 ///
 /// Checks for common error indicators in command output. Only examines
@@ -372,18 +384,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// Uses prefix patterns for "error" to avoid false positives on benign
 /// output like "0 errors generated" or filenames containing "error".
 fn looks_like_error(content: &str) -> bool {
-    // Limit analysis to first 1KB to avoid large allocations
-    const MAX_CHECK_LEN: usize = 1024;
-    let check_content = if content.len() > MAX_CHECK_LEN {
-        // Find a safe UTF-8 boundary near the limit
-        let mut end = MAX_CHECK_LEN;
-        while end > 0 && !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        &content[..end]
-    } else {
-        content
-    };
+    let check_content = truncate_utf8(content, 1024);
 
     let lower = check_content.to_lowercase();
 
@@ -572,32 +573,19 @@ fn generate_rules_content(corrections: &[CorrectionPair]) -> String {
 /// - Stripping markdown heading markers at line start
 /// - Collapsing to single line
 fn sanitize_command_for_rules(cmd: &str) -> String {
-    const MAX_COMMAND_LEN: usize = 200;
-
     // Collapse to single line, trim whitespace
     let single_line: String = cmd
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect::<String>();
+        .collect();
     let single_line = single_line.trim();
 
-    // Truncate to max length
-    let truncated = if single_line.len() > MAX_COMMAND_LEN {
-        let mut end = MAX_COMMAND_LEN;
-        while end > 0 && !single_line.is_char_boundary(end) {
-            end -= 1;
-        }
-        &single_line[..end]
-    } else {
-        single_line
-    };
-
-    // Escape backticks to prevent breaking out of inline code blocks
-    // Strip leading '#' to prevent markdown heading injection
-    let sanitized = truncated.replace('`', "'");
-    let sanitized = sanitized.trim_start_matches('#').trim_start();
-
-    sanitized.to_string()
+    // Truncate to max length, then escape/strip injection vectors
+    truncate_utf8(single_line, 200)
+        .replace('`', "'")
+        .trim_start_matches('#')
+        .trim_start()
+        .to_string()
 }
 
 /// Write the rules file to `.claude/rules/cli-corrections.md`.
@@ -1245,7 +1233,9 @@ mod tests {
         // Rust compiler error format
         assert!(looks_like_error("error[E0308]: mismatched types"));
         // Prefixed error on second line
-        assert!(looks_like_error("some output\nerror: aborting due to previous error"));
+        assert!(looks_like_error(
+            "some output\nerror: aborting due to previous error"
+        ));
         // Colon-prefixed error
         assert!(looks_like_error("rustc: error: could not compile"));
     }
@@ -1260,10 +1250,7 @@ mod tests {
     #[test]
     fn test_sanitize_command_for_rules_backticks() {
         // Backticks should be escaped to prevent breaking inline code
-        assert_eq!(
-            sanitize_command_for_rules("echo `whoami`"),
-            "echo 'whoami'"
-        );
+        assert_eq!(sanitize_command_for_rules("echo `whoami`"), "echo 'whoami'");
     }
 
     #[test]

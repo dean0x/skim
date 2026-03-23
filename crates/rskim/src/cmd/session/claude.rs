@@ -41,7 +41,10 @@ impl SessionProvider for ClaudeCodeProvider {
         let mut sessions = Vec::new();
 
         // Canonicalize projects_dir to prevent symlink traversal outside boundary
-        let canonical_root = self.projects_dir.canonicalize().unwrap_or_else(|_| self.projects_dir.clone());
+        let canonical_root = self
+            .projects_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.projects_dir.clone());
 
         // Read project directories
         let entries = std::fs::read_dir(&self.projects_dir)?;
@@ -117,9 +120,7 @@ impl SessionProvider for ClaudeCodeProvider {
     fn parse_session(&self, file: &SessionFile) -> anyhow::Result<Vec<ToolInvocation>> {
         // Guard against unbounded reads -- reject files over 100 MB
         const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
-        let file_size = std::fs::metadata(&file.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(&file.path)?.len();
         if file_size > MAX_SESSION_SIZE {
             anyhow::bail!(
                 "session file too large ({:.1} MB, limit {:.0} MB): {}",
