@@ -1,0 +1,8 @@
+ ❯ src/utils.test.ts (3 tests | 1 failed)
+   ✓ adds numbers
+   ✓ subtracts numbers
+   × divides by zero
+
+ Test Files  1 failed (1)
+      Tests  2 passed | 1 failed | 3 total
+   Duration  1.23s

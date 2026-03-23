@@ -1,0 +1,4 @@
+This is not cargo test output.
+It contains random text that no parser should understand.
+blah blah blah 12345 $$$ @@@ ???
+No test results here.

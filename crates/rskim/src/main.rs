@@ -55,6 +55,9 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--max-lines"
             | "--last-lines"
             | "--tokens"
+            | "--since"
+            | "--session"
+            | "--agent"
     )
 }
 
@@ -183,12 +186,14 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
 SUBCOMMANDS:\n  \
+    build                                    Build with output parsing\n  \
     completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n  \
-    init                                     Initialize skim configuration (planned)\n  \
-    test                                     Run test with output parsing (planned)\n  \
+    discover                                 Identify missed optimization opportunities\n  \
+    git                                      Git integration helpers\n  \
+    init                                     Initialize skim configuration\n  \
+    learn                                    Detect CLI error patterns and generate correction rules\n  \
     rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
-    git                                      Git integration helpers (planned)\n  \
-    build                                    Build with output parsing (planned)\n\n\
+    test                                     Run test with output parsing\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File, directory, or glob pattern to process (use '-' for stdin)
@@ -583,7 +588,8 @@ mod tests {
     // ========================================================================
 
     /// Exhaustive list of flags that consume the next token as a value.
-    /// Derived from the `Args` struct fields that are NOT bool.
+    /// Derived from `Args` struct fields that are NOT bool, plus subcommand
+    /// flags (--since, --session, --agent) registered in `is_flag_with_value`.
     ///
     /// UPDATE THIS LIST if you add/remove a value-consuming flag.
     const VALUE_FLAGS: &[&str] = &[
@@ -598,6 +604,9 @@ mod tests {
         "--max-lines",
         "--last-lines",
         "--tokens",
+        "--since",
+        "--session",
+        "--agent",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
