@@ -63,7 +63,7 @@ pub(crate) struct SessionFile {
 
 /// Agent-agnostic tool invocation.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields populated by providers, consumed by analysis and future learn command
+#[allow(dead_code)] // Fields populated by providers, consumed by discover/learn commands
 pub(crate) struct ToolInvocation {
     pub(crate) tool_name: String,
     pub(crate) input: ToolInput,
@@ -75,7 +75,7 @@ pub(crate) struct ToolInvocation {
 
 /// Normalized tool input.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Variants populated by provider parsers, consumed by analysis and future learn command
+#[allow(dead_code)] // Variants populated by provider parsers, consumed by discover/learn commands
 pub(crate) enum ToolInput {
     Read {
         file_path: String,
@@ -101,7 +101,7 @@ pub(crate) enum ToolInput {
     },
 }
 
-#[allow(dead_code)] // Used by tests and future learn command
+#[allow(dead_code)] // Used by provider parsers and discover/learn commands
 impl ToolInput {
     /// Extract file path if this is a file-related operation.
     pub(crate) fn file_path(&self) -> Option<&str> {
@@ -116,7 +116,7 @@ impl ToolInput {
 
 /// Tool execution result.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields populated by providers, consumed by analysis and learn command
+#[allow(dead_code)] // Fields populated by providers, consumed by discover/learn commands
 pub(crate) struct ToolResult {
     pub(crate) content: String,
     pub(crate) is_error: bool,
@@ -148,11 +148,12 @@ pub(crate) fn parse_duration_ago(s: &str) -> anyhow::Result<SystemTime> {
         .map_err(|_| anyhow::anyhow!("invalid number in duration: '{s}'"))?;
 
     let secs = match unit {
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 7 * 86400,
+        "h" => num.checked_mul(3600),
+        "d" => num.checked_mul(86400),
+        "w" => num.checked_mul(7 * 86400),
         _ => unreachable!(),
-    };
+    }
+    .ok_or_else(|| anyhow::anyhow!("duration value too large: '{s}'"))?;
 
     Ok(SystemTime::now() - std::time::Duration::from_secs(secs))
 }
