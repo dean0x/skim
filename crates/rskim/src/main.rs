@@ -55,6 +55,9 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--max-lines"
             | "--last-lines"
             | "--tokens"
+            | "--since"
+            | "--session"
+            | "--agent"
     )
 }
 
@@ -598,6 +601,9 @@ mod tests {
         "--max-lines",
         "--last-lines",
         "--tokens",
+        "--since",
+        "--session",
+        "--agent",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
