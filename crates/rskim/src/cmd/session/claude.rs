@@ -40,6 +40,9 @@ impl SessionProvider for ClaudeCodeProvider {
     fn find_sessions(&self, filter: &TimeFilter) -> anyhow::Result<Vec<SessionFile>> {
         let mut sessions = Vec::new();
 
+        // Canonicalize projects_dir to prevent symlink traversal outside boundary
+        let canonical_root = self.projects_dir.canonicalize().unwrap_or_else(|_| self.projects_dir.clone());
+
         // Read project directories
         let entries = std::fs::read_dir(&self.projects_dir)?;
         for entry in entries.flatten() {
@@ -53,8 +56,29 @@ impl SessionProvider for ClaudeCodeProvider {
                     if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                         continue;
                     }
-                    let metadata = std::fs::metadata(&path)?;
-                    let modified = metadata.modified()?;
+
+                    // Verify resolved path stays within the projects directory (symlink traversal guard)
+                    if let Ok(canonical_path) = path.canonicalize() {
+                        if !canonical_path.starts_with(&canonical_root) {
+                            eprintln!(
+                                "warning: skipping file outside projects dir: {}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                    }
+
+                    let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!(
+                                "warning: could not read metadata for {}: {}",
+                                path.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    };
 
                     // Apply time filter
                     if let Some(since) = filter.since {
@@ -91,6 +115,20 @@ impl SessionProvider for ClaudeCodeProvider {
     }
 
     fn parse_session(&self, file: &SessionFile) -> anyhow::Result<Vec<ToolInvocation>> {
+        // Guard against unbounded reads -- reject files over 100 MB
+        const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
+        let file_size = std::fs::metadata(&file.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if file_size > MAX_SESSION_SIZE {
+            anyhow::bail!(
+                "session file too large ({:.1} MB, limit {:.0} MB): {}",
+                file_size as f64 / (1024.0 * 1024.0),
+                MAX_SESSION_SIZE as f64 / (1024.0 * 1024.0),
+                file.path.display()
+            );
+        }
+
         let content = std::fs::read_to_string(&file.path)?;
         parse_claude_jsonl(&content, &file.session_id)
     }
