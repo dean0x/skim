@@ -116,8 +116,43 @@ impl ToolInput {
 
 /// Tool execution result.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields populated by providers, consumed by analysis and future learn command
+#[allow(dead_code)] // Fields populated by providers, consumed by analysis and learn command
 pub(crate) struct ToolResult {
     pub(crate) content: String,
     pub(crate) is_error: bool,
+}
+
+// ============================================================================
+// Shared duration parsing
+// ============================================================================
+
+/// Parse a human-readable duration string into a `SystemTime` in the past.
+///
+/// Supports: `Nd` (days), `Nh` (hours), `Nw` (weeks).
+///
+/// Shared by `discover` and `learn` subcommands.
+pub(crate) fn parse_duration_ago(s: &str) -> anyhow::Result<SystemTime> {
+    let s = s.trim();
+    let (num_str, unit) = if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, "d")
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, "h")
+    } else if let Some(stripped) = s.strip_suffix('w') {
+        (stripped, "w")
+    } else {
+        anyhow::bail!("invalid duration format: '{s}' (expected Nd, Nh, or Nw)");
+    };
+
+    let num: u64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number in duration: '{s}'"))?;
+
+    let secs = match unit {
+        "h" => num * 3600,
+        "d" => num * 86400,
+        "w" => num * 7 * 86400,
+        _ => unreachable!(),
+    };
+
+    Ok(SystemTime::now() - std::time::Duration::from_secs(secs))
 }
