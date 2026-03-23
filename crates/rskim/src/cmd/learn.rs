@@ -180,16 +180,13 @@ impl PatternType {
 /// If a similar successful command is found, create a `CorrectionPair`.
 fn detect_corrections(bash_invocations: &[&ToolInvocation]) -> Vec<CorrectionPair> {
     let mut corrections = Vec::new();
-    const LOOKAHEAD: usize = 5;
 
     for (i, inv) in bash_invocations.iter().enumerate() {
-        // Only look at failed commands
         let result = match &inv.result {
             Some(r) if r.is_error || looks_like_error(&r.content) => r,
             _ => continue,
         };
 
-        // Skip TDD cycles
         if is_tdd_cycle(bash_invocations, i) {
             continue;
         }
@@ -199,38 +196,54 @@ fn detect_corrections(bash_invocations: &[&ToolInvocation]) -> Vec<CorrectionPai
             _ => continue,
         };
 
-        // Look ahead for a similar successful command
-        let end = (i + 1 + LOOKAHEAD).min(bash_invocations.len());
-        for candidate in bash_invocations.iter().take(end).skip(i + 1) {
-            let is_success = match &candidate.result {
-                Some(r) => !r.is_error && !looks_like_error(&r.content),
-                None => false,
-            };
-            if !is_success {
-                continue;
-            }
-
-            let candidate_cmd = match &candidate.input {
-                ToolInput::Bash { command } => command.as_str(),
-                _ => continue,
-            };
-
-            // Check similarity
-            if let Some(pattern) = classify_correction(failed_cmd, candidate_cmd) {
-                corrections.push(CorrectionPair {
-                    failed_command: failed_cmd.to_string(),
-                    successful_command: candidate_cmd.to_string(),
-                    error_output: result.content.chars().take(200).collect(),
-                    pattern_type: pattern,
-                    occurrences: 1,
-                    sessions: vec![inv.session_id.clone()],
-                });
-                break; // Only match the first correction per failure
-            }
+        if let Some(pair) =
+            find_correction(bash_invocations, i, failed_cmd, result, &inv.session_id)
+        {
+            corrections.push(pair);
         }
     }
 
     corrections
+}
+
+/// Search the next LOOKAHEAD Bash invocations for a successful correction.
+fn find_correction(
+    invocations: &[&ToolInvocation],
+    failed_idx: usize,
+    failed_cmd: &str,
+    error_result: &session::ToolResult,
+    session_id: &str,
+) -> Option<CorrectionPair> {
+    const LOOKAHEAD: usize = 5;
+    let end = (failed_idx + 1 + LOOKAHEAD).min(invocations.len());
+
+    for candidate in invocations.iter().take(end).skip(failed_idx + 1) {
+        let is_success = match &candidate.result {
+            Some(r) => !r.is_error && !looks_like_error(&r.content),
+            None => false,
+        };
+        if !is_success {
+            continue;
+        }
+
+        let candidate_cmd = match &candidate.input {
+            ToolInput::Bash { command } => command.as_str(),
+            _ => continue,
+        };
+
+        if let Some(pattern) = classify_correction(failed_cmd, candidate_cmd) {
+            return Some(CorrectionPair {
+                failed_command: failed_cmd.to_string(),
+                successful_command: candidate_cmd.to_string(),
+                error_output: error_result.content.chars().take(200).collect(),
+                pattern_type: pattern,
+                occurrences: 1,
+                sessions: vec![session_id.to_string()],
+            });
+        }
+    }
+
+    None
 }
 
 // ============================================================================
@@ -239,7 +252,6 @@ fn detect_corrections(bash_invocations: &[&ToolInvocation]) -> Vec<CorrectionPai
 
 /// Classify how a correction differs from the failed command.
 fn classify_correction(failed: &str, success: &str) -> Option<PatternType> {
-    // Skip if commands are identical
     if failed == success {
         return None;
     }
@@ -247,55 +259,99 @@ fn classify_correction(failed: &str, success: &str) -> Option<PatternType> {
     let failed_tokens: Vec<&str> = failed.split_whitespace().collect();
     let success_tokens: Vec<&str> = success.split_whitespace().collect();
 
-    // Must have tokens
     if failed_tokens.is_empty() || success_tokens.is_empty() {
         return None;
     }
 
-    // At minimum, first token must match (same tool) -- or be a typo
-    if failed_tokens[0] != success_tokens[0] {
-        // Check edit distance 1-2 on first token (typo in command name)
-        if levenshtein(failed_tokens[0], success_tokens[0]) <= 2 {
-            return Some(PatternType::FlagTypo);
-        }
+    // Strings differ only in whitespace — not a real correction
+    if failed_tokens == success_tokens {
         return None;
     }
 
-    // Check for missing separator: failed has no --, success has --
+    // Strategy 1: Command name typo (different first token)
+    if failed_tokens[0] != success_tokens[0] {
+        return classify_by_command_typo(failed_tokens[0], success_tokens[0]);
+    }
+
+    // Strategy 2: Missing separator
     if !failed.contains(" -- ") && success.contains(" -- ") {
         return Some(PatternType::MissingSeparator);
     }
 
-    // Compare full strings via edit distance
+    // Strategy 3: Edit-distance based (close strings)
+    if let Some(pattern) =
+        classify_by_edit_distance(failed, success, &failed_tokens, &success_tokens)
+    {
+        return Some(pattern);
+    }
+
+    // Strategy 4: Shared prefix (same first 2 tokens)
+    classify_by_shared_prefix(&failed_tokens, &success_tokens)
+}
+
+fn classify_by_command_typo(failed_cmd: &str, success_cmd: &str) -> Option<PatternType> {
+    if levenshtein(failed_cmd, success_cmd) <= 2 {
+        Some(PatternType::FlagTypo)
+    } else {
+        None
+    }
+}
+
+fn classify_by_edit_distance(
+    failed: &str,
+    success: &str,
+    failed_tokens: &[&str],
+    success_tokens: &[&str],
+) -> Option<PatternType> {
     let edit_dist = levenshtein(failed, success);
-    if edit_dist <= 3 {
-        // Close enough to be a typo or minor fix
-        if failed_tokens.len() < success_tokens.len() {
-            return Some(PatternType::MissingArg);
-        }
-        if failed_tokens.len() == success_tokens.len() {
-            // Check if exactly one token differs and it looks like a flag
-            let diffs: Vec<usize> = failed_tokens
-                .iter()
-                .zip(success_tokens.iter())
-                .enumerate()
-                .filter(|(_, (a, b))| a != b)
-                .map(|(i, _)| i)
-                .collect();
-            if diffs.len() == 1 {
-                let diff_idx = diffs[0];
-                if failed_tokens[diff_idx].starts_with('-')
-                    || success_tokens[diff_idx].starts_with('-')
-                {
-                    return Some(PatternType::WrongFlag);
-                }
-                return Some(PatternType::FlagTypo);
-            }
+    if edit_dist > 3 {
+        return None;
+    }
+
+    if failed_tokens.len() < success_tokens.len() {
+        return Some(PatternType::MissingArg);
+    }
+
+    if failed_tokens.len() == success_tokens.len() {
+        return classify_same_length_tokens(failed_tokens, success_tokens);
+    }
+
+    Some(PatternType::FlagTypo)
+}
+
+/// Classify when token counts match and edit distance is small.
+fn classify_same_length_tokens(
+    failed_tokens: &[&str],
+    success_tokens: &[&str],
+) -> Option<PatternType> {
+    let diffs: Vec<usize> = failed_tokens
+        .iter()
+        .zip(success_tokens.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i)
+        .collect();
+
+    // Whitespace-only difference: strings differ but tokens are identical
+    if diffs.is_empty() {
+        return None;
+    }
+
+    if diffs.len() == 1 {
+        let idx = diffs[0];
+        if failed_tokens[idx].starts_with('-') || success_tokens[idx].starts_with('-') {
+            return Some(PatternType::WrongFlag);
         }
         return Some(PatternType::FlagTypo);
     }
 
-    // Looser match: same base command (first 2 tokens), different flags
+    Some(PatternType::FlagTypo)
+}
+
+fn classify_by_shared_prefix(
+    failed_tokens: &[&str],
+    success_tokens: &[&str],
+) -> Option<PatternType> {
     if failed_tokens.len() >= 2
         && success_tokens.len() >= 2
         && failed_tokens[..2] == success_tokens[..2]
@@ -305,7 +361,6 @@ fn classify_correction(failed: &str, success: &str) -> Option<PatternType> {
         }
         return Some(PatternType::WrongFlag);
     }
-
     None
 }
 
@@ -432,6 +487,7 @@ fn is_tdd_cycle(invocations: &[&ToolInvocation], start_idx: usize) -> bool {
 
     let mut alternations = 0;
     let mut last_was_error = true; // We start from a failed command
+    let normalized_cmd = normalize_command(cmd);
 
     for inv in invocations.iter().skip(start_idx + 1).take(10) {
         let inv_cmd = match &inv.input {
@@ -440,7 +496,7 @@ fn is_tdd_cycle(invocations: &[&ToolInvocation], start_idx: usize) -> bool {
         };
 
         // Must be the same (or very similar) command
-        if normalize_command(inv_cmd) != normalize_command(cmd) {
+        if normalize_command(inv_cmd) != normalized_cmd {
             continue;
         }
 
@@ -1313,10 +1369,10 @@ mod tests {
 
     #[test]
     fn test_classify_whitespace_only_diff() {
-        // BUG: whitespace-only difference (tokens identical after split_whitespace)
-        // currently falls through to FlagTypo — will be fixed to None in refactor.
+        // Whitespace-only difference (tokens identical after split_whitespace)
+        // is not a real correction — return None.
         let result = classify_correction("cargo  test", "cargo test");
-        assert_eq!(result, Some(PatternType::FlagTypo));
+        assert_eq!(result, None);
     }
 
     #[test]
