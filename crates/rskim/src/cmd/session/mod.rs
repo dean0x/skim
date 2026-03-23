@@ -7,8 +7,9 @@
 mod claude;
 pub(crate) mod types;
 
+#[allow(unused_imports)] // ToolResult used by learn.rs tests
 pub(crate) use types::{
-    parse_duration_ago, AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation,
+    parse_duration_ago, AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation, ToolResult,
 };
 
 // ============================================================================
@@ -51,4 +52,32 @@ pub(crate) fn get_providers(agent_filter: Option<AgentKind>) -> Vec<Box<dyn Sess
         }
         None => detect_agents(),
     }
+}
+
+/// Collect all tool invocations from the given providers within a time filter.
+///
+/// Iterates every provider, finds matching sessions, parses each one, and
+/// flattens the results into a single `Vec<ToolInvocation>`. Parse failures
+/// are logged as warnings to stderr and skipped.
+pub(crate) fn collect_invocations(
+    providers: &[Box<dyn SessionProvider>],
+    filter: &TimeFilter,
+) -> anyhow::Result<Vec<ToolInvocation>> {
+    let mut all_invocations: Vec<ToolInvocation> = Vec::new();
+    for provider in providers {
+        let sessions = provider.find_sessions(filter)?;
+        for session_file in &sessions {
+            match provider.parse_session(session_file) {
+                Ok(invocations) => all_invocations.extend(invocations),
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to parse {}: {}",
+                        session_file.path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+    Ok(all_invocations)
 }

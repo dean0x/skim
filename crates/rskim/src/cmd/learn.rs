@@ -32,22 +32,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     };
 
     // Collect all invocations from all providers
-    let mut all_invocations: Vec<ToolInvocation> = Vec::new();
-    for provider in &providers {
-        let sessions = provider.find_sessions(&filter)?;
-        for session_file in &sessions {
-            match provider.parse_session(session_file) {
-                Ok(invocations) => all_invocations.extend(invocations),
-                Err(e) => {
-                    eprintln!(
-                        "warning: failed to parse {}: {}",
-                        session_file.path.display(),
-                        e
-                    );
-                }
-            }
-        }
-    }
+    let all_invocations = session::collect_invocations(&providers, &filter)?;
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -763,7 +748,7 @@ pub(super) fn command() -> clap::Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::session::types::ToolResult;
+    use crate::cmd::session::ToolResult;
 
     // ---- levenshtein ----
 
