@@ -29,6 +29,7 @@ use crate::runner::CommandRunner;
 /// `program` is the runner binary name (e.g. `"vitest"` or `"jest"`), used when
 /// stdin is not piped and we need to spawn the process directly.
 pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+    let start = std::time::Instant::now();
     let raw_output = if stdin_has_data() {
         read_stdin()?
     } else {
@@ -77,7 +78,7 @@ pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::R
             result.content().to_string(),
             format!("skim test {program} {}", args.join(" ")),
             crate::analytics::CommandType::Test,
-            std::time::Duration::ZERO,
+            start.elapsed(),
             cwd,
             Some(result.tier_name().to_string()),
         );

@@ -207,6 +207,24 @@ fn run_passthrough(
         crate::process::report_token_stats(orig, comp, "");
     }
 
+    // Record analytics (fire-and-forget, non-blocking)
+    if crate::analytics::is_analytics_enabled() {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        let passthrough_output = output.stdout.clone();
+        crate::analytics::record_fire_and_forget(
+            passthrough_output.clone(),
+            passthrough_output,
+            format!("skim git {} {}", subcmd, args.join(" ")),
+            crate::analytics::CommandType::Git,
+            output.duration,
+            cwd,
+            None,
+        );
+    }
+
     Ok(exit_code_to_process(output.exit_code))
 }
 

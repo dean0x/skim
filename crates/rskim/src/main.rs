@@ -472,6 +472,12 @@ fn run_file_operation() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
+    // Propagate --disable-analytics to env var so that all code paths
+    // (including multi-file workers) respect it via is_analytics_enabled().
+    if args.disable_analytics {
+        std::env::set_var("SKIM_DISABLE_ANALYTICS", "1");
+    }
+
     if args.clear_cache {
         cache::clear_cache()?;
         println!("Cache cleared successfully");
