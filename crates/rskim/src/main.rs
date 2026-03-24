@@ -513,6 +513,7 @@ fn run_file_operation() -> anyhow::Result<()> {
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,
+        disable_analytics,
     };
 
     if path.is_dir() {

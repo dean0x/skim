@@ -69,6 +69,7 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
         "Install Rust via https://rustup.rs",
         use_stdin,
         show_stats,
+        crate::analytics::CommandType::Test,
         move |output, _args| parse_impl(output, is_nextest),
     )
 }

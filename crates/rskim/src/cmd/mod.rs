@@ -84,13 +84,14 @@ pub(crate) fn run_parsed_command<T>(
     env_overrides: &[(&str, &str)],
     install_hint: &str,
     show_stats: bool,
+    command_type: crate::analytics::CommandType,
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
     T: AsRef<str>,
 {
     let use_stdin = !io::stdin().is_terminal();
-    run_parsed_command_with_mode(program, args, env_overrides, install_hint, use_stdin, show_stats, parse)
+    run_parsed_command_with_mode(program, args, env_overrides, install_hint, use_stdin, show_stats, command_type, parse)
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -106,6 +107,7 @@ where
 /// `use_stdin` — when `true`, reads stdin instead of spawning the command.
 /// Callers should set this based on their own heuristics (e.g., only read
 /// stdin when no user args are provided AND stdin is piped).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_parsed_command_with_mode<T>(
     program: &str,
     args: &[String],
@@ -113,6 +115,7 @@ pub(crate) fn run_parsed_command_with_mode<T>(
     install_hint: &str,
     use_stdin: bool,
     show_stats: bool,
+    command_type: crate::analytics::CommandType,
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
@@ -200,7 +203,7 @@ where
             output.stdout.clone(),
             result.content().to_string(),
             format!("skim {program} {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
+            command_type,
             output.duration,
             cwd,
             Some(result.tier_name().to_string()),
