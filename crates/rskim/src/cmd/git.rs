@@ -43,7 +43,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (global_flags, rest) = split_global_flags(args);
+    let show_stats = args.iter().any(|a| a == "--show-stats");
+    let filtered_args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--show-stats")
+        .cloned()
+        .collect();
+
+    let (global_flags, rest) = split_global_flags(&filtered_args);
 
     let Some(subcmd) = rest.first() else {
         print_help();
@@ -53,9 +60,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let subcmd_args = &rest[1..];
 
     match subcmd.as_str() {
-        "status" => run_status(&global_flags, subcmd_args),
-        "diff" => run_diff(&global_flags, subcmd_args),
-        "log" => run_log(&global_flags, subcmd_args),
+        "status" => run_status(&global_flags, subcmd_args, show_stats),
+        "diff" => run_diff(&global_flags, subcmd_args, show_stats),
+        "log" => run_log(&global_flags, subcmd_args, show_stats),
         other => {
             anyhow::bail!(
                 "unknown git subcommand: '{other}'\n\n\
@@ -188,6 +195,7 @@ fn run_passthrough(
     global_flags: &[String],
     subcmd: &str,
     args: &[String],
+    show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.push(subcmd.to_string());
@@ -202,6 +210,13 @@ fn run_passthrough(
         eprint!("{}", output.stderr);
     }
 
+    if show_stats {
+        // Passthrough: raw == compressed (no savings)
+        let raw = &output.stdout;
+        let (orig, comp) = crate::process::count_token_pair(raw, raw);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
     Ok(exit_code_to_process(output.exit_code))
 }
 
@@ -209,7 +224,7 @@ fn run_passthrough(
 ///
 /// Callers are responsible for baking global flags into `subcmd_args` before
 /// calling this function.
-fn run_parsed_command<F>(subcmd_args: &[String], parser: F) -> anyhow::Result<ExitCode>
+fn run_parsed_command<F>(subcmd_args: &[String], show_stats: bool, parser: F) -> anyhow::Result<ExitCode>
 where
     F: FnOnce(&str) -> GitResult,
 {
@@ -229,7 +244,13 @@ where
     }
 
     let result = parser(&output.stdout);
-    println!("{result}");
+    let result_str = format!("{result}");
+    println!("{result_str}");
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &result_str);
+        crate::process::report_token_stats(orig, comp, "");
+    }
 
     Ok(ExitCode::SUCCESS)
 }
@@ -242,9 +263,9 @@ where
 ///
 /// Flag-aware passthrough: if user has `--porcelain`, `--short`, or `-s`,
 /// output is already compact — pass through unmodified.
-fn run_status(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCode> {
+fn run_status(global_flags: &[String], args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--porcelain", "--short", "-s"]) {
-        return run_passthrough(global_flags, "status", args);
+        return run_passthrough(global_flags, "status", args, show_stats);
     }
 
     let mut full_args: Vec<String> = global_flags.to_vec();
@@ -255,7 +276,7 @@ fn run_status(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCo
     ]);
     full_args.extend_from_slice(args);
 
-    run_parsed_command(&full_args, parse_status)
+    run_parsed_command(&full_args, show_stats, parse_status)
 }
 
 /// Parse porcelain v2 status output into a compressed GitResult.
@@ -442,16 +463,16 @@ fn worktree_prefix(c: char) -> &'static str {
 ///
 /// Flag-aware passthrough: if user has `--stat`, `--name-only`, or
 /// `--name-status`, output is already compact — pass through unmodified.
-fn run_diff(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCode> {
+fn run_diff(global_flags: &[String], args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--stat", "--name-only", "--name-status", "--check"]) {
-        return run_passthrough(global_flags, "diff", args);
+        return run_passthrough(global_flags, "diff", args, show_stats);
     }
 
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["diff".to_string(), "--stat".to_string()]);
     full_args.extend_from_slice(args);
 
-    run_parsed_command(&full_args, parse_diff_stat)
+    run_parsed_command(&full_args, show_stats, parse_diff_stat)
 }
 
 /// Parse `git diff --stat` output into a compressed GitResult.
@@ -499,9 +520,9 @@ fn parse_diff_stat(output: &str) -> GitResult {
 ///
 /// Flag-aware passthrough: if user has `--format`, `--pretty`, or `--oneline`,
 /// output is already compact — pass through unmodified.
-fn run_log(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCode> {
+fn run_log(global_flags: &[String], args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--format", "--pretty", "--oneline"]) {
-        return run_passthrough(global_flags, "log", args);
+        return run_passthrough(global_flags, "log", args, show_stats);
     }
 
     let mut full_args: Vec<String> = global_flags.to_vec();
@@ -513,7 +534,7 @@ fn run_log(global_flags: &[String], args: &[String]) -> anyhow::Result<ExitCode>
 
     full_args.extend_from_slice(args);
 
-    run_parsed_command(&full_args, parse_log)
+    run_parsed_command(&full_args, show_stats, parse_log)
 }
 
 /// Parse formatted `git log` output into a compressed GitResult.

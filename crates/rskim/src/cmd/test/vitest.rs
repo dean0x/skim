@@ -27,7 +27,7 @@ use crate::runner::CommandRunner;
 ///
 /// `program` is the runner binary name (e.g. `"vitest"` or `"jest"`), used when
 /// stdin is not piped and we need to spawn the process directly.
-pub(crate) fn run(program: &str, args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     let raw_output = if stdin_has_data() {
         read_stdin()?
     } else {
@@ -37,7 +37,7 @@ pub(crate) fn run(program: &str, args: &[String]) -> anyhow::Result<ExitCode> {
     let result = parse(&raw_output);
 
     // Emit the result to stdout
-    match &result {
+    let exit_code = match &result {
         ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
             println!("{test_result}");
             // Emit degradation markers to stderr
@@ -45,21 +45,27 @@ pub(crate) fn run(program: &str, args: &[String]) -> anyhow::Result<ExitCode> {
             let mut handle = stderr.lock();
             let _ = result.emit_markers(&mut handle);
 
-            let exit_code = if test_result.summary.fail > 0 {
+            if test_result.summary.fail > 0 {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
-            };
-            Ok(exit_code)
+            }
         }
         ParseResult::Passthrough(raw) => {
             println!("{raw}");
             let stderr = io::stderr();
             let mut handle = stderr.lock();
             let _ = result.emit_markers(&mut handle);
-            Ok(ExitCode::FAILURE)
+            ExitCode::FAILURE
         }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
+        crate::process::report_token_stats(orig, comp, "");
     }
+
+    Ok(exit_code)
 }
 
 // ============================================================================

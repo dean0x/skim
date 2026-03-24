@@ -28,13 +28,20 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let sub = args.first().map(String::as_str);
-    let remaining = if args.len() > 1 { &args[1..] } else { &[] };
+    let show_stats = args.iter().any(|a| a == "--show-stats");
+    let filtered_args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--show-stats")
+        .cloned()
+        .collect();
+
+    let sub = filtered_args.first().map(String::as_str);
+    let remaining = if filtered_args.len() > 1 { &filtered_args[1..] } else { &[] };
 
     match sub {
-        Some("cargo") => cargo::run(remaining),
-        Some("clippy") => cargo::run_clippy(remaining),
-        Some("tsc") => tsc::run(remaining),
+        Some("cargo") => cargo::run(remaining, show_stats),
+        Some("clippy") => cargo::run_clippy(remaining, show_stats),
+        Some("tsc") => tsc::run(remaining, show_stats),
         Some(unknown) => {
             anyhow::bail!(
                 "unknown build tool: '{unknown}'\n\n\
@@ -118,6 +125,7 @@ pub(super) fn run_parsed_command(
     args: &[String],
     env_vars: &[(&str, &str)],
     install_hint: &str,
+    show_stats: bool,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
 ) -> anyhow::Result<ExitCode> {
     let runner = CommandRunner::new(Some(Duration::from_secs(600)));
@@ -149,6 +157,18 @@ pub(super) fn run_parsed_command(
     let content = result.content();
     if !content.is_empty() {
         println!("{content}");
+    }
+
+    // Report token stats if requested
+    if show_stats {
+        // Combine stdout+stderr as raw input for comparison
+        let raw = if output.stderr.is_empty() {
+            &output.stdout
+        } else {
+            &format!("{}\n{}", output.stdout, output.stderr)
+        };
+        let (orig, comp) = crate::process::count_token_pair(raw, result.content());
+        crate::process::report_token_stats(orig, comp, "");
     }
 
     // Determine exit code from the parsed result

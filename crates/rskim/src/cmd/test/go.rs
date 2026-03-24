@@ -23,7 +23,7 @@ use crate::runner::CommandRunner;
 /// Injects `-json` if the user hasn't already set `-json` or `-v`,
 /// then runs the command through [`CommandRunner`] and parses output
 /// via three-tier degradation.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     let mut go_args: Vec<String> = vec!["test".to_string()];
 
     // Inject -json before any `--` separator, unless the user already specified
@@ -64,32 +64,37 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let parsed = parse(&combined);
 
     // Emit the result
-    match &parsed {
+    let exit_code = match &parsed {
         ParseResult::Full(result) | ParseResult::Degraded(result, _) => {
             println!("{result}");
             // Emit degradation markers to stderr
             let mut stderr = std::io::stderr().lock();
             let _ = parsed.emit_markers(&mut stderr);
 
-            let exit_code = if result.summary.fail > 0 {
+            if result.summary.fail > 0 {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
-            };
-            Ok(exit_code)
+            }
         }
         ParseResult::Passthrough(raw) => {
             println!("{raw}");
             let mut stderr = std::io::stderr().lock();
             let _ = parsed.emit_markers(&mut stderr);
             // Mirror the original process exit code
-            let exit_code = match output.exit_code {
+            match output.exit_code {
                 Some(0) => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
-            };
-            Ok(exit_code)
+            }
         }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&combined, parsed.content());
+        crate::process::report_token_stats(orig, comp, "");
     }
+
+    Ok(exit_code)
 }
 
 // ============================================================================

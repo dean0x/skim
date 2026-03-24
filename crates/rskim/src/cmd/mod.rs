@@ -81,13 +81,14 @@ pub(crate) fn run_parsed_command<T>(
     args: &[String],
     env_overrides: &[(&str, &str)],
     install_hint: &str,
+    show_stats: bool,
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
     T: AsRef<str>,
 {
     let use_stdin = !io::stdin().is_terminal();
-    run_parsed_command_with_mode(program, args, env_overrides, install_hint, use_stdin, parse)
+    run_parsed_command_with_mode(program, args, env_overrides, install_hint, use_stdin, show_stats, parse)
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -109,6 +110,7 @@ pub(crate) fn run_parsed_command_with_mode<T>(
     env_overrides: &[(&str, &str)],
     install_hint: &str,
     use_stdin: bool,
+    show_stats: bool,
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
@@ -179,6 +181,12 @@ where
         writeln!(stdout_handle)?;
     }
     stdout_handle.flush()?;
+
+    // Report token stats if requested
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&output.stdout, result.content());
+        crate::process::report_token_stats(orig, comp, "");
+    }
 
     // Map exit code: preserve full 0-255 exit code granularity from the
     // underlying process. This maintains documented semantics (0=success,

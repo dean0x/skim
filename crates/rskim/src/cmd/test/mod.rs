@@ -23,14 +23,21 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let runner = args[0].as_str();
-    let runner_args = &args[1..];
+    let show_stats = args.iter().any(|a| a == "--show-stats");
+    let filtered_args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--show-stats")
+        .cloned()
+        .collect();
+
+    let runner = filtered_args[0].as_str();
+    let runner_args: Vec<String> = filtered_args[1..].to_vec();
 
     match runner {
-        "cargo" => cargo::run(runner_args),
-        "go" => go::run(runner_args),
-        "vitest" | "jest" => vitest::run(runner, runner_args),
-        "pytest" => pytest::run(runner_args),
+        "cargo" => cargo::run(&runner_args, show_stats),
+        "go" => go::run(&runner_args, show_stats),
+        "vitest" | "jest" => vitest::run(runner, &runner_args, show_stats),
+        "pytest" => pytest::run(&runner_args, show_stats),
         _ => {
             eprintln!(
                 "skim test: unknown runner '{runner}'\n\

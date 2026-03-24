@@ -43,7 +43,7 @@ static CARGO_ERROR_LINE_RE: LazyLock<Regex> =
 ///
 /// Injects `--message-format=json` if not already set by the user, then
 /// parses the NDJSON output through the three-tier parser.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     let mut full_args = vec!["build".to_string()];
     full_args.extend_from_slice(args);
 
@@ -56,6 +56,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         &full_args,
         &[("CARGO_TERM_COLOR", "never")],
         "install Rust from https://rustup.rs",
+        show_stats,
         parse,
     )
 }
@@ -64,7 +65,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 ///
 /// Same JSON injection and parsing as cargo build, but with clippy-specific
 /// grouping of warnings by lint rule code.
-pub(crate) fn run_clippy(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run_clippy(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     let mut full_args = vec!["clippy".to_string()];
     full_args.extend_from_slice(args);
 
@@ -77,6 +78,7 @@ pub(crate) fn run_clippy(args: &[String]) -> anyhow::Result<ExitCode> {
         &full_args,
         &[("CARGO_TERM_COLOR", "never")],
         "install Rust from https://rustup.rs",
+        show_stats,
         parse,
     )
 }

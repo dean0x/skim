@@ -49,7 +49,7 @@ pub(crate) struct ProcessResult {
 /// Count tokens for both original and transformed text, returning `(None, None)` on failure.
 ///
 /// Centralises the paired token-counting pattern used across the processing pipeline.
-fn count_token_pair(original: &str, transformed: &str) -> (Option<usize>, Option<usize>) {
+pub(crate) fn count_token_pair(original: &str, transformed: &str) -> (Option<usize>, Option<usize>) {
     match (
         tokens::count_tokens(original),
         tokens::count_tokens(transformed),
@@ -108,9 +108,9 @@ fn try_cached_result(
         return Ok(None);
     };
 
-    // If stats are requested but the cache entry was written without them,
-    // read the original file and count tokens for both source and output.
-    let needs_recount = options.show_stats && hit.original_tokens.is_none();
+    // If the cache entry was written without token counts, read the original
+    // file and count tokens for both source and output.
+    let needs_recount = hit.original_tokens.is_none();
     let (orig_tokens, trans_tokens) = if needs_recount {
         let contents = read_and_validate(path)?;
         count_token_pair(&contents, &hit.content)
@@ -262,11 +262,7 @@ pub(crate) fn process_stdin(
             (transformed, false)
         };
 
-    let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&buffer, &final_output)
-    } else {
-        (None, None)
-    };
+    let (orig_tokens, trans_tokens) = count_token_pair(&buffer, &final_output);
 
     Ok(ProcessResult {
         output: final_output,
@@ -296,11 +292,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             (result, false)
         };
 
-    let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&contents, &final_output)
-    } else {
-        (None, None)
-    };
+    let (orig_tokens, trans_tokens) = count_token_pair(&contents, &final_output);
 
     // Cache the transform result (post-guardrail). Cache write failures are
     // non-fatal; don't fail the transformation.
