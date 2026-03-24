@@ -86,11 +86,16 @@ fn print_help() {
     println!("  --clear               Delete all analytics data");
     println!();
     println!("EXAMPLES:");
-    println!("  skim stats                   Show 30-day summary");
+    println!("  skim stats                   Show all-time summary");
     println!("  skim stats --since 7d        Last 7 days");
     println!("  skim stats --format json     Machine-readable output");
     println!("  skim stats --cost            Include cost estimates");
     println!("  skim stats --clear           Reset analytics data");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("  SKIM_INPUT_COST_PER_MTOK     Override $/MTok for cost estimates (default: 3.0)");
+    println!("  SKIM_ANALYTICS_DB            Override analytics database path");
+    println!("  SKIM_DISABLE_ANALYTICS       Set to disable analytics recording");
 }
 
 // ============================================================================
