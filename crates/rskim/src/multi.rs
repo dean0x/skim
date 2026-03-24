@@ -269,6 +269,25 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         );
     }
 
+    // Record analytics for multi-file operations
+    if crate::analytics::is_analytics_enabled() && total_original_tokens > 0 {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        let mode = format!("{:?}", options.process.mode).to_lowercase();
+        crate::analytics::record_with_counts(
+            total_original_tokens,
+            total_transformed_tokens,
+            format!("skim [multi: {} files]", success_count),
+            crate::analytics::CommandType::File,
+            0,
+            cwd,
+            Some(mode),
+            None, // mixed languages
+        );
+    }
+
     Ok(())
 }
 

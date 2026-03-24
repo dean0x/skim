@@ -13,6 +13,7 @@ mod init;
 mod learn;
 mod rewrite;
 mod session;
+mod stats;
 mod test;
 
 use std::io::{self, IsTerminal, Read, Write};
@@ -33,6 +34,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "init",
     "learn",
     "rewrite",
+    "stats",
     "test",
 ];
 
@@ -188,6 +190,23 @@ where
         crate::process::report_token_stats(orig, comp, "");
     }
 
+    // Record analytics (fire-and-forget, non-blocking)
+    if crate::analytics::is_analytics_enabled() {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        crate::analytics::record_fire_and_forget(
+            output.stdout.clone(),
+            result.content().to_string(),
+            format!("skim {program} {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            output.duration,
+            cwd,
+            Some(result.tier_name().to_string()),
+        );
+    }
+
     // Map exit code: preserve full 0-255 exit code granularity from the
     // underlying process. This maintains documented semantics (0=success,
     // 1=error, 2=parse error, 3=unsupported language) for downstream consumers.
@@ -219,6 +238,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "init" => return init::run(args),
         "learn" => return learn::run(args),
         "rewrite" => return rewrite::run(args),
+        "stats" => return stats::run(args),
         "test" => return test::run(args),
         _ => {}
     }
