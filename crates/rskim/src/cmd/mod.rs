@@ -229,35 +229,17 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         );
     }
 
-    // Dispatch implemented subcommands
     match subcommand {
-        "build" => return build::run(args),
-        "completions" => return completions::run(args),
-        "discover" => return discover::run(args),
-        "git" => return git::run(args),
-        "init" => return init::run(args),
-        "learn" => return learn::run(args),
-        "rewrite" => return rewrite::run(args),
-        "stats" => return stats::run(args),
-        "test" => return test::run(args),
-        _ => {}
+        "build" => build::run(args),
+        "completions" => completions::run(args),
+        "discover" => discover::run(args),
+        "git" => git::run(args),
+        "init" => init::run(args),
+        "learn" => learn::run(args),
+        "rewrite" => rewrite::run(args),
+        "stats" => stats::run(args),
+        "test" => test::run(args),
+        // Unreachable: is_known_subcommand guard above rejects unknown names
+        _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
     }
-
-    // Check for --help / -h in remaining args
-    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        println!("skim {subcommand}");
-        println!();
-        println!("  Status: not yet implemented");
-        println!();
-        println!("  This subcommand is planned for a future release.");
-        println!("  See: https://github.com/dean0x/skim/issues/19");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    eprintln!("skim {subcommand}: not yet implemented");
-    eprintln!();
-    eprintln!("This subcommand is planned for a future release.");
-    eprintln!("See: https://github.com/dean0x/skim/issues/19");
-
-    Ok(ExitCode::FAILURE)
 }

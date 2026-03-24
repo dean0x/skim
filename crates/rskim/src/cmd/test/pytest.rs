@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use regex::Regex;
 
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::{strip_ansi, ParseResult};
 use crate::runner::{CommandOutput, CommandRunner};
@@ -76,6 +77,23 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&cleaned, result.content());
         crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Record analytics (fire-and-forget, non-blocking)
+    if crate::analytics::is_analytics_enabled() {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        crate::analytics::record_fire_and_forget(
+            cleaned.clone(),
+            result.content().to_string(),
+            format!("skim test pytest {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            output.duration,
+            cwd,
+            Some(result.tier_name().to_string()),
+        );
     }
 
     // Exit code: mirror pytest's exit code if we ran it, or infer from parse
@@ -144,16 +162,7 @@ fn build_args(user_args: &[String]) -> Vec<String> {
     args
 }
 
-/// Check if any of the given flag prefixes appear in the user's args.
-///
-/// Matches both `--flag` and `--flag=value` forms.
-fn user_has_flag(args: &[String], prefixes: &[&str]) -> bool {
-    args.iter().any(|arg| {
-        prefixes
-            .iter()
-            .any(|prefix| arg == prefix || arg.starts_with(&format!("{prefix}=")))
-    })
-}
+// user_has_flag is imported from crate::cmd
 
 // ============================================================================
 // Command execution

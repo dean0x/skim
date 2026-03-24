@@ -79,32 +79,7 @@ fn print_help() {
     println!("  skim build tsc --noEmit");
 }
 
-// ============================================================================
-// Shared helpers
-// ============================================================================
-
-/// Check whether user already passed a flag matching the given prefix.
-///
-/// Returns `true` if any arg equals `prefix` exactly or starts with
-/// `prefix=` (e.g., `--message-format=json`). This avoids false positives
-/// from hypothetical flags that share a common prefix.
-pub(super) fn user_has_flag(args: &[String], prefix: &str) -> bool {
-    args.iter()
-        .any(|a| a == prefix || a.starts_with(&format!("{prefix}=")))
-}
-
-/// Inject a flag before the `--` separator, or at the end if no separator exists.
-///
-/// This ensures injected flags (like `--message-format=json`) appear in the
-/// correct position relative to any `--` separator that separates cargo flags
-/// from rustc flags.
-pub(super) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
-    if let Some(pos) = args.iter().position(|a| a == "--") {
-        args.insert(pos, flag.to_string());
-    } else {
-        args.push(flag.to_string());
-    }
-}
+// Shared helpers (user_has_flag, inject_flag_before_separator) are in crate::cmd
 
 /// Execute an external command, parse its output, and emit the result.
 ///
@@ -188,6 +163,28 @@ pub(super) fn run_parsed_command(
             }
         }
     };
+
+    // Record analytics (fire-and-forget, non-blocking)
+    if crate::analytics::is_analytics_enabled() {
+        let raw_text = if output.stderr.is_empty() {
+            output.stdout.clone()
+        } else {
+            format!("{}\n{}", output.stdout, output.stderr)
+        };
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        crate::analytics::record_fire_and_forget(
+            raw_text,
+            result.content().to_string(),
+            format!("skim build {program} {}", args.join(" ")),
+            crate::analytics::CommandType::Build,
+            output.duration,
+            cwd,
+            Some(result.tier_name().to_string()),
+        );
+    }
 
     Ok(exit_code)
 }

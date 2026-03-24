@@ -350,7 +350,7 @@ impl AnalyticsDb {
     pub(crate) fn prune_older_than(&self, days: u64) -> anyhow::Result<usize> {
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs() as i64
             - (days as i64 * 86400);
         let count = self
@@ -407,6 +407,31 @@ fn since_clause(since: Option<i64>) -> (String, Vec<i64>) {
 // Fire-and-forget recording functions
 // ============================================================================
 
+/// Compute token savings as a percentage (0.0 when raw_tokens is zero).
+fn savings_percentage(raw_tokens: usize, compressed_tokens: usize) -> f32 {
+    if raw_tokens == 0 {
+        0.0
+    } else {
+        (raw_tokens as f32 - compressed_tokens as f32) / raw_tokens as f32 * 100.0
+    }
+}
+
+/// Current Unix timestamp in seconds.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Persist a record to the default database, with auto-pruning.
+fn persist_record(record: &TokenSavingsRecord) {
+    if let Ok(db) = AnalyticsDb::open_default() {
+        let _ = db.record(record);
+        db.maybe_prune();
+    }
+}
+
 /// Record command output token savings. Defers token counting to background thread.
 /// Check is_analytics_enabled() BEFORE cloning strings.
 pub(crate) fn record_fire_and_forget(
@@ -428,31 +453,20 @@ pub(crate) fn record_fire_and_forget(
         let Ok(comp_tokens) = tokens::count_tokens(&compressed_text) else {
             return;
         };
-        let savings_pct = if raw_tokens == 0 {
-            0.0
-        } else {
-            (raw_tokens as f32 - comp_tokens as f32) / raw_tokens as f32 * 100.0
-        };
         let record = TokenSavingsRecord {
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            timestamp: now_unix_secs(),
             command_type,
             original_cmd,
             raw_tokens,
             compressed_tokens: comp_tokens,
-            savings_pct,
+            savings_pct: savings_percentage(raw_tokens, comp_tokens),
             duration_ms: duration.as_millis() as u64,
             project_path,
             mode: None,
             language: None,
             parse_tier,
         };
-        if let Ok(db) = AnalyticsDb::open_default() {
-            let _ = db.record(&record);
-            db.maybe_prune();
-        }
+        persist_record(&record);
     });
 }
 
@@ -472,31 +486,20 @@ pub(crate) fn record_with_counts(
         return;
     }
     std::thread::spawn(move || {
-        let savings_pct = if raw_tokens == 0 {
-            0.0
-        } else {
-            (raw_tokens as f32 - compressed_tokens as f32) / raw_tokens as f32 * 100.0
-        };
         let record = TokenSavingsRecord {
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            timestamp: now_unix_secs(),
             command_type,
             original_cmd,
             raw_tokens,
             compressed_tokens,
-            savings_pct,
+            savings_pct: savings_percentage(raw_tokens, compressed_tokens),
             duration_ms,
             project_path,
             mode,
             language,
             parse_tier: None,
         };
-        if let Ok(db) = AnalyticsDb::open_default() {
-            let _ = db.record(&record);
-            db.maybe_prune();
-        }
+        persist_record(&record);
     });
 }
 

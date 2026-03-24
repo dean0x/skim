@@ -94,6 +94,23 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
         crate::process::report_token_stats(orig, comp, "");
     }
 
+    // Record analytics (fire-and-forget, non-blocking)
+    if crate::analytics::is_analytics_enabled() {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        crate::analytics::record_fire_and_forget(
+            combined.clone(),
+            parsed.content().to_string(),
+            format!("skim test go {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            output.duration,
+            cwd,
+            Some(parsed.tier_name().to_string()),
+        );
+    }
+
     Ok(exit_code)
 }
 

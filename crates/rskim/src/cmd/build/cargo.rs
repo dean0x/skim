@@ -17,7 +17,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::{inject_flag_before_separator, run_parsed_command, user_has_flag};
+use super::run_parsed_command;
+use crate::cmd::{inject_flag_before_separator, user_has_flag};
 use crate::output::canonical::BuildResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -47,7 +48,7 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     let mut full_args = vec!["build".to_string()];
     full_args.extend_from_slice(args);
 
-    if !user_has_flag(&full_args, "--message-format") {
+    if !user_has_flag(&full_args, &["--message-format"]) {
         inject_flag_before_separator(&mut full_args, "--message-format=json");
     }
 
@@ -69,7 +70,7 @@ pub(crate) fn run_clippy(args: &[String], show_stats: bool) -> anyhow::Result<Ex
     let mut full_args = vec!["clippy".to_string()];
     full_args.extend_from_slice(args);
 
-    if !user_has_flag(&full_args, "--message-format") {
+    if !user_has_flag(&full_args, &["--message-format"]) {
         inject_flag_before_separator(&mut full_args, "--message-format=json");
     }
 
@@ -372,7 +373,7 @@ mod tests {
         // If user already has --message-format=json2, we should not inject our own
         let args = vec!["--message-format=json2".to_string()];
         assert!(
-            user_has_flag(&args, "--message-format"),
+            user_has_flag(&args, &["--message-format"]),
             "should detect existing --message-format flag"
         );
     }
@@ -390,7 +391,7 @@ mod tests {
         // Verify flag detection prevents injection
         let user_args = vec!["build".to_string(), "--message-format=short".to_string()];
         assert!(
-            user_has_flag(&user_args, "--message-format"),
+            user_has_flag(&user_args, &["--message-format"]),
             "should detect user's --message-format flag"
         );
 
@@ -473,12 +474,12 @@ mod tests {
     #[test]
     fn test_user_has_flag_present() {
         let args = vec!["build".to_string(), "--message-format=json2".to_string()];
-        assert!(user_has_flag(&args, "--message-format"));
+        assert!(user_has_flag(&args, &["--message-format"]));
     }
 
     #[test]
     fn test_user_has_flag_absent() {
         let args = vec!["build".to_string(), "--release".to_string()];
-        assert!(!user_has_flag(&args, "--message-format"));
+        assert!(!user_has_flag(&args, &["--message-format"]));
     }
 }

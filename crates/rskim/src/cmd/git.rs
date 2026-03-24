@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::cmd::user_has_flag;
 use crate::output::canonical::GitResult;
 use crate::runner::CommandRunner;
 
@@ -163,18 +164,7 @@ fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
 // Helpers
 // ============================================================================
 
-/// Check whether any of `flags` appears in `args`.
-///
-/// Supports both exact matches (`--oneline`) and prefix matches with `=`
-/// (`--format=%H` matches `--format`). This is consistent with the rewrite
-/// engine's `skip_if_flag_prefix` behavior.
-fn user_has_flag(args: &[String], flags: &[&str]) -> bool {
-    args.iter().any(|a| {
-        flags
-            .iter()
-            .any(|&f| a.as_str() == f || a.starts_with(&format!("{f}=")))
-    })
-}
+// user_has_flag is imported from crate::cmd
 
 /// Check whether the user has specified a limit flag (`-n`, `--max-count`).
 fn has_limit_flag(args: &[String]) -> bool {
@@ -250,6 +240,23 @@ where
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&output.stdout, &result_str);
         crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Record analytics (fire-and-forget, non-blocking)
+    if crate::analytics::is_analytics_enabled() {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        crate::analytics::record_fire_and_forget(
+            output.stdout.clone(),
+            result_str,
+            format!("skim git {}", subcmd_args.join(" ")),
+            crate::analytics::CommandType::Git,
+            output.duration,
+            cwd,
+            None,
+        );
     }
 
     Ok(ExitCode::SUCCESS)

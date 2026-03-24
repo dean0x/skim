@@ -49,7 +49,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return run_json(&db, since_ts, show_cost);
     }
 
-    run_dashboard(&db, since_ts, show_cost, &since_str)
+    run_dashboard(&db, since_ts, show_cost, since_str.as_deref())
 }
 
 // ============================================================================
@@ -156,7 +156,7 @@ fn run_dashboard(
     db: &AnalyticsDb,
     since: Option<i64>,
     show_cost: bool,
-    since_str: &Option<String>,
+    since_str: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let summary = db.query_summary(since)?;
 
@@ -169,9 +169,7 @@ fn run_dashboard(
     }
 
     // Header
-    let period = since_str
-        .as_ref()
-        .map_or("all time".to_string(), |s| format!("last {s}"));
+    let period = since_str.map_or("all time".to_string(), |s| format!("last {s}"));
     println!(
         "{}",
         format!("Token Analytics ({period})").bold()

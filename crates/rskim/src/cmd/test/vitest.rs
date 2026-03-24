@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
@@ -65,6 +66,23 @@ pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::R
         crate::process::report_token_stats(orig, comp, "");
     }
 
+    // Record analytics (fire-and-forget, non-blocking)
+    if crate::analytics::is_analytics_enabled() {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        crate::analytics::record_fire_and_forget(
+            raw_output,
+            result.content().to_string(),
+            format!("skim test {program} {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            std::time::Duration::ZERO,
+            cwd,
+            Some(result.tier_name().to_string()),
+        );
+    }
+
     Ok(exit_code)
 }
 
@@ -113,10 +131,10 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     let mut final_args: Vec<String> = args.to_vec();
 
     if program == "jest" {
-        if !user_has_flag(args, "--json") {
+        if !user_has_flag(args, &["--json"]) {
             final_args.push("--json".to_string());
         }
-    } else if !user_has_flag(args, "--reporter") {
+    } else if !user_has_flag(args, &["--reporter"]) {
         final_args.push("--reporter=json".to_string());
     }
 
@@ -143,13 +161,7 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     Ok(combined)
 }
 
-/// Check if the user has already specified a flag (with or without `=` value).
-///
-/// Matches both `--reporter=verbose` and `--reporter verbose` forms.
-fn user_has_flag(args: &[String], flag: &str) -> bool {
-    args.iter()
-        .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
-}
+// user_has_flag is imported from crate::cmd
 
 // ============================================================================
 // Three-tier parser
@@ -728,7 +740,7 @@ Duration: 1.5s";
             "math".to_string(),
         ];
         assert!(
-            user_has_flag(&args, "--reporter"),
+            user_has_flag(&args, &["--reporter"]),
             "should detect --reporter=verbose"
         );
     }
@@ -737,7 +749,7 @@ Duration: 1.5s";
     fn test_flag_injection_skipped_bare_flag() {
         let args = vec!["--reporter".to_string(), "json".to_string()];
         assert!(
-            user_has_flag(&args, "--reporter"),
+            user_has_flag(&args, &["--reporter"]),
             "should detect bare --reporter"
         );
     }
@@ -746,7 +758,7 @@ Duration: 1.5s";
     fn test_flag_injection_needed_when_no_reporter() {
         let args = vec!["--run".to_string(), "math".to_string()];
         assert!(
-            !user_has_flag(&args, "--reporter"),
+            !user_has_flag(&args, &["--reporter"]),
             "should not detect --reporter when absent"
         );
     }
