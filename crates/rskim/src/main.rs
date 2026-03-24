@@ -9,6 +9,9 @@
 //! - Multi-file glob pattern matching
 //! - File-based caching with mtime invalidation
 
+// Infrastructure module — consumers arrive in later commits.
+#[allow(dead_code)]
+mod analytics;
 mod cache;
 mod cascade;
 mod cmd;

@@ -34,6 +34,8 @@ tiktoken-rs = "0.7"
 clap_complete = "4.5"
 strip-ansi-escapes = "0.2"
 regex = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+colored = "2"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"

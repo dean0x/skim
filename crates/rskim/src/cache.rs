@@ -204,7 +204,8 @@ pub(crate) fn clear_cache() -> Result<()> {
         for entry in fs::read_dir(&cache_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() {
+            // Only remove JSON cache files; skip analytics.db and other non-cache files.
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
                 // Best-effort removal; ignore errors from concurrent access.
                 let _ = fs::remove_file(&path);
             }
