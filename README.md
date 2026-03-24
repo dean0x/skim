@@ -584,7 +584,7 @@ Comprehensive guides for all aspects of Skim:
 |------|------|-------------|
 | **Skim** | Context Optimization | Compresses code, test output, build output, and git output for optimal LLM reasoning |
 | **[DevFlow](https://github.com/dean0x/devflow)** | Quality Orchestration | 18 parallel reviewers, working memory, self-learning, production-grade lifecycle workflows |
-| **[Backbeat](https://github.com/dean0x/backbeat)** | Agent Orchestration | The only framework with Karpathy optimization loops. Multi-agent pipelines, DAG dependencies, scheduling |
+| **[Backbeat](https://github.com/dean0x/backbeat)** | Agent Orchestration | Orchestration at scale. Karpathy optimization loops, multi-agent pipelines, DAG dependencies, autoscaling |
 
 Skim optimizes every byte of context. DevFlow enforces production-grade quality. Backbeat scales execution across agents. No other stack covers all three.
 
