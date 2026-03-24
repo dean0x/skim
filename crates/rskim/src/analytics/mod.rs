@@ -156,9 +156,15 @@ impl PricingModel {
 
 /// Check if analytics recording is enabled.
 ///
-/// Disabled by `SKIM_DISABLE_ANALYTICS=1` env var.
+/// Disabled by setting `SKIM_DISABLE_ANALYTICS` to a truthy value
+/// (`1`, `true`, or `yes`, case-insensitive). Any other value (including
+/// `0`, `false`, `no`) keeps analytics enabled. Unsetting the variable
+/// also keeps analytics enabled (the default).
 pub(crate) fn is_analytics_enabled() -> bool {
-    std::env::var("SKIM_DISABLE_ANALYTICS").is_err()
+    match std::env::var("SKIM_DISABLE_ANALYTICS") {
+        Ok(val) => !matches!(val.to_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => true,
+    }
 }
 
 // ============================================================================
@@ -512,9 +518,16 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn test_db() -> AnalyticsDb {
+    /// Create a test database backed by a temporary file.
+    ///
+    /// Returns both the `AnalyticsDb` and the `NamedTempFile` handle. The
+    /// caller must keep the `NamedTempFile` alive for the duration of the
+    /// test -- dropping it deletes the underlying file, which would
+    /// invalidate the database connection.
+    fn test_db() -> (AnalyticsDb, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();
-        AnalyticsDb::open(tmp.path()).unwrap()
+        let db = AnalyticsDb::open(tmp.path()).unwrap();
+        (db, tmp)
     }
 
     fn sample_record() -> TokenSavingsRecord {
@@ -535,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_open_creates_tables() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         let count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM token_savings", [], |row| row.get(0))
@@ -545,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_record_and_query_summary() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         db.record(&sample_record()).unwrap();
 
         let summary = db.query_summary(None).unwrap();
@@ -557,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_daily_breakdown_groups_correctly() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         // Two records on same day
         let mut r1 = sample_record();
         r1.timestamp = 1711300000;
@@ -578,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_command_breakdown() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         let mut r1 = sample_record();
         r1.command_type = CommandType::File;
         db.record(&r1).unwrap();
@@ -593,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_prune_removes_old_records() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         // Record from 100 days ago
         let mut r = sample_record();
         r.timestamp = std::time::SystemTime::now()
@@ -620,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_wal_mode_enabled() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         let mode: String = db
             .conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -630,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_clear_deletes_all() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         db.record(&sample_record()).unwrap();
         db.record(&sample_record()).unwrap();
         db.clear().unwrap();
@@ -640,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_language_breakdown() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         let mut r1 = sample_record();
         r1.language = Some("rust".to_string());
         db.record(&r1).unwrap();
@@ -655,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_mode_breakdown() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         let mut r1 = sample_record();
         r1.mode = Some("structure".to_string());
         db.record(&r1).unwrap();
@@ -670,7 +683,7 @@ mod tests {
 
     #[test]
     fn test_tier_distribution() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         for tier in &["full", "full", "full", "degraded", "passthrough"] {
             let mut r = sample_record();
             r.parse_tier = Some(tier.to_string());
@@ -700,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_since_filter() {
-        let db = test_db();
+        let (db, _tmp) = test_db();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -716,5 +729,122 @@ mod tests {
 
         let summary = db.query_summary(Some(now - 86400)).unwrap();
         assert_eq!(summary.invocations, 1);
+    }
+
+    // ========================================================================
+    // is_analytics_enabled() tests
+    // ========================================================================
+
+    /// Run a closure with `SKIM_DISABLE_ANALYTICS` set to the given value,
+    /// then restore the original environment. Uses a mutex to prevent
+    /// concurrent env-var mutations from interfering between tests.
+    fn with_env_var(value: Option<&str>, f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let prev = std::env::var("SKIM_DISABLE_ANALYTICS").ok();
+        match value {
+            Some(v) => std::env::set_var("SKIM_DISABLE_ANALYTICS", v),
+            None => std::env::remove_var("SKIM_DISABLE_ANALYTICS"),
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev {
+            Some(v) => std::env::set_var("SKIM_DISABLE_ANALYTICS", v),
+            None => std::env::remove_var("SKIM_DISABLE_ANALYTICS"),
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn test_analytics_enabled_when_env_unset() {
+        with_env_var(None, || {
+            assert!(
+                is_analytics_enabled(),
+                "analytics should be enabled when SKIM_DISABLE_ANALYTICS is unset"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_disabled_with_value_1() {
+        with_env_var(Some("1"), || {
+            assert!(
+                !is_analytics_enabled(),
+                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=1"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_disabled_with_value_true() {
+        with_env_var(Some("true"), || {
+            assert!(
+                !is_analytics_enabled(),
+                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=true"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_disabled_with_value_yes() {
+        with_env_var(Some("yes"), || {
+            assert!(
+                !is_analytics_enabled(),
+                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=yes"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_disabled_case_insensitive() {
+        with_env_var(Some("TRUE"), || {
+            assert!(
+                !is_analytics_enabled(),
+                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=TRUE (case-insensitive)"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_enabled_with_value_0() {
+        with_env_var(Some("0"), || {
+            assert!(
+                is_analytics_enabled(),
+                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=0"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_enabled_with_value_false() {
+        with_env_var(Some("false"), || {
+            assert!(
+                is_analytics_enabled(),
+                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=false"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_enabled_with_value_no() {
+        with_env_var(Some("no"), || {
+            assert!(
+                is_analytics_enabled(),
+                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=no"
+            );
+        });
+    }
+
+    #[test]
+    fn test_analytics_enabled_with_empty_string() {
+        with_env_var(Some(""), || {
+            assert!(
+                is_analytics_enabled(),
+                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS is empty"
+            );
+        });
     }
 }
