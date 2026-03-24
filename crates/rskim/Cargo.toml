@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
-description = "Smart code reader - streaming code transformation for AI agents"
+description = "The fastest, most comprehensive context optimization tool for AI coding agents. Code skimming, command rewriting, output compression."
 repository = "https://github.com/dean0x/skim"
 readme = "README.md"
 
