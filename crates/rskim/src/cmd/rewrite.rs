@@ -111,29 +111,6 @@ struct SuggestOutput<'a> {
     skim_hook_version: &'a str,
 }
 
-// ---- Hook response types (#44) ----
-// SECURITY INVARIANT: No `permissionDecision` field. Skim only sets `updatedInput`
-// and lets Claude Code's permission system evaluate independently.
-
-#[derive(Serialize)]
-struct HookResponse {
-    #[serde(rename = "hookSpecificOutput")]
-    hook_specific_output: HookSpecificOutput,
-}
-
-#[derive(Serialize)]
-struct HookSpecificOutput {
-    #[serde(rename = "hookEventName")]
-    hook_event_name: String,
-    #[serde(rename = "updatedInput")]
-    updated_input: UpdatedInput,
-}
-
-#[derive(Serialize)]
-struct UpdatedInput {
-    command: String,
-}
-
 fn serialize_category<S: serde::Serializer>(
     cat: &Option<RewriteCategory>,
     serializer: S,
@@ -1049,21 +1026,24 @@ const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 ///
 /// SECURITY INVARIANT: Never sets `permissionDecision`. Only sets `updatedInput`.
 fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
-    // For non-Claude agents, passthrough until Phase 2 adds implementations
-    match agent {
-        None | Some(AgentKind::ClaudeCode) => {} // proceed with Claude Code logic
-        Some(_) => {
-            // TODO: Phase 2 will add hook implementations for other agents
-            return Ok(ExitCode::SUCCESS);
-        }
+    use super::hooks::{protocol_for_agent, HookSupport};
+
+    let agent_kind = agent.unwrap_or(AgentKind::ClaudeCode);
+    let protocol = protocol_for_agent(agent_kind);
+
+    // AwarenessOnly agents (Codex, OpenCode) have no hook mechanism — passthrough immediately
+    if protocol.hook_support() == HookSupport::AwarenessOnly {
+        return Ok(ExitCode::SUCCESS);
     }
+
     // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
-    // Integrity warning subsumes version mismatch: if the hook script was
-    // tampered with, the version check is redundant.
-    let integrity_failed = check_hook_integrity();
-    if !integrity_failed {
-        // A2: Version mismatch check — rate-limited daily warning
-        check_hook_version_mismatch();
+    // Only run for Claude Code where we have the hook script infrastructure.
+    if agent_kind == AgentKind::ClaudeCode {
+        let integrity_failed = check_hook_integrity();
+        if !integrity_failed {
+            // A2: Version mismatch check — rate-limited daily warning
+            check_hook_version_mismatch();
+        }
     }
 
     // Read stdin (bounded)
@@ -1087,16 +1067,12 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
         }
     };
 
-    // Extract tool_input.command
-    let command = match json
-        .get("tool_input")
-        .and_then(|ti| ti.get("command"))
-        .and_then(|c| c.as_str())
-    {
-        Some(cmd) => cmd.to_string(),
+    // Extract command using the agent-specific protocol
+    let command = match protocol.parse_input(&json) {
+        Some(input) => input.command,
         None => {
             audit_hook("", false, "");
-            return Ok(ExitCode::SUCCESS); // passthrough on missing field
+            return Ok(ExitCode::SUCCESS); // passthrough on missing/unparseable field
         }
     };
 
@@ -1141,16 +1117,8 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     match rewritten {
         Some(ref rewritten_cmd) => {
             audit_hook(&command, true, rewritten_cmd);
-            let response = HookResponse {
-                hook_specific_output: HookSpecificOutput {
-                    hook_event_name: "PreToolUse".to_string(),
-                    updated_input: UpdatedInput {
-                        command: rewritten_cmd.clone(),
-                    },
-                },
-            };
-            // Struct contains only String fields -- serialization is infallible in practice,
-            // but we propagate the error rather than panicking in the hook path.
+            // Use agent-specific response format
+            let response = protocol.format_response(rewritten_cmd);
             let json_out = serde_json::to_string(&response)?;
             println!("{json_out}");
         }

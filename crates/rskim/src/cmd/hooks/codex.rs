@@ -6,7 +6,6 @@
 use super::{HookInput, HookProtocol, HookSupport, InstallOpts, InstallResult, UninstallOpts};
 use crate::cmd::session::AgentKind;
 
-#[allow(dead_code)] // Constructed in tests; Phase 2 will use in init
 pub(crate) struct CodexCliHook;
 
 impl HookProtocol for CodexCliHook {

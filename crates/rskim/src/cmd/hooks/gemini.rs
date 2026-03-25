@@ -12,10 +12,9 @@
 //! SECURITY: Absolute binary path in generated scripts (GRANITE #685 lesson).
 
 use super::{HookInput, HookProtocol, HookSupport, InstallOpts, InstallResult, UninstallOpts};
-use crate::cmd::session::types::AgentKind;
+use crate::cmd::session::AgentKind;
 
 /// Gemini CLI hook implementation.
-#[allow(dead_code)] // Will be consumed by rewrite --hook --agent gemini dispatch
 pub(crate) struct GeminiCliHook;
 
 impl HookProtocol for GeminiCliHook {

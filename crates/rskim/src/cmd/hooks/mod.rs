@@ -14,7 +14,6 @@ use super::session::AgentKind;
 
 /// Whether an agent supports real hooks or awareness-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Used by HookProtocol implementations and tests
 pub(crate) enum HookSupport {
     /// Agent supports real tool interception hooks.
     RealHook,
@@ -24,14 +23,13 @@ pub(crate) enum HookSupport {
 
 /// Input extracted from agent's hook event JSON.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Used by HookProtocol implementations and tests
 pub(crate) struct HookInput {
     pub(crate) command: String,
 }
 
 /// Result of a hook installation.
 #[derive(Debug)]
-#[allow(dead_code)] // Used by HookProtocol implementations and tests
+#[allow(dead_code)] // Used in tests; will be consumed when init dispatches via protocol
 pub(crate) struct InstallResult {
     pub(crate) script_path: Option<std::path::PathBuf>,
     pub(crate) config_patched: bool,
@@ -39,7 +37,7 @@ pub(crate) struct InstallResult {
 
 /// Options passed to install/uninstall.
 #[derive(Debug)]
-#[allow(dead_code)] // Used by HookProtocol implementations and tests
+#[allow(dead_code)] // Used in tests; will be consumed when init dispatches via protocol
 pub(crate) struct InstallOpts {
     pub(crate) binary_path: std::path::PathBuf,
     pub(crate) version: String,
@@ -50,7 +48,7 @@ pub(crate) struct InstallOpts {
 
 /// Options for uninstall.
 #[derive(Debug)]
-#[allow(dead_code)] // Used by HookProtocol implementations and tests
+#[allow(dead_code)] // Used in tests; will be consumed when init dispatches via protocol
 pub(crate) struct UninstallOpts {
     pub(crate) config_dir: std::path::PathBuf,
     pub(crate) force: bool,
@@ -63,7 +61,7 @@ pub(crate) struct UninstallOpts {
 /// - Response formatting (rewritten command -> agent JSON)
 /// - Script generation (binary path -> shell script)
 /// - Installation/uninstallation
-#[allow(dead_code)] // Phase 2 will dispatch through this trait
+#[allow(dead_code)] // Some methods used only in tests; full dispatch planned for init --agent
 pub(crate) trait HookProtocol {
     fn agent_kind(&self) -> AgentKind;
     fn hook_support(&self) -> HookSupport;
@@ -72,6 +70,18 @@ pub(crate) trait HookProtocol {
     fn generate_script(&self, binary_path: &str, version: &str) -> String;
     fn install(&self, opts: &InstallOpts) -> anyhow::Result<InstallResult>;
     fn uninstall(&self, opts: &UninstallOpts) -> anyhow::Result<()>;
+}
+
+/// Factory: create the appropriate HookProtocol implementation for a given agent.
+pub(crate) fn protocol_for_agent(kind: AgentKind) -> Box<dyn HookProtocol> {
+    match kind {
+        AgentKind::ClaudeCode => Box::new(claude::ClaudeCodeHook),
+        AgentKind::Cursor => Box::new(cursor::CursorHook),
+        AgentKind::GeminiCli => Box::new(gemini::GeminiCliHook),
+        AgentKind::CopilotCli => Box::new(copilot::CopilotCliHook),
+        AgentKind::CodexCli => Box::new(codex::CodexCliHook),
+        AgentKind::OpenCode => Box::new(opencode::OpenCodeHook),
+    }
 }
 
 // ============================================================================

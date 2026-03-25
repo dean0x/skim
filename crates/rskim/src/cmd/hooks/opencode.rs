@@ -12,7 +12,6 @@ use crate::cmd::session::AgentKind;
 /// OpenCode has no shell hook mechanism, so all methods are no-ops.
 /// The provider exists so that `skim init --agent opencode` gives
 /// a clear "awareness-only" message instead of "unknown agent".
-#[allow(dead_code)] // Constructed in tests; Phase 2 will use in init
 pub(crate) struct OpenCodeHook;
 
 impl HookProtocol for OpenCodeHook {
