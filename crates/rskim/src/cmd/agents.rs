@@ -65,6 +65,7 @@ struct SessionInfo {
 }
 
 /// Hook installation status.
+#[derive(Debug)]
 enum HookStatus {
     Installed {
         version: Option<String>,
@@ -413,11 +414,15 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
             })
         });
 
-    // Check integrity: script exists and is executable
-    let integrity = if hook_script.is_file() {
-        "ok"
-    } else {
+    // Check integrity using SHA-256 verification
+    let integrity = if !hook_script.is_file() {
         "missing"
+    } else {
+        match super::integrity::verify_script_integrity(config_dir, "claude-code", &hook_script) {
+            Ok(true) => "ok",
+            Ok(false) => "tampered",
+            Err(_) => "unknown",
+        }
     };
 
     HookStatus::Installed { version, integrity }
@@ -781,5 +786,100 @@ mod tests {
         assert!(all.contains(&AgentKind::CodexCli));
         assert!(all.contains(&AgentKind::GeminiCli));
         assert!(all.contains(&AgentKind::CopilotCli));
+    }
+
+    #[test]
+    fn test_detect_claude_hook_integrity_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path();
+        let hooks_dir = config.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        // Create settings.json with a skim hook entry
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": hooks_dir.join("skim-rewrite.sh").to_str().unwrap()}]
+                }]
+            }
+        });
+        std::fs::write(config.join("settings.json"), serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        // Create hook script and hash manifest
+        let script_path = hooks_dir.join("skim-rewrite.sh");
+        std::fs::write(&script_path, "#!/usr/bin/env bash\n# skim-hook v1.0.0\nexec skim rewrite --hook\n").unwrap();
+        let hash = crate::cmd::integrity::compute_file_hash(&script_path).unwrap();
+        crate::cmd::integrity::write_hash_manifest(config, "claude-code", "skim-rewrite.sh", &hash).unwrap();
+
+        let status = detect_claude_hook(Some(config));
+        match status {
+            HookStatus::Installed { integrity, .. } => {
+                assert_eq!(integrity, "ok", "integrity should be 'ok' for valid script+hash");
+            }
+            other => panic!("expected HookStatus::Installed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_detect_claude_hook_integrity_tampered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path();
+        let hooks_dir = config.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": hooks_dir.join("skim-rewrite.sh").to_str().unwrap()}]
+                }]
+            }
+        });
+        std::fs::write(config.join("settings.json"), serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        // Create script, store hash, then modify the script (tamper)
+        let script_path = hooks_dir.join("skim-rewrite.sh");
+        std::fs::write(&script_path, "#!/usr/bin/env bash\n# skim-hook v1.0.0\nexec skim rewrite --hook\n").unwrap();
+        let hash = crate::cmd::integrity::compute_file_hash(&script_path).unwrap();
+        crate::cmd::integrity::write_hash_manifest(config, "claude-code", "skim-rewrite.sh", &hash).unwrap();
+
+        // Tamper with the script
+        std::fs::write(&script_path, "#!/usr/bin/env bash\necho HACKED\n").unwrap();
+
+        let status = detect_claude_hook(Some(config));
+        match status {
+            HookStatus::Installed { integrity, .. } => {
+                assert_eq!(integrity, "tampered", "integrity should be 'tampered' for modified script");
+            }
+            other => panic!("expected HookStatus::Installed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_detect_claude_hook_integrity_missing_script() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path();
+        let hooks_dir = config.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": hooks_dir.join("skim-rewrite.sh").to_str().unwrap()}]
+                }]
+            }
+        });
+        std::fs::write(config.join("settings.json"), serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        // No script file created -- should be "missing"
+
+        let status = detect_claude_hook(Some(config));
+        match status {
+            HookStatus::Installed { integrity, .. } => {
+                assert_eq!(integrity, "missing", "integrity should be 'missing' for absent script");
+            }
+            other => panic!("expected HookStatus::Installed, got: {other:?}"),
+        }
     }
 }
