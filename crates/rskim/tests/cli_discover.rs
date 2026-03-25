@@ -75,7 +75,10 @@ fn test_discover_no_agent_dir() {
         // Neutralize all providers to ensure no agents are detected
         .env("SKIM_CODEX_SESSIONS_DIR", nonexistent.to_str().unwrap())
         .env("SKIM_COPILOT_DIR", nonexistent.to_str().unwrap())
-        .env("SKIM_CURSOR_DB_PATH", dir.path().join("no-cursor.vscdb").to_str().unwrap())
+        .env(
+            "SKIM_CURSOR_DB_PATH",
+            dir.path().join("no-cursor.vscdb").to_str().unwrap(),
+        )
         .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
         .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
         .assert()

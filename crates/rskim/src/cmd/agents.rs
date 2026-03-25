@@ -98,6 +98,7 @@ fn detect_agent(kind: AgentKind) -> AgentStatus {
         AgentKind::CodexCli => detect_codex_cli(),
         AgentKind::GeminiCli => detect_gemini_cli(),
         AgentKind::CopilotCli => detect_copilot_cli(),
+        AgentKind::OpenCode => detect_opencode(),
     }
 }
 
@@ -108,9 +109,7 @@ fn detect_claude_code() -> AgentStatus {
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|h| h.join(".claude").join("projects")));
 
-    let detected = projects_dir
-        .as_ref()
-        .is_some_and(|p| p.is_dir());
+    let detected = projects_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = if detected {
         projects_dir.as_ref().map(|p| {
@@ -147,10 +146,7 @@ fn detect_cursor() -> AgentStatus {
     // Cursor stores state in ~/Library/Application Support/Cursor/ (macOS)
     // or ~/.config/Cursor/ (Linux)
     let state_path = home.as_ref().and_then(|h| {
-        let macos_path = h
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor");
+        let macos_path = h.join("Library").join("Application Support").join("Cursor");
         let linux_path = h.join(".config").join("Cursor");
         if macos_path.is_dir() {
             Some(macos_path)
@@ -243,9 +239,7 @@ fn detect_gemini_cli() -> AgentStatus {
 
     // Gemini CLI supports BeforeTool/AfterTool hooks
     let hooks = if detected {
-        let settings_path = gemini_dir
-            .as_ref()
-            .map(|p| p.join("settings.json"));
+        let settings_path = gemini_dir.as_ref().map(|p| p.join("settings.json"));
         let has_hook = settings_path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -299,18 +293,14 @@ fn detect_copilot_cli() -> AgentStatus {
     let sessions = None; // Copilot CLI sessions are cloud-managed
 
     let hooks = if detected {
-        let has_skim_hook = std::fs::read_dir(hooks_dir)
-            .ok()
-            .is_some_and(|entries| {
-                entries.flatten().any(|e| {
-                    e.path()
-                        .extension()
-                        .is_some_and(|ext| ext == "json")
-                        && std::fs::read_to_string(e.path())
-                            .ok()
-                            .is_some_and(|c| c.contains("skim"))
-                })
-            });
+        let has_skim_hook = std::fs::read_dir(hooks_dir).ok().is_some_and(|entries| {
+            entries.flatten().any(|e| {
+                e.path().extension().is_some_and(|ext| ext == "json")
+                    && std::fs::read_to_string(e.path())
+                        .ok()
+                        .is_some_and(|c| c.contains("skim"))
+            })
+        });
         if has_skim_hook {
             HookStatus::Installed {
                 version: None,
@@ -327,6 +317,39 @@ fn detect_copilot_cli() -> AgentStatus {
 
     AgentStatus {
         kind: AgentKind::CopilotCli,
+        detected,
+        sessions,
+        hooks,
+        rules,
+    }
+}
+
+fn detect_opencode() -> AgentStatus {
+    // OpenCode uses .opencode/ directory in project root
+    let opencode_dir = std::env::var("SKIM_OPENCODE_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".opencode"));
+    let detected = opencode_dir.is_dir();
+
+    let sessions = if detected {
+        let count = count_files_in_dir(&opencode_dir);
+        Some(SessionInfo {
+            path: tilde_path(&opencode_dir),
+            detail: format!("{count} files"),
+        })
+    } else {
+        None
+    };
+
+    let hooks = HookStatus::NotSupported {
+        note: "TypeScript plugin model",
+    };
+
+    let rules = None; // OpenCode uses AGENTS.md, not a rules directory
+
+    AgentStatus {
+        kind: AgentKind::OpenCode,
         detected,
         sessions,
         hooks,
@@ -391,12 +414,13 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
         });
 
     // Check integrity: script exists and is executable
-    let integrity = if hook_script.is_file() { "ok" } else { "missing" };
+    let integrity = if hook_script.is_file() {
+        "ok"
+    } else {
+        "missing"
+    };
 
-    HookStatus::Installed {
-        version,
-        integrity,
-    }
+    HookStatus::Installed { version, integrity }
 }
 
 // ============================================================================
@@ -427,10 +451,7 @@ fn print_text(agents: &[AgentStatus]) {
 
         // Hooks
         let hook_str = match &agent.hooks {
-            HookStatus::Installed {
-                version,
-                integrity,
-            } => {
+            HookStatus::Installed { version, integrity } => {
                 let ver = version
                     .as_deref()
                     .map(|v| format!(", v{v}"))
@@ -473,10 +494,7 @@ fn print_json(agents: &[AgentStatus]) -> anyhow::Result<()> {
         });
 
         let hooks = match &agent.hooks {
-            HookStatus::Installed {
-                version,
-                integrity,
-            } => serde_json::json!({
+            HookStatus::Installed { version, integrity } => serde_json::json!({
                 "status": "installed",
                 "version": version,
                 "integrity": integrity,
@@ -636,7 +654,10 @@ mod tests {
         if let Some(home) = dirs::home_dir() {
             let path = home.join("some").join("path");
             let result = tilde_path(&path);
-            assert!(result.starts_with("~/"), "expected ~/ prefix, got: {result}");
+            assert!(
+                result.starts_with("~/"),
+                "expected ~/ prefix, got: {result}"
+            );
             assert!(
                 result.contains("some/path"),
                 "expected path suffix, got: {result}"
@@ -688,10 +709,7 @@ mod tests {
             integrity: "ok",
         };
         match &installed {
-            HookStatus::Installed {
-                version,
-                integrity,
-            } => {
+            HookStatus::Installed { version, integrity } => {
                 assert_eq!(version.as_deref(), Some("2.0.0"));
                 assert_eq!(*integrity, "ok");
             }
@@ -725,7 +743,10 @@ mod tests {
             .find(|a| a.kind == AgentKind::ClaudeCode)
             .expect("Claude Code should be in results");
 
-        assert!(claude.detected, "Claude Code should be detected with fixture");
+        assert!(
+            claude.detected,
+            "Claude Code should be detected with fixture"
+        );
         assert!(
             claude.sessions.is_some(),
             "sessions should be reported for detected agent"
@@ -745,9 +766,10 @@ mod tests {
     fn test_agent_kind_cli_name() {
         assert_eq!(AgentKind::ClaudeCode.cli_name(), "claude-code");
         assert_eq!(AgentKind::Cursor.cli_name(), "cursor");
-        assert_eq!(AgentKind::CodexCli.cli_name(), "codex-cli");
-        assert_eq!(AgentKind::GeminiCli.cli_name(), "gemini-cli");
-        assert_eq!(AgentKind::CopilotCli.cli_name(), "copilot-cli");
+        assert_eq!(AgentKind::CodexCli.cli_name(), "codex");
+        assert_eq!(AgentKind::GeminiCli.cli_name(), "gemini");
+        assert_eq!(AgentKind::CopilotCli.cli_name(), "copilot");
+        assert_eq!(AgentKind::OpenCode.cli_name(), "opencode");
     }
 
     #[test]

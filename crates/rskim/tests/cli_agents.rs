@@ -59,10 +59,7 @@ fn test_agents_json_output_valid_json() {
     for agent in agents {
         assert!(agent.get("name").is_some(), "missing 'name' field");
         assert!(agent.get("cli_name").is_some(), "missing 'cli_name' field");
-        assert!(
-            agent.get("detected").is_some(),
-            "missing 'detected' field"
-        );
+        assert!(agent.get("detected").is_some(), "missing 'detected' field");
         assert!(agent.get("hooks").is_some(), "missing 'hooks' field");
     }
 }
@@ -139,9 +136,10 @@ fn test_agents_lists_all_supported() {
 
     assert!(cli_names.contains(&"claude-code"), "missing claude-code");
     assert!(cli_names.contains(&"cursor"), "missing cursor");
-    assert!(cli_names.contains(&"codex-cli"), "missing codex-cli");
-    assert!(cli_names.contains(&"gemini-cli"), "missing gemini-cli");
-    assert!(cli_names.contains(&"copilot-cli"), "missing copilot-cli");
+    assert!(cli_names.contains(&"codex"), "missing codex");
+    assert!(cli_names.contains(&"gemini"), "missing gemini");
+    assert!(cli_names.contains(&"copilot"), "missing copilot");
+    assert!(cli_names.contains(&"opencode"), "missing opencode");
 }
 
 #[test]
