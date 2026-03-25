@@ -112,6 +112,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
         yes: flags.yes,
         dry_run: flags.dry_run,
         uninstall: false,
+        force: flags.force,
     };
     let state = detect_state(&flags_override)?;
 
@@ -278,6 +279,16 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     }
 
     std::fs::rename(&tmp_path, &script_path)?;
+
+    // Compute and store SHA-256 hash for integrity verification (#57)
+    if let Ok(hash) = crate::cmd::integrity::compute_file_hash(&script_path) {
+        let _ = crate::cmd::integrity::write_hash_manifest(
+            &state.config_dir,
+            "claude-code",
+            HOOK_SCRIPT_NAME,
+            &hash,
+        );
+    }
 
     Ok(())
 }

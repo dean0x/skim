@@ -93,4 +93,10 @@ pub(super) fn command() -> clap::Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Remove hook and clean up"),
         )
+        .arg(
+            clap::Arg::new("force")
+                .long("force")
+                .action(clap::ArgAction::SetTrue)
+                .help("Force operation (e.g., uninstall tampered hook)"),
+        )
 }
