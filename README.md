@@ -1,8 +1,8 @@
-# Skim: The Fastest, Most Comprehensive Context Optimization Tool for AI Coding Agents
+# Skim: The Most Intelligent Context Optimization Engine for Coding Agents
 
 > **Code skimming. Command rewriting. Test, build, and git output compression. Token budget cascading.** 12 languages. 14ms for 3,000 lines. Built in Rust.
 
-Other tools skim code. Skim optimizes everything your AI agent touches: code, test output, build errors, git diffs, and raw commands. 14ms for 3,000 lines. 48x faster on cache hits. Nothing else comes close.
+Other tools filter terminal noise. Skim understands your code. It parses ASTs across 12 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, and raw commands. 14ms for 3,000 lines. 48x faster on cache hits.
 
 [![Website](https://img.shields.io/badge/Website-skim-e87040)](https://dean0x.github.io/x/skim/)
 [![CI](https://github.com/dean0x/skim/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/skim/actions/workflows/ci.yml)
@@ -13,7 +13,7 @@ Other tools skim code. Skim optimizes everything your AI agent touches: code, te
 
 ## Why Skim?
 
-**Context capacity is not the bottleneck. Attention is.** Every token you send to an LLM dilutes its focus. Research consistently shows attention dilution in long contexts -- models lose track of critical details even within their window. More tokens means higher latency, degraded recall, and weaker reasoning. Past a threshold, adding context makes outputs worse. While other tools stop at code skimming, Skim optimizes the full spectrum of AI agent context: code, test output, build errors, git diffs, and commands. Faster, broader, and smarter than anything else available.
+**Context capacity is not the bottleneck. Attention is.** Every token you send to an LLM dilutes its focus. Research consistently shows attention dilution in long contexts -- models lose track of critical details even within their window. More tokens means higher latency, degraded recall, and weaker reasoning. Past a threshold, adding context makes outputs worse. While other tools stop at filtering command output, Skim parses your actual code structure and optimizes the full spectrum of agent context: code, test output, build errors, git diffs, and commands. Deeper, broader, and smarter than anything else available.
 
 Take a typical 80-file TypeScript project: 63,000 tokens. That contains maybe 5,000 tokens of actual signal. The rest is implementation noise the model doesn't need for architectural reasoning.
 
@@ -603,7 +603,7 @@ Comprehensive guides for all aspects of Skim:
 
 | Tool | Role | What It Does |
 |------|------|-------------|
-| **Skim** | Context Optimization | Compresses code, test output, build output, and git output for optimal LLM reasoning |
+| **Skim** | Context Optimization | Code-aware AST parsing across 12 languages, command rewriting, test/build/git output compression |
 | **[DevFlow](https://github.com/dean0x/devflow)** | Quality Orchestration | 18 parallel reviewers, working memory, self-learning, composable plugin system |
 | **[Backbeat](https://github.com/dean0x/backbeat)** | Agent Orchestration | Orchestration at scale. Karpathy optimization loops, multi-agent pipelines, DAG dependencies, autoscaling |
 
