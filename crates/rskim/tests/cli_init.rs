@@ -762,8 +762,8 @@ fn test_hook_version_mismatch_warning() {
     // Use a temp dir for cache to avoid stamp file pollution across tests.
     let cache_dir = TempDir::new().unwrap();
 
-    // Set SKIM_HOOK_VERSION to a value that differs from the compiled version,
-    // triggering the version mismatch warning on stderr.
+    // Set SKIM_HOOK_VERSION to a value that differs from the compiled version.
+    // The warning now goes to hook.log (NEVER stderr -- GRANITE #361 Bug 3).
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--hook"])
@@ -773,13 +773,14 @@ fn test_hook_version_mismatch_warning() {
         .assert()
         .success();
 
+    // CRITICAL: stderr MUST be empty in hook mode (zero-stderr invariant)
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     assert!(
-        stderr.contains("version mismatch"),
-        "Should warn about version mismatch on stderr, got: {stderr}"
+        stderr.is_empty(),
+        "Hook mode must have zero stderr even on version mismatch, got: {stderr}"
     );
 
-    // The rewrite should still succeed despite the warning
+    // The rewrite should still succeed
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert!(
@@ -787,7 +788,19 @@ fn test_hook_version_mismatch_warning() {
             .as_str()
             .unwrap()
             .contains("skim test cargo"),
-        "Rewrite should succeed despite version mismatch warning"
+        "Rewrite should succeed despite version mismatch"
+    );
+
+    // Verify warning went to hook.log file instead
+    let hook_log = cache_dir.path().join("hook.log");
+    assert!(
+        hook_log.exists(),
+        "Version mismatch warning should be written to hook.log"
+    );
+    let log_content = fs::read_to_string(&hook_log).unwrap();
+    assert!(
+        log_content.contains("version mismatch"),
+        "hook.log should contain version mismatch warning, got: {log_content}"
     );
 }
 

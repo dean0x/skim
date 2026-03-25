@@ -1270,11 +1270,10 @@ fn check_hook_version_mismatch() {
         }
     }
 
-    // Emit warning
-    eprintln!(
-        "warning: skim hook version mismatch (hook script: v{hook_version}, binary: v{compiled_version})"
-    );
-    eprintln!("hint: run `skim init --yes` to update the hook script");
+    // Emit warning to hook log (NEVER stderr -- GRANITE #361 Bug 3)
+    super::hook_log::log_hook_warning(&format!(
+        "version mismatch: hook script v{hook_version}, binary v{compiled_version} (run `skim init --yes` to update)"
+    ));
 
     // Update stamp file (best-effort)
     let _ = std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
