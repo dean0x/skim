@@ -563,14 +563,24 @@ fn tilde_path(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// Maximum directory traversal depth for recursive helpers.
+const MAX_TRAVERSAL_DEPTH: usize = 10;
+
 /// Count files with a specific extension recursively in a directory.
 fn count_files_recursive(dir: &Path, extension: &str) -> usize {
+    count_files_recursive_inner(dir, extension, 0)
+}
+
+fn count_files_recursive_inner(dir: &Path, extension: &str, depth: usize) -> usize {
+    if depth >= MAX_TRAVERSAL_DEPTH {
+        return 0;
+    }
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                count += count_files_recursive(&path, extension);
+                count += count_files_recursive_inner(&path, extension, depth + 1);
             } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
                 count += 1;
             }
@@ -603,12 +613,19 @@ fn dir_size_human(dir: &Path) -> String {
 
 /// Calculate total size of all files in a directory tree.
 fn dir_size_bytes(dir: &Path) -> u64 {
+    dir_size_bytes_inner(dir, 0)
+}
+
+fn dir_size_bytes_inner(dir: &Path, depth: usize) -> u64 {
+    if depth >= MAX_TRAVERSAL_DEPTH {
+        return 0;
+    }
     let mut total: u64 = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                total += dir_size_bytes(&path);
+                total += dir_size_bytes_inner(&path, depth + 1);
             } else if let Ok(meta) = std::fs::metadata(&path) {
                 total += meta.len();
             }

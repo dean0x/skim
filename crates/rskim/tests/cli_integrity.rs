@@ -226,19 +226,19 @@ fn test_hook_mode_tamper_warning_goes_to_log_not_stderr() {
         // CRITICAL: stderr must NOT contain the tamper warning
         .stderr(predicate::str::contains("tampered").not());
 
-    // But the warning SHOULD appear in the log file.
+    // The warning SHOULD appear in the log file.
     // SKIM_CACHE_DIR points directly to the skim cache dir.
     let log_path = cache_dir.path().join("hook.log");
-    if log_path.exists() {
-        let log_content = fs::read_to_string(&log_path).unwrap();
-        assert!(
-            log_content.contains("tampered"),
-            "Hook log should contain tamper warning, got: {log_content}"
-        );
-    }
-    // Note: If the log file doesn't exist, the warning might have been
-    // rate-limited or the cache dir resolution differed. The critical
-    // assertion is that stderr does NOT contain the warning.
+    assert!(
+        log_path.exists(),
+        "Hook log file should exist at {}",
+        log_path.display()
+    );
+    let log_content = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        log_content.contains("tampered"),
+        "Hook log should contain tamper warning, got: {log_content}"
+    );
 }
 
 // ============================================================================
