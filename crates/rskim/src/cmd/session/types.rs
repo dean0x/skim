@@ -220,7 +220,10 @@ mod tests {
 
     #[test]
     fn test_agent_kind_from_str_claude_code() {
-        assert_eq!(AgentKind::from_str("claude-code"), Some(AgentKind::ClaudeCode));
+        assert_eq!(
+            AgentKind::from_str("claude-code"),
+            Some(AgentKind::ClaudeCode)
+        );
         assert_eq!(AgentKind::from_str("claude"), Some(AgentKind::ClaudeCode));
     }
 
@@ -233,13 +236,19 @@ mod tests {
     #[test]
     fn test_agent_kind_from_str_gemini() {
         assert_eq!(AgentKind::from_str("gemini"), Some(AgentKind::GeminiCli));
-        assert_eq!(AgentKind::from_str("gemini-cli"), Some(AgentKind::GeminiCli));
+        assert_eq!(
+            AgentKind::from_str("gemini-cli"),
+            Some(AgentKind::GeminiCli)
+        );
     }
 
     #[test]
     fn test_agent_kind_from_str_copilot() {
         assert_eq!(AgentKind::from_str("copilot"), Some(AgentKind::CopilotCli));
-        assert_eq!(AgentKind::from_str("copilot-cli"), Some(AgentKind::CopilotCli));
+        assert_eq!(
+            AgentKind::from_str("copilot-cli"),
+            Some(AgentKind::CopilotCli)
+        );
     }
 
     #[test]
@@ -301,7 +310,10 @@ mod tests {
     fn test_agent_kind_rules_dir() {
         assert_eq!(AgentKind::ClaudeCode.rules_dir(), Some(".claude/rules"));
         assert_eq!(AgentKind::Cursor.rules_dir(), Some(".cursor/rules"));
-        assert_eq!(AgentKind::CopilotCli.rules_dir(), Some(".github/instructions"));
+        assert_eq!(
+            AgentKind::CopilotCli.rules_dir(),
+            Some(".github/instructions")
+        );
         assert_eq!(AgentKind::CodexCli.rules_dir(), None);
         assert_eq!(AgentKind::GeminiCli.rules_dir(), None);
         assert_eq!(AgentKind::OpenCode.rules_dir(), None);

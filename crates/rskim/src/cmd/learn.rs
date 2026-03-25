@@ -114,8 +114,10 @@ fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
                     anyhow::bail!("--agent requires a value (e.g., claude-code)");
                 }
                 config.agent_filter = Some(AgentKind::from_str(&args[i]).ok_or_else(|| {
-                    let supported: Vec<&str> =
-                        AgentKind::all_supported().iter().map(|a| a.cli_name()).collect();
+                    let supported: Vec<&str> = AgentKind::all_supported()
+                        .iter()
+                        .map(|a| a.cli_name())
+                        .collect();
                     anyhow::anyhow!(
                         "unknown agent: '{}'\nSupported: {}",
                         &args[i],
@@ -607,7 +609,9 @@ fn generate_rules_content(corrections: &[CorrectionPair], agent: AgentKind) -> S
     // Agent-specific frontmatter
     match agent {
         AgentKind::Cursor => {
-            output.push_str("---\nalwaysApply: true\ndescription: CLI corrections learned by skim\n---\n\n");
+            output.push_str(
+                "---\nalwaysApply: true\ndescription: CLI corrections learned by skim\n---\n\n",
+            );
         }
         AgentKind::CopilotCli => {
             output.push_str("---\napplyTo: \"**/*\"\n---\n\n");
@@ -741,9 +745,7 @@ fn print_text_report(corrections: &[CorrectionPair]) {
         println!();
     }
 
-    println!(
-        "hint: run `skim learn --generate` to write corrections to agent-specific rules file"
-    );
+    println!("hint: run `skim learn --generate` to write corrections to agent-specific rules file");
 }
 
 fn print_json_report(corrections: &[CorrectionPair]) -> anyhow::Result<()> {

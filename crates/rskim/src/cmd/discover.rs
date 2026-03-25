@@ -94,8 +94,10 @@ fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
                     anyhow::bail!("--agent requires a value (e.g., claude-code)");
                 }
                 config.agent_filter = Some(AgentKind::from_str(&args[i]).ok_or_else(|| {
-                    let supported: Vec<&str> =
-                        AgentKind::all_supported().iter().map(|a| a.cli_name()).collect();
+                    let supported: Vec<&str> = AgentKind::all_supported()
+                        .iter()
+                        .map(|a| a.cli_name())
+                        .collect();
                     anyhow::anyhow!(
                         "unknown agent: '{}'\nSupported: {}",
                         &args[i],
