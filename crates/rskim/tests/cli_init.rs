@@ -759,11 +759,8 @@ fn test_hook_pipe_command_passthrough() {
 
 #[test]
 fn test_hook_version_mismatch_warning() {
-    // Use a fresh HOME so the rate-limiting stamp file doesn't suppress the warning.
-    // On macOS, dirs::cache_dir() returns $HOME/Library/Caches; on Linux it uses
-    // $XDG_CACHE_HOME or $HOME/.cache. Setting HOME to a temp dir ensures a clean
-    // stamp file location for every test run.
-    let home_dir = TempDir::new().unwrap();
+    // Use a temp dir for cache to avoid stamp file pollution across tests.
+    let cache_dir = TempDir::new().unwrap();
 
     // Set SKIM_HOOK_VERSION to a value that differs from the compiled version,
     // triggering the version mismatch warning on stderr.
@@ -771,7 +768,7 @@ fn test_hook_version_mismatch_warning() {
         .unwrap()
         .args(["rewrite", "--hook"])
         .env("SKIM_HOOK_VERSION", "0.0.1")
-        .env("HOME", home_dir.path().as_os_str())
+        .env("SKIM_CACHE_DIR", cache_dir.path().as_os_str())
         .write_stdin(hook_payload("cargo test"))
         .assert()
         .success();

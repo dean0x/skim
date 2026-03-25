@@ -110,6 +110,7 @@ pub(super) fn print_help() {
     println!("  --yes, -y      Non-interactive mode (skip prompts)");
     println!("  --dry-run      Print actions without writing");
     println!("  --uninstall    Remove hook and clean up");
+    println!("  --force        Force uninstall even if hook script was modified");
     println!("  --help, -h     Print help information");
     println!();
     println!("Examples:");

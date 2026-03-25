@@ -1057,8 +1057,14 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
     }
-    // A2: Version mismatch check — rate-limited daily warning
-    check_hook_version_mismatch();
+    // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
+    // Integrity warning subsumes version mismatch: if the hook script was
+    // tampered with, the version check is redundant.
+    let integrity_failed = check_hook_integrity();
+    if !integrity_failed {
+        // A2: Version mismatch check — rate-limited daily warning
+        check_hook_version_mismatch();
+    }
 
     // Read stdin (bounded)
     let mut stdin_buf = String::new();
@@ -1156,10 +1162,86 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Resolve the agent name from environment for per-agent stamping.
+///
+/// Currently detects "claude-code" from the hook context. Future agents
+/// (Cursor, Windsurf) will set their own identifiers.
+fn resolve_agent_name() -> &'static str {
+    // SKIM_HOOK_VERSION is set by our hook script, which is agent-specific.
+    // For now, all hook scripts are "claude-code"; future: detect from env.
+    "claude-code"
+}
+
+/// Resolve the hook config directory from environment.
+///
+/// Checks `CLAUDE_CONFIG_DIR` first, then falls back to `~/.claude/`.
+fn resolve_hook_config_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    dirs::home_dir().map(|h| h.join(".claude"))
+}
+
+/// #57: Check hook script integrity.
+///
+/// Uses SHA-256 hash verification. Warnings go to log file only (NEVER
+/// stderr). Returns `true` if integrity check failed (tampered), `false`
+/// if valid, missing, or check was skipped.
+fn check_hook_integrity() -> bool {
+    let config_dir = match resolve_hook_config_dir() {
+        Some(dir) => dir,
+        None => return false,
+    };
+
+    let agent_name = resolve_agent_name();
+    let script_path = config_dir.join("hooks").join("skim-rewrite.sh");
+
+    if !script_path.exists() {
+        return false;
+    }
+
+    match super::integrity::verify_script_integrity(&config_dir, agent_name, &script_path) {
+        Ok(true) => false, // Valid or missing hash (backward compat)
+        Ok(false) => {
+            // Tampered! Log warning to file (NEVER stderr).
+            // Rate-limit: per-agent daily stamp to avoid log spam.
+            let stamp_path = match cache_dir() {
+                Some(dir) => dir.join(format!(".hook-integrity-warned-{agent_name}")),
+                None => {
+                    super::hook_log::log_hook_warning(&format!(
+                        "hook script tampered: {}",
+                        script_path.display()
+                    ));
+                    return true;
+                }
+            };
+
+            let today = today_date_string();
+            if let Ok(contents) = std::fs::read_to_string(&stamp_path) {
+                if contents.trim() == today {
+                    return true; // Already warned today
+                }
+            }
+
+            super::hook_log::log_hook_warning(&format!(
+                "hook script tampered: {} (run `skim init --yes` to reinstall)",
+                script_path.display()
+            ));
+
+            // Update stamp (best-effort)
+            let _ =
+                std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
+            let _ = std::fs::write(&stamp_path, &today);
+            true
+        }
+        Err(_) => false, // Script unreadable — don't block the hook
+    }
+}
+
 /// A2: Check for version mismatch between hook script and binary.
 ///
 /// If `SKIM_HOOK_VERSION` is set and differs from the compiled version,
-/// emit a daily warning to stderr. Rate-limited via stamp file.
+/// emit a daily warning to stderr. Rate-limited via per-agent stamp file.
 fn check_hook_version_mismatch() {
     let hook_version = match std::env::var("SKIM_HOOK_VERSION") {
         Ok(v) => v,
@@ -1171,9 +1253,11 @@ fn check_hook_version_mismatch() {
         return; // versions match
     }
 
-    // Rate limit: warn at most once per day
+    let agent_name = resolve_agent_name();
+
+    // Rate limit: per-agent, warn at most once per day
     let stamp_path = match cache_dir() {
-        Some(dir) => dir.join(".hook-version-warned"),
+        Some(dir) => dir.join(format!(".hook-version-warned-{agent_name}")),
         None => return,
     };
 
@@ -1242,11 +1326,16 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
     }
 }
 
-/// Get the skim cache directory, respecting platform conventions and `$XDG_CACHE_HOME`.
+/// Get the skim cache directory, respecting `$SKIM_CACHE_DIR` override and
+/// platform conventions.
 ///
-/// Uses `dirs::cache_dir()` (which respects `$XDG_CACHE_HOME` on Linux) rather
-/// than hardcoding `~/.cache/`, consistent with `crate::cache::get_cache_dir()`.
+/// Priority: `SKIM_CACHE_DIR` env > `dirs::cache_dir()/skim`.
+/// The env override enables test isolation on all platforms (especially macOS
+/// where `dirs::cache_dir()` ignores `$XDG_CACHE_HOME`).
 fn cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("SKIM_CACHE_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
     dirs::cache_dir().map(|c| c.join("skim"))
 }
 

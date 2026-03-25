@@ -77,6 +77,21 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
+    // Integrity check (#57): warn if hook script has been modified since install
+    if script_exists {
+        if let Ok(false) =
+            crate::cmd::integrity::verify_script_integrity(&config_dir, "claude-code", &hook_script_path)
+        {
+            if !flags.force {
+                eprintln!("warning: hook script has been modified since installation");
+                eprintln!("hint: use --force to uninstall anyway");
+                return Ok(std::process::ExitCode::FAILURE);
+            }
+            // --force provided: proceed despite tamper, but inform user
+            eprintln!("warning: hook script has been modified (proceeding with --force)");
+        }
+    }
+
     // Interactive confirmation
     if !flags.yes {
         println!();
@@ -148,7 +163,7 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
         );
     }
 
-    // Delete hook script
+    // Delete hook script and hash manifest
     if script_exists {
         std::fs::remove_file(&hook_script_path)?;
         println!(
@@ -156,6 +171,9 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
             check_mark(true),
             hook_script_path.display()
         );
+
+        // Clean up hash manifest (#57)
+        let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, "claude-code");
     }
 
     println!();

@@ -7,6 +7,7 @@ pub(super) struct InitFlags {
     pub(super) yes: bool,
     pub(super) dry_run: bool,
     pub(super) uninstall: bool,
+    pub(super) force: bool,
 }
 
 pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
@@ -14,6 +15,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
     let mut yes = false;
     let mut dry_run = false;
     let mut uninstall = false;
+    let mut force = false;
 
     for arg in args {
         match arg.as_str() {
@@ -22,6 +24,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
             "--yes" | "-y" => yes = true,
             "--dry-run" => dry_run = true,
             "--uninstall" => uninstall = true,
+            "--force" => force = true,
             other => {
                 anyhow::bail!(
                     "unknown flag: '{other}'\n\
@@ -36,5 +39,6 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         yes,
         dry_run,
         uninstall,
+        force,
     })
 }
