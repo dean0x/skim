@@ -87,7 +87,8 @@ struct RulesInfo {
 fn detect_all_agents() -> Vec<AgentStatus> {
     AgentKind::all_supported()
         .iter()
-        .map(|kind| detect_agent(*kind))
+        .copied()
+        .map(detect_agent)
         .collect()
 }
 
@@ -488,47 +489,48 @@ fn print_text(agents: &[AgentStatus]) {
 }
 
 fn print_json(agents: &[AgentStatus]) -> anyhow::Result<()> {
-    let mut agent_values: Vec<serde_json::Value> = Vec::new();
+    let agent_values: Vec<serde_json::Value> = agents
+        .iter()
+        .map(|agent| {
+            let sessions = agent.sessions.as_ref().map(|s| {
+                serde_json::json!({
+                    "path": s.path,
+                    "detail": s.detail,
+                })
+            });
 
-    for agent in agents {
-        let sessions = agent.sessions.as_ref().map(|s| {
+            let hooks = match &agent.hooks {
+                HookStatus::Installed { version, integrity } => serde_json::json!({
+                    "status": "installed",
+                    "version": version,
+                    "integrity": integrity,
+                }),
+                HookStatus::NotInstalled => serde_json::json!({
+                    "status": "not_installed",
+                }),
+                HookStatus::NotSupported { note } => serde_json::json!({
+                    "status": "not_supported",
+                    "note": note,
+                }),
+            };
+
+            let rules = agent.rules.as_ref().map(|r| {
+                serde_json::json!({
+                    "path": r.path,
+                    "exists": r.exists,
+                })
+            });
+
             serde_json::json!({
-                "path": s.path,
-                "detail": s.detail,
+                "name": agent.kind.display_name(),
+                "cli_name": agent.kind.cli_name(),
+                "detected": agent.detected,
+                "sessions": sessions,
+                "hooks": hooks,
+                "rules": rules,
             })
-        });
-
-        let hooks = match &agent.hooks {
-            HookStatus::Installed { version, integrity } => serde_json::json!({
-                "status": "installed",
-                "version": version,
-                "integrity": integrity,
-            }),
-            HookStatus::NotInstalled => serde_json::json!({
-                "status": "not_installed",
-            }),
-            HookStatus::NotSupported { note } => serde_json::json!({
-                "status": "not_supported",
-                "note": note,
-            }),
-        };
-
-        let rules = agent.rules.as_ref().map(|r| {
-            serde_json::json!({
-                "path": r.path,
-                "exists": r.exists,
-            })
-        });
-
-        agent_values.push(serde_json::json!({
-            "name": agent.kind.display_name(),
-            "cli_name": agent.kind.cli_name(),
-            "detected": agent.detected,
-            "sessions": sessions,
-            "hooks": hooks,
-            "rules": rules,
-        }));
-    }
+        })
+        .collect();
 
     let output = serde_json::json!({ "agents": agent_values });
     println!("{}", serde_json::to_string_pretty(&output)?);

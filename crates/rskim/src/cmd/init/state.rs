@@ -3,9 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::flags::InitFlags;
-use super::helpers::{
-    resolve_config_dir, resolve_config_dir_for_agent, HOOK_SCRIPT_NAME, SETTINGS_FILE,
-};
+use super::helpers::{resolve_config_dir_for_agent, HOOK_SCRIPT_NAME, SETTINGS_FILE};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
@@ -24,6 +22,8 @@ pub(super) struct DetectedState {
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim Bash PreToolUse hooks (plugin collision detection)
     pub(super) existing_bash_hooks: Vec<String>,
+    /// CLI name of the target agent (e.g., "claude-code", "cursor") for integrity hashing
+    pub(super) agent_cli_name: &'static str,
 }
 
 pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
@@ -76,6 +76,7 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
         marketplace_installed,
         dual_scope_warning,
         existing_bash_hooks,
+        agent_cli_name: flags.agent.cli_name(),
     })
 }
 
@@ -129,11 +130,11 @@ fn scan_existing_bash_hooks(settings_path: &Path) -> Vec<String> {
 pub(super) fn check_dual_scope(flags: &InitFlags) -> anyhow::Result<Option<String>> {
     let other_dir = if flags.project {
         // Installing project-level, check global
-        resolve_config_dir(false)?
+        resolve_config_dir_for_agent(false, flags.agent)?
     } else {
         // Installing global, check project
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(".claude"),
+        match resolve_config_dir_for_agent(true, flags.agent) {
+            Ok(dir) => dir,
             Err(_) => return Ok(None),
         }
     };

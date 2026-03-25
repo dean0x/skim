@@ -15,11 +15,6 @@ pub(super) const SETTINGS_BACKUP: &str = "settings.json.bak";
 // Config directory resolution (B6)
 // ============================================================================
 
-pub(super) fn resolve_config_dir(project: bool) -> anyhow::Result<PathBuf> {
-    use crate::cmd::session::AgentKind;
-    resolve_config_dir_for_agent(project, AgentKind::ClaudeCode)
-}
-
 /// Resolve the config directory for a specific agent.
 ///
 /// For Claude Code: `CLAUDE_CONFIG_DIR` env > `~/.claude/` (or `.claude/` with --project)

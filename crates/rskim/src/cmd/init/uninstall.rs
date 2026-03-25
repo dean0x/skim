@@ -2,7 +2,7 @@
 
 use super::flags::InitFlags;
 use super::helpers::{
-    check_mark, confirm_proceed, resolve_config_dir, resolve_symlink, HOOK_SCRIPT_NAME,
+    check_mark, confirm_proceed, resolve_config_dir_for_agent, resolve_symlink, HOOK_SCRIPT_NAME,
     SETTINGS_FILE,
 };
 use super::state::{has_skim_hook_entry, read_settings_json, MAX_SETTINGS_SIZE};
@@ -56,7 +56,7 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value) {
 }
 
 pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let config_dir = resolve_config_dir(flags.project)?;
+    let config_dir = resolve_config_dir_for_agent(flags.project, flags.agent)?;
     let settings_path = config_dir.join(SETTINGS_FILE);
     let hook_script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
@@ -81,7 +81,7 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
     if script_exists {
         if let Ok(false) = crate::cmd::integrity::verify_script_integrity(
             &config_dir,
-            "claude-code",
+            flags.agent.cli_name(),
             &hook_script_path,
         ) {
             if !flags.force {
@@ -175,7 +175,7 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
         );
 
         // Clean up hash manifest (#57)
-        let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, "claude-code");
+        let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, flags.agent.cli_name());
     }
 
     println!();

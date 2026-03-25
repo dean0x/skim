@@ -292,12 +292,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     if !has_operator_chars {
         let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
         let result = try_rewrite(&token_refs);
-        let rewritten = result.as_ref().map(|r| r.tokens.join(" "));
-        let match_info = result
-            .as_ref()
-            .zip(rewritten.as_ref())
-            .map(|(r, s)| (s.as_str(), r.category));
-        return emit_result(suggest_mode, &original, match_info, false);
+        return emit_rewrite_result(suggest_mode, &original, result, false);
     }
 
     // Split into compound segments (or simple if no operators found)
@@ -306,21 +301,11 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         CompoundSplitResult::Simple(simple_tokens) => {
             let token_refs: Vec<&str> = simple_tokens.iter().map(|s| s.as_str()).collect();
             let result = try_rewrite(&token_refs);
-            let rewritten = result.as_ref().map(|r| r.tokens.join(" "));
-            let match_info = result
-                .as_ref()
-                .zip(rewritten.as_ref())
-                .map(|(r, s)| (s.as_str(), r.category));
-            emit_result(suggest_mode, &original, match_info, false)
+            emit_rewrite_result(suggest_mode, &original, result, false)
         }
         CompoundSplitResult::Compound(segments) => {
             let result = try_rewrite_compound(&segments);
-            let rewritten = result.as_ref().map(|r| r.tokens.join(" "));
-            let match_info = result
-                .as_ref()
-                .zip(rewritten.as_ref())
-                .map(|(r, s)| (s.as_str(), r.category));
-            emit_result(suggest_mode, &original, match_info, true)
+            emit_rewrite_result(suggest_mode, &original, result, true)
         }
     }
 }
@@ -347,6 +332,24 @@ fn emit_result(
         }
         None => Ok(ExitCode::FAILURE),
     }
+}
+
+/// Convert a `RewriteResult` into the final output via `emit_result`.
+///
+/// Joins the rewrite tokens and extracts the category, bridging the gap
+/// between the internal `RewriteResult` type and the `emit_result` API.
+fn emit_rewrite_result(
+    suggest_mode: bool,
+    original: &str,
+    result: Option<RewriteResult>,
+    compound: bool,
+) -> anyhow::Result<ExitCode> {
+    let rewritten = result.as_ref().map(|r| r.tokens.join(" "));
+    let match_info = result
+        .as_ref()
+        .zip(rewritten.as_ref())
+        .map(|(r, s)| (s.as_str(), r.category));
+    emit_result(suggest_mode, original, match_info, compound)
 }
 
 // ============================================================================
@@ -1225,7 +1228,7 @@ fn check_hook_integrity() -> bool {
 /// A2: Check for version mismatch between hook script and binary.
 ///
 /// If `SKIM_HOOK_VERSION` is set and differs from the compiled version,
-/// emit a daily warning to stderr. Rate-limited via per-agent stamp file.
+/// emit a daily warning to hook.log. Rate-limited via per-agent stamp file.
 fn check_hook_version_mismatch() {
     let hook_version = match std::env::var("SKIM_HOOK_VERSION") {
         Ok(v) => v,
