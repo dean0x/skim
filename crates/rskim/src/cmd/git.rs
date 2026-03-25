@@ -44,12 +44,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let show_stats = args.iter().any(|a| a == "--show-stats");
-    let filtered_args: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--show-stats")
-        .cloned()
-        .collect();
+    let (filtered_args, show_stats) = crate::cmd::extract_show_stats(args);
 
     let (global_flags, rest) = split_global_flags(&filtered_args);
 
@@ -171,7 +166,7 @@ fn has_limit_flag(args: &[String]) -> bool {
 }
 
 /// Convert an optional exit code to an ExitCode.
-fn exit_code_to_process(code: Option<i32>) -> ExitCode {
+fn map_exit_code(code: Option<i32>) -> ExitCode {
     match code {
         Some(0) => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
@@ -207,16 +202,20 @@ fn run_passthrough(
 
     // Record analytics (fire-and-forget, non-blocking).
     // Passthrough: raw == compressed (no transformation applied).
-    crate::analytics::try_record_command(
-        output.stdout.clone(),
-        output.stdout,
-        format!("skim git {} {}", subcmd, args.join(" ")),
-        crate::analytics::CommandType::Git,
-        output.duration,
-        None,
-    );
+    // Guard behind is_analytics_enabled() to avoid cloning large git output
+    // (100 KB+) when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            output.stdout.clone(),
+            output.stdout,
+            format!("skim git {} {}", subcmd, args.join(" ")),
+            crate::analytics::CommandType::Git,
+            output.duration,
+            None,
+        );
+    }
 
-    Ok(exit_code_to_process(output.exit_code))
+    Ok(map_exit_code(output.exit_code))
 }
 
 /// Run a git command and parse its output with the given parser function.
@@ -239,7 +238,7 @@ where
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        return Ok(exit_code_to_process(output.exit_code));
+        return Ok(map_exit_code(output.exit_code));
     }
 
     let result = parser(&output.stdout);
@@ -251,15 +250,18 @@ where
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Record analytics (fire-and-forget, non-blocking)
-    crate::analytics::try_record_command(
-        output.stdout,
-        result_str,
-        format!("skim git {}", subcmd_args.join(" ")),
-        crate::analytics::CommandType::Git,
-        output.duration,
-        None,
-    );
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid allocations when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            output.stdout,
+            result_str,
+            format!("skim git {}", subcmd_args.join(" ")),
+            crate::analytics::CommandType::Git,
+            output.duration,
+            None,
+        );
+    }
 
     Ok(ExitCode::SUCCESS)
 }
@@ -793,7 +795,7 @@ mod tests {
     }
 
     // ========================================================================
-    // user_has_flag / exit_code_to_process helpers
+    // user_has_flag / map_exit_code helpers
     // ========================================================================
 
     #[test]
@@ -802,21 +804,21 @@ mod tests {
     }
 
     #[test]
-    fn test_exit_code_to_process_success() {
-        let code = exit_code_to_process(Some(0));
+    fn test_map_exit_code_success() {
+        let code = map_exit_code(Some(0));
         // ExitCode doesn't impl PartialEq, so compare via Debug
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 
     #[test]
-    fn test_exit_code_to_process_failure() {
-        let code = exit_code_to_process(Some(1));
+    fn test_map_exit_code_failure() {
+        let code = map_exit_code(Some(1));
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 
     #[test]
-    fn test_exit_code_to_process_none() {
-        let code = exit_code_to_process(None);
+    fn test_map_exit_code_none() {
+        let code = map_exit_code(None);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
     }
 

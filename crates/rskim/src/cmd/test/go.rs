@@ -28,7 +28,10 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
 
     // Inject -json before any `--` separator, unless the user already specified
     // -json or -v (verbose mode produces non-JSON output).
-    if !user_has_flag(args, "-json") && !user_has_flag(args, "-v") {
+    //
+    // Go flags use `-flag=false` to explicitly disable a flag, so we use
+    // go-specific detection that treats `-v=false` as NOT having `-v`.
+    if !go_has_flag(args, "-json") && !go_has_flag(args, "-v") {
         // Find the position of `--` if present, and inject -json before it.
         if let Some(sep_pos) = args.iter().position(|a| a == "--") {
             go_args.extend_from_slice(&args[..sep_pos]);
@@ -94,15 +97,18 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Record analytics (fire-and-forget, non-blocking)
-    crate::analytics::try_record_command(
-        combined,
-        parsed.content().to_string(),
-        format!("skim test go {}", args.join(" ")),
-        crate::analytics::CommandType::Test,
-        output.duration,
-        Some(parsed.tier_name()),
-    );
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            combined,
+            parsed.content().to_string(),
+            format!("skim test go {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            output.duration,
+            Some(parsed.tier_name()),
+        );
+    }
 
     Ok(exit_code)
 }
@@ -111,12 +117,14 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
 // Flag detection
 // ============================================================================
 
-/// Check whether the user has specified a flag (exact match or prefix with `=`).
+/// Go-specific flag detection that respects `-flag=false` semantics.
 ///
-/// Handles both `-json` and `-json=true` as well as `-v` and `-v=true`.
-/// Treats `-flag=false` as the flag NOT being set, since the user is
-/// explicitly disabling it.
-fn user_has_flag(args: &[String], flag: &str) -> bool {
+/// Unlike the shared `crate::cmd::user_has_flag`, Go CLI flags use
+/// `-flag=false` to explicitly disable a boolean flag. This function
+/// treats `-v=false` as the flag NOT being set, which is required for
+/// correct `-json` injection logic. The shared version does not handle
+/// this because `=false` is not a convention outside Go tooling.
+fn go_has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| {
         if a == flag {
             return true;
@@ -599,9 +607,9 @@ mod tests {
     #[test]
     fn test_flag_injection_skipped_with_v() {
         let args = vec!["-v".to_string(), "./...".to_string()];
-        assert!(user_has_flag(&args, "-v"), "expected -v to be detected");
+        assert!(go_has_flag(&args, "-v"), "expected -v to be detected");
         assert!(
-            !user_has_flag(&args, "-json"),
+            !go_has_flag(&args, "-json"),
             "expected -json to NOT be detected"
         );
     }
@@ -610,11 +618,11 @@ mod tests {
     fn test_flag_injection_skipped_with_json() {
         let args = vec!["-json".to_string(), "./...".to_string()];
         assert!(
-            user_has_flag(&args, "-json"),
+            go_has_flag(&args, "-json"),
             "expected -json to be detected"
         );
         assert!(
-            !user_has_flag(&args, "-v"),
+            !go_has_flag(&args, "-v"),
             "expected -v to NOT be detected"
         );
     }
@@ -623,7 +631,7 @@ mod tests {
     fn test_user_has_flag_with_equals() {
         let args = vec!["-json=true".to_string()];
         assert!(
-            user_has_flag(&args, "-json"),
+            go_has_flag(&args, "-json"),
             "expected -json=true to match -json"
         );
     }
@@ -636,11 +644,11 @@ mod tests {
             "TestFoo".to_string(),
         ];
         assert!(
-            !user_has_flag(&args, "-json"),
+            !go_has_flag(&args, "-json"),
             "expected -json to NOT be detected"
         );
         assert!(
-            !user_has_flag(&args, "-v"),
+            !go_has_flag(&args, "-v"),
             "expected -v to NOT be detected"
         );
     }
@@ -762,7 +770,7 @@ mod tests {
         ];
 
         let mut go_args: Vec<String> = vec!["test".to_string()];
-        if !user_has_flag(&args, "-json") && !user_has_flag(&args, "-v") {
+        if !go_has_flag(&args, "-json") && !go_has_flag(&args, "-v") {
             if let Some(sep_pos) = args.iter().position(|a| a == "--") {
                 go_args.extend_from_slice(&args[..sep_pos]);
                 go_args.push("-json".to_string());
@@ -789,7 +797,7 @@ mod tests {
         // `-v=false` explicitly disables verbose mode, so -json should be injected.
         let args = vec!["-v=false".to_string(), "./...".to_string()];
         assert!(
-            !user_has_flag(&args, "-v"),
+            !go_has_flag(&args, "-v"),
             "expected -v=false to NOT be detected as -v"
         );
     }
@@ -799,7 +807,7 @@ mod tests {
         // `-v=true` enables verbose mode, so -json should NOT be injected.
         let args = vec!["-v=true".to_string(), "./...".to_string()];
         assert!(
-            user_has_flag(&args, "-v"),
+            go_has_flag(&args, "-v"),
             "expected -v=true to be detected as -v"
         );
     }

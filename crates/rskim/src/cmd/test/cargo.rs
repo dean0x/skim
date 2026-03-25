@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::cmd::{inject_flag_before_separator, run_parsed_command_with_mode, user_has_flag};
+use crate::cmd::{inject_flag_before_separator, run_parsed_command_with_mode, ParsedCommandConfig, user_has_flag};
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -63,13 +63,15 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
 
     run_parsed_command_with_mode(
-        "cargo",
-        &cmd_args,
-        &[("CARGO_TERM_COLOR", "never")],
-        "Install Rust via https://rustup.rs",
-        use_stdin,
-        show_stats,
-        crate::analytics::CommandType::Test,
+        ParsedCommandConfig {
+            program: "cargo",
+            args: &cmd_args,
+            env_overrides: &[("CARGO_TERM_COLOR", "never")],
+            install_hint: "Install Rust via https://rustup.rs",
+            use_stdin,
+            show_stats,
+            command_type: crate::analytics::CommandType::Test,
+        },
         move |output, _args| parse_impl(output, is_nextest),
     )
 }

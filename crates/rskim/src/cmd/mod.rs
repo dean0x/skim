@@ -59,6 +59,21 @@ pub(crate) fn user_has_flag(args: &[String], flags: &[&str]) -> bool {
     })
 }
 
+/// Extract the `--show-stats` flag from args, returning filtered args and whether
+/// the flag was present.
+///
+/// This centralises the pattern that was previously copy-pasted across build,
+/// git, and test subcommand entry points.
+pub(crate) fn extract_show_stats(args: &[String]) -> (Vec<String>, bool) {
+    let show_stats = args.iter().any(|a| a == "--show-stats");
+    let filtered: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--show-stats")
+        .cloned()
+        .collect();
+    (filtered, show_stats)
+}
+
 /// Inject a flag before the `--` separator, or at the end if no separator exists.
 ///
 /// This ensures injected flags (like `--message-format=json`) appear in the
@@ -70,6 +85,20 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
     } else {
         args.push(flag.to_string());
     }
+}
+
+/// Configuration for running an external command with parsed output.
+///
+/// Groups the cross-cutting parameters for [`run_parsed_command_with_mode`]
+/// to reduce its positional parameter count.
+pub(crate) struct ParsedCommandConfig<'a> {
+    pub program: &'a str,
+    pub args: &'a [String],
+    pub env_overrides: &'a [(&'a str, &'a str)],
+    pub install_hint: &'a str,
+    pub use_stdin: bool,
+    pub show_stats: bool,
+    pub command_type: crate::analytics::CommandType,
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -91,7 +120,16 @@ where
     T: AsRef<str>,
 {
     let use_stdin = !io::stdin().is_terminal();
-    run_parsed_command_with_mode(program, args, env_overrides, install_hint, use_stdin, show_stats, command_type, parse)
+    let config = ParsedCommandConfig {
+        program,
+        args,
+        env_overrides,
+        install_hint,
+        use_stdin,
+        show_stats,
+        command_type,
+    };
+    run_parsed_command_with_mode(config, parse)
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -104,18 +142,11 @@ where
 /// 4. Emitting the parsed result to stdout
 /// 5. Mapping the exit code
 ///
-/// `use_stdin` — when `true`, reads stdin instead of spawning the command.
+/// `config.use_stdin` — when `true`, reads stdin instead of spawning the command.
 /// Callers should set this based on their own heuristics (e.g., only read
 /// stdin when no user args are provided AND stdin is piped).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_parsed_command_with_mode<T>(
-    program: &str,
-    args: &[String],
-    env_overrides: &[(&str, &str)],
-    install_hint: &str,
-    use_stdin: bool,
-    show_stats: bool,
-    command_type: crate::analytics::CommandType,
+    config: ParsedCommandConfig<'_>,
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
@@ -124,6 +155,16 @@ where
     /// Maximum bytes we will read from stdin (64 MiB), consistent with the
     /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
     const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+
+    let ParsedCommandConfig {
+        program,
+        args,
+        env_overrides,
+        install_hint,
+        use_stdin,
+        show_stats,
+        command_type,
+    } = config;
 
     let output = if use_stdin {
         // Piped stdin mode: read stdin instead of executing the command.
@@ -196,15 +237,18 @@ where
     // Capture exit code before moving stdout into analytics
     let code = output.exit_code.unwrap_or(1);
 
-    // Record analytics (fire-and-forget, non-blocking)
-    crate::analytics::try_record_command(
-        output.stdout,
-        result.content().to_string(),
-        format!("skim {program} {}", args.join(" ")),
-        command_type,
-        output.duration,
-        Some(result.tier_name()),
-    );
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            output.stdout,
+            result.content().to_string(),
+            format!("skim {program} {}", args.join(" ")),
+            command_type,
+            output.duration,
+            Some(result.tier_name()),
+        );
+    }
 
     // Map exit code: preserve full 0-255 exit code granularity from the
     // underlying process. This maintains documented semantics (0=success,

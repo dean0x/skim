@@ -67,15 +67,18 @@ pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::R
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Record analytics (fire-and-forget, non-blocking)
-    crate::analytics::try_record_command(
-        raw_output,
-        result.content().to_string(),
-        format!("skim test {program} {}", args.join(" ")),
-        crate::analytics::CommandType::Test,
-        start.elapsed(),
-        Some(result.tier_name()),
-    );
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            raw_output,
+            result.content().to_string(),
+            format!("skim test {program} {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            start.elapsed(),
+            Some(result.tier_name()),
+        );
+    }
 
     Ok(exit_code)
 }

@@ -109,10 +109,10 @@ fn try_cached_result(
     };
 
     // If the cache entry was written without token counts, read the original
-    // file and count tokens for both source and output -- but only when stats
-    // or analytics actually need them.
-    let needs_recount = hit.original_tokens.is_none()
-        && (options.show_stats || crate::analytics::is_analytics_enabled());
+    // file and count tokens for both source and output -- but only when
+    // --show-stats is active. Analytics background threads handle their own
+    // token counting, so we don't erode cache speedup for analytics alone.
+    let needs_recount = hit.original_tokens.is_none() && options.show_stats;
     let (orig_tokens, trans_tokens) = if needs_recount {
         let contents = read_and_validate(path)?;
         count_token_pair(&contents, &hit.content)
@@ -264,12 +264,13 @@ pub(crate) fn process_stdin(
             (transformed, false)
         };
 
-    let (orig_tokens, trans_tokens) =
-        if options.show_stats || crate::analytics::is_analytics_enabled() {
-            count_token_pair(&buffer, &final_output)
-        } else {
-            (None, None)
-        };
+    // Only pay the tiktoken BPE cost on the main thread when --show-stats
+    // is set. Analytics background threads compute their own token counts.
+    let (orig_tokens, trans_tokens) = if options.show_stats {
+        count_token_pair(&buffer, &final_output)
+    } else {
+        (None, None)
+    };
 
     Ok(ProcessResult {
         output: final_output,
@@ -299,12 +300,13 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             (result, false)
         };
 
-    let (orig_tokens, trans_tokens) =
-        if options.show_stats || crate::analytics::is_analytics_enabled() {
-            count_token_pair(&contents, &final_output)
-        } else {
-            (None, None)
-        };
+    // Only pay the tiktoken BPE cost on the main thread when --show-stats
+    // is set. Analytics background threads compute their own token counts.
+    let (orig_tokens, trans_tokens) = if options.show_stats {
+        count_token_pair(&contents, &final_output)
+    } else {
+        (None, None)
+    };
 
     // Cache the transform result (post-guardrail). Cache write failures are
     // non-fatal; don't fail the transformation.

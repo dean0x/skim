@@ -1,11 +1,26 @@
 //! Token analytics persistence layer.
 //!
 //! Records token savings from every skim invocation into a local SQLite
-//! database and provides query functions for the `skim stats` dashboard.
+//! database (`~/.cache/skim/analytics.db`) and provides query functions
+//! for the `skim stats` dashboard.
+//!
+//! ## Design
+//!
+//! - **SQLite + WAL mode** for concurrent read/write safety.
+//! - **Fire-and-forget background threads** -- recording never blocks the
+//!   main processing pipeline. Token counting for analytics is deferred to
+//!   the background thread so the main thread pays zero BPE cost.
+//! - **90-day auto-pruning** via [`AnalyticsDb::maybe_prune`], tracked in
+//!   the `analytics_meta` table (schema migration v2).
+//! - **[`AnalyticsStore`] trait** abstracts query operations for testability;
+//!   test code can provide a mock without a real SQLite database.
+//! - **Versioned schema migrations** in [`schema`] -- each migration is
+//!   idempotent and guarded by a `user_version` PRAGMA check.
 
 mod schema;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -146,13 +161,32 @@ impl PricingModel {
 // Analytics enabled check
 // ============================================================================
 
+/// Process-wide flag to disable analytics without mutating environment
+/// variables. Set via [`force_disable_analytics`] at startup, before any
+/// background threads are spawned. Checked by [`is_analytics_enabled`].
+static ANALYTICS_FORCE_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Disable analytics for the lifetime of this process.
+///
+/// Thread-safe alternative to `std::env::set_var("SKIM_DISABLE_ANALYTICS", "1")`.
+/// Call this early in `main()` when `--disable-analytics` is detected.
+pub(crate) fn force_disable_analytics() {
+    ANALYTICS_FORCE_DISABLED.store(true, Ordering::Relaxed);
+}
+
 /// Check if analytics recording is enabled.
 ///
-/// Disabled by setting `SKIM_DISABLE_ANALYTICS` to a truthy value
-/// (`1`, `true`, or `yes`, case-insensitive). Any other value (including
-/// `0`, `false`, `no`) keeps analytics enabled. Unsetting the variable
-/// also keeps analytics enabled (the default).
+/// Returns `false` when:
+/// - [`force_disable_analytics`] has been called (e.g., `--disable-analytics` flag), OR
+/// - `SKIM_DISABLE_ANALYTICS` env var is set to a truthy value
+///   (`1`, `true`, or `yes`, case-insensitive).
+///
+/// Any other value (including `0`, `false`, `no`) keeps analytics enabled.
+/// Unsetting the variable also keeps analytics enabled (the default).
 pub(crate) fn is_analytics_enabled() -> bool {
+    if ANALYTICS_FORCE_DISABLED.load(Ordering::Relaxed) {
+        return false;
+    }
     match std::env::var("SKIM_DISABLE_ANALYTICS") {
         Ok(val) => !matches!(val.to_lowercase().as_str(), "1" | "true" | "yes"),
         Err(_) => true,
@@ -187,8 +221,24 @@ pub(crate) struct AnalyticsDb {
 
 impl AnalyticsDb {
     /// Open database at the given path, run migrations, enable WAL mode.
+    ///
+    /// On Unix, restricts file permissions to owner-only (0600) after
+    /// creation to prevent world-readable analytics data when the DB path
+    /// is outside the default 0700 cache directory.
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
+
+        // Restrict DB file permissions to owner-only on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(path, perms);
+            }
+        }
+
         conn.busy_timeout(Duration::from_millis(5000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         schema::run_migrations(&conn)?;
@@ -205,15 +255,27 @@ impl AnalyticsDb {
         Self::open(&path)
     }
 
+    /// Maximum length for the `original_cmd` column to prevent unbounded
+    /// DB growth from extremely long command strings.
+    const MAX_CMD_LEN: usize = 500;
+
     /// Record a token savings measurement.
+    ///
+    /// The `original_cmd` field is truncated to [`Self::MAX_CMD_LEN`] characters
+    /// before storage to bound database row size.
     pub(crate) fn record(&self, r: &TokenSavingsRecord) -> anyhow::Result<()> {
+        let cmd = if r.original_cmd.len() > Self::MAX_CMD_LEN {
+            &r.original_cmd[..Self::MAX_CMD_LEN]
+        } else {
+            &r.original_cmd
+        };
         self.conn.execute(
             "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path, mode, language, parse_tier)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 r.timestamp,
                 r.command_type.as_str(),
-                r.original_cmd,
+                cmd,
                 r.raw_tokens as i64,
                 r.compressed_tokens as i64,
                 r.savings_pct as f64,
@@ -288,14 +350,9 @@ impl AnalyticsDb {
 
     /// Query breakdown by language (file operations only).
     pub(crate) fn query_by_language(&self, since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>> {
-        let (where_clause, params) = since_clause(since);
-        let extra = if where_clause.is_empty() {
-            "WHERE language IS NOT NULL".to_string()
-        } else {
-            format!("{where_clause} AND language IS NOT NULL")
-        };
+        let (clause, params) = since_clause_with_extra(since, "language IS NOT NULL");
         let sql = format!(
-            "SELECT language, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {extra} GROUP BY language ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
+            "SELECT language, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {clause} GROUP BY language ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -311,14 +368,9 @@ impl AnalyticsDb {
 
     /// Query breakdown by mode (file operations only).
     pub(crate) fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
-        let (where_clause, params) = since_clause(since);
-        let extra = if where_clause.is_empty() {
-            "WHERE mode IS NOT NULL".to_string()
-        } else {
-            format!("{where_clause} AND mode IS NOT NULL")
-        };
+        let (clause, params) = since_clause_with_extra(since, "mode IS NOT NULL");
         let sql = format!(
-            "SELECT mode, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {extra} GROUP BY mode ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
+            "SELECT mode, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {clause} GROUP BY mode ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -334,17 +386,12 @@ impl AnalyticsDb {
 
     /// Query parse tier distribution (command operations only).
     pub(crate) fn query_tier_distribution(&self, since: Option<i64>) -> anyhow::Result<TierDistribution> {
-        let (where_clause, params) = since_clause(since);
-        let extra = if where_clause.is_empty() {
-            "WHERE parse_tier IS NOT NULL".to_string()
-        } else {
-            format!("{where_clause} AND parse_tier IS NOT NULL")
-        };
+        let (clause, params) = since_clause_with_extra(since, "parse_tier IS NOT NULL");
         let sql = format!(
             "SELECT COALESCE(SUM(CASE WHEN parse_tier = 'full' THEN 1 ELSE 0 END), 0), \
              COALESCE(SUM(CASE WHEN parse_tier = 'degraded' THEN 1 ELSE 0 END), 0), \
              COALESCE(SUM(CASE WHEN parse_tier = 'passthrough' THEN 1 ELSE 0 END), 0), \
-             COUNT(*) FROM token_savings {extra}"
+             COUNT(*) FROM token_savings {clause}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let row = stmt.query_row(rusqlite::params_from_iter(params), |row| {
@@ -439,12 +486,27 @@ fn since_clause(since: Option<i64>) -> (String, Vec<i64>) {
     }
 }
 
+/// Build WHERE clause with an optional extra condition appended.
+///
+/// Composes the `since` filter with an additional SQL predicate (e.g.
+/// `"language IS NOT NULL"`). The extra condition is AND-ed to the since
+/// clause when present, or becomes its own WHERE clause when since is None.
+fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String, Vec<i64>) {
+    let (base, params) = since_clause(since);
+    let clause = if base.is_empty() {
+        format!("WHERE {extra_condition}")
+    } else {
+        format!("{base} AND {extra_condition}")
+    };
+    (clause, params)
+}
+
 // ============================================================================
 // Fire-and-forget recording functions
 // ============================================================================
 
 /// Compute token savings as a percentage (0.0 when raw_tokens is zero).
-fn savings_percentage(raw_tokens: usize, compressed_tokens: usize) -> f32 {
+pub(crate) fn savings_percentage(raw_tokens: usize, compressed_tokens: usize) -> f32 {
     if raw_tokens == 0 {
         0.0
     } else {
@@ -453,7 +515,7 @@ fn savings_percentage(raw_tokens: usize, compressed_tokens: usize) -> f32 {
 }
 
 /// Current Unix timestamp in seconds.
-fn now_unix_secs() -> i64 {
+pub(crate) fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -507,34 +569,16 @@ pub(crate) fn record_fire_and_forget(
 }
 
 /// Record file operation token savings where counts are already known.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_with_counts(
-    raw_tokens: usize,
-    compressed_tokens: usize,
-    original_cmd: String,
-    command_type: CommandType,
-    duration_ms: u64,
-    project_path: String,
-    mode: Option<String>,
-    language: Option<String>,
-) {
+///
+/// Accepts a fully-constructed [`TokenSavingsRecord`] and persists it on
+/// a background thread. The `timestamp` and `savings_pct` fields should
+/// be populated by the caller (use [`now_unix_secs`] and
+/// [`savings_percentage`] helpers).
+pub(crate) fn record_with_counts(record: TokenSavingsRecord) {
     if !is_analytics_enabled() {
         return;
     }
     std::thread::spawn(move || {
-        let record = TokenSavingsRecord {
-            timestamp: now_unix_secs(),
-            command_type,
-            original_cmd,
-            raw_tokens,
-            compressed_tokens,
-            savings_pct: savings_percentage(raw_tokens, compressed_tokens),
-            duration_ms,
-            project_path,
-            mode,
-            language,
-            parse_tier: None,
-        };
         persist_record(&record);
     });
 }
@@ -578,6 +622,9 @@ pub(crate) fn try_record_command(
 /// Use this instead of [`try_record_command`] when the caller has already
 /// computed token counts (e.g., via `--show-stats`), avoiding redundant
 /// re-tokenization in the background thread.
+///
+/// Delegates to [`record_with_counts`] after resolving cwd and building
+/// the record.
 #[allow(dead_code)]
 pub(crate) fn try_record_command_with_counts(
     raw_tokens: usize,
@@ -594,22 +641,18 @@ pub(crate) fn try_record_command_with_counts(
         .unwrap_or_default()
         .display()
         .to_string();
-    let tier = parse_tier.map(|s| s.to_string());
-    std::thread::spawn(move || {
-        let record = TokenSavingsRecord {
-            timestamp: now_unix_secs(),
-            command_type,
-            original_cmd,
-            raw_tokens,
-            compressed_tokens,
-            savings_pct: savings_percentage(raw_tokens, compressed_tokens),
-            duration_ms: duration.as_millis() as u64,
-            project_path: cwd,
-            mode: None,
-            language: None,
-            parse_tier: tier,
-        };
-        persist_record(&record);
+    record_with_counts(TokenSavingsRecord {
+        timestamp: now_unix_secs(),
+        command_type,
+        original_cmd,
+        raw_tokens,
+        compressed_tokens,
+        savings_pct: savings_percentage(raw_tokens, compressed_tokens),
+        duration_ms: duration.as_millis() as u64,
+        project_path: cwd,
+        mode: None,
+        language: None,
+        parse_tier: parse_tier.map(|s| s.to_string()),
     });
 }
 
@@ -1044,5 +1087,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "analytics_meta table should be created by migration");
+    }
+
+    // ========================================================================
+    // force_disable_analytics / AtomicBool tests
+    // ========================================================================
+
+    #[test]
+    fn test_force_disable_analytics_disables() {
+        // Reset state (tests share the process-wide atomic)
+        ANALYTICS_FORCE_DISABLED.store(false, Ordering::Relaxed);
+
+        // Should be enabled by default (assuming env var not set by another test)
+        with_env_var(None, || {
+            assert!(is_analytics_enabled(), "should be enabled before force_disable");
+            force_disable_analytics();
+            assert!(!is_analytics_enabled(), "should be disabled after force_disable");
+        });
+
+        // Reset to not pollute other tests
+        ANALYTICS_FORCE_DISABLED.store(false, Ordering::Relaxed);
+    }
+
+    // ========================================================================
+    // original_cmd truncation test
+    // ========================================================================
+
+    #[test]
+    fn test_record_truncates_long_original_cmd() {
+        let (db, _tmp) = test_db();
+        let mut r = sample_record();
+        r.original_cmd = "x".repeat(1000);
+        db.record(&r).unwrap();
+
+        let stored: String = db
+            .conn
+            .query_row("SELECT original_cmd FROM token_savings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            AnalyticsDb::MAX_CMD_LEN,
+            "original_cmd should be truncated to {} chars",
+            AnalyticsDb::MAX_CMD_LEN
+        );
+    }
+
+    // ========================================================================
+    // DB file permissions test (Unix only)
+    // ========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_db_file_permissions_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let _db = AnalyticsDb::open(tmp.path()).unwrap();
+
+        let perms = std::fs::metadata(tmp.path()).unwrap().permissions();
+        let mode = perms.mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "DB file should have 0600 permissions, got {:o}",
+            mode
+        );
+    }
+
+    // ========================================================================
+    // since_clause_with_extra helper test
+    // ========================================================================
+
+    #[test]
+    fn test_since_clause_with_extra_no_since() {
+        let (clause, params) = since_clause_with_extra(None, "language IS NOT NULL");
+        assert_eq!(clause, "WHERE language IS NOT NULL");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_since_clause_with_extra_with_since() {
+        let (clause, params) = since_clause_with_extra(Some(12345), "mode IS NOT NULL");
+        assert_eq!(clause, "WHERE timestamp >= ?1 AND mode IS NOT NULL");
+        assert_eq!(params, vec![12345]);
     }
 }

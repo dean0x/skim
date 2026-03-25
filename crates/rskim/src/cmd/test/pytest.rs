@@ -79,15 +79,18 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Record analytics (fire-and-forget, non-blocking)
-    crate::analytics::try_record_command(
-        cleaned,
-        result.content().to_string(),
-        format!("skim test pytest {}", args.join(" ")),
-        crate::analytics::CommandType::Test,
-        output.duration,
-        Some(result.tier_name()),
-    );
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            cleaned,
+            result.content().to_string(),
+            format!("skim test pytest {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            output.duration,
+            Some(result.tier_name()),
+        );
+    }
 
     // Exit code: mirror pytest's exit code if we ran it, or infer from parse
     let code = match output.exit_code {

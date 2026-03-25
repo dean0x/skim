@@ -28,15 +28,12 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let show_stats = args.iter().any(|a| a == "--show-stats");
-    let filtered_args: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--show-stats")
-        .cloned()
-        .collect();
+    let (filtered_args, show_stats) = crate::cmd::extract_show_stats(args);
 
-    let sub = filtered_args.first().map(String::as_str);
-    let remaining = if filtered_args.len() > 1 { &filtered_args[1..] } else { &[] };
+    let (sub, remaining) = match filtered_args.split_first() {
+        Some((first, rest)) => (Some(first.as_str()), rest),
+        None => (None, [].as_slice()),
+    };
 
     match sub {
         Some("cargo") => cargo::run(remaining, show_stats),
@@ -121,6 +118,14 @@ pub(super) fn run_parsed_command(
         }
     };
 
+    // Strip ANSI escape codes before parsing. Some build tools emit color codes
+    // even with NO_COLOR=1, matching the shared run_parsed_command_with_mode pattern.
+    let output = CommandOutput {
+        stdout: crate::output::strip_ansi(&output.stdout),
+        stderr: crate::output::strip_ansi(&output.stderr),
+        ..output
+    };
+
     let result = parser(&output);
 
     // Emit markers to stderr (warnings, notices)
@@ -165,15 +170,18 @@ pub(super) fn run_parsed_command(
         }
     };
 
-    // Record analytics (fire-and-forget, non-blocking)
-    crate::analytics::try_record_command(
-        raw_text,
-        result.content().to_string(),
-        format!("skim build {program} {}", args.join(" ")),
-        crate::analytics::CommandType::Build,
-        output.duration,
-        Some(result.tier_name()),
-    );
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            raw_text,
+            result.content().to_string(),
+            format!("skim build {program} {}", args.join(" ")),
+            crate::analytics::CommandType::Build,
+            output.duration,
+            Some(result.tier_name()),
+        );
+    }
 
     Ok(exit_code)
 }

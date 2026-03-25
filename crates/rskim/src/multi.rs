@@ -280,16 +280,22 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             .display()
             .to_string();
         let mode = format!("{:?}", options.process.mode).to_lowercase();
-        crate::analytics::record_with_counts(
-            total_original_tokens,
-            total_transformed_tokens,
-            format!("skim [multi: {} files]", success_count),
-            crate::analytics::CommandType::File,
-            0,
-            cwd,
-            Some(mode),
-            None, // mixed languages
-        );
+        crate::analytics::record_with_counts(crate::analytics::TokenSavingsRecord {
+            timestamp: crate::analytics::now_unix_secs(),
+            command_type: crate::analytics::CommandType::File,
+            original_cmd: format!("skim [multi: {} files]", success_count),
+            raw_tokens: total_original_tokens,
+            compressed_tokens: total_transformed_tokens,
+            savings_pct: crate::analytics::savings_percentage(
+                total_original_tokens,
+                total_transformed_tokens,
+            ),
+            duration_ms: 0,
+            project_path: cwd,
+            mode: Some(mode),
+            language: None, // mixed languages
+            parse_tier: None,
+        });
     }
 
     Ok(())

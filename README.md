@@ -13,11 +13,9 @@ Other tools skim code. Skim optimizes everything your AI agent touches: code, te
 
 ## Why Skim?
 
-**Context capacity is not the bottleneck. Attention is.** Every token you send to an LLM dilutes its focus. Research consistently shows that past a threshold, adding context makes outputs worse. While other tools stop at code skimming, Skim optimizes the full spectrum of AI agent context: code, test output, build errors, git diffs, and commands. Faster, broader, and smarter than anything else available.
+**Context capacity is not the bottleneck. Attention is.** Every token you send to an LLM dilutes its focus. Research consistently shows attention dilution in long contexts -- models lose track of critical details even within their window. More tokens means higher latency, degraded recall, and weaker reasoning. Past a threshold, adding context makes outputs worse. While other tools stop at code skimming, Skim optimizes the full spectrum of AI agent context: code, test output, build errors, git diffs, and commands. Faster, broader, and smarter than anything else available.
 
 Take a typical 80-file TypeScript project: 63,000 tokens. That contains maybe 5,000 tokens of actual signal. The rest is implementation noise the model doesn't need for architectural reasoning.
-
-**Large contexts degrade model performance.** Research consistently shows attention dilution in long contexts — models lose track of critical details even within their window. More tokens means higher latency, degraded recall, and weaker reasoning. The inverse scaling problem: past a threshold, *adding context makes outputs worse.*
 
 **80% of the time, the model doesn't need implementation details.** It doesn't care *how* you loop through users or validate emails. It needs to understand *what* your code does and how pieces connect.
 
@@ -186,7 +184,6 @@ skim - --language typescript   # Stdin (requires --language)
 - `--no-cache` - Disable caching
 - `--show-stats` - Show token reduction stats
 - `--disable-analytics` - Disable analytics recording
-- `--cost` - Show cost savings estimates (with `skim stats`)
 
 📖 **[Full Usage Guide →](docs/usage.md)**
 

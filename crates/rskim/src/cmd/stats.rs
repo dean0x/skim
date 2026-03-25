@@ -5,6 +5,7 @@
 //! JSON output (`--format json`), cost estimates (`--cost`), and data clearing
 //! (`--clear`).
 
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
@@ -45,11 +46,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         None
     };
 
+    let mut stdout = io::stdout().lock();
+
     if format.as_deref() == Some("json") {
-        return run_json(&db, since_ts, show_cost);
+        return run_json(&mut stdout, &db, since_ts, show_cost);
     }
 
-    run_dashboard(&db, since_ts, show_cost, since_str.as_deref())
+    run_dashboard(&mut stdout, &db, since_ts, show_cost, since_str.as_deref())
 }
 
 // ============================================================================
@@ -95,7 +98,7 @@ fn print_help() {
     println!("ENVIRONMENT:");
     println!("  SKIM_INPUT_COST_PER_MTOK     Override $/MTok for cost estimates (default: 3.0)");
     println!("  SKIM_ANALYTICS_DB            Override analytics database path");
-    println!("  SKIM_DISABLE_ANALYTICS       Set to disable analytics recording");
+    println!("  SKIM_DISABLE_ANALYTICS       Set to 1, true, or yes to disable analytics recording");
 }
 
 // ============================================================================
@@ -112,7 +115,12 @@ fn run_clear(db: &dyn AnalyticsStore) -> anyhow::Result<ExitCode> {
 // JSON output
 // ============================================================================
 
-fn run_json(db: &dyn AnalyticsStore, since: Option<i64>, show_cost: bool) -> anyhow::Result<ExitCode> {
+fn run_json(
+    w: &mut dyn Write,
+    db: &dyn AnalyticsStore,
+    since: Option<i64>,
+    show_cost: bool,
+) -> anyhow::Result<ExitCode> {
     let summary = db.query_summary(since)?;
     let daily = db.query_daily(since)?;
     let by_command = db.query_by_command(since)?;
@@ -143,7 +151,7 @@ fn run_json(db: &dyn AnalyticsStore, since: Option<i64>, show_cost: bool) -> any
         );
     }
 
-    println!("{}", serde_json::to_string_pretty(&root)?);
+    writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -152,6 +160,7 @@ fn run_json(db: &dyn AnalyticsStore, since: Option<i64>, show_cost: bool) -> any
 // ============================================================================
 
 fn run_dashboard(
+    w: &mut dyn Write,
     db: &dyn AnalyticsStore,
     since: Option<i64>,
     show_cost: bool,
@@ -160,43 +169,49 @@ fn run_dashboard(
     let summary = db.query_summary(since)?;
 
     if summary.invocations == 0 {
-        println!("{}", "No analytics data found.".dimmed());
-        println!();
-        println!("Run skim commands to start collecting token savings data.");
-        println!("Example: skim src/main.rs");
+        writeln!(w, "{}", "No analytics data found.".dimmed())?;
+        writeln!(w)?;
+        writeln!(w, "Run skim commands to start collecting token savings data.")?;
+        writeln!(w, "Example: skim src/main.rs")?;
         return Ok(ExitCode::SUCCESS);
     }
 
     // Header
     let period = since_str.map_or("all time".to_string(), |s| format!("last {s}"));
-    println!(
+    writeln!(
+        w,
         "{}",
         format!("Token Analytics ({period})").bold()
-    );
-    println!();
+    )?;
+    writeln!(w)?;
 
     // Summary section
-    println!("{}", "Summary".bold().underline());
-    println!(
+    writeln!(w, "{}", "Summary".bold().underline())?;
+    writeln!(
+        w,
         "  Invocations:    {}",
         tokens::format_number(summary.invocations as usize)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  Raw tokens:     {}",
         tokens::format_number(summary.raw_tokens as usize)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  Compressed:     {}",
         tokens::format_number(summary.compressed_tokens as usize)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  Tokens saved:   {}",
         tokens::format_number(summary.tokens_saved as usize).green()
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  Avg reduction:  {:.1}%",
         summary.avg_savings_pct
-    );
+    )?;
 
     // Efficiency meter
     let pct = summary.avg_savings_pct.clamp(0.0, 100.0);
@@ -208,94 +223,83 @@ fn run_dashboard(
         "\u{2591}".repeat(empty),
         pct
     );
-    println!("{bar}");
-    println!();
+    writeln!(w, "{bar}")?;
+    writeln!(w)?;
 
     // By command type
     let by_command = db.query_by_command(since)?;
     if !by_command.is_empty() {
-        println!("{}", "By Command".bold().underline());
+        writeln!(w, "{}", "By Command".bold().underline())?;
         for cmd in &by_command {
-            println!(
+            writeln!(
+                w,
                 "  {:<8} {:>6} invocations, {} tokens saved ({:.1}%)",
                 cmd.command_type,
                 tokens::format_number(cmd.invocations as usize),
                 tokens::format_number(cmd.tokens_saved as usize),
                 cmd.avg_savings_pct,
-            );
+            )?;
         }
-        println!();
+        writeln!(w)?;
     }
 
     // By language
     let by_language = db.query_by_language(since)?;
     if !by_language.is_empty() {
-        println!("{}", "By Language".bold().underline());
+        writeln!(w, "{}", "By Language".bold().underline())?;
         for lang in &by_language {
-            println!(
+            writeln!(
+                w,
                 "  {:<12} {:>6} files, {} tokens saved ({:.1}%)",
                 lang.language,
                 tokens::format_number(lang.files as usize),
                 tokens::format_number(lang.tokens_saved as usize),
                 lang.avg_savings_pct,
-            );
+            )?;
         }
-        println!();
+        writeln!(w)?;
     }
 
     // By mode
     let by_mode = db.query_by_mode(since)?;
     if !by_mode.is_empty() {
-        println!("{}", "By Mode".bold().underline());
+        writeln!(w, "{}", "By Mode".bold().underline())?;
         for mode in &by_mode {
-            println!(
+            writeln!(
+                w,
                 "  {:<12} {:>6} files, {} tokens saved ({:.1}%)",
                 mode.mode,
                 tokens::format_number(mode.files as usize),
                 tokens::format_number(mode.tokens_saved as usize),
                 mode.avg_savings_pct,
-            );
+            )?;
         }
-        println!();
+        writeln!(w)?;
     }
 
     // Parse tier distribution
     let tier = db.query_tier_distribution(since)?;
     if tier.full_pct > 0.0 || tier.degraded_pct > 0.0 || tier.passthrough_pct > 0.0 {
-        println!("{}", "Parse Quality".bold().underline());
-        println!(
-            "  Full:        {:.1}%",
-            tier.full_pct,
-        );
-        println!(
-            "  Degraded:    {:.1}%",
-            tier.degraded_pct,
-        );
-        println!(
-            "  Passthrough: {:.1}%",
-            tier.passthrough_pct,
-        );
-        println!();
+        writeln!(w, "{}", "Parse Quality".bold().underline())?;
+        writeln!(w, "  Full:        {:.1}%", tier.full_pct)?;
+        writeln!(w, "  Degraded:    {:.1}%", tier.degraded_pct)?;
+        writeln!(w, "  Passthrough: {:.1}%", tier.passthrough_pct)?;
+        writeln!(w)?;
     }
 
     // Cost estimates
     if show_cost {
         let pricing = PricingModel::from_env_or_default();
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
-        println!("{}", "Cost Estimates".bold().underline());
-        println!(
-            "  Model:          {}",
-            pricing.model_name
-        );
-        println!(
-            "  Input cost:     ${:.2}/MTok",
-            pricing.input_cost_per_mtok
-        );
-        println!(
+        writeln!(w, "{}", "Cost Estimates".bold().underline())?;
+        writeln!(w, "  Model:          {}", pricing.model_name)?;
+        writeln!(w, "  Input cost:     ${:.2}/MTok", pricing.input_cost_per_mtok)?;
+        writeln!(
+            w,
             "  Estimated savings: {}",
             format!("${:.2}", cost_savings).green()
-        );
-        println!();
+        )?;
+        writeln!(w)?;
     }
 
     Ok(ExitCode::SUCCESS)
@@ -408,53 +412,90 @@ mod tests {
         }
     }
 
+    /// Helper: run a rendering function and return the captured output as a String.
+    fn capture<F>(f: F) -> String
+    where
+        F: FnOnce(&mut Vec<u8>) -> anyhow::Result<ExitCode>,
+    {
+        let mut buf = Vec::new();
+        let code = f(&mut buf).expect("render function should succeed");
+        assert_eq!(code, ExitCode::SUCCESS);
+        String::from_utf8(buf).expect("output should be valid UTF-8")
+    }
+
     #[test]
     fn test_run_json_empty_store() {
         let store = MockStore::empty();
-        let result = run_json(&store, None, false);
-        assert!(result.is_ok());
+        let output = capture(|w| run_json(w, &store, None, false));
+        let parsed: serde_json::Value = serde_json::from_str(&output)
+            .expect("output should be valid JSON");
+        let summary = &parsed["summary"];
+        assert_eq!(summary["invocations"], 0);
+        assert_eq!(summary["tokens_saved"], 0);
     }
 
     #[test]
     fn test_run_json_with_data() {
         let store = MockStore::with_data();
-        let result = run_json(&store, None, false);
-        assert!(result.is_ok());
+        let output = capture(|w| run_json(w, &store, None, false));
+        let parsed: serde_json::Value = serde_json::from_str(&output)
+            .expect("output should be valid JSON");
+        let summary = &parsed["summary"];
+        assert_eq!(summary["invocations"], 42);
+        assert_eq!(summary["tokens_saved"], 70_000);
+        assert_eq!(summary["avg_savings_pct"], 70.0);
+        // Verify breakdowns are present
+        assert!(parsed["by_command"].as_array().unwrap().len() == 1);
+        assert!(parsed["by_language"].as_array().unwrap().len() == 1);
+        assert!(parsed["by_mode"].as_array().unwrap().len() == 1);
+        // No cost_estimate when show_cost is false
+        assert!(parsed.get("cost_estimate").is_none());
     }
 
     #[test]
     fn test_run_json_with_cost() {
         let store = MockStore::with_data();
-        let result = run_json(&store, None, true);
-        assert!(result.is_ok());
+        let output = capture(|w| run_json(w, &store, None, true));
+        let parsed: serde_json::Value = serde_json::from_str(&output)
+            .expect("output should be valid JSON");
+        let cost = &parsed["cost_estimate"];
+        assert!(cost.is_object(), "cost_estimate should be present when show_cost=true");
+        assert_eq!(cost["tokens_saved"], 70_000);
+        assert!(cost["estimated_savings_usd"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
     fn test_run_dashboard_empty_store() {
         let store = MockStore::empty();
-        let result = run_dashboard(&store, None, false, None);
-        assert!(result.is_ok());
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(output.contains("No analytics data found"), "empty dashboard should show empty message");
     }
 
     #[test]
     fn test_run_dashboard_with_data() {
         let store = MockStore::with_data();
-        let result = run_dashboard(&store, None, false, None);
-        assert!(result.is_ok());
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(output.contains("42"), "dashboard should show invocation count");
+        assert!(output.contains("70,000"), "dashboard should show tokens saved");
+        assert!(output.contains("70.0%"), "dashboard should show avg reduction");
+        assert!(output.contains("all time"), "dashboard should show period label");
+        assert!(output.contains("rust"), "dashboard should show language breakdown");
+        assert!(output.contains("structure"), "dashboard should show mode breakdown");
     }
 
     #[test]
     fn test_run_dashboard_with_cost() {
         let store = MockStore::with_data();
-        let result = run_dashboard(&store, None, true, None);
-        assert!(result.is_ok());
+        let output = capture(|w| run_dashboard(w, &store, None, true, None));
+        assert!(output.contains("Cost Estimates"), "dashboard should show cost section");
+        assert!(output.contains("/MTok"), "dashboard should show cost rate");
     }
 
     #[test]
     fn test_run_dashboard_with_since_label() {
         let store = MockStore::with_data();
-        let result = run_dashboard(&store, None, false, Some("7d"));
-        assert!(result.is_ok());
+        let output = capture(|w| run_dashboard(w, &store, None, false, Some("7d")));
+        assert!(output.contains("last 7d"), "dashboard should show since period");
     }
 
     #[test]

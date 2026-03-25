@@ -450,6 +450,13 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Extract --disable-analytics from raw args before routing, so it
+    // applies to both file operations and subcommands. Uses an AtomicBool
+    // instead of env::set_var to avoid unsoundness in multi-threaded context.
+    if std::env::args().any(|a| a == "--disable-analytics") {
+        analytics::force_disable_analytics();
+    }
+
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
         Invocation::FileOperation => run_file_operation().map(|()| ExitCode::SUCCESS),
         Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args),
@@ -472,11 +479,8 @@ fn run_file_operation() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
-    // Propagate --disable-analytics to env var so that all code paths
-    // (including multi-file workers) respect it via is_analytics_enabled().
-    if args.disable_analytics {
-        std::env::set_var("SKIM_DISABLE_ANALYTICS", "1");
-    }
+    // --disable-analytics is handled in main() before routing via
+    // analytics::force_disable_analytics(). No env var mutation needed.
 
     if args.clear_cache {
         cache::clear_cache()?;
@@ -550,16 +554,19 @@ fn record_file_analytics(result: &process::ProcessResult, cmd: &str, args: &Args
             .to_string();
         let lang = args.language.map(|l| format!("{:?}", Language::from(l)).to_lowercase());
         let mode = format!("{:?}", Mode::from(args.mode)).to_lowercase();
-        analytics::record_with_counts(
-            raw,
-            comp,
-            cmd.to_string(),
-            analytics::CommandType::File,
-            0,
-            cwd,
-            Some(mode),
-            lang,
-        );
+        analytics::record_with_counts(analytics::TokenSavingsRecord {
+            timestamp: analytics::now_unix_secs(),
+            command_type: analytics::CommandType::File,
+            original_cmd: cmd.to_string(),
+            raw_tokens: raw,
+            compressed_tokens: comp,
+            savings_pct: analytics::savings_percentage(raw, comp),
+            duration_ms: 0,
+            project_path: cwd,
+            mode: Some(mode),
+            language: lang,
+            parse_tier: None,
+        });
     }
 }
 
