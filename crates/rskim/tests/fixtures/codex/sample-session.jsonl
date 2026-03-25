@@ -1,0 +1,6 @@
+{"type":"codex.tool_decision","tool":"bash","args":{"command":"cargo test"},"timestamp":"2026-03-01T10:00:00Z","session_id":"sess-abc","tool_decision_id":"td-001"}
+{"type":"codex.tool_result","tool":"bash","result":{"content":"test result: ok. 5 passed; 0 failed","is_error":false},"timestamp":"2026-03-01T10:00:01Z","session_id":"sess-abc","tool_decision_id":"td-001"}
+{"type":"codex.tool_decision","tool":"read","args":{"file_path":"/tmp/main.rs"},"timestamp":"2026-03-01T10:00:02Z","session_id":"sess-abc","tool_decision_id":"td-002"}
+{"type":"codex.tool_result","tool":"read","result":{"content":"fn main() { println!(\"hello\"); }","is_error":false},"timestamp":"2026-03-01T10:00:03Z","session_id":"sess-abc","tool_decision_id":"td-002"}
+{"type":"codex.tool_decision","tool":"bash","args":{"command":"git diff"},"timestamp":"2026-03-01T10:00:04Z","session_id":"sess-abc","tool_decision_id":"td-003"}
+{"type":"codex.tool_result","tool":"bash","result":{"content":"error: not a git repository","is_error":true},"timestamp":"2026-03-01T10:00:05Z","session_id":"sess-abc","tool_decision_id":"td-003"}

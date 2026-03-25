@@ -5,6 +5,7 @@
 //! are added by implementing the trait -- no conditionals in business logic.
 
 mod claude;
+mod codex;
 pub(crate) mod types;
 
 #[allow(unused_imports)] // ToolResult used by learn.rs tests
@@ -37,6 +38,9 @@ pub(crate) trait SessionProvider {
 pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
     let mut providers: Vec<Box<dyn SessionProvider>> = Vec::new();
     if let Some(p) = claude::ClaudeCodeProvider::detect() {
+        providers.push(Box::new(p));
+    }
+    if let Some(p) = codex::CodexCliProvider::detect() {
         providers.push(Box::new(p));
     }
     // Future: if let Some(p) = CopilotProvider::detect() { ... }

@@ -4,6 +4,7 @@
 //! Agents without hook support use awareness-only installation.
 
 pub(crate) mod claude;
+pub(crate) mod codex;
 
 use super::session::AgentKind;
 
