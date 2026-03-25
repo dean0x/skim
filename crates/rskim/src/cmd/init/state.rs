@@ -20,6 +20,8 @@ pub(super) struct DetectedState {
     pub(super) marketplace_installed: bool,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
+    /// Existing non-skim Bash PreToolUse hooks (plugin collision detection)
+    pub(super) existing_bash_hooks: Vec<String>,
 }
 
 pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
@@ -55,6 +57,9 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
         }
     }
 
+    // Scan for existing non-skim Bash PreToolUse hooks (plugin collision detection)
+    let existing_bash_hooks = scan_existing_bash_hooks(&settings_path);
+
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags)?;
 
@@ -68,7 +73,55 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
         hook_version,
         marketplace_installed,
         dual_scope_warning,
+        existing_bash_hooks,
     })
+}
+
+/// Scan settings.json for existing non-skim Bash PreToolUse hooks.
+///
+/// Returns the command strings of any Bash-matcher entries that are NOT skim entries.
+/// Used for plugin collision detection — warns the user if another tool is also
+/// intercepting Bash commands.
+fn scan_existing_bash_hooks(settings_path: &Path) -> Vec<String> {
+    let json = match read_settings_json(settings_path) {
+        Some(j) => j,
+        None => return Vec::new(),
+    };
+
+    let entries = match json
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|ptu| ptu.as_array())
+    {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    let mut other_hooks = Vec::new();
+    for entry in entries {
+        // Only care about "Bash" matcher entries
+        let is_bash_matcher = entry
+            .get("matcher")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m == "Bash");
+        if !is_bash_matcher {
+            continue;
+        }
+        // Skip skim entries
+        if has_skim_hook_entry(entry) {
+            continue;
+        }
+        // Extract command strings for reporting
+        if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
+            for hook in hooks {
+                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                    other_hooks.push(cmd.to_string());
+                }
+            }
+        }
+    }
+
+    other_hooks
 }
 
 pub(super) fn check_dual_scope(flags: &InitFlags) -> anyhow::Result<Option<String>> {
@@ -186,4 +239,90 @@ pub(super) fn extract_hook_version_from_entry(
         }
     }
     None
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_existing_bash_hooks_empty_settings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        // No file at all
+        let result = scan_existing_bash_hooks(&settings_path);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_scan_existing_bash_hooks_no_other_hooks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        // Only skim hook
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/home/.claude/hooks/skim-rewrite.sh"}]
+                }]
+            }
+        });
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let result = scan_existing_bash_hooks(&settings_path);
+        assert!(result.is_empty(), "skim entries should be excluded");
+    }
+
+    #[test]
+    fn test_scan_existing_bash_hooks_detects_other_bash_hook() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        // Settings with both skim and another Bash hook
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "/home/.claude/hooks/skim-rewrite.sh"}]
+                    },
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "/usr/bin/other-security-hook"}]
+                    }
+                ]
+            }
+        });
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let result = scan_existing_bash_hooks(&settings_path);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "/usr/bin/other-security-hook");
+    }
+
+    #[test]
+    fn test_scan_existing_bash_hooks_ignores_non_bash_matchers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings_path = dir.path().join("settings.json");
+
+        // A non-Bash matcher should be ignored
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Edit",
+                    "hooks": [{"type": "command", "command": "/usr/bin/some-hook"}]
+                }]
+            }
+        });
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+
+        let result = scan_existing_bash_hooks(&settings_path);
+        assert!(result.is_empty(), "non-Bash matchers should be ignored");
+    }
 }

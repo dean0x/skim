@@ -86,6 +86,17 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     // Print detected state
     print_detected_state(&state);
 
+    // Plugin collision warning: other Bash PreToolUse hooks exist
+    if !state.existing_bash_hooks.is_empty() {
+        println!("  WARNING: Other Bash PreToolUse hooks detected:");
+        for hook_cmd in &state.existing_bash_hooks {
+            println!("    - {hook_cmd}");
+        }
+        println!("  Both hooks will fire on Bash commands. This is usually harmless");
+        println!("  but may cause unexpected behavior if the other hook also modifies commands.");
+        println!();
+    }
+
     // Already up to date check
     if state.hook_installed
         && state.hook_version.as_deref() == Some(&state.skim_version)
