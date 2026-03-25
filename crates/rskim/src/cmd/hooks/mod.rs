@@ -29,7 +29,7 @@ pub(crate) struct HookInput {
 
 /// Result of a hook installation.
 #[derive(Debug)]
-#[allow(dead_code)] // Used in tests; will be consumed when init dispatches via protocol
+#[allow(dead_code)] // Used in per-agent install() tests
 pub(crate) struct InstallResult {
     pub(crate) script_path: Option<std::path::PathBuf>,
     pub(crate) config_patched: bool,
@@ -37,7 +37,7 @@ pub(crate) struct InstallResult {
 
 /// Options passed to install/uninstall.
 #[derive(Debug)]
-#[allow(dead_code)] // Used in tests; will be consumed when init dispatches via protocol
+#[allow(dead_code)] // Used in per-agent install() tests
 pub(crate) struct InstallOpts {
     pub(crate) binary_path: std::path::PathBuf,
     pub(crate) version: String,
@@ -48,7 +48,7 @@ pub(crate) struct InstallOpts {
 
 /// Options for uninstall.
 #[derive(Debug)]
-#[allow(dead_code)] // Used in tests; will be consumed when init dispatches via protocol
+#[allow(dead_code)] // Used in per-agent uninstall() tests
 pub(crate) struct UninstallOpts {
     pub(crate) config_dir: std::path::PathBuf,
     pub(crate) force: bool,
@@ -61,7 +61,7 @@ pub(crate) struct UninstallOpts {
 /// - Response formatting (rewritten command -> agent JSON)
 /// - Script generation (binary path -> shell script)
 /// - Installation/uninstallation
-#[allow(dead_code)] // Some methods used only in tests; full dispatch planned for init --agent
+#[allow(dead_code)] // agent_kind/generate_script/install/uninstall used in tests only; parse_input/format_response/hook_support used in production
 pub(crate) trait HookProtocol {
     fn agent_kind(&self) -> AgentKind;
     fn hook_support(&self) -> HookSupport;
