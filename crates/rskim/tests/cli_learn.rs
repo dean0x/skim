@@ -90,7 +90,7 @@ fn test_learn_generate_writes_file() {
         .stdout(predicate::str::contains("Wrote corrections to:"));
 
     // Verify the file was created
-    let rules_file = work_dir.path().join(".claude/rules/cli-corrections.md");
+    let rules_file = work_dir.path().join(".claude/rules/skim-corrections.md");
     assert!(rules_file.exists(), "Rules file should be created");
     let content = std::fs::read_to_string(&rules_file).unwrap();
     assert!(content.contains("CLI Corrections"), "Should have header");

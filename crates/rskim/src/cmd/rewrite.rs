@@ -1294,7 +1294,7 @@ fn print_suggest(original: &str, result: Option<(&str, RewriteCategory)>, compou
         category: result.map(|(_, c)| c),
         confidence: if result.is_some() { "exact" } else { "" },
         compound,
-        skim_hook_version: "1.0.0",
+        skim_hook_version: env!("CARGO_PKG_VERSION"),
     };
     // Struct contains only primitive types (&str, u8, bool) — serialization cannot fail.
     let json = serde_json::to_string(&output)

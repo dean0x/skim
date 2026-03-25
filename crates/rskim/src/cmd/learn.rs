@@ -2,7 +2,7 @@
 //!
 //! Scans AI agent session files for error-retry patterns: a failed Bash command
 //! followed by a similar successful command within the next few invocations.
-//! Optionally generates a `.claude/rules/cli-corrections.md` rules file.
+//! Optionally generates an agent-specific rules file (e.g., `.claude/rules/skim-corrections.md`).
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -113,17 +113,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
                 if i >= args.len() {
                     anyhow::bail!("--agent requires a value (e.g., claude-code)");
                 }
-                config.agent_filter = Some(AgentKind::from_str(&args[i]).ok_or_else(|| {
-                    let supported: Vec<&str> = AgentKind::all_supported()
-                        .iter()
-                        .map(|a| a.cli_name())
-                        .collect();
-                    anyhow::anyhow!(
-                        "unknown agent: '{}'\nSupported: {}",
-                        &args[i],
-                        supported.join(", ")
-                    )
-                })?);
+                config.agent_filter = Some(AgentKind::parse_cli_arg(&args[i])?);
             }
             other => {
                 anyhow::bail!(
@@ -783,7 +773,7 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --since <duration>   Time window (e.g., 24h, 7d, 1w) [default: 7d]");
-    println!("  --generate           Write rules to .claude/rules/cli-corrections.md");
+    println!("  --generate           Write rules to agent-specific rules file");
     println!("  --dry-run            Preview rules without writing (requires --generate)");
     println!("  --agent <name>       Only scan sessions from a specific agent");
     println!("  --json               Output machine-readable JSON");

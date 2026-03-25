@@ -3,10 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::flags::InitFlags;
-use super::helpers::resolve_config_dir;
-
-const HOOK_SCRIPT_NAME: &str = "skim-rewrite.sh";
-const SETTINGS_FILE: &str = "settings.json";
+use super::helpers::{resolve_config_dir, HOOK_SCRIPT_NAME, SETTINGS_FILE};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.

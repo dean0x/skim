@@ -4,12 +4,11 @@
 use std::os::unix::fs::PermissionsExt;
 
 use super::flags::InitFlags;
-use super::helpers::{check_mark, confirm_proceed, prompt_choice, resolve_symlink};
+use super::helpers::{
+    check_mark, confirm_proceed, prompt_choice, resolve_symlink, HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
+    SETTINGS_FILE,
+};
 use super::state::{detect_state, has_skim_hook_entry, DetectedState, MAX_SETTINGS_SIZE};
-
-const HOOK_SCRIPT_NAME: &str = "skim-rewrite.sh";
-const SETTINGS_FILE: &str = "settings.json";
-const SETTINGS_BACKUP: &str = "settings.json.bak";
 
 /// Resolved install options from interactive prompts or --yes defaults.
 struct InstallOptions {
@@ -106,25 +105,15 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     // Prompt for options (or use defaults for --yes)
     let options = prompt_install_options(flags, &state)?;
 
-    // If user changed scope interactively, re-detect state with the new scope
-    let (state, flags_override);
-    if options.project != flags.project {
-        flags_override = InitFlags {
-            project: options.project,
-            yes: flags.yes,
-            dry_run: flags.dry_run,
-            uninstall: false,
-        };
-        state = detect_state(&flags_override)?;
-    } else {
-        flags_override = InitFlags {
-            project: flags.project,
-            yes: flags.yes,
-            dry_run: flags.dry_run,
-            uninstall: false,
-        };
-        state = detect_state(&flags_override)?;
-    }
+    // Re-detect state with the resolved scope (may differ from flags if user
+    // changed scope interactively)
+    let flags_override = InitFlags {
+        project: options.project,
+        yes: flags.yes,
+        dry_run: flags.dry_run,
+        uninstall: false,
+    };
+    let state = detect_state(&flags_override)?;
 
     // Print summary
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);

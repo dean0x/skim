@@ -1,7 +1,15 @@
-//! Shared helper functions for `skim init`.
+//! Shared helper functions and constants for `skim init`.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+// ============================================================================
+// Shared constants
+// ============================================================================
+
+pub(super) const HOOK_SCRIPT_NAME: &str = "skim-rewrite.sh";
+pub(super) const SETTINGS_FILE: &str = "settings.json";
+pub(super) const SETTINGS_BACKUP: &str = "settings.json.bak";
 
 // ============================================================================
 // Config directory resolution (B6)

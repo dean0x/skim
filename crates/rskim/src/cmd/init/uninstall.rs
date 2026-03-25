@@ -1,11 +1,11 @@
 //! Uninstall flow for `skim init` (B10).
 
 use super::flags::InitFlags;
-use super::helpers::{check_mark, confirm_proceed, resolve_config_dir, resolve_symlink};
+use super::helpers::{
+    check_mark, confirm_proceed, resolve_config_dir, resolve_symlink, HOOK_SCRIPT_NAME,
+    SETTINGS_FILE,
+};
 use super::state::{has_skim_hook_entry, read_settings_json, MAX_SETTINGS_SIZE};
-
-const HOOK_SCRIPT_NAME: &str = "skim-rewrite.sh";
-const SETTINGS_FILE: &str = "settings.json";
 
 /// Remove skim hook entries and marketplace registration from a settings.json value.
 ///

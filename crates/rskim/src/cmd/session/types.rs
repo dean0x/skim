@@ -50,6 +50,21 @@ impl AgentKind {
         }
     }
 
+    /// Parse from a CLI flag value, returning a descriptive error for unknown agents.
+    ///
+    /// Shared by `discover` and `learn` subcommands to avoid duplicating the
+    /// error message with supported agent list.
+    pub(crate) fn parse_cli_arg(s: &str) -> anyhow::Result<Self> {
+        Self::from_str(s).ok_or_else(|| {
+            let supported: Vec<&str> = Self::all_supported().iter().map(|a| a.cli_name()).collect();
+            anyhow::anyhow!(
+                "unknown agent: '{}'\nSupported: {}",
+                s,
+                supported.join(", ")
+            )
+        })
+    }
+
     /// All supported agent kinds (for dynamic help text and iteration).
     pub(crate) fn all_supported() -> &'static [AgentKind] {
         &[
@@ -266,6 +281,27 @@ mod tests {
     fn test_agent_kind_from_str_unknown() {
         assert_eq!(AgentKind::from_str("unknown"), None);
         assert_eq!(AgentKind::from_str(""), None);
+    }
+
+    // ---- AgentKind::parse_cli_arg ----
+
+    #[test]
+    fn test_agent_kind_parse_cli_arg_valid() {
+        assert_eq!(
+            AgentKind::parse_cli_arg("claude-code").unwrap(),
+            AgentKind::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn test_agent_kind_parse_cli_arg_unknown() {
+        let err = AgentKind::parse_cli_arg("nonexistent").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown agent"), "got: {msg}");
+        assert!(
+            msg.contains("claude-code"),
+            "should list supported agents, got: {msg}"
+        );
     }
 
     // ---- AgentKind::display_name / cli_name ----
