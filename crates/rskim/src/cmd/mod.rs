@@ -9,6 +9,7 @@ mod build;
 mod completions;
 mod discover;
 mod git;
+mod hooks;
 mod init;
 mod learn;
 mod rewrite;
