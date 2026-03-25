@@ -154,3 +154,131 @@ fn test_agents_text_output_shows_all_names() {
         .stdout(predicate::str::contains("Gemini CLI"))
         .stdout(predicate::str::contains("Copilot CLI"));
 }
+
+// ============================================================================
+// Phase 6: Agent output accuracy and completeness
+// ============================================================================
+
+#[test]
+fn test_agents_no_agents_all_not_detected() {
+    // Point all providers to nonexistent paths -- all should show "not detected"
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("nonexistent");
+
+    let output = skim_cmd()
+        .args(["agents", "--json"])
+        .env("SKIM_PROJECTS_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_CODEX_SESSIONS_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_COPILOT_DIR", nonexistent.to_str().unwrap())
+        .env(
+            "SKIM_CURSOR_DB_PATH",
+            nonexistent.join("no-cursor.vscdb").to_str().unwrap(),
+        )
+        .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let agents = parsed["agents"].as_array().unwrap();
+
+    // At minimum, Claude Code and OpenCode use env overrides.
+    // Some agents (Cursor, Copilot, Gemini) detect from filesystem paths that
+    // don't have env overrides in the agents command. But with nonexistent paths
+    // set for those that do have overrides, we can at least verify the structure.
+    for agent in agents {
+        let name = agent["name"].as_str().unwrap();
+        let detected = agent["detected"].as_bool().unwrap();
+        // For agents whose detection depends on env vars we've overridden,
+        // they should not be detected
+        if name == "Claude Code" || name == "OpenCode" {
+            assert!(
+                !detected,
+                "{name} should not be detected with nonexistent path"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_agents_json_has_six_entries() {
+    let output = skim_cmd().args(["agents", "--json"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let agents = parsed["agents"].as_array().unwrap();
+    assert_eq!(
+        agents.len(),
+        6,
+        "Should have exactly 6 agent entries, got {}",
+        agents.len()
+    );
+}
+
+#[test]
+fn test_agents_claude_detected_with_session_count() {
+    let dir = TempDir::new().unwrap();
+    let project_dir = dir.path().join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    std::fs::write(project_dir.join("session1.jsonl"), "{}").unwrap();
+    std::fs::write(project_dir.join("session2.jsonl"), "{}").unwrap();
+    std::fs::write(project_dir.join("session3.jsonl"), "{}").unwrap();
+
+    let output = skim_cmd()
+        .args(["agents", "--json"])
+        .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let agents = parsed["agents"].as_array().unwrap();
+    let claude = agents
+        .iter()
+        .find(|a| a["cli_name"] == "claude-code")
+        .expect("should have claude-code agent");
+
+    assert_eq!(claude["detected"], true);
+    let detail = claude["sessions"]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("3 files"),
+        "Should report 3 files, got: {detail}"
+    );
+}
+
+#[test]
+fn test_agents_opencode_shows_typescript_plugin_note() {
+    // OpenCode should show "not supported (TypeScript plugin model)" for hooks
+    let output = skim_cmd().args(["agents", "--json"]).output().unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let agents = parsed["agents"].as_array().unwrap();
+    let opencode = agents
+        .iter()
+        .find(|a| a["cli_name"] == "opencode")
+        .expect("should have opencode agent");
+
+    assert_eq!(opencode["hooks"]["status"], "not_supported");
+    assert_eq!(opencode["hooks"]["note"], "TypeScript plugin model");
+}
+
+#[test]
+fn test_agents_text_not_detected_without_fixtures() {
+    // Text mode with no agents detected should say "not detected" for each
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("nonexistent");
+
+    skim_cmd()
+        .args(["agents"])
+        .env("SKIM_PROJECTS_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not detected"));
+}

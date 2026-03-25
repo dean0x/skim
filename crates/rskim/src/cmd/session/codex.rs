@@ -99,11 +99,10 @@ impl SessionProvider for CodexCliProvider {
                             }
                         }
 
-                        let modified =
-                            match std::fs::metadata(&path).and_then(|m| m.modified()) {
-                                Ok(t) => t,
-                                Err(_) => continue, // Graceful degradation
-                            };
+                        let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                            Ok(t) => t,
+                            Err(_) => continue, // Graceful degradation
+                        };
 
                         // Apply time filter
                         if let Some(since) = filter.since {
@@ -192,10 +191,7 @@ fn parse_codex_jsonl(content: &str, session_id: &str) -> anyhow::Result<Vec<Tool
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
                     .to_string();
-                let args = json
-                    .get("args")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
+                let args = json.get("args").cloned().unwrap_or(serde_json::Value::Null);
                 let tool_decision_id = json
                     .get("tool_decision_id")
                     .and_then(|id| id.as_str())
@@ -416,15 +412,11 @@ mod tests {
     fn test_parse_codex_tool_input_variants() {
         let write_args = serde_json::json!({"file_path": "/tmp/out.rs"});
         let result = parse_codex_tool_input("write", &write_args);
-        assert!(
-            matches!(result, ToolInput::Write { file_path } if file_path == "/tmp/out.rs")
-        );
+        assert!(matches!(result, ToolInput::Write { file_path } if file_path == "/tmp/out.rs"));
 
         let edit_args = serde_json::json!({"file_path": "/tmp/edit.rs"});
         let result = parse_codex_tool_input("edit", &edit_args);
-        assert!(
-            matches!(result, ToolInput::Edit { file_path } if file_path == "/tmp/edit.rs")
-        );
+        assert!(matches!(result, ToolInput::Edit { file_path } if file_path == "/tmp/edit.rs"));
 
         let glob_args = serde_json::json!({"pattern": "**/*.rs"});
         let result = parse_codex_tool_input("glob", &glob_args);

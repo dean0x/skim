@@ -79,9 +79,11 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
 
     // Integrity check (#57): warn if hook script has been modified since install
     if script_exists {
-        if let Ok(false) =
-            crate::cmd::integrity::verify_script_integrity(&config_dir, "claude-code", &hook_script_path)
-        {
+        if let Ok(false) = crate::cmd::integrity::verify_script_integrity(
+            &config_dir,
+            "claude-code",
+            &hook_script_path,
+        ) {
             if !flags.force {
                 eprintln!("warning: hook script has been modified since installation");
                 eprintln!("hint: use --force to uninstall anyway");

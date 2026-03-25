@@ -125,9 +125,7 @@ mod tests {
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v1.2.0"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.0\""));
-        assert!(script.contains(
-            "exec \"/usr/local/bin/skim\" rewrite --hook --agent cursor"
-        ));
+        assert!(script.contains("exec \"/usr/local/bin/skim\" rewrite --hook --agent cursor"));
         // Must use absolute path (quoted)
         assert!(script.contains("\"/usr/local/bin/skim\""));
     }

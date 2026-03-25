@@ -819,3 +819,30 @@ fn test_rewrite_hook_help() {
         .success()
         .stdout(predicate::str::contains("--hook"));
 }
+
+// ============================================================================
+// Phase 6: Multi-agent awareness in skim init
+// ============================================================================
+
+#[test]
+fn test_init_help_mentions_claude_code() {
+    // init --help currently targets Claude Code. When multi-agent init
+    // dispatch lands, this test should be updated to verify --agent documentation.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["init", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Claude Code"));
+}
+
+#[test]
+fn test_rewrite_help_mentions_agent_flag() {
+    // rewrite --help should mention the --agent flag
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--agent"));
+}

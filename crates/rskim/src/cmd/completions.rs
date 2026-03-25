@@ -75,8 +75,14 @@ fn build_full_command() -> Command {
     cmd = cmd.subcommand(super::learn::command());
 
     // Subcommands with full arg definitions added above -- skip in the stub loop.
-    const IMPLEMENTED_SUBCOMMANDS: &[&str] =
-        &["agents", "completions", "discover", "init", "learn", "rewrite"];
+    const IMPLEMENTED_SUBCOMMANDS: &[&str] = &[
+        "agents",
+        "completions",
+        "discover",
+        "init",
+        "learn",
+        "rewrite",
+    ];
 
     // Add stub subcommands for all OTHER known subcommands
     for name in super::KNOWN_SUBCOMMANDS {

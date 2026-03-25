@@ -133,10 +133,7 @@ impl SessionProvider for GeminiCliProvider {
 ///
 /// - First char `[` -> JSON array of messages (legacy format)
 /// - Otherwise -> JSONL (one JSON object per line, current format)
-fn parse_gemini_session(
-    content: &str,
-    session_id: &str,
-) -> anyhow::Result<Vec<ToolInvocation>> {
+fn parse_gemini_session(content: &str, session_id: &str) -> anyhow::Result<Vec<ToolInvocation>> {
     let trimmed = content.trim_start();
     if trimmed.starts_with('[') {
         parse_json_array_format(trimmed, session_id)
@@ -149,10 +146,7 @@ fn parse_gemini_session(
 ///
 /// Correlates tool_use events with tool_result events by matching
 /// `id` to `tool_use_id`.
-fn parse_jsonl_format(
-    content: &str,
-    session_id: &str,
-) -> anyhow::Result<Vec<ToolInvocation>> {
+fn parse_jsonl_format(content: &str, session_id: &str) -> anyhow::Result<Vec<ToolInvocation>> {
     let mut invocations = Vec::new();
     let mut pending: HashMap<String, usize> = HashMap::new();
 
@@ -176,10 +170,7 @@ fn parse_jsonl_format(
 /// Parse Gemini CLI JSON array format (legacy).
 ///
 /// The file contains a single JSON array of message objects.
-fn parse_json_array_format(
-    content: &str,
-    session_id: &str,
-) -> anyhow::Result<Vec<ToolInvocation>> {
+fn parse_json_array_format(content: &str, session_id: &str) -> anyhow::Result<Vec<ToolInvocation>> {
     let arr: Vec<serde_json::Value> = serde_json::from_str(content)?;
     let mut invocations = Vec::new();
     let mut pending: HashMap<String, usize> = HashMap::new();
@@ -216,10 +207,7 @@ fn process_gemini_event(
                 .and_then(|id| id.as_str())
                 .unwrap_or("")
                 .to_string();
-            let args_json = json
-                .get("args")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let args_json = json.get("args").cloned().unwrap_or(serde_json::Value::Null);
 
             let input = map_gemini_tool_input(&tool_name, &args_json);
 
@@ -370,7 +358,8 @@ mod tests {
     #[test]
     fn test_detect_format_by_first_char() {
         // JSON array format (starts with [)
-        let array_content = r#"[{"type":"tool_use","tool":"shell","args":{"command":"echo hi"},"id":"tu-001"}]"#;
+        let array_content =
+            r#"[{"type":"tool_use","tool":"shell","args":{"command":"echo hi"},"id":"tu-001"}]"#;
         let invocations = parse_gemini_session(array_content, "sess1").unwrap();
         assert_eq!(invocations.len(), 1);
 
@@ -487,8 +476,7 @@ mod tests {
         assert!(matches!(input, ToolInput::Bash { command } if command == "ls"));
 
         // "read_file" maps to ToolInput::Read
-        let input =
-            map_gemini_tool_input("read_file", &serde_json::json!({"file_path": "/a.rs"}));
+        let input = map_gemini_tool_input("read_file", &serde_json::json!({"file_path": "/a.rs"}));
         assert!(matches!(input, ToolInput::Read { file_path } if file_path == "/a.rs"));
 
         // "read_file" with "path" key also works
@@ -496,15 +484,12 @@ mod tests {
         assert!(matches!(input, ToolInput::Read { file_path } if file_path == "/b.rs"));
 
         // "edit_file" maps to ToolInput::Edit
-        let input =
-            map_gemini_tool_input("edit_file", &serde_json::json!({"file_path": "/c.rs"}));
+        let input = map_gemini_tool_input("edit_file", &serde_json::json!({"file_path": "/c.rs"}));
         assert!(matches!(input, ToolInput::Edit { file_path } if file_path == "/c.rs"));
 
         // Unknown tools map to ToolInput::Other
         let input = map_gemini_tool_input("search", &serde_json::json!({"query": "test"}));
-        assert!(
-            matches!(input, ToolInput::Other { tool_name, .. } if tool_name == "search")
-        );
+        assert!(matches!(input, ToolInput::Other { tool_name, .. } if tool_name == "search"));
     }
 
     #[test]
@@ -518,8 +503,7 @@ mod tests {
     #[test]
     fn test_uncorrelated_result_ignored() {
         // tool_result with no matching tool_use should be silently ignored
-        let content =
-            r#"{"type":"tool_result","tool_use_id":"nonexistent","content":"orphan","is_error":false}"#;
+        let content = r#"{"type":"tool_result","tool_use_id":"nonexistent","content":"orphan","is_error":false}"#;
         let invocations = parse_gemini_session(content, "sess1").unwrap();
         assert_eq!(invocations.len(), 0);
     }

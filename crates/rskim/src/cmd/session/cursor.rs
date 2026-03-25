@@ -41,21 +41,18 @@ impl CursorProvider {
 fn default_db_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        dirs::home_dir().map(|h| {
-            h.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
-        })
+        dirs::home_dir()
+            .map(|h| h.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb"))
     }
 
     #[cfg(target_os = "linux")]
     {
-        dirs::home_dir()
-            .map(|h| h.join(".config/Cursor/User/globalStorage/state.vscdb"))
+        dirs::home_dir().map(|h| h.join(".config/Cursor/User/globalStorage/state.vscdb"))
     }
 
     #[cfg(target_os = "windows")]
     {
-        dirs::data_dir()
-            .map(|d| d.join("Cursor/User/globalStorage/state.vscdb"))
+        dirs::data_dir().map(|d| d.join("Cursor/User/globalStorage/state.vscdb"))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -157,10 +154,7 @@ fn query_composer_keys(db_path: &std::path::Path) -> anyhow::Result<Vec<(String,
 }
 
 /// Query a single key's value from the database.
-fn query_single_key(
-    db_path: &std::path::Path,
-    key: &str,
-) -> anyhow::Result<Option<String>> {
+fn query_single_key(db_path: &std::path::Path, key: &str) -> anyhow::Result<Option<String>> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -202,8 +196,7 @@ pub(super) fn parse_cursor_json_value(
 
     let mut invocations = Vec::new();
     // Map from tool_call_id to index in invocations for result correlation
-    let mut pending: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    let mut pending: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for conversation in conversations {
         let messages = match conversation.get("messages").and_then(|m| m.as_array()) {
@@ -212,21 +205,15 @@ pub(super) fn parse_cursor_json_value(
         };
 
         for message in messages {
-            let role = message
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("");
+            let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
             match role {
                 "assistant" => {
-                    if let Some(tool_calls) =
-                        message.get("tool_calls").and_then(|tc| tc.as_array())
+                    if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array())
                     {
                         for tool_call in tool_calls {
-                            let tc_type = tool_call
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("");
+                            let tc_type =
+                                tool_call.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             if tc_type != "function" {
                                 continue;
                             }
@@ -636,7 +623,10 @@ mod tests {
             }
         }"#;
         let invocations = parse_cursor_json_value(json, "sess-1").unwrap();
-        assert!(invocations.is_empty(), "non-function tool calls should be skipped");
+        assert!(
+            invocations.is_empty(),
+            "non-function tool calls should be skipped"
+        );
     }
 
     #[test]
