@@ -804,18 +804,30 @@ mod tests {
                 }]
             }
         });
-        std::fs::write(config.join("settings.json"), serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
 
         // Create hook script and hash manifest
         let script_path = hooks_dir.join("skim-rewrite.sh");
-        std::fs::write(&script_path, "#!/usr/bin/env bash\n# skim-hook v1.0.0\nexec skim rewrite --hook\n").unwrap();
+        std::fs::write(
+            &script_path,
+            "#!/usr/bin/env bash\n# skim-hook v1.0.0\nexec skim rewrite --hook\n",
+        )
+        .unwrap();
         let hash = crate::cmd::integrity::compute_file_hash(&script_path).unwrap();
-        crate::cmd::integrity::write_hash_manifest(config, "claude-code", "skim-rewrite.sh", &hash).unwrap();
+        crate::cmd::integrity::write_hash_manifest(config, "claude-code", "skim-rewrite.sh", &hash)
+            .unwrap();
 
         let status = detect_claude_hook(Some(config));
         match status {
             HookStatus::Installed { integrity, .. } => {
-                assert_eq!(integrity, "ok", "integrity should be 'ok' for valid script+hash");
+                assert_eq!(
+                    integrity, "ok",
+                    "integrity should be 'ok' for valid script+hash"
+                );
             }
             other => panic!("expected HookStatus::Installed, got: {other:?}"),
         }
@@ -836,13 +848,22 @@ mod tests {
                 }]
             }
         });
-        std::fs::write(config.join("settings.json"), serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
 
         // Create script, store hash, then modify the script (tamper)
         let script_path = hooks_dir.join("skim-rewrite.sh");
-        std::fs::write(&script_path, "#!/usr/bin/env bash\n# skim-hook v1.0.0\nexec skim rewrite --hook\n").unwrap();
+        std::fs::write(
+            &script_path,
+            "#!/usr/bin/env bash\n# skim-hook v1.0.0\nexec skim rewrite --hook\n",
+        )
+        .unwrap();
         let hash = crate::cmd::integrity::compute_file_hash(&script_path).unwrap();
-        crate::cmd::integrity::write_hash_manifest(config, "claude-code", "skim-rewrite.sh", &hash).unwrap();
+        crate::cmd::integrity::write_hash_manifest(config, "claude-code", "skim-rewrite.sh", &hash)
+            .unwrap();
 
         // Tamper with the script
         std::fs::write(&script_path, "#!/usr/bin/env bash\necho HACKED\n").unwrap();
@@ -850,7 +871,10 @@ mod tests {
         let status = detect_claude_hook(Some(config));
         match status {
             HookStatus::Installed { integrity, .. } => {
-                assert_eq!(integrity, "tampered", "integrity should be 'tampered' for modified script");
+                assert_eq!(
+                    integrity, "tampered",
+                    "integrity should be 'tampered' for modified script"
+                );
             }
             other => panic!("expected HookStatus::Installed, got: {other:?}"),
         }
@@ -871,13 +895,20 @@ mod tests {
                 }]
             }
         });
-        std::fs::write(config.join("settings.json"), serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(
+            config.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
         // No script file created -- should be "missing"
 
         let status = detect_claude_hook(Some(config));
         match status {
             HookStatus::Installed { integrity, .. } => {
-                assert_eq!(integrity, "missing", "integrity should be 'missing' for absent script");
+                assert_eq!(
+                    integrity, "missing",
+                    "integrity should be 'missing' for absent script"
+                );
             }
             other => panic!("expected HookStatus::Installed, got: {other:?}"),
         }

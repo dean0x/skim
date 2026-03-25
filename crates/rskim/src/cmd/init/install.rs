@@ -75,12 +75,61 @@ fn prompt_install_options(
     })
 }
 
+/// Verify that the target agent appears to be installed on this system.
+///
+/// Checks for the expected config directory. If the agent's config dir
+/// doesn't exist, returns an error with a helpful message rather than
+/// silently creating an orphan config.
+fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::Result<()> {
+    use crate::cmd::session::AgentKind;
+
+    // Claude Code: always proceed (we create ~/.claude/ if needed)
+    if flags.agent == AgentKind::ClaudeCode {
+        return Ok(());
+    }
+
+    // For --project mode, we always create the dir, so skip the check
+    if flags.project {
+        return Ok(());
+    }
+
+    // Check if the config dir exists (or a parent indicator)
+    if !state.config_dir.exists() {
+        let hint = match flags.agent {
+            AgentKind::Cursor => "Install Cursor from https://cursor.com",
+            AgentKind::GeminiCli => "Install Gemini CLI: npm install -g @google/gemini-cli",
+            AgentKind::CopilotCli => {
+                "Install GitHub Copilot CLI: gh extension install github/gh-copilot"
+            }
+            AgentKind::CodexCli => "Install Codex CLI: npm install -g @openai/codex",
+            AgentKind::OpenCode => {
+                "Install OpenCode: go install github.com/opencode-ai/opencode@latest"
+            }
+            AgentKind::ClaudeCode => unreachable!("handled above"),
+        };
+        anyhow::bail!(
+            "{} does not appear to be installed (config dir not found: {})\nhint: {}",
+            flags.agent.display_name(),
+            state.config_dir.display(),
+            hint
+        );
+    }
+
+    Ok(())
+}
+
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
     let state = detect_state(flags)?;
 
+    // Verify agent is installed before proceeding
+    verify_agent_installed(&state, flags)?;
+
     // Print header
     println!();
-    println!("  skim init -- {} integration setup", flags.agent.display_name());
+    println!(
+        "  skim init -- {} integration setup",
+        flags.agent.display_name()
+    );
     println!();
 
     // Print detected state

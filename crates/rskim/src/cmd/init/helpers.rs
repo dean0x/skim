@@ -52,15 +52,18 @@ pub(super) fn resolve_config_dir_for_agent(
         }
     }
 
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
     match agent {
         AgentKind::ClaudeCode => Ok(home.join(".claude")),
         AgentKind::Cursor => {
             // macOS: ~/Library/Application Support/Cursor/
             // Linux: ~/.config/Cursor/
-            let macos_path = home.join("Library").join("Application Support").join("Cursor");
+            let macos_path = home
+                .join("Library")
+                .join("Application Support")
+                .join("Cursor");
             if macos_path.is_dir() {
                 Ok(macos_path)
             } else {
@@ -155,7 +158,9 @@ pub(super) fn print_help() {
     println!("  --global            Install to user-level config directory (default)");
     println!("  --project           Install to project-level config directory");
     println!("  --agent <name>      Target agent (default: claude-code)");
-    println!("                      Supported: claude-code, cursor, gemini, copilot, codex, opencode");
+    println!(
+        "                      Supported: claude-code, cursor, gemini, copilot, codex, opencode"
+    );
     println!("  --yes, -y           Non-interactive mode (skip prompts)");
     println!("  --dry-run           Print actions without writing");
     println!("  --uninstall         Remove hook and clean up");

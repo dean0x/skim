@@ -381,7 +381,10 @@ fn test_rewrite_hook_agent_gemini_match() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(json["decision"], "allow", "Gemini response should have decision=allow");
+    assert_eq!(
+        json["decision"], "allow",
+        "Gemini response should have decision=allow"
+    );
     assert!(
         json["tool_input"]["command"]
             .as_str()
@@ -434,10 +437,7 @@ fn test_rewrite_hook_agent_copilot_match() {
         "Copilot response should have permissionDecision=deny"
     );
     assert!(
-        json["reason"]
-            .as_str()
-            .unwrap()
-            .contains("skim test cargo"),
+        json["reason"].as_str().unwrap().contains("skim test cargo"),
         "Copilot deny reason should contain rewritten command"
     );
 }
@@ -479,7 +479,10 @@ fn test_rewrite_hook_agent_cursor_match() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(json["permission"], "allow", "Cursor response should have permission=allow");
+    assert_eq!(
+        json["permission"], "allow",
+        "Cursor response should have permission=allow"
+    );
     assert!(
         json["updated_input"]["command"]
             .as_str()
@@ -587,12 +590,27 @@ fn test_rewrite_hook_agent_unknown_passthrough() {
 fn test_rewrite_hook_all_agents_zero_stderr() {
     // Verify ALL hook responses have empty stderr
     let agents_and_inputs: Vec<(&str, serde_json::Value)> = vec![
-        ("claude-code", serde_json::json!({"tool_input": {"command": "cargo test"}})),
+        (
+            "claude-code",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
         ("cursor", serde_json::json!({"command": "cargo test"})),
-        ("gemini", serde_json::json!({"tool_input": {"command": "cargo test"}})),
-        ("copilot", serde_json::json!({"tool_input": {"command": "cargo test"}})),
-        ("codex", serde_json::json!({"tool_input": {"command": "cargo test"}})),
-        ("opencode", serde_json::json!({"tool_input": {"command": "cargo test"}})),
+        (
+            "gemini",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+        (
+            "copilot",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+        (
+            "opencode",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
     ];
 
     for (agent, input) in agents_and_inputs {

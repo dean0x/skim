@@ -68,6 +68,9 @@ pub(crate) fn get_providers(agent_filter: Option<AgentKind>) -> Vec<Box<dyn Sess
 }
 
 /// Collect all tool invocations from the given providers within a time filter.
+///
+/// Deduplicates invocations across agents using (input_key, timestamp) pairs.
+/// This prevents double-counting when multiple agents observe the same command.
 pub(crate) fn collect_invocations(
     providers: &[Box<dyn SessionProvider>],
     filter: &TimeFilter,
@@ -88,5 +91,126 @@ pub(crate) fn collect_invocations(
             }
         }
     }
+
+    dedup_invocations(&mut all_invocations);
     Ok(all_invocations)
+}
+
+/// Deduplicate invocations by (input_key, timestamp).
+///
+/// When multiple agents observe the same command at the same time,
+/// only the first occurrence is retained. Order is preserved.
+fn dedup_invocations(invocations: &mut Vec<ToolInvocation>) {
+    let mut seen = std::collections::HashSet::new();
+    invocations.retain(|inv| {
+        let key = (tool_input_key(&inv.input), inv.timestamp.clone());
+        seen.insert(key)
+    });
+}
+
+/// Extract a string key from a ToolInput for deduplication.
+fn tool_input_key(input: &ToolInput) -> String {
+    match input {
+        ToolInput::Read { file_path } => format!("read:{file_path}"),
+        ToolInput::Bash { command } => format!("bash:{command}"),
+        ToolInput::Write { file_path } => format!("write:{file_path}"),
+        ToolInput::Glob { pattern } => format!("glob:{pattern}"),
+        ToolInput::Grep { pattern } => format!("grep:{pattern}"),
+        ToolInput::Edit { file_path } => format!("edit:{file_path}"),
+        ToolInput::Other { tool_name, raw } => format!("other:{tool_name}:{raw}"),
+    }
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_invocation(command: &str, timestamp: &str, agent: AgentKind) -> ToolInvocation {
+        ToolInvocation {
+            tool_name: "Bash".to_string(),
+            input: ToolInput::Bash {
+                command: command.to_string(),
+            },
+            timestamp: timestamp.to_string(),
+            session_id: "test-session".to_string(),
+            agent,
+            result: None,
+        }
+    }
+
+    #[test]
+    fn test_dedup_same_command_same_timestamp() {
+        let mut invocations = vec![
+            make_invocation("cargo test", "2026-01-01T00:00:00Z", AgentKind::ClaudeCode),
+            make_invocation("cargo test", "2026-01-01T00:00:00Z", AgentKind::GeminiCli),
+        ];
+        dedup_invocations(&mut invocations);
+        assert_eq!(invocations.len(), 1, "same cmd+ts should dedup to 1");
+        assert_eq!(
+            invocations[0].agent,
+            AgentKind::ClaudeCode,
+            "first occurrence should be retained"
+        );
+    }
+
+    #[test]
+    fn test_dedup_same_command_different_timestamp() {
+        let mut invocations = vec![
+            make_invocation("cargo test", "2026-01-01T00:00:00Z", AgentKind::ClaudeCode),
+            make_invocation("cargo test", "2026-01-01T00:01:00Z", AgentKind::GeminiCli),
+        ];
+        dedup_invocations(&mut invocations);
+        assert_eq!(
+            invocations.len(),
+            2,
+            "same cmd but different ts should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_dedup_different_commands_same_timestamp() {
+        let mut invocations = vec![
+            make_invocation("cargo test", "2026-01-01T00:00:00Z", AgentKind::ClaudeCode),
+            make_invocation("cargo build", "2026-01-01T00:00:00Z", AgentKind::ClaudeCode),
+        ];
+        dedup_invocations(&mut invocations);
+        assert_eq!(
+            invocations.len(),
+            2,
+            "different commands should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_dedup_empty_list() {
+        let mut invocations: Vec<ToolInvocation> = Vec::new();
+        dedup_invocations(&mut invocations);
+        assert!(invocations.is_empty());
+    }
+
+    #[test]
+    fn test_tool_input_key_variants() {
+        assert_eq!(
+            tool_input_key(&ToolInput::Bash {
+                command: "cargo test".to_string()
+            }),
+            "bash:cargo test"
+        );
+        assert_eq!(
+            tool_input_key(&ToolInput::Read {
+                file_path: "/tmp/test.rs".to_string()
+            }),
+            "read:/tmp/test.rs"
+        );
+        assert_eq!(
+            tool_input_key(&ToolInput::Write {
+                file_path: "/tmp/out.rs".to_string()
+            }),
+            "write:/tmp/out.rs"
+        );
+    }
 }

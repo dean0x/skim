@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use super::flags::InitFlags;
-use super::helpers::{resolve_config_dir, resolve_config_dir_for_agent, HOOK_SCRIPT_NAME, SETTINGS_FILE};
+use super::helpers::{
+    resolve_config_dir, resolve_config_dir_for_agent, HOOK_SCRIPT_NAME, SETTINGS_FILE,
+};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
@@ -273,7 +275,11 @@ mod tests {
                 }]
             }
         });
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
 
         let result = scan_existing_bash_hooks(&settings_path);
         assert!(result.is_empty(), "skim entries should be excluded");
@@ -299,7 +305,11 @@ mod tests {
                 ]
             }
         });
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
 
         let result = scan_existing_bash_hooks(&settings_path);
         assert_eq!(result.len(), 1);
@@ -320,7 +330,11 @@ mod tests {
                 }]
             }
         });
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
 
         let result = scan_existing_bash_hooks(&settings_path);
         assert!(result.is_empty(), "non-Bash matchers should be ignored");

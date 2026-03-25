@@ -82,13 +82,23 @@ mod tests {
 
     #[test]
     fn test_parse_flags_agent_cursor() {
-        let flags = parse_flags(&["--yes".to_string(), "--agent".to_string(), "cursor".to_string()]).unwrap();
+        let flags = parse_flags(&[
+            "--yes".to_string(),
+            "--agent".to_string(),
+            "cursor".to_string(),
+        ])
+        .unwrap();
         assert_eq!(flags.agent, AgentKind::Cursor);
     }
 
     #[test]
     fn test_parse_flags_agent_gemini() {
-        let flags = parse_flags(&["--agent".to_string(), "gemini".to_string(), "--yes".to_string()]).unwrap();
+        let flags = parse_flags(&[
+            "--agent".to_string(),
+            "gemini".to_string(),
+            "--yes".to_string(),
+        ])
+        .unwrap();
         assert_eq!(flags.agent, AgentKind::GeminiCli);
     }
 
@@ -97,7 +107,10 @@ mod tests {
         let result = parse_flags(&["--agent".to_string(), "unknown-agent".to_string()]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown agent"), "error should mention unknown agent: {err}");
+        assert!(
+            err.contains("unknown agent"),
+            "error should mention unknown agent: {err}"
+        );
     }
 
     #[test]
@@ -105,7 +118,10 @@ mod tests {
         let result = parse_flags(&["--agent".to_string()]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("missing value"), "error should mention missing value: {err}");
+        assert!(
+            err.contains("missing value"),
+            "error should mention missing value: {err}"
+        );
     }
 
     #[test]
