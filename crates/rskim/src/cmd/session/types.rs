@@ -7,7 +7,11 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentKind {
     ClaudeCode,
-    // Future: CopilotCli, GeminiCli, CodexCli, Cursor, Cline, ...
+    CodexCli,
+    GeminiCli,
+    CopilotCli,
+    Cursor,
+    OpenCode,
 }
 
 impl AgentKind {
@@ -15,6 +19,11 @@ impl AgentKind {
     pub(crate) fn from_str(s: &str) -> Option<Self> {
         match s {
             "claude-code" | "claude" => Some(AgentKind::ClaudeCode),
+            "codex" | "codex-cli" => Some(AgentKind::CodexCli),
+            "gemini" | "gemini-cli" => Some(AgentKind::GeminiCli),
+            "copilot" | "copilot-cli" => Some(AgentKind::CopilotCli),
+            "cursor" => Some(AgentKind::Cursor),
+            "opencode" | "open-code" => Some(AgentKind::OpenCode),
             _ => None,
         }
     }
@@ -22,6 +31,47 @@ impl AgentKind {
     pub(crate) fn display_name(&self) -> &'static str {
         match self {
             AgentKind::ClaudeCode => "Claude Code",
+            AgentKind::CodexCli => "Codex CLI",
+            AgentKind::GeminiCli => "Gemini CLI",
+            AgentKind::CopilotCli => "Copilot CLI",
+            AgentKind::Cursor => "Cursor",
+            AgentKind::OpenCode => "OpenCode",
+        }
+    }
+
+    pub(crate) fn cli_name(&self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => "claude-code",
+            AgentKind::CodexCli => "codex",
+            AgentKind::GeminiCli => "gemini",
+            AgentKind::CopilotCli => "copilot",
+            AgentKind::Cursor => "cursor",
+            AgentKind::OpenCode => "opencode",
+        }
+    }
+
+    /// All supported agent kinds (for dynamic help text and iteration).
+    pub(crate) fn all_supported() -> &'static [AgentKind] {
+        &[
+            AgentKind::ClaudeCode,
+            AgentKind::CodexCli,
+            AgentKind::GeminiCli,
+            AgentKind::CopilotCli,
+            AgentKind::Cursor,
+            AgentKind::OpenCode,
+        ]
+    }
+
+    /// Returns the native rules directory/file path convention for this agent.
+    /// Returns None for agents that use single-file configs (user pastes content).
+    #[allow(dead_code)] // Used by learn.rs per-agent rules (phase 0.5)
+    pub(crate) fn rules_dir(&self) -> Option<&'static str> {
+        match self {
+            AgentKind::ClaudeCode => Some(".claude/rules"),
+            AgentKind::Cursor => Some(".cursor/rules"),
+            AgentKind::CopilotCli => Some(".github/instructions"),
+            // These agents use single-file configs -- user pastes content manually
+            AgentKind::CodexCli | AgentKind::GeminiCli | AgentKind::OpenCode => None,
         }
     }
 }
@@ -156,4 +206,122 @@ pub(crate) fn parse_duration_ago(s: &str) -> anyhow::Result<SystemTime> {
     .ok_or_else(|| anyhow::anyhow!("duration value too large: '{s}'"))?;
 
     Ok(SystemTime::now() - std::time::Duration::from_secs(secs))
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- AgentKind::from_str ----
+
+    #[test]
+    fn test_agent_kind_from_str_claude_code() {
+        assert_eq!(AgentKind::from_str("claude-code"), Some(AgentKind::ClaudeCode));
+        assert_eq!(AgentKind::from_str("claude"), Some(AgentKind::ClaudeCode));
+    }
+
+    #[test]
+    fn test_agent_kind_from_str_codex() {
+        assert_eq!(AgentKind::from_str("codex"), Some(AgentKind::CodexCli));
+        assert_eq!(AgentKind::from_str("codex-cli"), Some(AgentKind::CodexCli));
+    }
+
+    #[test]
+    fn test_agent_kind_from_str_gemini() {
+        assert_eq!(AgentKind::from_str("gemini"), Some(AgentKind::GeminiCli));
+        assert_eq!(AgentKind::from_str("gemini-cli"), Some(AgentKind::GeminiCli));
+    }
+
+    #[test]
+    fn test_agent_kind_from_str_copilot() {
+        assert_eq!(AgentKind::from_str("copilot"), Some(AgentKind::CopilotCli));
+        assert_eq!(AgentKind::from_str("copilot-cli"), Some(AgentKind::CopilotCli));
+    }
+
+    #[test]
+    fn test_agent_kind_from_str_cursor() {
+        assert_eq!(AgentKind::from_str("cursor"), Some(AgentKind::Cursor));
+    }
+
+    #[test]
+    fn test_agent_kind_from_str_opencode() {
+        assert_eq!(AgentKind::from_str("opencode"), Some(AgentKind::OpenCode));
+        assert_eq!(AgentKind::from_str("open-code"), Some(AgentKind::OpenCode));
+    }
+
+    #[test]
+    fn test_agent_kind_from_str_unknown() {
+        assert_eq!(AgentKind::from_str("unknown"), None);
+        assert_eq!(AgentKind::from_str(""), None);
+    }
+
+    // ---- AgentKind::display_name / cli_name ----
+
+    #[test]
+    fn test_agent_kind_display_name() {
+        assert_eq!(AgentKind::ClaudeCode.display_name(), "Claude Code");
+        assert_eq!(AgentKind::CodexCli.display_name(), "Codex CLI");
+        assert_eq!(AgentKind::GeminiCli.display_name(), "Gemini CLI");
+        assert_eq!(AgentKind::CopilotCli.display_name(), "Copilot CLI");
+        assert_eq!(AgentKind::Cursor.display_name(), "Cursor");
+        assert_eq!(AgentKind::OpenCode.display_name(), "OpenCode");
+    }
+
+    #[test]
+    fn test_agent_kind_cli_name() {
+        assert_eq!(AgentKind::ClaudeCode.cli_name(), "claude-code");
+        assert_eq!(AgentKind::CodexCli.cli_name(), "codex");
+        assert_eq!(AgentKind::GeminiCli.cli_name(), "gemini");
+        assert_eq!(AgentKind::CopilotCli.cli_name(), "copilot");
+        assert_eq!(AgentKind::Cursor.cli_name(), "cursor");
+        assert_eq!(AgentKind::OpenCode.cli_name(), "opencode");
+    }
+
+    // ---- AgentKind::all_supported ----
+
+    #[test]
+    fn test_agent_kind_all_supported() {
+        let all = AgentKind::all_supported();
+        assert_eq!(all.len(), 6);
+        assert!(all.contains(&AgentKind::ClaudeCode));
+        assert!(all.contains(&AgentKind::CodexCli));
+        assert!(all.contains(&AgentKind::GeminiCli));
+        assert!(all.contains(&AgentKind::CopilotCli));
+        assert!(all.contains(&AgentKind::Cursor));
+        assert!(all.contains(&AgentKind::OpenCode));
+    }
+
+    // ---- AgentKind::rules_dir ----
+
+    #[test]
+    fn test_agent_kind_rules_dir() {
+        assert_eq!(AgentKind::ClaudeCode.rules_dir(), Some(".claude/rules"));
+        assert_eq!(AgentKind::Cursor.rules_dir(), Some(".cursor/rules"));
+        assert_eq!(AgentKind::CopilotCli.rules_dir(), Some(".github/instructions"));
+        assert_eq!(AgentKind::CodexCli.rules_dir(), None);
+        assert_eq!(AgentKind::GeminiCli.rules_dir(), None);
+        assert_eq!(AgentKind::OpenCode.rules_dir(), None);
+    }
+
+    // ---- Display impl ----
+
+    #[test]
+    fn test_agent_kind_display() {
+        assert_eq!(format!("{}", AgentKind::ClaudeCode), "Claude Code");
+        assert_eq!(format!("{}", AgentKind::Cursor), "Cursor");
+    }
+
+    // ---- Round-trip: cli_name -> from_str ----
+
+    #[test]
+    fn test_agent_kind_roundtrip() {
+        for agent in AgentKind::all_supported() {
+            let parsed = AgentKind::from_str(agent.cli_name());
+            assert_eq!(parsed, Some(*agent), "round-trip failed for {:?}", agent);
+        }
+    }
 }
