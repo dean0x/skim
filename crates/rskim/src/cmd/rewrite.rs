@@ -1044,6 +1044,10 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(HOOK_TIMEOUT_SECS));
         super::hook_log::log_hook_warning("hook processing timed out after 5s, exiting");
+        // SAFETY: process::exit(0) is intentional here. In hook mode, timeout means
+        // passthrough (the agent sees empty stdout and proceeds normally). No Drop-based
+        // cleanup is relied upon — all writes use explicit flush before this point, and
+        // the watchdog only fires when processing has stalled beyond the timeout window.
         std::process::exit(0);
     });
 
