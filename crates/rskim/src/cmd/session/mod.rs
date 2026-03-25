@@ -6,6 +6,7 @@
 
 mod claude;
 mod codex;
+mod gemini;
 pub(crate) mod types;
 
 #[allow(unused_imports)] // ToolResult used by learn.rs tests
@@ -43,7 +44,9 @@ pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
     if let Some(p) = codex::CodexCliProvider::detect() {
         providers.push(Box::new(p));
     }
-    // Future: if let Some(p) = CopilotProvider::detect() { ... }
+    if let Some(p) = gemini::GeminiCliProvider::detect() {
+        providers.push(Box::new(p));
+    }
     providers
 }
 

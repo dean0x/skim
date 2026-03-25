@@ -1,0 +1,6 @@
+{"type":"tool_use","tool":"shell","args":{"command":"cargo test"},"id":"tu-001"}
+{"type":"tool_result","tool_use_id":"tu-001","content":"test result: ok. 5 passed; 0 failed","is_error":false}
+{"type":"tool_use","tool":"read_file","args":{"file_path":"/src/main.rs"},"id":"tu-002"}
+{"type":"tool_result","tool_use_id":"tu-002","content":"fn main() {\n    println!(\"hello\");\n}","is_error":false}
+{"type":"tool_use","tool":"shell","args":{"command":"git status"},"id":"tu-003"}
+{"type":"tool_result","tool_use_id":"tu-003","content":"On branch main\nnothing to commit","is_error":false}
