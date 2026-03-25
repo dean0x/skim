@@ -37,7 +37,8 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     let mut hook_version = None;
     let mut marketplace_installed = false;
 
-    if let Some(json) = read_settings_json(&settings_path) {
+    let parsed_settings = read_settings_json(&settings_path);
+    if let Some(ref json) = parsed_settings {
         if let Some(arr) = json
             .get("hooks")
             .and_then(|h| h.get("PreToolUse"))
@@ -60,7 +61,7 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     }
 
     // Scan for existing non-skim Bash PreToolUse hooks (plugin collision detection)
-    let existing_bash_hooks = scan_existing_bash_hooks(&settings_path);
+    let existing_bash_hooks = scan_existing_bash_hooks(parsed_settings.as_ref());
 
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags)?;
@@ -80,13 +81,16 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     })
 }
 
-/// Scan settings.json for existing non-skim Bash PreToolUse hooks.
+/// Scan already-parsed settings JSON for existing non-skim Bash PreToolUse hooks.
 ///
 /// Returns the command strings of any Bash-matcher entries that are NOT skim entries.
-/// Used for plugin collision detection — warns the user if another tool is also
+/// Used for plugin collision detection -- warns the user if another tool is also
 /// intercepting Bash commands.
-fn scan_existing_bash_hooks(settings_path: &Path) -> Vec<String> {
-    let json = match read_settings_json(settings_path) {
+///
+/// Accepts `Option<&Value>` so callers can reuse an already-parsed settings file
+/// instead of re-reading from disk.
+fn scan_existing_bash_hooks(parsed: Option<&serde_json::Value>) -> Vec<String> {
+    let json = match parsed {
         Some(j) => j,
         None => return Vec::new(),
     };
@@ -253,20 +257,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scan_existing_bash_hooks_empty_settings() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let settings_path = dir.path().join("settings.json");
-
-        // No file at all
-        let result = scan_existing_bash_hooks(&settings_path);
+    fn test_scan_existing_bash_hooks_none_input() {
+        // No parsed settings at all
+        let result = scan_existing_bash_hooks(None);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_scan_existing_bash_hooks_no_other_hooks() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let settings_path = dir.path().join("settings.json");
-
         // Only skim hook
         let settings = serde_json::json!({
             "hooks": {
@@ -276,21 +274,13 @@ mod tests {
                 }]
             }
         });
-        std::fs::write(
-            &settings_path,
-            serde_json::to_string_pretty(&settings).unwrap(),
-        )
-        .unwrap();
 
-        let result = scan_existing_bash_hooks(&settings_path);
+        let result = scan_existing_bash_hooks(Some(&settings));
         assert!(result.is_empty(), "skim entries should be excluded");
     }
 
     #[test]
     fn test_scan_existing_bash_hooks_detects_other_bash_hook() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let settings_path = dir.path().join("settings.json");
-
         // Settings with both skim and another Bash hook
         let settings = serde_json::json!({
             "hooks": {
@@ -306,22 +296,14 @@ mod tests {
                 ]
             }
         });
-        std::fs::write(
-            &settings_path,
-            serde_json::to_string_pretty(&settings).unwrap(),
-        )
-        .unwrap();
 
-        let result = scan_existing_bash_hooks(&settings_path);
+        let result = scan_existing_bash_hooks(Some(&settings));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "/usr/bin/other-security-hook");
     }
 
     #[test]
     fn test_scan_existing_bash_hooks_ignores_non_bash_matchers() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let settings_path = dir.path().join("settings.json");
-
         // A non-Bash matcher should be ignored
         let settings = serde_json::json!({
             "hooks": {
@@ -331,13 +313,8 @@ mod tests {
                 }]
             }
         });
-        std::fs::write(
-            &settings_path,
-            serde_json::to_string_pretty(&settings).unwrap(),
-        )
-        .unwrap();
 
-        let result = scan_existing_bash_hooks(&settings_path);
+        let result = scan_existing_bash_hooks(Some(&settings));
         assert!(result.is_empty(), "non-Bash matchers should be ignored");
     }
 }

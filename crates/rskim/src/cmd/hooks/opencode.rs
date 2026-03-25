@@ -36,6 +36,7 @@ impl HookProtocol for OpenCodeHook {
     }
 
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
+        // No-op: awareness-only agent has no hook to install
         Ok(InstallResult {
             script_path: None,
             config_patched: false,
@@ -43,6 +44,7 @@ impl HookProtocol for OpenCodeHook {
     }
 
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
+        // No-op: awareness-only agent has no hook to uninstall
         Ok(())
     }
 }

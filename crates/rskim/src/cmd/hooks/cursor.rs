@@ -45,7 +45,7 @@ impl HookProtocol for CursorHook {
     }
 
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // Actual install logic will be added in Phase 2 when multi-agent init lands.
+        // Stub: init module handles installation via resolve_config_dir_for_agent()
         Ok(InstallResult {
             script_path: None,
             config_patched: false,
@@ -53,7 +53,7 @@ impl HookProtocol for CursorHook {
     }
 
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
-        // Actual uninstall logic will be added in Phase 2.
+        // Stub: init module handles uninstallation via resolve_config_dir_for_agent()
         Ok(())
     }
 }

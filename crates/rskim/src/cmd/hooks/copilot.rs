@@ -55,7 +55,7 @@ impl HookProtocol for CopilotCliHook {
     }
 
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // Actual install logic will be implemented when multi-agent init lands.
+        // Stub: init module handles installation via resolve_config_dir_for_agent()
         Ok(InstallResult {
             script_path: None,
             config_patched: false,
@@ -63,6 +63,7 @@ impl HookProtocol for CopilotCliHook {
     }
 
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
+        // Stub: init module handles uninstallation via resolve_config_dir_for_agent()
         Ok(())
     }
 }

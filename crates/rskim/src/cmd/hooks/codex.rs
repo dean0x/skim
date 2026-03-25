@@ -30,6 +30,7 @@ impl HookProtocol for CodexCliHook {
     }
 
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
+        // No-op: awareness-only agent has no hook to install
         Ok(InstallResult {
             script_path: None,
             config_patched: false,
@@ -37,6 +38,7 @@ impl HookProtocol for CodexCliHook {
     }
 
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
+        // No-op: awareness-only agent has no hook to uninstall
         Ok(())
     }
 }
@@ -86,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_install_stub() {
+    fn test_codex_install_noop() {
         let opts = InstallOpts {
             binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
@@ -100,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_uninstall_stub() {
+    fn test_codex_uninstall_noop() {
         let opts = UninstallOpts {
             config_dir: "/tmp/.codex".into(),
             force: false,

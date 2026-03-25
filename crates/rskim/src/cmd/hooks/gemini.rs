@@ -55,7 +55,7 @@ impl HookProtocol for GeminiCliHook {
     }
 
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // Stub for Phase 0 -- full install logic in Phase 2 init changes
+        // Stub: init module handles installation via resolve_config_dir_for_agent()
         Ok(InstallResult {
             script_path: None,
             config_patched: false,
@@ -63,6 +63,7 @@ impl HookProtocol for GeminiCliHook {
     }
 
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
+        // Stub: init module handles uninstallation via resolve_config_dir_for_agent()
         Ok(())
     }
 }

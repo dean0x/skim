@@ -49,8 +49,7 @@ impl HookProtocol for ClaudeCodeHook {
     }
 
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // Actual install logic remains in init/install.rs for now.
-        // This will be migrated in Phase 2 when multi-agent init lands.
+        // Stub: init module handles installation via resolve_config_dir_for_agent()
         Ok(InstallResult {
             script_path: None,
             config_patched: false,
@@ -58,7 +57,7 @@ impl HookProtocol for ClaudeCodeHook {
     }
 
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
-        // Actual uninstall logic remains in init/uninstall.rs for now.
+        // Stub: init module handles uninstallation via resolve_config_dir_for_agent()
         Ok(())
     }
 }
@@ -76,17 +75,17 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_kind() {
+    fn test_claude_agent_kind() {
         assert_eq!(hook().agent_kind(), AgentKind::ClaudeCode);
     }
 
     #[test]
-    fn test_hook_support() {
+    fn test_claude_hook_support() {
         assert_eq!(hook().hook_support(), HookSupport::RealHook);
     }
 
     #[test]
-    fn test_parse_input_valid() {
+    fn test_claude_parse_input_valid() {
         let json = serde_json::json!({
             "tool_input": {
                 "command": "cargo test --nocapture"
@@ -98,13 +97,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_input_missing_tool_input() {
+    fn test_claude_parse_input_missing_tool_input() {
         let json = serde_json::json!({});
         assert!(hook().parse_input(&json).is_none());
     }
 
     #[test]
-    fn test_parse_input_missing_command() {
+    fn test_claude_parse_input_missing_command() {
         let json = serde_json::json!({
             "tool_input": {
                 "file_path": "/tmp/test.rs"
@@ -114,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_response() {
+    fn test_claude_format_response() {
         let response = hook().format_response("skim test cargo");
         let output = response.get("hookSpecificOutput").unwrap();
         assert_eq!(output["hookEventName"], "PreToolUse");
@@ -122,14 +121,14 @@ mod tests {
     }
 
     #[test]
-    fn test_format_response_no_permission_decision() {
+    fn test_claude_format_response_no_permission_decision() {
         let response = hook().format_response("skim test cargo");
         // SECURITY: Must never set permissionDecision
         assert!(response.get("permissionDecision").is_none());
     }
 
     #[test]
-    fn test_generate_script() {
+    fn test_claude_generate_script() {
         let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v1.0.0"));
@@ -138,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn test_install_stub() {
+    fn test_claude_install_stub() {
         let opts = InstallOpts {
             binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
@@ -152,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn test_uninstall_stub() {
+    fn test_claude_uninstall_stub() {
         let opts = UninstallOpts {
             config_dir: "/tmp/.claude".into(),
             force: false,
