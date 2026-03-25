@@ -349,7 +349,10 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by language (file operations only).
-    pub(crate) fn query_by_language(&self, since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>> {
+    pub(crate) fn query_by_language(
+        &self,
+        since: Option<i64>,
+    ) -> anyhow::Result<Vec<LanguageStats>> {
         let (clause, params) = since_clause_with_extra(since, "language IS NOT NULL");
         let sql = format!(
             "SELECT language, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {clause} GROUP BY language ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
@@ -385,7 +388,10 @@ impl AnalyticsDb {
     }
 
     /// Query parse tier distribution (command operations only).
-    pub(crate) fn query_tier_distribution(&self, since: Option<i64>) -> anyhow::Result<TierDistribution> {
+    pub(crate) fn query_tier_distribution(
+        &self,
+        since: Option<i64>,
+    ) -> anyhow::Result<TierDistribution> {
         let (clause, params) = since_clause_with_extra(since, "parse_tier IS NOT NULL");
         let sql = format!(
             "SELECT COALESCE(SUM(CASE WHEN parse_tier = 'full' THEN 1 ELSE 0 END), 0), \
@@ -1038,10 +1044,7 @@ mod tests {
     fn test_pricing_zero_is_valid() {
         with_cost_env_var(Some("0"), || {
             let p = PricingModel::from_env_or_default();
-            assert_eq!(
-                p.input_cost_per_mtok, 0.0,
-                "zero cost should be accepted"
-            );
+            assert_eq!(p.input_cost_per_mtok, 0.0, "zero cost should be accepted");
             assert_eq!(p.model_name, "custom");
         });
     }
@@ -1086,7 +1089,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "analytics_meta table should be created by migration");
+        assert_eq!(
+            count, 1,
+            "analytics_meta table should be created by migration"
+        );
     }
 
     // ========================================================================
@@ -1100,9 +1106,15 @@ mod tests {
 
         // Should be enabled by default (assuming env var not set by another test)
         with_env_var(None, || {
-            assert!(is_analytics_enabled(), "should be enabled before force_disable");
+            assert!(
+                is_analytics_enabled(),
+                "should be enabled before force_disable"
+            );
             force_disable_analytics();
-            assert!(!is_analytics_enabled(), "should be disabled after force_disable");
+            assert!(
+                !is_analytics_enabled(),
+                "should be disabled after force_disable"
+            );
         });
 
         // Reset to not pollute other tests

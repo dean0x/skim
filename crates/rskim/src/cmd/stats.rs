@@ -98,7 +98,9 @@ fn print_help() {
     println!("ENVIRONMENT:");
     println!("  SKIM_INPUT_COST_PER_MTOK     Override $/MTok for cost estimates (default: 3.0)");
     println!("  SKIM_ANALYTICS_DB            Override analytics database path");
-    println!("  SKIM_DISABLE_ANALYTICS       Set to 1, true, or yes to disable analytics recording");
+    println!(
+        "  SKIM_DISABLE_ANALYTICS       Set to 1, true, or yes to disable analytics recording"
+    );
 }
 
 // ============================================================================
@@ -171,18 +173,17 @@ fn run_dashboard(
     if summary.invocations == 0 {
         writeln!(w, "{}", "No analytics data found.".dimmed())?;
         writeln!(w)?;
-        writeln!(w, "Run skim commands to start collecting token savings data.")?;
+        writeln!(
+            w,
+            "Run skim commands to start collecting token savings data."
+        )?;
         writeln!(w, "Example: skim src/main.rs")?;
         return Ok(ExitCode::SUCCESS);
     }
 
     // Header
     let period = since_str.map_or("all time".to_string(), |s| format!("last {s}"));
-    writeln!(
-        w,
-        "{}",
-        format!("Token Analytics ({period})").bold()
-    )?;
+    writeln!(w, "{}", format!("Token Analytics ({period})").bold())?;
     writeln!(w)?;
 
     // Summary section
@@ -207,11 +208,7 @@ fn run_dashboard(
         "  Tokens saved:   {}",
         tokens::format_number(summary.tokens_saved as usize).green()
     )?;
-    writeln!(
-        w,
-        "  Avg reduction:  {:.1}%",
-        summary.avg_savings_pct
-    )?;
+    writeln!(w, "  Avg reduction:  {:.1}%", summary.avg_savings_pct)?;
 
     // Efficiency meter
     let pct = summary.avg_savings_pct.clamp(0.0, 100.0);
@@ -293,7 +290,11 @@ fn run_dashboard(
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
         writeln!(w, "{}", "Cost Estimates".bold().underline())?;
         writeln!(w, "  Model:          {}", pricing.model_name)?;
-        writeln!(w, "  Input cost:     ${:.2}/MTok", pricing.input_cost_per_mtok)?;
+        writeln!(
+            w,
+            "  Input cost:     ${:.2}/MTok",
+            pricing.input_cost_per_mtok
+        )?;
         writeln!(
             w,
             "  Estimated savings: {}",
@@ -427,8 +428,8 @@ mod tests {
     fn test_run_json_empty_store() {
         let store = MockStore::empty();
         let output = capture(|w| run_json(w, &store, None, false));
-        let parsed: serde_json::Value = serde_json::from_str(&output)
-            .expect("output should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
         let summary = &parsed["summary"];
         assert_eq!(summary["invocations"], 0);
         assert_eq!(summary["tokens_saved"], 0);
@@ -438,8 +439,8 @@ mod tests {
     fn test_run_json_with_data() {
         let store = MockStore::with_data();
         let output = capture(|w| run_json(w, &store, None, false));
-        let parsed: serde_json::Value = serde_json::from_str(&output)
-            .expect("output should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
         let summary = &parsed["summary"];
         assert_eq!(summary["invocations"], 42);
         assert_eq!(summary["tokens_saved"], 70_000);
@@ -456,10 +457,13 @@ mod tests {
     fn test_run_json_with_cost() {
         let store = MockStore::with_data();
         let output = capture(|w| run_json(w, &store, None, true));
-        let parsed: serde_json::Value = serde_json::from_str(&output)
-            .expect("output should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
         let cost = &parsed["cost_estimate"];
-        assert!(cost.is_object(), "cost_estimate should be present when show_cost=true");
+        assert!(
+            cost.is_object(),
+            "cost_estimate should be present when show_cost=true"
+        );
         assert_eq!(cost["tokens_saved"], 70_000);
         assert!(cost["estimated_savings_usd"].as_f64().unwrap() > 0.0);
     }
@@ -468,26 +472,50 @@ mod tests {
     fn test_run_dashboard_empty_store() {
         let store = MockStore::empty();
         let output = capture(|w| run_dashboard(w, &store, None, false, None));
-        assert!(output.contains("No analytics data found"), "empty dashboard should show empty message");
+        assert!(
+            output.contains("No analytics data found"),
+            "empty dashboard should show empty message"
+        );
     }
 
     #[test]
     fn test_run_dashboard_with_data() {
         let store = MockStore::with_data();
         let output = capture(|w| run_dashboard(w, &store, None, false, None));
-        assert!(output.contains("42"), "dashboard should show invocation count");
-        assert!(output.contains("70,000"), "dashboard should show tokens saved");
-        assert!(output.contains("70.0%"), "dashboard should show avg reduction");
-        assert!(output.contains("all time"), "dashboard should show period label");
-        assert!(output.contains("rust"), "dashboard should show language breakdown");
-        assert!(output.contains("structure"), "dashboard should show mode breakdown");
+        assert!(
+            output.contains("42"),
+            "dashboard should show invocation count"
+        );
+        assert!(
+            output.contains("70,000"),
+            "dashboard should show tokens saved"
+        );
+        assert!(
+            output.contains("70.0%"),
+            "dashboard should show avg reduction"
+        );
+        assert!(
+            output.contains("all time"),
+            "dashboard should show period label"
+        );
+        assert!(
+            output.contains("rust"),
+            "dashboard should show language breakdown"
+        );
+        assert!(
+            output.contains("structure"),
+            "dashboard should show mode breakdown"
+        );
     }
 
     #[test]
     fn test_run_dashboard_with_cost() {
         let store = MockStore::with_data();
         let output = capture(|w| run_dashboard(w, &store, None, true, None));
-        assert!(output.contains("Cost Estimates"), "dashboard should show cost section");
+        assert!(
+            output.contains("Cost Estimates"),
+            "dashboard should show cost section"
+        );
         assert!(output.contains("/MTok"), "dashboard should show cost rate");
     }
 
@@ -495,7 +523,10 @@ mod tests {
     fn test_run_dashboard_with_since_label() {
         let store = MockStore::with_data();
         let output = capture(|w| run_dashboard(w, &store, None, false, Some("7d")));
-        assert!(output.contains("last 7d"), "dashboard should show since period");
+        assert!(
+            output.contains("last 7d"),
+            "dashboard should show since period"
+        );
     }
 
     #[test]
@@ -508,13 +539,19 @@ mod tests {
     #[test]
     fn test_parse_value_flag_bare() {
         let args: Vec<String> = vec!["--format".into(), "json".into()];
-        assert_eq!(parse_value_flag(&args, "--format"), Some("json".to_string()));
+        assert_eq!(
+            parse_value_flag(&args, "--format"),
+            Some("json".to_string())
+        );
     }
 
     #[test]
     fn test_parse_value_flag_equals() {
         let args: Vec<String> = vec!["--format=json".into()];
-        assert_eq!(parse_value_flag(&args, "--format"), Some("json".to_string()));
+        assert_eq!(
+            parse_value_flag(&args, "--format"),
+            Some("json".to_string())
+        );
     }
 
     #[test]
