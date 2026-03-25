@@ -838,15 +838,14 @@ fn test_rewrite_hook_help() {
 // ============================================================================
 
 #[test]
-fn test_init_help_mentions_claude_code() {
-    // init --help currently targets Claude Code. When multi-agent init
-    // dispatch lands, this test should be updated to verify --agent documentation.
+fn test_init_help_mentions_agent_flag() {
+    // init --help should document the --agent flag for multi-agent support
     Command::cargo_bin("skim")
         .unwrap()
         .args(["init", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Claude Code"));
+        .stdout(predicate::str::contains("--agent"));
 }
 
 #[test]

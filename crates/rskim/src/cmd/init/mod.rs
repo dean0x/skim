@@ -61,18 +61,24 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 /// Build the clap `Command` definition for shell completions.
 pub(super) fn command() -> clap::Command {
     clap::Command::new("init")
-        .about("Install skim as a Claude Code hook")
+        .about("Install skim as an agent hook")
         .arg(
             clap::Arg::new("global")
                 .long("global")
                 .action(clap::ArgAction::SetTrue)
-                .help("Install to user-level ~/.claude/ (default)"),
+                .help("Install to user-level config directory (default)"),
         )
         .arg(
             clap::Arg::new("project")
                 .long("project")
                 .action(clap::ArgAction::SetTrue)
-                .help("Install to .claude/ in current directory"),
+                .help("Install to project-level config directory"),
+        )
+        .arg(
+            clap::Arg::new("agent")
+                .long("agent")
+                .value_name("NAME")
+                .help("Target agent (default: claude-code)"),
         )
         .arg(
             clap::Arg::new("yes")

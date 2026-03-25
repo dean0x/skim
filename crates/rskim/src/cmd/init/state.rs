@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::flags::InitFlags;
-use super::helpers::{resolve_config_dir, HOOK_SCRIPT_NAME, SETTINGS_FILE};
+use super::helpers::{resolve_config_dir, resolve_config_dir_for_agent, HOOK_SCRIPT_NAME, SETTINGS_FILE};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
@@ -27,7 +27,7 @@ pub(super) struct DetectedState {
 pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     let skim_binary = std::env::current_exe()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
-    let config_dir = resolve_config_dir(flags.project)?;
+    let config_dir = resolve_config_dir_for_agent(flags.project, flags.agent)?;
     let settings_path = config_dir.join(SETTINGS_FILE);
     let settings_exists = settings_path.exists();
 

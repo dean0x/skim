@@ -80,7 +80,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
 
     // Print header
     println!();
-    println!("  skim init -- Claude Code integration setup");
+    println!("  skim init -- {} integration setup", flags.agent.display_name());
     println!();
 
     // Print detected state
@@ -124,6 +124,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
         dry_run: flags.dry_run,
         uninstall: false,
         force: flags.force,
+        agent: flags.agent,
     };
     let state = detect_state(&flags_override)?;
 
