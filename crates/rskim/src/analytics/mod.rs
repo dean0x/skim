@@ -35,16 +35,6 @@ impl CommandType {
             CommandType::Git => "git",
         }
     }
-
-    #[allow(dead_code)]
-    fn from_str(s: &str) -> Self {
-        match s {
-            "test" => CommandType::Test,
-            "build" => CommandType::Build,
-            "git" => CommandType::Git,
-            _ => CommandType::File,
-        }
-    }
 }
 
 /// A single token savings measurement.
@@ -66,7 +56,7 @@ pub(crate) struct TokenSavingsRecord {
 // Query result types
 // ============================================================================
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct AnalyticsSummary {
     pub(crate) invocations: u64,
     pub(crate) raw_tokens: u64,
@@ -75,7 +65,7 @@ pub(crate) struct AnalyticsSummary {
     pub(crate) avg_savings_pct: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct DailyStats {
     pub(crate) date: String,
     pub(crate) invocations: u64,
@@ -83,7 +73,7 @@ pub(crate) struct DailyStats {
     pub(crate) avg_savings_pct: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct CommandStats {
     #[serde(rename = "type")]
     pub(crate) command_type: String,
@@ -92,7 +82,7 @@ pub(crate) struct CommandStats {
     pub(crate) avg_savings_pct: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct LanguageStats {
     pub(crate) language: String,
     pub(crate) files: u64,
@@ -100,7 +90,7 @@ pub(crate) struct LanguageStats {
     pub(crate) avg_savings_pct: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ModeStats {
     pub(crate) mode: String,
     pub(crate) files: u64,
@@ -108,7 +98,7 @@ pub(crate) struct ModeStats {
     pub(crate) avg_savings_pct: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct TierDistribution {
     pub(crate) full_pct: f64,
     pub(crate) degraded_pct: f64,
@@ -136,10 +126,12 @@ impl PricingModel {
     pub(crate) fn from_env_or_default() -> Self {
         if let Ok(val) = std::env::var("SKIM_INPUT_COST_PER_MTOK") {
             if let Ok(cost) = val.parse::<f64>() {
-                return Self {
-                    input_cost_per_mtok: cost,
-                    model_name: "custom",
-                };
+                if cost.is_finite() && cost >= 0.0 {
+                    return Self {
+                        input_cost_per_mtok: cost,
+                        model_name: "custom",
+                    };
+                }
             }
         }
         Self::default_pricing()
@@ -165,6 +157,24 @@ pub(crate) fn is_analytics_enabled() -> bool {
         Ok(val) => !matches!(val.to_lowercase().as_str(), "1" | "true" | "yes"),
         Err(_) => true,
     }
+}
+
+// ============================================================================
+// AnalyticsStore trait
+// ============================================================================
+
+/// Trait abstracting analytics query operations for testability.
+///
+/// `AnalyticsDb` implements this trait directly. Test code can provide a
+/// `MockStore` without requiring a real SQLite database.
+pub(crate) trait AnalyticsStore {
+    fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary>;
+    fn query_daily(&self, since: Option<i64>) -> anyhow::Result<Vec<DailyStats>>;
+    fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>>;
+    fn query_by_language(&self, since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>>;
+    fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>>;
+    fn query_tier_distribution(&self, since: Option<i64>) -> anyhow::Result<TierDistribution>;
+    fn clear(&self) -> anyhow::Result<()>;
 }
 
 // ============================================================================
@@ -255,7 +265,7 @@ impl AnalyticsDb {
                 avg_savings_pct: row.get(3)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Query breakdown by command type.
@@ -273,7 +283,7 @@ impl AnalyticsDb {
                 avg_savings_pct: row.get(3)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Query breakdown by language (file operations only).
@@ -296,7 +306,7 @@ impl AnalyticsDb {
                 avg_savings_pct: row.get(3)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Query breakdown by mode (file operations only).
@@ -319,7 +329,7 @@ impl AnalyticsDb {
                 avg_savings_pct: row.get(3)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Query parse tier distribution (command operations only).
@@ -365,17 +375,14 @@ impl AnalyticsDb {
         Ok(count)
     }
 
-    /// Prune if last prune was >24h ago. Uses a metadata table for tracking.
+    /// Prune if last prune was >24h ago. Uses the `analytics_meta` table
+    /// (created by schema migration v2) for tracking.
     pub(crate) fn maybe_prune(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let _ = self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS analytics_meta (key TEXT PRIMARY KEY, value INTEGER)",
-            [],
-        );
         let last_prune: i64 = self
             .conn
             .query_row(
@@ -385,8 +392,7 @@ impl AnalyticsDb {
             )
             .unwrap_or(0);
 
-        if now as i64 - last_prune > 86400 {
-            let _ = self.prune_older_than(90); // Keep 90 days
+        if now as i64 - last_prune > 86400 && self.prune_older_than(90).is_ok() {
             let _ = self.conn.execute(
                 "INSERT OR REPLACE INTO analytics_meta (key, value) VALUES ('last_prune', ?1)",
                 [now as i64],
@@ -395,9 +401,33 @@ impl AnalyticsDb {
     }
 
     /// Delete all analytics data.
-    pub(crate) fn clear(&self) -> anyhow::Result<()> {
+    fn clear_data(&self) -> anyhow::Result<()> {
         self.conn.execute("DELETE FROM token_savings", [])?;
         Ok(())
+    }
+}
+
+impl AnalyticsStore for AnalyticsDb {
+    fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
+        self.query_summary(since)
+    }
+    fn query_daily(&self, since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
+        self.query_daily(since)
+    }
+    fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
+        self.query_by_command(since)
+    }
+    fn query_by_language(&self, since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>> {
+        self.query_by_language(since)
+    }
+    fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
+        self.query_by_mode(since)
+    }
+    fn query_tier_distribution(&self, since: Option<i64>) -> anyhow::Result<TierDistribution> {
+        self.query_tier_distribution(since)
+    }
+    fn clear(&self) -> anyhow::Result<()> {
+        self.clear_data()
     }
 }
 
@@ -504,6 +534,80 @@ pub(crate) fn record_with_counts(
             mode,
             language,
             parse_tier: None,
+        };
+        persist_record(&record);
+    });
+}
+
+// ============================================================================
+// Convenience helpers for subcommand call sites
+// ============================================================================
+
+/// Record command output analytics with automatic enabled-check and cwd detection.
+///
+/// Reduces the 12-15 line inline pattern at each subcommand call site to a
+/// single function call. Token counting is deferred to a background thread.
+pub(crate) fn try_record_command(
+    raw_text: String,
+    compressed_text: String,
+    original_cmd: String,
+    command_type: CommandType,
+    duration: Duration,
+    parse_tier: Option<&str>,
+) {
+    if !is_analytics_enabled() {
+        return;
+    }
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+    record_fire_and_forget(
+        raw_text,
+        compressed_text,
+        original_cmd,
+        command_type,
+        duration,
+        cwd,
+        parse_tier.map(|s| s.to_string()),
+    );
+}
+
+/// Record command output analytics when token counts are already known.
+///
+/// Use this instead of [`try_record_command`] when the caller has already
+/// computed token counts (e.g., via `--show-stats`), avoiding redundant
+/// re-tokenization in the background thread.
+#[allow(dead_code)]
+pub(crate) fn try_record_command_with_counts(
+    raw_tokens: usize,
+    compressed_tokens: usize,
+    original_cmd: String,
+    command_type: CommandType,
+    duration: Duration,
+    parse_tier: Option<&str>,
+) {
+    if !is_analytics_enabled() {
+        return;
+    }
+    let cwd = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+    let tier = parse_tier.map(|s| s.to_string());
+    std::thread::spawn(move || {
+        let record = TokenSavingsRecord {
+            timestamp: now_unix_secs(),
+            command_type,
+            original_cmd,
+            raw_tokens,
+            compressed_tokens,
+            savings_pct: savings_percentage(raw_tokens, compressed_tokens),
+            duration_ms: duration.as_millis() as u64,
+            project_path: cwd,
+            mode: None,
+            language: None,
+            parse_tier: tier,
         };
         persist_record(&record);
     });
@@ -846,5 +950,99 @@ mod tests {
                 "analytics should remain enabled when SKIM_DISABLE_ANALYTICS is empty"
             );
         });
+    }
+
+    // ========================================================================
+    // Pricing validation tests
+    // ========================================================================
+
+    /// Run a closure with `SKIM_INPUT_COST_PER_MTOK` set to the given value,
+    /// then restore the original environment. Uses the same mutex as
+    /// `with_env_var` to prevent concurrent env-var mutations.
+    fn with_cost_env_var(value: Option<&str>, f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static COST_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = COST_ENV_LOCK.lock().unwrap();
+
+        let prev = std::env::var("SKIM_INPUT_COST_PER_MTOK").ok();
+        match value {
+            Some(v) => std::env::set_var("SKIM_INPUT_COST_PER_MTOK", v),
+            None => std::env::remove_var("SKIM_INPUT_COST_PER_MTOK"),
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prev {
+            Some(v) => std::env::set_var("SKIM_INPUT_COST_PER_MTOK", v),
+            None => std::env::remove_var("SKIM_INPUT_COST_PER_MTOK"),
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
+    fn test_pricing_negative_falls_back_to_default() {
+        with_cost_env_var(Some("-5"), || {
+            let p = PricingModel::from_env_or_default();
+            assert_eq!(
+                p.input_cost_per_mtok, 3.0,
+                "negative cost should fall back to default"
+            );
+            assert_eq!(p.model_name, "claude-sonnet-4-6");
+        });
+    }
+
+    #[test]
+    fn test_pricing_zero_is_valid() {
+        with_cost_env_var(Some("0"), || {
+            let p = PricingModel::from_env_or_default();
+            assert_eq!(
+                p.input_cost_per_mtok, 0.0,
+                "zero cost should be accepted"
+            );
+            assert_eq!(p.model_name, "custom");
+        });
+    }
+
+    #[test]
+    fn test_pricing_infinity_falls_back_to_default() {
+        with_cost_env_var(Some("inf"), || {
+            let p = PricingModel::from_env_or_default();
+            assert_eq!(
+                p.input_cost_per_mtok, 3.0,
+                "infinite cost should fall back to default"
+            );
+            assert_eq!(p.model_name, "claude-sonnet-4-6");
+        });
+    }
+
+    #[test]
+    fn test_pricing_nan_falls_back_to_default() {
+        with_cost_env_var(Some("NaN"), || {
+            let p = PricingModel::from_env_or_default();
+            assert_eq!(
+                p.input_cost_per_mtok, 3.0,
+                "NaN cost should fall back to default"
+            );
+            assert_eq!(p.model_name, "claude-sonnet-4-6");
+        });
+    }
+
+    // ========================================================================
+    // Schema migration v2 test
+    // ========================================================================
+
+    #[test]
+    fn test_analytics_meta_table_created_by_migration() {
+        let (db, _tmp) = test_db();
+        // analytics_meta should exist from the v2 migration
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='analytics_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "analytics_meta table should be created by migration");
     }
 }
