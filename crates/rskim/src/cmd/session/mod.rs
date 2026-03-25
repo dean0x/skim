@@ -7,6 +7,7 @@
 mod claude;
 mod codex;
 mod copilot;
+mod cursor;
 mod gemini;
 pub(crate) mod types;
 
@@ -20,9 +21,6 @@ pub(crate) use types::{
 // ============================================================================
 
 /// Trait implemented by each agent's session file parser.
-///
-/// Each agent stores session data differently. Providers normalize
-/// tool invocations into agent-agnostic `ToolInvocation` structs.
 pub(crate) trait SessionProvider {
     fn agent_kind(&self) -> AgentKind;
     fn find_sessions(&self, filter: &TimeFilter) -> anyhow::Result<Vec<SessionFile>>;
@@ -43,6 +41,9 @@ pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
         providers.push(Box::new(p));
     }
     if let Some(p) = copilot::CopilotCliProvider::detect() {
+        providers.push(Box::new(p));
+    }
+    if let Some(p) = cursor::CursorProvider::detect() {
         providers.push(Box::new(p));
     }
     if let Some(p) = gemini::GeminiCliProvider::detect() {

@@ -72,8 +72,12 @@ fn test_discover_no_agent_dir() {
     skim_cmd()
         .args(["discover"])
         .env("SKIM_PROJECTS_DIR", nonexistent.to_str().unwrap())
-        // Also neutralize Gemini provider to ensure no agents are detected
+        // Neutralize all providers to ensure no agents are detected
+        .env("SKIM_CODEX_SESSIONS_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_COPILOT_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_CURSOR_DB_PATH", dir.path().join("no-cursor.vscdb").to_str().unwrap())
         .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
         .assert()
         .success()
         .stdout(predicate::str::contains("No AI agent sessions found"));
