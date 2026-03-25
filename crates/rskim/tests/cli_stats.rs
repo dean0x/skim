@@ -69,19 +69,40 @@ fn test_stats_json_format() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "skim stats --format json should exit 0");
+    assert!(
+        output.status.success(),
+        "skim stats --format json should exit 0"
+    );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Expected valid JSON, got parse error: {e}\nstdout: {stdout}"));
 
     // Verify expected top-level keys exist
-    assert!(json.get("summary").is_some(), "JSON should contain 'summary' key");
-    assert!(json.get("daily").is_some(), "JSON should contain 'daily' key");
-    assert!(json.get("by_command").is_some(), "JSON should contain 'by_command' key");
-    assert!(json.get("by_language").is_some(), "JSON should contain 'by_language' key");
-    assert!(json.get("by_mode").is_some(), "JSON should contain 'by_mode' key");
-    assert!(json.get("tier_distribution").is_some(), "JSON should contain 'tier_distribution' key");
+    assert!(
+        json.get("summary").is_some(),
+        "JSON should contain 'summary' key"
+    );
+    assert!(
+        json.get("daily").is_some(),
+        "JSON should contain 'daily' key"
+    );
+    assert!(
+        json.get("by_command").is_some(),
+        "JSON should contain 'by_command' key"
+    );
+    assert!(
+        json.get("by_language").is_some(),
+        "JSON should contain 'by_language' key"
+    );
+    assert!(
+        json.get("by_mode").is_some(),
+        "JSON should contain 'by_mode' key"
+    );
+    assert!(
+        json.get("tier_distribution").is_some(),
+        "JSON should contain 'tier_distribution' key"
+    );
 }
 
 // ============================================================================
@@ -110,7 +131,10 @@ fn test_stats_cost_flag() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "skim stats --format json --cost should exit 0");
+    assert!(
+        output.status.success(),
+        "skim stats --format json --cost should exit 0"
+    );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim())
@@ -118,7 +142,10 @@ fn test_stats_cost_flag() {
 
     // With --cost, the JSON should include cost_estimate section
     let cost = json.get("cost_estimate");
-    assert!(cost.is_some(), "JSON should contain 'cost_estimate' key when --cost is passed");
+    assert!(
+        cost.is_some(),
+        "JSON should contain 'cost_estimate' key when --cost is passed"
+    );
 
     let cost = cost.unwrap();
     assert!(

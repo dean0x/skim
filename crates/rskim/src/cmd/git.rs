@@ -222,7 +222,11 @@ fn run_passthrough(
 ///
 /// Callers are responsible for baking global flags into `subcmd_args` before
 /// calling this function.
-fn run_parsed_command<F>(subcmd_args: &[String], show_stats: bool, parser: F) -> anyhow::Result<ExitCode>
+fn run_parsed_command<F>(
+    subcmd_args: &[String],
+    show_stats: bool,
+    parser: F,
+) -> anyhow::Result<ExitCode>
 where
     F: FnOnce(&str) -> GitResult,
 {
@@ -274,7 +278,11 @@ where
 ///
 /// Flag-aware passthrough: if user has `--porcelain`, `--short`, or `-s`,
 /// output is already compact — pass through unmodified.
-fn run_status(global_flags: &[String], args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+fn run_status(
+    global_flags: &[String],
+    args: &[String],
+    show_stats: bool,
+) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--porcelain", "--short", "-s"]) {
         return run_passthrough(global_flags, "status", args, show_stats);
     }
@@ -474,7 +482,11 @@ fn worktree_prefix(c: char) -> &'static str {
 ///
 /// Flag-aware passthrough: if user has `--stat`, `--name-only`, or
 /// `--name-status`, output is already compact — pass through unmodified.
-fn run_diff(global_flags: &[String], args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+fn run_diff(
+    global_flags: &[String],
+    args: &[String],
+    show_stats: bool,
+) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--stat", "--name-only", "--name-status", "--check"]) {
         return run_passthrough(global_flags, "diff", args, show_stats);
     }

@@ -552,7 +552,9 @@ fn record_file_analytics(result: &process::ProcessResult, cmd: &str, args: &Args
             .unwrap_or_default()
             .display()
             .to_string();
-        let lang = args.language.map(|l| format!("{:?}", Language::from(l)).to_lowercase());
+        let lang = args
+            .language
+            .map(|l| format!("{:?}", Language::from(l)).to_lowercase());
         let mode = format!("{:?}", Mode::from(args.mode)).to_lowercase();
         analytics::record_with_counts(analytics::TokenSavingsRecord {
             timestamp: analytics::now_unix_secs(),

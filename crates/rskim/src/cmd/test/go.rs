@@ -617,14 +617,8 @@ mod tests {
     #[test]
     fn test_flag_injection_skipped_with_json() {
         let args = vec!["-json".to_string(), "./...".to_string()];
-        assert!(
-            go_has_flag(&args, "-json"),
-            "expected -json to be detected"
-        );
-        assert!(
-            !go_has_flag(&args, "-v"),
-            "expected -v to NOT be detected"
-        );
+        assert!(go_has_flag(&args, "-json"), "expected -json to be detected");
+        assert!(!go_has_flag(&args, "-v"), "expected -v to NOT be detected");
     }
 
     #[test]
@@ -647,10 +641,7 @@ mod tests {
             !go_has_flag(&args, "-json"),
             "expected -json to NOT be detected"
         );
-        assert!(
-            !go_has_flag(&args, "-v"),
-            "expected -v to NOT be detected"
-        );
+        assert!(!go_has_flag(&args, "-v"), "expected -v to NOT be detected");
     }
 
     // ========================================================================

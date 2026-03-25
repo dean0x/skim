@@ -21,7 +21,9 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::cmd::{inject_flag_before_separator, run_parsed_command_with_mode, ParsedCommandConfig, user_has_flag};
+use crate::cmd::{
+    inject_flag_before_separator, run_parsed_command_with_mode, user_has_flag, ParsedCommandConfig,
+};
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;

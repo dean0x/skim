@@ -49,7 +49,10 @@ pub(crate) struct ProcessResult {
 /// Count tokens for both original and transformed text, returning `(None, None)` on failure.
 ///
 /// Centralises the paired token-counting pattern used across the processing pipeline.
-pub(crate) fn count_token_pair(original: &str, transformed: &str) -> (Option<usize>, Option<usize>) {
+pub(crate) fn count_token_pair(
+    original: &str,
+    transformed: &str,
+) -> (Option<usize>, Option<usize>) {
     match (
         tokens::count_tokens(original),
         tokens::count_tokens(transformed),
