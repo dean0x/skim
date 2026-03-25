@@ -176,6 +176,11 @@ fn analyze_invocations(invocations: &[ToolInvocation]) -> DiscoverAnalysis {
                 });
             }
             ToolInput::Bash { command } => {
+                // Skip commands already rewritten by the hook (start with "skim ")
+                if command.starts_with("skim ") {
+                    continue;
+                }
+
                 // Check if this command has a skim rewrite
                 let tokens: Vec<&str> = command.split_whitespace().collect();
                 let has_rewrite = !tokens.is_empty() && check_has_rewrite(&tokens);
@@ -591,5 +596,50 @@ mod tests {
     fn test_parse_args_since() {
         let config = parse_args(&["--since".to_string(), "7d".to_string()]).unwrap();
         assert!(config.since.is_some());
+    }
+
+    // ---- analyze_invocations: skim command exclusion ----
+
+    fn make_bash_invocation(command: &str) -> ToolInvocation {
+        ToolInvocation {
+            tool_name: "Bash".to_string(),
+            input: ToolInput::Bash {
+                command: command.to_string(),
+            },
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            session_id: "sess1".to_string(),
+            agent: AgentKind::ClaudeCode,
+            result: Some(session::ToolResult {
+                content: "output".to_string(),
+                is_error: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_analyze_excludes_already_rewritten_commands() {
+        // Commands starting with "skim " should NOT be counted as rewritable
+        let inv1 = make_bash_invocation("skim test cargo --nocapture");
+        let inv2 = make_bash_invocation("skim build clippy");
+        let inv3 = make_bash_invocation("cargo test"); // this one IS rewritable
+        let invocations = vec![inv1, inv2, inv3];
+
+        let analysis = analyze_invocations(&invocations);
+
+        // Only "cargo test" should be in bash_commands, not the skim commands
+        assert_eq!(analysis.bash_commands.len(), 1);
+        assert_eq!(analysis.bash_commands[0].command, "cargo test");
+        assert!(analysis.bash_commands[0].has_rewrite);
+    }
+
+    #[test]
+    fn test_analyze_counts_non_skim_commands() {
+        let inv1 = make_bash_invocation("ls -la");
+        let inv2 = make_bash_invocation("cargo test");
+        let invocations = vec![inv1, inv2];
+
+        let analysis = analyze_invocations(&invocations);
+
+        assert_eq!(analysis.bash_commands.len(), 2);
     }
 }
