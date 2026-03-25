@@ -21,6 +21,8 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 
+use super::session::AgentKind;
+
 // ============================================================================
 // Data structures
 // ============================================================================
@@ -261,9 +263,11 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Hook mode: run as Claude Code PreToolUse hook (#44)
+    // Hook mode: run as agent PreToolUse hook (#44)
     if args.iter().any(|a| a == "--hook") {
-        return run_hook_mode();
+        // Parse optional --agent flag
+        let agent = parse_agent_flag(args);
+        return run_hook_mode(agent);
     }
 
     // Check for --suggest flag (must be first non-help flag)
@@ -1008,11 +1012,29 @@ fn try_rewrite_tail(args: &[&str]) -> Option<RewriteResult> {
 // Hook mode (#44) — Claude Code PreToolUse integration
 // ============================================================================
 
+/// Parse the `--agent <name>` flag from rewrite args.
+///
+/// Returns `None` if `--agent` is not present or the value is missing.
+/// Does not error on unknown agent names — callers handle the fallback.
+fn parse_agent_flag(args: &[String]) -> Option<AgentKind> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--agent" {
+            i += 1;
+            if i < args.len() {
+                return AgentKind::from_str(&args[i]);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Maximum bytes to read from stdin in hook mode (64 KiB).
 /// Hook payloads are small JSON objects; this prevents unbounded allocation.
 const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 
-/// Run as a Claude Code PreToolUse hook.
+/// Run as an agent PreToolUse hook.
 ///
 /// Protocol:
 /// 1. Read JSON from stdin (bounded)
@@ -1022,8 +1044,19 @@ const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 /// 5. On match: emit hook response JSON, exit 0
 /// 6. On no match: exit 0, empty stdout (passthrough)
 ///
+/// When `agent` is None or ClaudeCode, uses existing Claude Code logic.
+/// Other agents passthrough (exit 0) until Phase 2 adds implementations.
+///
 /// SECURITY INVARIANT: Never sets `permissionDecision`. Only sets `updatedInput`.
-fn run_hook_mode() -> anyhow::Result<ExitCode> {
+fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
+    // For non-Claude agents, passthrough until Phase 2 adds implementations
+    match agent {
+        None | Some(AgentKind::ClaudeCode) => {} // proceed with Claude Code logic
+        Some(_) => {
+            // TODO: Phase 2 will add hook implementations for other agents
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
     // A2: Version mismatch check — rate-limited daily warning
     check_hook_version_mismatch();
 
@@ -1290,7 +1323,13 @@ pub(super) fn command() -> clap::Command {
             clap::Arg::new("hook")
                 .long("hook")
                 .action(clap::ArgAction::SetTrue)
-                .help("Run as Claude Code PreToolUse hook (reads JSON from stdin)"),
+                .help("Run as agent PreToolUse hook (reads JSON from stdin)"),
+        )
+        .arg(
+            clap::Arg::new("agent")
+                .long("agent")
+                .value_name("NAME")
+                .help("Agent type for hook mode (e.g., claude-code, codex, gemini)"),
         )
         .arg(
             clap::Arg::new("command")
@@ -1314,9 +1353,10 @@ fn print_help() {
     println!("       skim rewrite --hook  (Claude Code PreToolUse hook mode)");
     println!();
     println!("Options:");
-    println!("  --suggest    Output JSON suggestion instead of plain text");
-    println!("  --hook       Run as Claude Code PreToolUse hook (reads JSON from stdin)");
-    println!("  --help, -h   Print help information");
+    println!("  --suggest         Output JSON suggestion instead of plain text");
+    println!("  --hook            Run as agent PreToolUse hook (reads JSON from stdin)");
+    println!("  --agent <name>    Agent type for hook mode (default: claude-code)");
+    println!("  --help, -h        Print help information");
     println!();
     println!("Examples:");
     println!("  skim rewrite cargo test -- --nocapture");
@@ -2422,5 +2462,51 @@ mod tests {
             CompoundSplitResult::Bail => {}
             other => panic!("Expected Bail for variable expansion, got {:?}", other),
         }
+    }
+
+    // ========================================================================
+    // parse_agent_flag
+    // ========================================================================
+
+    #[test]
+    fn test_parse_agent_flag_present() {
+        let args = vec![
+            "--hook".to_string(),
+            "--agent".to_string(),
+            "claude-code".to_string(),
+        ];
+        assert_eq!(parse_agent_flag(&args), Some(AgentKind::ClaudeCode));
+    }
+
+    #[test]
+    fn test_parse_agent_flag_codex() {
+        let args = vec![
+            "--hook".to_string(),
+            "--agent".to_string(),
+            "codex".to_string(),
+        ];
+        assert_eq!(parse_agent_flag(&args), Some(AgentKind::CodexCli));
+    }
+
+    #[test]
+    fn test_parse_agent_flag_absent() {
+        let args = vec!["--hook".to_string()];
+        assert_eq!(parse_agent_flag(&args), None);
+    }
+
+    #[test]
+    fn test_parse_agent_flag_missing_value() {
+        let args = vec!["--hook".to_string(), "--agent".to_string()];
+        assert_eq!(parse_agent_flag(&args), None);
+    }
+
+    #[test]
+    fn test_parse_agent_flag_unknown_agent() {
+        let args = vec![
+            "--hook".to_string(),
+            "--agent".to_string(),
+            "unknown-agent".to_string(),
+        ];
+        assert_eq!(parse_agent_flag(&args), None);
     }
 }
