@@ -6,6 +6,7 @@
 
 mod claude;
 mod codex;
+mod copilot;
 mod gemini;
 pub(crate) mod types;
 
@@ -33,15 +34,15 @@ pub(crate) trait SessionProvider {
 // ============================================================================
 
 /// Auto-detect available agents by checking known session paths.
-///
-/// Uses `SKIM_PROJECTS_DIR` env var override for testability (same
-/// pattern as `CLAUDE_CONFIG_DIR` in init.rs).
 pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
     let mut providers: Vec<Box<dyn SessionProvider>> = Vec::new();
     if let Some(p) = claude::ClaudeCodeProvider::detect() {
         providers.push(Box::new(p));
     }
     if let Some(p) = codex::CodexCliProvider::detect() {
+        providers.push(Box::new(p));
+    }
+    if let Some(p) = copilot::CopilotCliProvider::detect() {
         providers.push(Box::new(p));
     }
     if let Some(p) = gemini::GeminiCliProvider::detect() {
@@ -62,10 +63,6 @@ pub(crate) fn get_providers(agent_filter: Option<AgentKind>) -> Vec<Box<dyn Sess
 }
 
 /// Collect all tool invocations from the given providers within a time filter.
-///
-/// Iterates every provider, finds matching sessions, parses each one, and
-/// flattens the results into a single `Vec<ToolInvocation>`. Parse failures
-/// are logged as warnings to stderr and skipped.
 pub(crate) fn collect_invocations(
     providers: &[Box<dyn SessionProvider>],
     filter: &TimeFilter,

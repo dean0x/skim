@@ -199,9 +199,14 @@ fn detect_corrections(bash_invocations: &[&ToolInvocation]) -> Vec<CorrectionPai
             _ => continue,
         };
 
-        if let Some(pair) =
-            find_correction(bash_invocations, i, failed_cmd, result, &inv.session_id, inv.agent)
-        {
+        if let Some(pair) = find_correction(
+            bash_invocations,
+            i,
+            failed_cmd,
+            result,
+            &inv.session_id,
+            inv.agent,
+        ) {
             corrections.push(pair);
         }
     }

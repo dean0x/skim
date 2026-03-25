@@ -1,0 +1,11 @@
+---
+model: gpt-4o
+session_start: "2024-06-15T10:00:00Z"
+project: "/home/user/myproject"
+---
+{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "cargo test --all"}, "id": "t-001", "timestamp": "2024-06-15T10:01:00Z" }
+{ "type": "tool_result", "toolUseId": "t-001", "resultType": "success", "content": "test result: ok. 42 passed", "timestamp": "2024-06-15T10:01:05Z" }
+{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "git diff --stat"}, "id": "t-002", "timestamp": "2024-06-15T10:02:00Z" }
+{ "type": "tool_result", "toolUseId": "t-002", "resultType": "error", "content": "fatal: not a git repository", "timestamp": "2024-06-15T10:02:01Z" }
+{ "type": "tool_use", "toolName": "readFile", "toolArgs": {"path": "/home/user/myproject/src/main.rs"}, "id": "t-003", "timestamp": "2024-06-15T10:03:00Z" }
+{ "type": "tool_result", "toolUseId": "t-003", "resultType": "success", "content": "fn main() { println!(\"hello\"); }", "timestamp": "2024-06-15T10:03:01Z" }
