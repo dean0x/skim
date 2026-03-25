@@ -30,6 +30,7 @@ strip-ansi-escapes = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true }
 colored = { workspace = true }
+serde_yaml_ng = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2.0"
