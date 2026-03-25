@@ -185,6 +185,8 @@ skim - --language typescript   # Stdin (requires --language)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
 - `--no-cache` - Disable caching
 - `--show-stats` - Show token reduction stats
+- `--disable-analytics` - Disable analytics recording
+- `--cost` - Show cost savings estimates (with `skim stats`)
 
 📖 **[Full Usage Guide →](docs/usage.md)**
 
@@ -459,6 +461,28 @@ skim 'src/**/*.ts' --show-stats
 ```
 
 Uses OpenAI's tiktoken (cl100k_base for GPT-3.5/GPT-4). Output to stderr for clean piping.
+
+## Analytics
+
+Skim automatically tracks token savings from every invocation in a local SQLite database (`~/.cache/skim/analytics.db`). View your savings with the `stats` subcommand:
+
+```bash
+skim stats                       # All-time dashboard
+skim stats --since 7d            # Last 7 days
+skim stats --format json         # Machine-readable output
+skim stats --cost                # Include cost savings estimates
+skim stats --clear               # Reset analytics data
+```
+
+**Environment variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `SKIM_DISABLE_ANALYTICS` | Set to `1`, `true`, or `yes` to disable recording |
+| `SKIM_INPUT_COST_PER_MTOK` | Override $/MTok for cost estimates (default: 3.0) |
+| `SKIM_ANALYTICS_DB` | Override analytics database path |
+
+Analytics recording is fire-and-forget (non-blocking) and does not affect command performance. Data is automatically pruned after 90 days.
 
 ## Security
 

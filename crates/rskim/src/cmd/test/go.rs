@@ -95,21 +95,14 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     }
 
     // Record analytics (fire-and-forget, non-blocking)
-    if crate::analytics::is_analytics_enabled() {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        crate::analytics::record_fire_and_forget(
-            combined.clone(),
-            parsed.content().to_string(),
-            format!("skim test go {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
-            output.duration,
-            cwd,
-            Some(parsed.tier_name().to_string()),
-        );
-    }
+    crate::analytics::try_record_command(
+        combined,
+        parsed.content().to_string(),
+        format!("skim test go {}", args.join(" ")),
+        crate::analytics::CommandType::Test,
+        output.duration,
+        Some(parsed.tier_name()),
+    );
 
     Ok(exit_code)
 }

@@ -28,5 +28,15 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
     }
 
+    if version < 2 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS analytics_meta (
+                key TEXT PRIMARY KEY,
+                value INTEGER
+            );
+            PRAGMA user_version = 2;",
+        )?;
+    }
+
     Ok(())
 }

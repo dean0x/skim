@@ -80,21 +80,14 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     }
 
     // Record analytics (fire-and-forget, non-blocking)
-    if crate::analytics::is_analytics_enabled() {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        crate::analytics::record_fire_and_forget(
-            cleaned.clone(),
-            result.content().to_string(),
-            format!("skim test pytest {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
-            output.duration,
-            cwd,
-            Some(result.tier_name().to_string()),
-        );
-    }
+    crate::analytics::try_record_command(
+        cleaned,
+        result.content().to_string(),
+        format!("skim test pytest {}", args.join(" ")),
+        crate::analytics::CommandType::Test,
+        output.duration,
+        Some(result.tier_name()),
+    );
 
     // Exit code: mirror pytest's exit code if we ran it, or infer from parse
     let code = match output.exit_code {
@@ -161,8 +154,6 @@ fn build_args(user_args: &[String]) -> Vec<String> {
 
     args
 }
-
-// user_has_flag is imported from crate::cmd
 
 // ============================================================================
 // Command execution
@@ -387,22 +378,11 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
 
         // Inside "short test summary info": parse FAILED/ERROR lines
         if in_summary_info {
-            if let Some(rest) = trimmed.strip_prefix("FAILED ") {
+            let rest = trimmed
+                .strip_prefix("FAILED ")
+                .or_else(|| trimmed.strip_prefix("ERROR "));
+            if let Some(rest) = rest {
                 // Format: "FAILED tests/test_b.py::test_two - assert 1 == 2"
-                let (name, detail) = if let Some(dash_pos) = rest.find(" - ") {
-                    (
-                        rest[..dash_pos].to_string(),
-                        Some(rest[dash_pos + 3..].to_string()),
-                    )
-                } else {
-                    (rest.to_string(), None)
-                };
-                entries.push(TestEntry {
-                    name,
-                    outcome: TestOutcome::Fail,
-                    detail,
-                });
-            } else if let Some(rest) = trimmed.strip_prefix("ERROR ") {
                 let (name, detail) = if let Some(dash_pos) = rest.find(" - ") {
                     (
                         rest[..dash_pos].to_string(),

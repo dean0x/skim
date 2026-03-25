@@ -164,8 +164,6 @@ fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
 // Helpers
 // ============================================================================
 
-// user_has_flag is imported from crate::cmd
-
 /// Check whether the user has specified a limit flag (`-n`, `--max-count`).
 fn has_limit_flag(args: &[String]) -> bool {
     args.iter()
@@ -207,23 +205,16 @@ fn run_passthrough(
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Record analytics (fire-and-forget, non-blocking)
-    if crate::analytics::is_analytics_enabled() {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        let passthrough_output = output.stdout.clone();
-        crate::analytics::record_fire_and_forget(
-            passthrough_output.clone(),
-            passthrough_output,
-            format!("skim git {} {}", subcmd, args.join(" ")),
-            crate::analytics::CommandType::Git,
-            output.duration,
-            cwd,
-            None,
-        );
-    }
+    // Record analytics (fire-and-forget, non-blocking).
+    // Passthrough: raw == compressed (no transformation applied).
+    crate::analytics::try_record_command(
+        output.stdout.clone(),
+        output.stdout,
+        format!("skim git {} {}", subcmd, args.join(" ")),
+        crate::analytics::CommandType::Git,
+        output.duration,
+        None,
+    );
 
     Ok(exit_code_to_process(output.exit_code))
 }
@@ -252,7 +243,7 @@ where
     }
 
     let result = parser(&output.stdout);
-    let result_str = format!("{result}");
+    let result_str = result.to_string();
     println!("{result_str}");
 
     if show_stats {
@@ -261,21 +252,14 @@ where
     }
 
     // Record analytics (fire-and-forget, non-blocking)
-    if crate::analytics::is_analytics_enabled() {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        crate::analytics::record_fire_and_forget(
-            output.stdout.clone(),
-            result_str,
-            format!("skim git {}", subcmd_args.join(" ")),
-            crate::analytics::CommandType::Git,
-            output.duration,
-            cwd,
-            None,
-        );
-    }
+    crate::analytics::try_record_command(
+        output.stdout,
+        result_str,
+        format!("skim git {}", subcmd_args.join(" ")),
+        crate::analytics::CommandType::Git,
+        output.duration,
+        None,
+    );
 
     Ok(ExitCode::SUCCESS)
 }

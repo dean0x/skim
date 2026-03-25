@@ -134,15 +134,16 @@ pub(super) fn run_parsed_command(
         println!("{content}");
     }
 
+    // Combine stdout+stderr for stats and analytics
+    let raw_text = if output.stderr.is_empty() {
+        output.stdout.clone()
+    } else {
+        format!("{}\n{}", output.stdout, output.stderr)
+    };
+
     // Report token stats if requested
     if show_stats {
-        // Combine stdout+stderr as raw input for comparison
-        let raw = if output.stderr.is_empty() {
-            &output.stdout
-        } else {
-            &format!("{}\n{}", output.stdout, output.stderr)
-        };
-        let (orig, comp) = crate::process::count_token_pair(raw, result.content());
+        let (orig, comp) = crate::process::count_token_pair(&raw_text, result.content());
         crate::process::report_token_stats(orig, comp, "");
     }
 
@@ -165,26 +166,14 @@ pub(super) fn run_parsed_command(
     };
 
     // Record analytics (fire-and-forget, non-blocking)
-    if crate::analytics::is_analytics_enabled() {
-        let raw_text = if output.stderr.is_empty() {
-            output.stdout.clone()
-        } else {
-            format!("{}\n{}", output.stdout, output.stderr)
-        };
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        crate::analytics::record_fire_and_forget(
-            raw_text,
-            result.content().to_string(),
-            format!("skim build {program} {}", args.join(" ")),
-            crate::analytics::CommandType::Build,
-            output.duration,
-            cwd,
-            Some(result.tier_name().to_string()),
-        );
-    }
+    crate::analytics::try_record_command(
+        raw_text,
+        result.content().to_string(),
+        format!("skim build {program} {}", args.join(" ")),
+        crate::analytics::CommandType::Build,
+        output.duration,
+        Some(result.tier_name()),
+    );
 
     Ok(exit_code)
 }

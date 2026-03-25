@@ -193,27 +193,22 @@ where
         crate::process::report_token_stats(orig, comp, "");
     }
 
+    // Capture exit code before moving stdout into analytics
+    let code = output.exit_code.unwrap_or(1);
+
     // Record analytics (fire-and-forget, non-blocking)
-    if crate::analytics::is_analytics_enabled() {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        crate::analytics::record_fire_and_forget(
-            output.stdout.clone(),
-            result.content().to_string(),
-            format!("skim {program} {}", args.join(" ")),
-            command_type,
-            output.duration,
-            cwd,
-            Some(result.tier_name().to_string()),
-        );
-    }
+    crate::analytics::try_record_command(
+        output.stdout,
+        result.content().to_string(),
+        format!("skim {program} {}", args.join(" ")),
+        command_type,
+        output.duration,
+        Some(result.tier_name()),
+    );
 
     // Map exit code: preserve full 0-255 exit code granularity from the
     // underlying process. This maintains documented semantics (0=success,
     // 1=error, 2=parse error, 3=unsupported language) for downstream consumers.
-    let code = output.exit_code.unwrap_or(1);
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 

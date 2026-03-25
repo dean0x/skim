@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 
 use colored::Colorize;
 
-use crate::analytics::{AnalyticsDb, PricingModel};
+use crate::analytics::{AnalyticsDb, AnalyticsStore, PricingModel};
 use crate::cmd::session::types::parse_duration_ago;
 use crate::tokens;
 
@@ -31,8 +31,10 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let format = parse_value_flag(args, "--format");
     let since_str = parse_value_flag(args, "--since");
 
+    let db = AnalyticsDb::open_default()?;
+
     if clear {
-        return run_clear();
+        return run_clear(&db);
     }
 
     let since_ts = if let Some(s) = &since_str {
@@ -42,8 +44,6 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     } else {
         None
     };
-
-    let db = AnalyticsDb::open_default()?;
 
     if format.as_deref() == Some("json") {
         return run_json(&db, since_ts, show_cost);
@@ -102,8 +102,7 @@ fn print_help() {
 // Clear
 // ============================================================================
 
-fn run_clear() -> anyhow::Result<ExitCode> {
-    let db = AnalyticsDb::open_default()?;
+fn run_clear(db: &dyn AnalyticsStore) -> anyhow::Result<ExitCode> {
     db.clear()?;
     println!("Analytics data cleared.");
     Ok(ExitCode::SUCCESS)
@@ -113,7 +112,7 @@ fn run_clear() -> anyhow::Result<ExitCode> {
 // JSON output
 // ============================================================================
 
-fn run_json(db: &AnalyticsDb, since: Option<i64>, show_cost: bool) -> anyhow::Result<ExitCode> {
+fn run_json(db: &dyn AnalyticsStore, since: Option<i64>, show_cost: bool) -> anyhow::Result<ExitCode> {
     let summary = db.query_summary(since)?;
     let daily = db.query_daily(since)?;
     let by_command = db.query_by_command(since)?;
@@ -153,7 +152,7 @@ fn run_json(db: &AnalyticsDb, since: Option<i64>, show_cost: bool) -> anyhow::Re
 // ============================================================================
 
 fn run_dashboard(
-    db: &AnalyticsDb,
+    db: &dyn AnalyticsStore,
     since: Option<i64>,
     show_cost: bool,
     since_str: Option<&str>,
@@ -300,4 +299,186 @@ fn run_dashboard(
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analytics::*;
+
+    /// In-memory mock store for testing dashboard rendering without a real DB.
+    struct MockStore {
+        summary: AnalyticsSummary,
+        daily: Vec<DailyStats>,
+        by_command: Vec<CommandStats>,
+        by_language: Vec<LanguageStats>,
+        by_mode: Vec<ModeStats>,
+        tier_dist: TierDistribution,
+    }
+
+    impl MockStore {
+        fn empty() -> Self {
+            Self {
+                summary: AnalyticsSummary {
+                    invocations: 0,
+                    raw_tokens: 0,
+                    compressed_tokens: 0,
+                    tokens_saved: 0,
+                    avg_savings_pct: 0.0,
+                },
+                daily: vec![],
+                by_command: vec![],
+                by_language: vec![],
+                by_mode: vec![],
+                tier_dist: TierDistribution {
+                    full_pct: 0.0,
+                    degraded_pct: 0.0,
+                    passthrough_pct: 0.0,
+                },
+            }
+        }
+
+        fn with_data() -> Self {
+            Self {
+                summary: AnalyticsSummary {
+                    invocations: 42,
+                    raw_tokens: 100_000,
+                    compressed_tokens: 30_000,
+                    tokens_saved: 70_000,
+                    avg_savings_pct: 70.0,
+                },
+                daily: vec![DailyStats {
+                    date: "2026-03-24".to_string(),
+                    invocations: 42,
+                    tokens_saved: 70_000,
+                    avg_savings_pct: 70.0,
+                }],
+                by_command: vec![CommandStats {
+                    command_type: "file".to_string(),
+                    invocations: 30,
+                    tokens_saved: 50_000,
+                    avg_savings_pct: 72.0,
+                }],
+                by_language: vec![LanguageStats {
+                    language: "rust".to_string(),
+                    files: 25,
+                    tokens_saved: 40_000,
+                    avg_savings_pct: 75.0,
+                }],
+                by_mode: vec![ModeStats {
+                    mode: "structure".to_string(),
+                    files: 20,
+                    tokens_saved: 35_000,
+                    avg_savings_pct: 78.0,
+                }],
+                tier_dist: TierDistribution {
+                    full_pct: 90.0,
+                    degraded_pct: 8.0,
+                    passthrough_pct: 2.0,
+                },
+            }
+        }
+    }
+
+    impl AnalyticsStore for MockStore {
+        fn query_summary(&self, _since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
+            Ok(self.summary.clone())
+        }
+        fn query_daily(&self, _since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
+            Ok(self.daily.clone())
+        }
+        fn query_by_command(&self, _since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
+            Ok(self.by_command.clone())
+        }
+        fn query_by_language(&self, _since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>> {
+            Ok(self.by_language.clone())
+        }
+        fn query_by_mode(&self, _since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
+            Ok(self.by_mode.clone())
+        }
+        fn query_tier_distribution(&self, _since: Option<i64>) -> anyhow::Result<TierDistribution> {
+            Ok(self.tier_dist.clone())
+        }
+        fn clear(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_run_json_empty_store() {
+        let store = MockStore::empty();
+        let result = run_json(&store, None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_json_with_data() {
+        let store = MockStore::with_data();
+        let result = run_json(&store, None, false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_json_with_cost() {
+        let store = MockStore::with_data();
+        let result = run_json(&store, None, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_dashboard_empty_store() {
+        let store = MockStore::empty();
+        let result = run_dashboard(&store, None, false, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_dashboard_with_data() {
+        let store = MockStore::with_data();
+        let result = run_dashboard(&store, None, false, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_dashboard_with_cost() {
+        let store = MockStore::with_data();
+        let result = run_dashboard(&store, None, true, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_dashboard_with_since_label() {
+        let store = MockStore::with_data();
+        let result = run_dashboard(&store, None, false, Some("7d"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_clear_mock() {
+        let store = MockStore::empty();
+        let result = run_clear(&store);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_value_flag_bare() {
+        let args: Vec<String> = vec!["--format".into(), "json".into()];
+        assert_eq!(parse_value_flag(&args, "--format"), Some("json".to_string()));
+    }
+
+    #[test]
+    fn test_parse_value_flag_equals() {
+        let args: Vec<String> = vec!["--format=json".into()];
+        assert_eq!(parse_value_flag(&args, "--format"), Some("json".to_string()));
+    }
+
+    #[test]
+    fn test_parse_value_flag_missing() {
+        let args: Vec<String> = vec!["--cost".into()];
+        assert_eq!(parse_value_flag(&args, "--format"), None);
+    }
 }

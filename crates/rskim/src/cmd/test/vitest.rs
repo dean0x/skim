@@ -68,21 +68,14 @@ pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::R
     }
 
     // Record analytics (fire-and-forget, non-blocking)
-    if crate::analytics::is_analytics_enabled() {
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        crate::analytics::record_fire_and_forget(
-            raw_output,
-            result.content().to_string(),
-            format!("skim test {program} {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
-            start.elapsed(),
-            cwd,
-            Some(result.tier_name().to_string()),
-        );
-    }
+    crate::analytics::try_record_command(
+        raw_output,
+        result.content().to_string(),
+        format!("skim test {program} {}", args.join(" ")),
+        crate::analytics::CommandType::Test,
+        start.elapsed(),
+        Some(result.tier_name()),
+    );
 
     Ok(exit_code)
 }
@@ -161,8 +154,6 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
 
     Ok(combined)
 }
-
-// user_has_flag is imported from crate::cmd
 
 // ============================================================================
 // Three-tier parser
