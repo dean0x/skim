@@ -140,6 +140,9 @@ struct CorrectionPair {
     pattern_type: PatternType,
     occurrences: usize,
     sessions: Vec<String>,
+    /// Which agent produced this correction (for per-agent rules output).
+    #[allow(dead_code)] // Read in Phase 2 for per-agent filtering
+    agent: AgentKind,
 }
 
 /// Classification of how the correction differs from the original.
@@ -197,7 +200,7 @@ fn detect_corrections(bash_invocations: &[&ToolInvocation]) -> Vec<CorrectionPai
         };
 
         if let Some(pair) =
-            find_correction(bash_invocations, i, failed_cmd, result, &inv.session_id)
+            find_correction(bash_invocations, i, failed_cmd, result, &inv.session_id, inv.agent)
         {
             corrections.push(pair);
         }
@@ -213,6 +216,7 @@ fn find_correction(
     failed_cmd: &str,
     error_result: &session::ToolResult,
     session_id: &str,
+    agent: AgentKind,
 ) -> Option<CorrectionPair> {
     const LOOKAHEAD: usize = 5;
     let end = (failed_idx + 1 + LOOKAHEAD).min(invocations.len());
@@ -232,10 +236,11 @@ fn find_correction(
             return Some(CorrectionPair {
                 failed_command: failed_cmd.to_string(),
                 successful_command: candidate_cmd.to_string(),
-                error_output: error_result.content.chars().take(200).collect(),
+                error_output: sanitize_error_output(&error_result.content),
                 pattern_type: pattern,
                 occurrences: 1,
                 sessions: vec![session_id.to_string()],
+                agent,
             });
         }
     }
@@ -631,6 +636,24 @@ fn generate_rules_content(corrections: &[CorrectionPair], agent: AgentKind) -> S
     }
 
     output
+}
+
+/// Sanitize error output to prevent data leakage and prompt injection.
+///
+/// Truncates to 200 chars, escapes backticks, collapses to single line,
+/// and strips markdown heading markers — same protections as command sanitization.
+fn sanitize_error_output(error: &str) -> String {
+    let single_line: String = error
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let single_line = single_line.trim();
+
+    truncate_utf8(single_line, 200)
+        .replace('`', "'")
+        .trim_start_matches('#')
+        .trim_start()
+        .to_string()
 }
 
 /// Sanitize a command string for safe inclusion in a markdown rules file.
@@ -1148,6 +1171,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
         let pair2 = CorrectionPair {
             failed_command: "carg test".to_string(),
@@ -1156,6 +1180,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess2".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair1, pair2]);
@@ -1173,6 +1198,7 @@ mod tests {
             pattern_type: PatternType::MissingArg,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair]);
@@ -1191,6 +1217,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair]);
@@ -1206,6 +1233,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair]);
@@ -1223,6 +1251,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 3,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         }];
 
         let content = generate_rules_content(&corrections, AgentKind::ClaudeCode);
@@ -1544,6 +1573,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         }];
 
         let content = generate_rules_content(&corrections, AgentKind::Cursor);
@@ -1561,6 +1591,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         }];
 
         let content = generate_rules_content(&corrections, AgentKind::CopilotCli);
@@ -1577,6 +1608,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         }];
 
         let content = generate_rules_content(&corrections, AgentKind::CodexCli);
