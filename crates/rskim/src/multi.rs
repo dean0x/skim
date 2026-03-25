@@ -21,6 +21,7 @@ pub(crate) struct MultiFileOptions {
     pub(crate) no_header: bool,
     pub(crate) jobs: Option<usize>,
     pub(crate) no_ignore: bool,
+    pub(crate) disable_analytics: bool,
 }
 
 /// Glob metacharacters recognised by skim.
@@ -267,6 +268,34 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             Some(total_transformed_tokens),
             &suffix,
         );
+    }
+
+    // Record analytics for multi-file operations
+    if !options.disable_analytics
+        && crate::analytics::is_analytics_enabled()
+        && total_original_tokens > 0
+    {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        let mode = format!("{:?}", options.process.mode).to_lowercase();
+        crate::analytics::record_with_counts(crate::analytics::TokenSavingsRecord {
+            timestamp: crate::analytics::now_unix_secs(),
+            command_type: crate::analytics::CommandType::File,
+            original_cmd: format!("skim [multi: {} files]", success_count),
+            raw_tokens: total_original_tokens,
+            compressed_tokens: total_transformed_tokens,
+            savings_pct: crate::analytics::savings_percentage(
+                total_original_tokens,
+                total_transformed_tokens,
+            ),
+            duration_ms: 0,
+            project_path: cwd,
+            mode: Some(mode),
+            language: None, // mixed languages
+            parse_tier: None,
+        });
     }
 
     Ok(())

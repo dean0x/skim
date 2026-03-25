@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
@@ -27,7 +28,8 @@ use crate::runner::CommandRunner;
 ///
 /// `program` is the runner binary name (e.g. `"vitest"` or `"jest"`), used when
 /// stdin is not piped and we need to spawn the process directly.
-pub(crate) fn run(program: &str, args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+    let start = std::time::Instant::now();
     let raw_output = if stdin_has_data() {
         read_stdin()?
     } else {
@@ -37,7 +39,7 @@ pub(crate) fn run(program: &str, args: &[String]) -> anyhow::Result<ExitCode> {
     let result = parse(&raw_output);
 
     // Emit the result to stdout
-    match &result {
+    let exit_code = match &result {
         ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
             println!("{test_result}");
             // Emit degradation markers to stderr
@@ -45,21 +47,40 @@ pub(crate) fn run(program: &str, args: &[String]) -> anyhow::Result<ExitCode> {
             let mut handle = stderr.lock();
             let _ = result.emit_markers(&mut handle);
 
-            let exit_code = if test_result.summary.fail > 0 {
+            if test_result.summary.fail > 0 {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
-            };
-            Ok(exit_code)
+            }
         }
         ParseResult::Passthrough(raw) => {
             println!("{raw}");
             let stderr = io::stderr();
             let mut handle = stderr.lock();
             let _ = result.emit_markers(&mut handle);
-            Ok(ExitCode::FAILURE)
+            ExitCode::FAILURE
         }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
+        crate::process::report_token_stats(orig, comp, "");
     }
+
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            raw_output,
+            result.content().to_string(),
+            format!("skim test {program} {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            start.elapsed(),
+            Some(result.tier_name()),
+        );
+    }
+
+    Ok(exit_code)
 }
 
 // ============================================================================
@@ -107,10 +128,10 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     let mut final_args: Vec<String> = args.to_vec();
 
     if program == "jest" {
-        if !user_has_flag(args, "--json") {
+        if !user_has_flag(args, &["--json"]) {
             final_args.push("--json".to_string());
         }
-    } else if !user_has_flag(args, "--reporter") {
+    } else if !user_has_flag(args, &["--reporter"]) {
         final_args.push("--reporter=json".to_string());
     }
 
@@ -135,14 +156,6 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     }
 
     Ok(combined)
-}
-
-/// Check if the user has already specified a flag (with or without `=` value).
-///
-/// Matches both `--reporter=verbose` and `--reporter verbose` forms.
-fn user_has_flag(args: &[String], flag: &str) -> bool {
-    args.iter()
-        .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
 }
 
 // ============================================================================
@@ -722,7 +735,7 @@ Duration: 1.5s";
             "math".to_string(),
         ];
         assert!(
-            user_has_flag(&args, "--reporter"),
+            user_has_flag(&args, &["--reporter"]),
             "should detect --reporter=verbose"
         );
     }
@@ -731,7 +744,7 @@ Duration: 1.5s";
     fn test_flag_injection_skipped_bare_flag() {
         let args = vec!["--reporter".to_string(), "json".to_string()];
         assert!(
-            user_has_flag(&args, "--reporter"),
+            user_has_flag(&args, &["--reporter"]),
             "should detect bare --reporter"
         );
     }
@@ -740,7 +753,7 @@ Duration: 1.5s";
     fn test_flag_injection_needed_when_no_reporter() {
         let args = vec!["--run".to_string(), "math".to_string()];
         assert!(
-            !user_has_flag(&args, "--reporter"),
+            !user_has_flag(&args, &["--reporter"]),
             "should not detect --reporter when absent"
         );
     }

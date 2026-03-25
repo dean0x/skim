@@ -1,8 +1,8 @@
-# Skim 🔍
+# Skim: The Fastest, Most Comprehensive Context Optimization Tool for AI Coding Agents
 
-> **Rust based smart code reader for AI agents** - Strip implementation, keep structure
+> **Code skimming. Command rewriting. Test, build, and git output compression. Token budget cascading.** 12 languages. 14ms for 3,000 lines. Built in Rust.
 
-Skim transforms source code by removing implementation details while preserving structure, signatures, and types. Built with tree-sitter for fast, accurate multi-language parsing.
+Other tools skim code. Skim optimizes everything your AI agent touches: code, test output, build errors, git diffs, and raw commands. 14ms for 3,000 lines. 48x faster on cache hits. Nothing else comes close.
 
 [![Website](https://img.shields.io/badge/Website-skim-e87040)](https://dean0x.github.io/x/skim/)
 [![CI](https://github.com/dean0x/skim/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/skim/actions/workflows/ci.yml)
@@ -13,11 +13,9 @@ Skim transforms source code by removing implementation details while preserving 
 
 ## Why Skim?
 
-Take a typical 80-file TypeScript project: 63,000 tokens. Modern LLMs handle 200k+ context, so capacity isn't the issue.
+**Context capacity is not the bottleneck. Attention is.** Every token you send to an LLM dilutes its focus. Research consistently shows attention dilution in long contexts -- models lose track of critical details even within their window. More tokens means higher latency, degraded recall, and weaker reasoning. Past a threshold, adding context makes outputs worse. While other tools stop at code skimming, Skim optimizes the full spectrum of AI agent context: code, test output, build errors, git diffs, and commands. Faster, broader, and smarter than anything else available.
 
-But **context capacity isn't the bottleneck — attention is.** That 63k contains maybe 5k of actual signal. The rest? Implementation noise: loop bodies, error handlers, validation chains the model doesn't need to reason about architecture.
-
-**Large contexts degrade model performance.** Research consistently shows attention dilution in long contexts — models lose track of critical details even within their window. More tokens means higher latency, degraded recall, and weaker reasoning. The inverse scaling problem: past a threshold, *adding context makes outputs worse.*
+Take a typical 80-file TypeScript project: 63,000 tokens. That contains maybe 5,000 tokens of actual signal. The rest is implementation noise the model doesn't need for architectural reasoning.
 
 **80% of the time, the model doesn't need implementation details.** It doesn't care *how* you loop through users or validate emails. It needs to understand *what* your code does and how pieces connect.
 
@@ -51,15 +49,35 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 
 ## Features
 
-- 🚀 **Fast** - 14.6ms for 3000-line files (powered by tree-sitter)
-- ⚡ **Cached** - 40-50x faster on repeated processing (enabled by default)
-- 🌐 **Multi-language** - TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
-- 🎯 **Multiple modes** - Structure, signatures, types, or full code
-- 📁 **Directory support** - Process entire directories recursively (`skim src/`)
-- 📂 **Multi-file** - Glob patterns (`src/**/*.ts`) with parallel processing
-- 🤖 **Auto-detection** - Automatically detects language from file extension
-- 🔒 **DoS-resistant** - Built-in limits prevent stack overflow and memory exhaustion
-- 💧 **Streaming** - Outputs to stdout for pipe workflows
+### Code Skimming (the original, still unmatched)
+- **12 languages** including TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
+- **6 transformation modes** from full to minimal to pseudo to structure to signatures to types (15-95% reduction)
+- **14.6ms** for 3,000-line files. **48x faster** on cache hits
+- **Token budget cascading** that automatically selects the most aggressive mode fitting your budget
+- **Parallel processing** with multi-file globs via rayon
+
+### Command Rewriting (`skim init`)
+- PreToolUse hook rewrites `cat`, `head`, `tail`, `cargo test`, `npm test`, `git diff` into skim equivalents
+- Two-layer rule system with declarative prefix-swap and custom argument handlers
+- One command installs the hook for automatic, invisible context savings
+
+### Test Output Compression (`skim test`)
+- Parses and compresses output from cargo, go, vitest, jest, pytest
+- Extracts failures, assertions, pass/fail counts while stripping noise
+- Three-tier degradation from structured parse to regex fallback to passthrough
+
+### Build Output Compression (`skim build`)
+- Parses cargo, clippy, tsc build output
+- Extracts errors, warnings, and summaries
+
+### Git Output Compression (`skim git`)
+- Compresses `git status`, `git diff`, `git log`
+- Flag-aware passthrough when user already specifies compact formats
+
+### Intelligence
+- `skim discover` scans agent session history for optimization opportunities
+- `skim learn` detects CLI error-retry patterns and generates correction rules
+- Output guardrail ensures compressed output is never larger than the original
 
 ## Installation
 
@@ -165,6 +183,7 @@ skim - --language typescript   # Stdin (requires --language)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
 - `--no-cache` - Disable caching
 - `--show-stats` - Show token reduction stats
+- `--disable-analytics` - Disable analytics recording
 
 📖 **[Full Usage Guide →](docs/usage.md)**
 
@@ -440,6 +459,28 @@ skim 'src/**/*.ts' --show-stats
 
 Uses OpenAI's tiktoken (cl100k_base for GPT-3.5/GPT-4). Output to stderr for clean piping.
 
+## Analytics
+
+Skim automatically tracks token savings from every invocation in a local SQLite database (`~/.cache/skim/analytics.db`). View your savings with the `stats` subcommand:
+
+```bash
+skim stats                       # All-time dashboard
+skim stats --since 7d            # Last 7 days
+skim stats --format json         # Machine-readable output
+skim stats --cost                # Include cost savings estimates
+skim stats --clear               # Reset analytics data
+```
+
+**Environment variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `SKIM_DISABLE_ANALYTICS` | Set to `1`, `true`, or `yes` to disable recording |
+| `SKIM_INPUT_COST_PER_MTOK` | Override $/MTok for cost estimates (default: 3.0) |
+| `SKIM_ANALYTICS_DB` | Override analytics database path |
+
+Analytics recording is fire-and-forget (non-blocking) and does not affect command performance. Data is automatically pruned after 90 days.
+
 ## Security
 
 Skim includes built-in DoS protections:
@@ -557,6 +598,16 @@ Comprehensive guides for all aspects of Skim:
 - 🏗️ **[Architecture](docs/architecture.md)** - System design and technical details
 - ⏱️ **[Performance](docs/performance.md)** - Benchmarks and optimization guide
 - 🛠️ **[Development](docs/development.md)** - Contributing and adding languages
+
+## Part of the AI Development Stack
+
+| Tool | Role | What It Does |
+|------|------|-------------|
+| **Skim** | Context Optimization | Compresses code, test output, build output, and git output for optimal LLM reasoning |
+| **[DevFlow](https://github.com/dean0x/devflow)** | Quality Orchestration | 18 parallel reviewers, working memory, self-learning, production-grade lifecycle workflows |
+| **[Backbeat](https://github.com/dean0x/backbeat)** | Agent Orchestration | Orchestration at scale. Karpathy optimization loops, multi-agent pipelines, DAG dependencies, autoscaling |
+
+Skim optimizes every byte of context. DevFlow enforces production-grade quality. Backbeat scales execution across agents. No other stack covers all three.
 
 ## Contributing
 

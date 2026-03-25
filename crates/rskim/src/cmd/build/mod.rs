@@ -28,13 +28,17 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let sub = args.first().map(String::as_str);
-    let remaining = if args.len() > 1 { &args[1..] } else { &[] };
+    let (filtered_args, show_stats) = crate::cmd::extract_show_stats(args);
+
+    let (sub, remaining) = match filtered_args.split_first() {
+        Some((first, rest)) => (Some(first.as_str()), rest),
+        None => (None, [].as_slice()),
+    };
 
     match sub {
-        Some("cargo") => cargo::run(remaining),
-        Some("clippy") => cargo::run_clippy(remaining),
-        Some("tsc") => tsc::run(remaining),
+        Some("cargo") => cargo::run(remaining, show_stats),
+        Some("clippy") => cargo::run_clippy(remaining, show_stats),
+        Some("tsc") => tsc::run(remaining, show_stats),
         Some(unknown) => {
             anyhow::bail!(
                 "unknown build tool: '{unknown}'\n\n\
@@ -72,32 +76,7 @@ fn print_help() {
     println!("  skim build tsc --noEmit");
 }
 
-// ============================================================================
-// Shared helpers
-// ============================================================================
-
-/// Check whether user already passed a flag matching the given prefix.
-///
-/// Returns `true` if any arg equals `prefix` exactly or starts with
-/// `prefix=` (e.g., `--message-format=json`). This avoids false positives
-/// from hypothetical flags that share a common prefix.
-pub(super) fn user_has_flag(args: &[String], prefix: &str) -> bool {
-    args.iter()
-        .any(|a| a == prefix || a.starts_with(&format!("{prefix}=")))
-}
-
-/// Inject a flag before the `--` separator, or at the end if no separator exists.
-///
-/// This ensures injected flags (like `--message-format=json`) appear in the
-/// correct position relative to any `--` separator that separates cargo flags
-/// from rustc flags.
-pub(super) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
-    if let Some(pos) = args.iter().position(|a| a == "--") {
-        args.insert(pos, flag.to_string());
-    } else {
-        args.push(flag.to_string());
-    }
-}
+// Shared helpers (user_has_flag, inject_flag_before_separator) are in crate::cmd
 
 /// Execute an external command, parse its output, and emit the result.
 ///
@@ -118,6 +97,7 @@ pub(super) fn run_parsed_command(
     args: &[String],
     env_vars: &[(&str, &str)],
     install_hint: &str,
+    show_stats: bool,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
 ) -> anyhow::Result<ExitCode> {
     let runner = CommandRunner::new(Some(Duration::from_secs(600)));
@@ -138,6 +118,14 @@ pub(super) fn run_parsed_command(
         }
     };
 
+    // Strip ANSI escape codes before parsing. Some build tools emit color codes
+    // even with NO_COLOR=1, matching the shared run_parsed_command_with_mode pattern.
+    let output = CommandOutput {
+        stdout: crate::output::strip_ansi(&output.stdout),
+        stderr: crate::output::strip_ansi(&output.stderr),
+        ..output
+    };
+
     let result = parser(&output);
 
     // Emit markers to stderr (warnings, notices)
@@ -149,6 +137,19 @@ pub(super) fn run_parsed_command(
     let content = result.content();
     if !content.is_empty() {
         println!("{content}");
+    }
+
+    // Combine stdout+stderr for stats and analytics
+    let raw_text = if output.stderr.is_empty() {
+        output.stdout.clone()
+    } else {
+        format!("{}\n{}", output.stdout, output.stderr)
+    };
+
+    // Report token stats if requested
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw_text, result.content());
+        crate::process::report_token_stats(orig, comp, "");
     }
 
     // Determine exit code from the parsed result
@@ -168,6 +169,19 @@ pub(super) fn run_parsed_command(
             }
         }
     };
+
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            raw_text,
+            result.content().to_string(),
+            format!("skim build {program} {}", args.join(" ")),
+            crate::analytics::CommandType::Build,
+            output.duration,
+            Some(result.tier_name()),
+        );
+    }
 
     Ok(exit_code)
 }

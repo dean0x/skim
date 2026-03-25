@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use regex::Regex;
 
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::{strip_ansi, ParseResult};
 use crate::runner::{CommandOutput, CommandRunner};
@@ -40,7 +41,7 @@ use crate::runner::{CommandOutput, CommandRunner};
 /// - If stdin is not a terminal → attempt to read stdin; if empty, fall back
 ///   to running pytest (handles test harness environments where stdin is a
 ///   pipe with no data)
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     // Intercept --help/-h: show skim's pytest help, then forward to real pytest
     // so the user sees both skim's flags and pytest's own options.
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
@@ -72,6 +73,24 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let result = parse(&cleaned);
 
     emit_result(&result, &output)?;
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&cleaned, result.content());
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid .to_string() allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            cleaned,
+            result.content().to_string(),
+            format!("skim test pytest {}", args.join(" ")),
+            crate::analytics::CommandType::Test,
+            output.duration,
+            Some(result.tier_name()),
+        );
+    }
 
     // Exit code: mirror pytest's exit code if we ran it, or infer from parse
     let code = match output.exit_code {
@@ -137,17 +156,6 @@ fn build_args(user_args: &[String]) -> Vec<String> {
     }
 
     args
-}
-
-/// Check if any of the given flag prefixes appear in the user's args.
-///
-/// Matches both `--flag` and `--flag=value` forms.
-fn user_has_flag(args: &[String], prefixes: &[&str]) -> bool {
-    args.iter().any(|arg| {
-        prefixes
-            .iter()
-            .any(|prefix| arg == prefix || arg.starts_with(&format!("{prefix}=")))
-    })
 }
 
 // ============================================================================
@@ -373,22 +381,11 @@ fn tier1_parse(output: &str) -> Option<TestResult> {
 
         // Inside "short test summary info": parse FAILED/ERROR lines
         if in_summary_info {
-            if let Some(rest) = trimmed.strip_prefix("FAILED ") {
+            let rest = trimmed
+                .strip_prefix("FAILED ")
+                .or_else(|| trimmed.strip_prefix("ERROR "));
+            if let Some(rest) = rest {
                 // Format: "FAILED tests/test_b.py::test_two - assert 1 == 2"
-                let (name, detail) = if let Some(dash_pos) = rest.find(" - ") {
-                    (
-                        rest[..dash_pos].to_string(),
-                        Some(rest[dash_pos + 3..].to_string()),
-                    )
-                } else {
-                    (rest.to_string(), None)
-                };
-                entries.push(TestEntry {
-                    name,
-                    outcome: TestOutcome::Fail,
-                    detail,
-                });
-            } else if let Some(rest) = trimmed.strip_prefix("ERROR ") {
                 let (name, detail) = if let Some(dash_pos) = rest.find(" - ") {
                     (
                         rest[..dash_pos].to_string(),

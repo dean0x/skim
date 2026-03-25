@@ -9,6 +9,7 @@
 //! - Multi-file glob pattern matching
 //! - File-based caching with mtime invalidation
 
+mod analytics;
 mod cache;
 mod cascade;
 mod cmd;
@@ -58,6 +59,7 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--since"
             | "--session"
             | "--agent"
+            | "--format"
     )
 }
 
@@ -193,6 +195,7 @@ SUBCOMMANDS:\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns and generate correction rules\n  \
     rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
+    stats [--since N] [--format json]        Show token analytics dashboard\n  \
     test                                     Run test with output parsing\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
@@ -288,6 +291,10 @@ struct Args {
         help = "Cascade through modes until output fits within N tokens"
     )]
     tokens: Option<usize>,
+
+    /// Disable analytics recording for this invocation
+    #[arg(long, help = "Disable analytics recording")]
+    disable_analytics: bool,
 }
 
 /// Build the clap `Command` from `Args` for use by shell completion generation.
@@ -443,6 +450,13 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Extract --disable-analytics from raw args before routing, so it
+    // applies to both file operations and subcommands. Uses an AtomicBool
+    // instead of env::set_var to avoid unsoundness in multi-threaded context.
+    if std::env::args().any(|a| a == "--disable-analytics") {
+        analytics::force_disable_analytics();
+    }
+
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
         Invocation::FileOperation => run_file_operation().map(|()| ExitCode::SUCCESS),
         Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args),
@@ -465,6 +479,9 @@ fn run_file_operation() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
+    // --disable-analytics is handled in main() before routing via
+    // analytics::force_disable_analytics(). No env var mutation needed.
+
     if args.clear_cache {
         cache::clear_cache()?;
         println!("Cache cleared successfully");
@@ -473,6 +490,7 @@ fn run_file_operation() -> anyhow::Result<()> {
 
     let file = args
         .file
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("FILE argument is required"))?;
 
     let process_options = process::ProcessOptions {
@@ -487,9 +505,15 @@ fn run_file_operation() -> anyhow::Result<()> {
         },
     };
 
+    let disable_analytics = args.disable_analytics;
+
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
-        return process::write_result_and_stats(&result, args.show_stats);
+        process::write_result_and_stats(&result, args.show_stats)?;
+        if !disable_analytics {
+            record_file_analytics(&result, "skim -", &args);
+        }
+        return Ok(());
     }
 
     let path = PathBuf::from(&file);
@@ -499,6 +523,7 @@ fn run_file_operation() -> anyhow::Result<()> {
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,
+        disable_analytics,
     };
 
     if path.is_dir() {
@@ -510,7 +535,41 @@ fn run_file_operation() -> anyhow::Result<()> {
     }
 
     let result = process::process_file(&path, process_options)?;
-    process::write_result_and_stats(&result, args.show_stats)
+    process::write_result_and_stats(&result, args.show_stats)?;
+    if !disable_analytics {
+        record_file_analytics(&result, &format!("skim {file}"), &args);
+    }
+    Ok(())
+}
+
+/// Record token analytics for file operations (single file or stdin).
+fn record_file_analytics(result: &process::ProcessResult, cmd: &str, args: &Args) {
+    if !analytics::is_analytics_enabled() {
+        return;
+    }
+    if let (Some(raw), Some(comp)) = (result.original_tokens, result.transformed_tokens) {
+        let cwd = std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string();
+        let lang = args
+            .language
+            .map(|l| format!("{:?}", Language::from(l)).to_lowercase());
+        let mode = format!("{:?}", Mode::from(args.mode)).to_lowercase();
+        analytics::record_with_counts(analytics::TokenSavingsRecord {
+            timestamp: analytics::now_unix_secs(),
+            command_type: analytics::CommandType::File,
+            original_cmd: cmd.to_string(),
+            raw_tokens: raw,
+            compressed_tokens: comp,
+            savings_pct: analytics::savings_percentage(raw, comp),
+            duration_ms: 0,
+            project_path: cwd,
+            mode: Some(mode),
+            language: lang,
+            parse_tier: None,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -607,6 +666,7 @@ mod tests {
         "--since",
         "--session",
         "--agent",
+        "--format",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
@@ -634,6 +694,7 @@ mod tests {
             "--no-cache",
             "--clear-cache",
             "--show-stats",
+            "--disable-analytics",
         ];
 
         for flag in boolean_flags {
