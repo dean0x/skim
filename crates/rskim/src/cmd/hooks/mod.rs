@@ -8,6 +8,7 @@ pub(crate) mod codex;
 pub(crate) mod copilot;
 pub(crate) mod cursor;
 pub(crate) mod gemini;
+pub(crate) mod opencode;
 
 use super::session::AgentKind;
 

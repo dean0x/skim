@@ -9,6 +9,7 @@ mod codex;
 mod copilot;
 mod cursor;
 mod gemini;
+mod opencode;
 pub(crate) mod types;
 
 #[allow(unused_imports)] // ToolResult used by learn.rs tests
@@ -47,6 +48,9 @@ pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
         providers.push(Box::new(p));
     }
     if let Some(p) = gemini::GeminiCliProvider::detect() {
+        providers.push(Box::new(p));
+    }
+    if let Some(p) = opencode::OpenCodeProvider::detect() {
         providers.push(Box::new(p));
     }
     providers
