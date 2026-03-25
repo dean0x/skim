@@ -1011,6 +1011,13 @@ fn parse_agent_flag(args: &[String]) -> Option<AgentKind> {
 /// Hook payloads are small JSON objects; this prevents unbounded allocation.
 const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 
+/// Maximum time (in seconds) a hook invocation is allowed before self-termination.
+///
+/// Prevents slow hook processing from hanging the agent indefinitely.
+/// The hook exits cleanly (exit 0, empty stdout) on timeout — this is a
+/// passthrough, not an error. Logs a warning to hook.log for debugging.
+const HOOK_TIMEOUT_SECS: u64 = 5;
+
 /// Run as an agent PreToolUse hook.
 ///
 /// Protocol:
@@ -1027,6 +1034,15 @@ const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 /// SECURITY INVARIANT: Never sets `permissionDecision`. Only sets `updatedInput`.
 fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     use super::hooks::{protocol_for_agent, HookSupport};
+
+    // Watchdog: self-terminate after HOOK_TIMEOUT_SECS to prevent hanging the agent.
+    // Uses a detached thread so it doesn't interfere with normal processing.
+    // On timeout: log warning, exit 0 (passthrough — agent sees empty stdout).
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(HOOK_TIMEOUT_SECS));
+        super::hook_log::log_hook_warning("hook processing timed out after 5s, exiting");
+        std::process::exit(0);
+    });
 
     let agent_kind = agent.unwrap_or(AgentKind::ClaudeCode);
     let protocol = protocol_for_agent(agent_kind);
@@ -2564,5 +2580,26 @@ mod tests {
             "unknown-agent".to_string(),
         ];
         assert_eq!(parse_agent_flag(&args), None);
+    }
+
+    // ========================================================================
+    // Hook timeout constant
+    // ========================================================================
+
+    #[test]
+    fn test_hook_timeout_constant() {
+        assert_eq!(
+            HOOK_TIMEOUT_SECS, 5,
+            "Hook timeout must be 5 seconds (Claude Code hook timeout is 5s)"
+        );
+    }
+
+    #[test]
+    fn test_hook_max_stdin_bytes_constant() {
+        assert_eq!(
+            HOOK_MAX_STDIN_BYTES,
+            64 * 1024,
+            "Hook max stdin must be 64 KiB"
+        );
     }
 }
