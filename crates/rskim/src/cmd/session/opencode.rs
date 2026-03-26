@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 use super::types::*;
 use super::SessionProvider;
 
+/// Maximum SQLite database size (500 MB) to prevent unbounded reads.
+///
+/// SQLite databases are larger than JSON session files, so the limit is
+/// higher than the 100 MB used by JSON-based providers.
+const MAX_SESSION_SIZE: u64 = 500 * 1024 * 1024;
+
 /// OpenCode session provider.
 ///
 /// Reads from `.opencode/` directory containing a SQLite database with
@@ -131,6 +137,17 @@ impl SessionProvider for OpenCodeProvider {
     }
 
     fn parse_session(&self, file: &SessionFile) -> anyhow::Result<Vec<ToolInvocation>> {
+        // Guard against unbounded reads -- reject databases over 500 MB
+        let file_size = std::fs::metadata(&self.db_path)?.len();
+        if file_size > MAX_SESSION_SIZE {
+            anyhow::bail!(
+                "session database too large ({:.1} MB, limit {:.0} MB): {}",
+                file_size as f64 / (1024.0 * 1024.0),
+                MAX_SESSION_SIZE as f64 / (1024.0 * 1024.0),
+                self.db_path.display()
+            );
+        }
+
         let conn = rusqlite::Connection::open_with_flags(
             &self.db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,

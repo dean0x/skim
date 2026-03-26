@@ -276,6 +276,30 @@ fn execute_install(state: &DetectedState, install_marketplace: bool) -> anyhow::
 // Hook script generation (B7)
 // ============================================================================
 
+/// Validate that a path is safe to interpolate into a double-quoted bash string.
+///
+/// Rejects characters that can escape double-quote context or inject commands:
+/// - `"` (closes the quote)
+/// - `` ` `` (command substitution)
+/// - `$` (variable/command expansion)
+/// - `\` (escape sequences)
+/// - newline / null byte (command injection)
+///
+/// Paths from `current_exe()` on any mainstream OS should never contain these,
+/// so this guard only fires on adversarial or corrupted environments.
+fn validate_shell_safe_path(path: &str) -> anyhow::Result<()> {
+    const UNSAFE_CHARS: &[char] = &['"', '`', '$', '\\', '\n', '\0'];
+    if let Some(bad) = path.chars().find(|c| UNSAFE_CHARS.contains(c)) {
+        anyhow::bail!(
+            "binary path contains shell-unsafe character {:?}: {}\n\
+             hint: reinstall skim to a path without special characters",
+            bad,
+            path
+        );
+    }
+    Ok(())
+}
+
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     let hooks_dir = state.config_dir.join("hooks");
     let script_path = hooks_dir.join(HOOK_SCRIPT_NAME);
@@ -321,8 +345,11 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     }
 
     // Generate script content
-    // Binary path is quoted to handle spaces
-    let binary_path = state.skim_binary.display();
+    // Binary path is quoted to handle spaces, but we must also reject
+    // characters that can escape double-quote context in bash.
+    let binary_path = state.skim_binary.display().to_string();
+    validate_shell_safe_path(&binary_path)?;
+
     let agent_flag = if state.agent_cli_name == "claude-code" {
         String::new()
     } else {
@@ -541,5 +568,46 @@ mod tests {
             1,
             "running upsert twice should produce exactly one entry, not a duplicate"
         );
+    }
+
+    // ---- Shell-safe path validation (SEC-1) ----
+
+    #[test]
+    fn test_validate_shell_safe_path_normal_paths() {
+        assert!(validate_shell_safe_path("/usr/local/bin/skim").is_ok());
+        assert!(validate_shell_safe_path("/home/user/.cargo/bin/skim").is_ok());
+        assert!(validate_shell_safe_path("/path/with spaces/skim").is_ok());
+    }
+
+    #[test]
+    fn test_validate_shell_safe_path_rejects_double_quote() {
+        let result = validate_shell_safe_path("/path/with\"quote/skim");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("shell-unsafe"));
+    }
+
+    #[test]
+    fn test_validate_shell_safe_path_rejects_backtick() {
+        assert!(validate_shell_safe_path("/path/with`cmd`/skim").is_err());
+    }
+
+    #[test]
+    fn test_validate_shell_safe_path_rejects_dollar() {
+        assert!(validate_shell_safe_path("/path/$HOME/skim").is_err());
+    }
+
+    #[test]
+    fn test_validate_shell_safe_path_rejects_backslash() {
+        assert!(validate_shell_safe_path("/path/with\\escape/skim").is_err());
+    }
+
+    #[test]
+    fn test_validate_shell_safe_path_rejects_newline() {
+        assert!(validate_shell_safe_path("/path/with\nnewline/skim").is_err());
+    }
+
+    #[test]
+    fn test_validate_shell_safe_path_rejects_null_byte() {
+        assert!(validate_shell_safe_path("/path/with\0null/skim").is_err());
     }
 }
