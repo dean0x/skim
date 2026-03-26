@@ -1062,10 +1062,10 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
     // Only run for Claude Code where we have the hook script infrastructure.
     if agent_kind == AgentKind::ClaudeCode {
-        let integrity_failed = check_hook_integrity();
+        let integrity_failed = check_hook_integrity(agent_kind);
         if !integrity_failed {
             // A2: Version mismatch check — rate-limited daily warning
-            check_hook_version_mismatch();
+            check_hook_version_mismatch(agent_kind);
         }
     }
 
@@ -1153,22 +1153,20 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve the agent name from environment for per-agent stamping.
+/// Resolve the agent CLI name for per-agent stamping.
 ///
-/// Currently detects "claude-code" from the hook context. Future agents
-/// (Cursor, Windsurf) will set their own identifiers.
-fn resolve_agent_name() -> &'static str {
-    // SKIM_HOOK_VERSION is set by our hook script, which is agent-specific.
-    // For now, all hook scripts are "claude-code"; future: detect from env.
-    "claude-code"
+/// Uses the canonical `cli_name()` from `AgentKind` so that integrity and
+/// version-mismatch stamp files are written under the correct agent prefix.
+fn resolve_agent_name(agent: AgentKind) -> &'static str {
+    agent.cli_name()
 }
 
-/// Resolve the hook config directory from environment.
+/// Resolve the hook config directory for the given agent.
 ///
 /// Delegates to the canonical `resolve_config_dir_for_agent` in `init/helpers.rs`
-/// which handles `CLAUDE_CONFIG_DIR` env override and `~/.claude/` fallback.
-fn resolve_hook_config_dir() -> Option<std::path::PathBuf> {
-    super::init::resolve_config_dir_for_agent(false, AgentKind::ClaudeCode).ok()
+/// which handles agent-specific env overrides and home-directory fallback.
+fn resolve_hook_config_dir(agent: AgentKind) -> Option<std::path::PathBuf> {
+    super::init::resolve_config_dir_for_agent(false, agent).ok()
 }
 
 /// Check if a daily rate-limit stamp allows warning today.
@@ -1191,13 +1189,13 @@ fn should_warn_today(stamp_path: &std::path::Path) -> bool {
 /// Uses SHA-256 hash verification. Warnings go to log file only (NEVER
 /// stderr). Returns `true` if integrity check failed (tampered), `false`
 /// if valid, missing, or check was skipped.
-fn check_hook_integrity() -> bool {
-    let config_dir = match resolve_hook_config_dir() {
+fn check_hook_integrity(agent: AgentKind) -> bool {
+    let config_dir = match resolve_hook_config_dir(agent) {
         Some(dir) => dir,
         None => return false,
     };
 
-    let agent_name = resolve_agent_name();
+    let agent_name = resolve_agent_name(agent);
     let script_path = config_dir.join("hooks").join("skim-rewrite.sh");
 
     if !script_path.exists() {
@@ -1236,7 +1234,7 @@ fn check_hook_integrity() -> bool {
 ///
 /// If `SKIM_HOOK_VERSION` is set and differs from the compiled version,
 /// emit a daily warning to hook.log. Rate-limited via per-agent stamp file.
-fn check_hook_version_mismatch() {
+fn check_hook_version_mismatch(agent: AgentKind) {
     let hook_version = match std::env::var("SKIM_HOOK_VERSION") {
         Ok(v) => v,
         Err(_) => return, // not set — nothing to check
@@ -1247,7 +1245,7 @@ fn check_hook_version_mismatch() {
         return; // versions match
     }
 
-    let agent_name = resolve_agent_name();
+    let agent_name = resolve_agent_name(agent);
 
     // Rate limit: per-agent, warn at most once per day
     let stamp_path = match cache_dir() {
@@ -1337,19 +1335,11 @@ fn today_date_string() -> String {
 }
 
 /// Convert days since Unix epoch to (year, month, day).
+///
+/// Delegates to the canonical implementation in `hook_log` to avoid
+/// duplicating the Howard Hinnant calendar algorithm.
 fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let z = days_since_epoch + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    super::hook_log::days_to_date(days_since_epoch)
 }
 
 // ============================================================================

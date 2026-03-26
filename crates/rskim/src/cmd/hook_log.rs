@@ -85,7 +85,7 @@ fn cache_dir() -> Option<std::path::PathBuf> {
 
 /// Generate a timestamp string in ISO-8601 format (UTC approximation).
 ///
-/// Uses the same `days_to_date` algorithm from `rewrite.rs` to avoid
+/// Uses `days_to_date` (Howard Hinnant calendar algorithm) to avoid
 /// pulling in chrono. Includes hour:minute:second for log granularity.
 fn timestamp_string() -> String {
     let now = std::time::SystemTime::now();
@@ -104,7 +104,7 @@ fn timestamp_string() -> String {
 
 /// Convert days since Unix epoch to (year, month, day).
 /// Algorithm from http://howardhinnant.github.io/date_algorithms.html
-fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+pub(super) fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     let z = days_since_epoch + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
