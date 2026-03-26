@@ -673,7 +673,7 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
     match agent.rules_dir() {
         Some(dir) => {
             // Directory-based agents: auto-create file
-            let rules_dir = std::path::Path::new(dir);
+            let rules_dir = std::path::Path::new(&dir);
             let filename = agent.rules_filename();
             let rules_path = rules_dir.join(filename);
 
@@ -708,7 +708,6 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
     Ok(())
 }
 
-
 // ============================================================================
 // Output
 // ============================================================================
@@ -741,10 +740,10 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
     }
 
     let target = match agent.rules_dir() {
-        Some(dir) => {
-            let path = std::path::Path::new(dir).join(agent.rules_filename());
-            format!("{}", path.display())
-        }
+        Some(dir) => std::path::Path::new(&dir)
+            .join(agent.rules_filename())
+            .display()
+            .to_string(),
         None => format!("{} configuration", agent.display_name()),
     };
     println!("hint: run `skim learn --generate` to write corrections to {target}");

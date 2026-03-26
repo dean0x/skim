@@ -1,6 +1,6 @@
 //! Agent detection types used by the `skim agents` subcommand.
 
-use super::super::session::AgentKind;
+use crate::cmd::session::AgentKind;
 
 /// Detected agent status report.
 pub(super) struct AgentStatus {

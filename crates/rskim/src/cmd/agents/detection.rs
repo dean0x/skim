@@ -156,10 +156,9 @@ fn detect_gemini_cli(home: Option<&Path>) -> AgentStatus {
 
     // Gemini CLI supports BeforeTool/AfterTool hooks
     let hooks = if detected {
-        let settings_path = gemini_dir.as_ref().map(|p| p.join("settings.json"));
-        let has_hook = settings_path
+        let has_hook = gemini_dir
             .as_ref()
-            .and_then(|p| read_settings_guarded(p))
+            .and_then(|p| read_settings_guarded(&p.join("settings.json")))
             .is_some_and(|v| has_skim_hook_in_settings(&v));
         if has_hook {
             HookStatus::Installed {
@@ -319,21 +318,9 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
 
     let settings_path = config_dir.join("settings.json");
 
-    // Guard against unexpectedly large files (OOM prevention).
-    if let Ok(meta) = std::fs::metadata(&settings_path) {
-        if meta.len() > MAX_SETTINGS_SIZE {
-            return HookStatus::NotInstalled;
-        }
-    }
-
-    let settings = match std::fs::read_to_string(&settings_path) {
-        Ok(c) => c,
-        Err(_) => return HookStatus::NotInstalled,
-    };
-
-    let json: serde_json::Value = match serde_json::from_str(&settings) {
-        Ok(v) => v,
-        Err(_) => return HookStatus::NotInstalled,
+    let json = match read_settings_guarded(&settings_path) {
+        Some(v) => v,
+        None => return HookStatus::NotInstalled,
     };
 
     // Check if hooks.PreToolUse contains a skim-rewrite entry

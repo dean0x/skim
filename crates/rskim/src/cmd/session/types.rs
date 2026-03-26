@@ -80,14 +80,15 @@ impl AgentKind {
     /// Returns the native rules directory/file path convention for this agent.
     /// Returns None for agents that use single-file configs (user pastes content).
     #[allow(dead_code)] // Used by learn.rs per-agent rules (phase 0.5)
-    pub(crate) fn rules_dir(&self) -> Option<&'static str> {
-        match self {
-            AgentKind::ClaudeCode => Some(".claude/rules"),
-            AgentKind::Cursor => Some(".cursor/rules"),
-            AgentKind::CopilotCli => Some(".github/instructions"),
+    pub(crate) fn rules_dir(&self) -> Option<String> {
+        let subdir = match self {
+            AgentKind::ClaudeCode => "rules",
+            AgentKind::Cursor => "rules",
+            AgentKind::CopilotCli => "instructions",
             // These agents use single-file configs -- user pastes content manually
-            AgentKind::CodexCli | AgentKind::GeminiCli | AgentKind::OpenCode => None,
-        }
+            AgentKind::CodexCli | AgentKind::GeminiCli | AgentKind::OpenCode => return None,
+        };
+        Some(format!("{}/{}", self.dot_dir_name(), subdir))
     }
 
     /// The dot-directory name (e.g., ".claude", ".gemini").
@@ -134,8 +135,7 @@ impl AgentKind {
     /// `None` for agents detected via home directory.
     pub(crate) fn detect_dir(&self) -> Option<PathBuf> {
         match self {
-            AgentKind::CopilotCli => Some(PathBuf::from(".github")),
-            AgentKind::OpenCode => Some(PathBuf::from(".opencode")),
+            AgentKind::CopilotCli | AgentKind::OpenCode => Some(self.project_dir()),
             _ => None,
         }
     }
@@ -403,10 +403,16 @@ mod tests {
 
     #[test]
     fn test_agent_kind_rules_dir() {
-        assert_eq!(AgentKind::ClaudeCode.rules_dir(), Some(".claude/rules"));
-        assert_eq!(AgentKind::Cursor.rules_dir(), Some(".cursor/rules"));
         assert_eq!(
-            AgentKind::CopilotCli.rules_dir(),
+            AgentKind::ClaudeCode.rules_dir().as_deref(),
+            Some(".claude/rules")
+        );
+        assert_eq!(
+            AgentKind::Cursor.rules_dir().as_deref(),
+            Some(".cursor/rules")
+        );
+        assert_eq!(
+            AgentKind::CopilotCli.rules_dir().as_deref(),
             Some(".github/instructions")
         );
         assert_eq!(AgentKind::CodexCli.rules_dir(), None);
