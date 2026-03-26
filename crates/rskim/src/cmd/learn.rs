@@ -67,7 +67,8 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         let content = generate_rules_content(&corrections, rules_agent);
         write_rules_file(&content, rules_agent, config.dry_run)?;
     } else {
-        print_text_report(&corrections);
+        let rules_agent = config.agent_filter.unwrap_or(AgentKind::ClaudeCode);
+        print_text_report(&corrections, rules_agent);
     }
 
     Ok(ExitCode::SUCCESS)
@@ -442,7 +443,7 @@ fn truncate_utf8(s: &str, max_len: usize) -> &str {
 fn looks_like_error(content: &str) -> bool {
     let check_content = truncate_utf8(content, 1024);
 
-    let lower = check_content.to_lowercase();
+    let lower = check_content.to_ascii_lowercase();
 
     // "0 failed" is a success indicator in test output — exclude it
     let has_failed = lower.contains("failed") && !lower.contains("0 failed");
@@ -632,45 +633,35 @@ fn generate_rules_content(corrections: &[CorrectionPair], agent: AgentKind) -> S
     output
 }
 
-/// Sanitize error output to prevent data leakage and prompt injection.
+/// Sanitize a string for safe inclusion in a markdown rules file.
 ///
-/// Truncates to 200 chars, escapes backticks, collapses to single line,
-/// and strips markdown heading markers — same protections as command sanitization.
-fn sanitize_error_output(error: &str) -> String {
-    let single_line: String = error
+/// Prevents prompt injection by:
+/// - Collapsing to single line
+/// - Truncating to `max_len` chars (longer strings are not useful in rules)
+/// - Escaping backticks to prevent breaking out of inline code
+/// - Stripping markdown heading markers at line start
+fn sanitize_for_rules(s: &str, max_len: usize) -> String {
+    let single_line: String = s
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
     let single_line = single_line.trim();
 
-    truncate_utf8(single_line, 200)
+    truncate_utf8(single_line, max_len)
         .replace('`', "'")
         .trim_start_matches('#')
         .trim_start()
         .to_string()
 }
 
-/// Sanitize a command string for safe inclusion in a markdown rules file.
-///
-/// Prevents prompt injection by:
-/// - Truncating to 200 chars (commands longer than this are not useful rules)
-/// - Escaping backticks to prevent breaking out of inline code
-/// - Stripping markdown heading markers at line start
-/// - Collapsing to single line
-fn sanitize_command_for_rules(cmd: &str) -> String {
-    // Collapse to single line, trim whitespace
-    let single_line: String = cmd
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let single_line = single_line.trim();
+/// Sanitize error output to prevent data leakage and prompt injection.
+fn sanitize_error_output(error: &str) -> String {
+    sanitize_for_rules(error, 200)
+}
 
-    // Truncate to max length, then escape/strip injection vectors
-    truncate_utf8(single_line, 200)
-        .replace('`', "'")
-        .trim_start_matches('#')
-        .trim_start()
-        .to_string()
+/// Sanitize a command string for safe inclusion in a markdown rules file.
+fn sanitize_command_for_rules(cmd: &str) -> String {
+    sanitize_for_rules(cmd, 200)
 }
 
 /// Write the rules file to the appropriate agent-specific location.
@@ -731,7 +722,7 @@ fn rules_filename(agent: AgentKind) -> &'static str {
 // Output
 // ============================================================================
 
-fn print_text_report(corrections: &[CorrectionPair]) {
+fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
     println!(
         "skim learn -- {} correction{} detected\n",
         corrections.len(),
@@ -758,7 +749,14 @@ fn print_text_report(corrections: &[CorrectionPair]) {
         println!();
     }
 
-    println!("hint: run `skim learn --generate` to write corrections to agent-specific rules file");
+    let target = match agent.rules_dir() {
+        Some(dir) => {
+            let path = std::path::Path::new(dir).join(rules_filename(agent));
+            format!("{}", path.display())
+        }
+        None => format!("{} configuration", agent.display_name()),
+    };
+    println!("hint: run `skim learn --generate` to write corrections to {target}");
 }
 
 fn print_json_report(corrections: &[CorrectionPair]) -> anyhow::Result<()> {
