@@ -11,10 +11,10 @@
 //! **Layer 2 — Custom handlers**: For commands requiring argument inspection
 //! (cat, head, tail) where simple prefix matching is insufficient.
 //!
-//! **Hook mode** (`--hook`): Runs as a Claude Code PreToolUse hook. Reads JSON
-//! from stdin, extracts `tool_input.command`, rewrites if matched, and emits
-//! hook-protocol JSON. Never sets `permissionDecision` — skim only sets
-//! `updatedInput` and lets Claude Code's permission system evaluate independently.
+//! **Hook mode** (`--hook`): Runs as an agent PreToolUse hook via `HookProtocol`.
+//! Reads JSON from stdin, extracts the command field (agent-specific), rewrites if
+//! matched, and emits agent-specific hook-protocol JSON. Each agent's
+//! `format_response()` controls the response shape — see `hooks/` module.
 
 use std::io::{self, BufRead, IsTerminal, Read};
 use std::process::ExitCode;
@@ -1034,7 +1034,9 @@ const HOOK_TIMEOUT_SECS: u64 = 5;
 /// When `agent` is None or ClaudeCode, uses existing Claude Code logic.
 /// Other agents passthrough (exit 0) until Phase 2 adds implementations.
 ///
-/// SECURITY INVARIANT: Never sets `permissionDecision`. Only sets `updatedInput`.
+/// SECURITY NOTE: Response shape is agent-specific — see each agent's
+/// `format_response()` in `hooks/`. Claude Code never sets `permissionDecision`;
+/// Copilot uses `permissionDecision: deny` (deny-with-suggestion pattern).
 fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     use super::hooks::{protocol_for_agent, HookSupport};
 
@@ -1253,14 +1255,19 @@ fn check_hook_version_mismatch(agent: AgentKind) {
     }
 }
 
-/// Maximum audit log size before truncation (10 MiB).
+/// Maximum audit log size before rotation (10 MiB).
 const AUDIT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Maximum number of audit log archive files to keep.
+const AUDIT_LOG_MAX_ARCHIVES: u32 = 3;
 
 /// A3: Audit logging for hook invocations.
 ///
 /// When `SKIM_HOOK_AUDIT=1`, appends a JSON line to `~/.cache/skim/hook-audit.log`.
-/// The log is truncated when it exceeds [`AUDIT_LOG_MAX_BYTES`] to prevent unbounded
-/// disk growth. Failures are silently ignored (never break the hook).
+/// The log is rotated when it exceeds [`AUDIT_LOG_MAX_BYTES`] to prevent unbounded
+/// disk growth. Rotation uses the same shift scheme as `hook_log.rs`:
+/// delete `.3`, rename `.2` -> `.3`, `.1` -> `.2`, current -> `.1`.
+/// Failures are silently ignored (never break the hook).
 fn audit_hook(original: &str, matched: bool, rewritten: &str) {
     if std::env::var("SKIM_HOOK_AUDIT").as_deref() != Ok("1") {
         return;
@@ -1271,10 +1278,17 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
         None => return,
     };
 
-    // Truncate if the log exceeds the size limit (best-effort)
+    // Rotate if the log exceeds the size limit (best-effort).
+    // Shift scheme: delete .3, rename .2 -> .3, .1 -> .2, current -> .1.
     if let Ok(meta) = std::fs::metadata(&log_path) {
         if meta.len() >= AUDIT_LOG_MAX_BYTES {
-            let _ = std::fs::write(&log_path, b"");
+            for i in (1..AUDIT_LOG_MAX_ARCHIVES).rev() {
+                let from = audit_archive_path(&log_path, i);
+                let to = audit_archive_path(&log_path, i + 1);
+                let _ = std::fs::rename(&from, &to);
+            }
+            let archive_1 = audit_archive_path(&log_path, 1);
+            let _ = std::fs::rename(&log_path, &archive_1);
         }
     }
 
@@ -1296,6 +1310,13 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
         use std::io::Write;
         let _ = writeln!(file, "{}", entry);
     }
+}
+
+/// Build the path for an audit log archive file (e.g., `hook-audit.log.1`).
+fn audit_archive_path(log_path: &std::path::Path, index: u32) -> std::path::PathBuf {
+    let mut path = log_path.as_os_str().to_owned();
+    path.push(format!(".{index}"));
+    std::path::PathBuf::from(path)
 }
 
 /// Get the skim cache directory, respecting `$SKIM_CACHE_DIR` override and
@@ -1395,7 +1416,7 @@ fn print_help() {
     println!();
     println!("Usage: skim rewrite [--suggest] <COMMAND>...");
     println!("       echo \"cargo test\" | skim rewrite [--suggest]");
-    println!("       skim rewrite --hook  (Claude Code PreToolUse hook mode)");
+    println!("       skim rewrite --hook  (agent PreToolUse hook mode)");
     println!();
     println!("Options:");
     println!("  --suggest         Output JSON suggestion instead of plain text");
@@ -1410,8 +1431,8 @@ fn print_help() {
     println!("  echo \"pytest -v\" | skim rewrite --suggest");
     println!();
     println!("Hook mode:");
-    println!("  Reads Claude Code PreToolUse JSON from stdin, rewrites command if");
-    println!("  matched, and emits hook-protocol JSON. Never sets permissionDecision.");
+    println!("  Reads agent PreToolUse JSON from stdin, rewrites command if matched,");
+    println!("  and emits agent-specific hook-protocol JSON (see --agent flag).");
     println!();
     println!("Exit codes:");
     println!("  0  Rewrite found (or --suggest/--hook mode)");
