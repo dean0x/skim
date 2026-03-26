@@ -34,7 +34,7 @@ fn detect_claude_code(home: Option<&Path>) -> AgentStatus {
     let projects_dir = std::env::var("SKIM_PROJECTS_DIR")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| home.map(|h| h.join(".claude").join("projects")));
+        .or_else(|| home.map(|h| AgentKind::ClaudeCode.config_dir(h).join("projects")));
 
     let detected = projects_dir.as_ref().is_some_and(|p| p.is_dir());
 
@@ -50,12 +50,13 @@ fn detect_claude_code(home: Option<&Path>) -> AgentStatus {
         None
     };
 
-    let config_dir = home.map(|h| h.join(".claude"));
+    let config_dir = home.map(|h| AgentKind::ClaudeCode.config_dir(h));
     let hooks = detect_claude_hook(config_dir.as_deref());
 
+    let rules_dir = AgentKind::ClaudeCode.project_dir().join("rules");
     let rules = Some(RulesInfo {
-        path: ".claude/rules/".to_string(),
-        exists: Path::new(".claude/rules").is_dir(),
+        path: format!("{}/", rules_dir.display()),
+        exists: rules_dir.is_dir(),
     });
 
     AgentStatus {
@@ -68,18 +69,10 @@ fn detect_claude_code(home: Option<&Path>) -> AgentStatus {
 }
 
 fn detect_cursor(home: Option<&Path>) -> AgentStatus {
-    // Cursor stores state in ~/Library/Application Support/Cursor/ (macOS)
-    // or ~/.config/Cursor/ (Linux)
+    // config_dir() handles macOS vs Linux detection internally
     let state_path = home.and_then(|h| {
-        let macos_path = h.join("Library").join("Application Support").join("Cursor");
-        let linux_path = h.join(".config").join("Cursor");
-        if macos_path.is_dir() {
-            Some(macos_path)
-        } else if linux_path.is_dir() {
-            Some(linux_path)
-        } else {
-            None
-        }
+        let path = AgentKind::Cursor.config_dir(h);
+        if path.is_dir() { Some(path) } else { None }
     });
 
     let detected = state_path.is_some();
@@ -97,9 +90,10 @@ fn detect_cursor(home: Option<&Path>) -> AgentStatus {
         note: "uses built-in AI features",
     };
 
+    let rules_dir = AgentKind::Cursor.project_dir().join("rules");
     let rules = Some(RulesInfo {
-        path: ".cursor/rules/".to_string(),
-        exists: Path::new(".cursor/rules").is_dir(),
+        path: format!("{}/", rules_dir.display()),
+        exists: rules_dir.is_dir(),
     });
 
     AgentStatus {
@@ -112,7 +106,7 @@ fn detect_cursor(home: Option<&Path>) -> AgentStatus {
 }
 
 fn detect_codex_cli(home: Option<&Path>) -> AgentStatus {
-    let codex_dir = home.map(|h| h.join(".codex"));
+    let codex_dir = home.map(|h| AgentKind::CodexCli.config_dir(h));
     let detected = codex_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = if detected {
@@ -155,7 +149,7 @@ fn detect_codex_cli(home: Option<&Path>) -> AgentStatus {
 }
 
 fn detect_gemini_cli(home: Option<&Path>) -> AgentStatus {
-    let gemini_dir = home.map(|h| h.join(".gemini"));
+    let gemini_dir = home.map(|h| AgentKind::GeminiCli.config_dir(h));
     let detected = gemini_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = None; // Gemini CLI doesn't persist session files locally
@@ -202,7 +196,10 @@ const MAX_COPILOT_HOOK_ENTRIES: usize = 50;
 
 fn detect_copilot_cli() -> AgentStatus {
     // Copilot CLI uses .github/hooks/ for hook configuration
-    let hooks_dir = Path::new(".github/hooks");
+    let hooks_dir = AgentKind::CopilotCli
+        .detect_dir()
+        .expect("CopilotCli always has detect_dir")
+        .join("hooks");
     let detected = hooks_dir.is_dir();
 
     let sessions = None; // Copilot CLI sessions are cloud-managed
@@ -251,7 +248,11 @@ fn detect_opencode() -> AgentStatus {
     let opencode_dir = std::env::var("SKIM_OPENCODE_DIR")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".opencode"));
+        .unwrap_or_else(|| {
+            AgentKind::OpenCode
+                .detect_dir()
+                .expect("OpenCode always has detect_dir")
+        });
     let detected = opencode_dir.is_dir();
 
     let sessions = if detected {
