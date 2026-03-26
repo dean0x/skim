@@ -420,6 +420,8 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --since <duration>   Time window (e.g., 24h, 7d, 1w) [default: 24h]");
+    println!("                       (24h default suits recent-session exploration;");
+    println!("                        use --since 7d for broader analysis)");
     println!("  --session latest     Only scan the most recent session");
     println!("  --agent <name>       Only scan sessions from a specific agent");
     println!("  --json               Output machine-readable JSON");
@@ -445,7 +447,7 @@ pub(super) fn command() -> clap::Command {
             clap::Arg::new("since")
                 .long("since")
                 .value_name("DURATION")
-                .help("Time window (e.g., 24h, 7d, 1w)"),
+                .help("Time window (e.g., 24h, 7d, 1w) [default: 24h]"),
         )
         .arg(
             clap::Arg::new("session")

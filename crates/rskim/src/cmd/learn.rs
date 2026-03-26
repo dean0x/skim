@@ -804,6 +804,8 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --since <duration>   Time window (e.g., 24h, 7d, 1w) [default: 7d]");
+    println!("                       (7d default provides enough history for");
+    println!("                        reliable error-pattern detection)");
     println!("  --generate           Write rules to agent-specific rules file");
     println!("  --dry-run            Preview rules without writing (requires --generate)");
     println!("  --agent <name>       Only scan sessions from a specific agent");
@@ -828,7 +830,7 @@ pub(super) fn command() -> clap::Command {
             clap::Arg::new("since")
                 .long("since")
                 .value_name("DURATION")
-                .help("Time window (e.g., 24h, 7d, 1w)"),
+                .help("Time window (e.g., 24h, 7d, 1w) [default: 7d]"),
         )
         .arg(
             clap::Arg::new("generate")
