@@ -1,91 +1,15 @@
-//! `skim agents` -- display detected AI agents and their hook/session status.
-//!
-//! Scans for known AI coding agents (Claude Code, Cursor, Codex CLI, Gemini CLI,
-//! Copilot CLI) and reports their detection status, session paths, hook installation
-//! status, and rules directory presence.
+//! Agent detection logic for the `skim agents` subcommand.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
-use super::init::MAX_SETTINGS_SIZE;
-use super::session::AgentKind;
+use crate::cmd::init::MAX_SETTINGS_SIZE;
+use crate::cmd::session::AgentKind;
 
-// ============================================================================
-// Public entry points
-// ============================================================================
-
-/// Run the `skim agents` subcommand.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
-    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        print_help();
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    let json_output = args.iter().any(|a| a == "--json");
-
-    let agents = detect_all_agents();
-
-    if json_output {
-        print_json(&agents)?;
-    } else {
-        print_text(&agents);
-    }
-
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Build the clap `Command` definition for shell completions.
-pub(super) fn command() -> clap::Command {
-    clap::Command::new("agents")
-        .about("Display detected AI agents and their integration status")
-        .arg(
-            clap::Arg::new("json")
-                .long("json")
-                .action(clap::ArgAction::SetTrue)
-                .help("Output as JSON"),
-        )
-}
-
-// ============================================================================
-// Agent detection
-// ============================================================================
-
-/// Detected agent status report.
-struct AgentStatus {
-    kind: AgentKind,
-    detected: bool,
-    sessions: Option<SessionInfo>,
-    hooks: HookStatus,
-    rules: Option<RulesInfo>,
-}
-
-/// Session file information.
-struct SessionInfo {
-    path: String,
-    detail: String, // e.g., "42 files" or "1.2 GB"
-}
-
-/// Hook installation status.
-#[derive(Debug)]
-enum HookStatus {
-    Installed {
-        version: Option<String>,
-        integrity: &'static str,
-    },
-    NotInstalled,
-    NotSupported {
-        note: &'static str,
-    },
-}
-
-/// Rules directory information.
-struct RulesInfo {
-    path: String,
-    exists: bool,
-}
+use super::types::*;
+use super::util::*;
 
 /// Detect all supported agents and return their status.
-fn detect_all_agents() -> Vec<AgentStatus> {
+pub(super) fn detect_all_agents() -> Vec<AgentStatus> {
     let home = dirs::home_dir();
     AgentKind::all_supported()
         .iter()
@@ -416,7 +340,7 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|ptu| ptu.as_array())
-        .is_some_and(|entries| entries.iter().any(super::init::has_skim_hook_entry));
+        .is_some_and(|entries| entries.iter().any(crate::cmd::init::has_skim_hook_entry));
 
     if !has_hook {
         return HookStatus::NotInstalled;
@@ -441,7 +365,8 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
     let integrity = if !hook_script.is_file() {
         "missing"
     } else {
-        match super::integrity::verify_script_integrity(config_dir, "claude-code", &hook_script) {
+        match crate::cmd::integrity::verify_script_integrity(config_dir, "claude-code", &hook_script)
+        {
             Ok(true) => "ok",
             Ok(false) => "tampered",
             Err(_) => "unknown",
@@ -449,224 +374,6 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
     };
 
     HookStatus::Installed { version, integrity }
-}
-
-// ============================================================================
-// Output formatting
-// ============================================================================
-
-fn print_text(agents: &[AgentStatus]) {
-    println!("Detected agents:");
-    for agent in agents {
-        println!();
-        if agent.detected {
-            println!("  {}   detected", agent.kind.display_name());
-        } else {
-            println!("  {}   not detected", agent.kind.display_name());
-            continue;
-        }
-
-        // Sessions
-        if let Some(ref sessions) = agent.sessions {
-            println!(
-                "  {:width$}sessions: {} ({})",
-                "",
-                sessions.path,
-                sessions.detail,
-                width = agent.kind.display_name().len() + 3,
-            );
-        }
-
-        // Hooks
-        let hook_str = match &agent.hooks {
-            HookStatus::Installed { version, integrity } => {
-                let ver = version
-                    .as_deref()
-                    .map(|v| format!(", v{v}"))
-                    .unwrap_or_default();
-                format!("installed (integrity: {integrity}{ver})")
-            }
-            HookStatus::NotInstalled => "not installed".to_string(),
-            HookStatus::NotSupported { note } => format!("not supported ({note})"),
-        };
-        println!(
-            "  {:width$}hooks: {}",
-            "",
-            hook_str,
-            width = agent.kind.display_name().len() + 3,
-        );
-
-        // Rules
-        if let Some(ref rules) = agent.rules {
-            let status = if rules.exists { "found" } else { "not found" };
-            println!(
-                "  {:width$}rules: {} ({})",
-                "",
-                rules.path,
-                status,
-                width = agent.kind.display_name().len() + 3,
-            );
-        }
-    }
-}
-
-fn print_json(agents: &[AgentStatus]) -> anyhow::Result<()> {
-    let agent_values: Vec<serde_json::Value> = agents
-        .iter()
-        .map(|agent| {
-            let sessions = agent.sessions.as_ref().map(|s| {
-                serde_json::json!({
-                    "path": s.path,
-                    "detail": s.detail,
-                })
-            });
-
-            let hooks = match &agent.hooks {
-                HookStatus::Installed { version, integrity } => serde_json::json!({
-                    "status": "installed",
-                    "version": version,
-                    "integrity": integrity,
-                }),
-                HookStatus::NotInstalled => serde_json::json!({
-                    "status": "not_installed",
-                }),
-                HookStatus::NotSupported { note } => serde_json::json!({
-                    "status": "not_supported",
-                    "note": note,
-                }),
-            };
-
-            let rules = agent.rules.as_ref().map(|r| {
-                serde_json::json!({
-                    "path": r.path,
-                    "exists": r.exists,
-                })
-            });
-
-            serde_json::json!({
-                "name": agent.kind.display_name(),
-                "cli_name": agent.kind.cli_name(),
-                "detected": agent.detected,
-                "sessions": sessions,
-                "hooks": hooks,
-                "rules": rules,
-            })
-        })
-        .collect();
-
-    let output = serde_json::json!({ "agents": agent_values });
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
-fn print_help() {
-    println!("skim agents");
-    println!();
-    println!("  Display detected AI agents and their integration status");
-    println!();
-    println!("Usage: skim agents [OPTIONS]");
-    println!();
-    println!("Options:");
-    println!("  --json    Output as JSON");
-    println!("  --help    Print this help message");
-}
-
-// ============================================================================
-// Utility helpers
-// ============================================================================
-
-/// Replace home directory prefix with ~ for display.
-fn tilde_path(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(stripped) = path.strip_prefix(&home) {
-            return format!("~/{}", stripped.display());
-        }
-    }
-    path.display().to_string()
-}
-
-/// Maximum directory traversal depth for recursive helpers.
-const MAX_TRAVERSAL_DEPTH: usize = 10;
-
-/// Count files with a specific extension recursively in a directory.
-fn count_files_recursive(dir: &Path, extension: &str) -> usize {
-    count_files_recursive_inner(dir, extension, 0)
-}
-
-fn count_files_recursive_inner(dir: &Path, extension: &str, depth: usize) -> usize {
-    if depth >= MAX_TRAVERSAL_DEPTH {
-        return 0;
-    }
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                count += count_files_recursive_inner(&entry.path(), extension, depth + 1);
-            } else if ft.is_file()
-                && entry.path().extension().and_then(|e| e.to_str()) == Some(extension)
-            {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-/// Count files (non-directories) directly in a directory.
-fn count_files_in_dir(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
-        .ok()
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
-                .count()
-        })
-        .unwrap_or(0)
-}
-
-/// Get human-readable size of a directory.
-fn dir_size_human(dir: &Path) -> String {
-    let bytes = dir_size_bytes(dir);
-    if bytes >= 1_073_741_824 {
-        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
-/// Calculate total size of all files in a directory tree.
-fn dir_size_bytes(dir: &Path) -> u64 {
-    dir_size_bytes_inner(dir, 0)
-}
-
-fn dir_size_bytes_inner(dir: &Path, depth: usize) -> u64 {
-    if depth >= MAX_TRAVERSAL_DEPTH {
-        return 0;
-    }
-    let mut total: u64 = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_dir() {
-                total += dir_size_bytes_inner(&entry.path(), depth + 1);
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
 }
 
 #[cfg(test)]
@@ -677,7 +384,6 @@ mod tests {
     fn test_detect_all_agents_returns_all_kinds() {
         let agents = detect_all_agents();
         assert_eq!(agents.len(), AgentKind::all_supported().len());
-        // Verify each agent kind is represented
         for kind in AgentKind::all_supported() {
             assert!(
                 agents.iter().any(|a| a.kind == *kind),
@@ -688,159 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_run_no_crash() {
-        // Should not crash even with no agents detected
-        let result = run(&[]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_agents_help_flag() {
-        let result = run(&["--help".to_string()]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_agents_json_output_valid_json() {
-        // Verify that detect_all_agents produces data that serialises to
-        // valid JSON with the expected top-level structure.  The integration
-        // test in cli_agents.rs covers the full stdout path; here we test
-        // the internal serialisation logic directly.
-        let agents = detect_all_agents();
-        assert_eq!(
-            agents.len(),
-            AgentKind::all_supported().len(),
-            "agent count should match supported kinds"
-        );
-
-        // Exercise the same JSON building path used by print_json.
-        let result = run(&["--json".to_string()]);
-        assert!(result.is_ok());
-
-        // Verify each agent has a well-formed hooks variant.
-        for agent in &agents {
-            match &agent.hooks {
-                HookStatus::Installed { integrity, .. } => {
-                    assert!(
-                        ["ok", "tampered", "missing", "unknown"].contains(integrity),
-                        "unexpected integrity value: {integrity}"
-                    );
-                }
-                HookStatus::NotInstalled => {}
-                HookStatus::NotSupported { note } => {
-                    assert!(!note.is_empty(), "NotSupported note should not be empty");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_tilde_path_with_home() {
-        if let Some(home) = dirs::home_dir() {
-            let path = home.join("some").join("path");
-            let result = tilde_path(&path);
-            assert!(
-                result.starts_with("~/"),
-                "expected ~/ prefix, got: {result}"
-            );
-            assert!(
-                result.contains("some/path"),
-                "expected path suffix, got: {result}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_tilde_path_without_home_prefix() {
-        let path = PathBuf::from("/tmp/not-home/file");
-        let result = tilde_path(&path);
-        assert_eq!(result, "/tmp/not-home/file");
-    }
-
-    #[test]
-    fn test_count_files_recursive_empty_dir() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert_eq!(count_files_recursive(dir.path(), "jsonl"), 0);
-    }
-
-    #[test]
-    fn test_count_files_recursive_with_files() {
-        let dir = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.jsonl"), "{}").unwrap();
-        std::fs::write(dir.path().join("b.jsonl"), "{}").unwrap();
-        std::fs::write(dir.path().join("c.txt"), "hello").unwrap();
-        let sub = dir.path().join("subdir");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("d.jsonl"), "{}").unwrap();
-        assert_eq!(count_files_recursive(dir.path(), "jsonl"), 3);
-    }
-
-    #[test]
-    fn test_dir_size_human_formats() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Empty dir
-        let size = dir_size_human(dir.path());
-        assert!(
-            size.contains("bytes") || size.contains("KB"),
-            "unexpected size format: {size}"
-        );
-    }
-
-    #[test]
-    fn test_hook_status_display() {
-        // Verify HookStatus variants produce expected text
-        let installed = HookStatus::Installed {
-            version: Some("2.0.0".to_string()),
-            integrity: "ok",
-        };
-        match &installed {
-            HookStatus::Installed { version, integrity } => {
-                assert_eq!(version.as_deref(), Some("2.0.0"));
-                assert_eq!(*integrity, "ok");
-            }
-            _ => panic!("expected Installed"),
-        }
-
-        let not_supported = HookStatus::NotSupported {
-            note: "experimental",
-        };
-        match &not_supported {
-            HookStatus::NotSupported { note } => {
-                assert_eq!(*note, "experimental");
-            }
-            _ => panic!("expected NotSupported"),
-        }
-    }
-
-    #[test]
-    fn test_agent_kind_cli_name() {
-        assert_eq!(AgentKind::ClaudeCode.cli_name(), "claude-code");
-        assert_eq!(AgentKind::Cursor.cli_name(), "cursor");
-        assert_eq!(AgentKind::CodexCli.cli_name(), "codex");
-        assert_eq!(AgentKind::GeminiCli.cli_name(), "gemini");
-        assert_eq!(AgentKind::CopilotCli.cli_name(), "copilot");
-        assert_eq!(AgentKind::OpenCode.cli_name(), "opencode");
-    }
-
-    #[test]
-    fn test_agent_kind_all_supported() {
-        let all = AgentKind::all_supported();
-        assert!(all.len() >= 5, "expected at least 5 agents");
-        assert!(all.contains(&AgentKind::ClaudeCode));
-        assert!(all.contains(&AgentKind::Cursor));
-        assert!(all.contains(&AgentKind::CodexCli));
-        assert!(all.contains(&AgentKind::GeminiCli));
-        assert!(all.contains(&AgentKind::CopilotCli));
-    }
-
-    #[test]
     fn test_detect_claude_hook_integrity_ok() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path();
         let hooks_dir = config.join("hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
 
-        // Create settings.json with a skim hook entry
         let settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
@@ -855,7 +414,6 @@ mod tests {
         )
         .unwrap();
 
-        // Create hook script and hash manifest
         let script_path = hooks_dir.join("skim-rewrite.sh");
         std::fs::write(
             &script_path,
@@ -899,7 +457,6 @@ mod tests {
         )
         .unwrap();
 
-        // Create script, store hash, then modify the script (tamper)
         let script_path = hooks_dir.join("skim-rewrite.sh");
         std::fs::write(
             &script_path,
@@ -945,7 +502,6 @@ mod tests {
             serde_json::to_string_pretty(&settings).unwrap(),
         )
         .unwrap();
-        // No script file created -- should be "missing"
 
         let status = detect_claude_hook(Some(config));
         match status {
@@ -993,7 +549,6 @@ mod tests {
     fn test_read_settings_guarded_rejects_oversized() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("big.json");
-        // Write a file slightly over 10 MiB
         let data = vec![b' '; (MAX_SETTINGS_SIZE as usize) + 1];
         std::fs::write(&path, data).unwrap();
         assert!(read_settings_guarded(&path).is_none());
