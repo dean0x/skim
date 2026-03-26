@@ -26,6 +26,7 @@ use install::run_install;
 use uninstall::run_uninstall;
 
 pub(crate) use helpers::resolve_config_dir_for_agent;
+pub(crate) use state::has_skim_hook_entry;
 
 /// Run the `init` subcommand.
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {

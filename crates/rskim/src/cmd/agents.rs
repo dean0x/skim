@@ -381,20 +381,7 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|ptu| ptu.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|hook| {
-                            hook.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|cmd| cmd.contains("skim-rewrite"))
-                        })
-                    })
-            })
-        });
+        .is_some_and(|entries| entries.iter().any(super::init::has_skim_hook_entry));
 
     if !has_hook {
         return HookStatus::NotInstalled;

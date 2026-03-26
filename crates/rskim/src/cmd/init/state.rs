@@ -190,7 +190,7 @@ pub(super) fn read_settings_json(path: &Path) -> Option<serde_json::Value> {
 }
 
 /// Check if a PreToolUse entry contains a skim hook (substring match on "skim-rewrite").
-pub(super) fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
+pub(crate) fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
     entry
         .get("hooks")
         .and_then(|h| h.as_array())
