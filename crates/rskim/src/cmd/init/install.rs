@@ -206,10 +206,16 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     execute_install(&state, options.install_marketplace)?;
 
     println!();
-    println!("  Done! skim is now active in Claude Code.");
+    println!(
+        "  Done! skim is now active in {}.",
+        flags_override.agent.display_name()
+    );
     println!();
     if options.install_marketplace {
-        println!("  Next step -- install the Skimmer plugin in Claude Code:");
+        println!(
+            "  Next step -- install the Skimmer plugin in {}:",
+            flags_override.agent.display_name()
+        );
         println!("    /install skimmer@skim");
         println!();
     }
@@ -365,10 +371,24 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
 use super::helpers::{atomic_write_settings, load_or_create_settings, resolve_real_settings_path};
 
 /// Back up the settings file before modification.
+///
+/// Re-checks that `real_path` is not a symlink immediately before copying to
+/// close the TOCTOU window between `resolve_real_settings_path()` and the
+/// actual I/O. Without this guard, an attacker could replace the file with a
+/// symlink after resolution, causing `fs::copy` to overwrite an arbitrary
+/// target.
 fn backup_settings(
     config_dir: &std::path::Path,
     real_path: &std::path::Path,
 ) -> anyhow::Result<()> {
+    // Guard: reject if the path became a symlink since resolution
+    if real_path.is_symlink() {
+        anyhow::bail!(
+            "settings path became a symlink after resolution: {}\n\
+             hint: this may indicate a symlink race; please verify the path manually",
+            real_path.display()
+        );
+    }
     let backup_path = config_dir.join(SETTINGS_BACKUP);
     std::fs::copy(real_path, &backup_path)?;
     Ok(())
