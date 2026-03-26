@@ -49,7 +49,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-// ---- Config ----
+// ============================================================================
+// Config
+// ============================================================================
 
 #[derive(Debug)]
 struct DiscoverConfig {
@@ -110,7 +112,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
     Ok(config)
 }
 
-// ---- Analysis ----
+// ============================================================================
+// Analysis
+// ============================================================================
 
 struct DiscoverAnalysis {
     total_invocations: usize,
@@ -273,7 +277,9 @@ fn get_rewrite_target(tokens: &[&str]) -> Option<String> {
     }
 }
 
-// ---- Output ----
+// ============================================================================
+// Output
+// ============================================================================
 
 fn print_text_report(analysis: &DiscoverAnalysis) {
     println!("skim discover -- optimization opportunities\n");
@@ -409,7 +415,9 @@ fn print_json_report(analysis: &DiscoverAnalysis) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---- Help ----
+// ============================================================================
+// Help
+// ============================================================================
 
 fn print_help() {
     println!("skim discover");
@@ -438,7 +446,9 @@ fn print_help() {
     println!("  skim discover --json               Machine-readable output");
 }
 
-// ---- Clap command for completions ----
+// ============================================================================
+// Clap command for completions
+// ============================================================================
 
 pub(super) fn command() -> clap::Command {
     clap::Command::new("discover")

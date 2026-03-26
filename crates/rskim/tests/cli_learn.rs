@@ -268,7 +268,7 @@ fn test_learn_generate_claude_code_writes_md_file() {
 }
 
 #[test]
-fn test_learn_generate_cursor_dry_run_has_frontmatter() {
+fn test_learn_generate_default_dry_run_preview() {
     // Cursor rules format test: use Claude Code sessions (the error patterns
     // are agent-agnostic) but request Cursor format output.
     //
