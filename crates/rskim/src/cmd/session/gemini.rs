@@ -25,7 +25,7 @@ impl GeminiCliProvider {
         let gemini_dir = if let Ok(override_dir) = std::env::var("SKIM_GEMINI_DIR") {
             PathBuf::from(override_dir)
         } else {
-            dirs::home_dir()?.join(".gemini").join("tmp")
+            AgentKind::GeminiCli.config_dir(&dirs::home_dir()?).join("tmp")
         };
 
         if gemini_dir.is_dir() {

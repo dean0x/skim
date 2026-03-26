@@ -42,25 +42,19 @@ impl CursorProvider {
 
 /// Platform-specific default path for Cursor's state database.
 fn default_db_path() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        dirs::home_dir()
-            .map(|h| h.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb"))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        dirs::home_dir().map(|h| h.join(".config/Cursor/User/globalStorage/state.vscdb"))
-    }
-
     #[cfg(target_os = "windows")]
     {
+        // Windows uses a different base directory (AppData), not covered by config_dir()
         dirs::data_dir().map(|d| d.join("Cursor/User/globalStorage/state.vscdb"))
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(target_os = "windows"))]
     {
-        None
+        dirs::home_dir().map(|h| {
+            AgentKind::Cursor
+                .config_dir(&h)
+                .join("User/globalStorage/state.vscdb")
+        })
     }
 }
 

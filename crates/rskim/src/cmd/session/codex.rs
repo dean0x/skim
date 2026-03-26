@@ -6,8 +6,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::types::*;
+use super::types::{AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation, ToolResult};
 use super::SessionProvider;
+
+/// Maximum session file size: 100 MB.
+const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Codex CLI session file provider.
 pub(crate) struct CodexCliProvider {
@@ -22,7 +25,7 @@ impl CodexCliProvider {
         let sessions_dir = if let Ok(override_dir) = std::env::var("SKIM_CODEX_SESSIONS_DIR") {
             PathBuf::from(override_dir)
         } else {
-            dirs::home_dir()?.join(".codex").join("sessions")
+            AgentKind::CodexCli.config_dir(&dirs::home_dir()?).join("sessions")
         };
 
         if sessions_dir.is_dir() {
@@ -137,7 +140,6 @@ impl SessionProvider for CodexCliProvider {
 
     fn parse_session(&self, file: &SessionFile) -> anyhow::Result<Vec<ToolInvocation>> {
         // Guard against unbounded reads -- reject files over 100 MB
-        const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
         let file_size = std::fs::metadata(&file.path)?.len();
         if file_size > MAX_SESSION_SIZE {
             anyhow::bail!(

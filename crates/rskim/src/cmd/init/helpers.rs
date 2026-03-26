@@ -29,15 +29,7 @@ pub(crate) fn resolve_config_dir_for_agent(
     use crate::cmd::session::AgentKind;
 
     if project {
-        let agent_dir_name = match agent {
-            AgentKind::ClaudeCode => ".claude",
-            AgentKind::Cursor => ".cursor",
-            AgentKind::GeminiCli => ".gemini",
-            AgentKind::CopilotCli => ".github",
-            AgentKind::CodexCli => ".codex",
-            AgentKind::OpenCode => ".opencode",
-        };
-        return Ok(std::env::current_dir()?.join(agent_dir_name));
+        return Ok(std::env::current_dir()?.join(agent.dot_dir_name()));
     }
 
     // Check agent-specific env override
@@ -50,26 +42,7 @@ pub(crate) fn resolve_config_dir_for_agent(
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
-    match agent {
-        AgentKind::ClaudeCode => Ok(home.join(".claude")),
-        AgentKind::Cursor => {
-            // macOS: ~/Library/Application Support/Cursor/
-            // Linux: ~/.config/Cursor/
-            let macos_path = home
-                .join("Library")
-                .join("Application Support")
-                .join("Cursor");
-            if macos_path.is_dir() {
-                Ok(macos_path)
-            } else {
-                Ok(home.join(".config").join("Cursor"))
-            }
-        }
-        AgentKind::GeminiCli => Ok(home.join(".gemini")),
-        AgentKind::CopilotCli => Ok(home.join(".github")),
-        AgentKind::CodexCli => Ok(home.join(".codex")),
-        AgentKind::OpenCode => Ok(home.join(".opencode")),
-    }
+    Ok(agent.config_dir(&home))
 }
 
 /// Resolve a symlink to its absolute target path.
