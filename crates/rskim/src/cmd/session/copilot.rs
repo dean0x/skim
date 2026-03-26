@@ -15,7 +15,7 @@ const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Copilot CLI session file provider.
 pub(crate) struct CopilotCliProvider {
-    session_dir: PathBuf,
+    sessions_dir: PathBuf,
 }
 
 impl CopilotCliProvider {
@@ -23,14 +23,14 @@ impl CopilotCliProvider {
     ///
     /// Uses `SKIM_COPILOT_DIR` env var override for testability.
     pub(crate) fn detect() -> Option<Self> {
-        let session_dir = if let Ok(override_dir) = std::env::var("SKIM_COPILOT_DIR") {
+        let sessions_dir = if let Ok(override_dir) = std::env::var("SKIM_COPILOT_DIR") {
             PathBuf::from(override_dir)
         } else {
             dirs::home_dir()?.join(".copilot").join("session-state")
         };
 
-        if session_dir.is_dir() {
-            Some(Self { session_dir })
+        if sessions_dir.is_dir() {
+            Some(Self { sessions_dir })
         } else {
             None
         }
@@ -45,13 +45,13 @@ impl SessionProvider for CopilotCliProvider {
     fn find_sessions(&self, filter: &TimeFilter) -> anyhow::Result<Vec<SessionFile>> {
         let mut sessions = Vec::new();
 
-        // Canonicalize session_dir to prevent symlink traversal outside boundary
+        // Canonicalize sessions_dir to prevent symlink traversal outside boundary
         let canonical_root = self
-            .session_dir
+            .sessions_dir
             .canonicalize()
-            .unwrap_or_else(|_| self.session_dir.clone());
+            .unwrap_or_else(|_| self.sessions_dir.clone());
 
-        let entries = std::fs::read_dir(&self.session_dir)?;
+        let entries = std::fs::read_dir(&self.sessions_dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
 

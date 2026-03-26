@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use super::types::*;
 use super::SessionProvider;
 
+/// Maximum session file size: 100 MB.
+const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Claude Code session file provider.
 pub(crate) struct ClaudeCodeProvider {
     projects_dir: PathBuf,
@@ -119,7 +122,6 @@ impl SessionProvider for ClaudeCodeProvider {
 
     fn parse_session(&self, file: &SessionFile) -> anyhow::Result<Vec<ToolInvocation>> {
         // Guard against unbounded reads -- reject files over 100 MB
-        const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
         let file_size = std::fs::metadata(&file.path)?.len();
         if file_size > MAX_SESSION_SIZE {
             anyhow::bail!(

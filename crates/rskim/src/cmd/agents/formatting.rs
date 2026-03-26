@@ -1,6 +1,6 @@
 //! Output formatting for the `skim agents` subcommand.
 
-use super::types::*;
+use super::types::{AgentStatus, HookStatus};
 
 pub(super) fn print_text(agents: &[AgentStatus]) {
     println!("Detected agents:");
