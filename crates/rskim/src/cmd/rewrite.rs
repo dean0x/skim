@@ -1165,12 +1165,10 @@ fn resolve_agent_name() -> &'static str {
 
 /// Resolve the hook config directory from environment.
 ///
-/// Checks `CLAUDE_CONFIG_DIR` first, then falls back to `~/.claude/`.
+/// Delegates to the canonical `resolve_config_dir_for_agent` in `init/helpers.rs`
+/// which handles `CLAUDE_CONFIG_DIR` env override and `~/.claude/` fallback.
 fn resolve_hook_config_dir() -> Option<std::path::PathBuf> {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    dirs::home_dir().map(|h| h.join(".claude"))
+    super::init::resolve_config_dir_for_agent(false, AgentKind::ClaudeCode).ok()
 }
 
 /// Check if a daily rate-limit stamp allows warning today.

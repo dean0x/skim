@@ -22,7 +22,7 @@ pub(super) const SETTINGS_BACKUP: &str = "settings.json.bak";
 /// For Gemini: `~/.gemini/`
 /// For Copilot: `~/.github/`
 /// For others: falls back to `~/.{agent_cli_name}/`
-pub(super) fn resolve_config_dir_for_agent(
+pub(crate) fn resolve_config_dir_for_agent(
     project: bool,
     agent: crate::cmd::session::AgentKind,
 ) -> anyhow::Result<PathBuf> {

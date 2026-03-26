@@ -25,6 +25,8 @@ use helpers::print_help;
 use install::run_install;
 use uninstall::run_uninstall;
 
+pub(crate) use helpers::resolve_config_dir_for_agent;
+
 /// Run the `init` subcommand.
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     // Unix-only guard
