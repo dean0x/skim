@@ -33,13 +33,68 @@ impl CodexCliProvider {
     }
 }
 
+/// Depth of the Codex YYYY/MM/DD/files directory structure.
+const CODEX_DIR_DEPTH: usize = 4;
+
+/// Recursively collect `rollout-*.jsonl` files from the YYYY/MM/DD directory structure.
+///
+/// At `depth < CODEX_DIR_DEPTH`, recurses into subdirectories.
+/// At `depth == CODEX_DIR_DEPTH`, collects matching files with symlink guard.
+fn collect_codex_files(
+    dir: &std::path::Path,
+    depth: usize,
+    canonical_root: &std::path::Path,
+) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if depth < CODEX_DIR_DEPTH {
+            // Intermediate level — recurse into subdirectories only
+            if path.is_dir() {
+                results.extend(collect_codex_files(&path, depth + 1, canonical_root));
+            }
+        } else {
+            // Leaf level — collect rollout-*.jsonl files
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+            if !file_name.starts_with("rollout-")
+                || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+
+            // Symlink traversal guard
+            if let Ok(canonical_path) = path.canonicalize() {
+                if !canonical_path.starts_with(canonical_root) {
+                    continue;
+                }
+            }
+
+            if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                results.push((path, modified));
+            }
+        }
+    }
+    results
+}
+
 impl SessionProvider for CodexCliProvider {
     fn agent_kind(&self) -> AgentKind {
         AgentKind::CodexCli
     }
 
     fn find_sessions(&self, filter: &TimeFilter) -> anyhow::Result<Vec<SessionFile>> {
-        let mut sessions = Vec::new();
+        if !self.sessions_dir.is_dir() {
+            return Ok(Vec::new());
+        }
 
         // Canonicalize sessions_dir to prevent symlink traversal outside boundary
         let canonical_root = self
@@ -47,86 +102,27 @@ impl SessionProvider for CodexCliProvider {
             .canonicalize()
             .unwrap_or_else(|_| self.sessions_dir.clone());
 
-        // Walk YYYY/MM/DD directory structure
-        let years = match std::fs::read_dir(&self.sessions_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Ok(sessions),
-        };
+        // Collect all matching files from YYYY/MM/DD structure
+        let files = collect_codex_files(&self.sessions_dir, 1, &canonical_root);
 
-        for year_entry in years.flatten() {
-            if !year_entry.path().is_dir() {
-                continue;
-            }
-            let months = match std::fs::read_dir(year_entry.path()) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            for month_entry in months.flatten() {
-                if !month_entry.path().is_dir() {
-                    continue;
+        // Filter by time, map to SessionFile, sort, truncate
+        let mut sessions: Vec<SessionFile> = files
+            .into_iter()
+            .filter(|(_, modified)| filter.since.is_none_or(|since| *modified >= since))
+            .map(|(path, modified)| {
+                let session_id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                SessionFile {
+                    path,
+                    modified,
+                    agent: AgentKind::CodexCli,
+                    session_id,
                 }
-                let days = match std::fs::read_dir(month_entry.path()) {
-                    Ok(entries) => entries,
-                    Err(_) => continue,
-                };
-                for day_entry in days.flatten() {
-                    if !day_entry.path().is_dir() {
-                        continue;
-                    }
-                    let files = match std::fs::read_dir(day_entry.path()) {
-                        Ok(entries) => entries,
-                        Err(_) => continue,
-                    };
-                    for file_entry in files.flatten() {
-                        let path = file_entry.path();
-
-                        // Only match rollout-*.jsonl files
-                        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                            Some(name) => name.to_string(),
-                            None => continue,
-                        };
-                        if !file_name.starts_with("rollout-")
-                            || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
-                        {
-                            continue;
-                        }
-
-                        // Symlink traversal guard
-                        if let Ok(canonical_path) = path.canonicalize() {
-                            if !canonical_path.starts_with(&canonical_root) {
-                                // Silently skip -- no stderr in hook context
-                                continue;
-                            }
-                        }
-
-                        let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
-                            Ok(t) => t,
-                            Err(_) => continue, // Graceful degradation
-                        };
-
-                        // Apply time filter
-                        if let Some(since) = filter.since {
-                            if modified < since {
-                                continue;
-                            }
-                        }
-
-                        let session_id = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-
-                        sessions.push(SessionFile {
-                            path,
-                            modified,
-                            agent: AgentKind::CodexCli,
-                            session_id,
-                        });
-                    }
-                }
-            }
-        }
+            })
+            .collect();
 
         // Sort by modification time (newest first)
         sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -447,5 +443,39 @@ mod tests {
         // Result should NOT be correlated since the decision had no tool_decision_id
         // (empty string key won't match "td-001")
         assert!(invocations[0].result.is_none());
+    }
+
+    // ========================================================================
+    // collect_codex_files recursive helper (TD-1)
+    // ========================================================================
+
+    #[test]
+    fn test_collect_codex_files_date_structure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Canonicalize to handle macOS /var -> /private/var symlink
+        let root = dir.path().canonicalize().unwrap();
+        // Create YYYY/MM/DD structure with a rollout file
+        let day_dir = root.join("2026").join("03").join("26");
+        std::fs::create_dir_all(&day_dir).unwrap();
+        std::fs::write(day_dir.join("rollout-abc.jsonl"), "{}").unwrap();
+        // Also add a non-matching file
+        std::fs::write(day_dir.join("other.txt"), "nope").unwrap();
+
+        let files = collect_codex_files(&root, 1, &root);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.ends_with("rollout-abc.jsonl"));
+    }
+
+    #[test]
+    fn test_collect_codex_files_ignores_wrong_depth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // File at depth 2 (YYYY/rollout-*.jsonl) — should NOT be collected
+        let year_dir = root.join("2026");
+        std::fs::create_dir_all(&year_dir).unwrap();
+        std::fs::write(year_dir.join("rollout-orphan.jsonl"), "{}").unwrap();
+
+        let files = collect_codex_files(&root, 1, &root);
+        assert!(files.is_empty(), "files at wrong depth should be ignored");
     }
 }
