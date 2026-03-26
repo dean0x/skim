@@ -11,9 +11,10 @@
 //! UPGRADE PATH: When Copilot ships working `allow` + `updatedInput`,
 //! change `format_response` only (one-file change).
 
-use super::{HookInput, HookProtocol, HookSupport, InstallOpts, InstallResult, UninstallOpts};
+use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
+/// Copilot CLI hook implementation (preToolUse hooks, deny-with-suggestion).
 pub(crate) struct CopilotCliHook;
 
 impl HookProtocol for CopilotCliHook {
@@ -26,12 +27,7 @@ impl HookProtocol for CopilotCliHook {
     }
 
     fn parse_input(&self, json: &serde_json::Value) -> Option<HookInput> {
-        let command = json
-            .get("tool_input")
-            .and_then(|ti| ti.get("command"))
-            .and_then(|c| c.as_str())?
-            .to_string();
-        Some(HookInput { command })
+        super::parse_tool_input_command(json)
     }
 
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
@@ -45,6 +41,12 @@ impl HookProtocol for CopilotCliHook {
     }
 
     fn generate_script(&self, binary_path: &str, version: &str) -> String {
+        debug_assert!(
+            version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+            "version contains unsafe characters for shell interpolation: {version}"
+        );
         format!(
             "#!/usr/bin/env bash\n\
              # skim-hook v{version}\n\
@@ -52,19 +54,6 @@ impl HookProtocol for CopilotCliHook {
              export SKIM_HOOK_VERSION=\"{version}\"\n\
              exec \"{binary_path}\" rewrite --hook --agent copilot\n"
         )
-    }
-
-    fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // Stub: init module handles installation via resolve_config_dir_for_agent()
-        Ok(InstallResult {
-            script_path: None,
-            config_patched: false,
-        })
-    }
-
-    fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
-        // Stub: init module handles uninstallation via resolve_config_dir_for_agent()
-        Ok(())
     }
 }
 
@@ -75,6 +64,7 @@ impl HookProtocol for CopilotCliHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::{InstallOpts, UninstallOpts};
 
     fn hook() -> CopilotCliHook {
         CopilotCliHook
@@ -170,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_install_stub() {
+    fn test_copilot_install_default() {
         let opts = InstallOpts {
             binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
@@ -184,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_uninstall_stub() {
+    fn test_copilot_uninstall_default() {
         let opts = UninstallOpts {
             config_dir: "/tmp/.copilot".into(),
             force: false,

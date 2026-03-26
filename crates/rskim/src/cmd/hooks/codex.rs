@@ -3,9 +3,10 @@
 //! Codex CLI has no PreToolUse hook equivalent. This implementation
 //! returns awareness-only support with no-op methods for all hook operations.
 
-use super::{HookInput, HookProtocol, HookSupport, InstallOpts, InstallResult, UninstallOpts};
+use super::{HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
+/// Codex CLI awareness-only hook (no PreToolUse equivalent).
 pub(crate) struct CodexCliHook;
 
 impl HookProtocol for CodexCliHook {
@@ -17,7 +18,7 @@ impl HookProtocol for CodexCliHook {
         HookSupport::AwarenessOnly
     }
 
-    fn parse_input(&self, _json: &serde_json::Value) -> Option<HookInput> {
+    fn parse_input(&self, _json: &serde_json::Value) -> Option<super::HookInput> {
         None // Not applicable -- awareness only
     }
 
@@ -28,19 +29,6 @@ impl HookProtocol for CodexCliHook {
     fn generate_script(&self, _binary_path: &str, _version: &str) -> String {
         String::new() // Not applicable -- awareness only
     }
-
-    fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // No-op: awareness-only agent has no hook to install
-        Ok(InstallResult {
-            script_path: None,
-            config_patched: false,
-        })
-    }
-
-    fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
-        // No-op: awareness-only agent has no hook to uninstall
-        Ok(())
-    }
 }
 
 // ============================================================================
@@ -50,6 +38,7 @@ impl HookProtocol for CodexCliHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::{InstallOpts, UninstallOpts};
 
     fn hook() -> CodexCliHook {
         CodexCliHook

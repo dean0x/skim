@@ -4,7 +4,7 @@
 //! This implementation provides awareness-only support: it registers the agent
 //! as recognized but does not intercept tool calls.
 
-use super::{HookInput, HookProtocol, HookSupport, InstallOpts, InstallResult, UninstallOpts};
+use super::{HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
 /// OpenCode awareness-only hook.
@@ -23,7 +23,7 @@ impl HookProtocol for OpenCodeHook {
         HookSupport::AwarenessOnly
     }
 
-    fn parse_input(&self, _json: &serde_json::Value) -> Option<HookInput> {
+    fn parse_input(&self, _json: &serde_json::Value) -> Option<super::HookInput> {
         None
     }
 
@@ -34,19 +34,6 @@ impl HookProtocol for OpenCodeHook {
     fn generate_script(&self, _binary_path: &str, _version: &str) -> String {
         String::new()
     }
-
-    fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // No-op: awareness-only agent has no hook to install
-        Ok(InstallResult {
-            script_path: None,
-            config_patched: false,
-        })
-    }
-
-    fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
-        // No-op: awareness-only agent has no hook to uninstall
-        Ok(())
-    }
 }
 
 // ============================================================================
@@ -56,6 +43,7 @@ impl HookProtocol for OpenCodeHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::{InstallOpts, UninstallOpts};
 
     fn hook() -> OpenCodeHook {
         OpenCodeHook

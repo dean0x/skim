@@ -11,7 +11,7 @@
 //! SECURITY: Zero stderr in hook mode (GRANITE #361 lesson).
 //! SECURITY: Absolute binary path in generated scripts (GRANITE #685 lesson).
 
-use super::{HookInput, HookProtocol, HookSupport, InstallOpts, InstallResult, UninstallOpts};
+use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
 /// Gemini CLI hook implementation.
@@ -27,12 +27,7 @@ impl HookProtocol for GeminiCliHook {
     }
 
     fn parse_input(&self, json: &serde_json::Value) -> Option<HookInput> {
-        let command = json
-            .get("tool_input")
-            .and_then(|ti| ti.get("command"))
-            .and_then(|c| c.as_str())?
-            .to_string();
-        Some(HookInput { command })
+        super::parse_tool_input_command(json)
     }
 
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
@@ -48,6 +43,12 @@ impl HookProtocol for GeminiCliHook {
     }
 
     fn generate_script(&self, binary_path: &str, version: &str) -> String {
+        debug_assert!(
+            version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+            "version contains unsafe characters for shell interpolation: {version}"
+        );
         format!(
             "#!/usr/bin/env bash\n\
              # skim-hook v{version}\n\
@@ -56,24 +57,16 @@ impl HookProtocol for GeminiCliHook {
              exec \"{binary_path}\" rewrite --hook --agent gemini\n"
         )
     }
-
-    fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // Stub: init module handles installation via resolve_config_dir_for_agent()
-        Ok(InstallResult {
-            script_path: None,
-            config_patched: false,
-        })
-    }
-
-    fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
-        // Stub: init module handles uninstallation via resolve_config_dir_for_agent()
-        Ok(())
-    }
 }
+
+// ============================================================================
+// Unit tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::{InstallOpts, UninstallOpts};
 
     fn hook() -> GeminiCliHook {
         GeminiCliHook
@@ -192,5 +185,28 @@ mod tests {
             script.starts_with("#!/usr/bin/env bash"),
             "script must start with bash shebang, got: {script}"
         );
+    }
+
+    #[test]
+    fn test_gemini_install_default() {
+        let opts = InstallOpts {
+            binary_path: "/usr/local/bin/skim".into(),
+            version: "1.0.0".into(),
+            config_dir: "/tmp/.gemini".into(),
+            project_scope: false,
+            dry_run: false,
+        };
+        let result = hook().install(&opts).unwrap();
+        assert!(result.script_path.is_none());
+        assert!(!result.config_patched);
+    }
+
+    #[test]
+    fn test_gemini_uninstall_default() {
+        let opts = UninstallOpts {
+            config_dir: "/tmp/.gemini".into(),
+            force: false,
+        };
+        assert!(hook().uninstall(&opts).is_ok());
     }
 }

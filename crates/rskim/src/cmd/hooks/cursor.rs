@@ -5,9 +5,10 @@
 //! tool_input like Claude Code), rewrites if matched, and responds
 //! with `{ "permission": "allow", "updated_input": { "command": ... } }`.
 
-use super::{HookInput, HookProtocol, HookSupport, InstallOpts, InstallResult, UninstallOpts};
+use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
+/// Cursor hook implementation (`beforeShellExecution` via `.cursor/hooks.json`).
 pub(crate) struct CursorHook;
 
 impl HookProtocol for CursorHook {
@@ -38,6 +39,12 @@ impl HookProtocol for CursorHook {
     }
 
     fn generate_script(&self, binary_path: &str, version: &str) -> String {
+        debug_assert!(
+            version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+            "version contains unsafe characters for shell interpolation: {version}"
+        );
         format!(
             "#!/usr/bin/env bash\n\
              # skim-hook v{version}\n\
@@ -45,19 +52,6 @@ impl HookProtocol for CursorHook {
              export SKIM_HOOK_VERSION=\"{version}\"\n\
              exec \"{binary_path}\" rewrite --hook --agent cursor\n"
         )
-    }
-
-    fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
-        // Stub: init module handles installation via resolve_config_dir_for_agent()
-        Ok(InstallResult {
-            script_path: None,
-            config_patched: false,
-        })
-    }
-
-    fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
-        // Stub: init module handles uninstallation via resolve_config_dir_for_agent()
-        Ok(())
     }
 }
 
@@ -68,6 +62,7 @@ impl HookProtocol for CursorHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::{InstallOpts, UninstallOpts};
 
     fn hook() -> CursorHook {
         CursorHook
@@ -171,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_install_stub() {
+    fn test_cursor_install_default() {
         let opts = InstallOpts {
             binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
@@ -185,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_uninstall_stub() {
+    fn test_cursor_uninstall_default() {
         let opts = UninstallOpts {
             config_dir: "/tmp/.cursor".into(),
             force: false,

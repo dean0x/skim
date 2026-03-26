@@ -61,15 +61,44 @@ pub(crate) struct UninstallOpts {
 /// - Response formatting (rewritten command -> agent JSON)
 /// - Script generation (binary path -> shell script)
 /// - Installation/uninstallation
-#[allow(dead_code)] // agent_kind/generate_script/install/uninstall used in tests only; parse_input/format_response/hook_support used in production
 pub(crate) trait HookProtocol {
+    #[allow(dead_code)] // Used in tests only
     fn agent_kind(&self) -> AgentKind;
+
     fn hook_support(&self) -> HookSupport;
     fn parse_input(&self, json: &serde_json::Value) -> Option<HookInput>;
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value;
+
+    #[allow(dead_code)] // Used in tests only
     fn generate_script(&self, binary_path: &str, version: &str) -> String;
-    fn install(&self, opts: &InstallOpts) -> anyhow::Result<InstallResult>;
-    fn uninstall(&self, opts: &UninstallOpts) -> anyhow::Result<()>;
+
+    /// Default no-op install. Override for agents with real hook installation.
+    #[allow(dead_code)] // Used in tests only
+    fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
+        Ok(InstallResult {
+            script_path: None,
+            config_patched: false,
+        })
+    }
+
+    /// Default no-op uninstall. Override for agents with real hook removal.
+    #[allow(dead_code)] // Used in tests only
+    fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Shared parser for agents whose hook JSON nests the command under `tool_input.command`.
+///
+/// Used by Claude Code, Copilot CLI, and Gemini CLI. Cursor differs (top-level `command`).
+/// Codex and OpenCode are awareness-only and return `None` from `parse_input` directly.
+pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookInput> {
+    let command = json
+        .get("tool_input")
+        .and_then(|ti| ti.get("command"))
+        .and_then(|c| c.as_str())?
+        .to_string();
+    Some(HookInput { command })
 }
 
 /// Factory: create the appropriate HookProtocol implementation for a given agent.
@@ -105,5 +134,43 @@ mod tests {
         };
         let cloned = input.clone();
         assert_eq!(cloned.command, "cargo test");
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_valid() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "command": "cargo test --nocapture"
+            }
+        });
+        let result = parse_tool_input_command(&json);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().command, "cargo test --nocapture");
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_missing_tool_input() {
+        let json = serde_json::json!({});
+        assert!(parse_tool_input_command(&json).is_none());
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_missing_command() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "file_path": "/tmp/test.rs"
+            }
+        });
+        assert!(parse_tool_input_command(&json).is_none());
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_non_string() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "command": 42
+            }
+        });
+        assert!(parse_tool_input_command(&json).is_none());
     }
 }
