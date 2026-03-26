@@ -1173,6 +1173,21 @@ fn resolve_hook_config_dir() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
 }
 
+/// Check if a daily rate-limit stamp allows warning today.
+/// Returns `true` if caller should emit warning, `false` if already warned today.
+/// Updates the stamp file as a side effect.
+fn should_warn_today(stamp_path: &std::path::Path) -> bool {
+    let today = today_date_string();
+    if let Ok(contents) = std::fs::read_to_string(stamp_path) {
+        if contents.trim() == today {
+            return false;
+        }
+    }
+    let _ = std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
+    let _ = std::fs::write(stamp_path, &today);
+    true
+}
+
 /// #57: Check hook script integrity.
 ///
 /// Uses SHA-256 hash verification. Warnings go to log file only (NEVER
@@ -1207,22 +1222,12 @@ fn check_hook_integrity() -> bool {
                 }
             };
 
-            let today = today_date_string();
-            if let Ok(contents) = std::fs::read_to_string(&stamp_path) {
-                if contents.trim() == today {
-                    return true; // Already warned today
-                }
+            if should_warn_today(&stamp_path) {
+                super::hook_log::log_hook_warning(&format!(
+                    "hook script tampered: {} (run `skim init --yes` to reinstall)",
+                    script_path.display()
+                ));
             }
-
-            super::hook_log::log_hook_warning(&format!(
-                "hook script tampered: {} (run `skim init --yes` to reinstall)",
-                script_path.display()
-            ));
-
-            // Update stamp (best-effort)
-            let _ =
-                std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
-            let _ = std::fs::write(&stamp_path, &today);
             true
         }
         Err(_) => false, // Script unreadable — don't block the hook
@@ -1252,23 +1257,12 @@ fn check_hook_version_mismatch() {
         None => return,
     };
 
-    let today = today_date_string();
-
-    // Check if we already warned today
-    if let Ok(contents) = std::fs::read_to_string(&stamp_path) {
-        if contents.trim() == today {
-            return; // already warned today
-        }
+    if should_warn_today(&stamp_path) {
+        // Emit warning to hook log (NEVER stderr -- GRANITE #361 Bug 3)
+        super::hook_log::log_hook_warning(&format!(
+            "version mismatch: hook script v{hook_version}, binary v{compiled_version} (run `skim init --yes` to update)"
+        ));
     }
-
-    // Emit warning to hook log (NEVER stderr -- GRANITE #361 Bug 3)
-    super::hook_log::log_hook_warning(&format!(
-        "version mismatch: hook script v{hook_version}, binary v{compiled_version} (run `skim init --yes` to update)"
-    ));
-
-    // Update stamp file (best-effort)
-    let _ = std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
-    let _ = std::fs::write(&stamp_path, &today);
 }
 
 /// Maximum audit log size before truncation (10 MiB).
@@ -2607,6 +2601,49 @@ mod tests {
             HOOK_MAX_STDIN_BYTES,
             64 * 1024,
             "Hook max stdin must be 64 KiB"
+        );
+    }
+
+    // ========================================================================
+    // should_warn_today rate-limit helper (TD-4)
+    // ========================================================================
+
+    #[test]
+    fn test_should_warn_today_no_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stamp = dir.path().join("stamp");
+        assert!(
+            should_warn_today(&stamp),
+            "should warn when no stamp exists"
+        );
+        assert!(stamp.exists(), "stamp file should be created");
+    }
+
+    #[test]
+    fn test_should_warn_today_same_day() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stamp = dir.path().join("stamp");
+        std::fs::write(&stamp, today_date_string()).unwrap();
+        assert!(
+            !should_warn_today(&stamp),
+            "should not warn when stamp is today"
+        );
+    }
+
+    #[test]
+    fn test_should_warn_today_stale_stamp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stamp = dir.path().join("stamp");
+        std::fs::write(&stamp, "2020-01-01").unwrap();
+        assert!(
+            should_warn_today(&stamp),
+            "should warn when stamp is from a different day"
+        );
+        let updated = std::fs::read_to_string(&stamp).unwrap();
+        assert_eq!(
+            updated.trim(),
+            today_date_string(),
+            "stamp should be updated to today"
         );
     }
 }
