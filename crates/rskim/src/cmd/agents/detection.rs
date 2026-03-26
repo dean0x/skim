@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::cmd::init::MAX_SETTINGS_SIZE;
 use crate::cmd::session::AgentKind;
 
-use super::types::*;
-use super::util::*;
+use super::types::{AgentStatus, HookStatus, RulesInfo, SessionInfo};
+use super::util::{count_files_in_dir, count_files_recursive, dir_size_human, tilde_path};
 
 /// Detect all supported agents and return their status.
 pub(super) fn detect_all_agents() -> Vec<AgentStatus> {
@@ -85,10 +85,9 @@ fn detect_cursor(home: Option<&Path>) -> AgentStatus {
         }
     });
 
-    // Cursor uses its own hook system (not skim hooks)
-    let hooks = HookStatus::NotSupported {
-        note: "uses built-in AI features",
-    };
+    // Cursor supports skim hooks via `skim init --agent cursor`
+    // (same PreToolUse + script pattern as Claude Code)
+    let hooks = detect_claude_hook(state_path.as_deref());
 
     let rules_dir = AgentKind::Cursor.project_dir().join("rules");
     let rules = Some(RulesInfo {
@@ -195,10 +194,7 @@ const MAX_COPILOT_HOOK_ENTRIES: usize = 50;
 
 fn detect_copilot_cli() -> AgentStatus {
     // Copilot CLI uses .github/hooks/ for hook configuration
-    let hooks_dir = AgentKind::CopilotCli
-        .detect_dir()
-        .expect("CopilotCli always has detect_dir")
-        .join("hooks");
+    let hooks_dir = AgentKind::CopilotCli.project_dir().join("hooks");
     let detected = hooks_dir.is_dir();
 
     let sessions = None; // Copilot CLI sessions are cloud-managed
@@ -247,11 +243,7 @@ fn detect_opencode() -> AgentStatus {
     let opencode_dir = std::env::var("SKIM_OPENCODE_DIR")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            AgentKind::OpenCode
-                .detect_dir()
-                .expect("OpenCode always has detect_dir")
-        });
+        .unwrap_or_else(|| AgentKind::OpenCode.project_dir());
     let detected = opencode_dir.is_dir();
 
     let sessions = if detected {
