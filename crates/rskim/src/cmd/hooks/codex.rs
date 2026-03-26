@@ -19,15 +19,15 @@ impl HookProtocol for CodexCliHook {
     }
 
     fn parse_input(&self, _json: &serde_json::Value) -> Option<super::HookInput> {
-        None // Not applicable -- awareness only
+        None
     }
 
     fn format_response(&self, _rewritten_command: &str) -> serde_json::Value {
-        serde_json::Value::Null // Not applicable -- awareness only
+        serde_json::Value::Null
     }
 
     fn generate_script(&self, _binary_path: &str, _version: &str) -> String {
-        String::new() // Not applicable -- awareness only
+        String::new()
     }
 }
 

@@ -179,7 +179,7 @@ fn analyze_invocations(invocations: &[ToolInvocation]) -> DiscoverAnalysis {
 
                 // Check if this command has a skim rewrite
                 let tokens: Vec<&str> = command.split_whitespace().collect();
-                let has_rewrite = !tokens.is_empty() && check_has_rewrite(&tokens);
+                let has_rewrite = check_has_rewrite(&tokens);
                 let rewrite_target = if has_rewrite {
                     get_rewrite_target(&tokens)
                 } else {
