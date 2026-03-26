@@ -111,9 +111,7 @@ mod tests {
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v1.0.0"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.0.0\""));
-        assert!(script.contains(
-            "exec \"/usr/local/bin/skim\" rewrite --hook --agent claude-code"
-        ));
+        assert!(script.contains("exec \"/usr/local/bin/skim\" rewrite --hook --agent claude-code"));
     }
 
     #[test]

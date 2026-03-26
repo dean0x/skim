@@ -270,8 +270,7 @@ mod tests {
     #[test]
     fn test_generate_hook_script_accepts_path_with_spaces() {
         // Spaces are safe because binary_path is double-quoted in the script
-        let script =
-            generate_hook_script("/Users/my user/bin/skim", "1.0.0", "test-agent");
+        let script = generate_hook_script("/Users/my user/bin/skim", "1.0.0", "test-agent");
         assert!(script.contains("exec \"/Users/my user/bin/skim\""));
     }
 }

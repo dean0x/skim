@@ -25,7 +25,9 @@ impl CodexCliProvider {
         let sessions_dir = if let Ok(override_dir) = std::env::var("SKIM_CODEX_SESSIONS_DIR") {
             PathBuf::from(override_dir)
         } else {
-            AgentKind::CodexCli.config_dir(&dirs::home_dir()?).join("sessions")
+            AgentKind::CodexCli
+                .config_dir(&dirs::home_dir()?)
+                .join("sessions")
         };
 
         if sessions_dir.is_dir() {

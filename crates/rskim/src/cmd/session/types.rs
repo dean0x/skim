@@ -517,7 +517,10 @@ mod tests {
 
     #[test]
     fn test_agent_kind_rules_filename() {
-        assert_eq!(AgentKind::ClaudeCode.rules_filename(), "skim-corrections.md");
+        assert_eq!(
+            AgentKind::ClaudeCode.rules_filename(),
+            "skim-corrections.md"
+        );
         assert_eq!(AgentKind::Cursor.rules_filename(), "skim-corrections.mdc");
         assert_eq!(
             AgentKind::CopilotCli.rules_filename(),

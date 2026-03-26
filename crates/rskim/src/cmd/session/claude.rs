@@ -24,7 +24,9 @@ impl ClaudeCodeProvider {
         let projects_dir = if let Ok(override_dir) = std::env::var("SKIM_PROJECTS_DIR") {
             PathBuf::from(override_dir)
         } else {
-            AgentKind::ClaudeCode.config_dir(&dirs::home_dir()?).join("projects")
+            AgentKind::ClaudeCode
+                .config_dir(&dirs::home_dir()?)
+                .join("projects")
         };
 
         if projects_dir.is_dir() {

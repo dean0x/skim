@@ -287,8 +287,7 @@ fn process_cursor_tool_calls(
             .and_then(|a| a.as_str())
             .unwrap_or("{}");
 
-        let arguments: serde_json::Value =
-            serde_json::from_str(arguments_str).unwrap_or_default();
+        let arguments: serde_json::Value = serde_json::from_str(arguments_str).unwrap_or_default();
 
         let input = map_cursor_tool(&tool_name, &arguments);
 

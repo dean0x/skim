@@ -72,7 +72,11 @@ fn detect_cursor(home: Option<&Path>) -> AgentStatus {
     // config_dir() handles macOS vs Linux detection internally
     let state_path = home.and_then(|h| {
         let path = AgentKind::Cursor.config_dir(h);
-        if path.is_dir() { Some(path) } else { None }
+        if path.is_dir() {
+            Some(path)
+        } else {
+            None
+        }
     });
 
     let detected = state_path.is_some();
@@ -199,19 +203,16 @@ fn detect_copilot_cli() -> AgentStatus {
 
     let hooks = if detected {
         let has_skim_hook = std::fs::read_dir(hooks_dir).ok().is_some_and(|entries| {
-            entries
-                .flatten()
-                .take(MAX_COPILOT_HOOK_ENTRIES)
-                .any(|e| {
-                    let path = e.path();
-                    path.extension().is_some_and(|ext| ext == "json")
-                        && std::fs::metadata(&path)
-                            .ok()
-                            .is_some_and(|m| m.len() <= MAX_SETTINGS_SIZE)
-                        && std::fs::read_to_string(&path)
-                            .ok()
-                            .is_some_and(|c| c.contains("skim"))
-                })
+            entries.flatten().take(MAX_COPILOT_HOOK_ENTRIES).any(|e| {
+                let path = e.path();
+                path.extension().is_some_and(|ext| ext == "json")
+                    && std::fs::metadata(&path)
+                        .ok()
+                        .is_some_and(|m| m.len() <= MAX_SETTINGS_SIZE)
+                    && std::fs::read_to_string(&path)
+                        .ok()
+                        .is_some_and(|c| c.contains("skim"))
+            })
         });
         if has_skim_hook {
             HookStatus::Installed {
@@ -345,8 +346,11 @@ fn detect_pretooluse_hook(config_dir: Option<&Path>) -> HookStatus {
     let integrity = if !hook_script.is_file() {
         "missing"
     } else {
-        match crate::cmd::integrity::verify_script_integrity(config_dir, "claude-code", &hook_script)
-        {
+        match crate::cmd::integrity::verify_script_integrity(
+            config_dir,
+            "claude-code",
+            &hook_script,
+        ) {
             Ok(true) => "ok",
             Ok(false) => "tampered",
             Err(_) => "unknown",

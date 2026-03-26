@@ -268,7 +268,10 @@ mod tests {
         );
 
         // The new hook.log should contain the freshly written message
-        assert!(log_path.exists(), "hook.log should be recreated after rotation");
+        assert!(
+            log_path.exists(),
+            "hook.log should be recreated after rotation"
+        );
         let new_content = std::fs::read_to_string(&log_path).unwrap();
         assert!(
             new_content.contains("rotation integration test"),
