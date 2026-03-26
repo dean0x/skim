@@ -674,7 +674,7 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
         Some(dir) => {
             // Directory-based agents: auto-create file
             let rules_dir = std::path::Path::new(dir);
-            let filename = rules_filename(agent);
+            let filename = agent.rules_filename();
             let rules_path = rules_dir.join(filename);
 
             // Migrate legacy filename (cli-corrections.md -> skim-corrections.md)
@@ -708,15 +708,6 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
     Ok(())
 }
 
-/// Return the rules filename for a given agent.
-fn rules_filename(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::ClaudeCode => "skim-corrections.md",
-        AgentKind::Cursor => "skim-corrections.mdc",
-        AgentKind::CopilotCli => "skim-corrections.instructions.md",
-        _ => "skim-corrections.md", // fallback for agents with rules_dir
-    }
-}
 
 // ============================================================================
 // Output
@@ -751,7 +742,7 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
 
     let target = match agent.rules_dir() {
         Some(dir) => {
-            let path = std::path::Path::new(dir).join(rules_filename(agent));
+            let path = std::path::Path::new(dir).join(agent.rules_filename());
             format!("{}", path.display())
         }
         None => format!("{} configuration", agent.display_name()),
@@ -1540,29 +1531,7 @@ mod tests {
     }
 
     // ---- per-agent rules file output ----
-
-    #[test]
-    fn test_rules_filename_claude() {
-        assert_eq!(rules_filename(AgentKind::ClaudeCode), "skim-corrections.md");
-    }
-
-    #[test]
-    fn test_rules_filename_cursor() {
-        assert_eq!(rules_filename(AgentKind::Cursor), "skim-corrections.mdc");
-    }
-
-    #[test]
-    fn test_rules_filename_copilot() {
-        assert_eq!(
-            rules_filename(AgentKind::CopilotCli),
-            "skim-corrections.instructions.md"
-        );
-    }
-
-    #[test]
-    fn test_rules_filename_fallback() {
-        assert_eq!(rules_filename(AgentKind::CodexCli), "skim-corrections.md");
-    }
+    // Note: rules_filename() tests moved to session::types::tests (AgentKind method)
 
     #[test]
     fn test_generate_rules_content_cursor_frontmatter() {
