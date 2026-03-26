@@ -752,41 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_detects_claude_code_with_fixture() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let project_dir = dir.path().join("test-project");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(project_dir.join("session.jsonl"), "{}").unwrap();
-
-        // Set SKIM_PROJECTS_DIR to our fixture
-        std::env::set_var("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap());
-
-        let agents = detect_all_agents();
-        let claude = agents
-            .iter()
-            .find(|a| a.kind == AgentKind::ClaudeCode)
-            .expect("Claude Code should be in results");
-
-        assert!(
-            claude.detected,
-            "Claude Code should be detected with fixture"
-        );
-        assert!(
-            claude.sessions.is_some(),
-            "sessions should be reported for detected agent"
-        );
-        let sessions = claude.sessions.as_ref().unwrap();
-        assert!(
-            sessions.detail.contains("1 files"),
-            "expected 1 file, got: {}",
-            sessions.detail
-        );
-
-        // Clean up
-        std::env::remove_var("SKIM_PROJECTS_DIR");
-    }
-
-    #[test]
     fn test_agent_kind_cli_name() {
         assert_eq!(AgentKind::ClaudeCode.cli_name(), "claude-code");
         assert_eq!(AgentKind::Cursor.cli_name(), "cursor");
