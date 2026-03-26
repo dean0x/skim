@@ -1153,14 +1153,6 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve the agent CLI name for per-agent stamping.
-///
-/// Uses the canonical `cli_name()` from `AgentKind` so that integrity and
-/// version-mismatch stamp files are written under the correct agent prefix.
-fn resolve_agent_name(agent: AgentKind) -> &'static str {
-    agent.cli_name()
-}
-
 /// Resolve the hook config directory for the given agent.
 ///
 /// Delegates to the canonical `resolve_config_dir_for_agent` in `init/helpers.rs`
@@ -1195,7 +1187,7 @@ fn check_hook_integrity(agent: AgentKind) -> bool {
         None => return false,
     };
 
-    let agent_name = resolve_agent_name(agent);
+    let agent_name = agent.cli_name();
     let script_path = config_dir.join("hooks").join("skim-rewrite.sh");
 
     if !script_path.exists() {
@@ -1245,7 +1237,7 @@ fn check_hook_version_mismatch(agent: AgentKind) {
         return; // versions match
     }
 
-    let agent_name = resolve_agent_name(agent);
+    let agent_name = agent.cli_name();
 
     // Rate limit: per-agent, warn at most once per day
     let stamp_path = match cache_dir() {
@@ -1330,16 +1322,8 @@ fn today_date_string() -> String {
     // Convert to days since epoch, then to date components
     let days = secs / 86400;
     // Simple date calculation (good enough for stamp file purposes)
-    let (year, month, day) = days_to_date(days);
+    let (year, month, day) = super::hook_log::days_to_date(days);
     format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-///
-/// Delegates to the canonical implementation in `hook_log` to avoid
-/// duplicating the Howard Hinnant calendar algorithm.
-fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
-    super::hook_log::days_to_date(days_since_epoch)
 }
 
 // ============================================================================

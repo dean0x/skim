@@ -408,9 +408,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
             } else {
                 1
             };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -446,13 +444,8 @@ fn looks_like_error(content: &str) -> bool {
 
     let lower = check_content.to_lowercase();
 
-    // Quick exclusion: "0 failed" is a success indicator in test output
-    let has_failed = if lower.contains("failed") {
-        // Only count as error if there's a non-zero count before "failed"
-        !lower.contains("0 failed")
-    } else {
-        false
-    };
+    // "0 failed" is a success indicator in test output — exclude it
+    let has_failed = lower.contains("failed") && !lower.contains("0 failed");
 
     // Use prefix patterns to avoid matching benign occurrences like
     // "0 errors generated", "error_handler.rs", etc.
@@ -470,7 +463,6 @@ fn looks_like_error(content: &str) -> bool {
         || lower.contains("command not found")
         || has_failed
         || lower.starts_with("fatal:")
-        || (check_content.contains("FAILED") && !lower.contains("0 failed"))
         || check_content.contains("Exit code")
 }
 
