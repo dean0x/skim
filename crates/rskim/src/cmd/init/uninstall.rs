@@ -2,10 +2,10 @@
 
 use super::flags::InitFlags;
 use super::helpers::{
-    check_mark, confirm_proceed, resolve_config_dir_for_agent, resolve_symlink, HOOK_SCRIPT_NAME,
-    SETTINGS_FILE,
+    atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
+    resolve_config_dir_for_agent, resolve_real_settings_path, HOOK_SCRIPT_NAME, SETTINGS_FILE,
 };
-use super::state::{has_skim_hook_entry, read_settings_json, MAX_SETTINGS_SIZE};
+use super::state::{has_skim_hook_entry, read_settings_json};
 
 /// Remove skim hook entries and marketplace registration from a settings.json value.
 ///
@@ -129,34 +129,12 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
 
     // Remove from settings.json
     if settings_has_hook {
-        // Resolve symlinks
-        let real_path = if settings_path.is_symlink() {
-            resolve_symlink(&settings_path)?
-        } else {
-            settings_path.clone()
-        };
-
-        // Guard against oversized files
-        let file_size = std::fs::metadata(&real_path)?.len();
-        if file_size > MAX_SETTINGS_SIZE {
-            anyhow::bail!(
-                "settings.json is too large ({} bytes, max {} bytes): {}\n\
-                 hint: This does not look like a valid Claude Code settings file",
-                file_size,
-                MAX_SETTINGS_SIZE,
-                real_path.display()
-            );
-        }
-        let contents = std::fs::read_to_string(&real_path)?;
-        let mut settings: serde_json::Value = serde_json::from_str(&contents)?;
+        let real_path = resolve_real_settings_path(&settings_path)?;
+        let mut settings = load_or_create_settings(&real_path)?;
 
         remove_skim_from_settings(&mut settings);
 
-        // Atomic write
-        let pretty = serde_json::to_string_pretty(&settings)?;
-        let tmp_path = real_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, format!("{pretty}\n"))?;
-        std::fs::rename(&tmp_path, &real_path)?;
+        atomic_write_settings(&settings, &real_path)?;
 
         println!(
             "  {} Removed: hook entry from {}",

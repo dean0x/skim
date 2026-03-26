@@ -98,6 +98,65 @@ pub(super) fn resolve_symlink(link: &Path) -> anyhow::Result<PathBuf> {
 }
 
 // ============================================================================
+// Settings I/O helpers (shared by install and uninstall)
+// ============================================================================
+
+/// Resolve symlinks on the settings path, returning the original path if not a symlink.
+pub(super) fn resolve_real_settings_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_symlink() {
+        resolve_symlink(path)
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
+/// Read and parse a settings.json file, creating an empty object for missing or empty files.
+///
+/// Rejects files larger than [`super::state::MAX_SETTINGS_SIZE`] to prevent OOM.
+pub(super) fn load_or_create_settings(path: &Path) -> anyhow::Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    let file_size = std::fs::metadata(path)?.len();
+    if file_size > super::state::MAX_SETTINGS_SIZE {
+        anyhow::bail!(
+            "settings.json is too large ({} bytes, max {} bytes): {}\n\
+             hint: This does not look like a valid Claude Code settings file",
+            file_size,
+            super::state::MAX_SETTINGS_SIZE,
+            path.display()
+        );
+    }
+
+    let contents = std::fs::read_to_string(path)?;
+    if contents.trim().is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    serde_json::from_str(&contents).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse {}: {}\n\
+             hint: Fix the JSON manually, then re-run `skim init`",
+            path.display(),
+            e
+        )
+    })
+}
+
+/// Atomically write settings JSON to disk using tmp+rename.
+pub(super) fn atomic_write_settings(
+    settings: &serde_json::Value,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let pretty = serde_json::to_string_pretty(settings)?;
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, format!("{pretty}\n"))?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+// ============================================================================
 // Interactive prompt helpers
 // ============================================================================
 
@@ -170,4 +229,32 @@ pub(super) fn print_help() {
     println!("  skim init --project --yes          Install project-level hook");
     println!("  skim init --uninstall              Remove skim hook");
     println!("  skim init --dry-run                Preview actions without writing");
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_or_create_settings_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let result = load_or_create_settings(&path).unwrap();
+        assert!(result.is_object());
+        assert!(result.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_load_or_create_settings_empty_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "  \n").unwrap();
+        let result = load_or_create_settings(&path).unwrap();
+        assert!(result.is_object());
+        assert!(result.as_object().unwrap().is_empty());
+    }
 }

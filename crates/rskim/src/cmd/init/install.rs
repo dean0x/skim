@@ -5,10 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::flags::InitFlags;
 use super::helpers::{
-    check_mark, confirm_proceed, prompt_choice, resolve_symlink, HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
-    SETTINGS_FILE,
+    check_mark, confirm_proceed, prompt_choice, HOOK_SCRIPT_NAME, SETTINGS_BACKUP, SETTINGS_FILE,
 };
-use super::state::{detect_state, has_skim_hook_entry, DetectedState, MAX_SETTINGS_SIZE};
+use super::state::{detect_state, has_skim_hook_entry, DetectedState};
 
 /// Resolved install options from interactive prompts or --yes defaults.
 struct InstallOptions {
@@ -363,74 +362,27 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
 // Settings.json patching (B8)
 // ============================================================================
 
-fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::Result<()> {
-    // Ensure config dir exists
-    if !state.config_dir.exists() {
-        std::fs::create_dir_all(&state.config_dir)?;
-    }
+use super::helpers::{atomic_write_settings, load_or_create_settings, resolve_real_settings_path};
 
-    // Resolve symlinks before writing (don't replace symlink with regular file)
-    let real_settings_path = if state.settings_path.is_symlink() {
-        resolve_symlink(&state.settings_path)?
-    } else {
-        state.settings_path.clone()
-    };
+/// Back up the settings file before modification.
+fn backup_settings(
+    config_dir: &std::path::Path,
+    real_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let backup_path = config_dir.join(SETTINGS_BACKUP);
+    std::fs::copy(real_path, &backup_path)?;
+    Ok(())
+}
 
-    // Read existing settings or start fresh.
-    // Re-check file existence here instead of using cached `state.settings_exists`
-    // to avoid TOCTOU race between detect_state() and this write path.
-    let settings_exists_now = real_settings_path.exists();
-    let mut settings: serde_json::Value = if settings_exists_now {
-        // Guard against oversized files (e.g., attacker-controlled .claude/settings.json)
-        let file_size = std::fs::metadata(&real_settings_path)?.len();
-        if file_size > MAX_SETTINGS_SIZE {
-            anyhow::bail!(
-                "settings.json is too large ({} bytes, max {} bytes): {}\n\
-                 hint: This does not look like a valid Claude Code settings file",
-                file_size,
-                MAX_SETTINGS_SIZE,
-                real_settings_path.display()
-            );
-        }
-        let contents = std::fs::read_to_string(&real_settings_path)?;
-        if contents.trim().is_empty() {
-            // Empty file — treat as {}
-            serde_json::Value::Object(serde_json::Map::new())
-        } else {
-            serde_json::from_str(&contents).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse {}: {}\n\
-                     hint: Fix the JSON manually, then re-run `skim init`",
-                    real_settings_path.display(),
-                    e
-                )
-            })?
-        }
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
-    };
-
+/// Insert or update the skim hook entry in `hooks.PreToolUse`.
+fn upsert_hook_entry(
+    settings: &mut serde_json::Value,
+    hook_script_path: &str,
+) -> anyhow::Result<()> {
     let obj = settings
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json root is not an object"))?;
 
-    // Back up existing file (use fresh check, not cached state)
-    if settings_exists_now {
-        let backup_path = state.config_dir.join(SETTINGS_BACKUP);
-        std::fs::copy(&real_settings_path, &backup_path)?;
-        println!(
-            "  {} Backed up: {} -> {}",
-            check_mark(true),
-            state.settings_path.display(),
-            SETTINGS_BACKUP
-        );
-    }
-
-    // Build the hook script path
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-    let hook_script_str = hook_script_path.display().to_string();
-
-    // Ensure hooks.PreToolUse array exists
     let hooks = obj
         .entry("hooks")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
@@ -443,22 +395,52 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks.PreToolUse' is not an array"))?;
 
-    // Search for existing skim entry and remove it (to update in place)
+    // Remove existing skim entry (to update in place)
     pre_tool_use.retain(|entry| !has_skim_hook_entry(entry));
 
-    // Build the new hook entry
-    let hook_entry = serde_json::json!({
+    // Insert new entry
+    pre_tool_use.push(serde_json::json!({
         "matcher": "Bash",
         "hooks": [{
             "type": "command",
-            "command": hook_script_str,
+            "command": hook_script_path,
             "timeout": 5
         }]
-    });
-    pre_tool_use.push(hook_entry);
+    }));
+
+    Ok(())
+}
+
+fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::Result<()> {
+    // Ensure config dir exists
+    if !state.config_dir.exists() {
+        std::fs::create_dir_all(&state.config_dir)?;
+    }
+
+    let real_path = resolve_real_settings_path(&state.settings_path)?;
+    let mut settings = load_or_create_settings(&real_path)?;
+
+    // Back up existing file (re-check existence to avoid TOCTOU race)
+    if real_path.exists() {
+        backup_settings(&state.config_dir, &real_path)?;
+        println!(
+            "  {} Backed up: {} -> {}",
+            check_mark(true),
+            state.settings_path.display(),
+            SETTINGS_BACKUP
+        );
+    }
+
+    // Upsert hook entry
+    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    upsert_hook_entry(&mut settings, &hook_script_path.display().to_string())?;
 
     // Add marketplace (if opted in)
     if install_marketplace {
+        let obj = settings
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("settings.json root is not an object"))?;
+
         let marketplaces = obj
             .entry("extraKnownMarketplaces")
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
@@ -473,11 +455,7 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
         );
     }
 
-    // Atomic write: write to tmp, then rename
-    let pretty = serde_json::to_string_pretty(&settings)?;
-    let tmp_path = real_settings_path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, format!("{pretty}\n"))?;
-    std::fs::rename(&tmp_path, &real_settings_path)?;
+    atomic_write_settings(&settings, &real_path)?;
 
     println!(
         "  {} Patched: {} (PreToolUse hook added)",
@@ -519,6 +497,29 @@ pub(super) fn print_dry_run_actions(state: &DetectedState, install_marketplace: 
         println!(
             "  [dry-run] Would register: skim marketplace in {}",
             SETTINGS_FILE
+        );
+    }
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_upsert_hook_entry_idempotent() {
+        let mut settings = serde_json::json!({});
+        upsert_hook_entry(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
+        upsert_hook_entry(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
+
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "running upsert twice should produce exactly one entry, not a duplicate"
         );
     }
 }
