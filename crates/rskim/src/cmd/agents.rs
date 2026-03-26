@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use super::init::MAX_SETTINGS_SIZE;
 use super::session::AgentKind;
 
 // ============================================================================
@@ -85,31 +86,31 @@ struct RulesInfo {
 
 /// Detect all supported agents and return their status.
 fn detect_all_agents() -> Vec<AgentStatus> {
+    let home = dirs::home_dir();
     AgentKind::all_supported()
         .iter()
         .copied()
-        .map(detect_agent)
+        .map(|kind| detect_agent(kind, home.as_deref()))
         .collect()
 }
 
 /// Detect a single agent's status.
-fn detect_agent(kind: AgentKind) -> AgentStatus {
+fn detect_agent(kind: AgentKind, home: Option<&Path>) -> AgentStatus {
     match kind {
-        AgentKind::ClaudeCode => detect_claude_code(),
-        AgentKind::Cursor => detect_cursor(),
-        AgentKind::CodexCli => detect_codex_cli(),
-        AgentKind::GeminiCli => detect_gemini_cli(),
+        AgentKind::ClaudeCode => detect_claude_code(home),
+        AgentKind::Cursor => detect_cursor(home),
+        AgentKind::CodexCli => detect_codex_cli(home),
+        AgentKind::GeminiCli => detect_gemini_cli(home),
         AgentKind::CopilotCli => detect_copilot_cli(),
         AgentKind::OpenCode => detect_opencode(),
     }
 }
 
-fn detect_claude_code() -> AgentStatus {
-    let home = dirs::home_dir();
+fn detect_claude_code(home: Option<&Path>) -> AgentStatus {
     let projects_dir = std::env::var("SKIM_PROJECTS_DIR")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".claude").join("projects")));
+        .or_else(|| home.map(|h| h.join(".claude").join("projects")));
 
     let detected = projects_dir.as_ref().is_some_and(|p| p.is_dir());
 
@@ -125,7 +126,7 @@ fn detect_claude_code() -> AgentStatus {
         None
     };
 
-    let config_dir = home.as_ref().map(|h| h.join(".claude"));
+    let config_dir = home.map(|h| h.join(".claude"));
     let hooks = detect_claude_hook(config_dir.as_deref());
 
     let rules = Some(RulesInfo {
@@ -142,12 +143,10 @@ fn detect_claude_code() -> AgentStatus {
     }
 }
 
-fn detect_cursor() -> AgentStatus {
-    let home = dirs::home_dir();
-
+fn detect_cursor(home: Option<&Path>) -> AgentStatus {
     // Cursor stores state in ~/Library/Application Support/Cursor/ (macOS)
     // or ~/.config/Cursor/ (Linux)
-    let state_path = home.as_ref().and_then(|h| {
+    let state_path = home.and_then(|h| {
         let macos_path = h.join("Library").join("Application Support").join("Cursor");
         let linux_path = h.join(".config").join("Cursor");
         if macos_path.is_dir() {
@@ -188,9 +187,8 @@ fn detect_cursor() -> AgentStatus {
     }
 }
 
-fn detect_codex_cli() -> AgentStatus {
-    let home = dirs::home_dir();
-    let codex_dir = home.as_ref().map(|h| h.join(".codex"));
+fn detect_codex_cli(home: Option<&Path>) -> AgentStatus {
+    let codex_dir = home.map(|h| h.join(".codex"));
     let detected = codex_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = if detected {
@@ -232,9 +230,8 @@ fn detect_codex_cli() -> AgentStatus {
     }
 }
 
-fn detect_gemini_cli() -> AgentStatus {
-    let home = dirs::home_dir();
-    let gemini_dir = home.as_ref().map(|h| h.join(".gemini"));
+fn detect_gemini_cli(home: Option<&Path>) -> AgentStatus {
+    let gemini_dir = home.map(|h| h.join(".gemini"));
     let detected = gemini_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = None; // Gemini CLI doesn't persist session files locally
@@ -244,20 +241,8 @@ fn detect_gemini_cli() -> AgentStatus {
         let settings_path = gemini_dir.as_ref().map(|p| p.join("settings.json"));
         let has_hook = settings_path
             .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            .and_then(|v| v.get("hooks")?.as_object().cloned())
-            .is_some_and(|hooks| {
-                hooks.values().any(|arr| {
-                    arr.as_array().is_some_and(|entries| {
-                        entries.iter().any(|e| {
-                            e.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|cmd| cmd.contains("skim"))
-                        })
-                    })
-                })
-            });
+            .and_then(|p| read_settings_guarded(p))
+            .is_some_and(|v| has_skim_hook_in_settings(&v));
         if has_hook {
             HookStatus::Installed {
                 version: None,
@@ -287,6 +272,10 @@ fn detect_gemini_cli() -> AgentStatus {
     }
 }
 
+/// Maximum number of directory entries to scan in `detect_copilot_cli`
+/// to prevent unbounded I/O on adversarial `.github/hooks/` directories.
+const MAX_COPILOT_HOOK_ENTRIES: usize = 50;
+
 fn detect_copilot_cli() -> AgentStatus {
     // Copilot CLI uses .github/hooks/ for hook configuration
     let hooks_dir = Path::new(".github/hooks");
@@ -296,12 +285,19 @@ fn detect_copilot_cli() -> AgentStatus {
 
     let hooks = if detected {
         let has_skim_hook = std::fs::read_dir(hooks_dir).ok().is_some_and(|entries| {
-            entries.flatten().any(|e| {
-                e.path().extension().is_some_and(|ext| ext == "json")
-                    && std::fs::read_to_string(e.path())
-                        .ok()
-                        .is_some_and(|c| c.contains("skim"))
-            })
+            entries
+                .flatten()
+                .take(MAX_COPILOT_HOOK_ENTRIES)
+                .any(|e| {
+                    let path = e.path();
+                    path.extension().is_some_and(|ext| ext == "json")
+                        && std::fs::metadata(&path)
+                            .ok()
+                            .is_some_and(|m| m.len() <= MAX_SETTINGS_SIZE)
+                        && std::fs::read_to_string(&path)
+                            .ok()
+                            .is_some_and(|c| c.contains("skim"))
+                })
         });
         if has_skim_hook {
             HookStatus::Installed {
@@ -359,9 +355,36 @@ fn detect_opencode() -> AgentStatus {
     }
 }
 
-/// Maximum settings.json size we'll read (10 MiB), consistent with
-/// the guard in `init/state.rs`.
-const MAX_SETTINGS_SIZE: u64 = 10 * 1024 * 1024;
+/// Read and parse a JSON settings file with a size guard.
+///
+/// Returns `None` if the file is missing, too large (> [`MAX_SETTINGS_SIZE`]),
+/// or not valid JSON.
+fn read_settings_guarded(path: &Path) -> Option<serde_json::Value> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_SETTINGS_SIZE {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Check whether a Gemini CLI settings object contains any hook whose
+/// command references "skim".
+fn has_skim_hook_in_settings(settings: &serde_json::Value) -> bool {
+    let hooks = match settings.get("hooks").and_then(|v| v.as_object()) {
+        Some(h) => h,
+        None => return false,
+    };
+    hooks.values().any(|arr| {
+        arr.as_array().is_some_and(|entries| {
+            entries.iter().any(|e| {
+                e.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|cmd| cmd.contains("skim"))
+            })
+        })
+    })
+}
 
 /// Detect skim hook installation for Claude Code.
 fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
@@ -934,5 +957,55 @@ mod tests {
             }
             other => panic!("expected HookStatus::Installed, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_has_skim_hook_in_settings_true() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "BeforeTool": [{
+                    "command": "/usr/local/bin/skim rewrite --hook"
+                }]
+            }
+        });
+        assert!(has_skim_hook_in_settings(&settings));
+    }
+
+    #[test]
+    fn test_has_skim_hook_in_settings_false() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "BeforeTool": [{
+                    "command": "/usr/local/bin/other-tool"
+                }]
+            }
+        });
+        assert!(!has_skim_hook_in_settings(&settings));
+    }
+
+    #[test]
+    fn test_has_skim_hook_in_settings_no_hooks() {
+        let settings = serde_json::json!({ "theme": "dark" });
+        assert!(!has_skim_hook_in_settings(&settings));
+    }
+
+    #[test]
+    fn test_read_settings_guarded_rejects_oversized() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("big.json");
+        // Write a file slightly over 10 MiB
+        let data = vec![b' '; (MAX_SETTINGS_SIZE as usize) + 1];
+        std::fs::write(&path, data).unwrap();
+        assert!(read_settings_guarded(&path).is_none());
+    }
+
+    #[test]
+    fn test_read_settings_guarded_valid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ok.json");
+        std::fs::write(&path, r#"{"key":"value"}"#).unwrap();
+        let v = read_settings_guarded(&path);
+        assert!(v.is_some());
+        assert_eq!(v.unwrap().get("key").unwrap().as_str().unwrap(), "value");
     }
 }

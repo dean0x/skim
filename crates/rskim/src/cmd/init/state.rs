@@ -7,7 +7,7 @@ use super::helpers::{resolve_config_dir_for_agent, HOOK_SCRIPT_NAME, SETTINGS_FI
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
-pub(super) const MAX_SETTINGS_SIZE: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_SETTINGS_SIZE: u64 = 10 * 1024 * 1024;
 
 pub(super) struct DetectedState {
     pub(super) skim_binary: PathBuf,
