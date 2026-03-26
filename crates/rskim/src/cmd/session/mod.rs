@@ -1,8 +1,9 @@
 //! Multi-agent session infrastructure (#61)
 //!
 //! Provides agent-agnostic types and the `SessionProvider` trait for scanning
-//! AI agent session files. Wave 4 ships the Claude Code provider; future agents
-//! are added by implementing the trait -- no conditionals in business logic.
+//! AI agent session files. Six providers ship today (Claude Code, Codex CLI,
+//! Copilot CLI, Cursor, Gemini CLI, OpenCode); new agents are added by
+//! implementing the trait -- no conditionals in business logic.
 
 mod claude;
 mod codex;
@@ -22,6 +23,9 @@ pub(crate) use types::{
 // ============================================================================
 
 /// Trait implemented by each agent's session file parser.
+///
+/// Each agent stores session data differently. Providers normalize
+/// tool invocations into agent-agnostic `ToolInvocation` structs.
 #[allow(dead_code)] // agent_kind used in tests only; detect_single routes by AgentKind directly
 pub(crate) trait SessionProvider {
     fn agent_kind(&self) -> AgentKind;
@@ -34,6 +38,10 @@ pub(crate) trait SessionProvider {
 // ============================================================================
 
 /// Auto-detect available agents by checking known session paths.
+///
+/// Individual providers accept `SKIM_*` env-var overrides (e.g.
+/// `SKIM_PROJECTS_DIR`, `SKIM_CURSOR_DB_PATH`) so integration tests
+/// can redirect detection to fixture directories.
 pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
     let mut providers: Vec<Box<dyn SessionProvider>> = Vec::new();
     if let Some(p) = claude::ClaudeCodeProvider::detect() {
@@ -106,7 +114,11 @@ pub(crate) fn collect_invocations(
         }
     }
 
-    dedup_invocations(&mut all_invocations);
+    // Skip dedup when a single provider is active -- cross-agent overlap
+    // is impossible and we avoid allocating a HashSet key per invocation.
+    if providers.len() > 1 {
+        dedup_invocations(&mut all_invocations);
+    }
     Ok(all_invocations)
 }
 
@@ -131,7 +143,12 @@ fn tool_input_key(input: &ToolInput) -> String {
         ToolInput::Glob { pattern } => format!("glob:{pattern}"),
         ToolInput::Grep { pattern } => format!("grep:{pattern}"),
         ToolInput::Edit { file_path } => format!("edit:{file_path}"),
-        ToolInput::Other { tool_name, raw } => format!("other:{tool_name}:{raw}"),
+        ToolInput::Other { tool_name, raw } => {
+            // Use serde_json::to_string for canonical JSON representation
+            // rather than Display, which is equivalent today but not guaranteed.
+            let raw_str = serde_json::to_string(raw).unwrap_or_default();
+            format!("other:{tool_name}:{raw_str}")
+        }
     }
 }
 
