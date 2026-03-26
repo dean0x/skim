@@ -233,4 +233,44 @@ mod tests {
             std::path::PathBuf::from("/tmp/hook.log.3")
         );
     }
+
+    #[test]
+    fn test_log_hook_warning_triggers_rotation() {
+        // End-to-end: call log_hook_warning with a >1MB log file already in place.
+        // Verifies that log_hook_warning rotates the existing file to .1 and
+        // creates a fresh hook.log with the new message.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path().join("skim-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        // Pre-fill hook.log just over the rotation threshold
+        let log_path = cache.join("hook.log");
+        let big_content = "z".repeat(MAX_LOG_SIZE as usize + 100);
+        std::fs::write(&log_path, &big_content).unwrap();
+
+        // Override SKIM_CACHE_DIR so log_hook_warning writes to our temp dir
+        std::env::set_var("SKIM_CACHE_DIR", &cache);
+        log_hook_warning("rotation integration test");
+        std::env::remove_var("SKIM_CACHE_DIR");
+
+        // The old oversized log should be archived to .1
+        let archive1 = archive_path(&log_path, 1);
+        assert!(
+            archive1.exists(),
+            "Archive .1 should exist after rotation triggered by log_hook_warning"
+        );
+        let archived = std::fs::read_to_string(&archive1).unwrap();
+        assert_eq!(
+            archived, big_content,
+            "Archive .1 should contain the original oversized content"
+        );
+
+        // The new hook.log should contain the freshly written message
+        assert!(log_path.exists(), "hook.log should be recreated after rotation");
+        let new_content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            new_content.contains("rotation integration test"),
+            "New hook.log should contain the warning message, got: {new_content}"
+        );
+    }
 }

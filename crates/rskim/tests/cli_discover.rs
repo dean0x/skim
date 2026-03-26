@@ -179,6 +179,26 @@ fn test_discover_unknown_flag_error() {
 }
 
 #[test]
+fn test_discover_since_missing_value() {
+    // --since with no value should fail with a descriptive error
+    skim_cmd()
+        .args(["discover", "--since"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--since requires a value"));
+}
+
+#[test]
+fn test_discover_agent_missing_value() {
+    // --agent with no value should fail with a descriptive error
+    skim_cmd()
+        .args(["discover", "--agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--agent requires a value"));
+}
+
+#[test]
 fn test_discover_json_has_structure() {
     let dir = TempDir::new().unwrap();
     let project_dir = dir.path().join("test-project");

@@ -202,8 +202,18 @@ fn test_agents_no_agents_all_not_detected() {
     }
 }
 
+/// All supported agents -- single source of truth for count assertions.
+const EXPECTED_AGENTS: &[&str] = &[
+    "claude-code",
+    "cursor",
+    "codex",
+    "gemini",
+    "copilot",
+    "opencode",
+];
+
 #[test]
-fn test_agents_json_has_six_entries() {
+fn test_agents_json_has_expected_count() {
     let output = skim_cmd().args(["agents", "--json"]).output().unwrap();
 
     assert!(output.status.success());
@@ -212,8 +222,9 @@ fn test_agents_json_has_six_entries() {
     let agents = parsed["agents"].as_array().unwrap();
     assert_eq!(
         agents.len(),
-        6,
-        "Should have exactly 6 agent entries, got {}",
+        EXPECTED_AGENTS.len(),
+        "Should have exactly {} agent entries (one per EXPECTED_AGENTS), got {}",
+        EXPECTED_AGENTS.len(),
         agents.len()
     );
 }

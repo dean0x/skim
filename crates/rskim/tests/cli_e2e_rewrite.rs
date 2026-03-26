@@ -584,6 +584,14 @@ fn test_rewrite_hook_agent_unknown_passthrough() {
         output.status.success(),
         "Unknown agent should not crash, exit 0"
     );
+
+    // Unknown agent falls back to Claude Code -- "cargo test" is rewritable,
+    // so stdout should contain a Claude Code hook response.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("hookSpecificOutput"),
+        "Unknown agent should fall back to Claude Code response format, got: {stdout}"
+    );
 }
 
 #[test]
