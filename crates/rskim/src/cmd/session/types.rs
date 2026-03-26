@@ -1,6 +1,6 @@
 //! Agent-agnostic session types (#61)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Which agent produced this session data.
@@ -87,6 +87,65 @@ impl AgentKind {
             AgentKind::CopilotCli => Some(".github/instructions"),
             // These agents use single-file configs -- user pastes content manually
             AgentKind::CodexCli | AgentKind::GeminiCli | AgentKind::OpenCode => None,
+        }
+    }
+
+    /// The dot-directory name (e.g., ".claude", ".gemini").
+    /// Single source of truth for all agent directory names.
+    pub(crate) fn dot_dir_name(&self) -> &'static str {
+        match self {
+            AgentKind::ClaudeCode => ".claude",
+            AgentKind::Cursor => ".cursor",
+            AgentKind::GeminiCli => ".gemini",
+            AgentKind::CopilotCli => ".github",
+            AgentKind::CodexCli => ".codex",
+            AgentKind::OpenCode => ".opencode",
+        }
+    }
+
+    /// Global config directory (home-relative).
+    /// Does NOT handle env var overrides — callers add those.
+    /// Note: Cursor uses runtime `is_dir()` for macOS vs Linux detection,
+    /// matching existing behavior in agents.rs and init/helpers.rs.
+    pub(crate) fn config_dir(&self, home: &Path) -> PathBuf {
+        match self {
+            AgentKind::Cursor => {
+                let macos = home
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Cursor");
+                if macos.is_dir() {
+                    macos
+                } else {
+                    home.join(".config").join("Cursor")
+                }
+            }
+            _ => home.join(self.dot_dir_name()),
+        }
+    }
+
+    /// Project-level config directory (CWD-relative).
+    pub(crate) fn project_dir(&self) -> PathBuf {
+        PathBuf::from(self.dot_dir_name())
+    }
+
+    /// CWD-relative detection path for project-scoped agents.
+    /// Returns `Some` for agents detected via CWD (Copilot, OpenCode),
+    /// `None` for agents detected via home directory.
+    pub(crate) fn detect_dir(&self) -> Option<PathBuf> {
+        match self {
+            AgentKind::CopilotCli => Some(PathBuf::from(".github")),
+            AgentKind::OpenCode => Some(PathBuf::from(".opencode")),
+            _ => None,
+        }
+    }
+
+    /// Return the rules filename for a given agent.
+    pub(crate) fn rules_filename(&self) -> &'static str {
+        match self {
+            AgentKind::Cursor => "skim-corrections.mdc",
+            AgentKind::CopilotCli => "skim-corrections.instructions.md",
+            _ => "skim-corrections.md",
         }
     }
 }
@@ -371,5 +430,101 @@ mod tests {
             let parsed = AgentKind::from_str(agent.cli_name());
             assert_eq!(parsed, Some(*agent), "round-trip failed for {:?}", agent);
         }
+    }
+
+    // ---- AgentKind::dot_dir_name ----
+
+    #[test]
+    fn test_agent_kind_dot_dir_name() {
+        assert_eq!(AgentKind::ClaudeCode.dot_dir_name(), ".claude");
+        assert_eq!(AgentKind::Cursor.dot_dir_name(), ".cursor");
+        assert_eq!(AgentKind::GeminiCli.dot_dir_name(), ".gemini");
+        assert_eq!(AgentKind::CopilotCli.dot_dir_name(), ".github");
+        assert_eq!(AgentKind::CodexCli.dot_dir_name(), ".codex");
+        assert_eq!(AgentKind::OpenCode.dot_dir_name(), ".opencode");
+    }
+
+    // ---- AgentKind::config_dir ----
+
+    #[test]
+    fn test_agent_kind_config_dir_simple_agents() {
+        let home = PathBuf::from("/fake/home");
+        assert_eq!(
+            AgentKind::ClaudeCode.config_dir(&home),
+            PathBuf::from("/fake/home/.claude")
+        );
+        assert_eq!(
+            AgentKind::CodexCli.config_dir(&home),
+            PathBuf::from("/fake/home/.codex")
+        );
+        assert_eq!(
+            AgentKind::GeminiCli.config_dir(&home),
+            PathBuf::from("/fake/home/.gemini")
+        );
+        assert_eq!(
+            AgentKind::CopilotCli.config_dir(&home),
+            PathBuf::from("/fake/home/.github")
+        );
+        assert_eq!(
+            AgentKind::OpenCode.config_dir(&home),
+            PathBuf::from("/fake/home/.opencode")
+        );
+    }
+
+    #[test]
+    fn test_agent_kind_config_dir_cursor_linux_fallback() {
+        // With a fake home, macOS path won't exist → falls back to Linux path
+        let home = PathBuf::from("/fake/home");
+        assert_eq!(
+            AgentKind::Cursor.config_dir(&home),
+            PathBuf::from("/fake/home/.config/Cursor")
+        );
+    }
+
+    // ---- AgentKind::project_dir ----
+
+    #[test]
+    fn test_agent_kind_project_dir() {
+        for agent in AgentKind::all_supported() {
+            assert_eq!(
+                agent.project_dir(),
+                PathBuf::from(agent.dot_dir_name()),
+                "project_dir mismatch for {:?}",
+                agent
+            );
+        }
+    }
+
+    // ---- AgentKind::detect_dir ----
+
+    #[test]
+    fn test_agent_kind_detect_dir() {
+        assert!(AgentKind::ClaudeCode.detect_dir().is_none());
+        assert!(AgentKind::Cursor.detect_dir().is_none());
+        assert!(AgentKind::GeminiCli.detect_dir().is_none());
+        assert!(AgentKind::CodexCli.detect_dir().is_none());
+        assert_eq!(
+            AgentKind::CopilotCli.detect_dir(),
+            Some(PathBuf::from(".github"))
+        );
+        assert_eq!(
+            AgentKind::OpenCode.detect_dir(),
+            Some(PathBuf::from(".opencode"))
+        );
+    }
+
+    // ---- AgentKind::rules_filename ----
+
+    #[test]
+    fn test_agent_kind_rules_filename() {
+        assert_eq!(AgentKind::ClaudeCode.rules_filename(), "skim-corrections.md");
+        assert_eq!(AgentKind::Cursor.rules_filename(), "skim-corrections.mdc");
+        assert_eq!(
+            AgentKind::CopilotCli.rules_filename(),
+            "skim-corrections.instructions.md"
+        );
+        assert_eq!(AgentKind::CodexCli.rules_filename(), "skim-corrections.md");
+        assert_eq!(AgentKind::GeminiCli.rules_filename(), "skim-corrections.md");
+        assert_eq!(AgentKind::OpenCode.rules_filename(), "skim-corrections.md");
     }
 }
