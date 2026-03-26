@@ -396,29 +396,26 @@ fn levenshtein(a: &str, b: &str) -> usize {
         return len_diff;
     }
 
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-
-    for (i, row) in dp.iter_mut().enumerate().take(m + 1) {
-        row[0] = i;
-    }
-    for (j, val) in dp[0].iter_mut().enumerate().take(n + 1) {
-        *val = j;
-    }
+    // Two-row DP: O(n) space instead of O(m*n).
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
 
     for i in 1..=m {
+        curr[0] = i;
         for j in 1..=n {
             let cost = if a_chars[i - 1] == b_chars[j - 1] {
                 0
             } else {
                 1
             };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
         }
+        std::mem::swap(&mut prev, &mut curr);
     }
 
-    dp[m][n]
+    prev[n]
 }
 
 // ============================================================================
