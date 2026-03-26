@@ -7,9 +7,13 @@
 //! The hook script calls `skim rewrite --hook` which reads Claude Code's
 //! PreToolUse JSON, rewrites matched commands, and emits `updatedInput`.
 //!
-//! SECURITY INVARIANT: The hook NEVER sets `permissionDecision`. Unlike
-//! competitors, our hook only sets `updatedInput` and lets Claude Code's
-//! permission system evaluate independently.
+//! SECURITY INVARIANT (Claude Code): The Claude Code hook NEVER sets
+//! `permissionDecision`. It only emits `updatedInput` inside
+//! `hookSpecificOutput` and lets Claude Code's permission system evaluate
+//! independently. Other agents have their own required response fields
+//! (e.g., Cursor uses `"permission": "allow"`, Gemini CLI uses
+//! `"decision": "allow"`) -- see each agent's `format_response()` in
+//! `cmd/hooks/` for protocol-specific documentation.
 
 mod flags;
 mod helpers;

@@ -36,6 +36,9 @@ impl HookProtocol for GeminiCliHook {
     }
 
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
+        // SECURITY: "decision": "allow" is REQUIRED by Gemini CLI's hook protocol.
+        // This is NOT the same as Claude Code's permissionDecision -- Gemini CLI's
+        // BeforeTool response schema requires an explicit decision field.
         serde_json::json!({
             "decision": "allow",
             "tool_input": {
@@ -99,6 +102,29 @@ mod tests {
         let response = hook().format_response("skim test cargo");
         assert_eq!(response["decision"], "allow");
         assert_eq!(response["tool_input"]["command"], "skim test cargo");
+    }
+
+    #[test]
+    fn test_gemini_format_response_has_required_decision_field() {
+        // SECURITY: Gemini CLI's BeforeTool protocol REQUIRES "decision": "allow"
+        // in every response. This is NOT Claude Code's permissionDecision -- it is
+        // a distinct, required field in Gemini CLI's schema.
+        let response = hook().format_response("skim test cargo");
+        assert_eq!(
+            response.get("decision").and_then(|v| v.as_str()),
+            Some("allow"),
+            "Gemini CLI protocol requires 'decision' field set to 'allow'"
+        );
+    }
+
+    #[test]
+    fn test_gemini_format_response_no_permission_decision() {
+        // Gemini must not emit Claude Code's permissionDecision field
+        let response = hook().format_response("skim test cargo");
+        assert!(
+            response.get("permissionDecision").is_none(),
+            "Gemini response must not contain Claude Code's permissionDecision"
+        );
     }
 
     #[test]

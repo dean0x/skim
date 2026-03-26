@@ -26,6 +26,9 @@ impl HookProtocol for CursorHook {
     }
 
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
+        // SECURITY: "permission": "allow" is REQUIRED by Cursor's hook protocol.
+        // This is NOT the same as Claude Code's permissionDecision -- Cursor's
+        // protocol requires an explicit permission field in every hook response.
         serde_json::json!({
             "permission": "allow",
             "updated_input": {
@@ -112,10 +115,33 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_format_response_has_required_permission_field() {
+        // SECURITY: Cursor's hook protocol REQUIRES "permission": "allow" in
+        // every response. This is NOT Claude Code's permissionDecision -- it is
+        // a distinct, required field in Cursor's schema.
+        let response = hook().format_response("skim test cargo");
+        assert_eq!(
+            response.get("permission").and_then(|v| v.as_str()),
+            Some("allow"),
+            "Cursor protocol requires 'permission' field set to 'allow'"
+        );
+    }
+
+    #[test]
     fn test_cursor_format_response_no_hook_specific_output() {
         // Cursor uses permission/updated_input, not hookSpecificOutput
         let response = hook().format_response("skim test cargo");
         assert!(response.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn test_cursor_format_response_no_permission_decision() {
+        // Cursor must not emit Claude Code's permissionDecision field
+        let response = hook().format_response("skim test cargo");
+        assert!(
+            response.get("permissionDecision").is_none(),
+            "Cursor response must not contain Claude Code's permissionDecision"
+        );
     }
 
     #[test]

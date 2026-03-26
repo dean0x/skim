@@ -359,6 +359,10 @@ fn detect_opencode() -> AgentStatus {
     }
 }
 
+/// Maximum settings.json size we'll read (10 MiB), consistent with
+/// the guard in `init/state.rs`.
+const MAX_SETTINGS_SIZE: u64 = 10 * 1024 * 1024;
+
 /// Detect skim hook installation for Claude Code.
 fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
     let Some(config_dir) = config_dir else {
@@ -366,6 +370,14 @@ fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
     };
 
     let settings_path = config_dir.join("settings.json");
+
+    // Guard against unexpectedly large files (OOM prevention).
+    if let Ok(meta) = std::fs::metadata(&settings_path) {
+        if meta.len() > MAX_SETTINGS_SIZE {
+            return HookStatus::NotInstalled;
+        }
+    }
+
     let settings = match std::fs::read_to_string(&settings_path) {
         Ok(c) => c,
         Err(_) => return HookStatus::NotInstalled,
@@ -565,10 +577,15 @@ fn count_files_recursive_inner(dir: &Path, extension: &str, depth: usize) -> usi
     let mut count = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                count += count_files_recursive_inner(&path, extension, depth + 1);
-            } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                count += count_files_recursive_inner(&entry.path(), extension, depth + 1);
+            } else if ft.is_file()
+                && entry.path().extension().and_then(|e| e.to_str()) == Some(extension)
+            {
                 count += 1;
             }
         }
@@ -580,7 +597,12 @@ fn count_files_recursive_inner(dir: &Path, extension: &str, depth: usize) -> usi
 fn count_files_in_dir(dir: &Path) -> usize {
     std::fs::read_dir(dir)
         .ok()
-        .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
+                .count()
+        })
         .unwrap_or(0)
 }
 
@@ -610,10 +632,13 @@ fn dir_size_bytes_inner(dir: &Path, depth: usize) -> u64 {
     let mut total: u64 = 0;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                total += dir_size_bytes_inner(&path, depth + 1);
-            } else if let Ok(meta) = std::fs::metadata(&path) {
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                total += dir_size_bytes_inner(&entry.path(), depth + 1);
+            } else if let Ok(meta) = entry.metadata() {
                 total += meta.len();
             }
         }
@@ -654,10 +679,36 @@ mod tests {
 
     #[test]
     fn test_agents_json_output_valid_json() {
-        // Capture JSON output -- we can't easily capture stdout in unit tests,
-        // but we can verify the function completes successfully
+        // Verify that detect_all_agents produces data that serialises to
+        // valid JSON with the expected top-level structure.  The integration
+        // test in cli_agents.rs covers the full stdout path; here we test
+        // the internal serialisation logic directly.
+        let agents = detect_all_agents();
+        assert_eq!(
+            agents.len(),
+            AgentKind::all_supported().len(),
+            "agent count should match supported kinds"
+        );
+
+        // Exercise the same JSON building path used by print_json.
         let result = run(&["--json".to_string()]);
         assert!(result.is_ok());
+
+        // Verify each agent has a well-formed hooks variant.
+        for agent in &agents {
+            match &agent.hooks {
+                HookStatus::Installed { integrity, .. } => {
+                    assert!(
+                        ["ok", "tampered", "missing", "unknown"].contains(integrity),
+                        "unexpected integrity value: {integrity}"
+                    );
+                }
+                HookStatus::NotInstalled => {}
+                HookStatus::NotSupported { note } => {
+                    assert!(!note.is_empty(), "NotSupported note should not be empty");
+                }
+            }
+        }
     }
 
     #[test]
