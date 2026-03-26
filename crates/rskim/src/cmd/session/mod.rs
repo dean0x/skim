@@ -22,6 +22,7 @@ pub(crate) use types::{
 // ============================================================================
 
 /// Trait implemented by each agent's session file parser.
+#[allow(dead_code)] // agent_kind used in tests only; detect_single routes by AgentKind directly
 pub(crate) trait SessionProvider {
     fn agent_kind(&self) -> AgentKind;
     fn find_sessions(&self, filter: &TimeFilter) -> anyhow::Result<Vec<SessionFile>>;
@@ -56,13 +57,26 @@ pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
     providers
 }
 
+/// Detect the single provider for a specific agent kind.
+///
+/// Short-circuits to only probe the requested agent's session path instead of
+/// detecting all providers and filtering.
+fn detect_single(kind: AgentKind) -> Vec<Box<dyn SessionProvider>> {
+    let opt: Option<Box<dyn SessionProvider>> = match kind {
+        AgentKind::ClaudeCode => claude::ClaudeCodeProvider::detect().map(|p| Box::new(p) as _),
+        AgentKind::CodexCli => codex::CodexCliProvider::detect().map(|p| Box::new(p) as _),
+        AgentKind::CopilotCli => copilot::CopilotCliProvider::detect().map(|p| Box::new(p) as _),
+        AgentKind::Cursor => cursor::CursorProvider::detect().map(|p| Box::new(p) as _),
+        AgentKind::GeminiCli => gemini::GeminiCliProvider::detect().map(|p| Box::new(p) as _),
+        AgentKind::OpenCode => opencode::OpenCodeProvider::detect().map(|p| Box::new(p) as _),
+    };
+    opt.into_iter().collect()
+}
+
 /// Get providers filtered by agent kind, or all detected agents.
 pub(crate) fn get_providers(agent_filter: Option<AgentKind>) -> Vec<Box<dyn SessionProvider>> {
     match agent_filter {
-        Some(kind) => {
-            let all = detect_agents();
-            all.into_iter().filter(|p| p.agent_kind() == kind).collect()
-        }
+        Some(kind) => detect_single(kind),
         None => detect_agents(),
     }
 }
