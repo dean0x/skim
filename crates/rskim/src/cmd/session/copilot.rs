@@ -132,30 +132,21 @@ impl SessionProvider for CopilotCliProvider {
     }
 }
 
-/// Optional YAML metadata parsed from session header.
-#[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)] // Fields parsed for metadata extraction; used by tests
-struct SessionMetadata {
-    model: Option<String>,
-    session_start: Option<String>,
-    project: Option<String>,
-}
-
-/// Split optional YAML header from JSONL body.
+/// Skip optional YAML header, returning only the JSONL body.
 ///
-/// If the first non-empty line is `---`, reads until the next `---` line,
-/// parses the block as YAML metadata, and returns (Some(metadata), remaining_lines).
-/// Otherwise returns (None, all_lines).
-fn split_yaml_header(content: &str) -> (Option<SessionMetadata>, &str) {
+/// If the first non-empty line is `---`, scans forward until the closing
+/// `---` delimiter and returns the content after it. Otherwise returns
+/// the original content unchanged.
+fn skip_yaml_header(content: &str) -> &str {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        return (None, content);
+        return content;
     }
 
     // Find the first `---` line
     let after_first = match trimmed.strip_prefix("---") {
         Some(rest) => rest.trim_start_matches(['\r', ' ', '\t']),
-        None => return (None, content),
+        None => return content,
     };
 
     // Skip leading newline after first ---
@@ -163,20 +154,15 @@ fn split_yaml_header(content: &str) -> (Option<SessionMetadata>, &str) {
 
     // Find the closing `---`
     if let Some(end_idx) = after_first.find("\n---") {
-        let yaml_block = &after_first[..end_idx];
         let rest_start = end_idx + 4; // skip "\n---"
-        let rest = if rest_start < after_first.len() {
+        if rest_start < after_first.len() {
             &after_first[rest_start..]
         } else {
             ""
-        };
-
-        // Parse YAML metadata; skip on failure
-        let metadata: Option<SessionMetadata> = serde_yaml_ng::from_str(yaml_block).ok();
-        (metadata, rest)
+        }
     } else {
         // No closing `---` found; treat entire content as JSONL (no valid header)
-        (None, content)
+        content
     }
 }
 
@@ -186,7 +172,7 @@ fn split_yaml_header(content: &str) -> (Option<SessionMetadata>, &str) {
 /// - `tool_use` events create invocations
 /// - `tool_result` events are correlated by `toolUseId` -> `id`
 fn parse_copilot_jsonl(content: &str, session_id: &str) -> anyhow::Result<Vec<ToolInvocation>> {
-    let (_metadata, jsonl_body) = split_yaml_header(content);
+    let jsonl_body = skip_yaml_header(content);
 
     let mut invocations = Vec::new();
     // Map from tool id to index in invocations vec for result correlation
@@ -448,10 +434,10 @@ mod tests {
         assert!(invocations[2].result.is_none());
     }
 
-    // ---- YAML metadata parsing ----
+    // ---- YAML header skipping ----
 
     #[test]
-    fn test_yaml_metadata_parsing() {
+    fn test_skip_yaml_header() {
         let content = concat!(
             "---\n",
             "model: gpt-4o\n",
@@ -461,15 +447,10 @@ mod tests {
             r#"{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "echo test"}, "id": "t-100", "timestamp": "2024-06-15T10:05:00Z" }"#,
         );
 
-        let (metadata, rest) = split_yaml_header(content);
-        assert!(metadata.is_some());
-        let meta = metadata.unwrap();
-        assert_eq!(meta.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(meta.session_start.as_deref(), Some("2024-06-15T10:00:00Z"));
-        assert_eq!(meta.project.as_deref(), Some("/home/user/myproject"));
-
-        // Remaining body should contain the JSONL events
-        assert!(!rest.is_empty());
+        let body = skip_yaml_header(content);
+        // Body should contain the JSONL events, not the YAML header
+        assert!(!body.is_empty());
+        assert!(!body.contains("model: gpt-4o"));
 
         // Full parse from original content works
         let invocations = parse_copilot_jsonl(content, "sess1").unwrap();
@@ -551,8 +532,9 @@ mod tests {
             "model: gpt-4o\n",
             r#"{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "ls"}, "id": "t-001", "timestamp": "2024-06-15T10:01:00Z" }"#,
         );
-        let (metadata, _rest) = split_yaml_header(content);
-        assert!(metadata.is_none());
+        let body = skip_yaml_header(content);
+        // Without closing delimiter, returns original content
+        assert_eq!(body, content);
 
         // Full parse should still attempt to parse lines (malformed YAML lines will be skipped)
         let invocations = parse_copilot_jsonl(content, "sess1").unwrap();

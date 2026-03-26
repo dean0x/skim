@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use super::types::*;
 use super::SessionProvider;
 
+/// Maximum database file size: 100 MB.
+const MAX_DB_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Cursor session file provider.
 ///
 /// Reads from Cursor's `state.vscdb` SQLite database. Access is always
@@ -110,6 +113,17 @@ impl SessionProvider for CursorProvider {
     }
 
     fn parse_session(&self, file: &SessionFile) -> anyhow::Result<Vec<ToolInvocation>> {
+        // Guard against oversized databases (consistent with other providers)
+        let db_size = std::fs::metadata(&self.db_path)?.len();
+        if db_size > MAX_DB_SIZE {
+            anyhow::bail!(
+                "database too large ({:.1} MB, limit {:.0} MB): {}",
+                db_size as f64 / (1024.0 * 1024.0),
+                MAX_DB_SIZE as f64 / (1024.0 * 1024.0),
+                self.db_path.display()
+            );
+        }
+
         let value = match query_single_key(&self.db_path, &file.session_id) {
             Ok(Some(v)) => v,
             Ok(None) => return Ok(Vec::new()),
@@ -211,54 +225,12 @@ pub(super) fn parse_cursor_json_value(
                 "assistant" => {
                     if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array())
                     {
-                        for tool_call in tool_calls {
-                            let tc_type =
-                                tool_call.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            if tc_type != "function" {
-                                continue;
-                            }
-
-                            let function = match tool_call.get("function") {
-                                Some(f) => f,
-                                None => continue,
-                            };
-
-                            let tool_name = function
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("")
-                                .to_string();
-
-                            let arguments_str = function
-                                .get("arguments")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or("{}");
-
-                            let arguments: serde_json::Value =
-                                serde_json::from_str(arguments_str).unwrap_or_default();
-
-                            let input = map_cursor_tool(&tool_name, &arguments);
-
-                            let tc_id = tool_call
-                                .get("id")
-                                .and_then(|id| id.as_str())
-                                .unwrap_or("")
-                                .to_string();
-
-                            let idx = invocations.len();
-                            invocations.push(ToolInvocation {
-                                tool_name: tool_name.clone(),
-                                input,
-                                timestamp: String::new(),
-                                session_id: session_id.to_string(),
-                                agent: AgentKind::Cursor,
-                                result: None,
-                            });
-
-                            if !tc_id.is_empty() {
-                                pending.insert(tc_id, idx);
-                            }
-                        }
+                        process_cursor_tool_calls(
+                            tool_calls,
+                            session_id,
+                            &mut invocations,
+                            &mut pending,
+                        );
                     }
                 }
                 "tool" => {
@@ -287,6 +259,65 @@ pub(super) fn parse_cursor_json_value(
     }
 
     Ok(invocations)
+}
+
+/// Extract tool invocations from Cursor's `tool_calls` array.
+///
+/// Each tool call has `type: "function"`, a `function` object with `name`
+/// and `arguments` (JSON-encoded string), and an `id` for result correlation.
+fn process_cursor_tool_calls(
+    tool_calls: &[serde_json::Value],
+    session_id: &str,
+    invocations: &mut Vec<ToolInvocation>,
+    pending: &mut std::collections::HashMap<String, usize>,
+) {
+    for tool_call in tool_calls {
+        let tc_type = tool_call.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if tc_type != "function" {
+            continue;
+        }
+
+        let function = match tool_call.get("function") {
+            Some(f) => f,
+            None => continue,
+        };
+
+        let tool_name = function
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let arguments_str = function
+            .get("arguments")
+            .and_then(|a| a.as_str())
+            .unwrap_or("{}");
+
+        let arguments: serde_json::Value =
+            serde_json::from_str(arguments_str).unwrap_or_default();
+
+        let input = map_cursor_tool(&tool_name, &arguments);
+
+        let tc_id = tool_call
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let idx = invocations.len();
+        invocations.push(ToolInvocation {
+            tool_name: tool_name.clone(),
+            input,
+            timestamp: String::new(),
+            session_id: session_id.to_string(),
+            agent: AgentKind::Cursor,
+            result: None,
+        });
+
+        if !tc_id.is_empty() {
+            pending.insert(tc_id, idx);
+        }
+    }
 }
 
 /// Map Cursor tool names to normalized ToolInput variants.
