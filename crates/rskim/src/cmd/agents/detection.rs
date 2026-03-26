@@ -51,7 +51,7 @@ fn detect_claude_code(home: Option<&Path>) -> AgentStatus {
     };
 
     let config_dir = home.map(|h| AgentKind::ClaudeCode.config_dir(h));
-    let hooks = detect_claude_hook(config_dir.as_deref());
+    let hooks = detect_pretooluse_hook(config_dir.as_deref());
 
     let rules_dir = AgentKind::ClaudeCode.project_dir().join("rules");
     let rules = Some(RulesInfo {
@@ -85,9 +85,7 @@ fn detect_cursor(home: Option<&Path>) -> AgentStatus {
         }
     });
 
-    // Cursor supports skim hooks via `skim init --agent cursor`
-    // (same PreToolUse + script pattern as Claude Code)
-    let hooks = detect_claude_hook(state_path.as_deref());
+    let hooks = detect_pretooluse_hook(state_path.as_deref());
 
     let rules_dir = AgentKind::Cursor.project_dir().join("rules");
     let rules = Some(RulesInfo {
@@ -302,8 +300,10 @@ fn has_skim_hook_in_settings(settings: &serde_json::Value) -> bool {
     })
 }
 
-/// Detect skim hook installation for Claude Code.
-fn detect_claude_hook(config_dir: Option<&Path>) -> HookStatus {
+/// Detect skim hook via the PreToolUse + skim-rewrite.sh pattern.
+///
+/// Shared by Claude Code and Cursor, which both use the same hook mechanism.
+fn detect_pretooluse_hook(config_dir: Option<&Path>) -> HookStatus {
     let Some(config_dir) = config_dir else {
         return HookStatus::NotInstalled;
     };
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_claude_hook_integrity_ok() {
+    fn test_detect_pretooluse_hook_integrity_ok() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path();
         let hooks_dir = config.join("hooks");
@@ -404,7 +404,7 @@ mod tests {
         crate::cmd::integrity::write_hash_manifest(config, "claude-code", "skim-rewrite.sh", &hash)
             .unwrap();
 
-        let status = detect_claude_hook(Some(config));
+        let status = detect_pretooluse_hook(Some(config));
         match status {
             HookStatus::Installed { integrity, .. } => {
                 assert_eq!(
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_claude_hook_integrity_tampered() {
+    fn test_detect_pretooluse_hook_integrity_tampered() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path();
         let hooks_dir = config.join("hooks");
@@ -450,7 +450,7 @@ mod tests {
         // Tamper with the script
         std::fs::write(&script_path, "#!/usr/bin/env bash\necho HACKED\n").unwrap();
 
-        let status = detect_claude_hook(Some(config));
+        let status = detect_pretooluse_hook(Some(config));
         match status {
             HookStatus::Installed { integrity, .. } => {
                 assert_eq!(
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_claude_hook_integrity_missing_script() {
+    fn test_detect_pretooluse_hook_integrity_missing_script() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path();
         let hooks_dir = config.join("hooks");
@@ -483,7 +483,7 @@ mod tests {
         )
         .unwrap();
 
-        let status = detect_claude_hook(Some(config));
+        let status = detect_pretooluse_hook(Some(config));
         match status {
             HookStatus::Installed { integrity, .. } => {
                 assert_eq!(
