@@ -72,11 +72,13 @@ fn archive_path(log_path: &Path, index: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// Get the skim cache directory, respecting `$SKIM_CACHE_DIR` override.
+/// Get the skim cache directory, respecting `$SKIM_CACHE_DIR` override and
+/// platform conventions.
 ///
 /// Priority: `SKIM_CACHE_DIR` env > `dirs::cache_dir()/skim`.
-/// The env override enables test isolation on all platforms.
-fn cache_dir() -> Option<std::path::PathBuf> {
+/// The env override enables test isolation on all platforms (especially macOS
+/// where `dirs::cache_dir()` ignores `$XDG_CACHE_HOME`).
+pub(super) fn cache_dir() -> Option<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("SKIM_CACHE_DIR") {
         return Some(std::path::PathBuf::from(dir));
     }

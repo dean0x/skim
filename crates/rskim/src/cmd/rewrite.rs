@@ -995,14 +995,22 @@ fn try_rewrite_tail(args: &[&str]) -> Option<RewriteResult> {
 /// Parse the `--agent <name>` flag from rewrite args.
 ///
 /// Returns `None` if `--agent` is not present or the value is missing.
-/// Does not error on unknown agent names — callers handle the fallback.
+/// Logs a warning for unknown agent names (never errors — hook mode must
+/// never fail). Callers default `None` to `AgentKind::ClaudeCode`.
 fn parse_agent_flag(args: &[String]) -> Option<AgentKind> {
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--agent" {
             i += 1;
             if i < args.len() {
-                return AgentKind::from_str(&args[i]);
+                let result = AgentKind::from_str(&args[i]);
+                if result.is_none() {
+                    super::hook_log::log_hook_warning(&format!(
+                        "unknown --agent value '{}', falling back to claude-code",
+                        &args[i]
+                    ));
+                }
+                return result;
             }
         }
         i += 1;
@@ -1063,6 +1071,8 @@ fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
 
     // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
     // Only run for Claude Code where we have the hook script infrastructure.
+    // TODO: Extend integrity checks to Cursor, Gemini, and Copilot once their
+    // hook script install paths are validated (they also report RealHook support).
     if agent_kind == AgentKind::ClaudeCode {
         let integrity_failed = check_hook_integrity(agent_kind);
         if !integrity_failed {
@@ -1319,17 +1329,10 @@ fn audit_archive_path(log_path: &std::path::Path, index: u32) -> std::path::Path
     std::path::PathBuf::from(path)
 }
 
-/// Get the skim cache directory, respecting `$SKIM_CACHE_DIR` override and
-/// platform conventions.
-///
-/// Priority: `SKIM_CACHE_DIR` env > `dirs::cache_dir()/skim`.
-/// The env override enables test isolation on all platforms (especially macOS
-/// where `dirs::cache_dir()` ignores `$XDG_CACHE_HOME`).
+/// Re-export `cache_dir` from `hook_log` to avoid duplication.
+/// See `hook_log::cache_dir` for full documentation.
 fn cache_dir() -> Option<std::path::PathBuf> {
-    if let Ok(dir) = std::env::var("SKIM_CACHE_DIR") {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    dirs::cache_dir().map(|c| c.join("skim"))
+    super::hook_log::cache_dir()
 }
 
 /// Get today's date as YYYY-MM-DD string.
