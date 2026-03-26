@@ -632,67 +632,8 @@ fn test_rewrite_hook_all_agents_zero_stderr() {
 // ============================================================================
 // Phase 6: Stderr cleanliness -- hook mode produces ZERO stderr
 // ============================================================================
-
-#[test]
-fn test_rewrite_hook_claude_code_zero_stderr() {
-    let input = serde_json::json!({
-        "tool_input": {
-            "command": "cargo test"
-        }
-    });
-    let output = skim_cmd()
-        .args(["rewrite", "--hook", "--agent", "claude-code"])
-        .write_stdin(serde_json::to_string(&input).unwrap())
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.is_empty(),
-        "Hook mode should produce zero stderr, got: {stderr}"
-    );
-}
-
-#[test]
-fn test_rewrite_hook_cursor_zero_stderr() {
-    let input = serde_json::json!({
-        "command": "cargo test"
-    });
-    let output = skim_cmd()
-        .args(["rewrite", "--hook", "--agent", "cursor"])
-        .write_stdin(serde_json::to_string(&input).unwrap())
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.is_empty(),
-        "Cursor hook mode should produce zero stderr, got: {stderr}"
-    );
-}
-
-#[test]
-fn test_rewrite_hook_gemini_zero_stderr() {
-    let input = serde_json::json!({
-        "tool_input": {
-            "command": "cargo test"
-        }
-    });
-    let output = skim_cmd()
-        .args(["rewrite", "--hook", "--agent", "gemini"])
-        .write_stdin(serde_json::to_string(&input).unwrap())
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.is_empty(),
-        "Gemini hook mode should produce zero stderr, got: {stderr}"
-    );
-}
+// Per-agent zero-stderr coverage is handled by test_rewrite_hook_all_agents_zero_stderr.
+// Only the passthrough (no --agent flag) case remains here as unique coverage.
 
 #[test]
 fn test_rewrite_hook_passthrough_zero_stderr() {
