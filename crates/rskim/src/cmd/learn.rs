@@ -700,7 +700,6 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
             // Migrate legacy filename (cli-corrections.md -> skim-corrections.md)
             let legacy_path = rules_dir.join("cli-corrections.md");
             if legacy_path.exists() && !rules_path.exists() {
-                std::fs::create_dir_all(rules_dir)?;
                 std::fs::rename(&legacy_path, &rules_path)?;
             }
 
