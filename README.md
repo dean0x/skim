@@ -616,9 +616,9 @@ Comprehensive guides for all aspects of Skim:
 |------|------|-------------|
 | **Skim** | Context Optimization | Code-aware AST parsing across 12 languages, command rewriting, test/build/git output compression |
 | **[DevFlow](https://github.com/dean0x/devflow)** | Quality Orchestration | 18 parallel reviewers, working memory, self-learning, composable plugin system |
-| **[Backbeat](https://github.com/dean0x/backbeat)** | Agent Orchestration | Orchestration at scale. Karpathy optimization loops, multi-agent pipelines, DAG dependencies, autoscaling |
+| **[Autobeat](https://github.com/dean0x/autobeat)** | Agent Orchestration | Autonomous orchestration. Eval loops, multi-agent pipelines, DAG dependencies, crash-proof persistence |
 
-Skim optimizes every byte of context. DevFlow enforces production-grade quality. Backbeat scales execution across agents. No other stack covers all three.
+Skim optimizes every byte of context. DevFlow enforces production-grade quality. Autobeat scales execution across agents. No other stack covers all three.
 
 ## Contributing
 
