@@ -759,23 +759,28 @@ fn test_hook_pipe_command_passthrough() {
 
 #[test]
 fn test_hook_version_mismatch_warning() {
-    // Set SKIM_HOOK_VERSION to a value that differs from the compiled version,
-    // triggering the version mismatch warning on stderr.
+    // Use a temp dir for cache to avoid stamp file pollution across tests.
+    let cache_dir = TempDir::new().unwrap();
+
+    // Set SKIM_HOOK_VERSION to a value that differs from the compiled version.
+    // The warning now goes to hook.log (NEVER stderr -- GRANITE #361 Bug 3).
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--hook"])
         .env("SKIM_HOOK_VERSION", "0.0.1")
+        .env("SKIM_CACHE_DIR", cache_dir.path().as_os_str())
         .write_stdin(hook_payload("cargo test"))
         .assert()
         .success();
 
+    // CRITICAL: stderr MUST be empty in hook mode (zero-stderr invariant)
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     assert!(
-        stderr.contains("version mismatch"),
-        "Should warn about version mismatch on stderr, got: {stderr}"
+        stderr.is_empty(),
+        "Hook mode must have zero stderr even on version mismatch, got: {stderr}"
     );
 
-    // The rewrite should still succeed despite the warning
+    // The rewrite should still succeed
     let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert!(
@@ -783,7 +788,19 @@ fn test_hook_version_mismatch_warning() {
             .as_str()
             .unwrap()
             .contains("skim test cargo"),
-        "Rewrite should succeed despite version mismatch warning"
+        "Rewrite should succeed despite version mismatch"
+    );
+
+    // Verify warning went to hook.log file instead
+    let hook_log = cache_dir.path().join("hook.log");
+    assert!(
+        hook_log.exists(),
+        "Version mismatch warning should be written to hook.log"
+    );
+    let log_content = fs::read_to_string(&hook_log).unwrap();
+    assert!(
+        log_content.contains("version mismatch"),
+        "hook.log should contain version mismatch warning, got: {log_content}"
     );
 }
 
@@ -814,4 +831,30 @@ fn test_rewrite_hook_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--hook"));
+}
+
+// ============================================================================
+// Phase 6: Multi-agent awareness in skim init
+// ============================================================================
+
+#[test]
+fn test_init_help_mentions_agent_flag() {
+    // init --help should document the --agent flag for multi-agent support
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["init", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--agent"));
+}
+
+#[test]
+fn test_rewrite_help_mentions_agent_flag() {
+    // rewrite --help should mention the --agent flag
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--agent"));
 }

@@ -5,8 +5,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::types::*;
+use super::types::{AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation, ToolResult};
 use super::SessionProvider;
+
+/// Maximum session file size: 100 MB.
+const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Claude Code session file provider.
 pub(crate) struct ClaudeCodeProvider {
@@ -21,7 +24,9 @@ impl ClaudeCodeProvider {
         let projects_dir = if let Ok(override_dir) = std::env::var("SKIM_PROJECTS_DIR") {
             PathBuf::from(override_dir)
         } else {
-            dirs::home_dir()?.join(".claude").join("projects")
+            AgentKind::ClaudeCode
+                .config_dir(&dirs::home_dir()?)
+                .join("projects")
         };
 
         if projects_dir.is_dir() {
@@ -119,7 +124,6 @@ impl SessionProvider for ClaudeCodeProvider {
 
     fn parse_session(&self, file: &SessionFile) -> anyhow::Result<Vec<ToolInvocation>> {
         // Guard against unbounded reads -- reject files over 100 MB
-        const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
         let file_size = std::fs::metadata(&file.path)?.len();
         if file_size > MAX_SESSION_SIZE {
             anyhow::bail!(

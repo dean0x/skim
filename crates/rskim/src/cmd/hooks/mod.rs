@@ -1,0 +1,276 @@
+//! Hook protocol abstraction for multi-agent hook integration.
+//!
+//! Each agent that supports tool interception hooks implements `HookProtocol`.
+//! Agents without hook support use awareness-only installation.
+
+pub(crate) mod claude;
+pub(crate) mod codex;
+pub(crate) mod copilot;
+pub(crate) mod cursor;
+pub(crate) mod gemini;
+pub(crate) mod opencode;
+
+use super::session::AgentKind;
+
+/// Whether an agent supports real hooks or awareness-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookSupport {
+    /// Agent supports real tool interception hooks.
+    RealHook,
+    /// Agent has no hook mechanism; install awareness files only.
+    AwarenessOnly,
+}
+
+/// Input extracted from agent's hook event JSON.
+#[derive(Debug, Clone)]
+pub(crate) struct HookInput {
+    pub(crate) command: String,
+}
+
+/// Result of a hook installation.
+#[derive(Debug)]
+#[allow(dead_code)] // Used in per-agent install() tests
+pub(crate) struct InstallResult {
+    pub(crate) script_path: Option<std::path::PathBuf>,
+    pub(crate) config_patched: bool,
+}
+
+/// Options passed to install/uninstall.
+#[derive(Debug)]
+#[allow(dead_code)] // Used in per-agent install() tests
+pub(crate) struct InstallOpts {
+    pub(crate) binary_path: std::path::PathBuf,
+    pub(crate) version: String,
+    pub(crate) config_dir: std::path::PathBuf,
+    pub(crate) project_scope: bool,
+    pub(crate) dry_run: bool,
+}
+
+/// Options for uninstall.
+#[derive(Debug)]
+#[allow(dead_code)] // Used in per-agent uninstall() tests
+pub(crate) struct UninstallOpts {
+    pub(crate) config_dir: std::path::PathBuf,
+    pub(crate) force: bool,
+}
+
+/// Trait for agent-specific hook protocols.
+///
+/// Each agent's hook system is different. This trait normalizes:
+/// - Hook event parsing (agent JSON -> HookInput)
+/// - Response formatting (rewritten command -> agent JSON)
+/// - Script generation (binary path -> shell script)
+/// - Installation/uninstallation
+pub(crate) trait HookProtocol {
+    #[allow(dead_code)] // Used in tests only
+    fn agent_kind(&self) -> AgentKind;
+
+    fn hook_support(&self) -> HookSupport;
+    fn parse_input(&self, json: &serde_json::Value) -> Option<HookInput>;
+    fn format_response(&self, rewritten_command: &str) -> serde_json::Value;
+
+    #[allow(dead_code)] // Used in tests only
+    fn generate_script(&self, binary_path: &str, version: &str) -> String;
+
+    /// Default no-op install. Override for agents with real hook installation.
+    #[allow(dead_code)] // Used in tests only
+    fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
+        Ok(InstallResult {
+            script_path: None,
+            config_patched: false,
+        })
+    }
+
+    /// Default no-op uninstall. Override for agents with real hook removal.
+    #[allow(dead_code)] // Used in tests only
+    fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Shared parser for agents whose hook JSON nests the command under `tool_input.command`.
+///
+/// Used by Claude Code, Copilot CLI, and Gemini CLI. Cursor differs (top-level `command`).
+/// Codex and OpenCode are awareness-only and return `None` from `parse_input` directly.
+pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookInput> {
+    let command = json
+        .get("tool_input")
+        .and_then(|ti| ti.get("command"))
+        .and_then(|c| c.as_str())?
+        .to_string();
+    Some(HookInput { command })
+}
+
+/// Characters that can escape double-quote context or inject shell commands.
+///
+/// Matches the set used by `validate_shell_safe_path` in the init installer.
+const SHELL_UNSAFE_CHARS: &[char] = &['"', '`', '$', '\\', '\n', '\0'];
+
+/// Generate a standard hook script for an agent.
+///
+/// Shared by all RealHook agents. The script sets `SKIM_HOOK_VERSION` and
+/// `exec`s the skim binary with `rewrite --hook --agent <agent_cli_name>`.
+///
+/// # Panics
+///
+/// Panics if `binary_path`, `version`, or `agent_cli_name` contain
+/// shell-unsafe characters (`"`, `` ` ``, `$`, `\`, newline, null).
+#[allow(dead_code)] // Called by per-agent generate_script() impls, which are test-only
+pub(crate) fn generate_hook_script(
+    binary_path: &str,
+    version: &str,
+    agent_cli_name: &str,
+) -> String {
+    assert!(
+        !binary_path.chars().any(|c| SHELL_UNSAFE_CHARS.contains(&c)),
+        "binary_path contains shell-unsafe character: {binary_path}"
+    );
+    assert!(
+        version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'),
+        "version contains unsafe characters for shell interpolation: {version}"
+    );
+    assert!(
+        agent_cli_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "agent_cli_name contains unsafe characters for shell interpolation: {agent_cli_name}"
+    );
+    format!(
+        "#!/usr/bin/env bash\n\
+         # skim-hook v{version}\n\
+         # Generated by: skim init --agent {agent_cli_name} -- do not edit manually\n\
+         export SKIM_HOOK_VERSION=\"{version}\"\n\
+         exec \"{binary_path}\" rewrite --hook --agent {agent_cli_name}\n"
+    )
+}
+
+/// Factory: create the appropriate HookProtocol implementation for a given agent.
+pub(crate) fn protocol_for_agent(kind: AgentKind) -> Box<dyn HookProtocol> {
+    match kind {
+        AgentKind::ClaudeCode => Box::new(claude::ClaudeCodeHook),
+        AgentKind::Cursor => Box::new(cursor::CursorHook),
+        AgentKind::GeminiCli => Box::new(gemini::GeminiCliHook),
+        AgentKind::CopilotCli => Box::new(copilot::CopilotCliHook),
+        AgentKind::CodexCli => Box::new(codex::CodexCliHook),
+        AgentKind::OpenCode => Box::new(opencode::OpenCodeHook),
+    }
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hook_support_equality() {
+        assert_eq!(HookSupport::RealHook, HookSupport::RealHook);
+        assert_ne!(HookSupport::RealHook, HookSupport::AwarenessOnly);
+    }
+
+    #[test]
+    fn test_hook_input_clone() {
+        let input = HookInput {
+            command: "cargo test".to_string(),
+        };
+        let cloned = input.clone();
+        assert_eq!(cloned.command, "cargo test");
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_valid() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "command": "cargo test --nocapture"
+            }
+        });
+        let result = parse_tool_input_command(&json);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().command, "cargo test --nocapture");
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_missing_tool_input() {
+        let json = serde_json::json!({});
+        assert!(parse_tool_input_command(&json).is_none());
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_missing_command() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "file_path": "/tmp/test.rs"
+            }
+        });
+        assert!(parse_tool_input_command(&json).is_none());
+    }
+
+    #[test]
+    fn test_parse_tool_input_command_non_string() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "command": 42
+            }
+        });
+        assert!(parse_tool_input_command(&json).is_none());
+    }
+
+    #[test]
+    fn test_generate_hook_script_structure() {
+        let script = generate_hook_script("/usr/local/bin/skim", "1.2.3", "test-agent");
+        assert!(script.starts_with("#!/usr/bin/env bash\n"));
+        assert!(script.contains("# skim-hook v1.2.3"));
+        assert!(script.contains("skim init --agent test-agent"));
+        assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.3\""));
+        assert!(script.contains("exec \"/usr/local/bin/skim\" rewrite --hook --agent test-agent"));
+    }
+
+    // ---- Shell injection guard tests ----
+
+    #[test]
+    #[should_panic(expected = "binary_path contains shell-unsafe character")]
+    fn test_generate_hook_script_rejects_backtick_in_path() {
+        generate_hook_script("/usr/local/bin/`evil`", "1.0.0", "test-agent");
+    }
+
+    #[test]
+    #[should_panic(expected = "binary_path contains shell-unsafe character")]
+    fn test_generate_hook_script_rejects_dollar_in_path() {
+        generate_hook_script("/usr/local/bin/$HOME/skim", "1.0.0", "test-agent");
+    }
+
+    #[test]
+    #[should_panic(expected = "binary_path contains shell-unsafe character")]
+    fn test_generate_hook_script_rejects_quote_in_path() {
+        generate_hook_script("/usr/local/bin/sk\"im", "1.0.0", "test-agent");
+    }
+
+    #[test]
+    #[should_panic(expected = "binary_path contains shell-unsafe character")]
+    fn test_generate_hook_script_rejects_newline_in_path() {
+        generate_hook_script("/usr/local/bin/skim\n;rm -rf /", "1.0.0", "test-agent");
+    }
+
+    #[test]
+    #[should_panic(expected = "version contains unsafe characters")]
+    fn test_generate_hook_script_rejects_unsafe_version() {
+        generate_hook_script("/usr/local/bin/skim", "1.0.0$(evil)", "test-agent");
+    }
+
+    #[test]
+    #[should_panic(expected = "agent_cli_name contains unsafe characters")]
+    fn test_generate_hook_script_rejects_unsafe_agent_name() {
+        generate_hook_script("/usr/local/bin/skim", "1.0.0", "agent;rm -rf /");
+    }
+
+    #[test]
+    fn test_generate_hook_script_accepts_path_with_spaces() {
+        // Spaces are safe because binary_path is double-quoted in the script
+        let script = generate_hook_script("/Users/my user/bin/skim", "1.0.0", "test-agent");
+        assert!(script.contains("exec \"/Users/my user/bin/skim\""));
+    }
+}

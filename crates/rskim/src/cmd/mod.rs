@@ -5,11 +5,15 @@
 //! helper functions used by subcommand parsers (arg inspection, flag injection,
 //! command execution with three-tier parse degradation).
 
+mod agents;
 mod build;
 mod completions;
 mod discover;
 mod git;
+mod hook_log;
+mod hooks;
 mod init;
+mod integrity;
 mod learn;
 mod rewrite;
 mod session;
@@ -27,6 +31,7 @@ use crate::runner::{CommandOutput, CommandRunner};
 /// IMPORTANT: Only register subcommands we will actually implement.
 /// Keep this list exact — no broad patterns. See GRANITE lesson #336.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "agents",
     "build",
     "completions",
     "discover",
@@ -272,6 +277,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
     }
 
     match subcommand {
+        "agents" => agents::run(args),
         "build" => build::run(args),
         "completions" => completions::run(args),
         "discover" => discover::run(args),

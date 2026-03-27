@@ -2,7 +2,7 @@
 //!
 //! Scans AI agent session files for error-retry patterns: a failed Bash command
 //! followed by a similar successful command within the next few invocations.
-//! Optionally generates a `.claude/rules/cli-corrections.md` rules file.
+//! Optionally generates an agent-specific rules file (e.g., `.claude/rules/skim-corrections.md`).
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -62,10 +62,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     if config.json_output {
         print_json_report(&corrections)?;
     } else if config.generate {
-        let content = generate_rules_content(&corrections);
-        write_rules_file(&content, config.dry_run)?;
+        // Use the agent filter for rules output format, default to ClaudeCode
+        let rules_agent = config.agent_filter.unwrap_or(AgentKind::ClaudeCode);
+        let content = generate_rules_content(&corrections, rules_agent);
+        write_rules_file(&content, rules_agent, config.dry_run)?;
     } else {
-        print_text_report(&corrections);
+        let rules_agent = config.agent_filter.unwrap_or(AgentKind::ClaudeCode);
+        print_text_report(&corrections, rules_agent);
     }
 
     Ok(ExitCode::SUCCESS)
@@ -111,9 +114,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
                 if i >= args.len() {
                     anyhow::bail!("--agent requires a value (e.g., claude-code)");
                 }
-                config.agent_filter = Some(AgentKind::from_str(&args[i]).ok_or_else(|| {
-                    anyhow::anyhow!("unknown agent: '{}'\nSupported: claude-code", &args[i])
-                })?);
+                config.agent_filter = Some(AgentKind::parse_cli_arg(&args[i])?);
             }
             other => {
                 anyhow::bail!(
@@ -140,6 +141,9 @@ struct CorrectionPair {
     pattern_type: PatternType,
     occurrences: usize,
     sessions: Vec<String>,
+    /// Which agent produced this correction (for per-agent rules output).
+    #[allow(dead_code)] // Read in Phase 2 for per-agent filtering
+    agent: AgentKind,
 }
 
 /// Classification of how the correction differs from the original.
@@ -196,9 +200,14 @@ fn detect_corrections(bash_invocations: &[&ToolInvocation]) -> Vec<CorrectionPai
             _ => continue,
         };
 
-        if let Some(pair) =
-            find_correction(bash_invocations, i, failed_cmd, result, &inv.session_id)
-        {
+        if let Some(pair) = find_correction(
+            bash_invocations,
+            i,
+            failed_cmd,
+            result,
+            &inv.session_id,
+            inv.agent,
+        ) {
             corrections.push(pair);
         }
     }
@@ -213,6 +222,7 @@ fn find_correction(
     failed_cmd: &str,
     error_result: &session::ToolResult,
     session_id: &str,
+    agent: AgentKind,
 ) -> Option<CorrectionPair> {
     const LOOKAHEAD: usize = 5;
     let end = (failed_idx + 1 + LOOKAHEAD).min(invocations.len());
@@ -232,10 +242,11 @@ fn find_correction(
             return Some(CorrectionPair {
                 failed_command: failed_cmd.to_string(),
                 successful_command: candidate_cmd.to_string(),
-                error_output: error_result.content.chars().take(200).collect(),
+                error_output: sanitize_error_output(&error_result.content),
                 pattern_type: pattern,
                 occurrences: 1,
                 sessions: vec![session_id.to_string()],
+                agent,
             });
         }
     }
@@ -386,29 +397,24 @@ fn levenshtein(a: &str, b: &str) -> usize {
         return len_diff;
     }
 
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-
-    for (i, row) in dp.iter_mut().enumerate().take(m + 1) {
-        row[0] = i;
-    }
-    for (j, val) in dp[0].iter_mut().enumerate().take(n + 1) {
-        *val = j;
-    }
+    // Two-row DP: O(n) space instead of O(m*n).
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
 
     for i in 1..=m {
+        curr[0] = i;
         for j in 1..=n {
             let cost = if a_chars[i - 1] == b_chars[j - 1] {
                 0
             } else {
                 1
             };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
+        std::mem::swap(&mut prev, &mut curr);
     }
 
-    dp[m][n]
+    prev[n]
 }
 
 // ============================================================================
@@ -437,15 +443,10 @@ fn truncate_utf8(s: &str, max_len: usize) -> &str {
 fn looks_like_error(content: &str) -> bool {
     let check_content = truncate_utf8(content, 1024);
 
-    let lower = check_content.to_lowercase();
+    let lower = check_content.to_ascii_lowercase();
 
-    // Quick exclusion: "0 failed" is a success indicator in test output
-    let has_failed = if lower.contains("failed") {
-        // Only count as error if there's a non-zero count before "failed"
-        !lower.contains("0 failed")
-    } else {
-        false
-    };
+    // "0 failed" is a success indicator in test output — exclude it
+    let has_failed = lower.contains("failed") && !lower.contains("0 failed");
 
     // Use prefix patterns to avoid matching benign occurrences like
     // "0 errors generated", "error_handler.rs", etc.
@@ -463,7 +464,6 @@ fn looks_like_error(content: &str) -> bool {
         || lower.contains("command not found")
         || has_failed
         || lower.starts_with("fatal:")
-        || (check_content.contains("FAILED") && !lower.contains("0 failed"))
         || check_content.contains("Exit code")
 }
 
@@ -591,8 +591,24 @@ fn looks_like_path(s: &str) -> bool {
 // ============================================================================
 
 /// Generate the rules file content from correction pairs.
-fn generate_rules_content(corrections: &[CorrectionPair]) -> String {
+///
+/// Adds agent-specific frontmatter for Cursor (.mdc) and Copilot (.instructions.md).
+fn generate_rules_content(corrections: &[CorrectionPair], agent: AgentKind) -> String {
     let mut output = String::new();
+
+    // Agent-specific frontmatter
+    match agent {
+        AgentKind::Cursor => {
+            output.push_str(
+                "---\nalwaysApply: true\ndescription: CLI corrections learned by skim\n---\n\n",
+            );
+        }
+        AgentKind::CopilotCli => {
+            output.push_str("---\napplyTo: \"**/*\"\n---\n\n");
+        }
+        _ => {}
+    }
+
     output.push_str("# CLI Corrections\n\n");
     output
         .push_str("Generated by `skim learn`. Common CLI mistakes detected in your sessions.\n\n");
@@ -617,44 +633,78 @@ fn generate_rules_content(corrections: &[CorrectionPair]) -> String {
     output
 }
 
-/// Sanitize a command string for safe inclusion in a markdown rules file.
+/// Sanitize a string for safe inclusion in a markdown rules file.
 ///
 /// Prevents prompt injection by:
-/// - Truncating to 200 chars (commands longer than this are not useful rules)
+/// - Collapsing to single line
+/// - Truncating to `max_len` chars (longer strings are not useful in rules)
 /// - Escaping backticks to prevent breaking out of inline code
 /// - Stripping markdown heading markers at line start
-/// - Collapsing to single line
-fn sanitize_command_for_rules(cmd: &str) -> String {
-    // Collapse to single line, trim whitespace
-    let single_line: String = cmd
+fn sanitize_for_rules(s: &str, max_len: usize) -> String {
+    let single_line: String = s
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
     let single_line = single_line.trim();
 
-    // Truncate to max length, then escape/strip injection vectors
-    truncate_utf8(single_line, 200)
+    truncate_utf8(single_line, max_len)
         .replace('`', "'")
         .trim_start_matches('#')
         .trim_start()
         .to_string()
 }
 
-/// Write the rules file to `.claude/rules/cli-corrections.md`.
-fn write_rules_file(content: &str, dry_run: bool) -> anyhow::Result<()> {
-    let rules_dir = std::path::Path::new(".claude").join("rules");
-    let rules_path = rules_dir.join("cli-corrections.md");
+/// Sanitize error output to prevent data leakage and prompt injection.
+fn sanitize_error_output(error: &str) -> String {
+    sanitize_for_rules(error, 200)
+}
 
-    if dry_run {
-        println!("Would write to: {}", rules_path.display());
-        println!("---");
-        print!("{content}");
-        return Ok(());
+/// Sanitize a command string for safe inclusion in a markdown rules file.
+fn sanitize_command_for_rules(cmd: &str) -> String {
+    sanitize_for_rules(cmd, 200)
+}
+
+/// Write the rules file to the appropriate agent-specific location.
+///
+/// For agents with a rules directory (Claude Code, Cursor, Copilot),
+/// creates the file automatically. For single-file agents (Codex, Gemini,
+/// OpenCode), prints the content with instructions to paste.
+fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::Result<()> {
+    match agent.rules_dir() {
+        Some(dir) => {
+            // Directory-based agents: auto-create file
+            let rules_dir = std::path::Path::new(&dir);
+            let filename = agent.rules_filename();
+            let rules_path = rules_dir.join(filename);
+
+            // Migrate legacy filename (cli-corrections.md -> skim-corrections.md)
+            let legacy_path = rules_dir.join("cli-corrections.md");
+            if legacy_path.exists() && !rules_path.exists() {
+                std::fs::rename(&legacy_path, &rules_path)?;
+            }
+
+            if dry_run {
+                println!("Would write to: {}", rules_path.display());
+                println!("---");
+                print!("{content}");
+                return Ok(());
+            }
+
+            std::fs::create_dir_all(rules_dir)?;
+            std::fs::write(&rules_path, content)?;
+            println!("Wrote corrections to: {}", rules_path.display());
+        }
+        None => {
+            // Single-file agents: print content with instructions
+            println!(
+                "Add the following to your {} configuration:\n",
+                agent.display_name()
+            );
+            println!("---");
+            print!("{content}");
+            println!("---");
+        }
     }
-
-    std::fs::create_dir_all(&rules_dir)?;
-    std::fs::write(&rules_path, content)?;
-    println!("Wrote corrections to: {}", rules_path.display());
     Ok(())
 }
 
@@ -662,7 +712,7 @@ fn write_rules_file(content: &str, dry_run: bool) -> anyhow::Result<()> {
 // Output
 // ============================================================================
 
-fn print_text_report(corrections: &[CorrectionPair]) {
+fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
     println!(
         "skim learn -- {} correction{} detected\n",
         corrections.len(),
@@ -689,9 +739,14 @@ fn print_text_report(corrections: &[CorrectionPair]) {
         println!();
     }
 
-    println!(
-        "hint: run `skim learn --generate` to write corrections to .claude/rules/cli-corrections.md"
-    );
+    let target = match agent.rules_dir() {
+        Some(dir) => std::path::Path::new(&dir)
+            .join(agent.rules_filename())
+            .display()
+            .to_string(),
+        None => format!("{} configuration", agent.display_name()),
+    };
+    println!("hint: run `skim learn --generate` to write corrections to {target}");
 }
 
 fn print_json_report(corrections: &[CorrectionPair]) -> anyhow::Result<()> {
@@ -729,7 +784,9 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  --since <duration>   Time window (e.g., 24h, 7d, 1w) [default: 7d]");
-    println!("  --generate           Write rules to .claude/rules/cli-corrections.md");
+    println!("                       (7d default provides enough history for");
+    println!("                        reliable error-pattern detection)");
+    println!("  --generate           Write rules to agent-specific rules file");
     println!("  --dry-run            Preview rules without writing (requires --generate)");
     println!("  --agent <name>       Only scan sessions from a specific agent");
     println!("  --json               Output machine-readable JSON");
@@ -753,7 +810,7 @@ pub(super) fn command() -> clap::Command {
             clap::Arg::new("since")
                 .long("since")
                 .value_name("DURATION")
-                .help("Time window (e.g., 24h, 7d, 1w)"),
+                .help("Time window (e.g., 24h, 7d, 1w) [default: 7d]"),
         )
         .arg(
             clap::Arg::new("generate")
@@ -1104,6 +1161,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
         let pair2 = CorrectionPair {
             failed_command: "carg test".to_string(),
@@ -1112,6 +1170,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess2".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair1, pair2]);
@@ -1129,6 +1188,7 @@ mod tests {
             pattern_type: PatternType::MissingArg,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair]);
@@ -1147,6 +1207,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair]);
@@ -1162,6 +1223,7 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 1,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         };
 
         let result = deduplicate_and_filter(vec![pair]);
@@ -1179,13 +1241,16 @@ mod tests {
             pattern_type: PatternType::FlagTypo,
             occurrences: 3,
             sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
         }];
 
-        let content = generate_rules_content(&corrections);
+        let content = generate_rules_content(&corrections, AgentKind::ClaudeCode);
         assert!(content.contains("# CLI Corrections"));
         assert!(content.contains("Typo (seen 3 times)"));
         assert!(content.contains("Instead of: `carg test`"));
         assert!(content.contains("Use: `cargo test`"));
+        // Claude Code: no frontmatter
+        assert!(!content.starts_with("---"));
     }
 
     // ---- parse_args ----
@@ -1462,5 +1527,60 @@ mod tests {
             corrections.is_empty(),
             "TDD cycles should not produce corrections"
         );
+    }
+
+    // ---- per-agent rules file output ----
+    // Note: rules_filename() tests moved to session::types::tests (AgentKind method)
+
+    #[test]
+    fn test_generate_rules_content_cursor_frontmatter() {
+        let corrections = vec![CorrectionPair {
+            failed_command: "carg test".to_string(),
+            successful_command: "cargo test".to_string(),
+            error_output: "error".to_string(),
+            pattern_type: PatternType::FlagTypo,
+            occurrences: 1,
+            sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
+        }];
+
+        let content = generate_rules_content(&corrections, AgentKind::Cursor);
+        assert!(content.starts_with("---\nalwaysApply: true\n"));
+        assert!(content.contains("description: CLI corrections learned by skim"));
+        assert!(content.contains("# CLI Corrections"));
+    }
+
+    #[test]
+    fn test_generate_rules_content_copilot_frontmatter() {
+        let corrections = vec![CorrectionPair {
+            failed_command: "carg test".to_string(),
+            successful_command: "cargo test".to_string(),
+            error_output: "error".to_string(),
+            pattern_type: PatternType::FlagTypo,
+            occurrences: 1,
+            sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
+        }];
+
+        let content = generate_rules_content(&corrections, AgentKind::CopilotCli);
+        assert!(content.starts_with("---\napplyTo:"));
+        assert!(content.contains("# CLI Corrections"));
+    }
+
+    #[test]
+    fn test_generate_rules_content_codex_no_frontmatter() {
+        let corrections = vec![CorrectionPair {
+            failed_command: "carg test".to_string(),
+            successful_command: "cargo test".to_string(),
+            error_output: "error".to_string(),
+            pattern_type: PatternType::FlagTypo,
+            occurrences: 1,
+            sessions: vec!["sess1".to_string()],
+            agent: AgentKind::ClaudeCode,
+        }];
+
+        let content = generate_rules_content(&corrections, AgentKind::CodexCli);
+        assert!(!content.starts_with("---"));
+        assert!(content.starts_with("# CLI Corrections"));
     }
 }

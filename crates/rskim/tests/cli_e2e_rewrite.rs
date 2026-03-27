@@ -306,3 +306,361 @@ fn test_rewrite_hook_compound_cargo_test_and_build() {
         .stdout(predicate::str::contains("skim test cargo"))
         .stdout(predicate::str::contains("skim build cargo"));
 }
+
+// ============================================================================
+// Phase 6: Hook protocol per-agent tests
+// ============================================================================
+
+#[test]
+fn test_rewrite_hook_default_is_claude_code_behavior() {
+    // --hook without --agent should default to Claude Code behavior
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Should produce hookSpecificOutput (Claude Code behavior)
+    assert!(
+        stdout.contains("hookSpecificOutput"),
+        "Default hook mode should produce Claude Code hookSpecificOutput"
+    );
+    assert!(
+        stdout.contains("skim test cargo"),
+        "Should rewrite cargo test"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_claude_code_explicit() {
+    // --hook --agent claude-code should produce Claude Code hookSpecificOutput
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "claude-code"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert!(json["hookSpecificOutput"]["updatedInput"]["command"]
+        .as_str()
+        .unwrap()
+        .contains("skim test cargo"));
+}
+
+#[test]
+fn test_rewrite_hook_agent_gemini_match() {
+    // Gemini uses same input format as Claude Code (tool_input.command)
+    // but responds with { "decision": "allow", "tool_input": { "command": ... } }
+    let input = serde_json::json!({
+        "tool_name": "shell",
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "gemini"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        json["decision"], "allow",
+        "Gemini response should have decision=allow"
+    );
+    assert!(
+        json["tool_input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("skim test cargo"),
+        "Gemini response should contain rewritten command"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_gemini_no_match_passthrough() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "echo hello"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "gemini"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "Gemini no-match should passthrough (empty stdout), got: {stdout}"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_copilot_match() {
+    // Copilot uses deny-with-suggestion response format
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "copilot"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        json["permissionDecision"], "deny",
+        "Copilot response should have permissionDecision=deny"
+    );
+    assert!(
+        json["reason"].as_str().unwrap().contains("skim test cargo"),
+        "Copilot deny reason should contain rewritten command"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_copilot_no_match_passthrough() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "echo hello"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "copilot"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "Copilot no-match should passthrough (empty stdout), got: {stdout}"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_cursor_match() {
+    // Cursor uses { "command": ... } at top level (not nested under tool_input)
+    // and responds with { "permission": "allow", "updated_input": { "command": ... } }
+    let input = serde_json::json!({
+        "command": "cargo test"
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "cursor"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        json["permission"], "allow",
+        "Cursor response should have permission=allow"
+    );
+    assert!(
+        json["updated_input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("skim test cargo"),
+        "Cursor response should contain rewritten command"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_cursor_no_match_passthrough() {
+    let input = serde_json::json!({
+        "command": "echo hello"
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "cursor"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "Cursor no-match should passthrough (empty stdout), got: {stdout}"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_codex_awareness_only() {
+    // Codex is AwarenessOnly — always empty stdout, exit 0
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "codex"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "Codex (AwarenessOnly) should produce empty stdout, got: {stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.is_empty(),
+        "Codex hook mode should produce zero stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_opencode_awareness_only() {
+    // OpenCode is AwarenessOnly — always empty stdout, exit 0
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "opencode"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "OpenCode (AwarenessOnly) should produce empty stdout, got: {stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.is_empty(),
+        "OpenCode hook mode should produce zero stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_agent_unknown_passthrough() {
+    // Unknown agent name (not in AgentKind::from_str) should default to
+    // Claude Code behavior since parse_agent_flag returns None.
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook", "--agent", "unknown-agent"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Unknown agent should not crash, exit 0"
+    );
+
+    // Unknown agent falls back to Claude Code -- "cargo test" is rewritable,
+    // so stdout should contain a Claude Code hook response.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("hookSpecificOutput"),
+        "Unknown agent should fall back to Claude Code response format, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_rewrite_hook_all_agents_zero_stderr() {
+    // Verify ALL hook responses have empty stderr
+    let agents_and_inputs: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "claude-code",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+        ("cursor", serde_json::json!({"command": "cargo test"})),
+        (
+            "gemini",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+        (
+            "copilot",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+        (
+            "codex",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+        (
+            "opencode",
+            serde_json::json!({"tool_input": {"command": "cargo test"}}),
+        ),
+    ];
+
+    for (agent, input) in agents_and_inputs {
+        let output = skim_cmd()
+            .args(["rewrite", "--hook", "--agent", agent])
+            .write_stdin(serde_json::to_string(&input).unwrap())
+            .output()
+            .unwrap();
+
+        assert!(output.status.success(), "Agent {agent} should exit 0");
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        assert!(
+            stderr.is_empty(),
+            "Agent {agent} hook mode must produce zero stderr, got: {stderr}"
+        );
+    }
+}
+
+// ============================================================================
+// Phase 6: Stderr cleanliness -- hook mode produces ZERO stderr
+// ============================================================================
+// Per-agent zero-stderr coverage is handled by test_rewrite_hook_all_agents_zero_stderr.
+// Only the passthrough (no --agent flag) case remains here as unique coverage.
+
+#[test]
+fn test_rewrite_hook_passthrough_zero_stderr() {
+    // Non-matching command with no agent flag
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "ls -la"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook"])
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.is_empty(),
+        "Passthrough hook mode should produce zero stderr, got: {stderr}"
+    );
+}

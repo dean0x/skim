@@ -244,6 +244,92 @@ fn test_rewrite_compound_bail_on_variable_expansion() {
 }
 
 // ============================================================================
+// Shell redirects (GRANITE #530)
+// ============================================================================
+
+#[test]
+fn test_rewrite_redirect_stderr_to_stdout() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test 2>&1\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo 2>&1"));
+}
+
+#[test]
+fn test_rewrite_redirect_stderr_to_stdout_pipe() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test 2>&1 | head\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo 2>&1"))
+        .stdout(predicate::str::contains("|"))
+        .stdout(predicate::str::contains("head"));
+}
+
+#[test]
+fn test_rewrite_redirect_stderr_to_stdout_compound() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test 2>&1 && cargo build\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo 2>&1"))
+        .stdout(predicate::str::contains("&&"))
+        .stdout(predicate::str::contains("skim build cargo"));
+}
+
+#[test]
+fn test_rewrite_redirect_stderr_to_devnull() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test 2>/dev/null\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo 2>/dev/null"));
+}
+
+#[test]
+fn test_rewrite_redirect_stdout_to_file() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test > output.txt\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo > output.txt"));
+}
+
+#[test]
+fn test_rewrite_redirect_both_to_file() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("cargo test &> output.txt\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test cargo &> output.txt"));
+}
+
+#[test]
+fn test_rewrite_redirect_git_with_skip_flags() {
+    // Redirect must not trigger skip_if_flag_prefix (--porcelain, --stat, etc.)
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("git status 2>&1\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git status 2>&1"));
+}
+
+// ============================================================================
 // Git with skip flags
 // ============================================================================
 
