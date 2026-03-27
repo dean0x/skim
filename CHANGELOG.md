@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-03-28
+
+Major release: skim evolves from a streaming code reader into a full context optimization engine for AI coding agents. Adds command output compression, agent hook integration, persistent analytics, and MCP server mode.
+
+### Added — Command Output Compression
+- **Test Output Parsers** — cargo test (`--message-format=json`), pytest (`--tb=short`), vitest/jest (`--reporter=json`), go test (`-json`) with three-tier degradation: Structured → Regex → Passthrough
+- **Git Output Compression** — `skim git` compresses `git status`, `git diff`, `git log` output
+- **Build Output Compression** — `skim build` compresses `cargo build`, `cargo clippy`, `tsc` output
+- **Three-Tier Parse Degradation** — all parsers gracefully degrade: Structured JSON → Regex fallback → Passthrough (never corrupts output)
+- **Output Guardrail** — compressed output is guaranteed never larger than raw input
+- **Raw Output Recovery** — on parse failure, original output preserved via tee/recovery system
+
+### Added — Agent Integration
+- **`skim init`** — one-command hook installation for 6 AI agents: Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode
+- **`skim rewrite`** — declarative command rewriting engine with `--hook` mode for agent integration
+- **Compound Shell Support** — rewrite engine handles piped commands and `&&`/`||` chains
+- **`skim init --uninstall`** — clean hook removal with SHA-256 integrity verification
+- **Multi-Agent Session Support** — discover and learn commands work across all 6 agent session formats
+
+### Added — Token Analytics & Intelligence
+- **`skim stats`** — persistent SQLite-based analytics dashboard with per-command savings, daily/weekly trends
+- **`skim stats --cost`** — cost estimation with configurable $/MTok rate (`SKIM_INPUT_COST_PER_MTOK`)
+- **`skim stats --format json`** — machine-readable analytics export
+- **`skim discover`** — scan agent session history to identify missed optimization opportunities
+- **`skim learn`** — detect CLI error-retry patterns and generate correction rules
+- **Fire-and-forget recording** — analytics never blocks main output path (background threads)
+
+### Added — Infrastructure
+- **MCP Server Mode** — native Model Context Protocol integration for agent-native workflows
+- **Shell Completions** — `skim completions bash|zsh|fish` for all subcommands
+- **Homebrew Distribution** — `brew install dean0x/tap/skim`
+- **`skim agents`** — display detected AI agents and their hook/session status (`--json`)
+- **Pre-parse Router** — CLI subcommand dispatch without full argument parsing
+
+### Added — Code Reading Enhancements
+- **Pseudo Mode** — code-aware output with simplified bodies (human-readable, not just structural)
+- **Gitignore Support** — `--no-ignore` override for directory traversal
+- **`--last-lines N`** — show last N lines of output (tail mode)
+
+### Changed
+- Analytics database at `~/.cache/skim/analytics.db` (SQLite with WAL mode)
+- `--clear-cache` clears parser cache only; `skim stats --clear` resets analytics
+- Versioned database migrations (v1: token_savings, v2: analytics_meta)
+
+### Architecture
+- Extracted `cascade`, `process`, and `multi` modules from monolithic main.rs
+- Agent detection centralized via `AgentKind` with SRP extraction
+- `AnalyticsStore` trait enables mock-based testing without real database
+- `OutputParser` trait standardizes command output compression interface
+
+### Testing
+- **1,594 tests passing** (up from 145 in v1.0.0 — 11x increase)
+- End-to-end tests for all command compression paths
+- Multi-agent session provider tests
+- Analytics pipeline integration tests
+- Three-tier degradation coverage for all parsers
+
 ## [1.0.0] - 2026-03-18
 
 This is the first stable release. All publicly exported types and functions in `rskim-core` are
@@ -496,6 +553,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.0.0** (2026-03-28): Context optimization engine — command compression, agent hooks, analytics, MCP server
 - **1.0.0** (2026-03-18): First stable release — minimal mode, token budgets, max-lines, C/C++/TOML, skimmer plugin
 - **0.9.0** (2026-03-16): C, C++, and TOML language support (12 languages total, 400 tests)
 - **0.8.0** (2025-12-06): YAML language support

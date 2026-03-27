@@ -566,22 +566,33 @@ cargo bench
 
 ## Project Status
 
-**Current**: v1.0.0 — Stable
+**Current**: v2.0.0 — Stable
 
-✅ **Implemented:**
-- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/Markdown/JSON/YAML/TOML support
-- Structure/signatures/types/full modes
-- CLI with stdin support
-- **Directory support (`skim src/` - recursively processes all files)**
-- Multi-file glob support (`skim 'src/**/*.ts'`)
-- **Automatic language detection from file extensions**
-- Parallel processing with rayon (`--jobs` flag)
-- **Caching layer with mtime-based invalidation (enabled by default)**
-- **Token counting with `--show-stats` (GPT-3.5/GPT-4 compatible)**
-- DoS protections
-- Comprehensive test suite (400 tests passing)
-- Performance benchmarks (verified: 14.6ms for 3000-line files, 5ms cached)
-- npm and cargo distribution
+✅ **Core — Code Reading (12 languages):**
+- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/Markdown/JSON/YAML/TOML
+- 5 transformation modes: structure, signatures, types, minimal, full
+- Token budget (`--tokens N`), max lines (`--max-lines N`), last lines (`--last-lines N`)
+- Multi-file glob support, parallel processing, caching (40-50x speedup)
+
+✅ **Command Output Compression:**
+- Test runners: cargo test, pytest, vitest/jest, go test
+- Build tools: cargo build, cargo clippy, tsc
+- Git: status, diff, log
+- Three-tier degradation: Structured → Regex → Passthrough
+
+✅ **Agent Integration:**
+- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode
+- `skim rewrite` — command rewriting engine with `--hook` mode
+- MCP server mode for agent-native workflows
+
+✅ **Analytics & Intelligence:**
+- `skim stats` — persistent SQLite dashboard with cost estimation
+- `skim discover` — missed optimization finder across agent sessions
+- `skim learn` — CLI error pattern detection and correction rules
+
+✅ **Distribution:**
+- cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
+- 1,594 tests passing, 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
