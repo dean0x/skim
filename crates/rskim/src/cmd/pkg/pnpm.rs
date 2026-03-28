@@ -224,7 +224,9 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
         details.push(format!("{module_name}: {title} ({severity})"));
     }
 
-    let total = critical + high + moderate + low;
+    // Use details.len() instead of summing severity buckets so entries with
+    // unknown/unrecognised severity are still counted (consistent with npm/cargo).
+    let total = details.len();
 
     Some(PkgResult::new(
         "pnpm".to_string(),

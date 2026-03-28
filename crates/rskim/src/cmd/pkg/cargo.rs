@@ -142,11 +142,11 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
         ));
     }
 
-    let empty = vec![];
     let list = vulns
         .get("list")
         .and_then(|v| v.as_array())
-        .unwrap_or(&empty);
+        .map(|v| v.as_slice())
+        .unwrap_or_default();
 
     let mut critical: usize = 0;
     let mut high: usize = 0;

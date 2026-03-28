@@ -182,31 +182,21 @@ fn try_parse_check_regex(text: &str) -> Option<PkgResult> {
         ));
     }
 
-    // Count lines matching requirement pattern
+    // Count lines matching the structured requirement pattern first,
+    // then fall back to looser "has requirement" / "which is not installed" matching.
     let issues = RE_PIP_REQUIREMENT.find_iter(text).count();
-    if issues == 0 {
-        // Also count lines with "has requirement" or "but you have" patterns
-        let line_issues = text
+    let issues = if issues > 0 {
+        issues
+    } else {
+        let fallback = text
             .lines()
             .filter(|l| l.contains("has requirement") || l.contains("which is not installed"))
             .count();
-        if line_issues > 0 {
-            let details: Vec<String> = text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| l.trim().to_string())
-                .collect();
-            return Some(PkgResult::new(
-                "pip".to_string(),
-                PkgOperation::Check {
-                    issues: line_issues,
-                },
-                false,
-                details,
-            ));
+        if fallback == 0 {
+            return None;
         }
-        return None;
-    }
+        fallback
+    };
 
     let details: Vec<String> = text
         .lines()
@@ -314,12 +304,6 @@ fn try_parse_list_regex(text: &str) -> Option<PkgResult> {
         return None;
     }
 
-    let count = lines
-        .iter()
-        .skip(2)
-        .filter(|l| !l.trim().is_empty())
-        .count();
-
     let details: Vec<String> = lines
         .iter()
         .skip(2)
@@ -329,7 +313,9 @@ fn try_parse_list_regex(text: &str) -> Option<PkgResult> {
 
     Some(PkgResult::new(
         "pip".to_string(),
-        PkgOperation::Outdated { count },
+        PkgOperation::Outdated {
+            count: details.len(),
+        },
         true,
         details,
     ))

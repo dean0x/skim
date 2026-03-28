@@ -461,13 +461,6 @@ fn try_parse_outdated_regex(text: &str) -> Option<PkgResult> {
         return None;
     }
 
-    // Count non-header, non-empty lines
-    let count = lines
-        .iter()
-        .skip(1)
-        .filter(|l| !l.trim().is_empty())
-        .count();
-
     let details: Vec<String> = lines
         .iter()
         .skip(1)
@@ -477,7 +470,9 @@ fn try_parse_outdated_regex(text: &str) -> Option<PkgResult> {
 
     Some(PkgResult::new(
         "npm".to_string(),
-        PkgOperation::Outdated { count },
+        PkgOperation::Outdated {
+            count: details.len(),
+        },
         true,
         details,
     ))
