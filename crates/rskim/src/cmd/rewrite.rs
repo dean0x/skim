@@ -34,6 +34,7 @@ enum RewriteCategory {
     Build,
     Git,
     Read,
+    Lint,
 }
 
 struct RewriteRule {
@@ -122,7 +123,7 @@ fn serialize_category<S: serde::Serializer>(
 }
 
 // ============================================================================
-// Rule table (15 rules, ordered longest-prefix-first within same leading token)
+// Rule table (26 rules, ordered longest-prefix-first within same leading token)
 // ============================================================================
 
 const REWRITE_RULES: &[RewriteRule] = &[
@@ -221,6 +222,64 @@ const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "build", "tsc"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
+    },
+    // lint — eslint
+    RewriteRule {
+        prefix: &["npx", "eslint"],
+        rewrite_to: &["skim", "lint", "eslint"],
+        skip_if_flag_prefix: &["--format", "-f"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["eslint"],
+        rewrite_to: &["skim", "lint", "eslint"],
+        skip_if_flag_prefix: &["--format", "-f"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — ruff
+    RewriteRule {
+        prefix: &["ruff", "check"],
+        rewrite_to: &["skim", "lint", "ruff"],
+        skip_if_flag_prefix: &["--output-format"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["ruff"],
+        rewrite_to: &["skim", "lint", "ruff"],
+        skip_if_flag_prefix: &["--output-format"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — mypy (longest prefix first: python3 -m mypy, python -m mypy, mypy)
+    RewriteRule {
+        prefix: &["python3", "-m", "mypy"],
+        rewrite_to: &["skim", "lint", "mypy"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["python", "-m", "mypy"],
+        rewrite_to: &["skim", "lint", "mypy"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["mypy"],
+        rewrite_to: &["skim", "lint", "mypy"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — golangci-lint
+    RewriteRule {
+        prefix: &["golangci-lint", "run"],
+        rewrite_to: &["skim", "lint", "golangci"],
+        skip_if_flag_prefix: &["--out-format"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["golangci-lint"],
+        rewrite_to: &["skim", "lint", "golangci"],
+        skip_if_flag_prefix: &["--out-format"],
+        category: RewriteCategory::Lint,
     },
 ];
 

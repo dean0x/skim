@@ -1,0 +1,9 @@
+/home/user/project/src/api/auth.ts
+  12:7  warning  'x' is defined but never used  no-unused-vars
+  45:18  error  Unexpected any. Specify a different type  @typescript-eslint/no-explicit-any
+
+/home/user/project/src/utils/format.ts
+  8:10  warning  'helper' is defined but never used  no-unused-vars
+  15:12  error  Expected '===' and instead saw '=='  eqeqeq
+
+✖ 4 problems (2 errors, 2 warnings)

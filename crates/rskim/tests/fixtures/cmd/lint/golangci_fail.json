@@ -1,0 +1,6 @@
+{"Issues": [
+  {"FromLinter": "govet", "Text": "printf: non-constant format string in call to fmt.Printf", "Pos": {"Filename": "cmd/main.go", "Line": 42, "Column": 12}, "Severity": ""},
+  {"FromLinter": "govet", "Text": "unreachable code", "Pos": {"Filename": "cmd/main.go", "Line": 55, "Column": 2}, "Severity": "warning"},
+  {"FromLinter": "errcheck", "Text": "Error return value of `os.Remove` is not checked", "Pos": {"Filename": "pkg/cleanup.go", "Line": 18, "Column": 9}, "Severity": ""},
+  {"FromLinter": "staticcheck", "Text": "SA1006: printf-style function with dynamic format string", "Pos": {"Filename": "internal/log.go", "Line": 33, "Column": 5}, "Severity": "error"}
+]}

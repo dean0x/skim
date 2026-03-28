@@ -664,3 +664,97 @@ fn test_rewrite_hook_passthrough_zero_stderr() {
         "Passthrough hook mode should produce zero stderr, got: {stderr}"
     );
 }
+
+// ============================================================================
+// Lint rewrite rules (#104)
+// ============================================================================
+
+#[test]
+fn test_rewrite_eslint() {
+    skim_cmd()
+        .args(["rewrite", "eslint", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint eslint ."));
+}
+
+#[test]
+fn test_rewrite_eslint_skip_format_flag() {
+    // When user already has --format json, rewrite should be suppressed
+    skim_cmd()
+        .args(["rewrite", "eslint", "--format", "json", "."])
+        .assert()
+        .failure(); // No match = exit 1
+}
+
+#[test]
+fn test_rewrite_npx_eslint() {
+    skim_cmd()
+        .args(["rewrite", "npx", "eslint", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint eslint src/"));
+}
+
+#[test]
+fn test_rewrite_ruff_check() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "check", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff ."));
+}
+
+#[test]
+fn test_rewrite_ruff_bare() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff ."));
+}
+
+#[test]
+fn test_rewrite_mypy() {
+    skim_cmd()
+        .args(["rewrite", "mypy", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint mypy ."));
+}
+
+#[test]
+fn test_rewrite_python_m_mypy() {
+    skim_cmd()
+        .args(["rewrite", "python", "-m", "mypy", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint mypy ."));
+}
+
+#[test]
+fn test_rewrite_python3_m_mypy() {
+    skim_cmd()
+        .args(["rewrite", "python3", "-m", "mypy", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint mypy src/"));
+}
+
+#[test]
+fn test_rewrite_golangci_lint_run() {
+    skim_cmd()
+        .args(["rewrite", "golangci-lint", "run", "./..."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint golangci ./..."));
+}
+
+#[test]
+fn test_rewrite_golangci_lint_bare() {
+    skim_cmd()
+        .args(["rewrite", "golangci-lint", "./..."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint golangci ./..."));
+}

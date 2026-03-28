@@ -39,6 +39,7 @@ pub(crate) enum CommandType {
     Test,
     Build,
     Git,
+    Lint,
 }
 
 impl CommandType {
@@ -48,6 +49,7 @@ impl CommandType {
             CommandType::Test => "test",
             CommandType::Build => "build",
             CommandType::Git => "git",
+            CommandType::Lint => "lint",
         }
     }
 }
