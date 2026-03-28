@@ -110,7 +110,8 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
                 locations: Vec::new(),
             });
         group.count += 1;
-        group.locations
+        group
+            .locations
             .push(format!("{}:{}", issue.file, issue.line));
     }
     LintResult::new(

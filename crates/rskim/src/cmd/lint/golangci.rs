@@ -208,10 +208,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
         let filename = pos.get("Filename").and_then(|v| v.as_str())?;
         let line = pos.get("Line").and_then(|v| v.as_u64())? as u32;
 
-        let severity_str = entry
-            .get("Severity")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let severity_str = entry.get("Severity").and_then(|v| v.as_str()).unwrap_or("");
         let severity = match severity_str {
             "error" => LintSeverity::Error,
             "warning" => LintSeverity::Warning,

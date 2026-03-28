@@ -216,10 +216,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
             .get("code")
             .and_then(|v| v.as_str())
             .unwrap_or("(unknown)");
-        let message = value
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
 
         issues.push(LintIssue {
             file: file.to_string(),
