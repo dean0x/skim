@@ -24,10 +24,6 @@ static RE_NPM_CHANGED: LazyLock<Regex> =
 static RE_NPM_FOUND_VULNS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"found\s+(\d+)\s+vulnerabilit").unwrap());
 
-// ============================================================================
-// npm install
-// ============================================================================
-
 pub(super) fn run_install(
     args: &[String],
     show_stats: bool,

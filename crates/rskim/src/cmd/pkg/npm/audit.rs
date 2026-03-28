@@ -20,10 +20,6 @@ static RE_NPM_VULNS: LazyLock<Regex> =
 static RE_NPM_VULN_COUNT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+)\s+(critical|high|moderate|low|info)").unwrap());
 
-// ============================================================================
-// npm audit
-// ============================================================================
-
 pub(super) fn run_audit(
     args: &[String],
     show_stats: bool,

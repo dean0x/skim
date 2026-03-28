@@ -8,10 +8,6 @@ use crate::runner::CommandOutput;
 
 use super::combine_output;
 
-// ============================================================================
-// npm outdated
-// ============================================================================
-
 pub(super) fn run_outdated(
     args: &[String],
     show_stats: bool,

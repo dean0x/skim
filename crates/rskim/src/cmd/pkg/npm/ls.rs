@@ -8,10 +8,6 @@ use crate::runner::CommandOutput;
 
 use super::combine_output;
 
-// ============================================================================
-// npm ls
-// ============================================================================
-
 pub(super) fn run_ls(
     args: &[String],
     show_stats: bool,
