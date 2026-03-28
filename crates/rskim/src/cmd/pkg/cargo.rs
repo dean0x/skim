@@ -155,30 +155,9 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
     let mut details: Vec<String> = Vec::new();
 
     for vuln in list {
-        let advisory = vuln.get("advisory");
-        let package = vuln.get("package");
-
-        let severity = advisory
-            .and_then(|a| a.get("severity"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let title = advisory
-            .and_then(|a| a.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let id = advisory
-            .and_then(|a| a.get("id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let pkg_name = package
-            .and_then(|p| p.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let pkg_version = package
-            .and_then(|p| p.get("version"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-
+        let Some((detail, severity)) = extract_vuln_detail(vuln) else {
+            continue;
+        };
         match severity {
             "critical" => critical += 1,
             "high" => high += 1,
@@ -186,10 +165,7 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
             "low" => low += 1,
             _ => {}
         }
-
-        details.push(format!(
-            "{id} {pkg_name}@{pkg_version}: {title} ({severity})"
-        ));
+        details.push(detail);
     }
 
     // Use details.len() instead of summing severity buckets so entries with
@@ -208,6 +184,37 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
         true,
         details,
     ))
+}
+
+/// Extract a single vulnerability entry from cargo audit JSON.
+/// Returns `(detail_string, severity_str)` or `None` if the entry is malformed.
+fn extract_vuln_detail(vuln: &serde_json::Value) -> Option<(String, &str)> {
+    let advisory = vuln.get("advisory");
+    let package = vuln.get("package");
+
+    let severity = advisory
+        .and_then(|a| a.get("severity"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let title = advisory
+        .and_then(|a| a.get("title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let id = advisory
+        .and_then(|a| a.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let pkg_name = package
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let pkg_version = package
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+
+    let detail = format!("{id} {pkg_name}@{pkg_version}: {title} ({severity})");
+    Some((detail, severity))
 }
 
 fn try_parse_audit_regex(text: &str) -> Option<PkgResult> {
