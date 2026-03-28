@@ -18,7 +18,11 @@ use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{group_issues, LintJsonConfig};
+use super::{combine_stdout_stderr, group_issues, LintJsonConfig};
+
+const PROGRAM: &str = "eslint";
+const ENV_OVERRIDES: &[(&str, &str)] = &[("NO_COLOR", "1")];
+const INSTALL_HINT: &str = "Install eslint via npm: npm install -g eslint";
 
 // Static regex patterns compiled once via LazyLock.
 static RE_ESLINT_LINE: LazyLock<Regex> = LazyLock::new(|| {
@@ -46,15 +50,25 @@ pub(crate) fn run(
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
 
     if json_output {
-        return run_json_mode(&cmd_args, use_stdin, show_stats);
+        return super::run_lint_json_mode(
+            LintJsonConfig {
+                program: PROGRAM,
+                cmd_args: &cmd_args,
+                env_overrides: ENV_OVERRIDES,
+                install_hint: INSTALL_HINT,
+                use_stdin,
+                show_stats,
+            },
+            parse_impl,
+        );
     }
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
-            program: "eslint",
+            program: PROGRAM,
             args: &cmd_args,
-            env_overrides: &[("NO_COLOR", "1")],
-            install_hint: "Install eslint via npm: npm install -g eslint",
+            env_overrides: ENV_OVERRIDES,
+            install_hint: INSTALL_HINT,
             use_stdin,
             show_stats,
             command_type: crate::analytics::CommandType::Lint,
@@ -63,44 +77,18 @@ pub(crate) fn run(
     )
 }
 
-/// Run in `--json` mode: delegate to shared lint JSON helper.
-fn run_json_mode(
-    cmd_args: &[String],
-    use_stdin: bool,
-    show_stats: bool,
-) -> anyhow::Result<ExitCode> {
-    super::run_lint_json_mode(
-        LintJsonConfig {
-            program: "eslint",
-            cmd_args,
-            env_overrides: &[("NO_COLOR", "1")],
-            install_hint: "Install eslint via npm: npm install -g eslint",
-            use_stdin,
-            show_stats,
-        },
-        parse_impl,
-    )
-}
-
 /// Three-tier parse function for eslint output.
 fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
-    // Tier 1: JSON parsing
     if let Some(result) = try_parse_json(&output.stdout) {
         return ParseResult::Full(result);
     }
 
-    // Tier 2: regex fallback on combined output
-    let combined = if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    };
+    let combined = combine_stdout_stderr(output);
 
     if let Some(result) = try_parse_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
-    // Tier 3: passthrough
     ParseResult::Passthrough(combined)
 }
 
@@ -218,18 +206,11 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 mod tests {
     use super::*;
 
-    fn fixture_path(name: &str) -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests");
-        path.push("fixtures");
-        path.push("cmd");
-        path.push("lint");
-        path.push(name);
-        path
-    }
-
     fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/cmd/lint");
+        path.push(name);
+        std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
     }
 

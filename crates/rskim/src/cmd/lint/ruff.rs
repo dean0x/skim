@@ -18,7 +18,11 @@ use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{group_issues, LintJsonConfig};
+use super::{combine_stdout_stderr, group_issues, LintJsonConfig};
+
+const PROGRAM: &str = "ruff";
+const ENV_OVERRIDES: &[(&str, &str)] = &[("NO_COLOR", "1")];
+const INSTALL_HINT: &str = "Install ruff: pip install ruff";
 
 // Static regex pattern compiled once via LazyLock.
 static RE_RUFF_LINE: LazyLock<Regex> =
@@ -49,15 +53,25 @@ pub(crate) fn run(
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
 
     if json_output {
-        return run_json_mode(&cmd_args, use_stdin, show_stats);
+        return super::run_lint_json_mode(
+            LintJsonConfig {
+                program: PROGRAM,
+                cmd_args: &cmd_args,
+                env_overrides: ENV_OVERRIDES,
+                install_hint: INSTALL_HINT,
+                use_stdin,
+                show_stats,
+            },
+            parse_impl,
+        );
     }
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
-            program: "ruff",
+            program: PROGRAM,
             args: &cmd_args,
-            env_overrides: &[("NO_COLOR", "1")],
-            install_hint: "Install ruff: pip install ruff",
+            env_overrides: ENV_OVERRIDES,
+            install_hint: INSTALL_HINT,
             use_stdin,
             show_stats,
             command_type: crate::analytics::CommandType::Lint,
@@ -66,44 +80,18 @@ pub(crate) fn run(
     )
 }
 
-/// Run in `--json` mode: delegate to shared lint JSON helper.
-fn run_json_mode(
-    cmd_args: &[String],
-    use_stdin: bool,
-    show_stats: bool,
-) -> anyhow::Result<ExitCode> {
-    super::run_lint_json_mode(
-        LintJsonConfig {
-            program: "ruff",
-            cmd_args,
-            env_overrides: &[("NO_COLOR", "1")],
-            install_hint: "Install ruff: pip install ruff",
-            use_stdin,
-            show_stats,
-        },
-        parse_impl,
-    )
-}
-
 /// Three-tier parse function for ruff output.
 fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
-    // Tier 1: JSON parsing
     if let Some(result) = try_parse_json(&output.stdout) {
         return ParseResult::Full(result);
     }
 
-    // Tier 2: regex fallback
-    let combined = if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    };
+    let combined = combine_stdout_stderr(output);
 
     if let Some(result) = try_parse_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
-    // Tier 3: passthrough
     ParseResult::Passthrough(combined)
 }
 

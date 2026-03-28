@@ -217,6 +217,17 @@ pub(crate) fn run_lint_json_mode(
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
+/// Combine stdout and stderr into a single string for regex fallback parsing.
+///
+/// Returns stdout directly when stderr is empty to avoid an unnecessary allocation.
+pub(crate) fn combine_stdout_stderr(output: &CommandOutput) -> String {
+    if output.stderr.is_empty() {
+        output.stdout.clone()
+    } else {
+        format!("{}\n{}", output.stdout, output.stderr)
+    }
+}
+
 /// Group individual lint issues by rule into a `LintResult`.
 ///
 /// Uses `BTreeMap` for deterministic ordering of rule groups.
