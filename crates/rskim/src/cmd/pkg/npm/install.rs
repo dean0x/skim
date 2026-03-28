@@ -68,24 +68,21 @@ fn parse_install(output: &CommandOutput) -> ParseResult<PkgResult> {
     ParseResult::Passthrough(combined.into_owned())
 }
 
+/// Extract a `usize` from a JSON object field, returning 0 on missing/invalid.
+fn json_usize(value: &serde_json::Value, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
+}
+
 fn try_parse_install_json(stdout: &str) -> Option<PkgResult> {
     let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
 
-    let added = value
-        .get("added")
-        .and_then(|v| v.as_u64())
-        .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(0);
-    let removed = value
-        .get("removed")
-        .and_then(|v| v.as_u64())
-        .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(0);
-    let changed = value
-        .get("changed")
-        .and_then(|v| v.as_u64())
-        .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(0);
+    let added = json_usize(&value, "added");
+    let removed = json_usize(&value, "removed");
+    let changed = json_usize(&value, "changed");
 
     // Count audit warnings from the embedded audit report
     let warnings = value
