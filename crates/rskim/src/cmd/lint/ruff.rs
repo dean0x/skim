@@ -130,7 +130,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
 
         issues.push(LintIssue {
             file: filename.to_string(),
-            line: row as u32,
+            line: u32::try_from(row).unwrap_or(u32::MAX),
             rule: code.to_string(),
             message: message.to_string(),
             // Ruff issues are all errors by default (no severity field)
@@ -231,6 +231,23 @@ mod tests {
         };
         let result = parse_impl(&output);
         assert!(result.is_full());
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        let input = load_fixture("ruff_text.txt");
+        let output = CommandOutput {
+            stdout: input,
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]

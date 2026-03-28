@@ -146,7 +146,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
 
         issues.push(LintIssue {
             file: filename.to_string(),
-            line: line as u32,
+            line: u32::try_from(line).unwrap_or(u32::MAX),
             rule: linter.to_string(),
             message: text.to_string(),
             severity,
@@ -163,6 +163,10 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
 /// Parse golangci-lint default text output via regex.
 ///
 /// Format: `file:line:col: message (linter)`
+///
+/// **Known limitation:** The golangci-lint text format does not include severity
+/// information, so all Tier 2 issues default to `Warning`. Accurate severity is
+/// only available via Tier 1 JSON parsing (the `Severity` field in JSON output).
 fn try_parse_regex(text: &str) -> Option<LintResult> {
     let mut issues: Vec<LintIssue> = Vec::new();
 
@@ -178,6 +182,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
                 line: line_num,
                 rule: linter,
                 message,
+                // Text format lacks severity; default to Warning (see doc comment above).
                 severity: LintSeverity::Warning,
             });
         }
@@ -248,6 +253,23 @@ mod tests {
         };
         let result = parse_impl(&output);
         assert!(result.is_full());
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        let input = load_fixture("golangci_text.txt");
+        let output = CommandOutput {
+            stdout: input,
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]

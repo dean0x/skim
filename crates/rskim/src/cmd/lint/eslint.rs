@@ -137,7 +137,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
 
             issues.push(LintIssue {
                 file: file_path.to_string(),
-                line: line as u32,
+                line: u32::try_from(line).unwrap_or(u32::MAX),
                 rule: rule_id.to_string(),
                 message: message.to_string(),
                 severity,
