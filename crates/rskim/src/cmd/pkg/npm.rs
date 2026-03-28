@@ -51,10 +51,8 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let Some((subcmd, subcmd_args)) = args.split_first() else {
-        print_help();
-        return Ok(ExitCode::SUCCESS);
-    };
+    // Safe: args.is_empty() is handled above.
+    let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
         "install" | "i" | "ci" => run_install(subcmd_args, show_stats, json_output),
@@ -126,13 +124,13 @@ fn parse_install(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Regex
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
     if let Some(result) = try_parse_install_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_install_json(stdout: &str) -> Option<PkgResult> {
@@ -238,13 +236,13 @@ fn parse_audit(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Regex
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
     if let Some(result) = try_parse_audit_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
@@ -273,19 +271,33 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
             _ => {}
         }
 
-        // Extract advisory title from via array
+        // Extract advisory title from via array. Entries can be either
+        // objects (advisories with a `title` field) or plain strings
+        // (transitive dependency names).
         let title = vuln
             .get("via")
             .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+            .and_then(|arr| {
+                arr.iter().find_map(|entry| {
+                    // Object entry: { "title": "...", ... }
+                    entry
+                        .get("title")
+                        .and_then(|t| t.as_str())
+                        .map(String::from)
+                })
+                .or_else(|| {
+                    // String entry: transitive dep name (e.g. "lodash")
+                    arr.first().and_then(|v| v.as_str()).map(|s| format!("via {s}"))
+                })
+            })
+            .unwrap_or_else(|| "unknown".to_string());
 
         details.push(format!("{name}: {title} ({severity})"));
     }
 
-    let total = critical + high + moderate + low;
+    // Use details.len() instead of summing severity buckets so entries with
+    // unknown/unrecognised severity are still counted.
+    let total = details.len();
 
     Some(PkgResult::new(
         "npm".to_string(),
@@ -391,13 +403,13 @@ fn parse_outdated(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Regex (count non-header table lines)
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
     if let Some(result) = try_parse_outdated_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_outdated_json(stdout: &str) -> Option<PkgResult> {
@@ -506,13 +518,13 @@ fn parse_ls(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Regex (count package lines)
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
     if let Some(result) = try_parse_ls_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_ls_json(stdout: &str) -> Option<PkgResult> {
@@ -571,18 +583,6 @@ fn try_parse_ls_regex(text: &str) -> Option<PkgResult> {
         true,
         vec![],
     ))
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn combine_output(output: &CommandOutput) -> String {
-    if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    }
 }
 
 // ============================================================================

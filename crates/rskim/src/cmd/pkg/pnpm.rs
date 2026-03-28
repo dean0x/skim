@@ -99,7 +99,7 @@ fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow:
 }
 
 fn parse_install(output: &CommandOutput) -> ParseResult<PkgResult> {
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
 
     // Tier 1: Regex (pnpm install has no JSON mode)
     if let Some(result) = try_parse_install_regex(&combined) {
@@ -107,7 +107,7 @@ fn parse_install(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
@@ -185,8 +185,8 @@ fn parse_audit(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Passthrough (pnpm audit text is harder to regex reliably)
-    let combined = combine_output(output);
-    ParseResult::Passthrough(combined)
+    let combined = super::combine_output(output);
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
@@ -278,8 +278,8 @@ fn parse_outdated(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Passthrough
-    let combined = combine_output(output);
-    ParseResult::Passthrough(combined)
+    let combined = super::combine_output(output);
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_outdated_json(stdout: &str) -> Option<PkgResult> {
@@ -310,18 +310,6 @@ fn try_parse_outdated_json(stdout: &str) -> Option<PkgResult> {
         true,
         details,
     ))
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn combine_output(output: &CommandOutput) -> String {
-    if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    }
 }
 
 // ============================================================================

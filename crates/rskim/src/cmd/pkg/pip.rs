@@ -102,7 +102,7 @@ fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow:
 }
 
 fn parse_install(output: &CommandOutput) -> ParseResult<PkgResult> {
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
 
     // Tier 1: Regex (pip install has no JSON mode)
     if let Some(result) = try_parse_install_regex(&combined) {
@@ -110,7 +110,7 @@ fn parse_install(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
@@ -143,8 +143,8 @@ fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
 // ============================================================================
 
 fn run_check(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::Result<ExitCode> {
-    let cmd_args: Vec<String> = vec!["check".to_string()];
-    // pip check takes no meaningful args, but pass them through
+    let mut cmd_args: Vec<String> = vec!["check".to_string()];
+    cmd_args.extend(args.iter().cloned());
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
 
@@ -163,7 +163,7 @@ fn run_check(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::R
 }
 
 fn parse_check(output: &CommandOutput) -> ParseResult<PkgResult> {
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
 
     // Tier 1: Regex
     if let Some(result) = try_parse_check_regex(&combined) {
@@ -171,7 +171,7 @@ fn parse_check(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_check_regex(text: &str) -> Option<PkgResult> {
@@ -265,13 +265,13 @@ fn parse_list(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Regex
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
     if let Some(result) = try_parse_list_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_list_json(stdout: &str) -> Option<PkgResult> {
@@ -335,18 +335,6 @@ fn try_parse_list_regex(text: &str) -> Option<PkgResult> {
         true,
         details,
     ))
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn combine_output(output: &CommandOutput) -> String {
-    if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    }
 }
 
 // ============================================================================

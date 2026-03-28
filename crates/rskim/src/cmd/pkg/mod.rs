@@ -8,7 +8,10 @@ mod npm;
 mod pip;
 mod pnpm;
 
+use std::borrow::Cow;
 use std::process::ExitCode;
+
+use crate::runner::CommandOutput;
 
 /// Known package manager tools that `skim pkg` can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["npm", "pnpm", "pip", "cargo"];
@@ -60,6 +63,18 @@ fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
         .cloned()
         .collect();
     (filtered, json_output)
+}
+
+/// Merge stdout and stderr into a single string.
+///
+/// Returns a `Cow::Borrowed` reference to stdout when stderr is empty
+/// (zero-copy fast path), or a `Cow::Owned` concatenation otherwise.
+pub(super) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
+    if output.stderr.is_empty() {
+        Cow::Borrowed(&output.stdout)
+    } else {
+        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
+    }
 }
 
 fn print_help() {

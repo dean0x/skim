@@ -45,10 +45,8 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let Some((subcmd, subcmd_args)) = args.split_first() else {
-        print_help();
-        return Ok(ExitCode::SUCCESS);
-    };
+    // Safe: args.is_empty() is handled above.
+    let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
         "audit" => run_audit(subcmd_args, show_stats, json_output),
@@ -111,13 +109,13 @@ fn parse_audit(output: &CommandOutput) -> ParseResult<PkgResult> {
     }
 
     // Tier 2: Regex
-    let combined = combine_output(output);
+    let combined = super::combine_output(output);
     if let Some(result) = try_parse_audit_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
@@ -144,11 +142,11 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
         ));
     }
 
+    let empty = vec![];
     let list = vulns
         .get("list")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .unwrap_or(&empty);
 
     let mut critical: usize = 0;
     let mut high: usize = 0;
@@ -156,7 +154,7 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
     let mut low: usize = 0;
     let mut details: Vec<String> = Vec::new();
 
-    for vuln in &list {
+    for vuln in list {
         let advisory = vuln.get("advisory");
         let package = vuln.get("package");
 
@@ -194,7 +192,9 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
         ));
     }
 
-    let total = critical + high + moderate + low;
+    // Use details.len() instead of summing severity buckets so entries with
+    // unknown/unrecognised severity are still counted.
+    let total = details.len();
 
     Some(PkgResult::new(
         "cargo".to_string(),
@@ -268,18 +268,6 @@ fn try_parse_audit_regex(text: &str) -> Option<PkgResult> {
         true,
         details,
     ))
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn combine_output(output: &CommandOutput) -> String {
-    if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    }
 }
 
 // ============================================================================
