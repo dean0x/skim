@@ -149,4 +149,41 @@ mod tests {
         assert!(display.contains("1 flagged"));
         assert!(display.contains("debug@4.3.4"));
     }
+
+    // ========================================================================
+    // Three-tier integration
+    // ========================================================================
+
+    #[test]
+    fn test_ls_json_produces_full() {
+        let input = load_fixture("npm_ls.json");
+        let output = CommandOutput {
+            stdout: input,
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_ls(&output);
+        assert!(
+            result.is_full(),
+            "Expected Full, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_ls_garbage_produces_passthrough() {
+        let output = CommandOutput {
+            stdout: "completely unparseable output".to_string(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_ls(&output);
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
 }

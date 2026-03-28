@@ -16,6 +16,19 @@ use crate::runner::CommandOutput;
 /// Known package manager tools that `skim pkg` can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["npm", "pnpm", "pip", "cargo"];
 
+/// Sanitize user input for safe display in error messages.
+///
+/// Filters to printable ASCII characters to prevent terminal escape
+/// injection attacks. Non-printable and non-ASCII bytes are replaced
+/// with `?`, and the string is truncated to 64 characters.
+pub(super) fn sanitize_for_display(input: &str) -> String {
+    input
+        .chars()
+        .take(64)
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .collect()
+}
+
 /// Entry point for `skim pkg <tool> [subcmd] [args...]`.
 ///
 /// If no tool is specified or `--help` / `-h` is passed, prints usage
@@ -42,8 +55,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "pip" => pip::run(tool_args, show_stats, json_output),
         "cargo" => cargo::run(tool_args, show_stats, json_output),
         _ => {
+            let safe_tool = sanitize_for_display(tool);
             eprintln!(
-                "skim pkg: unknown tool '{tool}'\n\
+                "skim pkg: unknown tool '{safe_tool}'\n\
                  Available tools: {}\n\
                  Run 'skim pkg --help' for usage information",
                 KNOWN_TOOLS.join(", ")
@@ -74,6 +88,97 @@ pub(super) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
         Cow::Borrowed(&output.stdout)
     } else {
         Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
+    }
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // sanitize_for_display
+    // ========================================================================
+
+    #[test]
+    fn test_sanitize_ascii_passthrough() {
+        assert_eq!(sanitize_for_display("hello-world"), "hello-world");
+    }
+
+    #[test]
+    fn test_sanitize_strips_escape_sequences() {
+        // ANSI escape: \x1b[31m (set red color)
+        let malicious = "\x1b[31mevil\x1b[0m";
+        let sanitized = sanitize_for_display(malicious);
+        assert!(!sanitized.contains('\x1b'));
+        assert_eq!(sanitized, "?[31mevil?[0m");
+    }
+
+    #[test]
+    fn test_sanitize_truncates_long_input() {
+        let long_input = "a".repeat(200);
+        let sanitized = sanitize_for_display(&long_input);
+        assert_eq!(sanitized.len(), 64);
+    }
+
+    #[test]
+    fn test_sanitize_replaces_control_chars() {
+        let input = "hello\0world\ttab\nnewline";
+        let sanitized = sanitize_for_display(input);
+        assert_eq!(sanitized, "hello?world?tab?newline");
+    }
+
+    // ========================================================================
+    // extract_json_flag
+    // ========================================================================
+
+    #[test]
+    fn test_extract_json_flag_present() {
+        let args: Vec<String> = vec!["npm".into(), "--json".into(), "install".into()];
+        let (filtered, found) = extract_json_flag(&args);
+        assert!(found);
+        assert_eq!(filtered, vec!["npm".to_string(), "install".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_json_flag_absent() {
+        let args: Vec<String> = vec!["npm".into(), "install".into()];
+        let (filtered, found) = extract_json_flag(&args);
+        assert!(!found);
+        assert_eq!(filtered, vec!["npm".to_string(), "install".to_string()]);
+    }
+
+    // ========================================================================
+    // combine_output
+    // ========================================================================
+
+    #[test]
+    fn test_combine_output_empty_stderr() {
+        let output = crate::runner::CommandOutput {
+            stdout: "hello".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let combined = combine_output(&output);
+        assert!(matches!(combined, Cow::Borrowed(_)));
+        assert_eq!(combined.as_ref(), "hello");
+    }
+
+    #[test]
+    fn test_combine_output_with_stderr() {
+        let output = crate::runner::CommandOutput {
+            stdout: "hello".to_string(),
+            stderr: "warning".to_string(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let combined = combine_output(&output);
+        assert!(matches!(combined, Cow::Owned(_)));
+        assert_eq!(combined.as_ref(), "hello\nwarning");
     }
 }
 

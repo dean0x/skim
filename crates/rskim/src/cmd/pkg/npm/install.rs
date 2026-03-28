@@ -71,9 +71,21 @@ fn parse_install(output: &CommandOutput) -> ParseResult<PkgResult> {
 fn try_parse_install_json(stdout: &str) -> Option<PkgResult> {
     let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
 
-    let added = value.get("added").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let removed = value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let changed = value.get("changed").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let added = value
+        .get("added")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    let removed = value
+        .get("removed")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    let changed = value
+        .get("changed")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
 
     // Count audit warnings from the embedded audit report
     let warnings = value

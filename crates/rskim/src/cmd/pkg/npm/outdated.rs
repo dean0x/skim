@@ -158,4 +158,41 @@ mod tests {
         let display = format!("{result}");
         assert!(display.contains("0 packages"));
     }
+
+    // ========================================================================
+    // Three-tier integration
+    // ========================================================================
+
+    #[test]
+    fn test_outdated_json_produces_full() {
+        let input = load_fixture("npm_outdated.json");
+        let output = CommandOutput {
+            stdout: input,
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_outdated(&output);
+        assert!(
+            result.is_full(),
+            "Expected Full, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_outdated_garbage_produces_passthrough() {
+        let output = CommandOutput {
+            stdout: "completely unparseable output".to_string(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_outdated(&output);
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
 }
