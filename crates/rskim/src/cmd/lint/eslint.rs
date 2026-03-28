@@ -18,7 +18,7 @@ use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::group_issues;
+use super::{group_issues, LintJsonConfig};
 
 // Static regex patterns compiled once via LazyLock.
 static RE_ESLINT_LINE: LazyLock<Regex> = LazyLock::new(|| {
@@ -63,86 +63,23 @@ pub(crate) fn run(
     )
 }
 
-/// Run in `--json` mode: parse output and serialize result as JSON to stdout.
+/// Run in `--json` mode: delegate to shared lint JSON helper.
 fn run_json_mode(
     cmd_args: &[String],
     use_stdin: bool,
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
-    use std::io::{self, Read, Write};
-
-    let output = if use_stdin {
-        let mut stdin_buf = String::new();
-        io::stdin().read_to_string(&mut stdin_buf)?;
-        CommandOutput {
-            stdout: crate::output::strip_ansi(&stdin_buf),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    } else {
-        let runner = crate::runner::CommandRunner::new(Some(std::time::Duration::from_secs(300)));
-        let args_str: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-        match runner.run_with_env("eslint", &args_str, &[("NO_COLOR", "1")]) {
-            Ok(out) => CommandOutput {
-                stdout: crate::output::strip_ansi(&out.stdout),
-                stderr: crate::output::strip_ansi(&out.stderr),
-                ..out
-            },
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("failed to execute") {
-                    eprintln!("error: 'eslint' not found");
-                    eprintln!("hint: Install eslint via npm: npm install -g eslint");
-                    return Ok(ExitCode::FAILURE);
-                }
-                return Err(e);
-            }
-        }
-    };
-
-    let result = parse_impl(&output);
-    let json_str = match &result {
-        ParseResult::Full(lint_result) => serde_json::to_string(lint_result)?,
-        ParseResult::Degraded(lint_result, warnings) => {
-            let val = serde_json::json!({
-                "tier": "degraded",
-                "warnings": warnings,
-                "result": lint_result,
-            });
-            serde_json::to_string(&val)?
-        }
-        ParseResult::Passthrough(raw) => {
-            let val = serde_json::json!({
-                "tier": "passthrough",
-                "raw": raw,
-            });
-            serde_json::to_string(&val)?
-        }
-    };
-
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    writeln!(handle, "{json_str}")?;
-    handle.flush()?;
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &json_str);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            output.stdout,
-            json_str,
-            format!("skim lint eslint {}", cmd_args.join(" ")),
-            crate::analytics::CommandType::Lint,
-            output.duration,
-            Some(result.tier_name()),
-        );
-    }
-
-    Ok(ExitCode::SUCCESS)
+    super::run_lint_json_mode(
+        LintJsonConfig {
+            program: "eslint",
+            cmd_args,
+            env_overrides: &[("NO_COLOR", "1")],
+            install_hint: "Install eslint via npm: npm install -g eslint",
+            use_stdin,
+            show_stats,
+        },
+        parse_impl,
+    )
 }
 
 /// Three-tier parse function for eslint output.
@@ -183,11 +120,17 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
     let mut issues: Vec<LintIssue> = Vec::new();
 
     for file_entry in &arr {
-        let file_path = file_entry.get("filePath")?.as_str()?;
-        let messages = file_entry.get("messages")?.as_array()?;
+        let Some(file_path) = file_entry.get("filePath").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(messages) = file_entry.get("messages").and_then(|v| v.as_array()) else {
+            continue;
+        };
 
         for msg in messages {
-            let severity_num = msg.get("severity")?.as_u64()?;
+            let Some(severity_num) = msg.get("severity").and_then(|v| v.as_u64()) else {
+                continue;
+            };
             let severity = match severity_num {
                 2 => LintSeverity::Error,
                 1 => LintSeverity::Warning,
@@ -197,12 +140,16 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
                 .get("ruleId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("(unknown)");
-            let message = msg.get("message")?.as_str()?;
-            let line = msg.get("line")?.as_u64()? as u32;
+            let Some(message) = msg.get("message").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(line) = msg.get("line").and_then(|v| v.as_u64()) else {
+                continue;
+            };
 
             issues.push(LintIssue {
                 file: file_path.to_string(),
-                line,
+                line: line as u32,
                 rule: rule_id.to_string(),
                 message: message.to_string(),
                 severity,

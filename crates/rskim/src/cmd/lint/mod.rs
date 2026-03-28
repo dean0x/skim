@@ -9,9 +9,12 @@ pub(crate) mod mypy;
 pub(crate) mod ruff;
 
 use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
+use crate::output::ParseResult;
+use crate::runner::CommandOutput;
 
 /// Known linters that `skim lint` can dispatch to.
 const KNOWN_LINTERS: &[&str] = &["eslint", "ruff", "mypy", "golangci"];
@@ -86,6 +89,132 @@ fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
         .cloned()
         .collect();
     (filtered, json_output)
+}
+
+// ============================================================================
+// Shared JSON mode helper
+// ============================================================================
+
+/// Configuration for [`run_lint_json_mode`].
+pub(crate) struct LintJsonConfig<'a> {
+    /// Binary name of the linter (e.g., "eslint", "ruff").
+    pub program: &'a str,
+    /// Arguments to pass to the linter.
+    pub cmd_args: &'a [String],
+    /// Environment variable overrides for the child process.
+    pub env_overrides: &'a [(&'a str, &'a str)],
+    /// Hint printed when the linter binary is not found.
+    pub install_hint: &'a str,
+    /// Whether stdin is piped (read stdin instead of running command).
+    pub use_stdin: bool,
+    /// Whether to report token statistics to stderr.
+    pub show_stats: bool,
+}
+
+/// Run a linter in `--json` mode: execute (or read stdin), parse output,
+/// serialize result as JSON to stdout, and preserve the child process exit code.
+///
+/// This is the single implementation shared by all lint parsers, eliminating
+/// the per-linter `run_json_mode` duplication. The caller supplies a
+/// `parse_fn` that implements the linter-specific three-tier parse logic.
+pub(crate) fn run_lint_json_mode(
+    config: LintJsonConfig<'_>,
+    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<LintResult>,
+) -> anyhow::Result<ExitCode> {
+    /// Maximum bytes we will read from stdin (64 MiB), consistent with the
+    /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
+    const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+
+    let LintJsonConfig {
+        program,
+        cmd_args,
+        env_overrides,
+        install_hint,
+        use_stdin,
+        show_stats,
+    } = config;
+
+    let output = if use_stdin {
+        let mut stdin_buf = String::new();
+        let bytes_read = io::stdin()
+            .take(MAX_STDIN_BYTES)
+            .read_to_string(&mut stdin_buf)?;
+        if bytes_read as u64 >= MAX_STDIN_BYTES {
+            anyhow::bail!("stdin input exceeded 64 MiB limit");
+        }
+        CommandOutput {
+            stdout: crate::output::strip_ansi(&stdin_buf),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        }
+    } else {
+        let runner = crate::runner::CommandRunner::new(Some(std::time::Duration::from_secs(300)));
+        let args_str: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
+        match runner.run_with_env(program, &args_str, env_overrides) {
+            Ok(out) => CommandOutput {
+                stdout: crate::output::strip_ansi(&out.stdout),
+                stderr: crate::output::strip_ansi(&out.stderr),
+                ..out
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("failed to execute") {
+                    eprintln!("error: '{program}' not found");
+                    eprintln!("hint: {install_hint}");
+                    return Ok(ExitCode::FAILURE);
+                }
+                return Err(e);
+            }
+        }
+    };
+
+    let result = parse_fn(&output);
+    let json_str = match &result {
+        ParseResult::Full(lint_result) => serde_json::to_string(lint_result)?,
+        ParseResult::Degraded(lint_result, warnings) => {
+            let val = serde_json::json!({
+                "tier": "degraded",
+                "warnings": warnings,
+                "result": lint_result,
+            });
+            serde_json::to_string(&val)?
+        }
+        ParseResult::Passthrough(raw) => {
+            let val = serde_json::json!({
+                "tier": "passthrough",
+                "raw": raw,
+            });
+            serde_json::to_string(&val)?
+        }
+    };
+
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    writeln!(handle, "{json_str}")?;
+    handle.flush()?;
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &json_str);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Capture exit code before moving stdout into analytics
+    let code = output.exit_code.unwrap_or(1);
+
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            output.stdout,
+            json_str,
+            format!("skim lint {program} {}", cmd_args.join(" ")),
+            crate::analytics::CommandType::Lint,
+            output.duration,
+            Some(result.tier_name()),
+        );
+    }
+
+    // Preserve child process exit code
+    Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
 /// Group individual lint issues by rule into a `LintResult`.

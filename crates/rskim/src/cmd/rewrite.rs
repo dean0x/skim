@@ -123,7 +123,7 @@ fn serialize_category<S: serde::Serializer>(
 }
 
 // ============================================================================
-// Rule table (26 rules, ordered longest-prefix-first within same leading token)
+// Rule table (24 rules, ordered longest-prefix-first within same leading token)
 // ============================================================================
 
 const REWRITE_RULES: &[RewriteRule] = &[

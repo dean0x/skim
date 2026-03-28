@@ -18,7 +18,7 @@ use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::group_issues;
+use super::{group_issues, LintJsonConfig};
 
 // Static regex pattern compiled once via LazyLock.
 static RE_GOLANGCI_LINE: LazyLock<Regex> =
@@ -66,88 +66,23 @@ pub(crate) fn run(
     )
 }
 
-/// Run in `--json` mode.
+/// Run in `--json` mode: delegate to shared lint JSON helper.
 fn run_json_mode(
     cmd_args: &[String],
     use_stdin: bool,
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
-    use std::io::{self, Read, Write};
-
-    let output = if use_stdin {
-        let mut stdin_buf = String::new();
-        io::stdin().read_to_string(&mut stdin_buf)?;
-        CommandOutput {
-            stdout: crate::output::strip_ansi(&stdin_buf),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    } else {
-        let runner = crate::runner::CommandRunner::new(Some(std::time::Duration::from_secs(300)));
-        let args_str: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-        match runner.run_with_env("golangci-lint", &args_str, &[("NO_COLOR", "1")]) {
-            Ok(out) => CommandOutput {
-                stdout: crate::output::strip_ansi(&out.stdout),
-                stderr: crate::output::strip_ansi(&out.stderr),
-                ..out
-            },
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("failed to execute") {
-                    eprintln!("error: 'golangci-lint' not found");
-                    eprintln!(
-                        "hint: Install golangci-lint: https://golangci-lint.run/welcome/install/"
-                    );
-                    return Ok(ExitCode::FAILURE);
-                }
-                return Err(e);
-            }
-        }
-    };
-
-    let result = parse_impl(&output);
-    let json_str = match &result {
-        ParseResult::Full(lint_result) => serde_json::to_string(lint_result)?,
-        ParseResult::Degraded(lint_result, warnings) => {
-            let val = serde_json::json!({
-                "tier": "degraded",
-                "warnings": warnings,
-                "result": lint_result,
-            });
-            serde_json::to_string(&val)?
-        }
-        ParseResult::Passthrough(raw) => {
-            let val = serde_json::json!({
-                "tier": "passthrough",
-                "raw": raw,
-            });
-            serde_json::to_string(&val)?
-        }
-    };
-
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    writeln!(handle, "{json_str}")?;
-    handle.flush()?;
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &json_str);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            output.stdout,
-            json_str,
-            format!("skim lint golangci {}", cmd_args.join(" ")),
-            crate::analytics::CommandType::Lint,
-            output.duration,
-            Some(result.tier_name()),
-        );
-    }
-
-    Ok(ExitCode::SUCCESS)
+    super::run_lint_json_mode(
+        LintJsonConfig {
+            program: "golangci-lint",
+            cmd_args,
+            env_overrides: &[("NO_COLOR", "1")],
+            install_hint: "Install golangci-lint: https://golangci-lint.run/welcome/install/",
+            use_stdin,
+            show_stats,
+        },
+        parse_impl,
+    )
 }
 
 /// Three-tier parse function for golangci-lint output.
@@ -204,9 +139,15 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
             .and_then(|v| v.as_str())
             .unwrap_or("(unknown)");
         let text = entry.get("Text").and_then(|v| v.as_str()).unwrap_or("");
-        let pos = entry.get("Pos")?;
-        let filename = pos.get("Filename").and_then(|v| v.as_str())?;
-        let line = pos.get("Line").and_then(|v| v.as_u64())? as u32;
+        let Some(pos) = entry.get("Pos") else {
+            continue;
+        };
+        let Some(filename) = pos.get("Filename").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(line) = pos.get("Line").and_then(|v| v.as_u64()) else {
+            continue;
+        };
 
         let severity_str = entry.get("Severity").and_then(|v| v.as_str()).unwrap_or("");
         let severity = match severity_str {
@@ -217,7 +158,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
 
         issues.push(LintIssue {
             file: filename.to_string(),
-            line,
+            line: line as u32,
             rule: linter.to_string(),
             message: text.to_string(),
             severity,
