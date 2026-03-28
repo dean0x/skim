@@ -37,10 +37,8 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let Some((subcmd, subcmd_args)) = args.split_first() else {
-        print_help();
-        return Ok(ExitCode::SUCCESS);
-    };
+    // Safe: args.is_empty() is handled above.
+    let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
         "install" | "i" => run_install(subcmd_args, show_stats, json_output),

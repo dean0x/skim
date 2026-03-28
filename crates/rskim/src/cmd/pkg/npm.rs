@@ -278,17 +278,20 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
             .get("via")
             .and_then(|v| v.as_array())
             .and_then(|arr| {
-                arr.iter().find_map(|entry| {
-                    // Object entry: { "title": "...", ... }
-                    entry
-                        .get("title")
-                        .and_then(|t| t.as_str())
-                        .map(String::from)
-                })
-                .or_else(|| {
-                    // String entry: transitive dep name (e.g. "lodash")
-                    arr.first().and_then(|v| v.as_str()).map(|s| format!("via {s}"))
-                })
+                arr.iter()
+                    .find_map(|entry| {
+                        // Object entry: { "title": "...", ... }
+                        entry
+                            .get("title")
+                            .and_then(|t| t.as_str())
+                            .map(String::from)
+                    })
+                    .or_else(|| {
+                        // String entry: transitive dep name (e.g. "lodash")
+                        arr.first()
+                            .and_then(|v| v.as_str())
+                            .map(|s| format!("via {s}"))
+                    })
             })
             .unwrap_or_else(|| "unknown".to_string());
 
