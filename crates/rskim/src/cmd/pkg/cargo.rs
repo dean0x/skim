@@ -51,8 +51,9 @@ pub(crate) fn run(
     match subcmd.as_str() {
         "audit" => run_audit(subcmd_args, show_stats, json_output),
         other => {
+            let safe = super::sanitize_for_display(other);
             eprintln!(
-                "skim pkg cargo: unknown subcommand '{other}'\n\
+                "skim pkg cargo: unknown subcommand '{safe}'\n\
                  Available: audit\n\
                  Run 'skim pkg cargo --help' for usage"
             );
@@ -92,7 +93,7 @@ fn run_audit(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Re
         ParsedCommandConfig {
             program: "cargo",
             args: &cmd_args,
-            env_overrides: &[("NO_COLOR", "1")],
+            env_overrides: &[("CARGO_TERM_COLOR", "never")],
             install_hint: "Install cargo-audit via: cargo install cargo-audit",
             use_stdin,
             show_stats,
@@ -155,9 +156,7 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
     let mut details: Vec<String> = Vec::new();
 
     for vuln in list {
-        let Some((detail, severity)) = extract_vuln_detail(vuln) else {
-            continue;
-        };
+        let (detail, severity) = extract_vuln_detail(vuln);
         match severity {
             "critical" => critical += 1,
             "high" => high += 1,
@@ -188,8 +187,8 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
 
 /// Extract a single vulnerability entry from cargo audit JSON.
 /// Returns `(detail_string, severity_str)`. Missing fields fall back to
-/// `"unknown"` / `"?"` so this always returns `Some` in practice.
-fn extract_vuln_detail(vuln: &serde_json::Value) -> Option<(String, &str)> {
+/// `"unknown"` / `"?"` so every input produces a result.
+fn extract_vuln_detail(vuln: &serde_json::Value) -> (String, &str) {
     let advisory = vuln.get("advisory");
     let package = vuln.get("package");
 
@@ -215,7 +214,7 @@ fn extract_vuln_detail(vuln: &serde_json::Value) -> Option<(String, &str)> {
         .unwrap_or("?");
 
     let detail = format!("{id} {pkg_name}@{pkg_version}: {title} ({severity})");
-    Some((detail, severity))
+    (detail, severity)
 }
 
 fn try_parse_audit_regex(text: &str) -> Option<PkgResult> {

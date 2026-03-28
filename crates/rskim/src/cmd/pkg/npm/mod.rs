@@ -37,8 +37,9 @@ pub(crate) fn run(
         "outdated" => outdated::run_outdated(subcmd_args, show_stats, json_output),
         "ls" | "list" => ls::run_ls(subcmd_args, show_stats, json_output),
         other => {
+            let safe = super::sanitize_for_display(other);
             eprintln!(
-                "skim pkg npm: unknown subcommand '{other}'\n\
+                "skim pkg npm: unknown subcommand '{safe}'\n\
                  Available: install, audit, outdated, ls\n\
                  Run 'skim pkg npm --help' for usage"
             );
