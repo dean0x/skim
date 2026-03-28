@@ -37,8 +37,7 @@ pub(crate) fn run(
     let mut cmd_args: Vec<String> = Vec::new();
 
     // Ensure "run" subcommand is present if args don't start with it
-    let needs_run = args.first().is_none_or(|a| a != "run");
-    if needs_run {
+    if args.first().is_none_or(|a| a != "run") {
         cmd_args.push("run".to_string());
     }
 
@@ -140,8 +139,8 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
         let severity_str = entry.get("Severity").and_then(|v| v.as_str()).unwrap_or("");
         let severity = match severity_str {
             "error" => LintSeverity::Error,
-            "warning" => LintSeverity::Warning,
-            _ => LintSeverity::Warning, // Default to warning when empty or unknown
+            // golangci-lint defaults to warning when Severity is empty/absent/unknown
+            _ => LintSeverity::Warning,
         };
 
         issues.push(LintIssue {

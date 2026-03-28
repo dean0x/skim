@@ -174,10 +174,7 @@ pub(crate) fn run_lint_json_mode(
 
     // Emit tier degradation markers to stderr for terminal observability,
     // consistent with run_parsed_command_with_mode (cmd/mod.rs).
-    let stderr_stream = io::stderr();
-    let mut stderr_handle = stderr_stream.lock();
-    let _ = result.emit_markers(&mut stderr_handle);
-    drop(stderr_handle);
+    let _ = result.emit_markers(&mut io::stderr().lock());
 
     let json_str = match &result {
         ParseResult::Full(lint_result) => serde_json::to_string(lint_result)?,
@@ -229,7 +226,7 @@ pub(crate) fn run_lint_json_mode(
 /// Combine stdout and stderr into a single string for regex fallback parsing.
 ///
 /// Returns a borrowed reference to stdout when stderr is empty to avoid an
-/// unnecessary allocation, matching the `Cow` pattern used in `pytest.rs`.
+/// unnecessary allocation.
 pub(crate) fn combine_stdout_stderr(output: &CommandOutput) -> Cow<'_, str> {
     if output.stderr.is_empty() {
         Cow::Borrowed(&output.stdout)
@@ -245,24 +242,23 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
     let mut groups: BTreeMap<String, LintGroup> = BTreeMap::new();
     let mut errors = 0usize;
     let mut warnings = 0usize;
-    for issue in &issues {
+    for issue in issues {
         match issue.severity {
             LintSeverity::Error => errors += 1,
             LintSeverity::Warning => warnings += 1,
             LintSeverity::Info => {}
         }
+        let location = format!("{}:{}", issue.file, issue.line);
         let group = groups
             .entry(issue.rule.clone())
             .or_insert_with(|| LintGroup {
-                rule: issue.rule.clone(),
+                rule: issue.rule,
                 count: 0,
-                severity: issue.severity.clone(),
+                severity: issue.severity,
                 locations: Vec::new(),
             });
         group.count += 1;
-        group
-            .locations
-            .push(format!("{}:{}", issue.file, issue.line));
+        group.locations.push(location);
     }
     LintResult::new(
         tool.to_string(),

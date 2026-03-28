@@ -352,11 +352,12 @@ impl LintResult {
 
         let mut output = format!("LINT: {errors} errors, {warnings} warnings | {tool}");
         for group in groups {
-            let _ = if group.count == 1 {
-                write!(output, "\n  {} ({} {}):", group.rule, group.count, group.severity)
-            } else {
-                write!(output, "\n  {} ({} {}s):", group.rule, group.count, group.severity)
-            };
+            let suffix = if group.count == 1 { "" } else { "s" };
+            let _ = write!(
+                output,
+                "\n  {} ({} {}{suffix}):",
+                group.rule, group.count, group.severity
+            );
             for loc in &group.locations {
                 let _ = write!(output, "\n    {loc}");
             }

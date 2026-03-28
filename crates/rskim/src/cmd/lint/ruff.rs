@@ -37,8 +37,7 @@ pub(crate) fn run(
     let mut cmd_args: Vec<String> = Vec::new();
 
     // Ensure "check" subcommand is present if args don't start with it
-    let needs_check = args.first().is_none_or(|a| a != "check");
-    if needs_check {
+    if args.first().is_none_or(|a| a != "check") {
         cmd_args.push("check".to_string());
     }
 
