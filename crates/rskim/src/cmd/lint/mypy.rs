@@ -85,7 +85,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 // ============================================================================

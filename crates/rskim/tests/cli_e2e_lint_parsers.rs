@@ -90,6 +90,18 @@ fn test_eslint_json_flag_full() {
         .stdout(predicate::str::contains("\"errors\":2"));
 }
 
+#[test]
+fn test_eslint_json_flag_degraded() {
+    let fixture = include_str!("fixtures/cmd/lint/eslint_text.txt");
+    skim_cmd()
+        .args(["lint", "--json", "eslint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tier\":\"degraded\""))
+        .stdout(predicate::str::contains("\"tool\":\"eslint\""));
+}
+
 // ============================================================================
 // Ruff: Tier 1 (JSON) -- Full
 // ============================================================================

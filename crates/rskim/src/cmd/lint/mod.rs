@@ -8,6 +8,7 @@ pub(crate) mod golangci;
 pub(crate) mod mypy;
 pub(crate) mod ruff;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
@@ -170,6 +171,14 @@ pub(crate) fn run_lint_json_mode(
     };
 
     let result = parse_fn(&output);
+
+    // Emit tier degradation markers to stderr for terminal observability,
+    // consistent with run_parsed_command_with_mode (cmd/mod.rs).
+    let stderr_stream = io::stderr();
+    let mut stderr_handle = stderr_stream.lock();
+    let _ = result.emit_markers(&mut stderr_handle);
+    drop(stderr_handle);
+
     let json_str = match &result {
         ParseResult::Full(lint_result) => serde_json::to_string(lint_result)?,
         ParseResult::Degraded(lint_result, warnings) => {
@@ -206,7 +215,7 @@ pub(crate) fn run_lint_json_mode(
         crate::analytics::try_record_command(
             output.stdout,
             json_str,
-            format!("skim lint {program} {}", cmd_args.join(" ")),
+            format!("skim {program} {}", cmd_args.join(" ")),
             crate::analytics::CommandType::Lint,
             output.duration,
             Some(result.tier_name()),
@@ -219,12 +228,13 @@ pub(crate) fn run_lint_json_mode(
 
 /// Combine stdout and stderr into a single string for regex fallback parsing.
 ///
-/// Returns stdout directly when stderr is empty to avoid an unnecessary allocation.
-pub(crate) fn combine_stdout_stderr(output: &CommandOutput) -> String {
+/// Returns a borrowed reference to stdout when stderr is empty to avoid an
+/// unnecessary allocation, matching the `Cow` pattern used in `pytest.rs`.
+pub(crate) fn combine_stdout_stderr(output: &CommandOutput) -> Cow<'_, str> {
     if output.stderr.is_empty() {
-        output.stdout.clone()
+        Cow::Borrowed(&output.stdout)
     } else {
-        format!("{}\n{}", output.stdout, output.stderr)
+        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
     }
 }
 
@@ -303,6 +313,47 @@ mod tests {
         assert_eq!(result.warnings, 0);
         assert!(result.groups.is_empty());
         assert!(result.as_ref().contains("LINT OK"));
+    }
+
+    #[test]
+    fn test_combine_stdout_stderr_empty_stderr() {
+        let output = CommandOutput {
+            stdout: "hello world".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let combined = combine_stdout_stderr(&output);
+        assert_eq!(&*combined, "hello world");
+        // When stderr is empty, should borrow (Cow::Borrowed)
+        assert!(matches!(combined, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_combine_stdout_stderr_with_stderr() {
+        let output = CommandOutput {
+            stdout: "out".to_string(),
+            stderr: "err".to_string(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let combined = combine_stdout_stderr(&output);
+        assert_eq!(&*combined, "out\nerr");
+        // When stderr is non-empty, should own (Cow::Owned)
+        assert!(matches!(combined, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_combine_stdout_stderr_both_empty() {
+        let output = CommandOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let combined = combine_stdout_stderr(&output);
+        assert_eq!(&*combined, "");
+        assert!(matches!(combined, Cow::Borrowed(_)));
     }
 
     #[test]
