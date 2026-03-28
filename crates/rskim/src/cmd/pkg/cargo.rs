@@ -187,7 +187,8 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
 }
 
 /// Extract a single vulnerability entry from cargo audit JSON.
-/// Returns `(detail_string, severity_str)` or `None` if the entry is malformed.
+/// Returns `(detail_string, severity_str)`. Missing fields fall back to
+/// `"unknown"` / `"?"` so this always returns `Some` in practice.
 fn extract_vuln_detail(vuln: &serde_json::Value) -> Option<(String, &str)> {
     let advisory = vuln.get("advisory");
     let package = vuln.get("package");
