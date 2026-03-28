@@ -15,6 +15,7 @@ mod hooks;
 mod init;
 mod integrity;
 mod learn;
+mod pkg;
 mod rewrite;
 mod session;
 mod stats;
@@ -38,6 +39,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "git",
     "init",
     "learn",
+    "pkg",
     "rewrite",
     "stats",
     "test",
@@ -284,6 +286,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "git" => git::run(args),
         "init" => init::run(args),
         "learn" => learn::run(args),
+        "pkg" => pkg::run(args),
         "rewrite" => rewrite::run(args),
         "stats" => stats::run(args),
         "test" => test::run(args),

@@ -1,0 +1,10 @@
+{
+  "added": 127,
+  "removed": 3,
+  "changed": 14,
+  "funding": 42,
+  "audit": {
+    "auditReportVersion": 2,
+    "vulnerabilities": {}
+  }
+}

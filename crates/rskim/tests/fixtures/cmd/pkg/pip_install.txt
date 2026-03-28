@@ -1,0 +1,8 @@
+Collecting flask>=2.0
+  Downloading Flask-3.0.0-py3-none-any.whl (101 kB)
+Collecting werkzeug>=3.0
+  Downloading werkzeug-3.0.1-py3-none-any.whl (226 kB)
+Collecting jinja2>=3.1.2
+  Using cached Jinja2-3.1.2-py3-none-any.whl (133 kB)
+Installing collected packages: werkzeug, jinja2, flask
+Successfully installed flask-3.0.0 jinja2-3.1.2 werkzeug-3.0.1

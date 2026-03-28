@@ -1,0 +1,9 @@
+{
+  "advisories": {
+    "1234": {"module_name": "lodash", "severity": "high", "title": "Prototype Pollution", "url": "https://github.com/advisories/GHSA-1234", "findings": [{"version": "4.17.20", "paths": ["."]}]},
+    "5678": {"module_name": "minimist", "severity": "critical", "title": "Prototype Pollution", "url": "https://github.com/advisories/GHSA-5678", "findings": [{"version": "1.2.0", "paths": ["mkdirp"]}]}
+  },
+  "metadata": {
+    "vulnerabilities": {"info": 0, "low": 0, "moderate": 0, "high": 1, "critical": 1, "total": 2}
+  }
+}

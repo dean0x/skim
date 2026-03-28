@@ -34,6 +34,7 @@ enum RewriteCategory {
     Build,
     Git,
     Read,
+    Pkg,
 }
 
 struct RewriteRule {
@@ -122,7 +123,7 @@ fn serialize_category<S: serde::Serializer>(
 }
 
 // ============================================================================
-// Rule table (15 rules, ordered longest-prefix-first within same leading token)
+// Rule table (32 rules, ordered longest-prefix-first within same leading token)
 // ============================================================================
 
 const REWRITE_RULES: &[RewriteRule] = &[
@@ -138,6 +139,12 @@ const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "test", "cargo"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["cargo", "audit"],
+        rewrite_to: &["skim", "pkg", "cargo", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
     },
     RewriteRule {
         prefix: &["cargo", "clippy"],
@@ -221,6 +228,99 @@ const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "build", "tsc"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
+    },
+    // pkg — npm (canonical + aliases)
+    RewriteRule {
+        prefix: &["npm", "audit"],
+        rewrite_to: &["skim", "pkg", "npm", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "install"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "i"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "ci"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "outdated"],
+        rewrite_to: &["skim", "pkg", "npm", "outdated"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "ls"],
+        rewrite_to: &["skim", "pkg", "npm", "ls"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    // pkg — pnpm
+    RewriteRule {
+        prefix: &["pnpm", "audit"],
+        rewrite_to: &["skim", "pkg", "pnpm", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "install"],
+        rewrite_to: &["skim", "pkg", "pnpm", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "outdated"],
+        rewrite_to: &["skim", "pkg", "pnpm", "outdated"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+    },
+    // pkg — pip (canonical + pip3 aliases)
+    RewriteRule {
+        prefix: &["pip", "install"],
+        rewrite_to: &["skim", "pkg", "pip", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip", "check"],
+        rewrite_to: &["skim", "pkg", "pip", "check"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip", "list"],
+        rewrite_to: &["skim", "pkg", "pip", "list"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "install"],
+        rewrite_to: &["skim", "pkg", "pip", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "check"],
+        rewrite_to: &["skim", "pkg", "pip", "check"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "list"],
+        rewrite_to: &["skim", "pkg", "pip", "list"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
     },
 ];
 
@@ -1451,7 +1551,7 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // Prefix rule matches (all 15 rules)
+    // Prefix rule matches (all 32 rules)
     // ========================================================================
 
     #[test]
