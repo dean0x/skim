@@ -225,7 +225,8 @@ mod tests {
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
         // 4 issues total: 1 error (staticcheck), 3 warnings (govet x2 + errcheck)
-        assert!(result.errors + result.warnings == 4);
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.warnings, 3);
     }
 
     #[test]

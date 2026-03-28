@@ -228,7 +228,9 @@ fn test_golangci_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("LINT:"));
+        .stdout(predicate::str::contains("LINT:"))
+        .stdout(predicate::str::contains("1 error"))
+        .stdout(predicate::str::contains("3 warning"));
 }
 
 // ============================================================================
@@ -310,4 +312,20 @@ fn test_lint_no_args_shows_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Available linters:"));
+}
+
+// ============================================================================
+// --show-stats integration
+// ============================================================================
+
+#[test]
+fn test_lint_show_stats_reports_tokens() {
+    let fixture = include_str!("fixtures/cmd/lint/eslint_fail.json");
+    skim_cmd()
+        .args(["lint", "--show-stats", "eslint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stderr(predicate::str::contains("tokens"));
 }

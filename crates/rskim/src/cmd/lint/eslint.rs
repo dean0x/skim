@@ -261,7 +261,8 @@ mod tests {
         let result = try_parse_regex(&input);
         assert!(result.is_some(), "Expected Tier 2 regex parse to succeed");
         let result = result.unwrap();
-        assert!(result.errors > 0 || result.warnings > 0);
+        assert_eq!(result.errors, 2);
+        assert_eq!(result.warnings, 2);
     }
 
     #[test]

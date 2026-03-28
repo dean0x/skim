@@ -250,3 +250,63 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
         groups.into_values().collect(),
     )
 }
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::canonical::{LintIssue, LintSeverity};
+
+    #[test]
+    fn test_group_issues_info_severity_not_counted() {
+        let issues = vec![
+            LintIssue {
+                file: "a.ts".to_string(),
+                line: 1,
+                rule: "info-rule".to_string(),
+                message: "informational".to_string(),
+                severity: LintSeverity::Info,
+            },
+            LintIssue {
+                file: "a.ts".to_string(),
+                line: 2,
+                rule: "err-rule".to_string(),
+                message: "real error".to_string(),
+                severity: LintSeverity::Error,
+            },
+        ];
+        let result = group_issues("test", issues);
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.warnings, 0);
+        // Info issue is grouped but not counted as error or warning
+        assert_eq!(result.groups.len(), 2);
+    }
+
+    #[test]
+    fn test_group_issues_empty() {
+        let result = group_issues("test", vec![]);
+        assert_eq!(result.errors, 0);
+        assert_eq!(result.warnings, 0);
+        assert!(result.groups.is_empty());
+        assert!(result.as_ref().contains("LINT OK"));
+    }
+
+    #[test]
+    fn test_extract_json_flag_present() {
+        let args = vec!["--json".to_string(), "eslint".to_string(), ".".to_string()];
+        let (filtered, json_output) = extract_json_flag(&args);
+        assert!(json_output);
+        assert_eq!(filtered, vec!["eslint".to_string(), ".".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_json_flag_absent() {
+        let args = vec!["eslint".to_string(), ".".to_string()];
+        let (filtered, json_output) = extract_json_flag(&args);
+        assert!(!json_output);
+        assert_eq!(filtered, vec!["eslint".to_string(), ".".to_string()]);
+    }
+}
