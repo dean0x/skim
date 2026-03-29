@@ -1,8 +1,8 @@
 # Skim: The Most Intelligent Context Optimization Engine for Coding Agents
 
-> **Code skimming. Command rewriting. Test, build, and git output compression. Token budget cascading.** 12 languages. 14ms for 3,000 lines. Built in Rust.
+> **Code skimming. Command rewriting. Test, build, and git output compression. Token budget cascading.** 15 languages. 14ms for 3,000 lines. Built in Rust.
 
-Other tools filter terminal noise. Skim understands your code. It parses ASTs across 12 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, and raw commands. 14ms for 3,000 lines. 48x faster on cache hits.
+Other tools filter terminal noise. Skim understands your code. It parses ASTs across 15 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, and raw commands. 14ms for 3,000 lines. 48x faster on cache hits.
 
 [![Website](https://img.shields.io/badge/Website-skim-e87040)](https://dean0x.github.io/x/skim/)
 [![CI](https://github.com/dean0x/skim/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/skim/actions/workflows/ci.yml)
@@ -50,7 +50,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 ## Features
 
 ### Code Skimming (the original, still unmatched)
-- **12 languages** including TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
+- **15 languages** including TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Markdown, JSON, YAML, TOML
 - **6 transformation modes** from full to minimal to pseudo to structure to signatures to types (15-95% reduction)
 - **14.6ms** for 3,000-line files. **48x faster** on cache hits
 - **Token budget cascading** that automatically selects the most aggressive mode fitting your budget
@@ -228,6 +228,9 @@ skim file.ts --mode full        # No transformation
 | JSON       | ✅     | `.json`            | Structure extraction (serde)    |
 | YAML       | ✅     | `.yaml`, `.yml`    | Multi-document support (serde)  |
 | TOML       | ✅     | `.toml`            | Structure extraction (toml)     |
+| C#         | ✅     | `.cs`              | Full grammar, structs/interfaces|
+| Ruby       | ✅     | `.rb`              | Classes, modules, methods       |
+| SQL        | ✅     | `.sql`             | DDL/DML via tree-sitter-sequel  |
 
 ## Examples
 
@@ -568,8 +571,8 @@ cargo bench
 
 **Current**: v2.0.0 — Stable
 
-✅ **Core — Code Reading (12 languages):**
-- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/Markdown/JSON/YAML/TOML
+✅ **Core — Code Reading (15 languages):**
+- TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
 - 5 transformation modes: structure, signatures, types, minimal, full
 - Token budget (`--tokens N`), max lines (`--max-lines N`), last lines (`--last-lines N`)
 - Multi-file glob support, parallel processing, caching (40-50x speedup)
@@ -614,7 +617,7 @@ Comprehensive guides for all aspects of Skim:
 
 | Tool | Role | What It Does |
 |------|------|-------------|
-| **Skim** | Context Optimization | Code-aware AST parsing across 12 languages, command rewriting, test/build/git output compression |
+| **Skim** | Context Optimization | Code-aware AST parsing across 15 languages, command rewriting, test/build/git output compression |
 | **[DevFlow](https://github.com/dean0x/devflow)** | Quality Orchestration | 18 parallel reviewers, working memory, self-learning, composable plugin system |
 | **[Autobeat](https://github.com/dean0x/autobeat)** | Agent Orchestration | Autonomous orchestration. Eval loops, multi-agent pipelines, DAG dependencies, crash-proof persistence |
 
