@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -494,6 +494,106 @@ fn worktree_prefix(c: char) -> &'static str {
 /// to raw diff hunks.
 const MAX_AST_FILE_SIZE: usize = 100 * 1024;
 
+/// Controls how unchanged AST nodes are rendered alongside changed nodes.
+///
+/// - `Default`: Only changed nodes are shown (no unchanged context).
+/// - `Structure`: Unchanged nodes are shown as signatures (`{ /* ... */ }`).
+/// - `Full`: Unchanged nodes are shown in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffMode {
+    /// Only changed AST nodes with `+`/`-` markers.
+    Default,
+    /// Changed nodes + unchanged nodes rendered as signatures.
+    Structure,
+    /// Changed nodes + unchanged nodes shown in full.
+    Full,
+}
+
+/// Extract `--mode <value>` or `--mode=<value>` from args.
+///
+/// Returns `(filtered_args, DiffMode)` where `filtered_args` has the mode
+/// flag removed so it is not passed to git.
+fn extract_diff_mode(args: &[String]) -> (Vec<String>, DiffMode) {
+    let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+    let mut mode = DiffMode::Default;
+    let mut skip_next = false;
+
+    for (i, arg) in args.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        if arg == "--mode" || arg == "-m" {
+            if let Some(val) = args.get(i + 1) {
+                mode = parse_diff_mode_value(val);
+                skip_next = true;
+            }
+            continue;
+        }
+
+        if let Some(val) = arg.strip_prefix("--mode=") {
+            mode = parse_diff_mode_value(val);
+            continue;
+        }
+
+        if let Some(val) = arg.strip_prefix("-m=") {
+            mode = parse_diff_mode_value(val);
+            continue;
+        }
+
+        filtered.push(arg.clone());
+    }
+
+    (filtered, mode)
+}
+
+/// Parse a mode value string into a DiffMode.
+fn parse_diff_mode_value(val: &str) -> DiffMode {
+    match val {
+        "structure" | "signatures" => DiffMode::Structure,
+        "full" => DiffMode::Full,
+        _ => DiffMode::Default,
+    }
+}
+
+/// Extract `--json` flag from args.
+///
+/// Returns `(filtered_args, is_json)`.
+fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
+    let is_json = args.iter().any(|a| a == "--json");
+    let filtered: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--json")
+        .cloned()
+        .collect();
+    (filtered, is_json)
+}
+
+/// Resolve the working tree root from global flags.
+///
+/// Checks for `-C <path>`, `--work-tree <path>`, or `--work-tree=<path>`.
+/// Returns `None` if no path override is present.
+fn resolve_work_tree(global_flags: &[String]) -> Option<PathBuf> {
+    let mut i = 0;
+    while i < global_flags.len() {
+        let flag = &global_flags[i];
+
+        if flag == "-C" || flag == "--work-tree" {
+            if let Some(val) = global_flags.get(i + 1) {
+                return Some(PathBuf::from(val));
+            }
+        }
+
+        if let Some(val) = flag.strip_prefix("--work-tree=") {
+            return Some(PathBuf::from(val));
+        }
+
+        i += 1;
+    }
+    None
+}
+
 /// Matches hunk headers: `@@ -N,M +N,M @@ optional context`
 static HUNK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@").expect("valid regex")
@@ -764,7 +864,7 @@ fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Result<String> {
 
 /// Resolve the file source content for AST parsing.
 ///
-/// - Unstaged (working tree): read from disk (respects `-C` flag)
+/// - Unstaged (working tree): read from disk (respecting `-C` / `--work-tree`)
 /// - `--cached` / `--staged`: use `git show :path`
 /// - Commit range (`A..B` or `A B`): use `git show B:path`
 fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyhow::Result<String> {
@@ -788,44 +888,43 @@ fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyh
     }
 
     // Default: read from working tree (disk).
-    // When `-C <dir>` is present in global flags, resolve the path relative
-    // to that directory since git diff outputs paths relative to the repo root.
-    let base_dir = extract_c_flag_dir(global_flags);
-    let full_path = match &base_dir {
-        Some(dir) => std::path::PathBuf::from(dir).join(path),
-        None => std::path::PathBuf::from(path),
+    // When `-C` or `--work-tree` is set, prepend that path to the file path.
+    let disk_path = match resolve_work_tree(global_flags) {
+        Some(root) => root.join(path),
+        None => PathBuf::from(path),
     };
-    std::fs::read_to_string(&full_path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", full_path.display()))
+
+    std::fs::read_to_string(&disk_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", disk_path.display()))
 }
 
-/// Extract the directory from a `-C <dir>` global flag, if present.
-fn extract_c_flag_dir(global_flags: &[String]) -> Option<String> {
-    let mut iter = global_flags.iter();
-    while let Some(flag) = iter.next() {
-        if flag == "-C" {
-            return iter.next().cloned();
-        }
-    }
-    None
+/// A resolved AST node range, with optional parent context for nested nodes.
+#[derive(Debug, Clone)]
+struct ChangedNodeRange {
+    /// Start line of this node (1-indexed).
+    start: usize,
+    /// End line of this node (1-indexed).
+    end: usize,
+    /// If this node is a child of a container (class/struct/impl), store the
+    /// parent's first line (declaration header) and last line (closing brace).
+    parent_context: Option<ParentContext>,
 }
 
-/// Find which top-level AST nodes overlap with changed line ranges from hunks.
+/// Stores the declaration line and closing brace of a container node.
+#[derive(Debug, Clone)]
+struct ParentContext {
+    /// The first line of the parent (declaration header), 1-indexed.
+    header_line: usize,
+    /// The last line of the parent (closing brace), 1-indexed.
+    close_line: usize,
+}
+
+/// Build the set of changed line numbers from diff hunks.
 ///
-/// Returns a list of `(start_line, end_line)` ranges for changed top-level nodes.
-/// Lines are 1-indexed to match diff output.
-fn find_changed_node_ranges(
-    tree: &tree_sitter::Tree,
-    hunks: &[DiffHunk],
-) -> Vec<(usize, usize)> {
-    if hunks.is_empty() {
-        return Vec::new();
-    }
-
-    // Build a set of changed line numbers (1-indexed, using new-file line numbers)
+/// Returns 1-indexed line numbers using new-file positions.
+fn build_changed_lines(hunks: &[DiffHunk]) -> HashSet<usize> {
     let mut changed_lines: HashSet<usize> = HashSet::new();
     for hunk in hunks {
-        // Walk through the patch lines to determine exact new-file line numbers
         let mut new_line = hunk.new_start;
         for patch_line in &hunk.patch_lines {
             if patch_line.starts_with('+') {
@@ -841,28 +940,102 @@ fn find_changed_node_ranges(
             // Skip lines starting with '\'
         }
     }
+    changed_lines
+}
+
+/// Check whether a node is a container (class, struct, impl, module).
+fn is_container_node(node: &tree_sitter::Node<'_>) -> bool {
+    let kind = node.kind();
+    matches!(
+        kind,
+        "class_declaration"
+            | "class_definition"          // Python
+            | "class"
+            | "struct_item"               // Rust
+            | "impl_item"                 // Rust
+            | "enum_item"                 // Rust
+            | "trait_item"                // Rust
+            | "interface_declaration"     // TypeScript
+            | "module"
+            | "namespace_definition" // C++
+    )
+}
+
+/// Find which AST nodes overlap with changed line ranges from hunks.
+///
+/// Performs one level of nesting: if a top-level container node (class/struct/impl)
+/// overlaps with hunks, walks its children to find the specific changed child
+/// nodes. Returns child-level ranges with parent context instead of the entire
+/// parent range.
+///
+/// Lines are 1-indexed to match diff output.
+fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHunk]) -> Vec<ChangedNodeRange> {
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+
+    let changed_lines = build_changed_lines(hunks);
 
     if changed_lines.is_empty() {
         return Vec::new();
     }
 
-    // Walk top-level AST nodes and find overlaps
     let root = tree.root_node();
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut ranges: Vec<ChangedNodeRange> = Vec::new();
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
-        // tree-sitter rows are 0-indexed, convert to 1-indexed
         let node_start = child.start_position().row + 1;
         let node_end = child.end_position().row + 1;
 
-        // Check if any changed line falls within this node's range
         let overlaps = changed_lines
             .iter()
             .any(|&line| line >= node_start && line <= node_end);
 
-        if overlaps {
-            ranges.push((node_start, node_end));
+        if !overlaps {
+            continue;
+        }
+
+        // If this is a container node, try to narrow down to child methods/fields
+        if is_container_node(&child) {
+            let mut child_cursor = child.walk();
+            let mut found_child = false;
+
+            for grandchild in child.children(&mut child_cursor) {
+                let gc_start = grandchild.start_position().row + 1;
+                let gc_end = grandchild.end_position().row + 1;
+
+                let gc_overlaps = changed_lines
+                    .iter()
+                    .any(|&line| line >= gc_start && line <= gc_end);
+
+                if gc_overlaps {
+                    found_child = true;
+                    ranges.push(ChangedNodeRange {
+                        start: gc_start,
+                        end: gc_end,
+                        parent_context: Some(ParentContext {
+                            header_line: node_start,
+                            close_line: node_end,
+                        }),
+                    });
+                }
+            }
+
+            // If no child matched (change is in parent's direct body), use the whole parent
+            if !found_child {
+                ranges.push(ChangedNodeRange {
+                    start: node_start,
+                    end: node_end,
+                    parent_context: None,
+                });
+            }
+        } else {
+            ranges.push(ChangedNodeRange {
+                start: node_start,
+                end: node_end,
+                parent_context: None,
+            });
         }
     }
 
@@ -875,7 +1048,17 @@ fn find_changed_node_ranges(
 /// preserving `+`/`-` markers from the patch.
 ///
 /// For unsupported languages or parse failures: falls back to raw hunks.
-fn render_diff_file(file_diff: &FileDiff, global_flags: &[String], args: &[String]) -> String {
+///
+/// `diff_mode` controls how unchanged nodes are rendered:
+/// - `Default`: Only changed nodes.
+/// - `Structure`: Changed + unchanged nodes as signatures.
+/// - `Full`: Changed + unchanged nodes in full.
+fn render_diff_file(
+    file_diff: &FileDiff,
+    global_flags: &[String],
+    args: &[String],
+    diff_mode: DiffMode,
+) -> String {
     let mut output = String::new();
 
     // File header
@@ -959,67 +1142,299 @@ fn render_diff_file(file_diff: &FileDiff, global_flags: &[String], args: &[Strin
         return render_raw_hunks(file_diff, &output);
     }
 
-    // Render: for each changed node range, emit the patch lines that fall within it.
-    // Group consecutive hunks and extend to node boundaries.
     let source_lines: Vec<&str> = source.lines().collect();
 
-    for (node_start, node_end) in &changed_ranges {
-        // Collect relevant hunks for this node
-        let relevant_hunks: Vec<&DiffHunk> = file_diff
-            .hunks
-            .iter()
-            .filter(|h| {
-                let hunk_start = h.new_start;
-                let hunk_end = h.new_start + h.new_count.saturating_sub(1);
-                // Check overlap: hunk range overlaps with node range
-                hunk_start <= *node_end && hunk_end >= *node_start
-            })
-            .collect();
+    // In structure/full mode, render unchanged top-level nodes as context
+    if diff_mode != DiffMode::Default {
+        let ctx = ModeRenderContext {
+            changed_ranges: &changed_ranges,
+            hunks: &file_diff.hunks,
+            source_lines: &source_lines,
+            source: &source,
+            lang,
+            diff_mode,
+        };
+        render_with_unchanged_context(&mut output, &tree, &ctx);
+    } else {
+        // Default mode: only changed nodes, with parent context headers for nested nodes
+        render_changed_only(
+            &mut output,
+            &changed_ranges,
+            &file_diff.hunks,
+            &source_lines,
+        );
+    }
 
-        if relevant_hunks.is_empty() {
+    output
+}
+
+/// Render only changed nodes (default mode).
+///
+/// For nested nodes (inside a class/struct), emits the parent declaration
+/// header line before the changed child node.
+fn render_changed_only(
+    output: &mut String,
+    changed_ranges: &[ChangedNodeRange],
+    hunks: &[DiffHunk],
+    source_lines: &[&str],
+) {
+    // Track which parent headers we have already emitted
+    let mut emitted_parent_headers: HashSet<usize> = HashSet::new();
+
+    for range in changed_ranges {
+        // Emit parent header if this is a nested node
+        if let Some(ref ctx) = range.parent_context {
+            if emitted_parent_headers.insert(ctx.header_line) {
+                if let Some(line) = source_lines.get(ctx.header_line - 1) {
+                    let _ = writeln!(output, " {line}");
+                }
+            }
+        }
+
+        render_node_with_hunks(output, range.start, range.end, hunks, source_lines);
+
+        // Emit parent closing brace if this is the last child with this parent
+        if let Some(ref ctx) = range.parent_context {
+            // Check if there's a subsequent range with the same parent
+            let is_last = !changed_ranges.iter().any(|r| {
+                r.parent_context
+                    .as_ref()
+                    .is_some_and(|p| p.header_line == ctx.header_line && r.start > range.start)
+            });
+            if is_last {
+                if let Some(line) = source_lines.get(ctx.close_line - 1) {
+                    let _ = writeln!(output, " {line}");
+                }
+            }
+        }
+    }
+}
+
+/// Shared context for mode-aware rendering functions.
+///
+/// Groups the parameters that are threaded through the rendering call chain
+/// to stay within clippy's 7-argument limit.
+struct ModeRenderContext<'a> {
+    changed_ranges: &'a [ChangedNodeRange],
+    hunks: &'a [DiffHunk],
+    source_lines: &'a [&'a str],
+    source: &'a str,
+    lang: Language,
+    diff_mode: DiffMode,
+}
+
+/// Render changed nodes with unchanged nodes as context (structure/full mode).
+///
+/// Walks all top-level AST nodes. Changed nodes get full patch rendering;
+/// unchanged nodes are rendered as signatures (structure mode) or in full
+/// (full mode).
+fn render_with_unchanged_context(
+    output: &mut String,
+    tree: &tree_sitter::Tree,
+    ctx: &ModeRenderContext<'_>,
+) {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        let node_start = child.start_position().row + 1;
+        let node_end = child.end_position().row + 1;
+
+        // Check if this top-level node contains any changed range
+        let has_changes = ctx.changed_ranges.iter().any(|r| {
+            // Either the range is directly this node, or it's a child within this node
+            (r.start >= node_start && r.end <= node_end)
+                || r.parent_context
+                    .as_ref()
+                    .is_some_and(|p| p.header_line == node_start)
+        });
+
+        if has_changes {
+            // This node contains changes — render with full patch detail.
+            // If it's a container, render parent header + changed children + context children.
+            if is_container_node(&child) {
+                render_container_with_mode(output, &child, ctx);
+            } else {
+                // Non-container changed node: render with patch
+                render_node_with_hunks(output, node_start, node_end, ctx.hunks, ctx.source_lines);
+            }
+        } else {
+            // Unchanged node: render at mode level
+            render_unchanged_node(
+                output,
+                &child,
+                ctx.source_lines,
+                ctx.source,
+                ctx.lang,
+                ctx.diff_mode,
+            );
+        }
+    }
+}
+
+/// Render a container node (class/struct) with mode-aware child rendering.
+fn render_container_with_mode(
+    output: &mut String,
+    node: &tree_sitter::Node<'_>,
+    ctx: &ModeRenderContext<'_>,
+) {
+    let node_start = node.start_position().row + 1;
+    let node_end = node.end_position().row + 1;
+
+    // Emit parent header
+    if let Some(line) = ctx.source_lines.get(node_start - 1) {
+        let _ = writeln!(output, " {line}");
+    }
+
+    // Walk children of the container
+    let mut child_cursor = node.walk();
+    for child in node.children(&mut child_cursor) {
+        let child_start = child.start_position().row + 1;
+        let child_end = child.end_position().row + 1;
+
+        // Skip the header line itself (already emitted)
+        if child_start == node_start {
             continue;
         }
 
-        // Render the node region. We output source lines from node_start to node_end,
-        // substituting hunk patch lines where they apply.
-        let mut current_new_line = *node_start;
+        let child_changed = ctx.changed_ranges.iter().any(|r| {
+            r.start == child_start
+                && r.end == child_end
+                && r.parent_context
+                    .as_ref()
+                    .is_some_and(|p| p.header_line == node_start)
+        });
 
-        for hunk in &relevant_hunks {
-            // Output unchanged source lines before this hunk's position
-            while current_new_line < hunk.new_start && current_new_line <= *node_end {
-                if let Some(line) = source_lines.get(current_new_line - 1) {
+        if child_changed {
+            render_node_with_hunks(output, child_start, child_end, ctx.hunks, ctx.source_lines);
+        } else {
+            render_unchanged_node(
+                output,
+                &child,
+                ctx.source_lines,
+                ctx.source,
+                ctx.lang,
+                ctx.diff_mode,
+            );
+        }
+    }
+
+    // Emit closing brace
+    if node_end > node_start {
+        if let Some(line) = ctx.source_lines.get(node_end - 1) {
+            let _ = writeln!(output, " {line}");
+        }
+    }
+}
+
+/// Render an unchanged node at the appropriate mode level.
+fn render_unchanged_node(
+    output: &mut String,
+    node: &tree_sitter::Node<'_>,
+    source_lines: &[&str],
+    source: &str,
+    lang: Language,
+    diff_mode: DiffMode,
+) {
+    let node_start = node.start_position().row + 1;
+    let node_end = node.end_position().row + 1;
+
+    match diff_mode {
+        DiffMode::Full => {
+            // Show unchanged nodes in full
+            for line_num in node_start..=node_end {
+                if let Some(line) = source_lines.get(line_num - 1) {
                     let _ = writeln!(output, " {line}");
-                }
-                current_new_line += 1;
-            }
-
-            // Output the hunk's patch lines
-            for patch_line in &hunk.patch_lines {
-                if patch_line.starts_with('+') {
-                    let _ = writeln!(output, "{patch_line}");
-                    current_new_line += 1;
-                } else if patch_line.starts_with('-') {
-                    let _ = writeln!(output, "{patch_line}");
-                    // Deleted lines don't advance the new-file line counter
-                } else if patch_line.starts_with(' ') {
-                    let _ = writeln!(output, "{patch_line}");
-                    current_new_line += 1;
-                } else if patch_line.starts_with('\\') {
-                    let _ = writeln!(output, "{patch_line}");
                 }
             }
         }
+        DiffMode::Structure => {
+            // Show unchanged nodes as structure (signatures)
+            let node_text = node.utf8_text(source.as_bytes()).unwrap_or("");
 
-        // Output remaining unchanged source lines to end of node
-        while current_new_line <= *node_end {
+            // Try to transform the node text at structure level
+            let config = rskim_core::TransformConfig::with_mode(rskim_core::Mode::Structure);
+            match rskim_core::transform_with_config(node_text, lang, &config) {
+                Ok(transformed) => {
+                    for line in transformed.lines() {
+                        let _ = writeln!(output, " {line}");
+                    }
+                }
+                Err(_) => {
+                    // Fall back to showing just the first line (declaration)
+                    if let Some(line) = source_lines.get(node_start - 1) {
+                        let _ = writeln!(output, " {line}");
+                    }
+                }
+            }
+        }
+        DiffMode::Default => {
+            // Default mode: unchanged nodes are omitted (handled by caller)
+        }
+    }
+}
+
+/// Render a node region with hunk patch lines overlaid.
+fn render_node_with_hunks(
+    output: &mut String,
+    node_start: usize,
+    node_end: usize,
+    hunks: &[DiffHunk],
+    source_lines: &[&str],
+) {
+    let relevant_hunks: Vec<&DiffHunk> = hunks
+        .iter()
+        .filter(|h| {
+            let hunk_start = h.new_start;
+            let hunk_end = h.new_start + h.new_count.saturating_sub(1);
+            hunk_start <= node_end && hunk_end >= node_start
+        })
+        .collect();
+
+    if relevant_hunks.is_empty() {
+        // No hunks overlap — show as unchanged context
+        for line_num in node_start..=node_end {
+            if let Some(line) = source_lines.get(line_num - 1) {
+                let _ = writeln!(output, " {line}");
+            }
+        }
+        return;
+    }
+
+    let mut current_new_line = node_start;
+
+    for hunk in &relevant_hunks {
+        // Output unchanged source lines before this hunk's position
+        while current_new_line < hunk.new_start && current_new_line <= node_end {
             if let Some(line) = source_lines.get(current_new_line - 1) {
                 let _ = writeln!(output, " {line}");
             }
             current_new_line += 1;
         }
+
+        // Output the hunk's patch lines
+        for patch_line in &hunk.patch_lines {
+            if patch_line.starts_with('+') {
+                let _ = writeln!(output, "{patch_line}");
+                current_new_line += 1;
+            } else if patch_line.starts_with('-') {
+                let _ = writeln!(output, "{patch_line}");
+            } else if patch_line.starts_with(' ') {
+                let _ = writeln!(output, "{patch_line}");
+                current_new_line += 1;
+            } else if patch_line.starts_with('\\') {
+                let _ = writeln!(output, "{patch_line}");
+            }
+        }
     }
 
-    output
+    // Output remaining unchanged source lines to end of node
+    while current_new_line <= node_end {
+        if let Some(line) = source_lines.get(current_new_line - 1) {
+            let _ = writeln!(output, " {line}");
+        }
+        current_new_line += 1;
+    }
 }
 
 /// Render raw diff hunks as fallback (no AST awareness).
@@ -1038,6 +1453,10 @@ fn render_raw_hunks(file_diff: &FileDiff, header: &str) -> String {
 /// Flag-aware passthrough: `--stat`, `--name-only`, `--name-status`, `--check`
 /// pass through to git unmodified.
 ///
+/// Supports:
+/// - `--mode structure|full` to control context rendering
+/// - `--json` for machine-readable output
+///
 /// Default: parses unified diff, overlays changed lines on tree-sitter AST,
 /// renders changed nodes with full function boundaries and `+`/`-` markers.
 fn run_diff(
@@ -1049,10 +1468,14 @@ fn run_diff(
         return run_passthrough(global_flags, "diff", args, show_stats);
     }
 
+    // Extract skim-specific flags before passing args to git
+    let (args_no_mode, diff_mode) = extract_diff_mode(args);
+    let (git_args, is_json) = extract_json_flag(&args_no_mode);
+
     // Run `git diff --no-color [user args]` to get unified diff output
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["diff".to_string(), "--no-color".to_string()]);
-    full_args.extend_from_slice(args);
+    full_args.extend_from_slice(&git_args);
 
     let runner = CommandRunner::new(None);
     let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
@@ -1089,7 +1512,12 @@ fn run_diff(
     let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
 
     for file_diff in &file_diffs {
-        rendered_output.push_str(&render_diff_file(file_diff, global_flags, args));
+        rendered_output.push_str(&render_diff_file(
+            file_diff,
+            global_flags,
+            &git_args,
+            diff_mode,
+        ));
         diff_file_entries.push(DiffFileEntry {
             path: file_diff.path.clone(),
             status: DiffFileStatus::from(&file_diff.status),
@@ -1098,8 +1526,17 @@ fn run_diff(
     }
 
     let result = DiffResult::new(diff_file_entries, rendered_output);
+
+    if is_json {
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
+        println!("{json}");
+    } else {
+        let result_str = result.to_string();
+        print!("{result_str}");
+    }
+
     let result_str = result.to_string();
-    print!("{result_str}");
 
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(raw_diff, &result_str);
@@ -1826,9 +2263,14 @@ mod tests {
             "expected at least one changed node range"
         );
         // The changed range should cover foo (lines 1-3) but not bar (lines 5-7)
-        let (start, end) = ranges[0];
-        assert!(start <= 2, "changed range should start at or before line 2");
-        assert!(end >= 2, "changed range should end at or after line 2");
+        assert!(
+            ranges[0].start <= 2,
+            "changed range should start at or before line 2"
+        );
+        assert!(
+            ranges[0].end >= 2,
+            "changed range should end at or after line 2"
+        );
     }
 
     #[test]
@@ -1863,6 +2305,45 @@ mod tests {
         assert!(!ranges.is_empty(), "import change should be detected");
     }
 
+    #[test]
+    fn test_find_changed_nodes_nested_class_method() {
+        // Gap 3: verify nested node detection narrows to child method
+        let source = "class Greeter {\n  greet(name: string) {\n    return `Hello, ${name}`;\n  }\n  farewell(name: string) {\n    return `Bye, ${name}`;\n  }\n}\n";
+
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+
+        // Simulate a hunk that changes line 3 (inside greet method)
+        let hunks = vec![DiffHunk {
+            old_start: 3,
+            old_count: 1,
+            new_start: 3,
+            new_count: 1,
+            patch_lines: vec![
+                "-    return `Hello, ${name}`;".to_string(),
+                "+    return `Hi, ${name}`;".to_string(),
+            ],
+        }];
+
+        let ranges = find_changed_node_ranges(&tree, &hunks);
+        assert!(
+            !ranges.is_empty(),
+            "expected at least one changed node range"
+        );
+
+        // Should have parent context since greet is inside Greeter class
+        let first = &ranges[0];
+        assert!(
+            first.parent_context.is_some(),
+            "expected parent context for nested node"
+        );
+        let parent = first.parent_context.as_ref().unwrap();
+        assert_eq!(
+            parent.header_line, 1,
+            "parent header should be class declaration"
+        );
+    }
+
     // ========================================================================
     // strip_ab_prefix tests (#103)
     // ========================================================================
@@ -1875,38 +2356,7 @@ mod tests {
         assert_eq!(strip_ab_prefix("/dev/null"), "/dev/null");
     }
 
-    // ========================================================================
-    // extract_c_flag_dir tests (#103)
-    // ========================================================================
-
-    #[test]
-    fn test_extract_c_flag_dir_present() {
-        let flags: Vec<String> = vec!["-C".into(), "/tmp/repo".into()];
-        assert_eq!(extract_c_flag_dir(&flags), Some("/tmp/repo".to_string()));
-    }
-
-    #[test]
-    fn test_extract_c_flag_dir_absent() {
-        let flags: Vec<String> = vec!["--no-pager".into()];
-        assert_eq!(extract_c_flag_dir(&flags), None);
-    }
-
-    #[test]
-    fn test_extract_c_flag_dir_empty() {
-        let flags: Vec<String> = vec![];
-        assert_eq!(extract_c_flag_dir(&flags), None);
-    }
-
-    #[test]
-    fn test_extract_c_flag_dir_with_other_flags() {
-        let flags: Vec<String> = vec![
-            "--no-pager".into(),
-            "-C".into(),
-            "/my/repo".into(),
-            "--bare".into(),
-        ];
-        assert_eq!(extract_c_flag_dir(&flags), Some("/my/repo".to_string()));
-    }
+    // (resolve_work_tree tests are in the Gap 4 section below)
 
     // ========================================================================
     // parse_diff_git_header tests (#103)
@@ -1955,7 +2405,7 @@ mod tests {
             status: FileStatus::Binary,
             hunks: vec![],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[]);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
         assert!(rendered.contains("logo.png"));
         assert!(rendered.contains("binary"));
         assert!(rendered.contains("Binary file differs"));
@@ -1975,7 +2425,7 @@ mod tests {
                 patch_lines: vec!["+const x = 1;".to_string(), "+const y = 2;".to_string()],
             }],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[]);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
         assert!(rendered.contains("added"), "header should show 'added'");
         assert!(
             rendered.contains("+const x = 1;"),
@@ -1997,7 +2447,7 @@ mod tests {
                 patch_lines: vec!["-const x = 1;".to_string(), "-const y = 2;".to_string()],
             }],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[]);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
         assert!(rendered.contains("deleted"), "header should show 'deleted'");
         assert!(
             rendered.contains("-const x = 1;"),
@@ -2013,7 +2463,7 @@ mod tests {
             status: FileStatus::Renamed,
             hunks: vec![],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[]);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
         assert!(rendered.contains("helpers.ts"), "should show old path");
         assert!(rendered.contains("format.ts"), "should show new path");
         assert!(rendered.contains("renamed"), "header should show 'renamed'");
@@ -2071,5 +2521,116 @@ mod tests {
     fn test_parse_unified_diff_whitespace_only() {
         let files = parse_unified_diff("  \n\n  \n");
         assert!(files.is_empty());
+    }
+
+    // ========================================================================
+    // DiffMode extraction tests (Gap 1)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_diff_mode_extraction_structure() {
+        let args: Vec<String> = vec!["--cached".into(), "--mode".into(), "structure".into()];
+        let (filtered, mode) = extract_diff_mode(&args);
+        assert_eq!(mode, DiffMode::Structure);
+        assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_parse_diff_mode_extraction_full() {
+        let args: Vec<String> = vec!["--mode=full".into(), "--cached".into()];
+        let (filtered, mode) = extract_diff_mode(&args);
+        assert_eq!(mode, DiffMode::Full);
+        assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_parse_diff_mode_extraction_default() {
+        let args: Vec<String> = vec!["--cached".into()];
+        let (filtered, mode) = extract_diff_mode(&args);
+        assert_eq!(mode, DiffMode::Default);
+        assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_parse_diff_mode_extraction_short_flag() {
+        let args: Vec<String> = vec!["-m".into(), "structure".into()];
+        let (filtered, mode) = extract_diff_mode(&args);
+        assert_eq!(mode, DiffMode::Structure);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_parse_diff_mode_extraction_unknown_mode() {
+        let args: Vec<String> = vec!["--mode".into(), "unknown".into()];
+        let (_, mode) = extract_diff_mode(&args);
+        assert_eq!(mode, DiffMode::Default);
+    }
+
+    // ========================================================================
+    // JSON flag extraction tests (Gap 2)
+    // ========================================================================
+
+    #[test]
+    fn test_extract_json_flag_present() {
+        let args: Vec<String> = vec!["--json".into(), "--cached".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_extract_json_flag_absent() {
+        let args: Vec<String> = vec!["--cached".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    // ========================================================================
+    // Path resolution with -C flag tests (Gap 4)
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_work_tree_with_c_flag() {
+        let flags: Vec<String> = vec!["-C".into(), "/other/repo".into()];
+        let result = resolve_work_tree(&flags);
+        assert_eq!(result, Some(PathBuf::from("/other/repo")));
+    }
+
+    #[test]
+    fn test_resolve_work_tree_with_work_tree_flag() {
+        let flags: Vec<String> = vec!["--work-tree".into(), "/other/repo".into()];
+        let result = resolve_work_tree(&flags);
+        assert_eq!(result, Some(PathBuf::from("/other/repo")));
+    }
+
+    #[test]
+    fn test_resolve_work_tree_with_work_tree_equals() {
+        let flags: Vec<String> = vec!["--work-tree=/other/repo".into()];
+        let result = resolve_work_tree(&flags);
+        assert_eq!(result, Some(PathBuf::from("/other/repo")));
+    }
+
+    #[test]
+    fn test_resolve_work_tree_none() {
+        let flags: Vec<String> = vec!["--no-pager".into()];
+        let result = resolve_work_tree(&flags);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_file_source_with_c_flag_path() {
+        // Create a temp dir with a file
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello world").unwrap();
+
+        let global_flags: Vec<String> =
+            vec!["-C".into(), dir.path().to_string_lossy().into_owned()];
+        let args: Vec<String> = vec![];
+
+        let result = get_file_source("test.txt", &global_flags, &args);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        assert_eq!(result.unwrap(), "hello world");
     }
 }

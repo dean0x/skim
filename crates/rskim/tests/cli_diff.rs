@@ -310,3 +310,194 @@ fn test_diff_multiple_files() {
         .stdout(predicates::str::contains("a.ts"))
         .stdout(predicates::str::contains("b.ts"));
 }
+
+// ============================================================================
+// --mode structure (Gap 1)
+// ============================================================================
+
+#[test]
+fn test_diff_mode_structure() {
+    let initial = r#"import { Request } from 'express';
+
+export function greet(name: string): string {
+  return `Hello, ${name}!`;
+}
+
+export function farewell(name: string): string {
+  return `Goodbye, ${name}!`;
+}
+"#;
+
+    let modified = r#"import { Request } from 'express';
+
+export function greet(name: string, title?: string): string {
+  const prefix = title ? `${title} ` : '';
+  return `Hello, ${prefix}${name}!`;
+}
+
+export function farewell(name: string): string {
+  return `Goodbye, ${name}!`;
+}
+"#;
+
+    let dir = setup_repo("src/greet.ts", initial);
+    fs::write(dir.path().join("src/greet.ts"), modified).unwrap();
+
+    // --mode structure should show changed nodes AND unchanged nodes as signatures
+    let assert = run_skim_diff(&dir, &["--mode", "structure"]);
+    let output = assert.success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    // Should contain the changed function
+    assert!(
+        stdout.contains("greet"),
+        "expected 'greet' in output, got:\n{stdout}"
+    );
+
+    // Should contain some reference to farewell (as structure/signature context)
+    assert!(
+        stdout.contains("farewell"),
+        "expected unchanged 'farewell' to appear in structure mode, got:\n{stdout}"
+    );
+}
+
+// ============================================================================
+// --mode full (Gap 1)
+// ============================================================================
+
+#[test]
+fn test_diff_mode_full() {
+    let initial = r#"export function greet(name: string): string {
+  return `Hello, ${name}!`;
+}
+
+export function farewell(name: string): string {
+  return `Goodbye, ${name}!`;
+}
+"#;
+
+    let modified = r#"export function greet(name: string, title?: string): string {
+  const prefix = title ? `${title} ` : '';
+  return `Hello, ${prefix}${name}!`;
+}
+
+export function farewell(name: string): string {
+  return `Goodbye, ${name}!`;
+}
+"#;
+
+    let dir = setup_repo("src/greet.ts", initial);
+    fs::write(dir.path().join("src/greet.ts"), modified).unwrap();
+
+    // --mode full should show changed nodes AND unchanged nodes in full
+    let assert = run_skim_diff(&dir, &["--mode", "full"]);
+    let output = assert.success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    // Should contain the changed function
+    assert!(
+        stdout.contains("greet"),
+        "expected 'greet' in output, got:\n{stdout}"
+    );
+
+    // Should contain the unchanged farewell function in full (including body)
+    assert!(
+        stdout.contains("farewell") && stdout.contains("Goodbye"),
+        "expected unchanged 'farewell' with full body in full mode, got:\n{stdout}"
+    );
+}
+
+// ============================================================================
+// --json output (Gap 2)
+// ============================================================================
+
+#[test]
+fn test_diff_json_output() {
+    let initial = "const x = 1;\n";
+    let modified = "const x = 2;\n";
+
+    let dir = setup_repo("main.ts", initial);
+    fs::write(dir.path().join("main.ts"), modified).unwrap();
+
+    let assert = run_skim_diff(&dir, &["--json"]);
+    let output = assert.success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    // Should be valid JSON
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("expected valid JSON output");
+
+    // Should have files_changed field
+    assert!(
+        parsed.get("files_changed").is_some(),
+        "expected 'files_changed' in JSON output"
+    );
+
+    // Should have files array
+    assert!(
+        parsed.get("files").is_some(),
+        "expected 'files' in JSON output"
+    );
+
+    // File should be main.ts
+    let files = parsed["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    assert_eq!(files[0]["path"], "main.ts");
+}
+
+// ============================================================================
+// --show-stats (Gap 5)
+// ============================================================================
+
+#[test]
+fn test_diff_show_stats() {
+    let initial = "const x = 1;\n";
+    let modified = "const x = 2;\n";
+
+    let dir = setup_repo("main.ts", initial);
+    fs::write(dir.path().join("main.ts"), modified).unwrap();
+
+    let assert = run_skim_diff(&dir, &["--show-stats"]);
+    assert.success().stderr(predicates::str::contains("tokens"));
+}
+
+// ============================================================================
+// --name-status passthrough (Gap 5)
+// ============================================================================
+
+#[test]
+fn test_diff_name_status_passthrough() {
+    let initial = "const x = 1;\n";
+    let modified = "const x = 2;\n";
+
+    let dir = setup_repo("main.ts", initial);
+    fs::write(dir.path().join("main.ts"), modified).unwrap();
+
+    // --name-status should pass through to git directly
+    let assert = run_skim_diff(&dir, &["--name-status"]);
+    let output = assert.success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    // --name-status output starts with M/A/D followed by file path
+    assert!(
+        stdout.contains("main.ts"),
+        "expected 'main.ts' in --name-status output"
+    );
+}
+
+// ============================================================================
+// --check passthrough (Gap 5)
+// ============================================================================
+
+#[test]
+fn test_diff_check_passthrough() {
+    let initial = "const x = 1;\n";
+    let modified = "const x = 2;\n";
+
+    let dir = setup_repo("main.ts", initial);
+    fs::write(dir.path().join("main.ts"), modified).unwrap();
+
+    // --check should pass through to git directly and succeed
+    let assert = run_skim_diff(&dir, &["--check"]);
+    assert.success();
+}
