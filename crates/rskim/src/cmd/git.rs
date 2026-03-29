@@ -726,11 +726,15 @@ fn parse_diff_git_header(line: &str) -> (String, String) {
         let b_part = &rest[pos + 1..];
         (a_part.to_string(), b_part.to_string())
     } else {
-        // Fallback: split on last space
-        let mid = rest.len() / 2;
-        let a_part = &rest[..mid];
-        let b_part = &rest[mid + 1..];
-        (a_part.to_string(), b_part.to_string())
+        // Fallback: split on last space (handles unusual path formats)
+        if let Some(pos) = rest.rfind(' ') {
+            let a_part = &rest[..pos];
+            let b_part = &rest[pos + 1..];
+            (a_part.to_string(), b_part.to_string())
+        } else {
+            // No separator found — treat entire string as b-path
+            (rest.to_string(), rest.to_string())
+        }
     }
 }
 
@@ -760,7 +764,7 @@ fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Result<String> {
 
 /// Resolve the file source content for AST parsing.
 ///
-/// - Unstaged (working tree): read from disk
+/// - Unstaged (working tree): read from disk (respects `-C` flag)
 /// - `--cached` / `--staged`: use `git show :path`
 /// - Commit range (`A..B` or `A B`): use `git show B:path`
 fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyhow::Result<String> {
@@ -783,8 +787,27 @@ fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyh
         return git_show(global_flags, &format!("{commit}:{path}"));
     }
 
-    // Default: read from working tree (disk)
-    std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))
+    // Default: read from working tree (disk).
+    // When `-C <dir>` is present in global flags, resolve the path relative
+    // to that directory since git diff outputs paths relative to the repo root.
+    let base_dir = extract_c_flag_dir(global_flags);
+    let full_path = match &base_dir {
+        Some(dir) => std::path::PathBuf::from(dir).join(path),
+        None => std::path::PathBuf::from(path),
+    };
+    std::fs::read_to_string(&full_path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", full_path.display()))
+}
+
+/// Extract the directory from a `-C <dir>` global flag, if present.
+fn extract_c_flag_dir(global_flags: &[String]) -> Option<String> {
+    let mut iter = global_flags.iter();
+    while let Some(flag) = iter.next() {
+        if flag == "-C" {
+            return iter.next().cloned();
+        }
+    }
+    None
 }
 
 /// Find which top-level AST nodes overlap with changed line ranges from hunks.
@@ -1853,6 +1876,39 @@ mod tests {
     }
 
     // ========================================================================
+    // extract_c_flag_dir tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_extract_c_flag_dir_present() {
+        let flags: Vec<String> = vec!["-C".into(), "/tmp/repo".into()];
+        assert_eq!(extract_c_flag_dir(&flags), Some("/tmp/repo".to_string()));
+    }
+
+    #[test]
+    fn test_extract_c_flag_dir_absent() {
+        let flags: Vec<String> = vec!["--no-pager".into()];
+        assert_eq!(extract_c_flag_dir(&flags), None);
+    }
+
+    #[test]
+    fn test_extract_c_flag_dir_empty() {
+        let flags: Vec<String> = vec![];
+        assert_eq!(extract_c_flag_dir(&flags), None);
+    }
+
+    #[test]
+    fn test_extract_c_flag_dir_with_other_flags() {
+        let flags: Vec<String> = vec![
+            "--no-pager".into(),
+            "-C".into(),
+            "/my/repo".into(),
+            "--bare".into(),
+        ];
+        assert_eq!(extract_c_flag_dir(&flags), Some("/my/repo".to_string()));
+    }
+
+    // ========================================================================
     // parse_diff_git_header tests (#103)
     // ========================================================================
 
@@ -1868,6 +1924,23 @@ mod tests {
         let (a, b) = parse_diff_git_header("diff --git a/old/path.ts b/new/path.ts");
         assert_eq!(a, "a/old/path.ts");
         assert_eq!(b, "b/new/path.ts");
+    }
+
+    #[test]
+    fn test_parse_diff_git_header_fallback_no_b_prefix() {
+        // Unusual format without " b/" — falls back to last-space split
+        let (a, b) = parse_diff_git_header("diff --git a-path b-path");
+        assert_eq!(a, "a-path");
+        assert_eq!(b, "b-path");
+    }
+
+    #[test]
+    fn test_parse_diff_git_header_no_separator() {
+        // Degenerate input with no space after stripping prefix
+        let (a, b) = parse_diff_git_header("diff --git noseparator");
+        // Both should be the same — no split possible
+        assert_eq!(a, "noseparator");
+        assert_eq!(b, "noseparator");
     }
 
     // ========================================================================
