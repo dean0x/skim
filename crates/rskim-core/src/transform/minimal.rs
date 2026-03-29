@@ -122,9 +122,9 @@ pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
         | Language::Go
         | Language::C
         | Language::Cpp
+        | Language::CSharp
         | Language::Ruby
         | Language::Sql => kind == "comment",
-        Language::CSharp => kind == "comment",
         Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
         // Markdown, JSON, YAML, TOML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,

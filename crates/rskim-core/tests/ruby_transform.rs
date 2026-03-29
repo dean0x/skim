@@ -1,5 +1,7 @@
 //! Ruby transformation tests — verify all modes work correctly
 
+#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+
 use rskim_core::{transform, Language, Mode};
 
 const SIMPLE_RB: &str = include_str!("../../../tests/fixtures/ruby/simple.rb");

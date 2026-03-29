@@ -1,8 +1,13 @@
 //! SQL transformation tests — verify all modes work correctly
 
+#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+
 use rskim_core::{transform, Language, Mode};
 
 const SIMPLE_SQL: &str = include_str!("../../../tests/fixtures/sql/simple.sql");
+const SCHEMA_SQL: &str = include_str!("../../../tests/fixtures/sql/schema.sql");
+const JOINS_SQL: &str = include_str!("../../../tests/fixtures/sql/joins.sql");
+const VIEWS_SQL: &str = include_str!("../../../tests/fixtures/sql/views.sql");
 
 // ============================================================================
 // Language detection
@@ -114,25 +119,32 @@ fn test_sql_pseudo_preserves_sql() {
 }
 
 // ============================================================================
-// Cross-mode test
+// Cross-fixture tests
 // ============================================================================
 
 #[test]
-fn test_sql_all_modes_parse() {
-    for mode in [
-        Mode::Structure,
-        Mode::Signatures,
-        Mode::Types,
-        Mode::Full,
-        Mode::Minimal,
-        Mode::Pseudo,
+fn test_sql_all_fixtures_parse() {
+    for (name, source) in [
+        ("simple.sql", SIMPLE_SQL),
+        ("schema.sql", SCHEMA_SQL),
+        ("joins.sql", JOINS_SQL),
+        ("views.sql", VIEWS_SQL),
     ] {
-        let result = transform(SIMPLE_SQL, Language::Sql, mode);
-        assert!(
-            result.is_ok(),
-            "Failed to transform simple.sql in {:?} mode: {:?}",
-            mode,
-            result.err()
-        );
+        for mode in [
+            Mode::Structure,
+            Mode::Signatures,
+            Mode::Types,
+            Mode::Full,
+            Mode::Minimal,
+            Mode::Pseudo,
+        ] {
+            let result = transform(source, Language::Sql, mode);
+            assert!(
+                result.is_ok(),
+                "Failed to transform {name} in {:?} mode: {:?}",
+                mode,
+                result.err()
+            );
+        }
     }
 }

@@ -221,7 +221,7 @@ fn find_body_node(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "statement_block" | "block" | "compound_statement" | "body_statement" => {
+            "statement_block" | "block" | "compound_statement" | "body" | "body_statement" => {
                 return Some(child)
             }
             _ => continue,

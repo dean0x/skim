@@ -211,7 +211,7 @@ struct Args {
     /// Override language detection (required for stdin unless --filename is given)
     #[arg(short, long, alias = "lang", value_enum)]
     #[arg(
-        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
+        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
     )]
     language: Option<LanguageArg>,
 

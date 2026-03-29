@@ -1,5 +1,7 @@
 //! C# transformation tests — verify all modes work correctly
 
+#![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
+
 use rskim_core::{transform, Language, Mode};
 
 const SIMPLE_CS: &str = include_str!("../../../tests/fixtures/csharp/simple.cs");
