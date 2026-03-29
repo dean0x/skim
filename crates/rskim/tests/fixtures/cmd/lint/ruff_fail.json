@@ -1,0 +1,5 @@
+[
+  {"code": "F401", "message": "`os` imported but unused", "filename": "src/main.py", "location": {"row": 1, "column": 1}},
+  {"code": "F401", "message": "`sys` imported but unused", "filename": "src/main.py", "location": {"row": 2, "column": 1}},
+  {"code": "E501", "message": "Line too long (120 > 88)", "filename": "src/utils.py", "location": {"row": 45, "column": 89}}
+]

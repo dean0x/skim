@@ -22,7 +22,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::{
-    inject_flag_before_separator, run_parsed_command_with_mode, user_has_flag, ParsedCommandConfig,
+    inject_flag_before_separator, run_parsed_command_with_mode, user_has_flag, OutputFormat,
+    ParsedCommandConfig,
 };
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
@@ -73,6 +74,7 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
             use_stdin,
             show_stats,
             command_type: crate::analytics::CommandType::Test,
+            output_format: OutputFormat::default(),
         },
         move |output, _args| parse_impl(output, is_nextest),
     )

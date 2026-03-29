@@ -1,0 +1,4 @@
+cmd/main.go:42:12: printf: non-constant format string in call to fmt.Printf (govet)
+cmd/main.go:55:2: unreachable code (govet)
+pkg/cleanup.go:18:9: Error return value of `os.Remove` is not checked (errcheck)
+internal/log.go:33:5: SA1006: printf-style function with dynamic format string (staticcheck)

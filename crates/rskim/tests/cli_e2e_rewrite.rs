@@ -664,3 +664,256 @@ fn test_rewrite_hook_passthrough_zero_stderr() {
         "Passthrough hook mode should produce zero stderr, got: {stderr}"
     );
 }
+
+// ============================================================================
+// Lint rewrite rules (#104)
+// ============================================================================
+
+#[test]
+fn test_rewrite_eslint() {
+    skim_cmd()
+        .args(["rewrite", "eslint", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint eslint ."));
+}
+
+#[test]
+fn test_rewrite_eslint_skip_format_flag() {
+    // When user already has --format json, rewrite should be suppressed
+    skim_cmd()
+        .args(["rewrite", "eslint", "--format", "json", "."])
+        .assert()
+        .failure(); // No match = exit 1
+}
+
+#[test]
+fn test_rewrite_npx_eslint() {
+    skim_cmd()
+        .args(["rewrite", "npx", "eslint", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint eslint src/"));
+}
+
+#[test]
+fn test_rewrite_ruff_check() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "check", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff ."));
+}
+
+#[test]
+fn test_rewrite_ruff_bare() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff ."));
+}
+
+#[test]
+fn test_rewrite_mypy() {
+    skim_cmd()
+        .args(["rewrite", "mypy", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint mypy ."));
+}
+
+#[test]
+fn test_rewrite_python_m_mypy() {
+    skim_cmd()
+        .args(["rewrite", "python", "-m", "mypy", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint mypy ."));
+}
+
+#[test]
+fn test_rewrite_python3_m_mypy() {
+    skim_cmd()
+        .args(["rewrite", "python3", "-m", "mypy", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint mypy src/"));
+}
+
+#[test]
+fn test_rewrite_golangci_lint_run() {
+    skim_cmd()
+        .args(["rewrite", "golangci-lint", "run", "./..."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint golangci ./..."));
+}
+
+#[test]
+fn test_rewrite_golangci_lint_bare() {
+    skim_cmd()
+        .args(["rewrite", "golangci-lint", "./..."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint golangci ./..."));
+}
+
+// ============================================================================
+// Phase 7: Pkg rewrite rules (#105)
+// ============================================================================
+
+#[test]
+fn test_rewrite_npm_audit() {
+    skim_cmd()
+        .args(["rewrite", "npm", "audit"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg npm audit"));
+}
+
+#[test]
+fn test_rewrite_npm_i_express() {
+    skim_cmd()
+        .args(["rewrite", "npm", "i", "express"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg npm install express"));
+}
+
+#[test]
+fn test_rewrite_npm_ci() {
+    skim_cmd()
+        .args(["rewrite", "npm", "ci"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg npm install"));
+}
+
+#[test]
+fn test_rewrite_pip_install_flask() {
+    skim_cmd()
+        .args(["rewrite", "pip", "install", "flask"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pip install flask"));
+}
+
+#[test]
+fn test_rewrite_pip3_check() {
+    skim_cmd()
+        .args(["rewrite", "pip3", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pip check"));
+}
+
+#[test]
+fn test_rewrite_cargo_audit() {
+    skim_cmd()
+        .args(["rewrite", "cargo", "audit"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg cargo audit"));
+}
+
+#[test]
+fn test_rewrite_pnpm_install() {
+    skim_cmd()
+        .args(["rewrite", "pnpm", "install"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pnpm install"));
+}
+
+#[test]
+fn test_rewrite_npm_audit_json_skip() {
+    // --json flag should prevent rewrite
+    skim_cmd()
+        .args(["rewrite", "npm", "audit", "--json"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_pip_list_format_skip() {
+    // --format=json should prevent rewrite
+    skim_cmd()
+        .args(["rewrite", "pip", "list", "--format=json"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_npm_install_with_args() {
+    skim_cmd()
+        .args(["rewrite", "npm", "install", "express", "lodash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim pkg npm install express lodash",
+        ));
+}
+
+#[test]
+fn test_rewrite_npm_outdated() {
+    skim_cmd()
+        .args(["rewrite", "npm", "outdated"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg npm outdated"));
+}
+
+#[test]
+fn test_rewrite_npm_ls() {
+    skim_cmd()
+        .args(["rewrite", "npm", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg npm ls"));
+}
+
+#[test]
+fn test_rewrite_pnpm_audit() {
+    skim_cmd()
+        .args(["rewrite", "pnpm", "audit"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pnpm audit"));
+}
+
+#[test]
+fn test_rewrite_pnpm_outdated() {
+    skim_cmd()
+        .args(["rewrite", "pnpm", "outdated"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pnpm outdated"));
+}
+
+#[test]
+fn test_rewrite_pip_list() {
+    skim_cmd()
+        .args(["rewrite", "pip", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pip list"));
+}
+
+#[test]
+fn test_rewrite_pip3_install() {
+    skim_cmd()
+        .args(["rewrite", "pip3", "install", "flask"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pip install flask"));
+}
+
+#[test]
+fn test_rewrite_pip3_list() {
+    skim_cmd()
+        .args(["rewrite", "pip3", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim pkg pip list"));
+}

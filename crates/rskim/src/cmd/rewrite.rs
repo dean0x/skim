@@ -34,6 +34,8 @@ enum RewriteCategory {
     Build,
     Git,
     Read,
+    Lint,
+    Pkg,
 }
 
 struct RewriteRule {
@@ -122,7 +124,7 @@ fn serialize_category<S: serde::Serializer>(
 }
 
 // ============================================================================
-// Rule table (15 rules, ordered longest-prefix-first within same leading token)
+// Rule table (44 rules, ordered longest-prefix-first within same leading token)
 // ============================================================================
 
 const REWRITE_RULES: &[RewriteRule] = &[
@@ -138,6 +140,12 @@ const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "test", "cargo"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
+    },
+    RewriteRule {
+        prefix: &["cargo", "audit"],
+        rewrite_to: &["skim", "pkg", "cargo", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
     },
     RewriteRule {
         prefix: &["cargo", "clippy"],
@@ -221,6 +229,169 @@ const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "build", "tsc"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
+    },
+    // lint — eslint
+    RewriteRule {
+        prefix: &["npx", "eslint"],
+        rewrite_to: &["skim", "lint", "eslint"],
+        skip_if_flag_prefix: &["--format", "-f"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["eslint"],
+        rewrite_to: &["skim", "lint", "eslint"],
+        skip_if_flag_prefix: &["--format", "-f"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — ruff
+    RewriteRule {
+        prefix: &["ruff", "check"],
+        rewrite_to: &["skim", "lint", "ruff"],
+        skip_if_flag_prefix: &["--output-format"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["ruff"],
+        rewrite_to: &["skim", "lint", "ruff"],
+        skip_if_flag_prefix: &["--output-format"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — mypy (longest prefix first: python3 -m mypy, python -m mypy, mypy)
+    RewriteRule {
+        prefix: &["python3", "-m", "mypy"],
+        rewrite_to: &["skim", "lint", "mypy"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["python", "-m", "mypy"],
+        rewrite_to: &["skim", "lint", "mypy"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["mypy"],
+        rewrite_to: &["skim", "lint", "mypy"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — golangci-lint
+    RewriteRule {
+        prefix: &["golangci-lint", "run"],
+        rewrite_to: &["skim", "lint", "golangci"],
+        skip_if_flag_prefix: &["--out-format"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["golangci-lint"],
+        rewrite_to: &["skim", "lint", "golangci"],
+        skip_if_flag_prefix: &["--out-format"],
+        category: RewriteCategory::Lint,
+    },
+    // pkg — npm (canonical + aliases)
+    RewriteRule {
+        prefix: &["npm", "audit"],
+        rewrite_to: &["skim", "pkg", "npm", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "install"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "i"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "ci"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "outdated"],
+        rewrite_to: &["skim", "pkg", "npm", "outdated"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "list"],
+        rewrite_to: &["skim", "pkg", "npm", "ls"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "ls"],
+        rewrite_to: &["skim", "pkg", "npm", "ls"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    // pkg — pnpm
+    RewriteRule {
+        prefix: &["pnpm", "audit"],
+        rewrite_to: &["skim", "pkg", "pnpm", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "install"],
+        rewrite_to: &["skim", "pkg", "pnpm", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "i"],
+        rewrite_to: &["skim", "pkg", "pnpm", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "outdated"],
+        rewrite_to: &["skim", "pkg", "pnpm", "outdated"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+    },
+    // pkg — pip (canonical + pip3 aliases)
+    RewriteRule {
+        prefix: &["pip", "install"],
+        rewrite_to: &["skim", "pkg", "pip", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip", "check"],
+        rewrite_to: &["skim", "pkg", "pip", "check"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip", "list"],
+        rewrite_to: &["skim", "pkg", "pip", "list"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "install"],
+        rewrite_to: &["skim", "pkg", "pip", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "check"],
+        rewrite_to: &["skim", "pkg", "pip", "check"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "list"],
+        rewrite_to: &["skim", "pkg", "pip", "list"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
     },
 ];
 
@@ -1451,7 +1622,7 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // Prefix rule matches (all 15 rules)
+    // Prefix rule matches (all 34 rules)
     // ========================================================================
 
     #[test]
@@ -1563,6 +1734,187 @@ mod tests {
     fn test_bare_tsc() {
         let result = try_rewrite(&["tsc"]).unwrap();
         assert_eq!(result.tokens, vec!["skim", "build", "tsc"]);
+    }
+
+    // ========================================================================
+    // Pkg rewrite rules (18 rules)
+    // ========================================================================
+
+    #[test]
+    fn test_cargo_audit() {
+        let result = try_rewrite(&["cargo", "audit"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "cargo", "audit"]);
+    }
+
+    #[test]
+    fn test_cargo_audit_skip_json() {
+        assert!(try_rewrite(&["cargo", "audit", "--json"]).is_none());
+    }
+
+    #[test]
+    fn test_npm_audit() {
+        let result = try_rewrite(&["npm", "audit"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "npm", "audit"]);
+    }
+
+    #[test]
+    fn test_npm_audit_skip_json() {
+        assert!(try_rewrite(&["npm", "audit", "--json"]).is_none());
+    }
+
+    #[test]
+    fn test_npm_install() {
+        let result = try_rewrite(&["npm", "install"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "npm", "install"]);
+    }
+
+    #[test]
+    fn test_npm_install_skip_json() {
+        assert!(try_rewrite(&["npm", "install", "--json"]).is_none());
+    }
+
+    #[test]
+    fn test_npm_i_alias() {
+        let result = try_rewrite(&["npm", "i"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "npm", "install"]);
+    }
+
+    #[test]
+    fn test_npm_ci() {
+        let result = try_rewrite(&["npm", "ci"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "npm", "install"]);
+    }
+
+    #[test]
+    fn test_npm_outdated() {
+        let result = try_rewrite(&["npm", "outdated"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "npm", "outdated"]);
+    }
+
+    #[test]
+    fn test_npm_outdated_skip_json() {
+        assert!(try_rewrite(&["npm", "outdated", "--json"]).is_none());
+    }
+
+    #[test]
+    fn test_npm_list_alias() {
+        let result = try_rewrite(&["npm", "list"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "npm", "ls"]);
+    }
+
+    #[test]
+    fn test_npm_ls() {
+        let result = try_rewrite(&["npm", "ls"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "npm", "ls"]);
+    }
+
+    #[test]
+    fn test_npm_ls_skip_json() {
+        assert!(try_rewrite(&["npm", "ls", "--json"]).is_none());
+    }
+
+    #[test]
+    fn test_pnpm_audit() {
+        let result = try_rewrite(&["pnpm", "audit"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pnpm", "audit"]);
+    }
+
+    #[test]
+    fn test_pnpm_audit_skip_json() {
+        assert!(try_rewrite(&["pnpm", "audit", "--json"]).is_none());
+    }
+
+    #[test]
+    fn test_pnpm_install() {
+        let result = try_rewrite(&["pnpm", "install"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pnpm", "install"]);
+    }
+
+    #[test]
+    fn test_pnpm_i_alias() {
+        let result = try_rewrite(&["pnpm", "i"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pnpm", "install"]);
+    }
+
+    #[test]
+    fn test_pnpm_outdated() {
+        let result = try_rewrite(&["pnpm", "outdated"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pnpm", "outdated"]);
+    }
+
+    #[test]
+    fn test_pnpm_outdated_skip_format() {
+        assert!(try_rewrite(&["pnpm", "outdated", "--format=json"]).is_none());
+    }
+
+    #[test]
+    fn test_pip_install() {
+        let result = try_rewrite(&["pip", "install"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pip", "install"]);
+    }
+
+    #[test]
+    fn test_pip_check() {
+        let result = try_rewrite(&["pip", "check"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pip", "check"]);
+    }
+
+    #[test]
+    fn test_pip_list() {
+        let result = try_rewrite(&["pip", "list"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pip", "list"]);
+    }
+
+    #[test]
+    fn test_pip_list_skip_format() {
+        assert!(try_rewrite(&["pip", "list", "--format=columns"]).is_none());
+    }
+
+    #[test]
+    fn test_pip3_install() {
+        let result = try_rewrite(&["pip3", "install"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pip", "install"]);
+    }
+
+    #[test]
+    fn test_pip3_check() {
+        let result = try_rewrite(&["pip3", "check"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pip", "check"]);
+    }
+
+    #[test]
+    fn test_pip3_list() {
+        let result = try_rewrite(&["pip3", "list"]).unwrap();
+        assert_eq!(result.tokens, vec!["skim", "pkg", "pip", "list"]);
+    }
+
+    #[test]
+    fn test_pip3_list_skip_format() {
+        assert!(try_rewrite(&["pip3", "list", "--format=json"]).is_none());
+    }
+
+    #[test]
+    fn test_pkg_category_for_cargo_audit() {
+        let result = try_rewrite(&["cargo", "audit"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Pkg));
+    }
+
+    #[test]
+    fn test_pkg_category_for_npm_install() {
+        let result = try_rewrite(&["npm", "install"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Pkg));
+    }
+
+    #[test]
+    fn test_pkg_category_for_pnpm_audit() {
+        let result = try_rewrite(&["pnpm", "audit"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Pkg));
+    }
+
+    #[test]
+    fn test_pkg_category_for_pip_install() {
+        let result = try_rewrite(&["pip", "install"]).unwrap();
+        assert!(matches!(result.category, RewriteCategory::Pkg));
     }
 
     // ========================================================================

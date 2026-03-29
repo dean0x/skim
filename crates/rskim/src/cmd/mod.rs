@@ -15,6 +15,8 @@ mod hooks;
 mod init;
 mod integrity;
 mod learn;
+mod lint;
+mod pkg;
 mod rewrite;
 mod session;
 mod stats;
@@ -38,6 +40,8 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "git",
     "init",
     "learn",
+    "lint",
+    "pkg",
     "rewrite",
     "stats",
     "test",
@@ -92,6 +96,16 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
     }
 }
 
+/// Controls the output format of parsed command results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OutputFormat {
+    /// Render the parsed result as human-readable text (default).
+    #[default]
+    Text,
+    /// Serialize the parsed result as JSON (for `--json` flag).
+    Json,
+}
+
 /// Configuration for running an external command with parsed output.
 ///
 /// Groups the cross-cutting parameters for [`run_parsed_command_with_mode`]
@@ -104,6 +118,7 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub use_stdin: bool,
     pub show_stats: bool,
     pub command_type: crate::analytics::CommandType,
+    pub output_format: OutputFormat,
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -122,7 +137,7 @@ pub(crate) fn run_parsed_command<T>(
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
-    T: AsRef<str>,
+    T: AsRef<str> + serde::Serialize,
 {
     let use_stdin = !io::stdin().is_terminal();
     let config = ParsedCommandConfig {
@@ -133,6 +148,7 @@ where
         use_stdin,
         show_stats,
         command_type,
+        output_format: OutputFormat::default(),
     };
     run_parsed_command_with_mode(config, parse)
 }
@@ -155,7 +171,7 @@ pub(crate) fn run_parsed_command_with_mode<T>(
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
-    T: AsRef<str>,
+    T: AsRef<str> + serde::Serialize,
 {
     /// Maximum bytes we will read from stdin (64 MiB), consistent with the
     /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
@@ -169,6 +185,7 @@ where
         use_stdin,
         show_stats,
         command_type,
+        output_format,
     } = config;
 
     let output = if use_stdin {
@@ -218,36 +235,43 @@ where
     let result = parse(&output, args);
 
     // Emit markers (warnings/notices) to stderr
-    let stderr_stream = io::stderr();
-    let mut stderr_handle = stderr_stream.lock();
-    let _ = result.emit_markers(&mut stderr_handle);
-    drop(stderr_handle);
-
-    // Emit content to stdout
-    let stdout_stream = io::stdout();
-    let mut stdout_handle = stdout_stream.lock();
-    write!(stdout_handle, "{}", result.content())?;
-    // Ensure trailing newline
-    if !result.content().is_empty() && !result.content().ends_with('\n') {
-        writeln!(stdout_handle)?;
-    }
-    stdout_handle.flush()?;
-
-    // Report token stats if requested
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, result.content());
-        crate::process::report_token_stats(orig, comp, "");
-    }
+    let _ = result.emit_markers(&mut io::stderr().lock());
 
     // Capture exit code before moving stdout into analytics
     let code = output.exit_code.unwrap_or(1);
 
+    // Render output and capture the compressed content string for stats/analytics.
+    let compressed: String = match output_format {
+        OutputFormat::Json => {
+            let json_str = result.to_json_envelope()?;
+            let mut handle = io::stdout().lock();
+            writeln!(handle, "{json_str}")?;
+            handle.flush()?;
+            json_str
+        }
+        OutputFormat::Text => {
+            let content = result.content();
+            let mut handle = io::stdout().lock();
+            write!(handle, "{content}")?;
+            if !content.is_empty() && !content.ends_with('\n') {
+                writeln!(handle)?;
+            }
+            handle.flush()?;
+            content.to_string()
+        }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &compressed);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
     // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid .to_string() allocation when analytics are disabled.
+    // Guard to avoid allocation when analytics are disabled.
     if crate::analytics::is_analytics_enabled() {
         crate::analytics::try_record_command(
             output.stdout,
-            result.content().to_string(),
+            compressed,
             format!("skim {program} {}", args.join(" ")),
             command_type,
             output.duration,
@@ -284,6 +308,8 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "git" => git::run(args),
         "init" => init::run(args),
         "learn" => learn::run(args),
+        "lint" => lint::run(args),
+        "pkg" => pkg::run(args),
         "rewrite" => rewrite::run(args),
         "stats" => stats::run(args),
         "test" => test::run(args),
