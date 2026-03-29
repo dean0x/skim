@@ -221,7 +221,9 @@ fn find_body_node(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "statement_block" | "block" | "compound_statement" => return Some(child),
+            "statement_block" | "block" | "compound_statement" | "body_statement" => {
+                return Some(child)
+            }
             _ => continue,
         }
     }
@@ -269,6 +271,18 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
         Language::C | Language::Cpp => Some(NodeTypes {
             function: "function_definition",
             method: "function_definition",
+        }),
+        Language::CSharp => Some(NodeTypes {
+            function: "method_declaration",
+            method: "constructor_declaration",
+        }),
+        Language::Ruby => Some(NodeTypes {
+            function: "method",
+            method: "singleton_method",
+        }),
+        Language::Sql => Some(NodeTypes {
+            function: "statement",
+            method: "statement",
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

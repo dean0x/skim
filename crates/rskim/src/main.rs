@@ -352,6 +352,11 @@ enum LanguageArg {
     #[value(alias = "c++", alias = "cxx")]
     Cpp,
     Toml,
+    #[value(name = "csharp", alias = "cs", alias = "c#")]
+    CSharp,
+    #[value(alias = "rb")]
+    Ruby,
+    Sql,
 }
 
 impl From<LanguageArg> for Language {
@@ -369,6 +374,9 @@ impl From<LanguageArg> for Language {
             LanguageArg::C => Language::C,
             LanguageArg::Cpp => Language::Cpp,
             LanguageArg::Toml => Language::Toml,
+            LanguageArg::CSharp => Language::CSharp,
+            LanguageArg::Ruby => Language::Ruby,
+            LanguageArg::Sql => Language::Sql,
         }
     }
 }

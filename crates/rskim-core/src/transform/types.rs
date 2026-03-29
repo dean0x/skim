@@ -219,7 +219,9 @@ fn find_class_body(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "class_body" | "declaration_list" | "block" | "field_declaration_list" => {
+            "class_body" | "declaration_list" | "block" | "field_declaration_list"
+            | "body_statement" =>
+            {
                 return Some(child)
             }
             _ => continue,
@@ -306,6 +308,27 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             enum_def: "enum_specifier",
             class_decl: "class_specifier",
             struct_def: "struct_specifier",
+        }),
+        Language::CSharp => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "interface_declaration",
+            enum_def: "enum_declaration",
+            class_decl: "class_declaration",
+            struct_def: "struct_declaration",
+        }),
+        Language::Ruby => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "module",
+            enum_def: "",
+            class_decl: "class",
+            struct_def: "",
+        }),
+        Language::Sql => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "",
+            enum_def: "",
+            class_decl: "",
+            struct_def: "create_table", // CREATE TABLE defines the type structure in SQL
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

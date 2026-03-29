@@ -31,6 +31,9 @@ pub enum Language {
     C,
     Cpp,
     Toml,
+    CSharp,
+    Ruby,
+    Sql,
 }
 
 impl Language {
@@ -62,6 +65,9 @@ impl Language {
             "c" | "h" => Some(Self::C),
             "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(Self::Cpp),
             "toml" => Some(Self::Toml),
+            "cs" => Some(Self::CSharp),
+            "rb" => Some(Self::Ruby),
+            "sql" => Some(Self::Sql),
             _ => None,
         }
     }
@@ -103,6 +109,9 @@ impl Language {
             Self::C => "C",
             Self::Cpp => "C++",
             Self::Toml => "TOML",
+            Self::CSharp => "C#",
+            Self::Ruby => "Ruby",
+            Self::Sql => "SQL",
         }
     }
 
@@ -132,6 +141,9 @@ impl Language {
             Self::C => Some(tree_sitter_c::LANGUAGE.into()),
             Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
             Self::Toml => None, // Uses toml crate, not tree-sitter
+            Self::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+            Self::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+            Self::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
         }
     }
 

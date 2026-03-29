@@ -121,7 +121,10 @@ pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
         | Language::Python
         | Language::Go
         | Language::C
-        | Language::Cpp => kind == "comment",
+        | Language::Cpp
+        | Language::Ruby
+        | Language::Sql => kind == "comment",
+        Language::CSharp => kind == "comment",
         Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
         // Markdown, JSON, YAML, TOML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
@@ -188,6 +191,19 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
         Language::C | Language::Cpp => {
             // Doxygen comments: /** or ///
             text.starts_with("/**") || text.starts_with("///")
+        }
+        Language::CSharp => {
+            // C# XML doc comments: ///
+            text.starts_with("///") || text.starts_with("/**")
+        }
+        Language::Ruby => {
+            // Ruby doesn't have doc comments — all `#` comments are regular.
+            // RDoc and YARD conventions use `#` but there's no syntactic distinction.
+            false
+        }
+        Language::Sql => {
+            // SQL `--` comments have no doc comment convention
+            false
         }
         // Markdown, JSON, YAML, TOML don't reach here
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,

@@ -53,6 +53,9 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::Python | Language::Rust | Language::Go => &["block"],
         Language::Java => &["block", "constructor_body"],
         Language::C | Language::Cpp => &["compound_statement"],
+        Language::CSharp => &["block"],
+        Language::Ruby => &["body_statement"],
+        Language::Sql => &[], // SQL has no function bodies
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
@@ -111,6 +114,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "using_declaration" => ("using_declaration", 5), // C++ using type aliases
         "alias_declaration" => ("alias_declaration", 5), // C++ `using Alias = Type;`
         "class_definition" => ("class_definition", 5),   // Python: classes ARE the type system
+        "struct_declaration" => ("struct_declaration", 5), // C# struct
+        "create_table" => ("create_table", 5),           // SQL: tables ARE the type system
         "atx_heading" => ("atx_heading", 5),
         "setext_heading" => ("setext_heading", 5),
 
@@ -124,6 +129,9 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "template_declaration" => ("template_declaration", 4),
         "arrow_function" => ("arrow_function", 4),
         "function_expression" => ("function_expression", 4),
+        "constructor_declaration" => ("constructor_declaration", 4), // C# constructor
+        "method" => ("method", 4),                                   // Ruby method
+        "singleton_method" => ("singleton_method", 4),               // Ruby class method
 
         // Priority 3: Import statements
         "import_statement" => ("import_statement", 3),
@@ -132,6 +140,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "preproc_include" => ("preproc_include", 3),
         "export_statement" => ("export_statement", 3),
         "use_item" => ("use_item", 3),
+        "using_directive" => ("using_directive", 3), // C# using statements
+        "call" => ("call", 3),                       // Ruby require calls
 
         // Priority 2: Class/module/impl containers
         "class_declaration" => ("class_declaration", 2),
@@ -139,8 +149,12 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "impl_item" => ("impl_item", 2),
         "class_specifier" => ("class_specifier", 2),
         "namespace_definition" => ("namespace_definition", 2),
+        "namespace_declaration" => ("namespace_declaration", 2), // C# namespace
         "interface_type" => ("interface_type", 2),
         "struct_type" => ("struct_type", 2),
+        "class" => ("class", 2),                                 // Ruby class
+        "module" => ("module", 2),                               // Ruby module
+        "statement" => ("statement", 2),                         // SQL statement
 
         // Priority 1: Known but low-priority kinds
         "program" => ("program", 1),
@@ -183,8 +197,10 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::Go
         | Language::Java
         | Language::C
-        | Language::Cpp => "//",
-        Language::Python => "#",
+        | Language::Cpp
+        | Language::CSharp => "//",
+        Language::Python | Language::Ruby => "#",
+        Language::Sql => "--",
         Language::Markdown => "<!--",
         Language::Json => "//", // JSON has no comments; // is JSONC-compatible
         Language::Yaml => "#",
@@ -266,6 +282,8 @@ mod tests {
             "using_declaration",
             "alias_declaration",
             "class_definition",
+            "struct_declaration",
+            "create_table",
             "atx_heading",
             "setext_heading",
             // Priority 4
@@ -278,6 +296,9 @@ mod tests {
             "template_declaration",
             "arrow_function",
             "function_expression",
+            "constructor_declaration",
+            "method",
+            "singleton_method",
             // Priority 3
             "import_statement",
             "use_declaration",
@@ -285,14 +306,20 @@ mod tests {
             "preproc_include",
             "export_statement",
             "use_item",
+            "using_directive",
+            "call",
             // Priority 2
             "class_declaration",
             "module_declaration",
             "impl_item",
             "class_specifier",
             "namespace_definition",
+            "namespace_declaration",
             "interface_type",
             "struct_type",
+            "class",
+            "module",
+            "statement",
             // Priority 1
             "program",
             "source_file",

@@ -187,7 +187,9 @@ fn find_body_for_signature(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "statement_block" | "block" | "compound_statement" | "body" => return Some(child),
+            "statement_block" | "block" | "compound_statement" | "body" | "body_statement" => {
+                return Some(child)
+            }
             _ => continue,
         }
     }
@@ -234,6 +236,18 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
         Language::C | Language::Cpp => Some(SignatureNodeTypes {
             function: "function_definition",
             method: "function_definition",
+        }),
+        Language::CSharp => Some(SignatureNodeTypes {
+            function: "method_declaration",
+            method: "constructor_declaration",
+        }),
+        Language::Ruby => Some(SignatureNodeTypes {
+            function: "method",
+            method: "singleton_method",
+        }),
+        Language::Sql => Some(SignatureNodeTypes {
+            function: "create_table",
+            method: "create_index",
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

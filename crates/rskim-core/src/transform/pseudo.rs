@@ -153,6 +153,31 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_semicolons: true,
             strip_self_param: false,
         },
+        Language::CSharp => PseudoRules {
+            strip_kinds: &[
+                "attribute_list",
+                "type_parameter_list",
+            ],
+            strip_keywords: &[
+                "public", "private", "protected", "internal",
+                "static", "virtual", "override", "sealed", "abstract", "async",
+            ],
+            strip_semicolons: true,
+            strip_self_param: false,
+        },
+        Language::Ruby => PseudoRules {
+            strip_kinds: &[],
+            strip_keywords: &["private", "protected", "public"],
+            strip_semicolons: false,
+            strip_self_param: false,
+        },
+        Language::Sql => PseudoRules {
+            // SQL has minimal syntactic noise — keep most things
+            strip_kinds: &[],
+            strip_keywords: &[],
+            strip_semicolons: true,
+            strip_self_param: false,
+        },
         // Serde languages and Markdown are handled as passthrough before reaching here
         _ => PseudoRules {
             strip_kinds: &[],
