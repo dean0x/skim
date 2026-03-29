@@ -10,7 +10,8 @@
 //! and renders changed nodes with full function boundaries and standard
 //! `+`/`-` markers.
 
-use std::fmt::Write as FmtWrite;
+use std::collections::HashSet;
+use std::fmt::Write;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::LazyLock;
@@ -527,6 +528,18 @@ enum FileStatus {
     Binary,
 }
 
+impl From<&FileStatus> for DiffFileStatus {
+    fn from(status: &FileStatus) -> Self {
+        match status {
+            FileStatus::Added => DiffFileStatus::Added,
+            FileStatus::Modified => DiffFileStatus::Modified,
+            FileStatus::Deleted => DiffFileStatus::Deleted,
+            FileStatus::Renamed => DiffFileStatus::Renamed,
+            FileStatus::Binary => DiffFileStatus::Binary,
+        }
+    }
+}
+
 /// Parsed representation of a single file in a unified diff.
 #[derive(Debug, Clone)]
 struct FileDiff {
@@ -633,10 +646,7 @@ fn parse_unified_diff(output: &str) -> Vec<FileDiff> {
         };
 
         if is_renamed {
-            old_path = rename_from.map(|p| p.to_string());
-            if old_path.is_none() {
-                old_path = Some(strip_ab_prefix(&a_path));
-            }
+            old_path = rename_from.or_else(|| Some(strip_ab_prefix(&a_path)));
         }
 
         // Parse hunks
@@ -735,59 +745,46 @@ fn strip_ab_prefix(path: &str) -> String {
     }
 }
 
+/// Run `git show <ref_spec>` and return stdout, or bail on failure.
+fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Result<String> {
+    let mut full_args: Vec<String> = global_flags.to_vec();
+    full_args.extend(["show".to_string(), ref_spec.to_string()]);
+    let runner = CommandRunner::new(None);
+    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let output = runner.run("git", &arg_refs)?;
+    if output.exit_code != Some(0) {
+        anyhow::bail!("git show {ref_spec} failed: {}", output.stderr.trim());
+    }
+    Ok(output.stdout)
+}
+
 /// Resolve the file source content for AST parsing.
 ///
 /// - Unstaged (working tree): read from disk
 /// - `--cached` / `--staged`: use `git show :path`
 /// - Commit range (`A..B` or `A B`): use `git show B:path`
 fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyhow::Result<String> {
-    let is_staged = user_has_flag(args, &["--cached", "--staged"]);
-
-    if is_staged {
-        // Read from git index
-        let mut full_args: Vec<String> = global_flags.to_vec();
-        full_args.extend(["show".to_string(), format!(":{path}")]);
-        let runner = CommandRunner::new(None);
-        let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
-        let output = runner.run("git", &arg_refs)?;
-        if output.exit_code != Some(0) {
-            anyhow::bail!("git show :{path} failed: {}", output.stderr.trim());
-        }
-        return Ok(output.stdout);
+    if user_has_flag(args, &["--cached", "--staged"]) {
+        return git_show(global_flags, &format!(":{path}"));
     }
 
-    // Check for commit range in args (e.g., "HEAD~2..HEAD" or "abc123 def456")
-    // Look for a range arg containing ".."
+    // Check for commit range in args (e.g., "HEAD~2..HEAD")
     let range_commit = args.iter().find_map(|a| {
-        if let Some(pos) = a.find("..") {
-            // Use the right side of the range
-            let right = &a[pos + 2..];
-            if right.is_empty() {
-                Some("HEAD".to_string())
-            } else {
-                Some(right.to_string())
-            }
+        let pos = a.find("..")?;
+        let right = &a[pos + 2..];
+        Some(if right.is_empty() {
+            "HEAD".to_string()
         } else {
-            None
-        }
+            right.to_string()
+        })
     });
 
     if let Some(commit) = range_commit {
-        let mut full_args: Vec<String> = global_flags.to_vec();
-        full_args.extend(["show".to_string(), format!("{commit}:{path}")]);
-        let runner = CommandRunner::new(None);
-        let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
-        let output = runner.run("git", &arg_refs)?;
-        if output.exit_code != Some(0) {
-            anyhow::bail!("git show {commit}:{path} failed: {}", output.stderr.trim());
-        }
-        return Ok(output.stdout);
+        return git_show(global_flags, &format!("{commit}:{path}"));
     }
 
     // Default: read from working tree (disk)
-    let contents =
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))?;
-    Ok(contents)
+    std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))
 }
 
 /// Find which top-level AST nodes overlap with changed line ranges from hunks.
@@ -795,7 +792,6 @@ fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyh
 /// Returns a list of `(start_line, end_line)` ranges for changed top-level nodes.
 /// Lines are 1-indexed to match diff output.
 fn find_changed_node_ranges(
-    _source: &str,
     tree: &tree_sitter::Tree,
     hunks: &[DiffHunk],
 ) -> Vec<(usize, usize)> {
@@ -804,7 +800,7 @@ fn find_changed_node_ranges(
     }
 
     // Build a set of changed line numbers (1-indexed, using new-file line numbers)
-    let mut changed_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut changed_lines: HashSet<usize> = HashSet::new();
     for hunk in hunks {
         // Walk through the patch lines to determine exact new-file line numbers
         let mut new_line = hunk.new_start;
@@ -868,20 +864,13 @@ fn render_diff_file(file_diff: &FileDiff, global_flags: &[String], args: &[Strin
         FileStatus::Binary => "binary",
     };
 
-    if file_diff.status == FileStatus::Renamed {
-        if let Some(old) = &file_diff.old_path {
-            let _ = writeln!(
-                output,
-                "\u{2500}\u{2500} {} \u{2192} {} ({}) \u{2500}\u{2500}",
-                old, file_diff.path, status_label
-            );
-        } else {
-            let _ = writeln!(
-                output,
-                "\u{2500}\u{2500} {} ({}) \u{2500}\u{2500}",
-                file_diff.path, status_label
-            );
-        }
+    // Renames with a known old path show "old -> new (renamed)"
+    if let (FileStatus::Renamed, Some(old)) = (&file_diff.status, &file_diff.old_path) {
+        let _ = writeln!(
+            output,
+            "\u{2500}\u{2500} {} \u{2192} {} ({}) \u{2500}\u{2500}",
+            old, file_diff.path, status_label
+        );
     } else {
         let _ = writeln!(
             output,
@@ -901,24 +890,9 @@ fn render_diff_file(file_diff: &FileDiff, global_flags: &[String], args: &[Strin
         return output;
     }
 
-    // For deleted files, show all removed content with - markers
-    if file_diff.status == FileStatus::Deleted {
-        for hunk in &file_diff.hunks {
-            for line in &hunk.patch_lines {
-                let _ = writeln!(output, "{line}");
-            }
-        }
-        return output;
-    }
-
-    // For added files, show all new content with + markers
-    if file_diff.status == FileStatus::Added {
-        for hunk in &file_diff.hunks {
-            for line in &hunk.patch_lines {
-                let _ = writeln!(output, "{line}");
-            }
-        }
-        return output;
+    // Added/deleted files: show all patch lines verbatim (no AST overlay needed)
+    if file_diff.status == FileStatus::Deleted || file_diff.status == FileStatus::Added {
+        return render_raw_hunks(file_diff, &output);
     }
 
     // For modified/renamed files, try AST-aware rendering
@@ -955,7 +929,7 @@ fn render_diff_file(file_diff: &FileDiff, global_flags: &[String], args: &[Strin
     };
 
     // Find changed AST node ranges
-    let changed_ranges = find_changed_node_ranges(&source, &tree, &file_diff.hunks);
+    let changed_ranges = find_changed_node_ranges(&tree, &file_diff.hunks);
 
     if changed_ranges.is_empty() {
         // No overlapping AST nodes found — fall back to raw hunks
@@ -973,7 +947,7 @@ fn render_diff_file(file_diff: &FileDiff, global_flags: &[String], args: &[Strin
             .iter()
             .filter(|h| {
                 let hunk_start = h.new_start;
-                let hunk_end = h.new_start + h.new_count.saturating_sub(1).max(0);
+                let hunk_end = h.new_start + h.new_count.saturating_sub(1);
                 // Check overlap: hunk range overlaps with node range
                 hunk_start <= *node_end && hunk_end >= *node_start
             })
@@ -1092,25 +1066,15 @@ fn run_diff(
     let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
 
     for file_diff in &file_diffs {
-        let rendered = render_diff_file(file_diff, global_flags, args);
-        rendered_output.push_str(&rendered);
-
-        let status = match file_diff.status {
-            FileStatus::Added => DiffFileStatus::Added,
-            FileStatus::Modified => DiffFileStatus::Modified,
-            FileStatus::Deleted => DiffFileStatus::Deleted,
-            FileStatus::Renamed => DiffFileStatus::Renamed,
-            FileStatus::Binary => DiffFileStatus::Binary,
-        };
-
+        rendered_output.push_str(&render_diff_file(file_diff, global_flags, args));
         diff_file_entries.push(DiffFileEntry {
             path: file_diff.path.clone(),
-            status,
+            status: DiffFileStatus::from(&file_diff.status),
             changed_regions: file_diff.hunks.len(),
         });
     }
 
-    let result = DiffResult::new(diff_file_entries, rendered_output.clone());
+    let result = DiffResult::new(diff_file_entries, rendered_output);
     let result_str = result.to_string();
     print!("{result_str}");
 
@@ -1831,7 +1795,7 @@ mod tests {
             ],
         }];
 
-        let ranges = find_changed_node_ranges(source, &tree, &hunks);
+        let ranges = find_changed_node_ranges(&tree, &hunks);
 
         // Should find at least the function containing line 2
         assert!(
@@ -1850,7 +1814,7 @@ mod tests {
         let mut parser = rskim_core::Parser::new(rskim_core::Language::TypeScript).unwrap();
         let tree = parser.parse(source).unwrap();
 
-        let ranges = find_changed_node_ranges(source, &tree, &[]);
+        let ranges = find_changed_node_ranges(&tree, &[]);
         assert!(ranges.is_empty(), "no hunks should yield no changed nodes");
     }
 
@@ -1872,7 +1836,7 @@ mod tests {
             ],
         }];
 
-        let ranges = find_changed_node_ranges(source, &tree, &hunks);
+        let ranges = find_changed_node_ranges(&tree, &hunks);
         assert!(!ranges.is_empty(), "import change should be detected");
     }
 
