@@ -77,13 +77,12 @@ fn test_skim_git_status_short_passthrough() {
 
 #[test]
 fn test_skim_git_diff_in_repo() {
-    // Clean repo may have no diff — that's fine, should still succeed
+    // Clean repo has no diff — AST-aware pipeline outputs "No changes" to stderr
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "diff"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("[diff]"));
+        .success();
 }
 
 #[test]
