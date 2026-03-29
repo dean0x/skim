@@ -9,8 +9,10 @@ mod pip;
 mod pnpm;
 
 use std::borrow::Cow;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known package manager tools that `skim pkg` can dispatch to.
@@ -25,7 +27,13 @@ pub(super) fn sanitize_for_display(input: &str) -> String {
     input
         .chars()
         .take(64)
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
         .collect()
 }
 
@@ -89,6 +97,53 @@ pub(super) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
     } else {
         Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
     }
+}
+
+/// Configuration for a package subcommand invocation.
+///
+/// Groups the constant parts of a `run_parsed_command_with_mode` call so
+/// that each `run_*` function only specifies what differs (flag injection
+/// and parse function).
+pub(super) struct PkgSubcommandConfig<'a> {
+    pub program: &'a str,
+    pub subcommand: &'a str,
+    pub env_overrides: &'a [(&'a str, &'a str)],
+    pub install_hint: &'a str,
+}
+
+/// Shared helper that eliminates the repetitive `run_*` boilerplate
+/// across all package manager subcommand parsers.
+///
+/// Builds the argument list, applies flag injection, detects stdin,
+/// and delegates to `run_parsed_command_with_mode`.
+pub(super) fn run_pkg_subcommand<T>(
+    config: PkgSubcommandConfig<'_>,
+    user_args: &[String],
+    show_stats: bool,
+    inject_flags: impl FnOnce(&mut Vec<String>),
+    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<T>,
+) -> anyhow::Result<ExitCode>
+where
+    T: AsRef<str>,
+{
+    let mut cmd_args: Vec<String> = vec![config.subcommand.to_string()];
+    cmd_args.extend(user_args.iter().cloned());
+    inject_flags(&mut cmd_args);
+
+    let use_stdin = !std::io::stdin().is_terminal() && user_args.is_empty();
+
+    crate::cmd::run_parsed_command_with_mode(
+        crate::cmd::ParsedCommandConfig {
+            program: config.program,
+            args: &cmd_args,
+            env_overrides: config.env_overrides,
+            install_hint: config.install_hint,
+            use_stdin,
+            show_stats,
+            command_type: crate::analytics::CommandType::Pkg,
+        },
+        |output, _args| parse_fn(output),
+    )
 }
 
 // ============================================================================

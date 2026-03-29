@@ -13,7 +13,7 @@ mod outdated;
 
 use std::process::ExitCode;
 
-use super::combine_output;
+use super::{combine_output, run_pkg_subcommand, PkgSubcommandConfig};
 
 /// Run `skim pkg npm <subcmd> [args...]`.
 ///

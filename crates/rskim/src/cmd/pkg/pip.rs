@@ -4,13 +4,12 @@
 //! pip install and check are text-only (no JSON mode), so they start at
 //! regex tier. pip list supports `--outdated --format=json`.
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::cmd::{run_parsed_command_with_mode, user_has_flag, ParsedCommandConfig};
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -81,22 +80,17 @@ fn print_help() {
 // ============================================================================
 
 fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = vec!["install".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
+    super::run_pkg_subcommand(
+        super::PkgSubcommandConfig {
             program: "pip",
-            args: &cmd_args,
+            subcommand: "install",
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Python from https://python.org",
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
         },
-        |output, _args| parse_install(output),
+        args,
+        show_stats,
+        |_cmd_args| {},
+        parse_install,
     )
 }
 
@@ -142,22 +136,17 @@ fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
 // ============================================================================
 
 fn run_check(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = vec!["check".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
+    super::run_pkg_subcommand(
+        super::PkgSubcommandConfig {
             program: "pip",
-            args: &cmd_args,
+            subcommand: "check",
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Python from https://python.org",
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
         },
-        |output, _args| parse_check(output),
+        args,
+        show_stats,
+        |_cmd_args| {},
+        parse_check,
     )
 }
 
@@ -218,32 +207,26 @@ fn try_parse_check_regex(text: &str) -> Option<PkgResult> {
 // ============================================================================
 
 fn run_list(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = vec!["list".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    // Inject --outdated and --format=json if json mode
-    if json_output {
-        if !user_has_flag(&cmd_args, &["--outdated"]) {
-            cmd_args.push("--outdated".to_string());
-        }
-        if !user_has_flag(&cmd_args, &["--format"]) {
-            cmd_args.push("--format=json".to_string());
-        }
-    }
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
+    super::run_pkg_subcommand(
+        super::PkgSubcommandConfig {
             program: "pip",
-            args: &cmd_args,
+            subcommand: "list",
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install Python from https://python.org",
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
         },
-        |output, _args| parse_list(output),
+        args,
+        show_stats,
+        |cmd_args| {
+            if json_output {
+                if !user_has_flag(cmd_args, &["--outdated"]) {
+                    cmd_args.push("--outdated".to_string());
+                }
+                if !user_has_flag(cmd_args, &["--format"]) {
+                    cmd_args.push("--format=json".to_string());
+                }
+            }
+        },
+        parse_list,
     )
 }
 

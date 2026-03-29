@@ -6,13 +6,12 @@
 //! NOTE: This is a DIFFERENT module from `cmd/build/cargo.rs` which handles
 //! `cargo build` and `cargo clippy`. No collision: different parent module paths.
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::cmd::{run_parsed_command_with_mode, user_has_flag, ParsedCommandConfig};
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -21,10 +20,6 @@ use crate::runner::CommandOutput;
 // Static regex patterns
 // ============================================================================
 
-static RE_CRATE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^Crate:\s+(\S+)").unwrap());
-static RE_TITLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^Title:\s+(.+)").unwrap());
-static RE_ADVISORY_ID: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^ID:\s+(RUSTSEC-\S+)").unwrap());
 static RE_NO_VULNS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"No\s+vulnerabilities\s+found").unwrap());
 
@@ -80,26 +75,21 @@ fn print_help() {
 // ============================================================================
 
 fn run_audit(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = vec!["audit".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    if json_output && !user_has_flag(&cmd_args, &["--json"]) {
-        cmd_args.push("--json".to_string());
-    }
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
+    super::run_pkg_subcommand(
+        super::PkgSubcommandConfig {
             program: "cargo",
-            args: &cmd_args,
+            subcommand: "audit",
             env_overrides: &[("CARGO_TERM_COLOR", "never")],
             install_hint: "Install cargo-audit via: cargo install cargo-audit",
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
         },
-        |output, _args| parse_audit(output),
+        args,
+        show_stats,
+        |cmd_args| {
+            if json_output && !user_has_flag(cmd_args, &["--json"]) {
+                cmd_args.push("--json".to_string());
+            }
+        },
+        parse_audit,
     )
 }
 
@@ -234,32 +224,28 @@ fn try_parse_audit_regex(text: &str) -> Option<PkgResult> {
         ));
     }
 
-    // Parse advisory blocks: Crate:, Version:, Title:, ID:
-    let crates: Vec<&str> = RE_CRATE
-        .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+    // Block-based parsing: split on blank lines to get individual advisory
+    // blocks, then extract fields from each block. This keeps fields
+    // associated with their block, avoiding the misalignment bug of the
+    // old triple-regex-zip approach (where missing fields in one block
+    // would shift IDs/titles from later blocks into earlier ones).
+    let blocks: Vec<&str> = text
+        .split("\n\n")
+        .filter(|b| b.contains("Crate:"))
         .collect();
-    let ids: Vec<&str> = RE_ADVISORY_ID
-        .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| m.as_str()))
-        .collect();
-    let titles: Vec<&str> = RE_TITLE
-        .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| m.as_str()))
-        .collect();
-
-    let total = crates.len();
-    if total == 0 {
+    if blocks.is_empty() {
         return None;
     }
 
     let mut details: Vec<String> = Vec::new();
-    for i in 0..total {
-        let crate_name = crates.get(i).unwrap_or(&"?");
-        let id = ids.get(i).unwrap_or(&"?");
-        let title = titles.get(i).unwrap_or(&"?");
+    for block in &blocks {
+        let crate_name = extract_field(block, "Crate:").unwrap_or("?");
+        let id = extract_field(block, "ID:").unwrap_or("?");
+        let title = extract_field(block, "Title:").unwrap_or("?");
         details.push(format!("{id} {crate_name}: {title}"));
     }
+
+    let total = details.len();
 
     // cargo audit text doesn't reliably include severity in text mode,
     // so count everything as moderate
@@ -275,6 +261,13 @@ fn try_parse_audit_regex(text: &str) -> Option<PkgResult> {
         true,
         details,
     ))
+}
+
+/// Extract a field value from a text block by line prefix.
+fn extract_field<'a>(block: &'a str, prefix: &str) -> Option<&'a str> {
+    block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix).map(|v| v.trim()))
 }
 
 // ============================================================================
@@ -359,6 +352,59 @@ ID:      RUSTSEC-2024-0002
         let display = format!("{result}");
         assert!(display.contains("total: 2"));
         assert!(display.contains("RUSTSEC-2024-0001"));
+    }
+
+    #[test]
+    fn test_audit_regex_missing_id_field() {
+        // First block is MISSING its ID, second block has one.
+        // Triple-regex misaligns: the ID from block 2 gets assigned to block 1
+        // because regex matches are zipped by index, not by block.
+        let text = "\
+Crate:   first-crate
+Version: 0.1.0
+Title:   Some vulnerability
+
+Crate:   second-crate
+Version: 0.2.0
+Title:   Another vulnerability
+ID:      RUSTSEC-2024-0099
+";
+        let result = try_parse_audit_regex(text);
+        assert!(
+            result.is_some(),
+            "Should still parse blocks with missing fields"
+        );
+        let result = result.unwrap();
+        let display = format!("{result}");
+        // Should have 2 vulnerabilities
+        assert!(
+            display.contains("total: 2"),
+            "Expected 2 vulns, got: {display}"
+        );
+        // The ID must be associated with second-crate, NOT first-crate.
+        // Triple-regex would misalign: RUSTSEC-2024-0099 would appear next to first-crate.
+        assert!(
+            display.contains("RUSTSEC-2024-0099 second-crate"),
+            "ID should be on second-crate, not first-crate. Got: {display}"
+        );
+    }
+
+    #[test]
+    fn test_audit_regex_reordered_fields() {
+        // Fields appear in non-standard order (ID before Crate)
+        let text = "\
+ID:      RUSTSEC-2024-0001
+Crate:   buffer-utils
+Title:   Buffer overflow
+Version: 0.3.1
+";
+        let result = try_parse_audit_regex(text);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        let display = format!("{result}");
+        assert!(display.contains("total: 1"));
+        assert!(display.contains("RUSTSEC-2024-0001"));
+        assert!(display.contains("buffer-utils"));
     }
 
     // ========================================================================

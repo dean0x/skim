@@ -4,13 +4,12 @@
 //! pnpm install is text-only (no JSON mode for install output).
 //! pnpm audit supports `--json`, pnpm outdated supports `--format json`.
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::cmd::{run_parsed_command_with_mode, user_has_flag, ParsedCommandConfig};
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -78,22 +77,17 @@ fn print_help() {
 // ============================================================================
 
 fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = vec!["install".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
+    super::run_pkg_subcommand(
+        super::PkgSubcommandConfig {
             program: "pnpm",
-            args: &cmd_args,
+            subcommand: "install",
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install pnpm via https://pnpm.io/installation",
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
         },
-        |output, _args| parse_install(output),
+        args,
+        show_stats,
+        |_cmd_args| {},
+        parse_install,
     )
 }
 
@@ -154,26 +148,21 @@ fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
 // ============================================================================
 
 fn run_audit(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = vec!["audit".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    if json_output && !user_has_flag(&cmd_args, &["--json"]) {
-        cmd_args.push("--json".to_string());
-    }
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
+    super::run_pkg_subcommand(
+        super::PkgSubcommandConfig {
             program: "pnpm",
-            args: &cmd_args,
+            subcommand: "audit",
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install pnpm via https://pnpm.io/installation",
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
         },
-        |output, _args| parse_audit(output),
+        args,
+        show_stats,
+        |cmd_args| {
+            if json_output && !user_has_flag(cmd_args, &["--json"]) {
+                cmd_args.push("--json".to_string());
+            }
+        },
+        parse_audit,
     )
 }
 
@@ -248,27 +237,22 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
 // ============================================================================
 
 fn run_outdated(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = vec!["outdated".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    if json_output && !user_has_flag(&cmd_args, &["--format"]) {
-        cmd_args.push("--format".to_string());
-        cmd_args.push("json".to_string());
-    }
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
+    super::run_pkg_subcommand(
+        super::PkgSubcommandConfig {
             program: "pnpm",
-            args: &cmd_args,
+            subcommand: "outdated",
             env_overrides: &[("NO_COLOR", "1")],
             install_hint: "Install pnpm via https://pnpm.io/installation",
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
         },
-        |output, _args| parse_outdated(output),
+        args,
+        show_stats,
+        |cmd_args| {
+            if json_output && !user_has_flag(cmd_args, &["--format"]) {
+                cmd_args.push("--format".to_string());
+                cmd_args.push("json".to_string());
+            }
+        },
+        parse_outdated,
     )
 }
 
