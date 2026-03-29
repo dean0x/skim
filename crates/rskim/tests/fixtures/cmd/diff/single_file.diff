@@ -1,0 +1,15 @@
+diff --git a/src/auth/middleware.ts b/src/auth/middleware.ts
+index abc1234..def5678 100644
+--- a/src/auth/middleware.ts
++++ b/src/auth/middleware.ts
+@@ -5,7 +5,10 @@ import { verifyJwt } from "./jwt";
+ export async function authenticate(req: Request): Promise<User> {
+   const token = req.headers.get("Authorization")?.replace("Bearer ", "");
+-  if (!token) throw new AuthError("Missing token");
++  if (!token) {
++    const cookieToken = req.cookies.get("session_token");
++    if (!cookieToken) throw new AuthError("Missing token");
++  }
+   const claims = await verifyJwt(token);
+   return User.fromClaims(claims);
+ }

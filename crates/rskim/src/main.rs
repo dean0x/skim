@@ -191,7 +191,7 @@ SUBCOMMANDS:\n  \
     build                                    Build with output parsing\n  \
     completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n  \
     discover                                 Identify missed optimization opportunities\n  \
-    git                                      Git integration helpers\n  \
+    git                                      Git helpers (AST-aware diff, status, log)\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns and generate correction rules\n  \
     rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \

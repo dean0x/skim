@@ -1,17 +1,25 @@
-//! Git output compression subcommand (#50)
+//! Git output compression subcommand (#50, #103)
 //!
 //! Executes git commands and compresses output for LLM context windows.
 //! Supports `status`, `diff`, and `log` subcommands with flag-aware
 //! passthrough: when the user already specifies a compact format flag,
 //! output is passed through unmodified.
+//!
+//! The `diff` subcommand uses an AST-aware pipeline (#103): it parses
+//! unified diff output, overlays changed line ranges on tree-sitter ASTs,
+//! and renders changed nodes with full function boundaries and standard
+//! `+`/`-` markers.
 
+use std::fmt::Write as FmtWrite;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use rskim_core::Language;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::GitResult;
+use crate::output::canonical::{DiffFileEntry, DiffFileStatus, DiffResult, GitResult};
 use crate::runner::CommandRunner;
 
 // ============================================================================
@@ -19,14 +27,17 @@ use crate::runner::CommandRunner;
 // ============================================================================
 
 /// Matches diff stat lines: " file | 42 +++++---"
+#[cfg(test)]
 static STAT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\|\s+(\d+)\s+([+-]+)").unwrap());
 
 /// Matches diff stat summary lines: "3 files changed, ..."
+#[cfg(test)]
 static SUMMARY_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+)\s+files?\s+changed").unwrap());
 
 /// Matches binary diff stat lines: " file.bin | Bin 0 -> 1234 bytes"
+#[cfg(test)]
 static BINARY_STAT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\|\s+Bin\s+").unwrap());
 
@@ -80,7 +91,7 @@ fn print_help() {
     println!();
     println!("Subcommands:");
     println!("  status    Show compressed working tree status");
-    println!("  diff      Show compressed diff statistics");
+    println!("  diff      AST-aware diff with full function boundaries");
     println!("  log       Show compressed commit log");
     println!();
     println!("Global git flags (before subcommand):");
@@ -475,13 +486,563 @@ fn worktree_prefix(c: char) -> &'static str {
 }
 
 // ============================================================================
-// Diff
+// Diff — AST-aware pipeline (#103)
 // ============================================================================
 
-/// Run `git diff` with compression.
+/// Maximum file size for AST processing (100 KB). Larger files fall back
+/// to raw diff hunks.
+const MAX_AST_FILE_SIZE: usize = 100 * 1024;
+
+/// Matches hunk headers: `@@ -N,M +N,M @@ optional context`
+static HUNK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@").expect("valid regex")
+});
+
+/// A single hunk from a unified diff.
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    /// Start line in the old file (1-indexed).
+    /// Used in tests and for hunk-to-node overlap calculations.
+    #[allow(dead_code)]
+    old_start: usize,
+    /// Number of lines removed from old file.
+    /// Used in tests for validating hunk parsing.
+    #[allow(dead_code)]
+    old_count: usize,
+    /// Start line in the new file (1-indexed)
+    new_start: usize,
+    /// Number of lines added in new file
+    new_count: usize,
+    /// Raw patch lines (including `+`, `-`, and context ` ` prefixes)
+    patch_lines: Vec<String>,
+}
+
+/// Status of a file in a unified diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Binary,
+}
+
+/// Parsed representation of a single file in a unified diff.
+#[derive(Debug, Clone)]
+struct FileDiff {
+    /// File path (new path for renames/adds, old path for deletes)
+    path: String,
+    /// Original path for renames (old name)
+    old_path: Option<String>,
+    /// File status
+    status: FileStatus,
+    /// Hunks of changed lines
+    hunks: Vec<DiffHunk>,
+}
+
+/// Parse a hunk header line: `@@ -N,M +N,M @@`
 ///
-/// Flag-aware passthrough: if user has `--stat`, `--name-only`, or
-/// `--name-status`, output is already compact — pass through unmodified.
+/// Returns `(old_start, old_count, new_start, new_count)` on success.
+fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
+    let caps = HUNK_RE.captures(line)?;
+    let old_start: usize = caps.get(1)?.as_str().parse().ok()?;
+    let old_count: usize = caps.get(2).map_or(1, |m| m.as_str().parse().unwrap_or(1));
+    let new_start: usize = caps.get(3)?.as_str().parse().ok()?;
+    let new_count: usize = caps.get(4).map_or(1, |m| m.as_str().parse().unwrap_or(1));
+    Some((old_start, old_count, new_start, new_count))
+}
+
+/// Parse unified diff output into a list of per-file diffs.
+///
+/// Handles standard `git diff --no-color` output including:
+/// - New files (`--- /dev/null`)
+/// - Deleted files (`+++ /dev/null`)
+/// - Renamed files (`rename from` / `rename to`)
+/// - Binary files (`Binary files ... differ`)
+fn parse_unified_diff(output: &str) -> Vec<FileDiff> {
+    let mut files: Vec<FileDiff> = Vec::new();
+    let lines: Vec<&str> = output.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Look for diff headers
+        if !line.starts_with("diff --git ") {
+            i += 1;
+            continue;
+        }
+
+        // Parse diff header: "diff --git a/path b/path"
+        let (a_path, b_path) = parse_diff_git_header(line);
+
+        // Scan extended headers and --- / +++ lines
+        i += 1;
+        let mut old_path: Option<String> = None;
+        let mut is_binary = false;
+        let mut is_new = false;
+        let mut is_deleted = false;
+        let mut is_renamed = false;
+        let mut rename_from: Option<String> = None;
+        let mut file_minus = String::new();
+        let mut file_plus = String::new();
+
+        while i < lines.len() && !lines[i].starts_with("diff --git ") {
+            let l = lines[i];
+
+            if l.starts_with("new file mode") {
+                is_new = true;
+            } else if l.starts_with("deleted file mode") {
+                is_deleted = true;
+            } else if l.starts_with("rename from ") {
+                is_renamed = true;
+                rename_from = Some(l.strip_prefix("rename from ").unwrap_or("").to_string());
+            } else if l.starts_with("rename to ") {
+                is_renamed = true;
+            } else if l.starts_with("Binary files") && l.contains("differ") {
+                is_binary = true;
+            } else if l.starts_with("--- ") {
+                file_minus = l.strip_prefix("--- ").unwrap_or("").to_string();
+            } else if l.starts_with("+++ ") {
+                file_plus = l.strip_prefix("+++ ").unwrap_or("").to_string();
+            } else if l.starts_with("@@") {
+                // Hunk header — we've moved past extended headers, stop scanning
+                break;
+            }
+
+            i += 1;
+        }
+
+        // Determine file status and path
+        let status = if is_binary {
+            FileStatus::Binary
+        } else if is_new || file_minus == "/dev/null" || file_minus == "a//dev/null" {
+            FileStatus::Added
+        } else if is_deleted || file_plus == "/dev/null" || file_plus == "b//dev/null" {
+            FileStatus::Deleted
+        } else if is_renamed {
+            FileStatus::Renamed
+        } else {
+            FileStatus::Modified
+        };
+
+        let path = if status == FileStatus::Deleted {
+            strip_ab_prefix(&a_path)
+        } else {
+            strip_ab_prefix(&b_path)
+        };
+
+        if is_renamed {
+            old_path = rename_from.map(|p| p.to_string());
+            if old_path.is_none() {
+                old_path = Some(strip_ab_prefix(&a_path));
+            }
+        }
+
+        // Parse hunks
+        let mut hunks: Vec<DiffHunk> = Vec::new();
+
+        if !is_binary {
+            while i < lines.len() && !lines[i].starts_with("diff --git ") {
+                let l = lines[i];
+
+                if l.starts_with("@@") {
+                    if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(l)
+                    {
+                        let mut patch_lines: Vec<String> = Vec::new();
+                        i += 1;
+
+                        while i < lines.len() {
+                            let pl = lines[i];
+                            if pl.starts_with("diff --git ") || pl.starts_with("@@") {
+                                break;
+                            }
+                            // Only keep actual patch lines (+, -, space, or \ no newline)
+                            if pl.starts_with('+')
+                                || pl.starts_with('-')
+                                || pl.starts_with(' ')
+                                || pl.starts_with('\\')
+                            {
+                                patch_lines.push(pl.to_string());
+                            }
+                            i += 1;
+                        }
+
+                        hunks.push(DiffHunk {
+                            old_start,
+                            old_count,
+                            new_start,
+                            new_count,
+                            patch_lines,
+                        });
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            // Skip remaining lines for binary files
+            while i < lines.len() && !lines[i].starts_with("diff --git ") {
+                i += 1;
+            }
+        }
+
+        files.push(FileDiff {
+            path,
+            old_path,
+            status,
+            hunks,
+        });
+    }
+
+    files
+}
+
+/// Parse the `diff --git a/path b/path` header to extract both paths.
+fn parse_diff_git_header(line: &str) -> (String, String) {
+    // Format: "diff --git a/path b/path"
+    // Handle paths with spaces by splitting on " b/"
+    let rest = line.strip_prefix("diff --git ").unwrap_or(line);
+
+    // Find the boundary between a/path and b/path.
+    // We look for " b/" as the separator, but need to handle cases where
+    // the path itself contains " b/".
+    if let Some(pos) = rest.find(" b/") {
+        let a_part = &rest[..pos];
+        let b_part = &rest[pos + 1..];
+        (a_part.to_string(), b_part.to_string())
+    } else if let Some(pos) = rest.find(" b\\") {
+        let a_part = &rest[..pos];
+        let b_part = &rest[pos + 1..];
+        (a_part.to_string(), b_part.to_string())
+    } else {
+        // Fallback: split on last space
+        let mid = rest.len() / 2;
+        let a_part = &rest[..mid];
+        let b_part = &rest[mid + 1..];
+        (a_part.to_string(), b_part.to_string())
+    }
+}
+
+/// Strip the `a/` or `b/` prefix from a diff path.
+fn strip_ab_prefix(path: &str) -> String {
+    if let Some(stripped) = path.strip_prefix("a/") {
+        stripped.to_string()
+    } else if let Some(stripped) = path.strip_prefix("b/") {
+        stripped.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Resolve the file source content for AST parsing.
+///
+/// - Unstaged (working tree): read from disk
+/// - `--cached` / `--staged`: use `git show :path`
+/// - Commit range (`A..B` or `A B`): use `git show B:path`
+fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyhow::Result<String> {
+    let is_staged = user_has_flag(args, &["--cached", "--staged"]);
+
+    if is_staged {
+        // Read from git index
+        let mut full_args: Vec<String> = global_flags.to_vec();
+        full_args.extend(["show".to_string(), format!(":{path}")]);
+        let runner = CommandRunner::new(None);
+        let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+        let output = runner.run("git", &arg_refs)?;
+        if output.exit_code != Some(0) {
+            anyhow::bail!("git show :{path} failed: {}", output.stderr.trim());
+        }
+        return Ok(output.stdout);
+    }
+
+    // Check for commit range in args (e.g., "HEAD~2..HEAD" or "abc123 def456")
+    // Look for a range arg containing ".."
+    let range_commit = args.iter().find_map(|a| {
+        if let Some(pos) = a.find("..") {
+            // Use the right side of the range
+            let right = &a[pos + 2..];
+            if right.is_empty() {
+                Some("HEAD".to_string())
+            } else {
+                Some(right.to_string())
+            }
+        } else {
+            None
+        }
+    });
+
+    if let Some(commit) = range_commit {
+        let mut full_args: Vec<String> = global_flags.to_vec();
+        full_args.extend(["show".to_string(), format!("{commit}:{path}")]);
+        let runner = CommandRunner::new(None);
+        let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+        let output = runner.run("git", &arg_refs)?;
+        if output.exit_code != Some(0) {
+            anyhow::bail!("git show {commit}:{path} failed: {}", output.stderr.trim());
+        }
+        return Ok(output.stdout);
+    }
+
+    // Default: read from working tree (disk)
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))?;
+    Ok(contents)
+}
+
+/// Find which top-level AST nodes overlap with changed line ranges from hunks.
+///
+/// Returns a list of `(start_line, end_line)` ranges for changed top-level nodes.
+/// Lines are 1-indexed to match diff output.
+fn find_changed_node_ranges(
+    _source: &str,
+    tree: &tree_sitter::Tree,
+    hunks: &[DiffHunk],
+) -> Vec<(usize, usize)> {
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+
+    // Build a set of changed line numbers (1-indexed, using new-file line numbers)
+    let mut changed_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for hunk in hunks {
+        // Walk through the patch lines to determine exact new-file line numbers
+        let mut new_line = hunk.new_start;
+        for patch_line in &hunk.patch_lines {
+            if patch_line.starts_with('+') {
+                changed_lines.insert(new_line);
+                new_line += 1;
+            } else if patch_line.starts_with('-') {
+                // Removed lines exist in old file, mark the current position
+                // in the new file as a change boundary
+                changed_lines.insert(new_line);
+            } else if patch_line.starts_with(' ') {
+                new_line += 1;
+            }
+            // Skip lines starting with '\'
+        }
+    }
+
+    if changed_lines.is_empty() {
+        return Vec::new();
+    }
+
+    // Walk top-level AST nodes and find overlaps
+    let root = tree.root_node();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        // tree-sitter rows are 0-indexed, convert to 1-indexed
+        let node_start = child.start_position().row + 1;
+        let node_end = child.end_position().row + 1;
+
+        // Check if any changed line falls within this node's range
+        let overlaps = changed_lines
+            .iter()
+            .any(|&line| line >= node_start && line <= node_end);
+
+        if overlaps {
+            ranges.push((node_start, node_end));
+        }
+    }
+
+    ranges
+}
+
+/// Render a single file diff with AST-aware context.
+///
+/// For supported languages: shows changed AST nodes with full boundaries,
+/// preserving `+`/`-` markers from the patch.
+///
+/// For unsupported languages or parse failures: falls back to raw hunks.
+fn render_diff_file(file_diff: &FileDiff, global_flags: &[String], args: &[String]) -> String {
+    let mut output = String::new();
+
+    // File header
+    let status_label = match file_diff.status {
+        FileStatus::Added => "added",
+        FileStatus::Modified => "modified",
+        FileStatus::Deleted => "deleted",
+        FileStatus::Renamed => "renamed",
+        FileStatus::Binary => "binary",
+    };
+
+    if file_diff.status == FileStatus::Renamed {
+        if let Some(old) = &file_diff.old_path {
+            let _ = writeln!(
+                output,
+                "\u{2500}\u{2500} {} \u{2192} {} ({}) \u{2500}\u{2500}",
+                old, file_diff.path, status_label
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "\u{2500}\u{2500} {} ({}) \u{2500}\u{2500}",
+                file_diff.path, status_label
+            );
+        }
+    } else {
+        let _ = writeln!(
+            output,
+            "\u{2500}\u{2500} {} ({}) \u{2500}\u{2500}",
+            file_diff.path, status_label
+        );
+    }
+
+    // Binary files
+    if file_diff.status == FileStatus::Binary {
+        let _ = writeln!(output, "Binary file differs");
+        return output;
+    }
+
+    // No hunks means nothing to show
+    if file_diff.hunks.is_empty() {
+        return output;
+    }
+
+    // For deleted files, show all removed content with - markers
+    if file_diff.status == FileStatus::Deleted {
+        for hunk in &file_diff.hunks {
+            for line in &hunk.patch_lines {
+                let _ = writeln!(output, "{line}");
+            }
+        }
+        return output;
+    }
+
+    // For added files, show all new content with + markers
+    if file_diff.status == FileStatus::Added {
+        for hunk in &file_diff.hunks {
+            for line in &hunk.patch_lines {
+                let _ = writeln!(output, "{line}");
+            }
+        }
+        return output;
+    }
+
+    // For modified/renamed files, try AST-aware rendering
+    let language = Language::from_path(Path::new(&file_diff.path));
+
+    let source = match get_file_source(&file_diff.path, global_flags, args) {
+        Ok(s) => s,
+        Err(_) => return render_raw_hunks(file_diff, &output),
+    };
+
+    // Skip AST for files > 100KB
+    if source.len() > MAX_AST_FILE_SIZE {
+        return render_raw_hunks(file_diff, &output);
+    }
+
+    let Some(lang) = language else {
+        return render_raw_hunks(file_diff, &output);
+    };
+
+    // Languages that don't use tree-sitter (JSON, YAML, TOML) fall back to raw hunks
+    if lang.is_serde_based() {
+        return render_raw_hunks(file_diff, &output);
+    }
+
+    // Parse with tree-sitter
+    let mut parser = match rskim_core::Parser::new(lang) {
+        Ok(p) => p,
+        Err(_) => return render_raw_hunks(file_diff, &output),
+    };
+
+    let tree = match parser.parse(&source) {
+        Ok(t) => t,
+        Err(_) => return render_raw_hunks(file_diff, &output),
+    };
+
+    // Find changed AST node ranges
+    let changed_ranges = find_changed_node_ranges(&source, &tree, &file_diff.hunks);
+
+    if changed_ranges.is_empty() {
+        // No overlapping AST nodes found — fall back to raw hunks
+        return render_raw_hunks(file_diff, &output);
+    }
+
+    // Render: for each changed node range, emit the patch lines that fall within it.
+    // Group consecutive hunks and extend to node boundaries.
+    let source_lines: Vec<&str> = source.lines().collect();
+
+    for (node_start, node_end) in &changed_ranges {
+        // Collect relevant hunks for this node
+        let relevant_hunks: Vec<&DiffHunk> = file_diff
+            .hunks
+            .iter()
+            .filter(|h| {
+                let hunk_start = h.new_start;
+                let hunk_end = h.new_start + h.new_count.saturating_sub(1).max(0);
+                // Check overlap: hunk range overlaps with node range
+                hunk_start <= *node_end && hunk_end >= *node_start
+            })
+            .collect();
+
+        if relevant_hunks.is_empty() {
+            continue;
+        }
+
+        // Render the node region. We output source lines from node_start to node_end,
+        // substituting hunk patch lines where they apply.
+        let mut current_new_line = *node_start;
+
+        for hunk in &relevant_hunks {
+            // Output unchanged source lines before this hunk's position
+            while current_new_line < hunk.new_start && current_new_line <= *node_end {
+                if let Some(line) = source_lines.get(current_new_line - 1) {
+                    let _ = writeln!(output, " {line}");
+                }
+                current_new_line += 1;
+            }
+
+            // Output the hunk's patch lines
+            for patch_line in &hunk.patch_lines {
+                if patch_line.starts_with('+') {
+                    let _ = writeln!(output, "{patch_line}");
+                    current_new_line += 1;
+                } else if patch_line.starts_with('-') {
+                    let _ = writeln!(output, "{patch_line}");
+                    // Deleted lines don't advance the new-file line counter
+                } else if patch_line.starts_with(' ') {
+                    let _ = writeln!(output, "{patch_line}");
+                    current_new_line += 1;
+                } else if patch_line.starts_with('\\') {
+                    let _ = writeln!(output, "{patch_line}");
+                }
+            }
+        }
+
+        // Output remaining unchanged source lines to end of node
+        while current_new_line <= *node_end {
+            if let Some(line) = source_lines.get(current_new_line - 1) {
+                let _ = writeln!(output, " {line}");
+            }
+            current_new_line += 1;
+        }
+    }
+
+    output
+}
+
+/// Render raw diff hunks as fallback (no AST awareness).
+fn render_raw_hunks(file_diff: &FileDiff, header: &str) -> String {
+    let mut output = header.to_string();
+    for hunk in &file_diff.hunks {
+        for line in &hunk.patch_lines {
+            let _ = writeln!(output, "{line}");
+        }
+    }
+    output
+}
+
+/// Run `git diff` with AST-aware pipeline (#103).
+///
+/// Flag-aware passthrough: `--stat`, `--name-only`, `--name-status`, `--check`
+/// pass through to git unmodified.
+///
+/// Default: parses unified diff, overlays changed lines on tree-sitter AST,
+/// renders changed nodes with full function boundaries and `+`/`-` markers.
 fn run_diff(
     global_flags: &[String],
     args: &[String],
@@ -491,14 +1052,92 @@ fn run_diff(
         return run_passthrough(global_flags, "diff", args, show_stats);
     }
 
+    // Run `git diff --no-color [user args]` to get unified diff output
     let mut full_args: Vec<String> = global_flags.to_vec();
-    full_args.extend(["diff".to_string(), "--stat".to_string()]);
+    full_args.extend(["diff".to_string(), "--no-color".to_string()]);
     full_args.extend_from_slice(args);
 
-    run_parsed_command(&full_args, show_stats, parse_diff_stat)
+    let runner = CommandRunner::new(None);
+    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let output = runner.run("git", &arg_refs)?;
+
+    if output.exit_code != Some(0) {
+        if !output.stderr.is_empty() {
+            eprint!("{}", output.stderr);
+        }
+        if !output.stdout.is_empty() {
+            print!("{}", output.stdout);
+        }
+        return Ok(map_exit_code(output.exit_code));
+    }
+
+    let raw_diff = &output.stdout;
+
+    // Handle empty diff
+    if raw_diff.trim().is_empty() {
+        eprintln!("No changes");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Parse unified diff into per-file structures
+    let file_diffs = parse_unified_diff(raw_diff);
+
+    if file_diffs.is_empty() {
+        eprintln!("No changes");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Render each file with AST-aware context
+    let mut rendered_output = String::new();
+    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
+
+    for file_diff in &file_diffs {
+        let rendered = render_diff_file(file_diff, global_flags, args);
+        rendered_output.push_str(&rendered);
+
+        let status = match file_diff.status {
+            FileStatus::Added => DiffFileStatus::Added,
+            FileStatus::Modified => DiffFileStatus::Modified,
+            FileStatus::Deleted => DiffFileStatus::Deleted,
+            FileStatus::Renamed => DiffFileStatus::Renamed,
+            FileStatus::Binary => DiffFileStatus::Binary,
+        };
+
+        diff_file_entries.push(DiffFileEntry {
+            path: file_diff.path.clone(),
+            status,
+            changed_regions: file_diff.hunks.len(),
+        });
+    }
+
+    let result = DiffResult::new(diff_file_entries, rendered_output.clone());
+    let result_str = result.to_string();
+    print!("{result_str}");
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(raw_diff, &result_str);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Record analytics (fire-and-forget, non-blocking).
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            raw_diff.to_string(),
+            result_str,
+            format!("skim git diff {}", args.join(" ")),
+            crate::analytics::CommandType::Diff,
+            output.duration,
+            None,
+        );
+    }
+
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Parse `git diff --stat` output into a compressed GitResult.
+///
+/// Retained for testing and potential future use (e.g., `--mode stat`).
+#[cfg(test)]
 fn parse_diff_stat(output: &str) -> GitResult {
     let mut file_stats: Vec<String> = Vec::new();
     let mut summary_line = String::new();
@@ -971,5 +1610,429 @@ mod tests {
             &["--check".to_string()],
             &["--stat", "--name-only", "--name-status", "--check"]
         ));
+    }
+
+    // ========================================================================
+    // Hunk header parsing tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_hunk_header_basic() {
+        let result = parse_hunk_header("@@ -1,5 +1,8 @@ function foo() {");
+        assert_eq!(result, Some((1, 5, 1, 8)));
+    }
+
+    #[test]
+    fn test_parse_hunk_header_single_line() {
+        let result = parse_hunk_header("@@ -1 +1 @@");
+        assert_eq!(result, Some((1, 1, 1, 1)));
+    }
+
+    #[test]
+    fn test_parse_hunk_header_with_context_label() {
+        let result = parse_hunk_header("@@ -10,3 +12,5 @@ impl MyStruct {");
+        assert_eq!(result, Some((10, 3, 12, 5)));
+    }
+
+    #[test]
+    fn test_parse_hunk_header_malformed() {
+        assert!(parse_hunk_header("not a hunk header").is_none());
+        assert!(parse_hunk_header("@@ invalid @@").is_none());
+        assert!(parse_hunk_header("--- a/file.rs").is_none());
+    }
+
+    #[test]
+    fn test_parse_hunk_header_zero_count() {
+        // New file with no old content
+        let result = parse_hunk_header("@@ -0,0 +1,12 @@");
+        assert_eq!(result, Some((0, 0, 1, 12)));
+    }
+
+    #[test]
+    fn test_parse_hunk_header_large_line_numbers() {
+        let result = parse_hunk_header("@@ -1000,50 +1050,60 @@");
+        assert_eq!(result, Some((1000, 50, 1050, 60)));
+    }
+
+    // ========================================================================
+    // Unified diff parsing tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_unified_diff_single_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/single_file.diff");
+        let files = parse_unified_diff(input);
+
+        assert_eq!(files.len(), 1, "expected 1 file");
+        assert_eq!(files[0].path, "src/auth/middleware.ts");
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].hunks.len(), 1, "expected 1 hunk");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_multi_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/multi_file.diff");
+        let files = parse_unified_diff(input);
+
+        assert_eq!(files.len(), 2, "expected 2 files");
+        assert_eq!(files[0].path, "src/api/routes.ts");
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[1].path, "src/api/handlers.ts");
+        assert_eq!(files[1].status, FileStatus::Modified);
+        assert_eq!(files[1].hunks.len(), 2, "expected 2 hunks for handlers.ts");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_new_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/new_file.diff");
+        let files = parse_unified_diff(input);
+
+        assert_eq!(files.len(), 1, "expected 1 file");
+        assert_eq!(files[0].path, "src/utils/validator.ts");
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert_eq!(files[0].hunks.len(), 1, "expected 1 hunk");
+        // All lines should be additions
+        assert!(
+            files[0].hunks[0]
+                .patch_lines
+                .iter()
+                .all(|l| l.starts_with('+')),
+            "all lines in new file should be additions"
+        );
+    }
+
+    #[test]
+    fn test_parse_unified_diff_deleted_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/deleted_file.diff");
+        let files = parse_unified_diff(input);
+
+        assert_eq!(files.len(), 1, "expected 1 file");
+        assert_eq!(files[0].path, "src/legacy/old_auth.ts");
+        assert_eq!(files[0].status, FileStatus::Deleted);
+        // All lines should be deletions
+        assert!(
+            files[0].hunks[0]
+                .patch_lines
+                .iter()
+                .all(|l| l.starts_with('-')),
+            "all lines in deleted file should be deletions"
+        );
+    }
+
+    #[test]
+    fn test_parse_unified_diff_renamed_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/renamed_file.diff");
+        let files = parse_unified_diff(input);
+
+        assert_eq!(files.len(), 1, "expected 1 file");
+        assert_eq!(files[0].path, "src/utils/format.ts");
+        assert_eq!(files[0].status, FileStatus::Renamed);
+        assert_eq!(
+            files[0].old_path.as_deref(),
+            Some("src/utils/helpers.ts"),
+            "expected old path for rename"
+        );
+    }
+
+    #[test]
+    fn test_parse_unified_diff_binary_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/binary_file.diff");
+        let files = parse_unified_diff(input);
+
+        assert_eq!(files.len(), 1, "expected 1 file");
+        assert_eq!(files[0].path, "assets/logo.png");
+        assert_eq!(files[0].status, FileStatus::Binary);
+        assert!(
+            files[0].hunks.is_empty(),
+            "binary files should have no hunks"
+        );
+    }
+
+    // ========================================================================
+    // File status detection tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_file_status_from_new_file() {
+        let diff = "diff --git a/new.ts b/new.ts\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1,3 @@\n+line 1\n+line 2\n+line 3\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files[0].status, FileStatus::Added);
+    }
+
+    #[test]
+    fn test_file_status_from_deleted_file() {
+        let diff = "diff --git a/old.ts b/old.ts\ndeleted file mode 100644\nindex abc1234..0000000\n--- a/old.ts\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-line 1\n-line 2\n-line 3\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files[0].status, FileStatus::Deleted);
+    }
+
+    #[test]
+    fn test_file_status_modified() {
+        let diff = "diff --git a/mod.ts b/mod.ts\nindex abc..def 100644\n--- a/mod.ts\n+++ b/mod.ts\n@@ -1,3 +1,4 @@\n line 1\n-line 2\n+line 2 modified\n+line 2b\n line 3\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files[0].status, FileStatus::Modified);
+    }
+
+    // ========================================================================
+    // Hunk content extraction tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_hunk_content_single_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/single_file.diff");
+        let files = parse_unified_diff(input);
+
+        let hunk = &files[0].hunks[0];
+        assert_eq!(hunk.old_start, 5);
+        assert_eq!(hunk.old_count, 7);
+        assert_eq!(hunk.new_start, 5);
+        assert_eq!(hunk.new_count, 10);
+
+        // Should contain both + and - lines
+        let has_additions = hunk.patch_lines.iter().any(|l| l.starts_with('+'));
+        let has_deletions = hunk.patch_lines.iter().any(|l| l.starts_with('-'));
+        assert!(has_additions, "expected additions in hunk");
+        assert!(has_deletions, "expected deletions in hunk");
+    }
+
+    #[test]
+    fn test_hunk_content_new_file() {
+        let input = include_str!("../../tests/fixtures/cmd/diff/new_file.diff");
+        let files = parse_unified_diff(input);
+
+        let hunk = &files[0].hunks[0];
+        assert_eq!(hunk.old_start, 0);
+        assert_eq!(hunk.old_count, 0);
+        assert_eq!(hunk.new_start, 1);
+        assert_eq!(hunk.new_count, 12);
+    }
+
+    // ========================================================================
+    // Changed node detection tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_find_changed_nodes_function_overlaps_hunk() {
+        let source = "function foo() {\n  return 1;\n}\n\nfunction bar() {\n  return 2;\n}\n";
+
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+
+        // Simulate a hunk that changes line 2 (inside foo)
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 2,
+            patch_lines: vec![
+                "-  return 1;".to_string(),
+                "+  return 42;".to_string(),
+                "+  console.log(42);".to_string(),
+            ],
+        }];
+
+        let ranges = find_changed_node_ranges(source, &tree, &hunks);
+
+        // Should find at least the function containing line 2
+        assert!(
+            !ranges.is_empty(),
+            "expected at least one changed node range"
+        );
+        // The changed range should cover foo (lines 1-3) but not bar (lines 5-7)
+        let (start, end) = ranges[0];
+        assert!(start <= 2, "changed range should start at or before line 2");
+        assert!(end >= 2, "changed range should end at or after line 2");
+    }
+
+    #[test]
+    fn test_find_changed_nodes_empty_hunks() {
+        let source = "function foo() {}\n";
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+
+        let ranges = find_changed_node_ranges(source, &tree, &[]);
+        assert!(ranges.is_empty(), "no hunks should yield no changed nodes");
+    }
+
+    #[test]
+    fn test_find_changed_nodes_import_overlaps() {
+        let source = "import { foo } from 'bar';\nimport { baz } from 'qux';\n\nfunction main() {\n  foo();\n}\n";
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+
+        // Simulate a hunk that changes line 1 (first import)
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            patch_lines: vec![
+                "-import { foo } from 'bar';".to_string(),
+                "+import { foo, extra } from 'bar';".to_string(),
+            ],
+        }];
+
+        let ranges = find_changed_node_ranges(source, &tree, &hunks);
+        assert!(!ranges.is_empty(), "import change should be detected");
+    }
+
+    // ========================================================================
+    // strip_ab_prefix tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_strip_ab_prefix() {
+        assert_eq!(strip_ab_prefix("a/src/main.rs"), "src/main.rs");
+        assert_eq!(strip_ab_prefix("b/src/main.rs"), "src/main.rs");
+        assert_eq!(strip_ab_prefix("src/main.rs"), "src/main.rs");
+        assert_eq!(strip_ab_prefix("/dev/null"), "/dev/null");
+    }
+
+    // ========================================================================
+    // parse_diff_git_header tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_diff_git_header_simple() {
+        let (a, b) = parse_diff_git_header("diff --git a/src/main.rs b/src/main.rs");
+        assert_eq!(a, "a/src/main.rs");
+        assert_eq!(b, "b/src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_diff_git_header_different_paths() {
+        let (a, b) = parse_diff_git_header("diff --git a/old/path.ts b/new/path.ts");
+        assert_eq!(a, "a/old/path.ts");
+        assert_eq!(b, "b/new/path.ts");
+    }
+
+    // ========================================================================
+    // Render output tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_render_binary_file() {
+        let file_diff = FileDiff {
+            path: "assets/logo.png".to_string(),
+            old_path: None,
+            status: FileStatus::Binary,
+            hunks: vec![],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[]);
+        assert!(rendered.contains("logo.png"));
+        assert!(rendered.contains("binary"));
+        assert!(rendered.contains("Binary file differs"));
+    }
+
+    #[test]
+    fn test_render_added_file() {
+        let file_diff = FileDiff {
+            path: "src/new.ts".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            hunks: vec![DiffHunk {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                patch_lines: vec!["+const x = 1;".to_string(), "+const y = 2;".to_string()],
+            }],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[]);
+        assert!(rendered.contains("added"), "header should show 'added'");
+        assert!(
+            rendered.contains("+const x = 1;"),
+            "should contain added lines"
+        );
+    }
+
+    #[test]
+    fn test_render_deleted_file() {
+        let file_diff = FileDiff {
+            path: "src/old.ts".to_string(),
+            old_path: None,
+            status: FileStatus::Deleted,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_count: 2,
+                new_start: 0,
+                new_count: 0,
+                patch_lines: vec!["-const x = 1;".to_string(), "-const y = 2;".to_string()],
+            }],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[]);
+        assert!(rendered.contains("deleted"), "header should show 'deleted'");
+        assert!(
+            rendered.contains("-const x = 1;"),
+            "should contain deleted lines"
+        );
+    }
+
+    #[test]
+    fn test_render_renamed_file_header() {
+        let file_diff = FileDiff {
+            path: "src/utils/format.ts".to_string(),
+            old_path: Some("src/utils/helpers.ts".to_string()),
+            status: FileStatus::Renamed,
+            hunks: vec![],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[]);
+        assert!(rendered.contains("helpers.ts"), "should show old path");
+        assert!(rendered.contains("format.ts"), "should show new path");
+        assert!(rendered.contains("renamed"), "header should show 'renamed'");
+    }
+
+    // ========================================================================
+    // DiffResult output type tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_diff_result_display() {
+        let entries = vec![
+            DiffFileEntry {
+                path: "src/main.rs".to_string(),
+                status: DiffFileStatus::Modified,
+                changed_regions: 2,
+            },
+            DiffFileEntry {
+                path: "src/lib.rs".to_string(),
+                status: DiffFileStatus::Added,
+                changed_regions: 1,
+            },
+        ];
+        let result = DiffResult::new(entries, "test rendered output".to_string());
+        assert_eq!(result.files_changed, 2);
+        assert_eq!(result.to_string(), "test rendered output");
+    }
+
+    #[test]
+    fn test_diff_result_serde_roundtrip() {
+        let entries = vec![DiffFileEntry {
+            path: "src/main.rs".to_string(),
+            status: DiffFileStatus::Modified,
+            changed_regions: 1,
+        }];
+        let original = DiffResult::new(entries, "rendered output".to_string());
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: DiffResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        // After deserialization+ensure_rendered, it should have some output
+        assert!(!deserialized.as_ref().is_empty());
+    }
+
+    // ========================================================================
+    // Empty diff edge case (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_unified_diff_empty() {
+        let files = parse_unified_diff("");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_parse_unified_diff_whitespace_only() {
+        let files = parse_unified_diff("  \n\n  \n");
+        assert!(files.is_empty());
     }
 }

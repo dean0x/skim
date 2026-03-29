@@ -1,0 +1,18 @@
+diff --git a/src/utils/validator.ts b/src/utils/validator.ts
+new file mode 100644
+index 0000000..abcdef1
+--- /dev/null
++++ b/src/utils/validator.ts
+@@ -0,0 +1,12 @@
++import { z } from "zod";
++
++export function validate<T>(schema: z.Schema<T>, data: unknown): T {
++  return schema.parse(data);
++}
++
++export const UserSchema = z.object({
++  name: z.string().min(1),
++  email: z.string().email(),
++  age: z.number().int().positive().optional(),
++});
++

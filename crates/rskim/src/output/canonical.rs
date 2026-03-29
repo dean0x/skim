@@ -504,6 +504,90 @@ impl fmt::Display for PkgResult {
 }
 
 // ============================================================================
+// DiffResult types
+// ============================================================================
+
+/// Status of a file in a diff
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DiffFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Binary,
+}
+
+impl fmt::Display for DiffFileStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DiffFileStatus::Added => write!(f, "added"),
+            DiffFileStatus::Modified => write!(f, "modified"),
+            DiffFileStatus::Deleted => write!(f, "deleted"),
+            DiffFileStatus::Renamed => write!(f, "renamed"),
+            DiffFileStatus::Binary => write!(f, "binary"),
+        }
+    }
+}
+
+/// A single file entry within a diff result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DiffFileEntry {
+    pub(crate) path: String,
+    pub(crate) status: DiffFileStatus,
+    pub(crate) changed_regions: usize,
+}
+
+/// Complete diff result with file entries and pre-rendered display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DiffResult {
+    pub(crate) files_changed: usize,
+    pub(crate) files: Vec<DiffFileEntry>,
+    #[serde(default)]
+    rendered: String,
+}
+
+impl DiffResult {
+    /// Create a new DiffResult with pre-computed rendered output
+    pub(crate) fn new(files: Vec<DiffFileEntry>, rendered: String) -> Self {
+        let files_changed = files.len();
+        Self {
+            files_changed,
+            files,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization)
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            // Re-render from file entries as a summary fallback
+            use std::fmt::Write;
+            let mut output = format!("[diff] {} files changed", self.files_changed);
+            for file in &self.files {
+                let _ = write!(
+                    output,
+                    "\n  {} ({}, {} regions)",
+                    file.path, file.status, file.changed_regions
+                );
+            }
+            self.rendered = output;
+        }
+    }
+}
+
+impl AsRef<str> for DiffResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for DiffResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
