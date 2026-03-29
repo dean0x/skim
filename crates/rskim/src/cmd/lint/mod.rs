@@ -10,7 +10,7 @@ pub(crate) mod ruff;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::io::{self, Read, Write};
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
@@ -93,134 +93,64 @@ fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
 }
 
 // ============================================================================
-// Shared JSON mode helper
+// Shared linter execution helper
 // ============================================================================
 
-/// Configuration for [`run_lint_json_mode`].
-pub(crate) struct LintJsonConfig<'a> {
+/// Static configuration for a linter binary.
+///
+/// Each linter module exposes a `CONFIG` constant with this type.
+pub(crate) struct LinterConfig<'a> {
     /// Binary name of the linter (e.g., "eslint", "ruff").
     pub program: &'a str,
-    /// Arguments to pass to the linter.
-    pub cmd_args: &'a [String],
     /// Environment variable overrides for the child process.
     pub env_overrides: &'a [(&'a str, &'a str)],
     /// Hint printed when the linter binary is not found.
     pub install_hint: &'a str,
-    /// Whether stdin is piped (read stdin instead of running command).
-    pub use_stdin: bool,
-    /// Whether to report token statistics to stderr.
-    pub show_stats: bool,
 }
 
-/// Run a linter in `--json` mode: execute (or read stdin), parse output,
-/// serialize result as JSON to stdout, and preserve the child process exit code.
+/// Execute a linter, parse its output, and emit the result.
 ///
-/// This is the single implementation shared by all lint parsers, eliminating
-/// the per-linter `run_json_mode` duplication. The caller supplies a
-/// `parse_fn` that implements the linter-specific three-tier parse logic.
-pub(crate) fn run_lint_json_mode(
-    config: LintJsonConfig<'_>,
+/// This is the single implementation shared by all lint parsers, handling both
+/// text and JSON output modes. It eliminates per-linter `run()` boilerplate by
+/// delegating to [`crate::cmd::run_parsed_command_with_mode`].
+///
+/// - `config`: static linter metadata (program name, env vars, install hint)
+/// - `args`: raw user args (before prepare_args)
+/// - `show_stats`: whether to report token statistics
+/// - `json_output`: whether to emit JSON instead of text
+/// - `prepare_args`: closure to inject linter-specific flags (e.g., `--format json`)
+/// - `parse_fn`: linter-specific three-tier parse function
+pub(crate) fn run_linter(
+    config: LinterConfig<'_>,
+    args: &[String],
+    show_stats: bool,
+    json_output: bool,
+    prepare_args: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<LintResult>,
 ) -> anyhow::Result<ExitCode> {
-    /// Maximum bytes we will read from stdin (64 MiB), consistent with the
-    /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
-    const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+    let mut cmd_args = args.to_vec();
+    prepare_args(&mut cmd_args);
 
-    let LintJsonConfig {
-        program,
-        cmd_args,
-        env_overrides,
-        install_hint,
-        use_stdin,
-        show_stats,
-    } = config;
-
-    let output = if use_stdin {
-        let mut stdin_buf = String::new();
-        let bytes_read = io::stdin()
-            .take(MAX_STDIN_BYTES)
-            .read_to_string(&mut stdin_buf)?;
-        if bytes_read as u64 >= MAX_STDIN_BYTES {
-            anyhow::bail!("stdin input exceeded 64 MiB limit");
-        }
-        CommandOutput {
-            stdout: crate::output::strip_ansi(&stdin_buf),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
+    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let output_format = if json_output {
+        crate::cmd::OutputFormat::Json
     } else {
-        let runner = crate::runner::CommandRunner::new(Some(std::time::Duration::from_secs(300)));
-        let args_str: Vec<&str> = cmd_args.iter().map(|s| s.as_str()).collect();
-        match runner.run_with_env(program, &args_str, env_overrides) {
-            Ok(out) => CommandOutput {
-                stdout: crate::output::strip_ansi(&out.stdout),
-                stderr: crate::output::strip_ansi(&out.stderr),
-                ..out
-            },
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("failed to execute") {
-                    eprintln!("error: '{program}' not found");
-                    eprintln!("hint: {install_hint}");
-                    return Ok(ExitCode::FAILURE);
-                }
-                return Err(e);
-            }
-        }
+        crate::cmd::OutputFormat::Text
     };
 
-    let result = parse_fn(&output);
-
-    // Emit tier degradation markers to stderr for terminal observability,
-    // consistent with run_parsed_command_with_mode (cmd/mod.rs).
-    let _ = result.emit_markers(&mut io::stderr().lock());
-
-    let json_str = match &result {
-        ParseResult::Full(lint_result) => serde_json::to_string(lint_result)?,
-        ParseResult::Degraded(lint_result, warnings) => {
-            let val = serde_json::json!({
-                "tier": "degraded",
-                "warnings": warnings,
-                "result": lint_result,
-            });
-            serde_json::to_string(&val)?
-        }
-        ParseResult::Passthrough(raw) => {
-            let val = serde_json::json!({
-                "tier": "passthrough",
-                "raw": raw,
-            });
-            serde_json::to_string(&val)?
-        }
-    };
-
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    writeln!(handle, "{json_str}")?;
-    handle.flush()?;
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &json_str);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    // Capture exit code before moving stdout into analytics
-    let code = output.exit_code.unwrap_or(1);
-
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            output.stdout,
-            json_str,
-            format!("skim {program} {}", cmd_args.join(" ")),
-            crate::analytics::CommandType::Lint,
-            output.duration,
-            Some(result.tier_name()),
-        );
-    }
-
-    // Preserve child process exit code
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+    crate::cmd::run_parsed_command_with_mode(
+        crate::cmd::ParsedCommandConfig {
+            program: config.program,
+            args: &cmd_args,
+            env_overrides: config.env_overrides,
+            install_hint: config.install_hint,
+            use_stdin,
+            show_stats,
+            command_type: crate::analytics::CommandType::Lint,
+            output_format,
+        },
+        |output, _args| parse_fn(output),
+    )
 }
 
 /// Combine stdout and stderr into a single string for regex fallback parsing.

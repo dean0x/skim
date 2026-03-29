@@ -73,6 +73,7 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
             use_stdin,
             show_stats,
             command_type: crate::analytics::CommandType::Test,
+            output_format: crate::cmd::OutputFormat::default(),
         },
         move |output, _args| parse_impl(output, is_nextest),
     )

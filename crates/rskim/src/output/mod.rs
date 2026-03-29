@@ -88,6 +88,34 @@ impl<T: AsRef<str>> ParseResult<T> {
     }
 }
 
+impl<T: serde::Serialize> ParseResult<T> {
+    /// Serialize the parse result as a JSON string suitable for `--json` output.
+    ///
+    /// - `Full(result)` -> direct JSON serialization (no envelope -- preserves existing behavior)
+    /// - `Degraded(result, warnings)` -> `{"tier":"degraded","warnings":[...],"result":{...}}`
+    /// - `Passthrough(raw)` -> `{"tier":"passthrough","raw":"..."}`
+    pub(crate) fn to_json_envelope(&self) -> serde_json::Result<String> {
+        match self {
+            ParseResult::Full(inner) => serde_json::to_string(inner),
+            ParseResult::Degraded(inner, warnings) => {
+                let val = serde_json::json!({
+                    "tier": "degraded",
+                    "warnings": warnings,
+                    "result": inner,
+                });
+                serde_json::to_string(&val)
+            }
+            ParseResult::Passthrough(raw) => {
+                let val = serde_json::json!({
+                    "tier": "passthrough",
+                    "raw": raw,
+                });
+                serde_json::to_string(&val)
+            }
+        }
+    }
+}
+
 impl<T: Into<String>> ParseResult<T> {
     /// Consuming access to inner content as `String`.
     pub(crate) fn into_content(self) -> String {
@@ -927,6 +955,63 @@ mod tests {
         assert!(
             output.contains("100%") || output.contains("99%"),
             "expected ~100% savings for huge input with zero output, got: {output}"
+        );
+    }
+
+    // ========================================================================
+    // to_json_envelope tests
+    // ========================================================================
+
+    /// Minimal type for testing to_json_envelope without coupling to canonical types.
+    #[derive(Debug, Clone, serde::Serialize)]
+    struct StubResult {
+        name: String,
+        count: usize,
+    }
+
+    #[test]
+    fn test_to_json_envelope_full_no_wrapper() {
+        let inner = StubResult {
+            name: "test".to_string(),
+            count: 42,
+        };
+        let result: ParseResult<StubResult> = ParseResult::Full(inner);
+        let json_str = result.to_json_envelope().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        // Full: direct serialization, no envelope
+        assert_eq!(parsed["name"], "test");
+        assert_eq!(parsed["count"], 42);
+        assert!(parsed.get("tier").is_none(), "Full should have no tier key");
+    }
+
+    #[test]
+    fn test_to_json_envelope_degraded_has_envelope() {
+        let inner = StubResult {
+            name: "partial".to_string(),
+            count: 7,
+        };
+        let warnings = vec!["regex fallback".to_string(), "missing field".to_string()];
+        let result: ParseResult<StubResult> = ParseResult::Degraded(inner, warnings);
+        let json_str = result.to_json_envelope().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["tier"], "degraded");
+        assert_eq!(parsed["warnings"][0], "regex fallback");
+        assert_eq!(parsed["warnings"][1], "missing field");
+        assert_eq!(parsed["result"]["name"], "partial");
+        assert_eq!(parsed["result"]["count"], 7);
+    }
+
+    #[test]
+    fn test_to_json_envelope_passthrough_has_envelope() {
+        let result: ParseResult<StubResult> =
+            ParseResult::Passthrough("raw output here".to_string());
+        let json_str = result.to_json_envelope().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["tier"], "passthrough");
+        assert_eq!(parsed["raw"], "raw output here");
+        assert!(
+            parsed.get("result").is_none(),
+            "Passthrough should have no result key"
         );
     }
 }

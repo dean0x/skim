@@ -7,22 +7,22 @@
 //! - **Tier 2 (Degraded)**: Regex on default text output
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 
-use std::io::IsTerminal;
-use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::cmd::{run_parsed_command_with_mode, user_has_flag, ParsedCommandConfig};
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, group_issues, LintJsonConfig};
+use super::{combine_stdout_stderr, group_issues, LinterConfig};
 
-const PROGRAM: &str = "mypy";
-const ENV_OVERRIDES: &[(&str, &str)] = &[("NO_COLOR", "1"), ("MYPY_FORCE_COLOR", "0")];
-const INSTALL_HINT: &str = "Install mypy: pip install mypy";
+const CONFIG: LinterConfig<'static> = LinterConfig {
+    program: "mypy",
+    env_overrides: &[("NO_COLOR", "1"), ("MYPY_FORCE_COLOR", "0")],
+    install_hint: "Install mypy: pip install mypy",
+};
 
 // Static regex pattern compiled once via LazyLock.
 static RE_MYPY_LINE: LazyLock<Regex> = LazyLock::new(|| {
@@ -34,43 +34,23 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
-) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = args.to_vec();
+) -> anyhow::Result<std::process::ExitCode> {
+    super::run_linter(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        prepare_args,
+        parse_impl,
+    )
+}
 
-    // Inject --output json if not already present
-    if !user_has_flag(&cmd_args, &["--output"]) {
+/// Inject `--output json` if not already present.
+fn prepare_args(cmd_args: &mut Vec<String>) {
+    if !user_has_flag(cmd_args, &["--output"]) {
         cmd_args.insert(0, "json".to_string());
         cmd_args.insert(0, "--output".to_string());
     }
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    if json_output {
-        return super::run_lint_json_mode(
-            LintJsonConfig {
-                program: PROGRAM,
-                cmd_args: &cmd_args,
-                env_overrides: ENV_OVERRIDES,
-                install_hint: INSTALL_HINT,
-                use_stdin,
-                show_stats,
-            },
-            parse_impl,
-        );
-    }
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
-            program: PROGRAM,
-            args: &cmd_args,
-            env_overrides: ENV_OVERRIDES,
-            install_hint: INSTALL_HINT,
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Lint,
-        },
-        |output, _args| parse_impl(output),
-    )
 }
 
 /// Three-tier parse function for mypy output.

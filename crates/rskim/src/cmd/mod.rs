@@ -94,6 +94,16 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
     }
 }
 
+/// Controls the output format of parsed command results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum OutputFormat {
+    /// Render the parsed result as human-readable text (default).
+    #[default]
+    Text,
+    /// Serialize the parsed result as JSON (for `--json` flag).
+    Json,
+}
+
 /// Configuration for running an external command with parsed output.
 ///
 /// Groups the cross-cutting parameters for [`run_parsed_command_with_mode`]
@@ -106,6 +116,7 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub use_stdin: bool,
     pub show_stats: bool,
     pub command_type: crate::analytics::CommandType,
+    pub output_format: OutputFormat,
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -124,7 +135,7 @@ pub(crate) fn run_parsed_command<T>(
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
-    T: AsRef<str>,
+    T: AsRef<str> + serde::Serialize,
 {
     let use_stdin = !io::stdin().is_terminal();
     let config = ParsedCommandConfig {
@@ -135,6 +146,7 @@ where
         use_stdin,
         show_stats,
         command_type,
+        output_format: OutputFormat::default(),
     };
     run_parsed_command_with_mode(config, parse)
 }
@@ -157,7 +169,7 @@ pub(crate) fn run_parsed_command_with_mode<T>(
     parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
 where
-    T: AsRef<str>,
+    T: AsRef<str> + serde::Serialize,
 {
     /// Maximum bytes we will read from stdin (64 MiB), consistent with the
     /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
@@ -171,6 +183,7 @@ where
         use_stdin,
         show_stats,
         command_type,
+        output_format,
     } = config;
 
     let output = if use_stdin {
@@ -220,41 +233,64 @@ where
     let result = parse(&output, args);
 
     // Emit markers (warnings/notices) to stderr
-    let stderr_stream = io::stderr();
-    let mut stderr_handle = stderr_stream.lock();
-    let _ = result.emit_markers(&mut stderr_handle);
-    drop(stderr_handle);
-
-    // Emit content to stdout
-    let stdout_stream = io::stdout();
-    let mut stdout_handle = stdout_stream.lock();
-    write!(stdout_handle, "{}", result.content())?;
-    // Ensure trailing newline
-    if !result.content().is_empty() && !result.content().ends_with('\n') {
-        writeln!(stdout_handle)?;
-    }
-    stdout_handle.flush()?;
-
-    // Report token stats if requested
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, result.content());
-        crate::process::report_token_stats(orig, comp, "");
-    }
+    let _ = result.emit_markers(&mut io::stderr().lock());
 
     // Capture exit code before moving stdout into analytics
     let code = output.exit_code.unwrap_or(1);
 
-    // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid .to_string() allocation when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            output.stdout,
-            result.content().to_string(),
-            format!("skim {program} {}", args.join(" ")),
-            command_type,
-            output.duration,
-            Some(result.tier_name()),
-        );
+    match output_format {
+        OutputFormat::Json => {
+            let json_str = result.to_json_envelope()?;
+            let mut handle = io::stdout().lock();
+            writeln!(handle, "{json_str}")?;
+            handle.flush()?;
+
+            if show_stats {
+                let (orig, comp) = crate::process::count_token_pair(&output.stdout, &json_str);
+                crate::process::report_token_stats(orig, comp, "");
+            }
+
+            if crate::analytics::is_analytics_enabled() {
+                crate::analytics::try_record_command(
+                    output.stdout,
+                    json_str,
+                    format!("skim {program} {}", args.join(" ")),
+                    command_type,
+                    output.duration,
+                    Some(result.tier_name()),
+                );
+            }
+        }
+        OutputFormat::Text => {
+            // Emit content to stdout
+            let mut stdout_handle = io::stdout().lock();
+            write!(stdout_handle, "{}", result.content())?;
+            // Ensure trailing newline
+            if !result.content().is_empty() && !result.content().ends_with('\n') {
+                writeln!(stdout_handle)?;
+            }
+            stdout_handle.flush()?;
+
+            // Report token stats if requested
+            if show_stats {
+                let (orig, comp) =
+                    crate::process::count_token_pair(&output.stdout, result.content());
+                crate::process::report_token_stats(orig, comp, "");
+            }
+
+            // Record analytics (fire-and-forget, non-blocking).
+            // Guard to avoid .to_string() allocation when analytics are disabled.
+            if crate::analytics::is_analytics_enabled() {
+                crate::analytics::try_record_command(
+                    output.stdout,
+                    result.content().to_string(),
+                    format!("skim {program} {}", args.join(" ")),
+                    command_type,
+                    output.duration,
+                    Some(result.tier_name()),
+                );
+            }
+        }
     }
 
     // Map exit code: preserve full 0-255 exit code granularity from the

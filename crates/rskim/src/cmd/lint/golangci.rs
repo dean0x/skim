@@ -7,22 +7,22 @@
 //! - **Tier 2 (Degraded)**: Regex on default text output
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 
-use std::io::IsTerminal;
-use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::cmd::{run_parsed_command_with_mode, user_has_flag, ParsedCommandConfig};
+use crate::cmd::user_has_flag;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, group_issues, LintJsonConfig};
+use super::{combine_stdout_stderr, group_issues, LinterConfig};
 
-const PROGRAM: &str = "golangci-lint";
-const ENV_OVERRIDES: &[(&str, &str)] = &[("NO_COLOR", "1")];
-const INSTALL_HINT: &str = "Install golangci-lint: https://golangci-lint.run/welcome/install/";
+const CONFIG: LinterConfig<'static> = LinterConfig {
+    program: "golangci-lint",
+    env_overrides: &[("NO_COLOR", "1")],
+    install_hint: "Install golangci-lint: https://golangci-lint.run/welcome/install/",
+};
 
 // Static regex pattern compiled once via LazyLock.
 static RE_GOLANGCI_LINE: LazyLock<Regex> =
@@ -33,50 +33,29 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
-) -> anyhow::Result<ExitCode> {
-    let mut cmd_args: Vec<String> = Vec::new();
+) -> anyhow::Result<std::process::ExitCode> {
+    super::run_linter(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        prepare_args,
+        parse_impl,
+    )
+}
 
+/// Ensure "run" subcommand is present and inject `--out-format json`.
+fn prepare_args(cmd_args: &mut Vec<String>) {
     // Ensure "run" subcommand is present if args don't start with it
-    if args.first().is_none_or(|a| a != "run") {
-        cmd_args.push("run".to_string());
+    if cmd_args.first().is_none_or(|a| a != "run") {
+        cmd_args.insert(0, "run".to_string());
     }
 
-    cmd_args.extend(args.iter().cloned());
-
     // Inject --out-format json if not already present
-    if !user_has_flag(&cmd_args, &["--out-format"]) {
+    if !user_has_flag(cmd_args, &["--out-format"]) {
         cmd_args.push("--out-format".to_string());
         cmd_args.push("json".to_string());
     }
-
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-
-    if json_output {
-        return super::run_lint_json_mode(
-            LintJsonConfig {
-                program: PROGRAM,
-                cmd_args: &cmd_args,
-                env_overrides: ENV_OVERRIDES,
-                install_hint: INSTALL_HINT,
-                use_stdin,
-                show_stats,
-            },
-            parse_impl,
-        );
-    }
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
-            program: PROGRAM,
-            args: &cmd_args,
-            env_overrides: ENV_OVERRIDES,
-            install_hint: INSTALL_HINT,
-            use_stdin,
-            show_stats,
-            command_type: crate::analytics::CommandType::Lint,
-        },
-        |output, _args| parse_impl(output),
-    )
 }
 
 /// Three-tier parse function for golangci-lint output.
