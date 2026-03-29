@@ -1,0 +1,5 @@
+{
+  "lodash": {"current": "4.17.20", "wanted": "4.17.21", "latest": "4.17.21", "dependent": "my-app", "location": "node_modules/lodash"},
+  "express": {"current": "4.17.1", "wanted": "4.18.2", "latest": "4.18.2", "dependent": "my-app", "location": "node_modules/express"},
+  "typescript": {"current": "4.9.5", "wanted": "5.3.3", "latest": "5.3.3", "dependent": "my-app", "location": "node_modules/typescript"}
+}

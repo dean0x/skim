@@ -16,6 +16,7 @@ mod init;
 mod integrity;
 mod learn;
 mod lint;
+mod pkg;
 mod rewrite;
 mod session;
 mod stats;
@@ -40,6 +41,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "init",
     "learn",
     "lint",
+    "pkg",
     "rewrite",
     "stats",
     "test",
@@ -307,6 +309,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "init" => init::run(args),
         "learn" => learn::run(args),
         "lint" => lint::run(args),
+        "pkg" => pkg::run(args),
         "rewrite" => rewrite::run(args),
         "stats" => stats::run(args),
         "test" => test::run(args),

@@ -1,0 +1,36 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "lodash": {
+      "name": "lodash",
+      "severity": "high",
+      "isDirect": true,
+      "via": [{"title": "Prototype Pollution", "severity": "high", "url": "https://github.com/advisories/GHSA-1234"}],
+      "effects": [],
+      "range": "<4.17.21",
+      "fixAvailable": true
+    },
+    "minimist": {
+      "name": "minimist",
+      "severity": "critical",
+      "isDirect": false,
+      "via": [{"title": "Prototype Pollution in minimist", "severity": "critical", "url": "https://github.com/advisories/GHSA-5678"}],
+      "effects": ["mkdirp"],
+      "range": "<1.2.6",
+      "fixAvailable": true
+    },
+    "glob-parent": {
+      "name": "glob-parent",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [{"title": "Regular Expression Denial of Service", "severity": "moderate", "url": "https://github.com/advisories/GHSA-9012"}],
+      "effects": ["chokidar"],
+      "range": "<5.1.2",
+      "fixAvailable": false
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {"info": 0, "low": 0, "moderate": 1, "high": 1, "critical": 1, "total": 3},
+    "dependencies": {"prod": 150, "dev": 45, "optional": 5, "peer": 0, "peerOptional": 0, "total": 200}
+  }
+}

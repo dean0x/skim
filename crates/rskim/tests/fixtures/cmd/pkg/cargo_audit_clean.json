@@ -1,0 +1,9 @@
+{
+  "database": {"advisory-count": 650, "last-commit": "2024-01-15T00:00:00Z", "last-updated": "2024-01-15T00:00:00Z"},
+  "lockfile": {"dependency-count": 250},
+  "vulnerabilities": {
+    "found": false,
+    "count": 0,
+    "list": []
+  }
+}

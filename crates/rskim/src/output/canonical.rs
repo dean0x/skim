@@ -317,6 +317,49 @@ pub(crate) struct LintResult {
     rendered: String,
 }
 
+// ============================================================================
+// PkgResult types
+// ============================================================================
+
+/// Package operation type with operation-specific data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum PkgOperation {
+    Install {
+        added: usize,
+        removed: usize,
+        changed: usize,
+        warnings: usize,
+    },
+    Audit {
+        critical: usize,
+        high: usize,
+        moderate: usize,
+        low: usize,
+        total: usize,
+    },
+    Outdated {
+        count: usize,
+    },
+    Check {
+        issues: usize,
+    },
+    List {
+        total: usize,
+        flagged: usize,
+    },
+}
+
+/// Complete package manager result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PkgResult {
+    pub(crate) tool: String,
+    pub(crate) operation: PkgOperation,
+    pub(crate) success: bool,
+    pub(crate) details: Vec<String>,
+    #[serde(default)]
+    rendered: String,
+}
+
 impl LintResult {
     /// Create a new LintResult with pre-computed rendered output
     pub(crate) fn new(
@@ -367,13 +410,94 @@ impl LintResult {
     }
 }
 
+impl PkgResult {
+    /// Create a new PkgResult with pre-computed rendered output
+    pub(crate) fn new(
+        tool: String,
+        operation: PkgOperation,
+        success: bool,
+        details: Vec<String>,
+    ) -> Self {
+        let rendered = Self::render(&tool, &operation, &details);
+        Self {
+            tool,
+            operation,
+            success,
+            details,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization)
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            self.rendered = Self::render(&self.tool, &self.operation, &self.details);
+        }
+    }
+
+    fn render(tool: &str, operation: &PkgOperation, details: &[String]) -> String {
+        use std::fmt::Write;
+
+        let mut output = match operation {
+            PkgOperation::Install {
+                added,
+                removed,
+                changed,
+                warnings,
+            } => {
+                format!(
+                    "PKG INSTALL | {tool} | added: {added} | removed: {removed} | changed: {changed} | warnings: {warnings}"
+                )
+            }
+            PkgOperation::Audit {
+                critical,
+                high,
+                moderate,
+                low,
+                total,
+            } => {
+                format!(
+                    "PKG AUDIT | {tool} | critical: {critical} | high: {high} | moderate: {moderate} | low: {low} | total: {total}"
+                )
+            }
+            PkgOperation::Outdated { count } => {
+                format!("PKG OUTDATED | {tool} | {count} packages")
+            }
+            PkgOperation::Check { issues } => {
+                format!("PKG CHECK | {tool} | {issues} issues")
+            }
+            PkgOperation::List { total, flagged } => {
+                format!("PKG LIST | {tool} | {total} total | {flagged} flagged")
+            }
+        };
+
+        for detail in details {
+            let _ = write!(output, "\n  {detail}");
+        }
+
+        output
+    }
+}
+
 impl AsRef<str> for LintResult {
     fn as_ref(&self) -> &str {
         &self.rendered
     }
 }
 
+impl AsRef<str> for PkgResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
 impl fmt::Display for LintResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+impl fmt::Display for PkgResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.rendered)
     }
@@ -703,6 +827,115 @@ mod tests {
         assert_eq!(format!("{original}"), format!("{deserialized}"));
     }
 
+    // ========================================================================
+    // PkgResult Display tests
+    // ========================================================================
+
+    #[test]
+    fn test_pkg_install_display() {
+        let result = PkgResult::new(
+            "npm".to_string(),
+            PkgOperation::Install {
+                added: 5,
+                removed: 1,
+                changed: 2,
+                warnings: 3,
+            },
+            true,
+            vec![],
+        );
+        let display = format!("{result}");
+        assert!(display.contains("PKG INSTALL | npm"));
+        assert!(display.contains("added: 5"));
+        assert!(display.contains("removed: 1"));
+        assert!(display.contains("changed: 2"));
+        assert!(display.contains("warnings: 3"));
+    }
+
+    #[test]
+    fn test_pkg_audit_display() {
+        let result = PkgResult::new(
+            "npm".to_string(),
+            PkgOperation::Audit {
+                critical: 0,
+                high: 2,
+                moderate: 3,
+                low: 1,
+                total: 6,
+            },
+            true,
+            vec!["lodash: Prototype Pollution (high)".to_string()],
+        );
+        let display = format!("{result}");
+        assert!(display.contains("PKG AUDIT | npm"));
+        assert!(display.contains("critical: 0"));
+        assert!(display.contains("high: 2"));
+        assert!(display.contains("total: 6"));
+        assert!(display.contains("lodash: Prototype Pollution (high)"));
+    }
+
+    #[test]
+    fn test_pkg_outdated_display() {
+        let result = PkgResult::new(
+            "npm".to_string(),
+            PkgOperation::Outdated { count: 4 },
+            true,
+            vec!["lodash 4.17.20 -> 4.17.21".to_string()],
+        );
+        let display = format!("{result}");
+        assert!(display.contains("PKG OUTDATED | npm | 4 packages"));
+        assert!(display.contains("lodash 4.17.20 -> 4.17.21"));
+    }
+
+    #[test]
+    fn test_pkg_check_display() {
+        let result = PkgResult::new(
+            "pip".to_string(),
+            PkgOperation::Check { issues: 3 },
+            false,
+            vec!["flask requires werkzeug>=3.0.1".to_string()],
+        );
+        let display = format!("{result}");
+        assert!(display.contains("PKG CHECK | pip | 3 issues"));
+        assert!(display.contains("flask requires werkzeug>=3.0.1"));
+    }
+
+    #[test]
+    fn test_pkg_list_display() {
+        let result = PkgResult::new(
+            "npm".to_string(),
+            PkgOperation::List {
+                total: 42,
+                flagged: 2,
+            },
+            true,
+            vec!["debug@4.3.4: invalid".to_string()],
+        );
+        let display = format!("{result}");
+        assert!(display.contains("PKG LIST | npm | 42 total | 2 flagged"));
+        assert!(display.contains("debug@4.3.4: invalid"));
+    }
+
+    #[test]
+    fn test_pkg_result_serde_roundtrip() {
+        let original = PkgResult::new(
+            "npm".to_string(),
+            PkgOperation::Audit {
+                critical: 1,
+                high: 2,
+                moderate: 0,
+                low: 0,
+                total: 3,
+            },
+            true,
+            vec!["advisory detail".to_string()],
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: PkgResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(format!("{original}"), format!("{deserialized}"));
+    }
+
     #[test]
     fn test_lint_result_ensure_rendered_recomputes_when_empty() {
         let mut result = LintResult {
@@ -722,5 +955,19 @@ mod tests {
         assert_eq!(format!("{}", LintSeverity::Error), "error");
         assert_eq!(format!("{}", LintSeverity::Warning), "warning");
         assert_eq!(format!("{}", LintSeverity::Info), "info");
+    }
+
+    #[test]
+    fn test_pkg_ensure_rendered_recomputes_when_empty() {
+        let mut result = PkgResult {
+            tool: "pip".to_string(),
+            operation: PkgOperation::Check { issues: 0 },
+            success: true,
+            details: vec![],
+            rendered: String::new(),
+        };
+        assert_eq!(result.as_ref(), "");
+        result.ensure_rendered();
+        assert_eq!(result.as_ref(), "PKG CHECK | pip | 0 issues");
     }
 }

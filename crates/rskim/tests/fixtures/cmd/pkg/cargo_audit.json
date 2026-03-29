@@ -1,0 +1,20 @@
+{
+  "database": {"advisory-count": 650, "last-commit": "2024-01-15T00:00:00Z", "last-updated": "2024-01-15T00:00:00Z"},
+  "lockfile": {"dependency-count": 250},
+  "vulnerabilities": {
+    "found": true,
+    "count": 2,
+    "list": [
+      {
+        "advisory": {"id": "RUSTSEC-2024-0001", "title": "Buffer overflow in buffer-utils", "description": "A buffer overflow exists...", "severity": "high", "url": "https://rustsec.org/advisories/RUSTSEC-2024-0001"},
+        "package": {"name": "buffer-utils", "version": "0.3.1"},
+        "versions": {"patched": [">=0.3.2"], "unaffected": []}
+      },
+      {
+        "advisory": {"id": "RUSTSEC-2024-0002", "title": "Memory safety issue in unsafe-lib", "description": "An unsafe block...", "severity": "critical", "url": "https://rustsec.org/advisories/RUSTSEC-2024-0002"},
+        "package": {"name": "unsafe-lib", "version": "1.0.0"},
+        "versions": {"patched": [">=1.0.1"], "unaffected": []}
+      }
+    ]
+  }
+}
