@@ -14,10 +14,7 @@ const GENERICS_CS: &str = include_str!("../../../tests/fixtures/csharp/generics.
 #[test]
 fn test_csharp_language_detection() {
     use std::path::Path;
-    assert_eq!(
-        rskim_core::detect_language("cs"),
-        Some(Language::CSharp)
-    );
+    assert_eq!(rskim_core::detect_language("cs"), Some(Language::CSharp));
     assert_eq!(
         rskim_core::detect_language_from_path(Path::new("Program.cs")),
         Some(Language::CSharp)

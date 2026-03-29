@@ -219,11 +219,11 @@ fn find_class_body(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "class_body" | "declaration_list" | "block" | "field_declaration_list"
-            | "body_statement" =>
-            {
-                return Some(child)
-            }
+            "class_body"
+            | "declaration_list"
+            | "block"
+            | "field_declaration_list"
+            | "body_statement" => return Some(child),
             _ => continue,
         }
     }

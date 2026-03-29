@@ -152,9 +152,9 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "namespace_declaration" => ("namespace_declaration", 2), // C# namespace
         "interface_type" => ("interface_type", 2),
         "struct_type" => ("struct_type", 2),
-        "class" => ("class", 2),                                 // Ruby class
-        "module" => ("module", 2),                               // Ruby module
-        "statement" => ("statement", 2),                         // SQL statement
+        "class" => ("class", 2),         // Ruby class
+        "module" => ("module", 2),       // Ruby module
+        "statement" => ("statement", 2), // SQL statement
 
         // Priority 1: Known but low-priority kinds
         "program" => ("program", 1),
