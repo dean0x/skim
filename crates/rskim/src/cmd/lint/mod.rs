@@ -13,9 +13,7 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use super::{
-    extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig,
-};
+use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
