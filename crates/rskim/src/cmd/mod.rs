@@ -238,59 +238,43 @@ where
     // Capture exit code before moving stdout into analytics
     let code = output.exit_code.unwrap_or(1);
 
-    match output_format {
+    // Render output and capture the compressed content string for stats/analytics.
+    let compressed: String = match output_format {
         OutputFormat::Json => {
             let json_str = result.to_json_envelope()?;
             let mut handle = io::stdout().lock();
             writeln!(handle, "{json_str}")?;
             handle.flush()?;
-
-            if show_stats {
-                let (orig, comp) = crate::process::count_token_pair(&output.stdout, &json_str);
-                crate::process::report_token_stats(orig, comp, "");
-            }
-
-            if crate::analytics::is_analytics_enabled() {
-                crate::analytics::try_record_command(
-                    output.stdout,
-                    json_str,
-                    format!("skim {program} {}", args.join(" ")),
-                    command_type,
-                    output.duration,
-                    Some(result.tier_name()),
-                );
-            }
+            json_str
         }
         OutputFormat::Text => {
-            // Emit content to stdout
-            let mut stdout_handle = io::stdout().lock();
-            write!(stdout_handle, "{}", result.content())?;
-            // Ensure trailing newline
-            if !result.content().is_empty() && !result.content().ends_with('\n') {
-                writeln!(stdout_handle)?;
+            let content = result.content();
+            let mut handle = io::stdout().lock();
+            write!(handle, "{content}")?;
+            if !content.is_empty() && !content.ends_with('\n') {
+                writeln!(handle)?;
             }
-            stdout_handle.flush()?;
-
-            // Report token stats if requested
-            if show_stats {
-                let (orig, comp) =
-                    crate::process::count_token_pair(&output.stdout, result.content());
-                crate::process::report_token_stats(orig, comp, "");
-            }
-
-            // Record analytics (fire-and-forget, non-blocking).
-            // Guard to avoid .to_string() allocation when analytics are disabled.
-            if crate::analytics::is_analytics_enabled() {
-                crate::analytics::try_record_command(
-                    output.stdout,
-                    result.content().to_string(),
-                    format!("skim {program} {}", args.join(" ")),
-                    command_type,
-                    output.duration,
-                    Some(result.tier_name()),
-                );
-            }
+            handle.flush()?;
+            content.to_string()
         }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &compressed);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid allocation when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            output.stdout,
+            compressed,
+            format!("skim {program} {}", args.join(" ")),
+            command_type,
+            output.duration,
+            Some(result.tier_name()),
+        );
     }
 
     // Map exit code: preserve full 0-255 exit code granularity from the

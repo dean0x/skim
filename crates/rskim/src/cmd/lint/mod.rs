@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use super::{
+    extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig,
+};
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -30,7 +33,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (filtered_args, show_stats) = crate::cmd::extract_show_stats(args);
+    let (filtered_args, show_stats) = extract_show_stats(args);
 
     // Extract --json flag
     let (filtered_args, json_output) = extract_json_flag(&filtered_args);
@@ -112,7 +115,7 @@ pub(crate) struct LinterConfig<'a> {
 ///
 /// This is the single implementation shared by all lint parsers, handling both
 /// text and JSON output modes. It eliminates per-linter `run()` boilerplate by
-/// delegating to [`crate::cmd::run_parsed_command_with_mode`].
+/// delegating to [`super::run_parsed_command_with_mode`].
 ///
 /// - `config`: static linter metadata (program name, env vars, install hint)
 /// - `args`: raw user args (before prepare_args)
@@ -133,13 +136,13 @@ pub(crate) fn run_linter(
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
     let output_format = if json_output {
-        crate::cmd::OutputFormat::Json
+        OutputFormat::Json
     } else {
-        crate::cmd::OutputFormat::Text
+        OutputFormat::Text
     };
 
-    crate::cmd::run_parsed_command_with_mode(
-        crate::cmd::ParsedCommandConfig {
+    run_parsed_command_with_mode(
+        ParsedCommandConfig {
             program: config.program,
             args: &cmd_args,
             env_overrides: config.env_overrides,
