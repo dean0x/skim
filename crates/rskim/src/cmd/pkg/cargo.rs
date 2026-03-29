@@ -1,27 +1,17 @@
 //! Cargo audit parser (#105)
 //!
 //! Parses `cargo audit` output using three-tier degradation:
-//! JSON (`--json` flag) -> regex on text blocks -> passthrough.
+//! JSON (`--json` flag) -> block-based text parsing -> passthrough.
 //!
 //! NOTE: This is a DIFFERENT module from `cmd/build/cargo.rs` which handles
 //! `cargo build` and `cargo clippy`. No collision: different parent module paths.
 
 use std::process::ExitCode;
-use std::sync::LazyLock;
-
-use regex::Regex;
 
 use crate::cmd::user_has_flag;
 use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
-
-// ============================================================================
-// Static regex patterns
-// ============================================================================
-
-static RE_NO_VULNS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"No\s+vulnerabilities\s+found").unwrap());
 
 // ============================================================================
 // Public entry point
@@ -209,7 +199,7 @@ fn extract_vuln_detail(vuln: &serde_json::Value) -> (String, &str) {
 
 fn try_parse_audit_regex(text: &str) -> Option<PkgResult> {
     // Check for clean output first
-    if RE_NO_VULNS.is_match(text) {
+    if text.contains("No vulnerabilities found") {
         return Some(PkgResult::new(
             "cargo".to_string(),
             PkgOperation::Audit {
