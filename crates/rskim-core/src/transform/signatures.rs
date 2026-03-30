@@ -137,7 +137,6 @@ fn is_signature_node(kind: &str, node_types: &SignatureNodeTypes) -> bool {
         || kind == node_types.method
         || kind == "arrow_function"
         || kind == "function_expression"
-        || kind == "method_declaration"
         || node_types.extra_function_kinds.contains(&kind)
 }
 

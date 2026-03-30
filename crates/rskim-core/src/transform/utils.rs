@@ -420,23 +420,30 @@ mod tests {
         assert_eq!(get_comment_prefix(Language::Python), "#");
         assert_eq!(get_comment_prefix(Language::Ruby), "#");
         assert_eq!(get_comment_prefix(Language::Sql), "--");
+        assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
+        assert_eq!(get_comment_prefix(Language::Json), "//");
         assert_eq!(get_comment_prefix(Language::Yaml), "#");
         assert_eq!(get_comment_prefix(Language::Toml), "#");
-        assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
     }
 
     #[test]
     fn test_comment_suffix() {
         assert_eq!(get_comment_suffix(Language::TypeScript), "");
-        assert_eq!(get_comment_suffix(Language::Python), "");
+        assert_eq!(get_comment_suffix(Language::JavaScript), "");
+        assert_eq!(get_comment_suffix(Language::Rust), "");
+        assert_eq!(get_comment_suffix(Language::Go), "");
+        assert_eq!(get_comment_suffix(Language::Java), "");
         assert_eq!(get_comment_suffix(Language::C), "");
         assert_eq!(get_comment_suffix(Language::Cpp), "");
         assert_eq!(get_comment_suffix(Language::CSharp), "");
-        assert_eq!(get_comment_suffix(Language::Ruby), "");
-        assert_eq!(get_comment_suffix(Language::Sql), "");
         assert_eq!(get_comment_suffix(Language::Kotlin), "");
         assert_eq!(get_comment_suffix(Language::Swift), "");
-        assert_eq!(get_comment_suffix(Language::Toml), "");
+        assert_eq!(get_comment_suffix(Language::Python), "");
+        assert_eq!(get_comment_suffix(Language::Ruby), "");
+        assert_eq!(get_comment_suffix(Language::Sql), "");
         assert_eq!(get_comment_suffix(Language::Markdown), " -->");
+        assert_eq!(get_comment_suffix(Language::Json), "");
+        assert_eq!(get_comment_suffix(Language::Yaml), "");
+        assert_eq!(get_comment_suffix(Language::Toml), "");
     }
 }

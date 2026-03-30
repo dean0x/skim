@@ -2253,9 +2253,9 @@ fn test_cpp_malformed_syntax() {
 #[test]
 fn test_csharp_malformed_syntax() {
     let sources = [
-        "class Foo {",                  // Unclosed class
-        "public void Broken(( {",       // Broken parameter list
-        "interface Partial<T",          // Incomplete generic interface
+        "class Foo {",            // Unclosed class
+        "public void Broken(( {", // Broken parameter list
+        "interface Partial<T",    // Incomplete generic interface
     ];
     for source in sources {
         let result = transform(source, Language::CSharp, Mode::Structure);
@@ -2271,9 +2271,9 @@ fn test_csharp_malformed_syntax() {
 #[test]
 fn test_ruby_malformed_syntax() {
     let sources = [
-        "class Foo",                    // Missing class body
-        "def broken((",                 // Broken parameter list
-        "module Partial",               // Incomplete module
+        "class Foo",      // Missing class body
+        "def broken((",   // Broken parameter list
+        "module Partial", // Incomplete module
     ];
     for source in sources {
         let result = transform(source, Language::Ruby, Mode::Structure);
@@ -2289,9 +2289,9 @@ fn test_ruby_malformed_syntax() {
 #[test]
 fn test_sql_malformed_syntax() {
     let sources = [
-        "CREATE TABLE (",              // Missing table name
-        "SELECT FROM WHERE",           // Invalid SELECT syntax
-        "ALTER TABLE",                 // Incomplete ALTER
+        "CREATE TABLE (",    // Missing table name
+        "SELECT FROM WHERE", // Invalid SELECT syntax
+        "ALTER TABLE",       // Incomplete ALTER
     ];
     for source in sources {
         let result = transform(source, Language::Sql, Mode::Structure);
@@ -2307,9 +2307,9 @@ fn test_sql_malformed_syntax() {
 #[test]
 fn test_kotlin_malformed_syntax() {
     let sources = [
-        "class Foo {",                 // Unclosed class
-        "fun broken(() {",             // Broken parameter list
-        "data class Partial(val x",    // Incomplete data class
+        "class Foo {",              // Unclosed class
+        "fun broken(() {",          // Broken parameter list
+        "data class Partial(val x", // Incomplete data class
     ];
     for source in sources {
         let result = transform(source, Language::Kotlin, Mode::Structure);
@@ -2325,9 +2325,9 @@ fn test_kotlin_malformed_syntax() {
 #[test]
 fn test_swift_malformed_syntax() {
     let sources = [
-        "class Foo {",                 // Unclosed class
-        "func broken(() {",            // Broken parameter list
-        "struct Partial<T",            // Incomplete generic struct
+        "class Foo {",      // Unclosed class
+        "func broken(() {", // Broken parameter list
+        "struct Partial<T", // Incomplete generic struct
     ];
     for source in sources {
         let result = transform(source, Language::Swift, Mode::Structure);
