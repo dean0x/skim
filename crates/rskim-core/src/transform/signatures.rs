@@ -6,7 +6,7 @@
 
 use crate::transform::structure::extract_markdown_headers_with_spans;
 use crate::transform::truncate::NodeSpan;
-use crate::transform::utils::to_static_node_kind;
+use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
 use crate::{Language, Result, SkimError};
 use tree_sitter::{Node, Tree};
 
@@ -189,14 +189,10 @@ fn find_body_for_signature(node: Node) -> Option<Node> {
     crate::transform::utils::find_body_child(node)
 }
 
-/// Node types for signature extraction
-struct SignatureNodeTypes {
-    function: &'static str,
-    method: &'static str,
-    /// Extra node kinds that behave like functions (e.g., Swift init, Kotlin constructors).
-    /// Checked by is_signature_node so language-specific kinds are data-driven, not hardcoded.
-    extra_function_kinds: &'static [&'static str],
-}
+/// Type alias: signatures mode reuses the shared FunctionNodeTypes struct from utils.
+/// The factory function (get_signature_node_types) produces intentionally different
+/// values than structure mode — e.g., omitting node kinds with no extractable signature.
+type SignatureNodeTypes = FunctionNodeTypes;
 
 /// Get signature node types for language
 ///

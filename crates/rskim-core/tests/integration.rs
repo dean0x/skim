@@ -2407,6 +2407,89 @@ fn test_swift_structure_reduces_tokens() {
 }
 
 // ============================================================================
+// Auto-Detection Tests — Tier 2 Languages
+// ============================================================================
+
+#[test]
+fn test_csharp_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/csharp/simple.cs");
+    let path = Path::new("Program.cs");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok(), "C# auto-detection failed: {:?}", result.err());
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "C# auto-detection should produce valid output containing 'UserService'"
+    );
+}
+
+#[test]
+fn test_ruby_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/ruby/simple.rb");
+    let path = Path::new("app.rb");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok(), "Ruby auto-detection failed: {:?}", result.err());
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "Ruby auto-detection should produce valid output containing 'UserService'"
+    );
+}
+
+#[test]
+fn test_sql_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/sql/simple.sql");
+    let path = Path::new("schema.sql");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok(), "SQL auto-detection failed: {:?}", result.err());
+    let content = result.unwrap();
+    assert!(
+        content.contains("CREATE TABLE"),
+        "SQL auto-detection should produce valid output containing 'CREATE TABLE'"
+    );
+}
+
+#[test]
+fn test_kotlin_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
+    let path = Path::new("Main.kt");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok(), "Kotlin auto-detection failed: {:?}", result.err());
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "Kotlin auto-detection should produce valid output containing 'UserService'"
+    );
+}
+
+#[test]
+fn test_kotlin_auto_detection_kts() {
+    let source = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
+    let path = Path::new("build.gradle.kts");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok(), "Kotlin .kts auto-detection failed: {:?}", result.err());
+}
+
+#[test]
+fn test_swift_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/swift/Simple.swift");
+    let path = Path::new("main.swift");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(result.is_ok(), "Swift auto-detection failed: {:?}", result.err());
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "Swift auto-detection should produce valid output containing 'UserService'"
+    );
+}
+
+// ============================================================================
 // TOML Tests
 // ============================================================================
 

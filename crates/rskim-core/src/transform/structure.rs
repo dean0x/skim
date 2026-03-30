@@ -5,7 +5,7 @@
 //! Token reduction target: 70-80%
 
 use crate::transform::truncate::NodeSpan;
-use crate::transform::utils::to_static_node_kind;
+use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
@@ -224,14 +224,8 @@ fn find_body_node(node: Node) -> Option<Node> {
     crate::transform::utils::find_body_child(node)
 }
 
-/// Node types for different languages
-struct NodeTypes {
-    function: &'static str,
-    method: &'static str,
-    /// Extra node kinds that behave like functions (e.g., Swift init/deinit, Kotlin constructors).
-    /// Checked by matches_function_node so language-specific kinds are data-driven, not hardcoded.
-    extra_function_kinds: &'static [&'static str],
-}
+/// Type alias for backward compatibility within this module
+type NodeTypes = FunctionNodeTypes;
 
 /// Get node types based on language
 ///
@@ -286,6 +280,12 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             method: "singleton_method",
             extra_function_kinds: &[],
         }),
+        // ARCHITECTURE: SQL maps both function and method to "statement" because
+        // SQL is a declarative language where all top-level constructs are statements
+        // (SELECT, CREATE TABLE, INSERT, etc.). Unlike procedural languages, SQL has
+        // no function/method distinction — every statement is a self-contained unit
+        // analogous to a top-level function definition. This causes structure mode to
+        // strip statement bodies, which is the correct behavior for SQL summarization.
         Language::Sql => Some(NodeTypes {
             function: "statement",
             method: "statement",

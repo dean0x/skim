@@ -132,6 +132,20 @@ pub(crate) fn find_body_child(node: Node) -> Option<Node> {
 /// grammar, but Rust can't prove this to the borrow checker. We map known kinds
 /// to static strings. Unknown kinds get `("unknown", 1)` (lowest priority).
 ///
+/// ARCHITECTURE: This is a flat mapping (no language parameter) by design. Some
+/// entries like "call" and "statement" have generic names that appear in multiple
+/// grammars, but tree-sitter supertypes (abstract nodes) never appear as
+/// `node.kind()` — only their concrete subtypes do. Additionally, the truncation
+/// scoring path only operates on top-level NodeSpans built from `root.children()`,
+/// further limiting which node kinds are actually scored. See inline comments on
+/// "call" and "statement" entries for cross-grammar safety analysis.
+///
+/// ARCHITECTURE: Linear growth with ~1 line per match arm is acceptable here.
+/// Each arm is compile-time verified (typos cause "unreachable pattern" warnings),
+/// and the match compiles to a jump table — faster than a HashMap at runtime.
+/// Adding a new language requires ~3-5 new arms, bounded by the number of unique
+/// node kinds that language introduces.
+///
 /// Priority levels:
 /// - 5: Type definitions (type aliases, interfaces, structs, traits, enums,
 ///   Python class_definition — Python classes ARE the type system)
@@ -192,7 +206,13 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "export_statement" => ("export_statement", 3),
         "use_item" => ("use_item", 3),
         "using_directive" => ("using_directive", 3), // C# using statements
-        "call" => ("call", 3),                       // Ruby require calls
+        // ARCHITECTURE: "call" is a concrete node in both Ruby and Python grammars.
+        // Safe at priority 3 because: (1) In Ruby, top-level `require` calls resolve
+        // to "call" nodes — correct import-level priority. (2) In Python, top-level
+        // calls appear as `expression_statement` > `call` — the parent
+        // `expression_statement` is the top-level span, not "call" itself. The
+        // truncation path only scores top-level NodeSpans from root.children().
+        "call" => ("call", 3),
         "import" => ("import", 3),                   // Kotlin import
         "package_header" => ("package_header", 3),   // Kotlin package declaration
 
@@ -207,7 +227,13 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "struct_type" => ("struct_type", 2),
         "class" => ("class", 2),         // Ruby class
         "module" => ("module", 2),       // Ruby module
-        "statement" => ("statement", 2), // SQL statement
+        // ARCHITECTURE: "statement" is a SUPERTYPE (abstract) in TypeScript,
+        // JavaScript, C, C++, Java, and Kotlin — tree-sitter resolves these to
+        // concrete subtypes (e.g., "expression_statement", "break_statement"),
+        // so "statement" never appears as node.kind() for those languages.
+        // Only SQL's tree-sitter-sequel grammar defines "statement" as a concrete
+        // node, making this entry effectively SQL-scoped.
+        "statement" => ("statement", 2),
 
         // Priority 1: Known but low-priority kinds
         "program" => ("program", 1),
