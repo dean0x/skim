@@ -262,6 +262,15 @@ fn test_swift_pseudo_strips_visibility() {
 }
 
 #[test]
+fn test_swift_pseudo_preserves_async() {
+    let result = transform(SIMPLE_SWIFT, Language::Swift, Mode::Pseudo).unwrap();
+    assert!(
+        result.contains("async"),
+        "async should be preserved (changes calling semantics), got:\n{result}"
+    );
+}
+
+#[test]
 fn test_swift_pseudo_preserves_logic() {
     let result = transform(SIMPLE_SWIFT, Language::Swift, Mode::Pseudo).unwrap();
     assert!(

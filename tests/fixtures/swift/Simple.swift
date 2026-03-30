@@ -39,3 +39,8 @@ class UserService {
 func add(_ a: Int, _ b: Int) -> Int {
     return a + b
 }
+
+async func fetchUser(id: UUID) -> User {
+    let user = UserService(repository: InMemoryRepository()).getUser(id: id)
+    return user
+}
