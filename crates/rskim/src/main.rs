@@ -211,7 +211,7 @@ struct Args {
     /// Override language detection (required for stdin unless --filename is given)
     #[arg(short, long, alias = "lang", value_enum)]
     #[arg(
-        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
+        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
     )]
     language: Option<LanguageArg>,
 
@@ -359,6 +359,7 @@ enum LanguageArg {
     Sql,
     #[value(alias = "kt")]
     Kotlin,
+    Swift,
 }
 
 impl From<LanguageArg> for Language {
@@ -380,6 +381,7 @@ impl From<LanguageArg> for Language {
             LanguageArg::Ruby => Language::Ruby,
             LanguageArg::Sql => Language::Sql,
             LanguageArg::Kotlin => Language::Kotlin,
+            LanguageArg::Swift => Language::Swift,
         }
     }
 }

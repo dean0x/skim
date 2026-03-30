@@ -287,6 +287,10 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             function: "function_declaration",
             method: "function_declaration", // Kotlin doesn't distinguish methods from functions
         }),
+        Language::Swift => Some(NodeTypes {
+            function: "function_declaration",
+            method: "function_declaration", // Swift methods are also function_declaration
+        }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
 }

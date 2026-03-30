@@ -89,6 +89,12 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
             interface: "class_declaration", // Kotlin interfaces use class_declaration with "interface" keyword
             type_alias: "type_alias",
         }),
+        Language::Swift => Some(LanguageNodeTypes {
+            function: "function_declaration",
+            class: "class_declaration", // covers struct, class, and enum in Swift
+            interface: "protocol_declaration",
+            type_alias: "typealias_declaration",
+        }),
         // ARCHITECTURE: Serde-based languages use their own parsers, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
         Language::Json | Language::Yaml | Language::Toml => None,

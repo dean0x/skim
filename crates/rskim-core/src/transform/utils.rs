@@ -57,6 +57,7 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::Ruby => &["body_statement"],
         Language::Sql => &[], // SQL has no function bodies
         Language::Kotlin => &["function_body", "block"],
+        Language::Swift => &["function_body"],
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
@@ -119,6 +120,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "create_table" => ("create_table", 5),           // SQL: tables ARE the type system
         "type_alias" => ("type_alias", 5),               // Kotlin type alias
         "object_declaration" => ("object_declaration", 5), // Kotlin object/singleton
+        "typealias_declaration" => ("typealias_declaration", 5), // Swift typealias
+        "protocol_declaration" => ("protocol_declaration", 5), // Swift protocol
         "atx_heading" => ("atx_heading", 5),
         "setext_heading" => ("setext_heading", 5),
 
@@ -204,7 +207,8 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::C
         | Language::Cpp
         | Language::CSharp
-        | Language::Kotlin => "//",
+        | Language::Kotlin
+        | Language::Swift => "//",
         Language::Python | Language::Ruby => "#",
         Language::Sql => "--",
         Language::Markdown => "<!--",
@@ -292,6 +296,8 @@ mod tests {
             "create_table",
             "type_alias",
             "object_declaration",
+            "typealias_declaration",
+            "protocol_declaration",
             "atx_heading",
             "setext_heading",
             // Priority 4

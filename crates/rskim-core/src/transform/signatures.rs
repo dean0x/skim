@@ -252,6 +252,10 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
             function: "function_declaration",
             method: "function_declaration",
         }),
+        Language::Swift => Some(SignatureNodeTypes {
+            function: "function_declaration",
+            method: "function_declaration",
+        }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
 }

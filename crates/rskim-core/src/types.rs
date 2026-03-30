@@ -35,6 +35,7 @@ pub enum Language {
     Ruby,
     Sql,
     Kotlin,
+    Swift,
 }
 
 impl Language {
@@ -70,6 +71,7 @@ impl Language {
             "rb" => Some(Self::Ruby),
             "sql" => Some(Self::Sql),
             "kt" | "kts" => Some(Self::Kotlin),
+            "swift" => Some(Self::Swift),
             _ => None,
         }
     }
@@ -115,6 +117,7 @@ impl Language {
             Self::Ruby => "Ruby",
             Self::Sql => "SQL",
             Self::Kotlin => "Kotlin",
+            Self::Swift => "Swift",
         }
     }
 
@@ -148,6 +151,7 @@ impl Language {
             Self::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
             Self::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
             Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+            Self::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
         }
     }
 

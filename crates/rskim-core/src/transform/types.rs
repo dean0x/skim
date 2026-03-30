@@ -339,6 +339,13 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "class_declaration",
             struct_def: "", // Kotlin has no structs
         }),
+        Language::Swift => Some(TypeNodeTypes {
+            type_alias: "typealias_declaration",
+            interface: "protocol_declaration",
+            enum_def: "class_declaration", // Swift enums use class_declaration with "enum" keyword
+            class_decl: "class_declaration",
+            struct_def: "", // Swift structs also use class_declaration
+        }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
 }

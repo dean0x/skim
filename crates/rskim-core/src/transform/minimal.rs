@@ -127,6 +127,7 @@ pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
         | Language::Sql => kind == "comment",
         Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
         Language::Kotlin => kind == "line_comment" || kind == "block_comment",
+        Language::Swift => kind == "comment" || kind == "multiline_comment",
         // Markdown, JSON, YAML, TOML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
@@ -205,6 +206,10 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
         Language::Kotlin => {
             // Kotlin doc comments: /** */ (KDoc)
             text.starts_with("/**")
+        }
+        Language::Swift => {
+            // Swift doc comments: /// or /** */
+            text.starts_with("///") || text.starts_with("/**")
         }
         Language::Sql => {
             // SQL `--` comments have no doc comment convention

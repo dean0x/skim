@@ -193,6 +193,23 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_semicolons: false,
             strip_self_param: false,
         },
+        Language::Swift => PseudoRules {
+            strip_kinds: &["attribute", "type_parameters"],
+            strip_keywords: &[
+                "public",
+                "private",
+                "internal",
+                "fileprivate",
+                "open",
+                "static",
+                "override",
+                "final",
+                "class",
+                // NOTE: `async` intentionally NOT stripped — it changes calling semantics
+            ],
+            strip_semicolons: false,
+            strip_self_param: false,
+        },
         Language::Sql => PseudoRules {
             // SQL has minimal syntactic noise — keep most things
             strip_kinds: &[],
