@@ -44,6 +44,15 @@ fn test_ruby_structure_strips_method_bodies() {
         result.contains("def delete_user"),
         "method name should be preserved, got:\n{result}"
     );
+    // Body content should be stripped
+    assert!(
+        !result.contains("User.find"),
+        "method body should be stripped, got:\n{result}"
+    );
+    assert!(
+        !result.contains("User.destroy"),
+        "method body should be stripped, got:\n{result}"
+    );
 }
 
 #[test]

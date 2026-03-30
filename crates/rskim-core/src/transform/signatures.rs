@@ -258,11 +258,13 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
         Language::Kotlin => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "function_declaration",
+            // anonymous_initializer (init {}) omitted: has no parameters/signature to extract
             extra_function_kinds: &["secondary_constructor"],
         }),
         Language::Swift => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "function_declaration",
+            // deinit_declaration omitted: has no parameters/signature to extract
             extra_function_kinds: &["init_declaration"],
         }),
         Language::Json | Language::Yaml | Language::Toml => None,

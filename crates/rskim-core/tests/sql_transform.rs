@@ -95,6 +95,14 @@ fn test_sql_types_extracts_create_table() {
         !result.contains("SELECT"),
         "SELECT should not be in types mode, got:\n{result}"
     );
+    assert!(
+        !result.contains("UPDATE"),
+        "UPDATE should not be in types mode, got:\n{result}"
+    );
+    assert!(
+        !result.contains("DELETE"),
+        "DELETE should not be in types mode, got:\n{result}"
+    );
 }
 
 // ============================================================================
