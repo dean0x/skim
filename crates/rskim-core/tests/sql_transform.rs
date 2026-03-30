@@ -60,6 +60,19 @@ fn test_sql_signatures_extracts_create_table() {
         result.contains("CREATE TABLE"),
         "CREATE TABLE should be extracted, got:\n{result}"
     );
+    // Signatures should NOT include DML statements
+    assert!(
+        !result.contains("INSERT INTO"),
+        "INSERT should not be in signatures mode, got:\n{result}"
+    );
+    assert!(
+        !result.contains("UPDATE users"),
+        "UPDATE should not be in signatures mode, got:\n{result}"
+    );
+    assert!(
+        !result.contains("DELETE FROM"),
+        "DELETE should not be in signatures mode, got:\n{result}"
+    );
 }
 
 // ============================================================================
@@ -72,6 +85,15 @@ fn test_sql_types_extracts_create_table() {
     assert!(
         result.contains("CREATE TABLE"),
         "CREATE TABLE should be extracted as type, got:\n{result}"
+    );
+    // Types should NOT include DML or query statements
+    assert!(
+        !result.contains("INSERT INTO"),
+        "INSERT should not be in types mode, got:\n{result}"
+    );
+    assert!(
+        !result.contains("SELECT"),
+        "SELECT should not be in types mode, got:\n{result}"
     );
 }
 
@@ -115,6 +137,11 @@ fn test_sql_pseudo_preserves_sql() {
     assert!(
         result.contains("CREATE TABLE"),
         "SQL statements should be preserved in pseudo mode, got:\n{result}"
+    );
+    // Pseudo mode should strip semicolons for readability
+    assert!(
+        !result.contains(';'),
+        "semicolons should be stripped in pseudo mode, got:\n{result}"
     );
 }
 

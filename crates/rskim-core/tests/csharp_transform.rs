@@ -44,6 +44,15 @@ fn test_csharp_structure_strips_method_bodies() {
         result.contains("DeleteUser"),
         "method names should be preserved, got:\n{result}"
     );
+    // Body content should NOT be present
+    assert!(
+        !result.contains("_repository.FindById"),
+        "method body content should be stripped, got:\n{result}"
+    );
+    assert!(
+        !result.contains("_repository.Delete"),
+        "method body content should be stripped, got:\n{result}"
+    );
 }
 
 #[test]

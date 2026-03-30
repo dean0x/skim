@@ -142,6 +142,20 @@ fn test_ruby_minimal_strips_comments() {
     );
 }
 
+#[test]
+fn test_ruby_minimal_preserves_body_comments() {
+    let source = "# Top-level comment to strip\nclass Foo\n  def bar\n    # inside body comment\n    42\n  end\nend\n";
+    let result = transform(source, Language::Ruby, Mode::Minimal).unwrap();
+    assert!(
+        !result.contains("Top-level comment"),
+        "top-level comments should be stripped, got:\n{result}"
+    );
+    assert!(
+        result.contains("inside body comment"),
+        "in-body comments should be preserved, got:\n{result}"
+    );
+}
+
 // ============================================================================
 // Pseudo mode
 // ============================================================================
@@ -156,6 +170,15 @@ fn test_ruby_pseudo_preserves_logic() {
     assert!(
         result.contains("User.find"),
         "method body should be preserved in pseudo mode, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_ruby_pseudo_strips_visibility() {
+    let result = transform(SIMPLE_RB, Language::Ruby, Mode::Pseudo).unwrap();
+    assert!(
+        !result.contains("private"),
+        "private modifier should be stripped in pseudo mode, got:\n{result}"
     );
 }
 
