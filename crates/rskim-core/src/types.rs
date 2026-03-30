@@ -34,6 +34,7 @@ pub enum Language {
     CSharp,
     Ruby,
     Sql,
+    Kotlin,
 }
 
 impl Language {
@@ -68,6 +69,7 @@ impl Language {
             "cs" => Some(Self::CSharp),
             "rb" => Some(Self::Ruby),
             "sql" => Some(Self::Sql),
+            "kt" | "kts" => Some(Self::Kotlin),
             _ => None,
         }
     }
@@ -112,6 +114,7 @@ impl Language {
             Self::CSharp => "C#",
             Self::Ruby => "Ruby",
             Self::Sql => "SQL",
+            Self::Kotlin => "Kotlin",
         }
     }
 
@@ -144,6 +147,7 @@ impl Language {
             Self::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
             Self::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
             Self::Sql => Some(tree_sitter_sequel::LANGUAGE.into()),
+            Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
         }
     }
 

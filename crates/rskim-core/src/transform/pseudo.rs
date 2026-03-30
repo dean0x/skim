@@ -176,6 +176,23 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_semicolons: false,
             strip_self_param: false,
         },
+        Language::Kotlin => PseudoRules {
+            strip_kinds: &["type_parameters", "annotation"],
+            strip_keywords: &[
+                "public",
+                "private",
+                "protected",
+                "internal",
+                "open",
+                "data",
+                "sealed",
+                "override",
+                "abstract",
+                // NOTE: `suspend` intentionally NOT stripped — it changes calling semantics
+            ],
+            strip_semicolons: false,
+            strip_self_param: false,
+        },
         Language::Sql => PseudoRules {
             // SQL has minimal syntactic noise — keep most things
             strip_kinds: &[],

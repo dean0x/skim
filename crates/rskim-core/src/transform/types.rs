@@ -223,7 +223,9 @@ fn find_class_body(node: Node) -> Option<Node> {
             | "declaration_list"
             | "block"
             | "field_declaration_list"
-            | "body_statement" => return Some(child),
+            | "body_statement"
+            | "enum_class_body"
+            | "protocol_body" => return Some(child),
             _ => continue,
         }
     }
@@ -329,6 +331,13 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             enum_def: "",
             class_decl: "",
             struct_def: "create_table", // CREATE TABLE defines the type structure in SQL
+        }),
+        Language::Kotlin => Some(TypeNodeTypes {
+            type_alias: "type_alias",
+            interface: "class_declaration", // Kotlin interfaces use class_declaration
+            enum_def: "",                   // Kotlin enum class uses class_declaration
+            class_decl: "class_declaration",
+            struct_def: "", // Kotlin has no structs
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

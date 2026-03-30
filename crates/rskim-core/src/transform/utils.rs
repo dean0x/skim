@@ -56,6 +56,7 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::CSharp => &["block"],
         Language::Ruby => &["body_statement"],
         Language::Sql => &[], // SQL has no function bodies
+        Language::Kotlin => &["function_body", "block"],
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
@@ -116,6 +117,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "class_definition" => ("class_definition", 5),   // Python: classes ARE the type system
         "struct_declaration" => ("struct_declaration", 5), // C# struct
         "create_table" => ("create_table", 5),           // SQL: tables ARE the type system
+        "type_alias" => ("type_alias", 5),               // Kotlin type alias
+        "object_declaration" => ("object_declaration", 5), // Kotlin object/singleton
         "atx_heading" => ("atx_heading", 5),
         "setext_heading" => ("setext_heading", 5),
 
@@ -142,6 +145,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "use_item" => ("use_item", 3),
         "using_directive" => ("using_directive", 3), // C# using statements
         "call" => ("call", 3),                       // Ruby require calls
+        "import" => ("import", 3),                   // Kotlin import
+        "package_header" => ("package_header", 3),   // Kotlin package declaration
 
         // Priority 2: Class/module/impl containers
         "class_declaration" => ("class_declaration", 2),
@@ -198,7 +203,8 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::Java
         | Language::C
         | Language::Cpp
-        | Language::CSharp => "//",
+        | Language::CSharp
+        | Language::Kotlin => "//",
         Language::Python | Language::Ruby => "#",
         Language::Sql => "--",
         Language::Markdown => "<!--",
@@ -284,6 +290,8 @@ mod tests {
             "class_definition",
             "struct_declaration",
             "create_table",
+            "type_alias",
+            "object_declaration",
             "atx_heading",
             "setext_heading",
             // Priority 4
@@ -303,6 +311,8 @@ mod tests {
             "import_statement",
             "use_declaration",
             "import_declaration",
+            "import",
+            "package_header",
             "preproc_include",
             "export_statement",
             "use_item",

@@ -83,6 +83,12 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
             interface: "",         // SQL has no interfaces
             type_alias: "",        // SQL has no type aliases
         }),
+        Language::Kotlin => Some(LanguageNodeTypes {
+            function: "function_declaration",
+            class: "class_declaration", // covers class, data class, sealed class, enum class
+            interface: "class_declaration", // Kotlin interfaces use class_declaration with "interface" keyword
+            type_alias: "type_alias",
+        }),
         // ARCHITECTURE: Serde-based languages use their own parsers, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
         Language::Json | Language::Yaml | Language::Toml => None,

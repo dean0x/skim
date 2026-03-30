@@ -221,9 +221,8 @@ fn find_body_node(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "statement_block" | "block" | "compound_statement" | "body" | "body_statement" => {
-                return Some(child)
-            }
+            "statement_block" | "block" | "compound_statement" | "body" | "body_statement"
+            | "function_body" => return Some(child),
             _ => continue,
         }
     }
@@ -283,6 +282,10 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
         Language::Sql => Some(NodeTypes {
             function: "statement",
             method: "statement",
+        }),
+        Language::Kotlin => Some(NodeTypes {
+            function: "function_declaration",
+            method: "function_declaration", // Kotlin doesn't distinguish methods from functions
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

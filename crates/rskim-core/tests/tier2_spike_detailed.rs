@@ -47,21 +47,13 @@ fn dump_node_types(source: &str, lang: tree_sitter::Language, label: &str) {
 #[test]
 fn kotlin_detailed_ast() {
     let source = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
-    dump_node_types(
-        source,
-        tree_sitter_kotlin_ng::LANGUAGE.into(),
-        "KOTLIN",
-    );
+    dump_node_types(source, tree_sitter_kotlin_ng::LANGUAGE.into(), "KOTLIN");
 }
 
 #[test]
 fn swift_detailed_ast() {
     let source = include_str!("../../../tests/fixtures/swift/Simple.swift");
-    dump_node_types(
-        source,
-        tree_sitter_swift::LANGUAGE.into(),
-        "SWIFT",
-    );
+    dump_node_types(source, tree_sitter_swift::LANGUAGE.into(), "SWIFT");
 }
 
 #[test]
@@ -93,11 +85,7 @@ enum Direction {
 
 typealias StringList = [String]
 "#;
-    dump_node_types(
-        source,
-        tree_sitter_swift::LANGUAGE.into(),
-        "SWIFT-TYPES",
-    );
+    dump_node_types(source, tree_sitter_swift::LANGUAGE.into(), "SWIFT-TYPES");
 }
 
 #[test]

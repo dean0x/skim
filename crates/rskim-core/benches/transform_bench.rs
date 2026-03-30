@@ -22,6 +22,7 @@ const SMALL_TOML: &str = include_str!("../../../tests/fixtures/toml/simple.toml"
 const SMALL_CS: &str = include_str!("../../../tests/fixtures/csharp/simple.cs");
 const SMALL_RB: &str = include_str!("../../../tests/fixtures/ruby/simple.rb");
 const SMALL_SQL: &str = include_str!("../../../tests/fixtures/sql/simple.sql");
+const SMALL_KT: &str = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
 
 // Medium complexity TypeScript
 const MEDIUM_TS: &str = include_str!("../../../tests/fixtures/typescript/types.ts");
@@ -101,6 +102,11 @@ fn bench_structure_mode(c: &mut Criterion) {
     // SQL
     group.bench_function("sql_small", |b| {
         b.iter(|| transform(black_box(SMALL_SQL), Language::Sql, Mode::Structure).unwrap())
+    });
+
+    // Kotlin
+    group.bench_function("kotlin_small", |b| {
+        b.iter(|| transform(black_box(SMALL_KT), Language::Kotlin, Mode::Structure).unwrap())
     });
 
     group.finish();
@@ -215,6 +221,7 @@ fn bench_language_comparison(c: &mut Criterion) {
         (Language::CSharp, SMALL_CS),
         (Language::Ruby, SMALL_RB),
         (Language::Sql, SMALL_SQL),
+        (Language::Kotlin, SMALL_KT),
     ];
 
     for (lang, source) in languages {
