@@ -372,6 +372,35 @@ fn test_detect_language_from_path() {
         detect_language_from_path(Path::new("Cargo.toml")),
         Some(Language::Toml)
     );
+    // C# extension
+    assert_eq!(
+        detect_language_from_path(Path::new("Program.cs")),
+        Some(Language::CSharp)
+    );
+    // Ruby extension
+    assert_eq!(
+        detect_language_from_path(Path::new("app.rb")),
+        Some(Language::Ruby)
+    );
+    // SQL extension
+    assert_eq!(
+        detect_language_from_path(Path::new("schema.sql")),
+        Some(Language::Sql)
+    );
+    // Kotlin extensions
+    assert_eq!(
+        detect_language_from_path(Path::new("Main.kt")),
+        Some(Language::Kotlin)
+    );
+    assert_eq!(
+        detect_language_from_path(Path::new("build.gradle.kts")),
+        Some(Language::Kotlin)
+    );
+    // Swift extension
+    assert_eq!(
+        detect_language_from_path(Path::new("main.swift")),
+        Some(Language::Swift)
+    );
 }
 
 #[test]
@@ -2215,6 +2244,273 @@ fn test_cpp_malformed_syntax() {
             result.err()
         );
     }
+}
+
+// ============================================================================
+// C# / Ruby / SQL / Kotlin / Swift Malformed Syntax Tests
+// ============================================================================
+
+#[test]
+fn test_csharp_malformed_syntax() {
+    let sources = [
+        "class Foo {",            // Unclosed class
+        "public void Broken(( {", // Broken parameter list
+        "interface Partial<T",    // Incomplete generic interface
+    ];
+    for source in sources {
+        let result = transform(source, Language::CSharp, Mode::Structure);
+        assert!(
+            result.is_ok(),
+            "C# malformed syntax should not crash, input: '{}', error: {:?}",
+            source,
+            result.err()
+        );
+    }
+}
+
+#[test]
+fn test_ruby_malformed_syntax() {
+    let sources = [
+        "class Foo",      // Missing class body
+        "def broken((",   // Broken parameter list
+        "module Partial", // Incomplete module
+    ];
+    for source in sources {
+        let result = transform(source, Language::Ruby, Mode::Structure);
+        assert!(
+            result.is_ok(),
+            "Ruby malformed syntax should not crash, input: '{}', error: {:?}",
+            source,
+            result.err()
+        );
+    }
+}
+
+#[test]
+fn test_sql_malformed_syntax() {
+    let sources = [
+        "CREATE TABLE (",    // Missing table name
+        "SELECT FROM WHERE", // Invalid SELECT syntax
+        "ALTER TABLE",       // Incomplete ALTER
+    ];
+    for source in sources {
+        let result = transform(source, Language::Sql, Mode::Structure);
+        assert!(
+            result.is_ok(),
+            "SQL malformed syntax should not crash, input: '{}', error: {:?}",
+            source,
+            result.err()
+        );
+    }
+}
+
+#[test]
+fn test_kotlin_malformed_syntax() {
+    let sources = [
+        "class Foo {",              // Unclosed class
+        "fun broken(() {",          // Broken parameter list
+        "data class Partial(val x", // Incomplete data class
+    ];
+    for source in sources {
+        let result = transform(source, Language::Kotlin, Mode::Structure);
+        assert!(
+            result.is_ok(),
+            "Kotlin malformed syntax should not crash, input: '{}', error: {:?}",
+            source,
+            result.err()
+        );
+    }
+}
+
+#[test]
+fn test_swift_malformed_syntax() {
+    let sources = [
+        "class Foo {",      // Unclosed class
+        "func broken(() {", // Broken parameter list
+        "struct Partial<T", // Incomplete generic struct
+    ];
+    for source in sources {
+        let result = transform(source, Language::Swift, Mode::Structure);
+        assert!(
+            result.is_ok(),
+            "Swift malformed syntax should not crash, input: '{}', error: {:?}",
+            source,
+            result.err()
+        );
+    }
+}
+
+// ============================================================================
+// Token Reduction Tests — Tier 2 Languages
+// ============================================================================
+
+#[test]
+fn test_csharp_structure_reduces_tokens() {
+    let source = include_str!("../../../tests/fixtures/csharp/simple.cs");
+    let result = transform(source, Language::CSharp, Mode::Structure).unwrap();
+    assert!(
+        result.len() < source.len(),
+        "C# structure mode should reduce output size: {} >= {}",
+        result.len(),
+        source.len()
+    );
+}
+
+#[test]
+fn test_ruby_structure_reduces_tokens() {
+    let source = include_str!("../../../tests/fixtures/ruby/simple.rb");
+    let result = transform(source, Language::Ruby, Mode::Structure).unwrap();
+    assert!(
+        result.len() < source.len(),
+        "Ruby structure mode should reduce output size: {} >= {}",
+        result.len(),
+        source.len()
+    );
+}
+
+#[test]
+fn test_sql_minimal_reduces_tokens() {
+    // SQL structure mode preserves all statements (no function bodies to strip).
+    // Minimal mode strips comments, verifying actual token reduction.
+    let source = include_str!("../../../tests/fixtures/sql/simple.sql");
+    let result = transform(source, Language::Sql, Mode::Minimal).unwrap();
+    assert!(
+        result.len() < source.len(),
+        "SQL minimal mode should reduce output size: {} >= {}",
+        result.len(),
+        source.len()
+    );
+}
+
+#[test]
+fn test_kotlin_structure_reduces_tokens() {
+    let source = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
+    let result = transform(source, Language::Kotlin, Mode::Structure).unwrap();
+    assert!(
+        result.len() < source.len(),
+        "Kotlin structure mode should reduce output size: {} >= {}",
+        result.len(),
+        source.len()
+    );
+}
+
+#[test]
+fn test_swift_structure_reduces_tokens() {
+    let source = include_str!("../../../tests/fixtures/swift/Simple.swift");
+    let result = transform(source, Language::Swift, Mode::Structure).unwrap();
+    assert!(
+        result.len() < source.len(),
+        "Swift structure mode should reduce output size: {} >= {}",
+        result.len(),
+        source.len()
+    );
+}
+
+// ============================================================================
+// Auto-Detection Tests — Tier 2 Languages
+// ============================================================================
+
+#[test]
+fn test_csharp_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/csharp/simple.cs");
+    let path = Path::new("Program.cs");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(
+        result.is_ok(),
+        "C# auto-detection failed: {:?}",
+        result.err()
+    );
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "C# auto-detection should produce valid output containing 'UserService'"
+    );
+}
+
+#[test]
+fn test_ruby_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/ruby/simple.rb");
+    let path = Path::new("app.rb");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(
+        result.is_ok(),
+        "Ruby auto-detection failed: {:?}",
+        result.err()
+    );
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "Ruby auto-detection should produce valid output containing 'UserService'"
+    );
+}
+
+#[test]
+fn test_sql_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/sql/simple.sql");
+    let path = Path::new("schema.sql");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(
+        result.is_ok(),
+        "SQL auto-detection failed: {:?}",
+        result.err()
+    );
+    let content = result.unwrap();
+    assert!(
+        content.contains("CREATE TABLE"),
+        "SQL auto-detection should produce valid output containing 'CREATE TABLE'"
+    );
+}
+
+#[test]
+fn test_kotlin_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
+    let path = Path::new("Main.kt");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(
+        result.is_ok(),
+        "Kotlin auto-detection failed: {:?}",
+        result.err()
+    );
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "Kotlin auto-detection should produce valid output containing 'UserService'"
+    );
+}
+
+#[test]
+fn test_kotlin_auto_detection_kts() {
+    let source = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
+    let path = Path::new("build.gradle.kts");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(
+        result.is_ok(),
+        "Kotlin .kts auto-detection failed: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_swift_auto_detection() {
+    let source = include_str!("../../../tests/fixtures/swift/Simple.swift");
+    let path = Path::new("main.swift");
+
+    let result = transform_auto(source, path, Mode::Structure);
+    assert!(
+        result.is_ok(),
+        "Swift auto-detection failed: {:?}",
+        result.err()
+    );
+    let content = result.unwrap();
+    assert!(
+        content.contains("UserService"),
+        "Swift auto-detection should produce valid output containing 'UserService'"
+    );
 }
 
 // ============================================================================

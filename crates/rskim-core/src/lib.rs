@@ -353,6 +353,11 @@ pub fn supported_languages() -> &'static [Language] {
         Language::C,
         Language::Cpp,
         Language::Toml,
+        Language::CSharp,
+        Language::Ruby,
+        Language::Sql,
+        Language::Kotlin,
+        Language::Swift,
     ]
 }
 
@@ -371,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_supported_languages() {
-        assert_eq!(supported_languages().len(), 12);
+        assert_eq!(supported_languages().len(), 17);
         assert!(supported_languages().contains(&Language::Markdown));
         assert!(supported_languages().contains(&Language::Json));
         assert!(supported_languages().contains(&Language::Yaml));

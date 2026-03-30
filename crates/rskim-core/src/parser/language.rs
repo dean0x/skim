@@ -65,6 +65,36 @@ pub(crate) fn get_node_types(language: Language) -> Option<LanguageNodeTypes> {
             interface: "", // C++ has no separate interface concept
             type_alias: "type_definition",
         }),
+        Language::CSharp => Some(LanguageNodeTypes {
+            function: "method_declaration",
+            class: "class_declaration",
+            interface: "interface_declaration",
+            type_alias: "", // C# has no standalone type aliases
+        }),
+        Language::Ruby => Some(LanguageNodeTypes {
+            function: "method",
+            class: "class",
+            interface: "module",
+            type_alias: "", // Ruby has no type aliases
+        }),
+        Language::Sql => Some(LanguageNodeTypes {
+            function: "statement", // SQL statements are the top-level construct
+            class: "create_table", // CREATE TABLE defines structure
+            interface: "",         // SQL has no interfaces
+            type_alias: "",        // SQL has no type aliases
+        }),
+        Language::Kotlin => Some(LanguageNodeTypes {
+            function: "function_declaration",
+            class: "class_declaration", // covers class, data class, sealed class, enum class
+            interface: "class_declaration", // Kotlin interfaces use class_declaration with "interface" keyword
+            type_alias: "type_alias",
+        }),
+        Language::Swift => Some(LanguageNodeTypes {
+            function: "function_declaration",
+            class: "class_declaration", // covers struct, class, and enum in Swift
+            interface: "protocol_declaration",
+            type_alias: "typealias_declaration",
+        }),
         // ARCHITECTURE: Serde-based languages use their own parsers, not tree-sitter.
         // This is enforced by the Strategy Pattern in Language::transform_source().
         Language::Json | Language::Yaml | Language::Toml => None,

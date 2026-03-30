@@ -121,8 +121,14 @@ pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
         | Language::Python
         | Language::Go
         | Language::C
-        | Language::Cpp => kind == "comment",
-        Language::Rust | Language::Java => kind == "line_comment" || kind == "block_comment",
+        | Language::Cpp
+        | Language::CSharp
+        | Language::Ruby
+        | Language::Sql => kind == "comment",
+        Language::Rust | Language::Java | Language::Kotlin => {
+            kind == "line_comment" || kind == "block_comment"
+        }
+        Language::Swift => kind == "comment" || kind == "multiline_comment",
         // Markdown, JSON, YAML, TOML don't have comment nodes to strip
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,
     }
@@ -147,12 +153,8 @@ pub(crate) fn is_removable_comment(node: Node, source: &str, language: Language)
 
 /// Check if a comment node is a doc comment that should be preserved
 ///
-/// Doc comment detection per language:
-/// - TypeScript/JS: Starts with `/**`
-/// - Python: Comment nodes are `#` -- docstrings are `expression_statement > string`, not comments
-/// - Rust: `///`, `//!`, `/**`, `/*!`
-/// - Go: Adjacent to a declaration (next non-comment sibling is a declaration)
-/// - Java: Starts with `/**`
+/// Language-specific doc comment detection. See match arms below for
+/// per-language rules covering all supported tree-sitter languages.
 fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
     let text = match node.utf8_text(source.as_bytes()) {
         Ok(t) => t,
@@ -188,6 +190,27 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
         Language::C | Language::Cpp => {
             // Doxygen comments: /** or ///
             text.starts_with("/**") || text.starts_with("///")
+        }
+        Language::CSharp => {
+            // C# XML doc comments: ///
+            text.starts_with("///") || text.starts_with("/**")
+        }
+        Language::Ruby => {
+            // Ruby doesn't have doc comments — all `#` comments are regular.
+            // RDoc and YARD conventions use `#` but there's no syntactic distinction.
+            false
+        }
+        Language::Kotlin => {
+            // Kotlin doc comments: /** */ (KDoc)
+            text.starts_with("/**")
+        }
+        Language::Swift => {
+            // Swift doc comments: /// or /** */
+            text.starts_with("///") || text.starts_with("/**")
+        }
+        Language::Sql => {
+            // SQL `--` comments have no doc comment convention
+            false
         }
         // Markdown, JSON, YAML, TOML don't reach here
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => false,

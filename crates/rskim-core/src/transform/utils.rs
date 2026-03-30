@@ -5,6 +5,25 @@
 use crate::Language;
 use tree_sitter::Node;
 
+// ============================================================================
+// Shared Node Type Structs
+// ============================================================================
+
+/// Node type mapping for function/method identification
+///
+/// Used by both structure mode (to replace function bodies) and signatures mode
+/// (to extract function signatures). The struct shape is identical for both modes,
+/// but factory functions produce intentionally different values per mode — e.g.,
+/// signatures mode omits node kinds that have no extractable signature
+/// (anonymous_initializer, deinit_declaration).
+pub(crate) struct FunctionNodeTypes {
+    pub(crate) function: &'static str,
+    pub(crate) method: &'static str,
+    /// Extra node kinds that behave like functions (e.g., Swift init/deinit, Kotlin constructors).
+    /// Language-specific kinds are data-driven, not hardcoded in match logic.
+    pub(crate) extra_function_kinds: &'static [&'static str],
+}
+
 /// Check if a node is inside a function/method body
 ///
 /// Walks up the AST via parent nodes looking for body/block nodes or
@@ -53,6 +72,11 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::Python | Language::Rust | Language::Go => &["block"],
         Language::Java => &["block", "constructor_body"],
         Language::C | Language::Cpp => &["compound_statement"],
+        Language::CSharp => &["block"],
+        Language::Ruby => &["body_statement"],
+        Language::Sql => &[], // SQL has no function bodies
+        Language::Kotlin => &["function_body", "block"],
+        Language::Swift => &["function_body"],
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
@@ -74,6 +98,28 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
     }
 }
 
+/// Find the body/block child of a function/method node
+///
+/// Walks immediate children looking for body-like node kinds that represent
+/// a function/method body. Used by both structure mode (to replace bodies)
+/// and signatures mode (to extract text before the body).
+///
+/// ARCHITECTURE: The matched kinds here must be the union of all body kinds
+/// from `get_body_node_kinds()`. This is the single source of truth for
+/// "what is a body child node" when walking DOWN from a function node.
+/// `get_body_node_kinds()` is used for walking UP (checking ancestry).
+pub(crate) fn find_body_child(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "statement_block" | "block" | "compound_statement" | "constructor_body"
+            | "body_statement" | "function_body" => return Some(child),
+            _ => continue,
+        }
+    }
+    None
+}
+
 // ============================================================================
 // Priority Scoring for AST-aware truncation
 // ============================================================================
@@ -85,6 +131,20 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
 /// ARCHITECTURE: tree-sitter node kind strings have static lifetime tied to the
 /// grammar, but Rust can't prove this to the borrow checker. We map known kinds
 /// to static strings. Unknown kinds get `("unknown", 1)` (lowest priority).
+///
+/// ARCHITECTURE: This is a flat mapping (no language parameter) by design. Some
+/// entries like "call" and "statement" have generic names that appear in multiple
+/// grammars, but tree-sitter supertypes (abstract nodes) never appear as
+/// `node.kind()` — only their concrete subtypes do. Additionally, the truncation
+/// scoring path only operates on top-level NodeSpans built from `root.children()`,
+/// further limiting which node kinds are actually scored. See inline comments on
+/// "call" and "statement" entries for cross-grammar safety analysis.
+///
+/// ARCHITECTURE: Linear growth with ~1 line per match arm is acceptable here.
+/// Each arm is compile-time verified (typos cause "unreachable pattern" warnings),
+/// and the match compiles to a jump table — faster than a HashMap at runtime.
+/// Adding a new language requires ~3-5 new arms, bounded by the number of unique
+/// node kinds that language introduces.
 ///
 /// Priority levels:
 /// - 5: Type definitions (type aliases, interfaces, structs, traits, enums,
@@ -111,6 +171,12 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "using_declaration" => ("using_declaration", 5), // C++ using type aliases
         "alias_declaration" => ("alias_declaration", 5), // C++ `using Alias = Type;`
         "class_definition" => ("class_definition", 5),   // Python: classes ARE the type system
+        "struct_declaration" => ("struct_declaration", 5), // C# struct
+        "create_table" => ("create_table", 5),           // SQL: tables ARE the type system
+        "type_alias" => ("type_alias", 5),               // Kotlin type alias
+        "object_declaration" => ("object_declaration", 5), // Kotlin object/singleton
+        "typealias_declaration" => ("typealias_declaration", 5), // Swift typealias
+        "protocol_declaration" => ("protocol_declaration", 5), // Swift protocol
         "atx_heading" => ("atx_heading", 5),
         "setext_heading" => ("setext_heading", 5),
 
@@ -124,6 +190,13 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "template_declaration" => ("template_declaration", 4),
         "arrow_function" => ("arrow_function", 4),
         "function_expression" => ("function_expression", 4),
+        "constructor_declaration" => ("constructor_declaration", 4), // C# constructor
+        "method" => ("method", 4),                                   // Ruby method
+        "singleton_method" => ("singleton_method", 4),               // Ruby class method
+        "init_declaration" => ("init_declaration", 4),               // Swift init
+        "deinit_declaration" => ("deinit_declaration", 4),           // Swift deinit
+        "secondary_constructor" => ("secondary_constructor", 4),     // Kotlin constructor
+        "anonymous_initializer" => ("anonymous_initializer", 4),     // Kotlin init block
 
         // Priority 3: Import statements
         "import_statement" => ("import_statement", 3),
@@ -132,6 +205,16 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "preproc_include" => ("preproc_include", 3),
         "export_statement" => ("export_statement", 3),
         "use_item" => ("use_item", 3),
+        "using_directive" => ("using_directive", 3), // C# using statements
+        // ARCHITECTURE: "call" is a concrete node in both Ruby and Python grammars.
+        // Safe at priority 3 because: (1) In Ruby, top-level `require` calls resolve
+        // to "call" nodes — correct import-level priority. (2) In Python, top-level
+        // calls appear as `expression_statement` > `call` — the parent
+        // `expression_statement` is the top-level span, not "call" itself. The
+        // truncation path only scores top-level NodeSpans from root.children().
+        "call" => ("call", 3),
+        "import" => ("import", 3),                 // Kotlin import
+        "package_header" => ("package_header", 3), // Kotlin package declaration
 
         // Priority 2: Class/module/impl containers
         "class_declaration" => ("class_declaration", 2),
@@ -139,8 +222,18 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "impl_item" => ("impl_item", 2),
         "class_specifier" => ("class_specifier", 2),
         "namespace_definition" => ("namespace_definition", 2),
+        "namespace_declaration" => ("namespace_declaration", 2), // C# namespace
         "interface_type" => ("interface_type", 2),
         "struct_type" => ("struct_type", 2),
+        "class" => ("class", 2),   // Ruby class
+        "module" => ("module", 2), // Ruby module
+        // ARCHITECTURE: "statement" is a SUPERTYPE (abstract) in TypeScript,
+        // JavaScript, C, C++, Java, and Kotlin — tree-sitter resolves these to
+        // concrete subtypes (e.g., "expression_statement", "break_statement"),
+        // so "statement" never appears as node.kind() for those languages.
+        // Only SQL's tree-sitter-sequel grammar defines "statement" as a concrete
+        // node, making this entry effectively SQL-scoped.
+        "statement" => ("statement", 2),
 
         // Priority 1: Known but low-priority kinds
         "program" => ("program", 1),
@@ -183,8 +276,12 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::Go
         | Language::Java
         | Language::C
-        | Language::Cpp => "//",
-        Language::Python => "#",
+        | Language::Cpp
+        | Language::CSharp
+        | Language::Kotlin
+        | Language::Swift => "//",
+        Language::Python | Language::Ruby => "#",
+        Language::Sql => "--",
         Language::Markdown => "<!--",
         Language::Json => "//", // JSON has no comments; // is JSONC-compatible
         Language::Yaml => "#",
@@ -266,6 +363,12 @@ mod tests {
             "using_declaration",
             "alias_declaration",
             "class_definition",
+            "struct_declaration",
+            "create_table",
+            "type_alias",
+            "object_declaration",
+            "typealias_declaration",
+            "protocol_declaration",
             "atx_heading",
             "setext_heading",
             // Priority 4
@@ -278,21 +381,36 @@ mod tests {
             "template_declaration",
             "arrow_function",
             "function_expression",
+            "constructor_declaration",
+            "method",
+            "singleton_method",
+            "init_declaration",
+            "deinit_declaration",
+            "secondary_constructor",
+            "anonymous_initializer",
             // Priority 3
             "import_statement",
             "use_declaration",
             "import_declaration",
+            "import",
+            "package_header",
             "preproc_include",
             "export_statement",
             "use_item",
+            "using_directive",
+            "call",
             // Priority 2
             "class_declaration",
             "module_declaration",
             "impl_item",
             "class_specifier",
             "namespace_definition",
+            "namespace_declaration",
             "interface_type",
             "struct_type",
+            "class",
+            "module",
+            "statement",
             // Priority 1
             "program",
             "source_file",
@@ -346,19 +464,36 @@ mod tests {
         assert_eq!(get_comment_prefix(Language::Java), "//");
         assert_eq!(get_comment_prefix(Language::C), "//");
         assert_eq!(get_comment_prefix(Language::Cpp), "//");
+        assert_eq!(get_comment_prefix(Language::CSharp), "//");
+        assert_eq!(get_comment_prefix(Language::Kotlin), "//");
+        assert_eq!(get_comment_prefix(Language::Swift), "//");
         assert_eq!(get_comment_prefix(Language::Python), "#");
+        assert_eq!(get_comment_prefix(Language::Ruby), "#");
+        assert_eq!(get_comment_prefix(Language::Sql), "--");
+        assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
+        assert_eq!(get_comment_prefix(Language::Json), "//");
         assert_eq!(get_comment_prefix(Language::Yaml), "#");
         assert_eq!(get_comment_prefix(Language::Toml), "#");
-        assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
     }
 
     #[test]
     fn test_comment_suffix() {
         assert_eq!(get_comment_suffix(Language::TypeScript), "");
-        assert_eq!(get_comment_suffix(Language::Python), "");
+        assert_eq!(get_comment_suffix(Language::JavaScript), "");
+        assert_eq!(get_comment_suffix(Language::Rust), "");
+        assert_eq!(get_comment_suffix(Language::Go), "");
+        assert_eq!(get_comment_suffix(Language::Java), "");
         assert_eq!(get_comment_suffix(Language::C), "");
         assert_eq!(get_comment_suffix(Language::Cpp), "");
-        assert_eq!(get_comment_suffix(Language::Toml), "");
+        assert_eq!(get_comment_suffix(Language::CSharp), "");
+        assert_eq!(get_comment_suffix(Language::Kotlin), "");
+        assert_eq!(get_comment_suffix(Language::Swift), "");
+        assert_eq!(get_comment_suffix(Language::Python), "");
+        assert_eq!(get_comment_suffix(Language::Ruby), "");
+        assert_eq!(get_comment_suffix(Language::Sql), "");
         assert_eq!(get_comment_suffix(Language::Markdown), " -->");
+        assert_eq!(get_comment_suffix(Language::Json), "");
+        assert_eq!(get_comment_suffix(Language::Yaml), "");
+        assert_eq!(get_comment_suffix(Language::Toml), "");
     }
 }

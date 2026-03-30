@@ -219,9 +219,13 @@ fn find_class_body(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "class_body" | "declaration_list" | "block" | "field_declaration_list" => {
-                return Some(child)
-            }
+            "class_body"
+            | "declaration_list"
+            | "block"
+            | "field_declaration_list"
+            | "body_statement"
+            | "enum_class_body"
+            | "protocol_body" => return Some(child),
             _ => continue,
         }
     }
@@ -306,6 +310,48 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             enum_def: "enum_specifier",
             class_decl: "class_specifier",
             struct_def: "struct_specifier",
+        }),
+        Language::CSharp => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "interface_declaration",
+            enum_def: "enum_declaration",
+            class_decl: "class_declaration",
+            struct_def: "struct_declaration",
+        }),
+        Language::Ruby => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "module",
+            enum_def: "",
+            class_decl: "class",
+            struct_def: "",
+        }),
+        Language::Sql => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "",
+            enum_def: "",
+            class_decl: "",
+            struct_def: "create_table", // CREATE TABLE defines the type structure in SQL
+        }),
+        // ARCHITECTURE: tree-sitter-kotlin uses class_declaration for all class-like
+        // constructs (class, interface, data class, sealed class, enum class). There is
+        // no grammar-level distinction, so interface and class_decl map to the same kind.
+        Language::Kotlin => Some(TypeNodeTypes {
+            type_alias: "type_alias",
+            interface: "class_declaration",
+            enum_def: "",
+            class_decl: "class_declaration",
+            struct_def: "",
+        }),
+        // ARCHITECTURE: tree-sitter-swift uses class_declaration for struct, class, and
+        // enum declarations. Only protocol_declaration is a distinct grammar node.
+        // This means enum_def and struct_def overlap with class_decl — callers should
+        // expect duplicate matches when querying multiple fields.
+        Language::Swift => Some(TypeNodeTypes {
+            type_alias: "typealias_declaration",
+            interface: "protocol_declaration",
+            enum_def: "class_declaration",
+            class_decl: "class_declaration",
+            struct_def: "",
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

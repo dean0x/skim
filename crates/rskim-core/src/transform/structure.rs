@@ -5,7 +5,7 @@
 //! Token reduction target: 70-80%
 
 use crate::transform::truncate::NodeSpan;
-use crate::transform::utils::to_static_node_kind;
+use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
@@ -208,31 +208,25 @@ fn collect_body_replacements(
     Ok(())
 }
 
-/// Check if node kind matches a function/method/class
+/// Check if node kind matches a function/method/constructor
 fn matches_function_node(kind: &str, node_types: &NodeTypes) -> bool {
     kind == node_types.function
         || kind == node_types.method
         || kind == "arrow_function"
         || kind == "function_expression"
+        || node_types.extra_function_kinds.contains(&kind)
 }
 
 /// Find the body node of a function/method
+///
+/// Delegates to shared `find_body_child` in utils.rs.
 fn find_body_node(node: Node) -> Option<Node> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "statement_block" | "block" | "compound_statement" => return Some(child),
-            _ => continue,
-        }
-    }
-    None
+    crate::transform::utils::find_body_child(node)
 }
 
-/// Node types for different languages
-struct NodeTypes {
-    function: &'static str,
-    method: &'static str,
-}
+/// Type alias: structure mode reuses the shared FunctionNodeTypes struct from utils.
+/// This avoids renaming all usages within the module while making the shared origin clear.
+type NodeTypes = FunctionNodeTypes;
 
 /// Get node types based on language
 ///
@@ -244,31 +238,69 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
         Language::TypeScript | Language::JavaScript => Some(NodeTypes {
             function: "function_declaration",
             method: "method_definition",
+            extra_function_kinds: &[],
         }),
         Language::Python => Some(NodeTypes {
             function: "function_definition",
             method: "function_definition",
+            extra_function_kinds: &[],
         }),
         Language::Rust => Some(NodeTypes {
             function: "function_item",
             method: "function_item",
+            extra_function_kinds: &[],
         }),
         Language::Go => Some(NodeTypes {
             function: "function_declaration",
             method: "method_declaration",
+            extra_function_kinds: &[],
         }),
         Language::Java => Some(NodeTypes {
             function: "method_declaration",
             method: "method_declaration",
+            extra_function_kinds: &[],
         }),
         // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(NodeTypes {
             function: "atx_heading",
             method: "atx_heading",
+            extra_function_kinds: &[],
         }),
         Language::C | Language::Cpp => Some(NodeTypes {
             function: "function_definition",
             method: "function_definition",
+            extra_function_kinds: &[],
+        }),
+        Language::CSharp => Some(NodeTypes {
+            function: "method_declaration",
+            method: "constructor_declaration",
+            extra_function_kinds: &[],
+        }),
+        Language::Ruby => Some(NodeTypes {
+            function: "method",
+            method: "singleton_method",
+            extra_function_kinds: &[],
+        }),
+        // ARCHITECTURE: SQL maps both function and method to "statement" because
+        // SQL is a declarative language where all top-level constructs are statements
+        // (SELECT, CREATE TABLE, INSERT, etc.). Unlike procedural languages, SQL has
+        // no function/method distinction — every statement is a self-contained unit
+        // analogous to a top-level function definition. This causes structure mode to
+        // strip statement bodies, which is the correct behavior for SQL summarization.
+        Language::Sql => Some(NodeTypes {
+            function: "statement",
+            method: "statement",
+            extra_function_kinds: &[],
+        }),
+        Language::Kotlin => Some(NodeTypes {
+            function: "function_declaration",
+            method: "function_declaration", // Kotlin doesn't distinguish methods from functions
+            extra_function_kinds: &["secondary_constructor", "anonymous_initializer"],
+        }),
+        Language::Swift => Some(NodeTypes {
+            function: "function_declaration",
+            method: "function_declaration", // Swift methods are also function_declaration
+            extra_function_kinds: &["init_declaration", "deinit_declaration"],
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

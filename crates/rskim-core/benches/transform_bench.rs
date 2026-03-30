@@ -19,6 +19,11 @@ const SMALL_JAVA: &str = include_str!("../../../tests/fixtures/java/Simple.java"
 const SMALL_C: &str = include_str!("../../../tests/fixtures/c/simple.c");
 const SMALL_CPP: &str = include_str!("../../../tests/fixtures/cpp/simple.cpp");
 const SMALL_TOML: &str = include_str!("../../../tests/fixtures/toml/simple.toml");
+const SMALL_CS: &str = include_str!("../../../tests/fixtures/csharp/simple.cs");
+const SMALL_RB: &str = include_str!("../../../tests/fixtures/ruby/simple.rb");
+const SMALL_SQL: &str = include_str!("../../../tests/fixtures/sql/simple.sql");
+const SMALL_KT: &str = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
+const SMALL_SWIFT: &str = include_str!("../../../tests/fixtures/swift/Simple.swift");
 
 // Medium complexity TypeScript
 const MEDIUM_TS: &str = include_str!("../../../tests/fixtures/typescript/types.ts");
@@ -83,6 +88,31 @@ fn bench_structure_mode(c: &mut Criterion) {
     // TOML
     group.bench_function("toml_small", |b| {
         b.iter(|| transform(black_box(SMALL_TOML), Language::Toml, Mode::Structure).unwrap())
+    });
+
+    // C#
+    group.bench_function("csharp_small", |b| {
+        b.iter(|| transform(black_box(SMALL_CS), Language::CSharp, Mode::Structure).unwrap())
+    });
+
+    // Ruby
+    group.bench_function("ruby_small", |b| {
+        b.iter(|| transform(black_box(SMALL_RB), Language::Ruby, Mode::Structure).unwrap())
+    });
+
+    // SQL
+    group.bench_function("sql_small", |b| {
+        b.iter(|| transform(black_box(SMALL_SQL), Language::Sql, Mode::Structure).unwrap())
+    });
+
+    // Kotlin
+    group.bench_function("kotlin_small", |b| {
+        b.iter(|| transform(black_box(SMALL_KT), Language::Kotlin, Mode::Structure).unwrap())
+    });
+
+    // Swift
+    group.bench_function("swift_small", |b| {
+        b.iter(|| transform(black_box(SMALL_SWIFT), Language::Swift, Mode::Structure).unwrap())
     });
 
     group.finish();
@@ -194,6 +224,11 @@ fn bench_language_comparison(c: &mut Criterion) {
         (Language::C, SMALL_C),
         (Language::Cpp, SMALL_CPP),
         (Language::Toml, SMALL_TOML),
+        (Language::CSharp, SMALL_CS),
+        (Language::Ruby, SMALL_RB),
+        (Language::Sql, SMALL_SQL),
+        (Language::Kotlin, SMALL_KT),
+        (Language::Swift, SMALL_SWIFT),
     ];
 
     for (lang, source) in languages {
