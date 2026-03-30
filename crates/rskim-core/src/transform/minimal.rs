@@ -153,12 +153,8 @@ pub(crate) fn is_removable_comment(node: Node, source: &str, language: Language)
 
 /// Check if a comment node is a doc comment that should be preserved
 ///
-/// Doc comment detection per language:
-/// - TypeScript/JS: Starts with `/**`
-/// - Python: Comment nodes are `#` -- docstrings are `expression_statement > string`, not comments
-/// - Rust: `///`, `//!`, `/**`, `/*!`
-/// - Go: Adjacent to a declaration (next non-comment sibling is a declaration)
-/// - Java: Starts with `/**`
+/// Language-specific doc comment detection. See match arms below for
+/// per-language rules covering all supported tree-sitter languages.
 fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
     let text = match node.utf8_text(source.as_bytes()) {
         Ok(t) => t,

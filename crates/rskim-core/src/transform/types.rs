@@ -332,19 +332,26 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             class_decl: "",
             struct_def: "create_table", // CREATE TABLE defines the type structure in SQL
         }),
+        // ARCHITECTURE: tree-sitter-kotlin uses class_declaration for all class-like
+        // constructs (class, interface, data class, sealed class, enum class). There is
+        // no grammar-level distinction, so interface and class_decl map to the same kind.
         Language::Kotlin => Some(TypeNodeTypes {
             type_alias: "type_alias",
-            interface: "class_declaration", // Kotlin interfaces use class_declaration
-            enum_def: "",                   // Kotlin enum class uses class_declaration
+            interface: "class_declaration",
+            enum_def: "",
             class_decl: "class_declaration",
-            struct_def: "", // Kotlin has no structs
+            struct_def: "",
         }),
+        // ARCHITECTURE: tree-sitter-swift uses class_declaration for struct, class, and
+        // enum declarations. Only protocol_declaration is a distinct grammar node.
+        // This means enum_def and struct_def overlap with class_decl — callers should
+        // expect duplicate matches when querying multiple fields.
         Language::Swift => Some(TypeNodeTypes {
             type_alias: "typealias_declaration",
             interface: "protocol_declaration",
-            enum_def: "class_declaration", // Swift enums use class_declaration with "enum" keyword
+            enum_def: "class_declaration",
             class_decl: "class_declaration",
-            struct_def: "", // Swift structs also use class_declaration
+            struct_def: "",
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
