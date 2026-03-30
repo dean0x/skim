@@ -192,11 +192,11 @@ fn test_csharp_pseudo_strips_visibility() {
 }
 
 #[test]
-fn test_csharp_pseudo_strips_async() {
+fn test_csharp_pseudo_preserves_async() {
     let result = transform(SIMPLE_CS, Language::CSharp, Mode::Pseudo).unwrap();
     assert!(
-        !result.contains("async "),
-        "async modifier should be stripped, got:\n{result}"
+        result.contains("async"),
+        "async modifier should be preserved (changes calling semantics), got:\n{result}"
     );
 }
 

@@ -165,7 +165,7 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
                 "override",
                 "sealed",
                 "abstract",
-                "async",
+                // NOTE: `async` intentionally NOT stripped — it changes calling semantics
             ],
             strip_semicolons: true,
             strip_self_param: false,
