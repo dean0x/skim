@@ -138,6 +138,10 @@ fn is_signature_node(kind: &str, node_types: &SignatureNodeTypes) -> bool {
         || kind == "arrow_function"
         || kind == "function_expression"
         || kind == "method_declaration"
+        // Swift: initializers are callable signatures
+        || kind == "init_declaration"
+        // Kotlin: secondary constructors are callable signatures
+        || kind == "secondary_constructor"
 }
 
 /// Extract signature text from node

@@ -208,12 +208,18 @@ fn collect_body_replacements(
     Ok(())
 }
 
-/// Check if node kind matches a function/method/class
+/// Check if node kind matches a function/method/constructor
 fn matches_function_node(kind: &str, node_types: &NodeTypes) -> bool {
     kind == node_types.function
         || kind == node_types.method
         || kind == "arrow_function"
         || kind == "function_expression"
+        // Swift: initializers and deinitializers have function_body children
+        || kind == "init_declaration"
+        || kind == "deinit_declaration"
+        // Kotlin: secondary constructors and init blocks have block children
+        || kind == "secondary_constructor"
+        || kind == "anonymous_initializer"
 }
 
 /// Find the body node of a function/method

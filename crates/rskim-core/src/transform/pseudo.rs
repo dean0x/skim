@@ -204,7 +204,9 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
                 "static",
                 "override",
                 "final",
-                "class",
+                // NOTE: `class` intentionally NOT stripped — it introduces class declarations,
+                // and in tree-sitter-swift the keyword is a leaf node in both class declarations
+                // and class method modifiers, so stripping it would remove class declarations.
                 // NOTE: `async` intentionally NOT stripped — it changes calling semantics
             ],
             strip_semicolons: false,

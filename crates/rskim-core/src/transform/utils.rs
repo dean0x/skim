@@ -138,6 +138,10 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "constructor_declaration" => ("constructor_declaration", 4), // C# constructor
         "method" => ("method", 4),                                   // Ruby method
         "singleton_method" => ("singleton_method", 4),               // Ruby class method
+        "init_declaration" => ("init_declaration", 4),               // Swift init
+        "deinit_declaration" => ("deinit_declaration", 4),           // Swift deinit
+        "secondary_constructor" => ("secondary_constructor", 4),     // Kotlin constructor
+        "anonymous_initializer" => ("anonymous_initializer", 4),     // Kotlin init block
 
         // Priority 3: Import statements
         "import_statement" => ("import_statement", 3),
@@ -313,6 +317,10 @@ mod tests {
             "constructor_declaration",
             "method",
             "singleton_method",
+            "init_declaration",
+            "deinit_declaration",
+            "secondary_constructor",
+            "anonymous_initializer",
             // Priority 3
             "import_statement",
             "use_declaration",

@@ -90,6 +90,35 @@ fn test_kotlin_structure_preserves_expression_body() {
     );
 }
 
+#[test]
+fn test_kotlin_structure_strips_init_block() {
+    let source = "class Foo(val x: Int) {\n    init {\n        println(x)\n    }\n\n    fun bar() {\n        println(\"bar\")\n    }\n}\n";
+    let result = transform(source, Language::Kotlin, Mode::Structure).unwrap();
+    // init block body should be replaced
+    assert!(
+        !result.contains("println(x)"),
+        "init block body should be stripped, got:\n{result}"
+    );
+    assert!(
+        result.contains("init"),
+        "init keyword should be preserved, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_kotlin_structure_strips_secondary_constructor() {
+    let source = "class Foo(val x: Int) {\n    constructor(x: Int, y: Int) : this(x) {\n        println(y)\n    }\n\n    fun bar() {\n        println(\"bar\")\n    }\n}\n";
+    let result = transform(source, Language::Kotlin, Mode::Structure).unwrap();
+    assert!(
+        !result.contains("println(y)"),
+        "secondary constructor body should be stripped, got:\n{result}"
+    );
+    assert!(
+        result.contains("constructor"),
+        "constructor keyword should be preserved, got:\n{result}"
+    );
+}
+
 // ============================================================================
 // Signatures mode
 // ============================================================================

@@ -73,6 +73,44 @@ fn test_swift_structure_preserves_class() {
     );
 }
 
+#[test]
+fn test_swift_structure_strips_init_body() {
+    let source = "class Foo {\n    init(x: Int) {\n        print(x)\n    }\n\n    func bar() {\n        print(\"bar\")\n    }\n}\n";
+    let result = transform(source, Language::Swift, Mode::Structure).unwrap();
+    assert!(
+        !result.contains("print(x)"),
+        "init body should be stripped, got:\n{result}"
+    );
+    assert!(
+        result.contains("init(x: Int)"),
+        "init signature should be preserved, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_swift_structure_strips_deinit_body() {
+    let source = "class Foo {\n    deinit {\n        print(\"cleanup\")\n    }\n\n    func bar() {\n        print(\"bar\")\n    }\n}\n";
+    let result = transform(source, Language::Swift, Mode::Structure).unwrap();
+    assert!(
+        !result.contains("cleanup"),
+        "deinit body should be stripped, got:\n{result}"
+    );
+    assert!(
+        result.contains("deinit"),
+        "deinit keyword should be preserved, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_swift_signatures_extracts_init() {
+    let source = "class Foo {\n    init(x: Int) {\n        print(x)\n    }\n\n    func bar() {\n        print(\"bar\")\n    }\n}\n";
+    let result = transform(source, Language::Swift, Mode::Signatures).unwrap();
+    assert!(
+        result.contains("init(x: Int)"),
+        "init signature should be extracted, got:\n{result}"
+    );
+}
+
 // ============================================================================
 // Signatures mode
 // ============================================================================
