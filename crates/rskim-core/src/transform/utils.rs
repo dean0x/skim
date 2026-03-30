@@ -5,6 +5,25 @@
 use crate::Language;
 use tree_sitter::Node;
 
+// ============================================================================
+// Shared Node Type Structs
+// ============================================================================
+
+/// Node type mapping for function/method identification
+///
+/// Used by both structure mode (to replace function bodies) and signatures mode
+/// (to extract function signatures). The struct shape is identical for both modes,
+/// but factory functions produce intentionally different values per mode — e.g.,
+/// signatures mode omits node kinds that have no extractable signature
+/// (anonymous_initializer, deinit_declaration).
+pub(crate) struct FunctionNodeTypes {
+    pub(crate) function: &'static str,
+    pub(crate) method: &'static str,
+    /// Extra node kinds that behave like functions (e.g., Swift init/deinit, Kotlin constructors).
+    /// Language-specific kinds are data-driven, not hardcoded in match logic.
+    pub(crate) extra_function_kinds: &'static [&'static str],
+}
+
 /// Check if a node is inside a function/method body
 ///
 /// Walks up the AST via parent nodes looking for body/block nodes or
@@ -84,12 +103,17 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
 /// Walks immediate children looking for body-like node kinds that represent
 /// a function/method body. Used by both structure mode (to replace bodies)
 /// and signatures mode (to extract text before the body).
+///
+/// ARCHITECTURE: The matched kinds here must be the union of all body kinds
+/// from `get_body_node_kinds()`. This is the single source of truth for
+/// "what is a body child node" when walking DOWN from a function node.
+/// `get_body_node_kinds()` is used for walking UP (checking ancestry).
 pub(crate) fn find_body_child(node: Node) -> Option<Node> {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "statement_block" | "block" | "compound_statement" | "body" | "body_statement"
-            | "function_body" => return Some(child),
+            "statement_block" | "block" | "compound_statement" | "constructor_body"
+            | "body_statement" | "function_body" => return Some(child),
             _ => continue,
         }
     }
