@@ -214,12 +214,7 @@ fn matches_function_node(kind: &str, node_types: &NodeTypes) -> bool {
         || kind == node_types.method
         || kind == "arrow_function"
         || kind == "function_expression"
-        // Swift: initializers and deinitializers have function_body children
-        || kind == "init_declaration"
-        || kind == "deinit_declaration"
-        // Kotlin: secondary constructors and init blocks have block children
-        || kind == "secondary_constructor"
-        || kind == "anonymous_initializer"
+        || node_types.extra_function_kinds.contains(&kind)
 }
 
 /// Find the body node of a function/method
@@ -239,6 +234,9 @@ fn find_body_node(node: Node) -> Option<Node> {
 struct NodeTypes {
     function: &'static str,
     method: &'static str,
+    /// Extra node kinds that behave like functions (e.g., Swift init/deinit, Kotlin constructors).
+    /// Checked by matches_function_node so language-specific kinds are data-driven, not hardcoded.
+    extra_function_kinds: &'static [&'static str],
 }
 
 /// Get node types based on language
@@ -251,51 +249,63 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
         Language::TypeScript | Language::JavaScript => Some(NodeTypes {
             function: "function_declaration",
             method: "method_definition",
+            extra_function_kinds: &[],
         }),
         Language::Python => Some(NodeTypes {
             function: "function_definition",
             method: "function_definition",
+            extra_function_kinds: &[],
         }),
         Language::Rust => Some(NodeTypes {
             function: "function_item",
             method: "function_item",
+            extra_function_kinds: &[],
         }),
         Language::Go => Some(NodeTypes {
             function: "function_declaration",
             method: "method_declaration",
+            extra_function_kinds: &[],
         }),
         Language::Java => Some(NodeTypes {
             function: "method_declaration",
             method: "method_declaration",
+            extra_function_kinds: &[],
         }),
         // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(NodeTypes {
             function: "atx_heading",
             method: "atx_heading",
+            extra_function_kinds: &[],
         }),
         Language::C | Language::Cpp => Some(NodeTypes {
             function: "function_definition",
             method: "function_definition",
+            extra_function_kinds: &[],
         }),
         Language::CSharp => Some(NodeTypes {
             function: "method_declaration",
             method: "constructor_declaration",
+            extra_function_kinds: &[],
         }),
         Language::Ruby => Some(NodeTypes {
             function: "method",
             method: "singleton_method",
+            extra_function_kinds: &[],
         }),
         Language::Sql => Some(NodeTypes {
             function: "statement",
             method: "statement",
+            extra_function_kinds: &[],
         }),
         Language::Kotlin => Some(NodeTypes {
             function: "function_declaration",
             method: "function_declaration", // Kotlin doesn't distinguish methods from functions
+            extra_function_kinds: &["secondary_constructor", "anonymous_initializer"],
         }),
         Language::Swift => Some(NodeTypes {
             function: "function_declaration",
             method: "function_declaration", // Swift methods are also function_declaration
+            extra_function_kinds: &["init_declaration", "deinit_declaration"],
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }

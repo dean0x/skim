@@ -138,10 +138,7 @@ fn is_signature_node(kind: &str, node_types: &SignatureNodeTypes) -> bool {
         || kind == "arrow_function"
         || kind == "function_expression"
         || kind == "method_declaration"
-        // Swift: initializers are callable signatures
-        || kind == "init_declaration"
-        // Kotlin: secondary constructors are callable signatures
-        || kind == "secondary_constructor"
+        || node_types.extra_function_kinds.contains(&kind)
 }
 
 /// Extract signature text from node
@@ -203,6 +200,9 @@ fn find_body_for_signature(node: Node) -> Option<Node> {
 struct SignatureNodeTypes {
     function: &'static str,
     method: &'static str,
+    /// Extra node kinds that behave like functions (e.g., Swift init, Kotlin constructors).
+    /// Checked by is_signature_node so language-specific kinds are data-driven, not hardcoded.
+    extra_function_kinds: &'static [&'static str],
 }
 
 /// Get signature node types for language
@@ -214,51 +214,63 @@ fn get_signature_node_types(language: Language) -> Option<SignatureNodeTypes> {
         Language::TypeScript | Language::JavaScript => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "method_definition",
+            extra_function_kinds: &[],
         }),
         Language::Python => Some(SignatureNodeTypes {
             function: "function_definition",
             method: "function_definition",
+            extra_function_kinds: &[],
         }),
         Language::Rust => Some(SignatureNodeTypes {
             function: "function_item",
             method: "function_item",
+            extra_function_kinds: &[],
         }),
         Language::Go => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "method_declaration",
+            extra_function_kinds: &[],
         }),
         Language::Java => Some(SignatureNodeTypes {
             function: "method_declaration",
             method: "method_declaration",
+            extra_function_kinds: &[],
         }),
         // Unreachable: Markdown returns early via extract_markdown_headers_with_spans
         Language::Markdown => Some(SignatureNodeTypes {
             function: "atx_heading",
             method: "atx_heading",
+            extra_function_kinds: &[],
         }),
         Language::C | Language::Cpp => Some(SignatureNodeTypes {
             function: "function_definition",
             method: "function_definition",
+            extra_function_kinds: &[],
         }),
         Language::CSharp => Some(SignatureNodeTypes {
             function: "method_declaration",
             method: "constructor_declaration",
+            extra_function_kinds: &[],
         }),
         Language::Ruby => Some(SignatureNodeTypes {
             function: "method",
             method: "singleton_method",
+            extra_function_kinds: &[],
         }),
         Language::Sql => Some(SignatureNodeTypes {
             function: "create_table",
             method: "create_index",
+            extra_function_kinds: &[],
         }),
         Language::Kotlin => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "function_declaration",
+            extra_function_kinds: &["secondary_constructor"],
         }),
         Language::Swift => Some(SignatureNodeTypes {
             function: "function_declaration",
             method: "function_declaration",
+            extra_function_kinds: &["init_declaration"],
         }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
