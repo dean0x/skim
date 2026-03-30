@@ -224,7 +224,8 @@ fn find_body_node(node: Node) -> Option<Node> {
     crate::transform::utils::find_body_child(node)
 }
 
-/// Type alias for backward compatibility within this module
+/// Type alias: structure mode reuses the shared FunctionNodeTypes struct from utils.
+/// This avoids renaming all usages within the module while making the shared origin clear.
 type NodeTypes = FunctionNodeTypes;
 
 /// Get node types based on language

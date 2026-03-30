@@ -2416,7 +2416,11 @@ fn test_csharp_auto_detection() {
     let path = Path::new("Program.cs");
 
     let result = transform_auto(source, path, Mode::Structure);
-    assert!(result.is_ok(), "C# auto-detection failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "C# auto-detection failed: {:?}",
+        result.err()
+    );
     let content = result.unwrap();
     assert!(
         content.contains("UserService"),
@@ -2430,7 +2434,11 @@ fn test_ruby_auto_detection() {
     let path = Path::new("app.rb");
 
     let result = transform_auto(source, path, Mode::Structure);
-    assert!(result.is_ok(), "Ruby auto-detection failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Ruby auto-detection failed: {:?}",
+        result.err()
+    );
     let content = result.unwrap();
     assert!(
         content.contains("UserService"),
@@ -2444,7 +2452,11 @@ fn test_sql_auto_detection() {
     let path = Path::new("schema.sql");
 
     let result = transform_auto(source, path, Mode::Structure);
-    assert!(result.is_ok(), "SQL auto-detection failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "SQL auto-detection failed: {:?}",
+        result.err()
+    );
     let content = result.unwrap();
     assert!(
         content.contains("CREATE TABLE"),
@@ -2458,7 +2470,11 @@ fn test_kotlin_auto_detection() {
     let path = Path::new("Main.kt");
 
     let result = transform_auto(source, path, Mode::Structure);
-    assert!(result.is_ok(), "Kotlin auto-detection failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Kotlin auto-detection failed: {:?}",
+        result.err()
+    );
     let content = result.unwrap();
     assert!(
         content.contains("UserService"),
@@ -2472,7 +2488,11 @@ fn test_kotlin_auto_detection_kts() {
     let path = Path::new("build.gradle.kts");
 
     let result = transform_auto(source, path, Mode::Structure);
-    assert!(result.is_ok(), "Kotlin .kts auto-detection failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Kotlin .kts auto-detection failed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -2481,7 +2501,11 @@ fn test_swift_auto_detection() {
     let path = Path::new("main.swift");
 
     let result = transform_auto(source, path, Mode::Structure);
-    assert!(result.is_ok(), "Swift auto-detection failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Swift auto-detection failed: {:?}",
+        result.err()
+    );
     let content = result.unwrap();
     assert!(
         content.contains("UserService"),

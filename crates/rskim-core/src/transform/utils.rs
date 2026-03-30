@@ -213,8 +213,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         // `expression_statement` is the top-level span, not "call" itself. The
         // truncation path only scores top-level NodeSpans from root.children().
         "call" => ("call", 3),
-        "import" => ("import", 3),                   // Kotlin import
-        "package_header" => ("package_header", 3),   // Kotlin package declaration
+        "import" => ("import", 3),                 // Kotlin import
+        "package_header" => ("package_header", 3), // Kotlin package declaration
 
         // Priority 2: Class/module/impl containers
         "class_declaration" => ("class_declaration", 2),
@@ -225,8 +225,8 @@ pub(crate) fn node_kind_info(kind: &str) -> (&'static str, u8) {
         "namespace_declaration" => ("namespace_declaration", 2), // C# namespace
         "interface_type" => ("interface_type", 2),
         "struct_type" => ("struct_type", 2),
-        "class" => ("class", 2),         // Ruby class
-        "module" => ("module", 2),       // Ruby module
+        "class" => ("class", 2),   // Ruby class
+        "module" => ("module", 2), // Ruby module
         // ARCHITECTURE: "statement" is a SUPERTYPE (abstract) in TypeScript,
         // JavaScript, C, C++, Java, and Kotlin — tree-sitter resolves these to
         // concrete subtypes (e.g., "expression_statement", "break_statement"),
