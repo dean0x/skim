@@ -184,16 +184,10 @@ fn extract_signature(
 }
 
 /// Find body node for a function/method
+///
+/// Delegates to shared `find_body_child` in utils.rs.
 fn find_body_for_signature(node: Node) -> Option<Node> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "statement_block" | "block" | "compound_statement" | "body" | "body_statement"
-            | "function_body" => return Some(child),
-            _ => continue,
-        }
-    }
-    None
+    crate::transform::utils::find_body_child(node)
 }
 
 /// Node types for signature extraction

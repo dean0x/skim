@@ -79,6 +79,23 @@ fn get_function_node_kinds(language: Language) -> &'static [&'static str] {
     }
 }
 
+/// Find the body/block child of a function/method node
+///
+/// Walks immediate children looking for body-like node kinds that represent
+/// a function/method body. Used by both structure mode (to replace bodies)
+/// and signatures mode (to extract text before the body).
+pub(crate) fn find_body_child(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "statement_block" | "block" | "compound_statement" | "body" | "body_statement"
+            | "function_body" => return Some(child),
+            _ => continue,
+        }
+    }
+    None
+}
+
 // ============================================================================
 // Priority Scoring for AST-aware truncation
 // ============================================================================
@@ -397,7 +414,12 @@ mod tests {
         assert_eq!(get_comment_prefix(Language::Java), "//");
         assert_eq!(get_comment_prefix(Language::C), "//");
         assert_eq!(get_comment_prefix(Language::Cpp), "//");
+        assert_eq!(get_comment_prefix(Language::CSharp), "//");
+        assert_eq!(get_comment_prefix(Language::Kotlin), "//");
+        assert_eq!(get_comment_prefix(Language::Swift), "//");
         assert_eq!(get_comment_prefix(Language::Python), "#");
+        assert_eq!(get_comment_prefix(Language::Ruby), "#");
+        assert_eq!(get_comment_prefix(Language::Sql), "--");
         assert_eq!(get_comment_prefix(Language::Yaml), "#");
         assert_eq!(get_comment_prefix(Language::Toml), "#");
         assert_eq!(get_comment_prefix(Language::Markdown), "<!--");
@@ -409,6 +431,11 @@ mod tests {
         assert_eq!(get_comment_suffix(Language::Python), "");
         assert_eq!(get_comment_suffix(Language::C), "");
         assert_eq!(get_comment_suffix(Language::Cpp), "");
+        assert_eq!(get_comment_suffix(Language::CSharp), "");
+        assert_eq!(get_comment_suffix(Language::Ruby), "");
+        assert_eq!(get_comment_suffix(Language::Sql), "");
+        assert_eq!(get_comment_suffix(Language::Kotlin), "");
+        assert_eq!(get_comment_suffix(Language::Swift), "");
         assert_eq!(get_comment_suffix(Language::Toml), "");
         assert_eq!(get_comment_suffix(Language::Markdown), " -->");
     }
