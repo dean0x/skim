@@ -12,6 +12,8 @@ pub(super) mod types;
 
 use std::process::ExitCode;
 
+use rayon::prelude::*;
+
 use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
@@ -176,23 +178,48 @@ pub(super) fn run_diff(
         // Render each file with AST-aware context.
         // After MAX_AST_FILE_COUNT files, skip AST rendering and fall back to raw
         // hunks to keep diff processing bounded on very large changesets.
-        let mut rendered_output = String::new();
-        let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
-
-        for (i, file_diff) in file_diffs.iter().enumerate() {
+        //
+        // When >4 files, render in parallel via rayon. Each thread gets its own
+        // tree-sitter parser from the thread_local cache in render.rs.
+        // `par_iter().collect()` preserves the original element order, so output
+        // is deterministic regardless of thread scheduling.
+        let render_one = |i: usize, file_diff: &super::diff::types::FileDiff<'_>| {
             let skip_ast = i >= MAX_AST_FILE_COUNT;
-            rendered_output.push_str(&render_diff_file(
-                file_diff,
-                global_flags,
-                &git_args,
-                diff_mode,
-                skip_ast,
-            ));
-            diff_file_entries.push(DiffFileEntry {
+            let rendered = render_diff_file(file_diff, global_flags, &git_args, diff_mode, skip_ast);
+            let entry = DiffFileEntry {
                 path: file_diff.path.clone(),
                 status: file_diff.status.clone(),
                 changed_regions: file_diff.hunks.len(),
-            });
+            };
+            (rendered, entry)
+        };
+
+        /// Minimum file count to engage rayon parallelism. Below this, the
+        /// thread pool scheduling overhead exceeds the per-file render cost.
+        const PARALLEL_THRESHOLD: usize = 5;
+
+        let rendered_files: Vec<(String, DiffFileEntry)> = if file_diffs.len() >= PARALLEL_THRESHOLD
+        {
+            file_diffs
+                .iter()
+                .enumerate()
+                .collect::<Vec<_>>()
+                .par_iter()
+                .map(|&(i, file_diff)| render_one(i, file_diff))
+                .collect()
+        } else {
+            file_diffs
+                .iter()
+                .enumerate()
+                .map(|(i, file_diff)| render_one(i, file_diff))
+                .collect()
+        };
+
+        let mut rendered_output = String::new();
+        let mut diff_file_entries: Vec<DiffFileEntry> = Vec::with_capacity(rendered_files.len());
+        for (rendered, entry) in rendered_files {
+            rendered_output.push_str(&rendered);
+            diff_file_entries.push(entry);
         }
 
         let result = DiffResult::new(diff_file_entries, rendered_output);

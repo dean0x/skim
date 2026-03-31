@@ -1,5 +1,6 @@
 //! Diff rendering — AST-aware and raw hunk output.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
@@ -11,6 +12,12 @@ use super::source::get_file_source;
 use super::types::{ChangedNodeRange, DiffHunk, FileDiff, ModeRenderContext};
 use super::{DiffMode, MAX_AST_FILE_SIZE};
 use crate::output::canonical::DiffFileStatus;
+
+thread_local! {
+    /// Per-thread parser cache — avoids creating a new tree-sitter Parser for every file.
+    /// Each thread in the rayon pool gets its own `HashMap` of parsers keyed by language.
+    static PARSERS: RefCell<HashMap<Language, rskim_core::Parser>> = RefCell::new(HashMap::new());
+}
 
 /// Render a single file diff with AST-aware context.
 ///
@@ -68,9 +75,31 @@ pub(super) fn render_diff_file(
         return render_raw_hunks(file_diff, &output);
     }
 
-    // For modified/renamed files, attempt AST-aware rendering.
-    // Falls back to raw hunks when AST rendering is not possible.
-    if let Some(ast_output) = try_ast_render(file_diff, global_flags, args, diff_mode) {
+    // Determine language for parser lookup
+    let lang = Language::from_path(Path::new(&file_diff.path));
+    let can_ast = lang.is_some_and(|l| !l.is_serde_based());
+
+    if !can_ast {
+        return render_raw_hunks(file_diff, &output);
+    }
+
+    let lang = lang.expect("checked above");
+
+    // Obtain a cached parser from the thread-local pool and attempt AST rendering.
+    let ast_result = PARSERS.with_borrow_mut(|cache| {
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(lang) {
+            if let Ok(p) = rskim_core::Parser::new(lang) {
+                e.insert(p);
+            }
+        }
+        if let Some(parser) = cache.get_mut(&lang) {
+            try_ast_render(file_diff, global_flags, args, diff_mode, parser)
+        } else {
+            None
+        }
+    });
+
+    if let Some(ast_output) = ast_result {
         output.push_str(&ast_output);
     } else {
         return render_raw_hunks(file_diff, &output);
@@ -82,24 +111,19 @@ pub(super) fn render_diff_file(
 /// Attempt AST-aware rendering for a modified/renamed file.
 ///
 /// Returns `Some(rendered)` on success, `None` when the file cannot be
-/// processed via tree-sitter (unsupported language, file too large, parse
-/// failure, or no overlapping AST nodes).
+/// processed via tree-sitter (file too large, parse failure, or no
+/// overlapping AST nodes).
 ///
-/// Accepts an external `parser` to avoid re-creating a tree-sitter Parser
-/// per file (parser reuse across calls for the same language).
+/// Language validation and serde-based filtering happen in the caller
+/// (`render_diff_file`), so `parser` is guaranteed to match the file's
+/// language.
 fn try_ast_render(
     file_diff: &FileDiff<'_>,
     global_flags: &[String],
     args: &[String],
     diff_mode: DiffMode,
+    parser: &mut rskim_core::Parser,
 ) -> Option<String> {
-    let lang = Language::from_path(Path::new(&file_diff.path))?;
-
-    // Languages that don't use tree-sitter (JSON, YAML, TOML)
-    if lang.is_serde_based() {
-        return None;
-    }
-
     let source = match get_file_source(&file_diff.path, global_flags, args) {
         Ok(s) => s,
         Err(e) => {
@@ -113,7 +137,6 @@ fn try_ast_render(
         return None;
     }
 
-    let mut parser = rskim_core::Parser::new(lang).ok()?;
     let tree = parser.parse(&source).ok()?;
 
     let changed_ranges = find_changed_node_ranges(&tree, &file_diff.hunks);
@@ -132,7 +155,7 @@ fn try_ast_render(
             source: &source,
             diff_mode,
         };
-        render_with_unchanged_context(&mut output, &tree, &ctx, &mut parser);
+        render_with_unchanged_context(&mut output, &tree, &ctx, parser);
     } else {
         render_changed_only(
             &mut output,
