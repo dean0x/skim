@@ -10,7 +10,7 @@
 //! and renders changed nodes with full function boundaries and standard
 //! `+`/`-` markers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1198,50 +1198,53 @@ fn render_diff_file(
         return render_raw_hunks(file_diff, &output);
     }
 
-    // For modified/renamed files, try AST-aware rendering
-    let language = Language::from_path(Path::new(&file_diff.path));
+    // For modified/renamed files, attempt AST-aware rendering.
+    // Falls back to raw hunks when AST rendering is not possible.
+    if let Some(ast_output) = try_ast_render(file_diff, global_flags, args, diff_mode) {
+        output.push_str(&ast_output);
+    } else {
+        return render_raw_hunks(file_diff, &output);
+    }
 
-    let source = match get_file_source(&file_diff.path, global_flags, args) {
-        Ok(s) => s,
-        Err(_) => return render_raw_hunks(file_diff, &output),
-    };
+    output
+}
+
+/// Attempt AST-aware rendering for a modified/renamed file.
+///
+/// Returns `Some(rendered)` on success, `None` when the file cannot be
+/// processed via tree-sitter (unsupported language, file too large, parse
+/// failure, or no overlapping AST nodes).
+fn try_ast_render(
+    file_diff: &FileDiff,
+    global_flags: &[String],
+    args: &[String],
+    diff_mode: DiffMode,
+) -> Option<String> {
+    let lang = Language::from_path(Path::new(&file_diff.path))?;
+
+    // Languages that don't use tree-sitter (JSON, YAML, TOML)
+    if lang.is_serde_based() {
+        return None;
+    }
+
+    let source = get_file_source(&file_diff.path, global_flags, args).ok()?;
 
     // Skip AST for files > 100KB
     if source.len() > MAX_AST_FILE_SIZE {
-        return render_raw_hunks(file_diff, &output);
+        return None;
     }
 
-    let Some(lang) = language else {
-        return render_raw_hunks(file_diff, &output);
-    };
+    let mut parser = rskim_core::Parser::new(lang).ok()?;
+    let tree = parser.parse(&source).ok()?;
 
-    // Languages that don't use tree-sitter (JSON, YAML, TOML) fall back to raw hunks
-    if lang.is_serde_based() {
-        return render_raw_hunks(file_diff, &output);
-    }
-
-    // Parse with tree-sitter
-    let mut parser = match rskim_core::Parser::new(lang) {
-        Ok(p) => p,
-        Err(_) => return render_raw_hunks(file_diff, &output),
-    };
-
-    let tree = match parser.parse(&source) {
-        Ok(t) => t,
-        Err(_) => return render_raw_hunks(file_diff, &output),
-    };
-
-    // Find changed AST node ranges
     let changed_ranges = find_changed_node_ranges(&tree, &file_diff.hunks);
-
     if changed_ranges.is_empty() {
-        // No overlapping AST nodes found — fall back to raw hunks
-        return render_raw_hunks(file_diff, &output);
+        return None;
     }
 
     let source_lines: Vec<&str> = source.lines().collect();
+    let mut output = String::new();
 
-    // In structure/full mode, render unchanged top-level nodes as context
     if diff_mode != DiffMode::Default {
         let ctx = ModeRenderContext {
             changed_ranges: &changed_ranges,
@@ -1253,7 +1256,6 @@ fn render_diff_file(
         };
         render_with_unchanged_context(&mut output, &tree, &ctx);
     } else {
-        // Default mode: only changed nodes, with parent context headers for nested nodes
         render_changed_only(
             &mut output,
             &changed_ranges,
@@ -1262,7 +1264,7 @@ fn render_diff_file(
         );
     }
 
-    output
+    Some(output)
 }
 
 /// Render only changed nodes (default mode).
@@ -1278,7 +1280,16 @@ fn render_changed_only(
     // Track which parent headers we have already emitted
     let mut emitted_parent_headers: HashSet<usize> = HashSet::new();
 
-    for range in changed_ranges {
+    // Pre-compute the last range index for each parent header to avoid O(N^2)
+    // scanning on every iteration.
+    let mut last_index_for_parent: HashMap<usize, usize> = HashMap::new();
+    for (idx, range) in changed_ranges.iter().enumerate() {
+        if let Some(ref ctx) = range.parent_context {
+            last_index_for_parent.insert(ctx.header_line, idx);
+        }
+    }
+
+    for (idx, range) in changed_ranges.iter().enumerate() {
         // Emit parent header if this is a nested node
         if let Some(ref ctx) = range.parent_context {
             if emitted_parent_headers.insert(ctx.header_line) {
@@ -1292,12 +1303,9 @@ fn render_changed_only(
 
         // Emit parent closing brace if this is the last child with this parent
         if let Some(ref ctx) = range.parent_context {
-            // Check if there's a subsequent range with the same parent
-            let is_last = !changed_ranges.iter().any(|r| {
-                r.parent_context
-                    .as_ref()
-                    .is_some_and(|p| p.header_line == ctx.header_line && r.start > range.start)
-            });
+            let is_last = last_index_for_parent
+                .get(&ctx.header_line)
+                .is_some_and(|&last_idx| last_idx == idx);
             if is_last {
                 if let Some(line) = source_lines.get(ctx.close_line - 1) {
                     let _ = writeln!(output, " {line}");
