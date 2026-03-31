@@ -1054,4 +1054,56 @@ mod tests {
         result.ensure_rendered();
         assert_eq!(result.as_ref(), "PKG CHECK | pip | 0 issues");
     }
+
+    // ========================================================================
+    // DiffResult ensure_rendered lossy fallback (#103 review batch-7)
+    // ========================================================================
+
+    #[test]
+    fn test_diff_result_ensure_rendered_produces_summary_fallback() {
+        // When `rendered` is empty (e.g., after deserialization that strips the
+        // rendered field), `ensure_rendered` produces a *lossy* summary: only
+        // file paths, statuses, and region counts -- not the full diff content.
+        // This is intentional: the rendered field is the source of truth; the
+        // fallback exists solely to provide a human-readable overview.
+        let mut result = DiffResult::new(
+            vec![
+                DiffFileEntry {
+                    path: "src/main.rs".to_string(),
+                    status: DiffFileStatus::Modified,
+                    changed_regions: 3,
+                },
+                DiffFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    status: DiffFileStatus::Added,
+                    changed_regions: 1,
+                },
+            ],
+            String::new(), // simulate empty rendered field
+        );
+
+        result.ensure_rendered();
+        let output = result.as_ref();
+
+        // Summary header
+        assert!(
+            output.starts_with("[diff] 2 files changed"),
+            "expected summary header, got: {output}"
+        );
+        // Per-file entries with status and region counts
+        assert!(
+            output.contains("src/main.rs (modified, 3 regions)"),
+            "expected main.rs entry, got: {output}"
+        );
+        assert!(
+            output.contains("src/lib.rs (added, 1 regions)"),
+            "expected lib.rs entry, got: {output}"
+        );
+        // Intentionally does NOT contain actual diff hunks -- this is the lossy
+        // nature of the fallback.
+        assert!(
+            !output.contains('+') && !output.contains('-'),
+            "fallback should not contain diff markers"
+        );
+    }
 }

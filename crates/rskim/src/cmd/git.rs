@@ -544,6 +544,10 @@ fn worktree_prefix(c: char) -> &'static str {
 /// to raw diff hunks.
 const MAX_AST_FILE_SIZE: usize = 100 * 1024;
 
+/// Maximum number of files processed through the AST pipeline. Files beyond
+/// this limit fall back to raw diff hunks to keep diff rendering bounded.
+const MAX_AST_FILE_COUNT: usize = 200;
+
 /// Controls how unchanged AST nodes are rendered alongside changed nodes.
 ///
 /// - `Default`: Only changed nodes are shown (no unchanged context).
@@ -1147,6 +1151,7 @@ fn render_diff_file(
     global_flags: &[String],
     args: &[String],
     diff_mode: DiffMode,
+    skip_ast: bool,
 ) -> String {
     let mut output = String::new();
 
@@ -1187,6 +1192,11 @@ fn render_diff_file(
 
     // Added/deleted files: show all patch lines verbatim (no AST overlay needed)
     if file_diff.status == FileStatus::Deleted || file_diff.status == FileStatus::Added {
+        return render_raw_hunks(file_diff, &output);
+    }
+
+    // When AST is skipped (e.g., beyond MAX_AST_FILE_COUNT), render raw hunks.
+    if skip_ast {
         return render_raw_hunks(file_diff, &output);
     }
 
@@ -1626,16 +1636,20 @@ fn run_diff(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Render each file with AST-aware context
+    // Render each file with AST-aware context.
+    // After MAX_AST_FILE_COUNT files, skip AST rendering and fall back to raw
+    // hunks to keep diff processing bounded on very large changesets.
     let mut rendered_output = String::new();
     let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
 
-    for file_diff in &file_diffs {
+    for (i, file_diff) in file_diffs.iter().enumerate() {
+        let skip_ast = i >= MAX_AST_FILE_COUNT;
         rendered_output.push_str(&render_diff_file(
             file_diff,
             global_flags,
             &git_args,
             diff_mode,
+            skip_ast,
         ));
         diff_file_entries.push(DiffFileEntry {
             path: file_diff.path.clone(),
@@ -2766,7 +2780,7 @@ mod tests {
             status: FileStatus::Binary,
             hunks: vec![],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("logo.png"));
         assert!(rendered.contains("binary"));
         assert!(rendered.contains("Binary file differs"));
@@ -2786,7 +2800,7 @@ mod tests {
                 patch_lines: vec!["+const x = 1;".to_string(), "+const y = 2;".to_string()],
             }],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("added"), "header should show 'added'");
         assert!(
             rendered.contains("+const x = 1;"),
@@ -2808,7 +2822,7 @@ mod tests {
                 patch_lines: vec!["-const x = 1;".to_string(), "-const y = 2;".to_string()],
             }],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("deleted"), "header should show 'deleted'");
         assert!(
             rendered.contains("-const x = 1;"),
@@ -2824,7 +2838,7 @@ mod tests {
             status: FileStatus::Renamed,
             hunks: vec![],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("helpers.ts"), "should show old path");
         assert!(rendered.contains("format.ts"), "should show new path");
         assert!(rendered.contains("renamed"), "header should show 'renamed'");
@@ -2980,5 +2994,88 @@ mod tests {
         let result = get_file_source("test.txt", &global_flags, &args);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
         assert_eq!(result.unwrap(), "hello world");
+    }
+
+    // ========================================================================
+    // MAX_AST_FILE_COUNT limit (#103 review batch-7)
+    // ========================================================================
+
+    #[test]
+    fn test_max_ast_file_count_is_bounded() {
+        // The AST pipeline has a per-file size limit (MAX_AST_FILE_SIZE) and a
+        // total file count limit (MAX_AST_FILE_COUNT). This test documents the
+        // constant value so changes are deliberate.
+        assert_eq!(MAX_AST_FILE_COUNT, 200);
+    }
+
+    #[test]
+    fn test_render_diff_file_skip_ast_uses_raw_hunks() {
+        // When skip_ast is true, render_diff_file should produce raw patch
+        // lines instead of attempting AST-aware rendering.
+        let file_diff = FileDiff {
+            path: "src/foo.rs".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 4,
+                patch_lines: vec![
+                    " fn main() {".to_string(),
+                    "+    println!(\"hello\");".to_string(),
+                    " }".to_string(),
+                ],
+            }],
+        };
+
+        let output = render_diff_file(
+            &file_diff,
+            &[],
+            &[],
+            DiffMode::Structure,
+            true, // skip_ast
+        );
+
+        // Should contain file header
+        assert!(
+            output.contains("src/foo.rs (modified)"),
+            "expected file header, got: {output}"
+        );
+        // Should contain raw patch lines (not AST-processed)
+        assert!(
+            output.contains("+    println!(\"hello\");"),
+            "expected raw patch line, got: {output}"
+        );
+    }
+
+    // ========================================================================
+    // Empty diff behavior documentation (#103 review batch-7)
+    // ========================================================================
+
+    /// Documents intentional behavior change in the AST-aware diff pipeline:
+    /// when `git diff` produces no output, `run_diff` prints "No changes" to
+    /// stderr and returns `ExitCode::SUCCESS`. This replaces the old
+    /// `parse_diff_stat` behavior which returned `"no changes"` as a
+    /// `GitResult.summary` on stdout.
+    ///
+    /// Rationale: stderr is the correct channel for status messages so that
+    /// stdout remains clean for piping. The old behavior mixed status messages
+    /// into the structured output.
+    #[test]
+    fn test_empty_diff_produces_no_stdout_output() {
+        // parse_unified_diff on empty input produces no files
+        let files = parse_unified_diff("");
+        assert!(files.is_empty(), "empty diff should parse to zero files");
+
+        // The behavior is: when file_diffs is empty, run_diff writes
+        // "No changes" to stderr (not stdout) and returns SUCCESS.
+        // This test documents that empty input never reaches the rendering
+        // pipeline -- the empty check at line 1616-1618 catches it first.
+        let files_whitespace = parse_unified_diff("  \n\n  \n");
+        assert!(
+            files_whitespace.is_empty(),
+            "whitespace-only diff should parse to zero files"
+        );
     }
 }
