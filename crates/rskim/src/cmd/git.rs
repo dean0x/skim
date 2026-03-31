@@ -646,7 +646,7 @@ static HUNK_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// A single hunk from a unified diff.
 #[derive(Debug, Clone)]
-struct DiffHunk {
+struct DiffHunk<'a> {
     /// Start line in the old file (1-indexed).
     /// Used in tests and for hunk-to-node overlap calculations.
     #[allow(dead_code)]
@@ -659,13 +659,14 @@ struct DiffHunk {
     new_start: usize,
     /// Number of lines added in new file
     new_count: usize,
-    /// Raw patch lines (including `+`, `-`, and context ` ` prefixes)
-    patch_lines: Vec<String>,
+    /// Raw patch lines (including `+`, `-`, and context ` ` prefixes).
+    /// Borrows from the raw diff output string, which outlives all consumers.
+    patch_lines: Vec<&'a str>,
 }
 
 /// Parsed representation of a single file in a unified diff.
 #[derive(Debug, Clone)]
-struct FileDiff {
+struct FileDiff<'a> {
     /// File path (new path for renames/adds, old path for deletes)
     path: String,
     /// Original path for renames (old name)
@@ -673,7 +674,7 @@ struct FileDiff {
     /// File status
     status: DiffFileStatus,
     /// Hunks of changed lines
-    hunks: Vec<DiffHunk>,
+    hunks: Vec<DiffHunk<'a>>,
 }
 
 /// Parse a hunk header line: `@@ -N,M +N,M @@`
@@ -750,8 +751,8 @@ fn scan_extended_headers(lines: &[&str], start: usize) -> (FileMetadata, usize) 
 /// Reads hunk headers (`@@`) and their patch lines until the next `diff --git`
 /// header or end of input. Returns the hunks and the index of the next
 /// unprocessed line.
-fn collect_hunks(lines: &[&str], start: usize) -> (Vec<DiffHunk>, usize) {
-    let mut hunks: Vec<DiffHunk> = Vec::new();
+fn collect_hunks<'a>(lines: &[&'a str], start: usize) -> (Vec<DiffHunk<'a>>, usize) {
+    let mut hunks: Vec<DiffHunk<'a>> = Vec::new();
     let mut i = start;
 
     while i < lines.len() && !lines[i].starts_with("diff --git ") {
@@ -759,7 +760,7 @@ fn collect_hunks(lines: &[&str], start: usize) -> (Vec<DiffHunk>, usize) {
 
         if l.starts_with("@@") {
             if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(l) {
-                let mut patch_lines: Vec<String> = Vec::new();
+                let mut patch_lines: Vec<&'a str> = Vec::new();
                 i += 1;
 
                 while i < lines.len() {
@@ -773,7 +774,7 @@ fn collect_hunks(lines: &[&str], start: usize) -> (Vec<DiffHunk>, usize) {
                         || pl.starts_with(' ')
                         || pl.starts_with('\\')
                     {
-                        patch_lines.push(pl.to_string());
+                        patch_lines.push(pl);
                     }
                     i += 1;
                 }
@@ -837,8 +838,8 @@ fn resolve_file_info(
 /// - Deleted files (`+++ /dev/null`)
 /// - Renamed files (`rename from` / `rename to`)
 /// - Binary files (`Binary files ... differ`)
-fn parse_unified_diff(output: &str) -> Vec<FileDiff> {
-    let mut files: Vec<FileDiff> = Vec::new();
+fn parse_unified_diff<'a>(output: &'a str) -> Vec<FileDiff<'a>> {
+    let mut files: Vec<FileDiff<'a>> = Vec::new();
     let lines: Vec<&str> = output.lines().collect();
     let mut i = 0;
 
@@ -1033,7 +1034,7 @@ struct ParentContext {
 /// Build the set of changed line numbers from diff hunks.
 ///
 /// Returns 1-indexed line numbers using new-file positions.
-fn build_changed_lines(hunks: &[DiffHunk]) -> BTreeSet<usize> {
+fn build_changed_lines(hunks: &[DiffHunk<'_>]) -> BTreeSet<usize> {
     let mut changed_lines: BTreeSet<usize> = BTreeSet::new();
     for hunk in hunks {
         let mut new_line = hunk.new_start;
@@ -1090,7 +1091,7 @@ fn is_container_node(node: &tree_sitter::Node<'_>) -> bool {
 /// parent range.
 ///
 /// Lines are 1-indexed to match diff output.
-fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHunk]) -> Vec<ChangedNodeRange> {
+fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHunk<'_>]) -> Vec<ChangedNodeRange> {
     if hunks.is_empty() {
         return Vec::new();
     }
@@ -1177,7 +1178,7 @@ fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHunk]) -> Vec
 /// - `Structure`: Changed + unchanged nodes as signatures.
 /// - `Full`: Changed + unchanged nodes in full.
 fn render_diff_file(
-    file_diff: &FileDiff,
+    file_diff: &FileDiff<'_>,
     global_flags: &[String],
     args: &[String],
     diff_mode: DiffMode,
@@ -1238,7 +1239,7 @@ fn render_diff_file(
 /// processed via tree-sitter (unsupported language, file too large, parse
 /// failure, or no overlapping AST nodes).
 fn try_ast_render(
-    file_diff: &FileDiff,
+    file_diff: &FileDiff<'_>,
     global_flags: &[String],
     args: &[String],
     diff_mode: DiffMode,
@@ -1303,7 +1304,7 @@ fn try_ast_render(
 fn render_changed_only(
     output: &mut String,
     changed_ranges: &[ChangedNodeRange],
-    hunks: &[DiffHunk],
+    hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
 ) {
     // Track which parent headers we have already emitted
@@ -1350,7 +1351,7 @@ fn render_changed_only(
 /// to stay within clippy's 7-argument limit.
 struct ModeRenderContext<'a> {
     changed_ranges: &'a [ChangedNodeRange],
-    hunks: &'a [DiffHunk],
+    hunks: &'a [DiffHunk<'a>],
     source_lines: &'a [&'a str],
     source: &'a str,
     lang: Language,
@@ -1513,10 +1514,10 @@ fn render_node_with_hunks(
     output: &mut String,
     node_start: usize,
     node_end: usize,
-    hunks: &[DiffHunk],
+    hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
 ) {
-    let relevant_hunks: Vec<&DiffHunk> = hunks
+    let relevant_hunks: Vec<&DiffHunk<'_>> = hunks
         .iter()
         .filter(|h| {
             let hunk_start = h.new_start;
@@ -1575,7 +1576,7 @@ fn render_node_with_hunks(
 }
 
 /// Render raw diff hunks as fallback (no AST awareness).
-fn render_raw_hunks(file_diff: &FileDiff, header: &str) -> String {
+fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str) -> String {
     let mut output = header.to_string();
     for hunk in &file_diff.hunks {
         for line in &hunk.patch_lines {
@@ -1652,51 +1653,54 @@ fn run_diff(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Parse unified diff into per-file structures
-    let file_diffs = parse_unified_diff(&raw_diff);
+    // Parse and render inside a block so `file_diffs` (which borrows
+    // `raw_diff`) drops before `raw_diff` is moved into analytics.
+    let result_str = {
+        let file_diffs = parse_unified_diff(&raw_diff);
 
-    if file_diffs.is_empty() {
-        eprintln!("No changes");
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Render each file with AST-aware context.
-    // After MAX_AST_FILE_COUNT files, skip AST rendering and fall back to raw
-    // hunks to keep diff processing bounded on very large changesets.
-    let mut rendered_output = String::new();
-    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
-
-    for (i, file_diff) in file_diffs.iter().enumerate() {
-        let skip_ast = i >= MAX_AST_FILE_COUNT;
-        rendered_output.push_str(&render_diff_file(
-            file_diff,
-            global_flags,
-            &git_args,
-            diff_mode,
-            skip_ast,
-        ));
-        diff_file_entries.push(DiffFileEntry {
-            path: file_diff.path.clone(),
-            status: file_diff.status.clone(),
-            changed_regions: file_diff.hunks.len(),
-        });
-    }
-
-    let result = DiffResult::new(diff_file_entries, rendered_output);
-
-    let result_str = match output_format {
-        OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&result)
-                .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-            println!("{json}");
-            json
+        if file_diffs.is_empty() {
+            eprintln!("No changes");
+            return Ok(ExitCode::SUCCESS);
         }
-        OutputFormat::Text => {
-            let s = result.to_string();
-            print!("{s}");
-            s
+
+        // Render each file with AST-aware context.
+        // After MAX_AST_FILE_COUNT files, skip AST rendering and fall back to raw
+        // hunks to keep diff processing bounded on very large changesets.
+        let mut rendered_output = String::new();
+        let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
+
+        for (i, file_diff) in file_diffs.iter().enumerate() {
+            let skip_ast = i >= MAX_AST_FILE_COUNT;
+            rendered_output.push_str(&render_diff_file(
+                file_diff,
+                global_flags,
+                &git_args,
+                diff_mode,
+                skip_ast,
+            ));
+            diff_file_entries.push(DiffFileEntry {
+                path: file_diff.path.clone(),
+                status: file_diff.status.clone(),
+                changed_regions: file_diff.hunks.len(),
+            });
         }
-    };
+
+        let result = DiffResult::new(diff_file_entries, rendered_output);
+
+        match output_format {
+            OutputFormat::Json => {
+                let json = serde_json::to_string_pretty(&result)
+                    .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
+                println!("{json}");
+                json
+            }
+            OutputFormat::Text => {
+                let s = result.to_string();
+                print!("{s}");
+                s
+            }
+        }
+    }; // file_diffs dropped here, raw_diff is free to move
 
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&raw_diff, &result_str);
@@ -2465,9 +2469,9 @@ mod tests {
             new_start: 3,
             new_count: 3,
             patch_lines: vec![
-                "-  old line".to_string(),
-                "+  new line 1".to_string(),
-                "+  new line 2".to_string(),
+                "-  old line",
+                "+  new line 1",
+                "+  new line 2",
             ],
         }];
         let lines = build_changed_lines(&hunks);
@@ -2491,9 +2495,9 @@ mod tests {
             new_start: 1,
             new_count: 3,
             patch_lines: vec![
-                " unchanged 1".to_string(),
-                " unchanged 2".to_string(),
-                " unchanged 3".to_string(),
+                " unchanged 1",
+                " unchanged 2",
+                " unchanged 3",
             ],
         }];
         let lines = build_changed_lines(&hunks);
@@ -2518,8 +2522,8 @@ mod tests {
             new_start: 5,
             new_count: 0,
             patch_lines: vec![
-                "-  removed line 1".to_string(),
-                "-  removed line 2".to_string(),
+                "-  removed line 1",
+                "-  removed line 2",
             ],
         }];
         let lines = build_changed_lines(&hunks);
@@ -2538,8 +2542,8 @@ mod tests {
                 new_start: 2,
                 new_count: 1,
                 patch_lines: vec![
-                    "-  old".to_string(),
-                    "+  new".to_string(),
+                    "-  old",
+                    "+  new",
                 ],
             },
             DiffHunk {
@@ -2548,8 +2552,8 @@ mod tests {
                 new_start: 10,
                 new_count: 1,
                 patch_lines: vec![
-                    "-  old2".to_string(),
-                    "+  new2".to_string(),
+                    "-  old2",
+                    "+  new2",
                 ],
             },
         ];
@@ -2648,9 +2652,9 @@ mod tests {
             new_start: 2,
             new_count: 2,
             patch_lines: vec![
-                "-  return 1;".to_string(),
-                "+  return 42;".to_string(),
-                "+  console.log(42);".to_string(),
+                "-  return 1;",
+                "+  return 42;",
+                "+  console.log(42);",
             ],
         }];
 
@@ -2695,8 +2699,8 @@ mod tests {
             new_start: 1,
             new_count: 1,
             patch_lines: vec![
-                "-import { foo } from 'bar';".to_string(),
-                "+import { foo, extra } from 'bar';".to_string(),
+                "-import { foo } from 'bar';",
+                "+import { foo, extra } from 'bar';",
             ],
         }];
 
@@ -2719,8 +2723,8 @@ mod tests {
             new_start: 3,
             new_count: 1,
             patch_lines: vec![
-                "-    return `Hello, ${name}`;".to_string(),
-                "+    return `Hi, ${name}`;".to_string(),
+                "-    return `Hello, ${name}`;",
+                "+    return `Hi, ${name}`;",
             ],
         }];
 
@@ -2821,7 +2825,7 @@ mod tests {
                 old_count: 0,
                 new_start: 1,
                 new_count: 2,
-                patch_lines: vec!["+const x = 1;".to_string(), "+const y = 2;".to_string()],
+                patch_lines: vec!["+const x = 1;", "+const y = 2;"],
             }],
         };
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
@@ -2843,7 +2847,7 @@ mod tests {
                 old_count: 2,
                 new_start: 0,
                 new_count: 0,
-                patch_lines: vec!["-const x = 1;".to_string(), "-const y = 2;".to_string()],
+                patch_lines: vec!["-const x = 1;", "-const y = 2;"],
             }],
         };
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
@@ -3046,9 +3050,9 @@ mod tests {
                 new_start: 1,
                 new_count: 4,
                 patch_lines: vec![
-                    " fn main() {".to_string(),
-                    "+    println!(\"hello\");".to_string(),
-                    " }".to_string(),
+                    " fn main() {",
+                    "+    println!(\"hello\");",
+                    " }",
                 ],
             }],
         };
