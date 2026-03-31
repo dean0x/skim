@@ -124,6 +124,21 @@ fn test_normalize_trailing_slash() {
     assert_eq!(table.len(), 1);
 }
 
+/// `/a/../../b` — the second `..` has only `RootDir` behind it (not a Normal
+/// component), so normalize cannot pop it and instead keeps `..` in the output.
+/// The result is `/../b`, which is logically above the filesystem root.
+///
+/// This is a documented limitation of the I/O-free normalizer: it does not
+/// clamp absolute paths at root. Callers providing paths that traverse above
+/// root receive a path that still contains a `..` segment.
+#[test]
+fn test_normalize_absolute_over_root() {
+    let mut table = FileTable::new();
+    let id = table.register(Path::new("/a/../../b"));
+    // Second `..` cannot pop RootDir — stays in output as `/../b`.
+    assert_eq!(table.lookup(id), Some(Path::new("/../b")));
+}
+
 // ============================================================================
 // Registration semantics
 // ============================================================================

@@ -134,6 +134,33 @@ fn test_search_empty_query() {
 }
 
 #[test]
+fn test_search_build_flag_hits_stub() {
+    skim_cmd()
+        .args(["search", "--build", "test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented"));
+}
+
+#[test]
+fn test_search_rebuild_flag_hits_stub() {
+    skim_cmd()
+        .args(["search", "--rebuild", "test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented"));
+}
+
+#[test]
+fn test_search_update_flag_hits_stub() {
+    skim_cmd()
+        .args(["search", "--update", "test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented"));
+}
+
+#[test]
 fn test_search_in_main_help() {
     skim_cmd()
         .args(["--help"])
