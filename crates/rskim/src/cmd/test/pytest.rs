@@ -16,7 +16,6 @@
 //! pytest ... | skim test pytest       # Parse piped stdin
 //! ```
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
@@ -25,7 +24,7 @@ use std::time::Duration;
 
 use regex::Regex;
 
-use crate::cmd::user_has_flag;
+use crate::cmd::{combine_output, user_has_flag};
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::{strip_ansi, ParseResult};
 use crate::runner::{CommandOutput, CommandRunner};
@@ -202,18 +201,6 @@ fn read_stdin() -> anyhow::Result<CommandOutput> {
     })
 }
 
-/// Combine stdout and stderr into a single string for parsing.
-///
-/// Pytest writes test output to stdout and some warnings/errors to stderr.
-/// We combine them so the parser can see everything. Returns a `Cow` to
-/// avoid cloning stdout when stderr is empty (the common case).
-fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
-    if output.stderr.is_empty() {
-        Cow::Borrowed(&output.stdout)
-    } else {
-        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
-    }
-}
 
 // ============================================================================
 // Three-tier parser

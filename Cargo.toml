@@ -41,6 +41,11 @@ strip-ansi-escapes = "0.2"
 regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 colored = "2"
+assert_cmd = "2.0"
+predicates = "3.0"
+tempfile = "3.0"
+insta = "1.39"
+criterion = "0.5"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"
