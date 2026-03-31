@@ -688,6 +688,148 @@ fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
     Some((old_start, old_count, new_start, new_count))
 }
 
+/// Metadata collected from extended diff headers (new/deleted/renamed/binary).
+struct FileMetadata {
+    is_binary: bool,
+    is_new: bool,
+    is_deleted: bool,
+    is_renamed: bool,
+    rename_from: Option<String>,
+    file_minus: String,
+    file_plus: String,
+}
+
+/// Scan extended headers from a `diff --git` block.
+///
+/// Starting at `start`, reads lines until a hunk header (`@@`) or the next
+/// `diff --git` header. Returns the collected metadata and the index of
+/// the next unprocessed line.
+fn scan_extended_headers(lines: &[&str], start: usize) -> (FileMetadata, usize) {
+    let mut meta = FileMetadata {
+        is_binary: false,
+        is_new: false,
+        is_deleted: false,
+        is_renamed: false,
+        rename_from: None,
+        file_minus: String::new(),
+        file_plus: String::new(),
+    };
+
+    let mut i = start;
+    while i < lines.len() && !lines[i].starts_with("diff --git ") {
+        let l = lines[i];
+
+        if l.starts_with("new file mode") {
+            meta.is_new = true;
+        } else if l.starts_with("deleted file mode") {
+            meta.is_deleted = true;
+        } else if l.starts_with("rename from ") {
+            meta.is_renamed = true;
+            meta.rename_from = Some(l.strip_prefix("rename from ").unwrap_or("").to_string());
+        } else if l.starts_with("rename to ") {
+            meta.is_renamed = true;
+        } else if l.starts_with("Binary files") && l.contains("differ") {
+            meta.is_binary = true;
+        } else if l.starts_with("--- ") {
+            meta.file_minus = l.strip_prefix("--- ").unwrap_or("").to_string();
+        } else if l.starts_with("+++ ") {
+            meta.file_plus = l.strip_prefix("+++ ").unwrap_or("").to_string();
+        } else if l.starts_with("@@") {
+            // Hunk header — extended headers are done, stop before consuming it
+            break;
+        }
+
+        i += 1;
+    }
+
+    (meta, i)
+}
+
+/// Collect hunks from diff lines starting at `start`.
+///
+/// Reads hunk headers (`@@`) and their patch lines until the next `diff --git`
+/// header or end of input. Returns the hunks and the index of the next
+/// unprocessed line.
+fn collect_hunks(lines: &[&str], start: usize) -> (Vec<DiffHunk>, usize) {
+    let mut hunks: Vec<DiffHunk> = Vec::new();
+    let mut i = start;
+
+    while i < lines.len() && !lines[i].starts_with("diff --git ") {
+        let l = lines[i];
+
+        if l.starts_with("@@") {
+            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(l) {
+                let mut patch_lines: Vec<String> = Vec::new();
+                i += 1;
+
+                while i < lines.len() {
+                    let pl = lines[i];
+                    if pl.starts_with("diff --git ") || pl.starts_with("@@") {
+                        break;
+                    }
+                    // Only keep actual patch lines (+, -, space, or \ no newline)
+                    if pl.starts_with('+')
+                        || pl.starts_with('-')
+                        || pl.starts_with(' ')
+                        || pl.starts_with('\\')
+                    {
+                        patch_lines.push(pl.to_string());
+                    }
+                    i += 1;
+                }
+
+                hunks.push(DiffHunk {
+                    old_start,
+                    old_count,
+                    new_start,
+                    new_count,
+                    patch_lines,
+                });
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    (hunks, i)
+}
+
+/// Determine the file status, display path, and optional old_path from diff
+/// header paths and extended header metadata.
+fn resolve_file_info(
+    a_path: &str,
+    b_path: &str,
+    meta: &FileMetadata,
+) -> (DiffFileStatus, String, Option<String>) {
+    let status = if meta.is_binary {
+        DiffFileStatus::Binary
+    } else if meta.is_new || meta.file_minus == "/dev/null" || meta.file_minus == "a//dev/null" {
+        DiffFileStatus::Added
+    } else if meta.is_deleted || meta.file_plus == "/dev/null" || meta.file_plus == "b//dev/null" {
+        DiffFileStatus::Deleted
+    } else if meta.is_renamed {
+        DiffFileStatus::Renamed
+    } else {
+        DiffFileStatus::Modified
+    };
+
+    let path = if status == DiffFileStatus::Deleted {
+        strip_ab_prefix(a_path)
+    } else {
+        strip_ab_prefix(b_path)
+    };
+
+    let old_path = if meta.is_renamed {
+        meta.rename_from
+            .clone()
+            .or_else(|| Some(strip_ab_prefix(a_path)))
+    } else {
+        None
+    };
+
+    (status, path, old_path)
+}
+
 /// Parse unified diff output into a list of per-file diffs.
 ///
 /// Handles standard `git diff --no-color` output including:
@@ -701,124 +843,31 @@ fn parse_unified_diff(output: &str) -> Vec<FileDiff> {
     let mut i = 0;
 
     while i < lines.len() {
-        let line = lines[i];
-
-        // Look for diff headers
-        if !line.starts_with("diff --git ") {
+        // Skip lines until a diff header
+        if !lines[i].starts_with("diff --git ") {
             i += 1;
             continue;
         }
 
-        // Parse diff header: "diff --git a/path b/path"
-        let (a_path, b_path) = parse_diff_git_header(line);
-
-        // Scan extended headers and --- / +++ lines
+        let (a_path, b_path) = parse_diff_git_header(lines[i]);
         i += 1;
-        let mut old_path: Option<String> = None;
-        let mut is_binary = false;
-        let mut is_new = false;
-        let mut is_deleted = false;
-        let mut is_renamed = false;
-        let mut rename_from: Option<String> = None;
-        let mut file_minus = String::new();
-        let mut file_plus = String::new();
 
-        while i < lines.len() && !lines[i].starts_with("diff --git ") {
-            let l = lines[i];
+        let (meta, next_i) = scan_extended_headers(&lines, i);
+        i = next_i;
 
-            if l.starts_with("new file mode") {
-                is_new = true;
-            } else if l.starts_with("deleted file mode") {
-                is_deleted = true;
-            } else if l.starts_with("rename from ") {
-                is_renamed = true;
-                rename_from = Some(l.strip_prefix("rename from ").unwrap_or("").to_string());
-            } else if l.starts_with("rename to ") {
-                is_renamed = true;
-            } else if l.starts_with("Binary files") && l.contains("differ") {
-                is_binary = true;
-            } else if l.starts_with("--- ") {
-                file_minus = l.strip_prefix("--- ").unwrap_or("").to_string();
-            } else if l.starts_with("+++ ") {
-                file_plus = l.strip_prefix("+++ ").unwrap_or("").to_string();
-            } else if l.starts_with("@@") {
-                // Hunk header — we've moved past extended headers, stop scanning
-                break;
-            }
+        let (status, path, old_path) = resolve_file_info(&a_path, &b_path, &meta);
 
-            i += 1;
-        }
-
-        // Determine file status and path
-        let status = if is_binary {
-            DiffFileStatus::Binary
-        } else if is_new || file_minus == "/dev/null" || file_minus == "a//dev/null" {
-            DiffFileStatus::Added
-        } else if is_deleted || file_plus == "/dev/null" || file_plus == "b//dev/null" {
-            DiffFileStatus::Deleted
-        } else if is_renamed {
-            DiffFileStatus::Renamed
-        } else {
-            DiffFileStatus::Modified
-        };
-
-        let path = if status == DiffFileStatus::Deleted {
-            strip_ab_prefix(&a_path)
-        } else {
-            strip_ab_prefix(&b_path)
-        };
-
-        if is_renamed {
-            old_path = rename_from.or_else(|| Some(strip_ab_prefix(&a_path)));
-        }
-
-        // Parse hunks
-        let mut hunks: Vec<DiffHunk> = Vec::new();
-
-        if !is_binary {
-            while i < lines.len() && !lines[i].starts_with("diff --git ") {
-                let l = lines[i];
-
-                if l.starts_with("@@") {
-                    if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(l)
-                    {
-                        let mut patch_lines: Vec<String> = Vec::new();
-                        i += 1;
-
-                        while i < lines.len() {
-                            let pl = lines[i];
-                            if pl.starts_with("diff --git ") || pl.starts_with("@@") {
-                                break;
-                            }
-                            // Only keep actual patch lines (+, -, space, or \ no newline)
-                            if pl.starts_with('+')
-                                || pl.starts_with('-')
-                                || pl.starts_with(' ')
-                                || pl.starts_with('\\')
-                            {
-                                patch_lines.push(pl.to_string());
-                            }
-                            i += 1;
-                        }
-
-                        hunks.push(DiffHunk {
-                            old_start,
-                            old_count,
-                            new_start,
-                            new_count,
-                            patch_lines,
-                        });
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-        } else {
+        let hunks = if meta.is_binary {
             // Skip remaining lines for binary files
             while i < lines.len() && !lines[i].starts_with("diff --git ") {
                 i += 1;
             }
-        }
+            Vec::new()
+        } else {
+            let (h, next_i) = collect_hunks(&lines, i);
+            i = next_i;
+            h
+        };
 
         files.push(FileDiff {
             path,
