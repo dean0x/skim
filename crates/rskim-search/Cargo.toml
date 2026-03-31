@@ -12,7 +12,6 @@ rskim-core = { version = "2.0.0", path = "../rskim-core" }
 tree-sitter = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 [lints.clippy]
 unwrap_used = "deny"
