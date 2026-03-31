@@ -116,31 +116,31 @@ fn print_help() {
 }
 
 fn print_diff_help() {
-    eprintln!("skim git diff \u{2014} AST-aware diff compression");
-    eprintln!();
-    eprintln!("USAGE:");
-    eprintln!("    skim git diff [OPTIONS] [<commit>..] [-- <path>...]");
-    eprintln!();
-    eprintln!("SKIM OPTIONS:");
-    eprintln!("    --mode <MODE>    Diff rendering mode:");
-    eprintln!("                       (default)    Changed functions with boundaries");
-    eprintln!("                       structure    + unchanged functions as signatures");
-    eprintln!("                       full         Entire files with change markers");
-    eprintln!("    --json           Machine-readable JSON output");
-    eprintln!("    --show-stats     Show token savings statistics");
-    eprintln!();
-    eprintln!("GIT OPTIONS:");
-    eprintln!("    --staged, --cached    Diff staged changes");
-    eprintln!("    --stat, --shortstat   Passthrough to git (no AST processing)");
-    eprintln!("    --name-only           Passthrough to git");
-    eprintln!();
-    eprintln!("EXAMPLES:");
-    eprintln!("    skim git diff                    Working tree changes");
-    eprintln!("    skim git diff --staged           Staged changes");
-    eprintln!("    skim git diff HEAD~3             Last 3 commits");
-    eprintln!("    skim git diff main..feature      Branch comparison");
-    eprintln!("    skim git diff --mode structure   With context signatures");
-    eprintln!("    skim git diff --json             JSON output");
+    println!("skim git diff \u{2014} AST-aware diff compression");
+    println!();
+    println!("USAGE:");
+    println!("    skim git diff [OPTIONS] [<commit>..] [-- <path>...]");
+    println!();
+    println!("SKIM OPTIONS:");
+    println!("    --mode <MODE>    Diff rendering mode:");
+    println!("                       (default)    Changed functions with boundaries");
+    println!("                       structure    + unchanged functions as signatures");
+    println!("                       full         Entire files with change markers");
+    println!("    --json           Machine-readable JSON output");
+    println!("    --show-stats     Show token savings statistics");
+    println!();
+    println!("GIT OPTIONS:");
+    println!("    --staged, --cached    Diff staged changes");
+    println!("    --stat, --shortstat   Passthrough to git (no AST processing)");
+    println!("    --name-only           Passthrough to git");
+    println!();
+    println!("EXAMPLES:");
+    println!("    skim git diff                    Working tree changes");
+    println!("    skim git diff --staged           Staged changes");
+    println!("    skim git diff HEAD~3             Last 3 commits");
+    println!("    skim git diff main..feature      Branch comparison");
+    println!("    skim git diff --mode structure   With context signatures");
+    println!("    skim git diff --json             JSON output");
 }
 
 // ============================================================================
@@ -594,6 +594,10 @@ fn extract_diff_mode(args: &[String]) -> anyhow::Result<(Vec<String>, DiffMode)>
             if let Some(val) = args.get(i + 1) {
                 mode = parse_diff_mode_value(val)?;
                 skip_next = true;
+            } else {
+                return Err(anyhow::anyhow!(
+                    "{arg} requires a value\nValid modes: structure, full (default: changed-only)"
+                ));
             }
             continue;
         }
@@ -1526,7 +1530,17 @@ fn run_diff(
         return Ok(ExitCode::SUCCESS);
     }
 
-    if user_has_flag(args, &["--stat", "--name-only", "--name-status", "--check"]) {
+    if user_has_flag(
+        args,
+        &[
+            "--stat",
+            "--shortstat",
+            "--numstat",
+            "--name-only",
+            "--name-status",
+            "--check",
+        ],
+    ) {
         return run_passthrough(global_flags, "diff", args, show_stats);
     }
 
@@ -1589,19 +1603,19 @@ fn run_diff(
 
     let result = DiffResult::new(diff_file_entries, rendered_output);
 
-    match output_format {
+    let result_str = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
             println!("{json}");
+            json
         }
         OutputFormat::Text => {
-            let result_str = result.to_string();
-            print!("{result_str}");
+            let s = result.to_string();
+            print!("{s}");
+            s
         }
-    }
-
-    let result_str = result.to_string();
+    };
 
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(raw_diff, &result_str);
@@ -2101,6 +2115,63 @@ mod tests {
             &["--check".to_string()],
             &["--stat", "--name-only", "--name-status", "--check"]
         ));
+    }
+
+    // ========================================================================
+    // --shortstat and --numstat passthrough for diff
+    // ========================================================================
+
+    #[test]
+    fn test_diff_passthrough_with_shortstat() {
+        assert!(user_has_flag(
+            &["--shortstat".to_string()],
+            &[
+                "--stat",
+                "--shortstat",
+                "--numstat",
+                "--name-only",
+                "--name-status",
+                "--check"
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_diff_passthrough_with_numstat() {
+        assert!(user_has_flag(
+            &["--numstat".to_string()],
+            &[
+                "--stat",
+                "--shortstat",
+                "--numstat",
+                "--name-only",
+                "--name-status",
+                "--check"
+            ]
+        ));
+    }
+
+    // ========================================================================
+    // --mode without value error (edge case)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_diff_mode_missing_value() {
+        let args: Vec<String> = vec!["--mode".into()];
+        let result = extract_diff_mode(&args);
+        assert!(result.is_err(), "expected error when --mode has no value");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("requires a value"),
+            "expected 'requires a value' in error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_diff_mode_short_flag_missing_value() {
+        let args: Vec<String> = vec!["-m".into()];
+        let result = extract_diff_mode(&args);
+        assert!(result.is_err(), "expected error when -m has no value");
     }
 
     // ========================================================================

@@ -22,6 +22,7 @@ mod session;
 mod stats;
 mod test;
 
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
@@ -96,6 +97,18 @@ pub(crate) fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
         .cloned()
         .collect();
     (filtered, is_json)
+}
+
+/// Merge stdout and stderr into a single string for fallback parsing.
+///
+/// Returns a `Cow::Borrowed` reference to stdout when stderr is empty
+/// (zero-copy fast path), or a `Cow::Owned` concatenation otherwise.
+pub(crate) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
+    if output.stderr.is_empty() {
+        Cow::Borrowed(&output.stdout)
+    } else {
+        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
+    }
 }
 
 /// Inject a flag before the `--` separator, or at the end if no separator exists.

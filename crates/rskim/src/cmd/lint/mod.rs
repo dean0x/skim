@@ -8,7 +8,6 @@ pub(crate) mod golangci;
 pub(crate) mod mypy;
 pub(crate) mod ruff;
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -143,17 +142,8 @@ pub(crate) fn run_linter(
     )
 }
 
-/// Combine stdout and stderr into a single string for regex fallback parsing.
-///
-/// Returns a borrowed reference to stdout when stderr is empty to avoid an
-/// unnecessary allocation.
-pub(crate) fn combine_stdout_stderr(output: &CommandOutput) -> Cow<'_, str> {
-    if output.stderr.is_empty() {
-        Cow::Borrowed(&output.stdout)
-    } else {
-        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
-    }
-}
+/// Re-export the shared `combine_output` under the name callers expect.
+pub(crate) use super::combine_output as combine_stdout_stderr;
 
 /// Group individual lint issues by rule into a `LintResult`.
 ///
@@ -194,6 +184,8 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use crate::output::canonical::{LintIssue, LintSeverity};
 
@@ -271,5 +263,4 @@ mod tests {
         assert_eq!(&*combined, "");
         assert!(matches!(combined, Cow::Borrowed(_)));
     }
-
 }

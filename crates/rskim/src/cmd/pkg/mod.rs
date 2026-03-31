@@ -8,7 +8,6 @@ mod npm;
 mod pip;
 mod pnpm;
 
-use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -75,17 +74,8 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Merge stdout and stderr into a single string.
-///
-/// Returns a `Cow::Borrowed` reference to stdout when stderr is empty
-/// (zero-copy fast path), or a `Cow::Owned` concatenation otherwise.
-pub(super) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
-    if output.stderr.is_empty() {
-        Cow::Borrowed(&output.stdout)
-    } else {
-        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
-    }
-}
+/// Re-export shared helper for child module use.
+pub(super) use super::combine_output;
 
 /// Configuration for a package subcommand invocation.
 ///
@@ -135,12 +125,35 @@ where
     )
 }
 
+fn print_help() {
+    println!("skim pkg <tool> [subcmd] [args...]");
+    println!();
+    println!("  Parse package manager output for AI context windows.");
+    println!();
+    println!("Available tools:");
+    for tool in KNOWN_TOOLS {
+        println!("  {tool}");
+    }
+    println!();
+    println!("Examples:");
+    println!("  skim pkg npm install              Run npm install");
+    println!("  skim pkg npm audit                Run npm audit");
+    println!("  skim pkg npm outdated             Run npm outdated");
+    println!("  skim pkg pip install flask        Run pip install flask");
+    println!("  skim pkg pip check                Run pip check");
+    println!("  skim pkg cargo audit              Run cargo audit");
+    println!("  skim pkg pnpm install             Run pnpm install");
+    println!("  npm install 2>&1 | skim pkg npm install  Pipe npm output");
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
 
     // ========================================================================
@@ -204,25 +217,4 @@ mod tests {
         assert!(matches!(combined, Cow::Owned(_)));
         assert_eq!(combined.as_ref(), "hello\nwarning");
     }
-}
-
-fn print_help() {
-    println!("skim pkg <tool> [subcmd] [args...]");
-    println!();
-    println!("  Parse package manager output for AI context windows.");
-    println!();
-    println!("Available tools:");
-    for tool in KNOWN_TOOLS {
-        println!("  {tool}");
-    }
-    println!();
-    println!("Examples:");
-    println!("  skim pkg npm install              Run npm install");
-    println!("  skim pkg npm audit                Run npm audit");
-    println!("  skim pkg npm outdated             Run npm outdated");
-    println!("  skim pkg pip install flask        Run pip install flask");
-    println!("  skim pkg pip check                Run pip check");
-    println!("  skim pkg cargo audit              Run cargo audit");
-    println!("  skim pkg pnpm install             Run pnpm install");
-    println!("  npm install 2>&1 | skim pkg npm install  Pipe npm output");
 }
