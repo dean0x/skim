@@ -19,8 +19,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use rskim_core::Language;
 
-use crate::cmd::user_has_flag;
-use crate::cmd::{extract_output_format, OutputFormat};
+use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffFileStatus, DiffResult, GitResult};
 use crate::runner::CommandRunner;
 
@@ -674,6 +673,18 @@ enum FileStatus {
     Binary,
 }
 
+impl std::fmt::Display for FileStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileStatus::Added => write!(f, "added"),
+            FileStatus::Modified => write!(f, "modified"),
+            FileStatus::Deleted => write!(f, "deleted"),
+            FileStatus::Renamed => write!(f, "renamed"),
+            FileStatus::Binary => write!(f, "binary"),
+        }
+    }
+}
+
 impl From<&FileStatus> for DiffFileStatus {
     fn from(status: &FileStatus) -> Self {
         match status {
@@ -895,6 +906,19 @@ fn strip_ab_prefix(path: &str) -> String {
     }
 }
 
+/// Extract the right-hand side of a range separator (`..` or `...`).
+///
+/// Returns `"HEAD"` when the right side is empty (e.g., `"main.."`).
+fn extract_range_right(arg: &str, separator: &str) -> Option<String> {
+    let pos = arg.find(separator)?;
+    let right = &arg[pos + separator.len()..];
+    Some(if right.is_empty() {
+        "HEAD".to_string()
+    } else {
+        right.to_string()
+    })
+}
+
 /// Run `git show <ref_spec>` and return stdout, or bail on failure.
 fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Result<String> {
     // Guard against argument injection: a ref_spec starting with `-` could be
@@ -931,24 +955,9 @@ fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyh
     // Check for commit range in args (e.g., "HEAD~2..HEAD" or "A...B").
     // Try three-dot first so `find("..")` doesn't accidentally match at the
     // wrong position inside a `...` range.
-    let range_commit = args.iter().find_map(|a| {
-        if let Some(pos) = a.find("...") {
-            let right = &a[pos + 3..];
-            Some(if right.is_empty() {
-                "HEAD".to_string()
-            } else {
-                right.to_string()
-            })
-        } else {
-            let pos = a.find("..")?;
-            let right = &a[pos + 2..];
-            Some(if right.is_empty() {
-                "HEAD".to_string()
-            } else {
-                right.to_string()
-            })
-        }
-    });
+    let range_commit = args
+        .iter()
+        .find_map(|a| extract_range_right(a, "...").or_else(|| extract_range_right(a, "..")));
 
     if let Some(commit) = range_commit {
         return git_show(global_flags, &format!("{commit}:{path}"));
@@ -1014,21 +1023,27 @@ fn build_changed_lines(hunks: &[DiffHunk]) -> BTreeSet<usize> {
     for hunk in hunks {
         let mut new_line = hunk.new_start;
         for patch_line in &hunk.patch_lines {
-            if patch_line.starts_with('+') {
-                changed_lines.insert(new_line);
-                new_line += 1;
-            } else if patch_line.starts_with('-') {
-                // Removed lines exist in old file — mark the current new-file
-                // position as a change boundary so the surrounding AST node is
-                // included.  Trailing deletions at EOF may push `new_line`
-                // beyond the actual file length; this is harmless because the
-                // downstream `changed_lines.range(node_start..=node_end)` check
-                // will never match an out-of-range value against a real node.
-                changed_lines.insert(new_line);
-            } else if patch_line.starts_with(' ') {
-                new_line += 1;
+            match patch_line.as_bytes().first() {
+                Some(b'+') => {
+                    changed_lines.insert(new_line);
+                    new_line += 1;
+                }
+                Some(b'-') => {
+                    // Removed lines exist in old file -- mark the current
+                    // new-file position as a change boundary so the
+                    // surrounding AST node is included. Trailing deletions
+                    // at EOF may push `new_line` beyond the actual file
+                    // length; this is harmless because the downstream
+                    // `changed_lines.range(node_start..=node_end)` check
+                    // will never match an out-of-range value against a
+                    // real node.
+                    changed_lines.insert(new_line);
+                }
+                Some(b' ') => {
+                    new_line += 1;
+                }
+                _ => {} // Skip lines starting with '\' or other
             }
-            // Skip lines starting with '\'
         }
     }
     changed_lines
@@ -1155,27 +1170,18 @@ fn render_diff_file(
 ) -> String {
     let mut output = String::new();
 
-    // File header
-    let status_label = match file_diff.status {
-        FileStatus::Added => "added",
-        FileStatus::Modified => "modified",
-        FileStatus::Deleted => "deleted",
-        FileStatus::Renamed => "renamed",
-        FileStatus::Binary => "binary",
-    };
-
-    // Renames with a known old path show "old -> new (renamed)"
+    // File header: renames show "old -> new (renamed)", others show "path (status)"
     if let (FileStatus::Renamed, Some(old)) = (&file_diff.status, &file_diff.old_path) {
         let _ = writeln!(
             output,
             "\u{2500}\u{2500} {} \u{2192} {} ({}) \u{2500}\u{2500}",
-            old, file_diff.path, status_label
+            old, file_diff.path, file_diff.status
         );
     } else {
         let _ = writeln!(
             output,
             "\u{2500}\u{2500} {} ({}) \u{2500}\u{2500}",
-            file_diff.path, status_label
+            file_diff.path, file_diff.status
         );
     }
 
@@ -1527,16 +1533,19 @@ fn render_node_with_hunks(
 
         // Output the hunk's patch lines
         for patch_line in &hunk.patch_lines {
-            if patch_line.starts_with('+') {
-                let _ = writeln!(output, "{patch_line}");
-                current_new_line += 1;
-            } else if patch_line.starts_with('-') {
-                let _ = writeln!(output, "{patch_line}");
-            } else if patch_line.starts_with(' ') {
-                let _ = writeln!(output, "{patch_line}");
-                current_new_line += 1;
-            } else if patch_line.starts_with('\\') {
-                let _ = writeln!(output, "{patch_line}");
+            match patch_line.as_bytes().first() {
+                Some(b'+') => {
+                    let _ = writeln!(output, "{patch_line}");
+                    current_new_line += 1;
+                }
+                Some(b' ') => {
+                    let _ = writeln!(output, "{patch_line}");
+                    current_new_line += 1;
+                }
+                Some(b'-' | b'\\') => {
+                    let _ = writeln!(output, "{patch_line}");
+                }
+                _ => {}
             }
         }
     }
@@ -3071,7 +3080,7 @@ mod tests {
         // The behavior is: when file_diffs is empty, run_diff writes
         // "No changes" to stderr (not stdout) and returns SUCCESS.
         // This test documents that empty input never reaches the rendering
-        // pipeline -- the empty check at line 1616-1618 catches it first.
+        // pipeline -- the `file_diffs.is_empty()` guard in run_diff catches it.
         let files_whitespace = parse_unified_diff("  \n\n  \n");
         assert!(
             files_whitespace.is_empty(),
