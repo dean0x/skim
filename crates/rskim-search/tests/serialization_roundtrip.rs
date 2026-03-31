@@ -241,6 +241,61 @@ fn test_file_table_serialized_is_just_paths() {
 }
 
 // ============================================================================
+// FileTable deserialization idempotency with unnormalized paths
+// ============================================================================
+
+/// Roundtrip a FileTable that was registered with unnormalized paths (e.g., "./src/main.rs").
+///
+/// The serialized form stores the normalized path. After deserialization, the ids
+/// map must also be keyed on the normalized path so that a subsequent register()
+/// call with the same unnormalized input returns the existing FileId rather than
+/// creating a duplicate entry.
+#[test]
+fn test_file_table_unnormalized_paths_idempotent_after_roundtrip() {
+    let mut table = FileTable::new();
+    let id_a = table.register(Path::new("./src/main.rs"));
+    let id_b = table.register(Path::new("./src/lib.rs"));
+    let id_c = table.register(Path::new("./tests/test.rs"));
+
+    // Paths normalize away the leading `./`
+    assert_eq!(table.lookup(id_a), Some(Path::new("src/main.rs")));
+    assert_eq!(table.len(), 3);
+
+    let json = serde_json::to_string(&table).expect("serialize failed");
+    let mut rt: FileTable = serde_json::from_str(&json).expect("deserialize failed");
+
+    assert_eq!(rt.len(), 3);
+    assert_eq!(rt.lookup(id_a), Some(Path::new("src/main.rs")));
+    assert_eq!(rt.lookup(id_b), Some(Path::new("src/lib.rs")));
+    assert_eq!(rt.lookup(id_c), Some(Path::new("tests/test.rs")));
+
+    // Registering the same unnormalized paths must return the existing IDs — no duplicates.
+    let re_a = rt.register(Path::new("./src/main.rs"));
+    let re_b = rt.register(Path::new("src/lib.rs")); // already-normalized form
+    let re_c = rt.register(Path::new("./tests/test.rs"));
+    assert_eq!(re_a, id_a, "unnormalized re-register must return existing id");
+    assert_eq!(re_b, id_b, "normalized re-register must return existing id");
+    assert_eq!(re_c, id_c, "unnormalized re-register must return existing id");
+    assert_eq!(rt.len(), 3, "no duplicate entries after re-registering unnormalized paths");
+}
+
+/// Serialized form of a FileTable registered with unnormalized paths must store
+/// the normalized paths, not the raw input.
+#[test]
+fn test_file_table_serialized_form_uses_normalized_paths() {
+    let mut table = FileTable::new();
+    table.register(Path::new("./src/main.rs"));
+    table.register(Path::new("a/b/../c.rs"));
+
+    let json = serde_json::to_string(&table).expect("serialize failed");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse failed");
+
+    let arr = parsed.as_array().expect("serialized form must be an array");
+    assert_eq!(arr[0], "src/main.rs", "leading ./ must be stripped");
+    assert_eq!(arr[1], "a/c.rs", ".. must be collapsed");
+}
+
+// ============================================================================
 // SearchError Display
 // ============================================================================
 

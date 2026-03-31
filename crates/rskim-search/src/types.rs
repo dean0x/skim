@@ -4,6 +4,11 @@
 //! Design principle: I/O-free types with explicit error handling.
 //! All types follow the rskim-core pattern: thiserror for errors, explicit derives.
 
+// FileTable uses usize↔u64 conversions that are infallible only on 64-bit targets.
+// Reject compilation on 32-bit to prevent silent truncation of FileId values.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("rskim-search requires a 64-bit target (usize must be at least 64 bits)");
+
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -299,17 +304,25 @@ impl Serialize for FileTable {
     }
 }
 
-// Custom Deserialize: reconstruct ids from paths
+// Custom Deserialize: reconstruct ids from paths, normalizing each path so that
+// deserialized state is consistent with state built via register(). Without
+// normalization, a serialized "./src/main.rs" would be treated as a new path
+// by subsequent register("src/main.rs") calls, breaking idempotency.
 impl<'de> Deserialize<'de> for FileTable {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
-        let paths = Vec::<PathBuf>::deserialize(deserializer)?;
-        let ids = paths
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.clone(), FileId::new(i as u64)))
-            .collect();
+        let raw_paths = Vec::<PathBuf>::deserialize(deserializer)?;
+        let mut paths = Vec::with_capacity(raw_paths.len());
+        let mut ids = HashMap::with_capacity(raw_paths.len());
+        for (i, p) in raw_paths.iter().enumerate() {
+            let normalized = Self::normalize(p);
+            // u64::try_from(i) is infallible on 64-bit (guarded by compile_error above)
+            #[allow(clippy::cast_possible_truncation)]
+            let id = FileId::new(i as u64);
+            ids.insert(normalized.clone(), id);
+            paths.push(normalized);
+        }
         Ok(Self { paths, ids })
     }
 }
@@ -333,9 +346,13 @@ impl FileTable {
         if let Some(&id) = self.ids.get(&normalized) {
             return id;
         }
+        // paths.len() → u64 is infallible on 64-bit (guarded by compile_error above);
+        // usize is always ≤ u64 on 64-bit targets.
+        #[allow(clippy::cast_possible_truncation)]
         let id = FileId::new(self.paths.len() as u64);
-        self.paths.push(normalized.clone());
-        self.ids.insert(normalized, id);
+        // Clone into ids first, then move the original into paths — avoids a second clone.
+        self.ids.insert(normalized.clone(), id);
+        self.paths.push(normalized);
         id
     }
 
@@ -343,7 +360,10 @@ impl FileTable {
     ///
     /// Returns `None` for IDs that were never registered with this table.
     pub fn lookup(&self, id: FileId) -> Option<&Path> {
-        self.paths.get(id.as_u64() as usize).map(PathBuf::as_path)
+        // usize::try_from is infallible on 64-bit targets (guarded by compile_error above),
+        // but using try_from makes the conversion explicit and safe.
+        let idx = usize::try_from(id.as_u64()).ok()?;
+        self.paths.get(idx).map(PathBuf::as_path)
     }
 
     /// Return the number of registered files.
@@ -363,6 +383,15 @@ impl FileTable {
     /// - `..` components are collapsed by removing the preceding component.
     /// - Absolute paths are kept as-is.
     fn normalize(path: &Path) -> PathBuf {
+        // Fast path: if the path contains no `.` or `..` components, it is already
+        // normalized — return a cheap clone without allocating the components Vec.
+        let needs_normalization = path
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir));
+        if !needs_normalization {
+            return path.to_path_buf();
+        }
+
         let mut components: Vec<Component<'_>> = Vec::new();
         for component in path.components() {
             match component {
