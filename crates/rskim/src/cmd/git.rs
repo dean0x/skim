@@ -10,7 +10,7 @@
 //! and renders changed nodes with full function boundaries and standard
 //! `+`/`-` markers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1019,8 +1019,8 @@ struct ParentContext {
 /// Build the set of changed line numbers from diff hunks.
 ///
 /// Returns 1-indexed line numbers using new-file positions.
-fn build_changed_lines(hunks: &[DiffHunk]) -> HashSet<usize> {
-    let mut changed_lines: HashSet<usize> = HashSet::new();
+fn build_changed_lines(hunks: &[DiffHunk]) -> BTreeSet<usize> {
+    let mut changed_lines: BTreeSet<usize> = BTreeSet::new();
     for hunk in hunks {
         let mut new_line = hunk.new_start;
         for patch_line in &hunk.patch_lines {
@@ -1086,8 +1086,9 @@ fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHunk]) -> Vec
         let node_end = child.end_position().row + 1;
 
         let overlaps = changed_lines
-            .iter()
-            .any(|&line| line >= node_start && line <= node_end);
+            .range(node_start..=node_end)
+            .next()
+            .is_some();
 
         if !overlaps {
             continue;
@@ -1103,8 +1104,9 @@ fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHunk]) -> Vec
                 let gc_end = grandchild.end_position().row + 1;
 
                 let gc_overlaps = changed_lines
-                    .iter()
-                    .any(|&line| line >= gc_start && line <= gc_end);
+                    .range(gc_start..=gc_end)
+                    .next()
+                    .is_some();
 
                 if gc_overlaps {
                     found_child = true;
@@ -1611,7 +1613,8 @@ fn run_diff(
         return Ok(map_exit_code(output.exit_code));
     }
 
-    let raw_diff = &output.stdout;
+    let duration = output.duration;
+    let raw_diff = output.stdout;
 
     // Handle empty diff
     if raw_diff.trim().is_empty() {
@@ -1620,7 +1623,7 @@ fn run_diff(
     }
 
     // Parse unified diff into per-file structures
-    let file_diffs = parse_unified_diff(raw_diff);
+    let file_diffs = parse_unified_diff(&raw_diff);
 
     if file_diffs.is_empty() {
         eprintln!("No changes");
@@ -1662,18 +1665,19 @@ fn run_diff(
     };
 
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(raw_diff, &result_str);
+        let (orig, comp) = crate::process::count_token_pair(&raw_diff, &result_str);
         crate::process::report_token_stats(orig, comp, "");
     }
 
     // Record analytics (fire-and-forget, non-blocking).
+    // Move `raw_diff` into the call to avoid cloning the entire diff string.
     if crate::analytics::is_analytics_enabled() {
         crate::analytics::try_record_command(
-            raw_diff.to_string(),
+            raw_diff,
             result_str,
             format!("skim git diff {}", args.join(" ")),
             crate::analytics::CommandType::Diff,
-            output.duration,
+            duration,
             None,
         );
     }
