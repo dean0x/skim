@@ -84,9 +84,7 @@ pub(super) fn command() -> clap::Command {
 }
 
 fn print_help() {
-    command()
-        .name("skim search")
-        .print_help()
-        .unwrap_or(());
+    // Delegate to clap's command definition — single source of truth for flags.
+    let _ = command().name("skim search").print_help();
     println!();
 }
