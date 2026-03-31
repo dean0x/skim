@@ -20,6 +20,7 @@ use regex::Regex;
 use rskim_core::Language;
 
 use crate::cmd::user_has_flag;
+use crate::cmd::OutputFormat;
 use crate::output::canonical::{DiffFileEntry, DiffFileStatus, DiffResult, GitResult};
 use crate::runner::CommandRunner;
 
@@ -100,11 +101,46 @@ fn print_help() {
     println!("  --git-dir    Set the path to the repository");
     println!("  --work-tree  Set the path to the working tree");
     println!();
+    println!("Flags (all subcommands):");
+    println!("  --json           Machine-readable JSON output");
+    println!("  --show-stats     Show token savings statistics");
+    println!();
     println!("Examples:");
     println!("  skim git status");
-    println!("  skim git -C /path/to/repo status");
+    println!("  skim git status --json");
     println!("  skim git diff --cached");
+    println!("  skim git diff --mode structure");
+    println!("  skim git diff main..feature --json");
     println!("  skim git log -n 5");
+    println!("  skim git diff --help                   Diff-specific options");
+}
+
+fn print_diff_help() {
+    eprintln!("skim git diff \u{2014} AST-aware diff compression");
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("    skim git diff [OPTIONS] [<commit>..] [-- <path>...]");
+    eprintln!();
+    eprintln!("SKIM OPTIONS:");
+    eprintln!("    --mode <MODE>    Diff rendering mode:");
+    eprintln!("                       (default)    Changed functions with boundaries");
+    eprintln!("                       structure    + unchanged functions as signatures");
+    eprintln!("                       full         Entire files with change markers");
+    eprintln!("    --json           Machine-readable JSON output");
+    eprintln!("    --show-stats     Show token savings statistics");
+    eprintln!();
+    eprintln!("GIT OPTIONS:");
+    eprintln!("    --staged, --cached    Diff staged changes");
+    eprintln!("    --stat, --shortstat   Passthrough to git (no AST processing)");
+    eprintln!("    --name-only           Passthrough to git");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("    skim git diff                    Working tree changes");
+    eprintln!("    skim git diff --staged           Staged changes");
+    eprintln!("    skim git diff HEAD~3             Last 3 commits");
+    eprintln!("    skim git diff main..feature      Branch comparison");
+    eprintln!("    skim git diff --mode structure   With context signatures");
+    eprintln!("    skim git diff --json             JSON output");
 }
 
 // ============================================================================
@@ -237,6 +273,7 @@ fn run_passthrough(
 fn run_parsed_command<F>(
     subcmd_args: &[String],
     show_stats: bool,
+    output_format: OutputFormat,
     parser: F,
 ) -> anyhow::Result<ExitCode>
 where
@@ -258,8 +295,19 @@ where
     }
 
     let result = parser(&output.stdout);
-    let result_str = result.to_string();
-    println!("{result_str}");
+    let result_str = match output_format {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
+            println!("{json}");
+            json
+        }
+        OutputFormat::Text => {
+            let s = result.to_string();
+            println!("{s}");
+            s
+        }
+    };
 
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&output.stdout, &result_str);
@@ -282,6 +330,20 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
+/// Extract `--json` flag from args and return the corresponding `OutputFormat`.
+///
+/// Convenience wrapper that combines `extract_json_flag` with `OutputFormat`
+/// conversion, keeping the git subcommand handlers consistent.
+fn extract_output_format(args: &[String]) -> (Vec<String>, OutputFormat) {
+    let (filtered, is_json) = super::extract_json_flag(args);
+    let fmt = if is_json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    };
+    (filtered, fmt)
+}
+
 // ============================================================================
 // Status
 // ============================================================================
@@ -299,15 +361,17 @@ fn run_status(
         return run_passthrough(global_flags, "status", args, show_stats);
     }
 
+    let (filtered_args, output_format) = extract_output_format(args);
+
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend([
         "status".to_string(),
         "--porcelain=v2".to_string(),
         "--branch".to_string(),
     ]);
-    full_args.extend_from_slice(args);
+    full_args.extend_from_slice(&filtered_args);
 
-    run_parsed_command(&full_args, show_stats, parse_status)
+    run_parsed_command(&full_args, show_stats, output_format, parse_status)
 }
 
 /// Parse porcelain v2 status output into a compressed GitResult.
@@ -513,7 +577,9 @@ enum DiffMode {
 ///
 /// Returns `(filtered_args, DiffMode)` where `filtered_args` has the mode
 /// flag removed so it is not passed to git.
-fn extract_diff_mode(args: &[String]) -> (Vec<String>, DiffMode) {
+///
+/// Returns an error if the mode value is not one of the recognized values.
+fn extract_diff_mode(args: &[String]) -> anyhow::Result<(Vec<String>, DiffMode)> {
     let mut filtered: Vec<String> = Vec::with_capacity(args.len());
     let mut mode = DiffMode::Default;
     let mut skip_next = false;
@@ -526,48 +592,39 @@ fn extract_diff_mode(args: &[String]) -> (Vec<String>, DiffMode) {
 
         if arg == "--mode" || arg == "-m" {
             if let Some(val) = args.get(i + 1) {
-                mode = parse_diff_mode_value(val);
+                mode = parse_diff_mode_value(val)?;
                 skip_next = true;
             }
             continue;
         }
 
         if let Some(val) = arg.strip_prefix("--mode=") {
-            mode = parse_diff_mode_value(val);
+            mode = parse_diff_mode_value(val)?;
             continue;
         }
 
         if let Some(val) = arg.strip_prefix("-m=") {
-            mode = parse_diff_mode_value(val);
+            mode = parse_diff_mode_value(val)?;
             continue;
         }
 
         filtered.push(arg.clone());
     }
 
-    (filtered, mode)
+    Ok((filtered, mode))
 }
 
 /// Parse a mode value string into a DiffMode.
-fn parse_diff_mode_value(val: &str) -> DiffMode {
-    match val {
-        "structure" | "signatures" => DiffMode::Structure,
-        "full" => DiffMode::Full,
-        _ => DiffMode::Default,
-    }
-}
-
-/// Extract `--json` flag from args.
 ///
-/// Returns `(filtered_args, is_json)`.
-fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
-    let is_json = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--json")
-        .cloned()
-        .collect();
-    (filtered, is_json)
+/// Returns an error for unrecognized mode values with a helpful message.
+fn parse_diff_mode_value(val: &str) -> Result<DiffMode, anyhow::Error> {
+    match val {
+        "structure" | "signatures" => Ok(DiffMode::Structure),
+        "full" => Ok(DiffMode::Full),
+        _ => Err(anyhow::anyhow!(
+            "unknown diff mode: '{val}'\nValid modes: structure, full (default: changed-only)"
+        )),
+    }
 }
 
 /// Resolve the working tree root from global flags.
@@ -1464,13 +1521,18 @@ fn run_diff(
     args: &[String],
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_diff_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if user_has_flag(args, &["--stat", "--name-only", "--name-status", "--check"]) {
         return run_passthrough(global_flags, "diff", args, show_stats);
     }
 
     // Extract skim-specific flags before passing args to git
-    let (args_no_mode, diff_mode) = extract_diff_mode(args);
-    let (git_args, is_json) = extract_json_flag(&args_no_mode);
+    let (args_no_mode, diff_mode) = extract_diff_mode(args)?;
+    let (git_args, output_format) = extract_output_format(&args_no_mode);
 
     // Run `git diff --no-color [user args]` to get unified diff output
     let mut full_args: Vec<String> = global_flags.to_vec();
@@ -1527,13 +1589,16 @@ fn run_diff(
 
     let result = DiffResult::new(diff_file_entries, rendered_output);
 
-    if is_json {
-        let json = serde_json::to_string_pretty(&result)
-            .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-        println!("{json}");
-    } else {
-        let result_str = result.to_string();
-        print!("{result_str}");
+    match output_format {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
+            println!("{json}");
+        }
+        OutputFormat::Text => {
+            let result_str = result.to_string();
+            print!("{result_str}");
+        }
     }
 
     let result_str = result.to_string();
@@ -1611,16 +1676,18 @@ fn run_log(global_flags: &[String], args: &[String], show_stats: bool) -> anyhow
         return run_passthrough(global_flags, "log", args, show_stats);
     }
 
+    let (filtered_args, output_format) = extract_output_format(args);
+
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["log".to_string(), "--format=%h %s (%cr) <%an>".to_string()]);
 
-    if !has_limit_flag(args) {
+    if !has_limit_flag(&filtered_args) {
         full_args.extend(["-n".to_string(), "20".to_string()]);
     }
 
-    full_args.extend_from_slice(args);
+    full_args.extend_from_slice(&filtered_args);
 
-    run_parsed_command(&full_args, show_stats, parse_log)
+    run_parsed_command(&full_args, show_stats, output_format, parse_log)
 }
 
 /// Parse formatted `git log` output into a compressed GitResult.
@@ -2530,7 +2597,7 @@ mod tests {
     #[test]
     fn test_parse_diff_mode_extraction_structure() {
         let args: Vec<String> = vec!["--cached".into(), "--mode".into(), "structure".into()];
-        let (filtered, mode) = extract_diff_mode(&args);
+        let (filtered, mode) = extract_diff_mode(&args).unwrap();
         assert_eq!(mode, DiffMode::Structure);
         assert_eq!(filtered, vec!["--cached"]);
     }
@@ -2538,7 +2605,7 @@ mod tests {
     #[test]
     fn test_parse_diff_mode_extraction_full() {
         let args: Vec<String> = vec!["--mode=full".into(), "--cached".into()];
-        let (filtered, mode) = extract_diff_mode(&args);
+        let (filtered, mode) = extract_diff_mode(&args).unwrap();
         assert_eq!(mode, DiffMode::Full);
         assert_eq!(filtered, vec!["--cached"]);
     }
@@ -2546,7 +2613,7 @@ mod tests {
     #[test]
     fn test_parse_diff_mode_extraction_default() {
         let args: Vec<String> = vec!["--cached".into()];
-        let (filtered, mode) = extract_diff_mode(&args);
+        let (filtered, mode) = extract_diff_mode(&args).unwrap();
         assert_eq!(mode, DiffMode::Default);
         assert_eq!(filtered, vec!["--cached"]);
     }
@@ -2554,7 +2621,7 @@ mod tests {
     #[test]
     fn test_parse_diff_mode_extraction_short_flag() {
         let args: Vec<String> = vec!["-m".into(), "structure".into()];
-        let (filtered, mode) = extract_diff_mode(&args);
+        let (filtered, mode) = extract_diff_mode(&args).unwrap();
         assert_eq!(mode, DiffMode::Structure);
         assert!(filtered.is_empty());
     }
@@ -2562,28 +2629,13 @@ mod tests {
     #[test]
     fn test_parse_diff_mode_extraction_unknown_mode() {
         let args: Vec<String> = vec!["--mode".into(), "unknown".into()];
-        let (_, mode) = extract_diff_mode(&args);
-        assert_eq!(mode, DiffMode::Default);
-    }
-
-    // ========================================================================
-    // JSON flag extraction tests (Gap 2)
-    // ========================================================================
-
-    #[test]
-    fn test_extract_json_flag_present() {
-        let args: Vec<String> = vec!["--json".into(), "--cached".into()];
-        let (filtered, is_json) = extract_json_flag(&args);
-        assert!(is_json);
-        assert_eq!(filtered, vec!["--cached"]);
-    }
-
-    #[test]
-    fn test_extract_json_flag_absent() {
-        let args: Vec<String> = vec!["--cached".into()];
-        let (filtered, is_json) = extract_json_flag(&args);
-        assert!(!is_json);
-        assert_eq!(filtered, vec!["--cached"]);
+        let result = extract_diff_mode(&args);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unknown diff mode"),
+            "expected 'unknown diff mode' in error, got: {err_msg}"
+        );
     }
 
     // ========================================================================

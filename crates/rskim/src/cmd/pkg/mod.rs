@@ -48,7 +48,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     }
 
     let (filtered_args, show_stats) = crate::cmd::extract_show_stats(args);
-    let (json_args, json_output) = extract_json_flag(&filtered_args);
+    let (json_args, json_output) = crate::cmd::extract_json_flag(&filtered_args);
 
     let Some((tool_name, tool_args)) = json_args.split_first() else {
         print_help();
@@ -73,18 +73,6 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::FAILURE)
         }
     }
-}
-
-/// Extract the `--json` flag from args, returning filtered args and whether
-/// the flag was present.
-fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
-    let json_output = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--json")
-        .cloned()
-        .collect();
-    (filtered, json_output)
 }
 
 /// Merge stdout and stderr into a single string.
@@ -185,26 +173,6 @@ mod tests {
         let input = "hello\0world\ttab\nnewline";
         let sanitized = sanitize_for_display(input);
         assert_eq!(sanitized, "hello?world?tab?newline");
-    }
-
-    // ========================================================================
-    // extract_json_flag
-    // ========================================================================
-
-    #[test]
-    fn test_extract_json_flag_present() {
-        let args: Vec<String> = vec!["npm".into(), "--json".into(), "install".into()];
-        let (filtered, found) = extract_json_flag(&args);
-        assert!(found);
-        assert_eq!(filtered, vec!["npm".to_string(), "install".to_string()]);
-    }
-
-    #[test]
-    fn test_extract_json_flag_absent() {
-        let args: Vec<String> = vec!["npm".into(), "install".into()];
-        let (filtered, found) = extract_json_flag(&args);
-        assert!(!found);
-        assert_eq!(filtered, vec!["npm".to_string(), "install".to_string()]);
     }
 
     // ========================================================================

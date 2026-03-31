@@ -83,6 +83,21 @@ pub(crate) fn extract_show_stats(args: &[String]) -> (Vec<String>, bool) {
     (filtered, show_stats)
 }
 
+/// Extract the `--json` flag from args, returning filtered args and whether
+/// the flag was present.
+///
+/// This centralises the pattern that was previously copy-pasted across git,
+/// lint, and pkg subcommand entry points.
+pub(crate) fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
+    let is_json = args.iter().any(|a| a == "--json");
+    let filtered: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--json")
+        .cloned()
+        .collect();
+    (filtered, is_json)
+}
+
 /// Inject a flag before the `--` separator, or at the end if no separator exists.
 ///
 /// This ensures injected flags (like `--message-format=json`) appear in the
@@ -315,5 +330,30 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "test" => test::run(args),
         // Unreachable: is_known_subcommand guard above rejects unknown names
         _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_json_flag_present() {
+        let args: Vec<String> = vec!["--json".into(), "--cached".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_extract_json_flag_absent() {
+        let args: Vec<String> = vec!["--cached".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(filtered, vec!["--cached"]);
     }
 }

@@ -34,7 +34,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let (filtered_args, show_stats) = extract_show_stats(args);
 
     // Extract --json flag
-    let (filtered_args, json_output) = extract_json_flag(&filtered_args);
+    let (filtered_args, json_output) = super::extract_json_flag(&filtered_args);
 
     let Some((linter_name, linter_args)) = filtered_args.split_first() else {
         print_help();
@@ -80,17 +80,6 @@ fn print_help() {
     println!("  skim lint mypy src/            Run mypy");
     println!("  skim lint golangci run ./...   Run golangci-lint");
     println!("  eslint . 2>&1 | skim lint eslint  Pipe eslint output");
-}
-
-/// Extract `--json` flag from args, returning (filtered_args, json_output).
-fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
-    let json_output = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--json")
-        .cloned()
-        .collect();
-    (filtered, json_output)
 }
 
 // ============================================================================
@@ -283,19 +272,4 @@ mod tests {
         assert!(matches!(combined, Cow::Borrowed(_)));
     }
 
-    #[test]
-    fn test_extract_json_flag_present() {
-        let args = vec!["--json".to_string(), "eslint".to_string(), ".".to_string()];
-        let (filtered, json_output) = extract_json_flag(&args);
-        assert!(json_output);
-        assert_eq!(filtered, vec!["eslint".to_string(), ".".to_string()]);
-    }
-
-    #[test]
-    fn test_extract_json_flag_absent() {
-        let args = vec!["eslint".to_string(), ".".to_string()];
-        let (filtered, json_output) = extract_json_flag(&args);
-        assert!(!json_output);
-        assert_eq!(filtered, vec!["eslint".to_string(), ".".to_string()]);
-    }
 }
