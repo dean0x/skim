@@ -857,13 +857,13 @@ fn parse_diff_git_header(line: &str) -> (String, String) {
     let rest = line.strip_prefix("diff --git ").unwrap_or(line);
 
     // Find the boundary between a/path and b/path.
-    // We look for " b/" as the separator, but need to handle cases where
-    // the path itself contains " b/".
-    if let Some(pos) = rest.find(" b/") {
+    // We use rfind so that paths containing " b/" in a directory name
+    // are split at the *last* occurrence (which is the real separator).
+    if let Some(pos) = rest.rfind(" b/") {
         let a_part = &rest[..pos];
         let b_part = &rest[pos + 1..];
         (a_part.to_string(), b_part.to_string())
-    } else if let Some(pos) = rest.find(" b\\") {
+    } else if let Some(pos) = rest.rfind(" b\\") {
         let a_part = &rest[..pos];
         let b_part = &rest[pos + 1..];
         (a_part.to_string(), b_part.to_string())
@@ -1014,8 +1014,12 @@ fn build_changed_lines(hunks: &[DiffHunk]) -> BTreeSet<usize> {
                 changed_lines.insert(new_line);
                 new_line += 1;
             } else if patch_line.starts_with('-') {
-                // Removed lines exist in old file, mark the current position
-                // in the new file as a change boundary
+                // Removed lines exist in old file — mark the current new-file
+                // position as a change boundary so the surrounding AST node is
+                // included.  Trailing deletions at EOF may push `new_line`
+                // beyond the actual file length; this is harmless because the
+                // downstream `changed_lines.range(node_start..=node_end)` check
+                // will never match an out-of-range value against a real node.
                 changed_lines.insert(new_line);
             } else if patch_line.starts_with(' ') {
                 new_line += 1;
@@ -1215,7 +1219,13 @@ fn try_ast_render(
         return None;
     }
 
-    let source = get_file_source(&file_diff.path, global_flags, args).ok()?;
+    let source = match get_file_source(&file_diff.path, global_flags, args) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skim: AST fallback for {}: {e}", file_diff.path);
+            return None;
+        }
+    };
 
     // Skip AST for files > 100KB
     if source.len() > MAX_AST_FILE_SIZE {
