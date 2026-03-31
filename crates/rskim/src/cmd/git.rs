@@ -20,7 +20,7 @@ use regex::Regex;
 use rskim_core::Language;
 
 use crate::cmd::user_has_flag;
-use crate::cmd::OutputFormat;
+use crate::cmd::{extract_output_format, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffFileStatus, DiffResult, GitResult};
 use crate::runner::CommandRunner;
 
@@ -328,20 +328,6 @@ where
     }
 
     Ok(ExitCode::SUCCESS)
-}
-
-/// Extract `--json` flag from args and return the corresponding `OutputFormat`.
-///
-/// Convenience wrapper that combines `extract_json_flag` with `OutputFormat`
-/// conversion, keeping the git subcommand handlers consistent.
-fn extract_output_format(args: &[String]) -> (Vec<String>, OutputFormat) {
-    let (filtered, is_json) = super::extract_json_flag(args);
-    let fmt = if is_json {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Text
-    };
-    (filtered, fmt)
 }
 
 // ============================================================================
@@ -1676,7 +1662,7 @@ fn run_diff(
             raw_diff,
             result_str,
             format!("skim git diff {}", args.join(" ")),
-            crate::analytics::CommandType::Diff,
+            crate::analytics::CommandType::Git,
             duration,
             None,
         );

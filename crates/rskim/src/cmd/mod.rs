@@ -99,6 +99,20 @@ pub(crate) fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
     (filtered, is_json)
 }
 
+/// Extract `--json` flag from args and return the corresponding [`OutputFormat`].
+///
+/// Convenience wrapper that combines [`extract_json_flag`] with `OutputFormat`
+/// conversion, keeping subcommand handlers consistent.
+pub(crate) fn extract_output_format(args: &[String]) -> (Vec<String>, OutputFormat) {
+    let (filtered, is_json) = extract_json_flag(args);
+    let fmt = if is_json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    };
+    (filtered, fmt)
+}
+
 /// Merge stdout and stderr into a single string for fallback parsing.
 ///
 /// Returns a `Cow::Borrowed` reference to stdout when stderr is empty
