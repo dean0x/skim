@@ -84,6 +84,9 @@ pub(super) fn command() -> clap::Command {
 }
 
 fn print_help() {
-    command().print_help().unwrap_or(());
+    command()
+        .name("skim search")
+        .print_help()
+        .unwrap_or(());
     println!();
 }
