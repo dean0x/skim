@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rskim-core = { version = "2.1.0", path = "../rskim-core" }
+rskim-search = { version = "2.1.0", path = "../rskim-search" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 globset = { workspace = true }

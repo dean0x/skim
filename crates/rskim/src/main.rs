@@ -60,6 +60,8 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--session"
             | "--agent"
             | "--format"
+            | "--ast"
+            | "--limit"
     )
 }
 
@@ -195,6 +197,7 @@ SUBCOMMANDS:\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns and generate correction rules\n  \
     rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
+    search [QUERY]                           Search code using the 3-layer index\n  \
     stats [--since N] [--format json]        Show token analytics dashboard\n  \
     test                                     Run test with output parsing\n\n\
 For more info: https://github.com/dean0x/skim")]
@@ -680,6 +683,8 @@ mod tests {
         "--session",
         "--agent",
         "--format",
+        "--ast",
+        "--limit",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`

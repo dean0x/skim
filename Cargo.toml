@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rskim-core",
+    "crates/rskim-search",
     "crates/rskim",
 ]
 resolver = "2"
