@@ -1,7 +1,5 @@
 //! Type definitions for the AST-aware diff pipeline.
 
-use rskim_core::Language;
-
 use super::DiffMode;
 use crate::output::canonical::DiffFileStatus;
 
@@ -73,12 +71,12 @@ pub(super) struct ParentContext {
 /// Shared context for mode-aware rendering functions.
 ///
 /// Groups the parameters that are threaded through the rendering call chain
-/// to stay within clippy's 7-argument limit.
+/// to stay within clippy's 7-argument limit. The tree-sitter `Parser` is
+/// passed separately as `&mut` (cannot be shared via an immutable context).
 pub(super) struct ModeRenderContext<'a> {
     pub changed_ranges: &'a [ChangedNodeRange],
     pub hunks: &'a [DiffHunk<'a>],
     pub source_lines: &'a [&'a str],
     pub source: &'a str,
-    pub lang: Language,
     pub diff_mode: DiffMode,
 }

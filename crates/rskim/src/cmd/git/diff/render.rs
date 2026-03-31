@@ -84,6 +84,9 @@ pub(super) fn render_diff_file(
 /// Returns `Some(rendered)` on success, `None` when the file cannot be
 /// processed via tree-sitter (unsupported language, file too large, parse
 /// failure, or no overlapping AST nodes).
+///
+/// Accepts an external `parser` to avoid re-creating a tree-sitter Parser
+/// per file (parser reuse across calls for the same language).
 fn try_ast_render(
     file_diff: &FileDiff<'_>,
     global_flags: &[String],
@@ -127,10 +130,9 @@ fn try_ast_render(
             hunks: &file_diff.hunks,
             source_lines: &source_lines,
             source: &source,
-            lang,
             diff_mode,
         };
-        render_with_unchanged_context(&mut output, &tree, &ctx);
+        render_with_unchanged_context(&mut output, &tree, &ctx, &mut parser);
     } else {
         render_changed_only(
             &mut output,
@@ -196,10 +198,14 @@ fn render_changed_only(
 /// Walks all top-level AST nodes. Changed nodes get full patch rendering;
 /// unchanged nodes are rendered as signatures (structure mode) or in full
 /// (full mode).
+///
+/// `parser` is threaded through for reuse by `render_unchanged_node` in
+/// structure mode, avoiding per-node parser re-creation.
 fn render_with_unchanged_context(
     output: &mut String,
     tree: &tree_sitter::Tree,
     ctx: &ModeRenderContext<'_>,
+    parser: &mut rskim_core::Parser,
 ) {
     let root = tree.root_node();
     let mut cursor = root.walk();
@@ -221,7 +227,7 @@ fn render_with_unchanged_context(
             // This node contains changes — render with full patch detail.
             // If it's a container, render parent header + changed children + context children.
             if is_container_node(&child) {
-                render_container_with_mode(output, &child, ctx);
+                render_container_with_mode(output, &child, ctx, parser);
             } else {
                 // Non-container changed node: render with patch
                 render_node_with_hunks(output, node_start, node_end, ctx.hunks, ctx.source_lines);
@@ -233,8 +239,8 @@ fn render_with_unchanged_context(
                 &child,
                 ctx.source_lines,
                 ctx.source,
-                ctx.lang,
                 ctx.diff_mode,
+                parser,
             );
         }
     }
@@ -245,6 +251,7 @@ fn render_container_with_mode(
     output: &mut String,
     node: &tree_sitter::Node<'_>,
     ctx: &ModeRenderContext<'_>,
+    parser: &mut rskim_core::Parser,
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
@@ -281,8 +288,8 @@ fn render_container_with_mode(
                 &child,
                 ctx.source_lines,
                 ctx.source,
-                ctx.lang,
                 ctx.diff_mode,
+                parser,
             );
         }
     }
@@ -296,13 +303,16 @@ fn render_container_with_mode(
 }
 
 /// Render an unchanged node at the appropriate mode level.
+///
+/// In structure mode, reuses the provided `parser` for transformation
+/// instead of creating a new parser per node.
 fn render_unchanged_node(
     output: &mut String,
     node: &tree_sitter::Node<'_>,
     source_lines: &[&str],
     source: &str,
-    lang: Language,
     diff_mode: DiffMode,
+    parser: &mut rskim_core::Parser,
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
@@ -320,9 +330,9 @@ fn render_unchanged_node(
             // Show unchanged nodes as structure (signatures)
             let node_text = node.utf8_text(source.as_bytes()).unwrap_or("");
 
-            // Try to transform the node text at structure level
+            // Transform using the reused parser (avoids per-node parser creation)
             let config = rskim_core::TransformConfig::with_mode(rskim_core::Mode::Structure);
-            match rskim_core::transform_with_config(node_text, lang, &config) {
+            match parser.transform(node_text, &config) {
                 Ok(transformed) => {
                     for line in transformed.lines() {
                         let _ = writeln!(output, " {line}");

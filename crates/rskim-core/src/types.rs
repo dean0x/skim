@@ -666,6 +666,18 @@ impl Parser {
     pub fn language(&self) -> Language {
         self.language
     }
+
+    /// Transform source reusing this parser (avoids parser re-creation).
+    ///
+    /// Only works for tree-sitter languages. For non-tree-sitter languages
+    /// (JSON, YAML, TOML), use [`transform_with_config`](crate::transform_with_config) directly.
+    ///
+    /// # Errors
+    /// Returns `SkimError::ParseError` if parsing fails.
+    pub fn transform(&mut self, source: &str, config: &TransformConfig) -> Result<String> {
+        let tree = self.parse(source)?;
+        crate::transform::transform_tree(source, &tree, self.language, config)
+    }
 }
 
 // ============================================================================
@@ -858,6 +870,18 @@ mod tests {
                 mode
             );
         }
+    }
+
+    #[test]
+    fn test_parser_transform_reuse() {
+        let mut parser = Parser::new(Language::Rust).unwrap();
+        let source = "fn hello() {\n    println!(\"hi\");\n}\n";
+        let config = TransformConfig::with_mode(Mode::Structure);
+        let result = parser.transform(source, &config).unwrap();
+        assert!(result.contains("fn hello()"));
+        // Second call reuses the same parser instance
+        let result2 = parser.transform(source, &config).unwrap();
+        assert_eq!(result, result2);
     }
 
     #[test]
