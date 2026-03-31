@@ -183,7 +183,7 @@ pub(super) fn run_diff(
         // tree-sitter parser from the thread_local cache in render.rs.
         // `par_iter().collect()` preserves the original element order, so output
         // is deterministic regardless of thread scheduling.
-        let render_one = |i: usize, file_diff: &super::diff::types::FileDiff<'_>| {
+        let render_one = |i: usize, file_diff: &types::FileDiff<'_>| {
             let skip_ast = i >= MAX_AST_FILE_COUNT;
             let rendered = render_diff_file(file_diff, global_flags, &git_args, diff_mode, skip_ast);
             let entry = DiffFileEntry {

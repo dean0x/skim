@@ -75,15 +75,11 @@ pub(super) fn render_diff_file(
         return render_raw_hunks(file_diff, &output);
     }
 
-    // Determine language for parser lookup
-    let lang = Language::from_path(Path::new(&file_diff.path));
-    let can_ast = lang.is_some_and(|l| !l.is_serde_based());
-
-    if !can_ast {
+    // Determine language for parser lookup — serde-based formats (JSON, YAML,
+    // TOML) have no tree-sitter grammar, so fall back to raw hunks.
+    let Some(lang) = Language::from_path(Path::new(&file_diff.path)).filter(|l| !l.is_serde_based()) else {
         return render_raw_hunks(file_diff, &output);
-    }
-
-    let lang = lang.expect("checked above");
+    };
 
     // Obtain a cached parser from the thread-local pool and attempt AST rendering.
     let ast_result = PARSERS.with_borrow_mut(|cache| {
@@ -92,20 +88,17 @@ pub(super) fn render_diff_file(
                 e.insert(p);
             }
         }
-        if let Some(parser) = cache.get_mut(&lang) {
-            try_ast_render(file_diff, global_flags, args, diff_mode, parser)
-        } else {
-            None
-        }
+        let parser = cache.get_mut(&lang)?;
+        try_ast_render(file_diff, global_flags, args, diff_mode, parser)
     });
 
-    if let Some(ast_output) = ast_result {
-        output.push_str(&ast_output);
-    } else {
-        return render_raw_hunks(file_diff, &output);
+    match ast_result {
+        Some(ast_output) => {
+            output.push_str(&ast_output);
+            output
+        }
+        None => render_raw_hunks(file_diff, &output),
     }
-
-    output
 }
 
 /// Attempt AST-aware rendering for a modified/renamed file.
@@ -459,7 +452,6 @@ fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::types::DiffHunk;
     use crate::output::canonical::{DiffFileEntry, DiffResult};
 
     // ========================================================================

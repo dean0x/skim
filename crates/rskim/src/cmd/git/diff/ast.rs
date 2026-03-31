@@ -146,7 +146,6 @@ pub(super) fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::types::DiffHunk;
 
     // ========================================================================
     // build_changed_lines unit tests (#103)
