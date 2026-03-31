@@ -590,7 +590,7 @@ fn extract_diff_mode(args: &[String]) -> anyhow::Result<(Vec<String>, DiffMode)>
             continue;
         }
 
-        if arg == "--mode" || arg == "-m" {
+        if arg == "--mode" {
             if let Some(val) = args.get(i + 1) {
                 mode = parse_diff_mode_value(val)?;
                 skip_next = true;
@@ -603,11 +603,6 @@ fn extract_diff_mode(args: &[String]) -> anyhow::Result<(Vec<String>, DiffMode)>
         }
 
         if let Some(val) = arg.strip_prefix("--mode=") {
-            mode = parse_diff_mode_value(val)?;
-            continue;
-        }
-
-        if let Some(val) = arg.strip_prefix("-m=") {
             mode = parse_diff_mode_value(val)?;
             continue;
         }
@@ -912,6 +907,11 @@ fn strip_ab_prefix(path: &str) -> String {
 
 /// Run `git show <ref_spec>` and return stdout, or bail on failure.
 fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Result<String> {
+    // Guard against argument injection: a ref_spec starting with `-` could be
+    // interpreted as a flag by `git show`.
+    if ref_spec.starts_with('-') {
+        anyhow::bail!("invalid ref spec: {ref_spec:?} (must not start with '-')");
+    }
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["show".to_string(), ref_spec.to_string()]);
     let runner = CommandRunner::new(None);
@@ -929,19 +929,35 @@ fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Result<String> {
 /// - `--cached` / `--staged`: use `git show :path`
 /// - Commit range (`A..B` or `A B`): use `git show B:path`
 fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyhow::Result<String> {
+    // Reject null bytes — they could truncate the ref spec passed to git.
+    if path.contains('\0') {
+        anyhow::bail!("invalid diff path: contains null byte");
+    }
+
     if user_has_flag(args, &["--cached", "--staged"]) {
         return git_show(global_flags, &format!(":{path}"));
     }
 
-    // Check for commit range in args (e.g., "HEAD~2..HEAD")
+    // Check for commit range in args (e.g., "HEAD~2..HEAD" or "A...B").
+    // Try three-dot first so `find("..")` doesn't accidentally match at the
+    // wrong position inside a `...` range.
     let range_commit = args.iter().find_map(|a| {
-        let pos = a.find("..")?;
-        let right = &a[pos + 2..];
-        Some(if right.is_empty() {
-            "HEAD".to_string()
+        if let Some(pos) = a.find("...") {
+            let right = &a[pos + 3..];
+            Some(if right.is_empty() {
+                "HEAD".to_string()
+            } else {
+                right.to_string()
+            })
         } else {
-            right.to_string()
-        })
+            let pos = a.find("..")?;
+            let right = &a[pos + 2..];
+            Some(if right.is_empty() {
+                "HEAD".to_string()
+            } else {
+                right.to_string()
+            })
+        }
     });
 
     if let Some(commit) = range_commit {
@@ -950,13 +966,33 @@ fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyh
 
     // Default: read from working tree (disk).
     // When `-C` or `--work-tree` is set, prepend that path to the file path.
-    let disk_path = match resolve_work_tree(global_flags) {
-        Some(root) => root.join(path),
+    let root = resolve_work_tree(global_flags);
+    let disk_path = match &root {
+        Some(r) => r.join(path),
         None => PathBuf::from(path),
     };
 
-    std::fs::read_to_string(&disk_path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", disk_path.display()))
+    // Path-traversal guard: canonicalize and verify the resolved path stays
+    // within the work-tree root (or CWD when no explicit root is set).
+    let canonical = disk_path
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("failed to resolve {}: {e}", disk_path.display()))?;
+    let base = match &root {
+        Some(r) => r
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+    if !canonical.starts_with(&base) {
+        anyhow::bail!(
+            "path traversal detected: {} escapes work tree {}",
+            canonical.display(),
+            base.display()
+        );
+    }
+
+    std::fs::read_to_string(&canonical)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", canonical.display()))
 }
 
 /// A resolved AST node range, with optional parent context for nested nodes.
@@ -2168,10 +2204,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_diff_mode_short_flag_missing_value() {
+    fn test_parse_diff_mode_short_m_passed_through_to_git() {
+        // `-m` is a valid git flag, so it must NOT be consumed by skim.
         let args: Vec<String> = vec!["-m".into()];
-        let result = extract_diff_mode(&args);
-        assert!(result.is_err(), "expected error when -m has no value");
+        let (filtered, mode) = extract_diff_mode(&args).unwrap();
+        assert_eq!(mode, DiffMode::Default);
+        assert_eq!(filtered, vec!["-m"]);
     }
 
     // ========================================================================
@@ -2690,11 +2728,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_diff_mode_extraction_short_flag() {
+    fn test_parse_diff_mode_short_m_not_consumed_as_mode() {
+        // `-m` conflicts with git's own `-m` flag, so skim should NOT treat
+        // it as `--mode`. Both `-m` and the next arg should pass through.
         let args: Vec<String> = vec!["-m".into(), "structure".into()];
         let (filtered, mode) = extract_diff_mode(&args).unwrap();
-        assert_eq!(mode, DiffMode::Structure);
-        assert!(filtered.is_empty());
+        assert_eq!(mode, DiffMode::Default);
+        assert_eq!(filtered, vec!["-m", "structure"]);
     }
 
     #[test]
