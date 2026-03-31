@@ -663,40 +663,6 @@ struct DiffHunk {
     patch_lines: Vec<String>,
 }
 
-/// Status of a file in a unified diff.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FileStatus {
-    Added,
-    Modified,
-    Deleted,
-    Renamed,
-    Binary,
-}
-
-impl std::fmt::Display for FileStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FileStatus::Added => write!(f, "added"),
-            FileStatus::Modified => write!(f, "modified"),
-            FileStatus::Deleted => write!(f, "deleted"),
-            FileStatus::Renamed => write!(f, "renamed"),
-            FileStatus::Binary => write!(f, "binary"),
-        }
-    }
-}
-
-impl From<&FileStatus> for DiffFileStatus {
-    fn from(status: &FileStatus) -> Self {
-        match status {
-            FileStatus::Added => DiffFileStatus::Added,
-            FileStatus::Modified => DiffFileStatus::Modified,
-            FileStatus::Deleted => DiffFileStatus::Deleted,
-            FileStatus::Renamed => DiffFileStatus::Renamed,
-            FileStatus::Binary => DiffFileStatus::Binary,
-        }
-    }
-}
-
 /// Parsed representation of a single file in a unified diff.
 #[derive(Debug, Clone)]
 struct FileDiff {
@@ -705,7 +671,7 @@ struct FileDiff {
     /// Original path for renames (old name)
     old_path: Option<String>,
     /// File status
-    status: FileStatus,
+    status: DiffFileStatus,
     /// Hunks of changed lines
     hunks: Vec<DiffHunk>,
 }
@@ -785,18 +751,18 @@ fn parse_unified_diff(output: &str) -> Vec<FileDiff> {
 
         // Determine file status and path
         let status = if is_binary {
-            FileStatus::Binary
+            DiffFileStatus::Binary
         } else if is_new || file_minus == "/dev/null" || file_minus == "a//dev/null" {
-            FileStatus::Added
+            DiffFileStatus::Added
         } else if is_deleted || file_plus == "/dev/null" || file_plus == "b//dev/null" {
-            FileStatus::Deleted
+            DiffFileStatus::Deleted
         } else if is_renamed {
-            FileStatus::Renamed
+            DiffFileStatus::Renamed
         } else {
-            FileStatus::Modified
+            DiffFileStatus::Modified
         };
 
-        let path = if status == FileStatus::Deleted {
+        let path = if status == DiffFileStatus::Deleted {
             strip_ab_prefix(&a_path)
         } else {
             strip_ab_prefix(&b_path)
@@ -1171,7 +1137,7 @@ fn render_diff_file(
     let mut output = String::new();
 
     // File header: renames show "old -> new (renamed)", others show "path (status)"
-    if let (FileStatus::Renamed, Some(old)) = (&file_diff.status, &file_diff.old_path) {
+    if let (DiffFileStatus::Renamed, Some(old)) = (&file_diff.status, &file_diff.old_path) {
         let _ = writeln!(
             output,
             "\u{2500}\u{2500} {} \u{2192} {} ({}) \u{2500}\u{2500}",
@@ -1186,7 +1152,7 @@ fn render_diff_file(
     }
 
     // Binary files
-    if file_diff.status == FileStatus::Binary {
+    if file_diff.status == DiffFileStatus::Binary {
         let _ = writeln!(output, "Binary file differs");
         return output;
     }
@@ -1197,7 +1163,7 @@ fn render_diff_file(
     }
 
     // Added/deleted files: show all patch lines verbatim (no AST overlay needed)
-    if file_diff.status == FileStatus::Deleted || file_diff.status == FileStatus::Added {
+    if file_diff.status == DiffFileStatus::Deleted || file_diff.status == DiffFileStatus::Added {
         return render_raw_hunks(file_diff, &output);
     }
 
@@ -1662,7 +1628,7 @@ fn run_diff(
         ));
         diff_file_entries.push(DiffFileEntry {
             path: file_diff.path.clone(),
-            status: DiffFileStatus::from(&file_diff.status),
+            status: file_diff.status.clone(),
             changed_regions: file_diff.hunks.len(),
         });
     }
@@ -2296,7 +2262,7 @@ mod tests {
 
         assert_eq!(files.len(), 1, "expected 1 file");
         assert_eq!(files[0].path, "src/auth/middleware.ts");
-        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].status, DiffFileStatus::Modified);
         assert_eq!(files[0].hunks.len(), 1, "expected 1 hunk");
     }
 
@@ -2307,9 +2273,9 @@ mod tests {
 
         assert_eq!(files.len(), 2, "expected 2 files");
         assert_eq!(files[0].path, "src/api/routes.ts");
-        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].status, DiffFileStatus::Modified);
         assert_eq!(files[1].path, "src/api/handlers.ts");
-        assert_eq!(files[1].status, FileStatus::Modified);
+        assert_eq!(files[1].status, DiffFileStatus::Modified);
         assert_eq!(files[1].hunks.len(), 2, "expected 2 hunks for handlers.ts");
     }
 
@@ -2320,7 +2286,7 @@ mod tests {
 
         assert_eq!(files.len(), 1, "expected 1 file");
         assert_eq!(files[0].path, "src/utils/validator.ts");
-        assert_eq!(files[0].status, FileStatus::Added);
+        assert_eq!(files[0].status, DiffFileStatus::Added);
         assert_eq!(files[0].hunks.len(), 1, "expected 1 hunk");
         // All lines should be additions
         assert!(
@@ -2339,7 +2305,7 @@ mod tests {
 
         assert_eq!(files.len(), 1, "expected 1 file");
         assert_eq!(files[0].path, "src/legacy/old_auth.ts");
-        assert_eq!(files[0].status, FileStatus::Deleted);
+        assert_eq!(files[0].status, DiffFileStatus::Deleted);
         // All lines should be deletions
         assert!(
             files[0].hunks[0]
@@ -2357,7 +2323,7 @@ mod tests {
 
         assert_eq!(files.len(), 1, "expected 1 file");
         assert_eq!(files[0].path, "src/utils/format.ts");
-        assert_eq!(files[0].status, FileStatus::Renamed);
+        assert_eq!(files[0].status, DiffFileStatus::Renamed);
         assert_eq!(
             files[0].old_path.as_deref(),
             Some("src/utils/helpers.ts"),
@@ -2372,7 +2338,7 @@ mod tests {
 
         assert_eq!(files.len(), 1, "expected 1 file");
         assert_eq!(files[0].path, "assets/logo.png");
-        assert_eq!(files[0].status, FileStatus::Binary);
+        assert_eq!(files[0].status, DiffFileStatus::Binary);
         assert!(
             files[0].hunks.is_empty(),
             "binary files should have no hunks"
@@ -2387,21 +2353,21 @@ mod tests {
     fn test_file_status_from_new_file() {
         let diff = "diff --git a/new.ts b/new.ts\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1,3 @@\n+line 1\n+line 2\n+line 3\n";
         let files = parse_unified_diff(diff);
-        assert_eq!(files[0].status, FileStatus::Added);
+        assert_eq!(files[0].status, DiffFileStatus::Added);
     }
 
     #[test]
     fn test_file_status_from_deleted_file() {
         let diff = "diff --git a/old.ts b/old.ts\ndeleted file mode 100644\nindex abc1234..0000000\n--- a/old.ts\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-line 1\n-line 2\n-line 3\n";
         let files = parse_unified_diff(diff);
-        assert_eq!(files[0].status, FileStatus::Deleted);
+        assert_eq!(files[0].status, DiffFileStatus::Deleted);
     }
 
     #[test]
     fn test_file_status_modified() {
         let diff = "diff --git a/mod.ts b/mod.ts\nindex abc..def 100644\n--- a/mod.ts\n+++ b/mod.ts\n@@ -1,3 +1,4 @@\n line 1\n-line 2\n+line 2 modified\n+line 2b\n line 3\n";
         let files = parse_unified_diff(diff);
-        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].status, DiffFileStatus::Modified);
     }
 
     // ========================================================================
@@ -2786,7 +2752,7 @@ mod tests {
         let file_diff = FileDiff {
             path: "assets/logo.png".to_string(),
             old_path: None,
-            status: FileStatus::Binary,
+            status: DiffFileStatus::Binary,
             hunks: vec![],
         };
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
@@ -2800,7 +2766,7 @@ mod tests {
         let file_diff = FileDiff {
             path: "src/new.ts".to_string(),
             old_path: None,
-            status: FileStatus::Added,
+            status: DiffFileStatus::Added,
             hunks: vec![DiffHunk {
                 old_start: 0,
                 old_count: 0,
@@ -2822,7 +2788,7 @@ mod tests {
         let file_diff = FileDiff {
             path: "src/old.ts".to_string(),
             old_path: None,
-            status: FileStatus::Deleted,
+            status: DiffFileStatus::Deleted,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 old_count: 2,
@@ -2844,7 +2810,7 @@ mod tests {
         let file_diff = FileDiff {
             path: "src/utils/format.ts".to_string(),
             old_path: Some("src/utils/helpers.ts".to_string()),
-            status: FileStatus::Renamed,
+            status: DiffFileStatus::Renamed,
             hunks: vec![],
         };
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
@@ -3024,7 +2990,7 @@ mod tests {
         let file_diff = FileDiff {
             path: "src/foo.rs".to_string(),
             old_path: None,
-            status: FileStatus::Modified,
+            status: DiffFileStatus::Modified,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 old_count: 3,
