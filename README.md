@@ -71,8 +71,12 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Extracts errors, warnings, and summaries
 
 ### Git Output Compression (`skim git`)
-- Compresses `git status`, `git diff`, `git log`
-- Flag-aware passthrough when user already specifies compact formats
+- **`skim git diff`** -- AST-aware: shows changed functions with full boundaries and `+`/`-` markers, strips diff noise
+  - `--mode structure` adds unchanged functions as signatures for context
+  - `--mode full` shows entire files with change markers
+  - Supports `--staged`, commit ranges (`HEAD~3`, `main..feature`)
+- Compresses `git status` and `git log` with flag-aware passthrough
+- All subcommands support `--json` for machine-readable output
 
 ### Intelligence
 - `skim discover` scans agent session history for optimization opportunities
