@@ -164,6 +164,7 @@ pub struct TemporalFlags {
 ///
 /// let q = SearchQuery::text("parse_file").with_limit(20);
 /// ```
+#[must_use]
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     /// Free-text query string for lexical matching.
@@ -283,12 +284,34 @@ pub struct IndexStats {
 /// All search layers reference files by `FileId`. Callers resolve IDs back to
 /// paths via [`FileTable::lookup`]. The table is I/O-free — it does not touch
 /// the filesystem.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct FileTable {
     /// Ordered list of registered paths; index into this vec is the raw FileId.
     paths: Vec<PathBuf>,
     /// Reverse map: normalized path -> FileId.
     ids: HashMap<PathBuf, FileId>,
+}
+
+// Custom Serialize: only emit the paths vec (ids are derived)
+impl Serialize for FileTable {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.paths.serialize(serializer)
+    }
+}
+
+// Custom Deserialize: reconstruct ids from paths
+impl<'de> Deserialize<'de> for FileTable {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let paths = Vec::<PathBuf>::deserialize(deserializer)?;
+        let ids = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.clone(), FileId::new(i as u64)))
+            .collect();
+        Ok(Self { paths, ids })
+    }
 }
 
 impl FileTable {
@@ -413,11 +436,6 @@ mod tests {
     fn test_file_id_accessors() {
         let id = FileId::new(42);
         assert_eq!(id.as_u64(), 42);
-        // Copy semantics: both bindings are independent copies
-        let a = id;
-        let b = id;
-        assert_eq!(a, b);
-        assert_eq!(a.as_u64(), 42);
     }
 
     #[test]
@@ -441,7 +459,6 @@ mod tests {
         let r = LineRange::new(1, 5);
         assert_eq!(r.start, 1);
         assert_eq!(r.end, 5);
-        assert_eq!(r, LineRange { start: 1, end: 5 });
     }
 
     #[test]

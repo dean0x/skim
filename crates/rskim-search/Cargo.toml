@@ -13,6 +13,9 @@ tree-sitter = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
