@@ -2416,6 +2416,183 @@ mod tests {
     }
 
     // ========================================================================
+    // build_changed_lines unit tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_build_changed_lines_additions() {
+        let hunks = vec![DiffHunk {
+            old_start: 3,
+            old_count: 1,
+            new_start: 3,
+            new_count: 3,
+            patch_lines: vec![
+                "-  old line".to_string(),
+                "+  new line 1".to_string(),
+                "+  new line 2".to_string(),
+            ],
+        }];
+        let lines = build_changed_lines(&hunks);
+        // Deletion at new_start=3 inserts 3, additions insert 3 and 4
+        assert!(
+            lines.contains(&3),
+            "expected line 3 in changed set: {lines:?}"
+        );
+        assert!(
+            lines.contains(&4),
+            "expected line 4 in changed set: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_changed_lines_context_only() {
+        // Context lines (starting with ' ') should not appear in the changed set
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            patch_lines: vec![
+                " unchanged 1".to_string(),
+                " unchanged 2".to_string(),
+                " unchanged 3".to_string(),
+            ],
+        }];
+        let lines = build_changed_lines(&hunks);
+        assert!(
+            lines.is_empty(),
+            "pure context hunks should yield empty changed set: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_changed_lines_empty_hunks() {
+        let lines = build_changed_lines(&[]);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_build_changed_lines_deletions_mark_boundary() {
+        // Deletions mark the current new-file position as a change boundary
+        let hunks = vec![DiffHunk {
+            old_start: 5,
+            old_count: 2,
+            new_start: 5,
+            new_count: 0,
+            patch_lines: vec![
+                "-  removed line 1".to_string(),
+                "-  removed line 2".to_string(),
+            ],
+        }];
+        let lines = build_changed_lines(&hunks);
+        assert!(
+            lines.contains(&5),
+            "deletion boundary should be marked: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_changed_lines_multiple_hunks() {
+        let hunks = vec![
+            DiffHunk {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+                patch_lines: vec![
+                    "-  old".to_string(),
+                    "+  new".to_string(),
+                ],
+            },
+            DiffHunk {
+                old_start: 10,
+                old_count: 1,
+                new_start: 10,
+                new_count: 1,
+                patch_lines: vec![
+                    "-  old2".to_string(),
+                    "+  new2".to_string(),
+                ],
+            },
+        ];
+        let lines = build_changed_lines(&hunks);
+        assert!(lines.contains(&2), "first hunk change at line 2: {lines:?}");
+        assert!(
+            lines.contains(&10),
+            "second hunk change at line 10: {lines:?}"
+        );
+        // Lines between hunks should not be marked
+        assert!(
+            !lines.contains(&6),
+            "line 6 should not be in changed set: {lines:?}"
+        );
+    }
+
+    // ========================================================================
+    // is_container_node unit tests (#103)
+    // ========================================================================
+
+    #[test]
+    fn test_is_container_node_class() {
+        let source = "class Foo {\n  x: number = 1;\n}\n";
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let class_node = root.children(&mut cursor).next().unwrap();
+        assert!(
+            is_container_node(&class_node),
+            "class_declaration should be a container node, got kind: {}",
+            class_node.kind()
+        );
+    }
+
+    #[test]
+    fn test_is_container_node_function_is_not() {
+        let source = "function foo() { return 1; }\n";
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let fn_node = root.children(&mut cursor).next().unwrap();
+        assert!(
+            !is_container_node(&fn_node),
+            "function_declaration should NOT be a container node, got kind: {}",
+            fn_node.kind()
+        );
+    }
+
+    #[test]
+    fn test_is_container_node_rust_struct() {
+        let source = "struct Point {\n    x: i32,\n    y: i32,\n}\n";
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::Rust).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let struct_node = root.children(&mut cursor).next().unwrap();
+        assert!(
+            is_container_node(&struct_node),
+            "struct_item should be a container node, got kind: {}",
+            struct_node.kind()
+        );
+    }
+
+    #[test]
+    fn test_is_container_node_rust_impl() {
+        let source = "impl Foo {\n    fn bar(&self) {}\n}\n";
+        let mut parser = rskim_core::Parser::new(rskim_core::Language::Rust).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let impl_node = root.children(&mut cursor).next().unwrap();
+        assert!(
+            is_container_node(&impl_node),
+            "impl_item should be a container node, got kind: {}",
+            impl_node.kind()
+        );
+    }
+
+    // ========================================================================
     // Changed node detection tests (#103)
     // ========================================================================
 

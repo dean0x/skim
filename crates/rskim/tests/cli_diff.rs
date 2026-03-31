@@ -7,29 +7,37 @@ use assert_cmd::Command;
 use std::fs;
 use tempfile::TempDir;
 
+/// Run a git command in the given directory, asserting it succeeds.
+///
+/// Panics with stderr output if the command exits with a non-zero status.
+fn git(repo_path: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Initialize a bare git repo with user config (no initial commit).
+fn init_repo(dir: &TempDir) {
+    let repo_path = dir.path();
+    git(repo_path, &["init", "--initial-branch=main"]);
+    git(repo_path, &["config", "user.email", "test@test.com"]);
+    git(repo_path, &["config", "user.name", "Test"]);
+}
+
 /// Create a temporary git repo with an initial commit containing the given file.
 fn setup_repo(filename: &str, initial_content: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
     let repo_path = dir.path();
 
-    // Initialize git repo
-    std::process::Command::new("git")
-        .args(["init", "--initial-branch=main"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-
-    // Configure git user for commits
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@test.com"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
+    init_repo(&dir);
 
     // Create subdirectories if needed
     let file_path = repo_path.join(filename);
@@ -39,16 +47,29 @@ fn setup_repo(filename: &str, initial_content: &str) -> TempDir {
 
     // Write initial file and commit
     fs::write(&file_path, initial_content).unwrap();
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial commit"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
+    git(repo_path, &["add", "."]);
+    git(repo_path, &["commit", "-m", "initial commit"]);
+
+    dir
+}
+
+/// Create a temporary git repo with an initial commit containing multiple files.
+fn setup_repo_multi(files: &[(&str, &str)]) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let repo_path = dir.path();
+
+    init_repo(&dir);
+
+    for (filename, content) in files {
+        let file_path = repo_path.join(filename);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&file_path, content).unwrap();
+    }
+
+    git(repo_path, &["add", "."]);
+    git(repo_path, &["commit", "-m", "initial commit"]);
 
     dir
 }
@@ -95,10 +116,32 @@ export function farewell(name: string): string {
     fs::write(dir.path().join("src/greet.ts"), modified).unwrap();
 
     let assert = run_skim_diff(&dir, &[]);
-    assert
-        .success()
-        .stdout(predicates::str::contains("greet.ts"))
-        .stdout(predicates::str::contains("modified"));
+    let output = assert.success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    // Should reference the changed file
+    assert!(
+        stdout.contains("greet.ts"),
+        "expected file path in output, got:\n{stdout}"
+    );
+
+    // AST-aware output should contain +/- markers for changed lines
+    assert!(
+        stdout.contains('+') || stdout.contains('-'),
+        "expected +/- patch markers in AST-aware output, got:\n{stdout}"
+    );
+
+    // Should contain the changed function name (AST node detection)
+    assert!(
+        stdout.contains("greet"),
+        "expected changed function 'greet' in output, got:\n{stdout}"
+    );
+
+    // Should show the signature change (title parameter added)
+    assert!(
+        stdout.contains("title"),
+        "expected new parameter 'title' in diff output, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -141,17 +184,21 @@ fn test_diff_staged() {
     fs::write(dir.path().join("version.ts"), modified).unwrap();
 
     // Stage the change
-    std::process::Command::new("git")
-        .args(["add", "version.ts"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    git(dir.path(), &["add", "version.ts"]);
 
     let assert = run_skim_diff(&dir, &["--cached"]);
-    assert
-        .success()
-        .stdout(predicates::str::contains("version.ts"))
-        .stdout(predicates::str::contains("modified"));
+    let output = assert.success().get_output().stdout.clone();
+    let stdout = String::from_utf8(output).unwrap();
+
+    assert!(
+        stdout.contains("version.ts"),
+        "expected file path in staged output, got:\n{stdout}"
+    );
+    // Should contain patch markers showing the version change
+    assert!(
+        stdout.contains("2.0") || stdout.contains("VERSION"),
+        "expected version change in staged diff output, got:\n{stdout}"
+    );
 }
 
 // ============================================================================
@@ -248,58 +295,19 @@ fn helper() -> i32 {
 
 #[test]
 fn test_diff_multiple_files() {
-    let dir = TempDir::new().unwrap();
-    let repo_path = dir.path();
-
-    // Initialize git repo
-    std::process::Command::new("git")
-        .args(["init", "--initial-branch=main"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@test.com"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-
-    // Create initial files
-    fs::create_dir_all(repo_path.join("src")).unwrap();
-    fs::write(
-        repo_path.join("src/a.ts"),
-        "export function a() { return 1; }\n",
-    )
-    .unwrap();
-    fs::write(
-        repo_path.join("src/b.ts"),
-        "export function b() { return 2; }\n",
-    )
-    .unwrap();
-
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial"])
-        .current_dir(repo_path)
-        .output()
-        .unwrap();
+    let dir = setup_repo_multi(&[
+        ("src/a.ts", "export function a() { return 1; }\n"),
+        ("src/b.ts", "export function b() { return 2; }\n"),
+    ]);
 
     // Modify both files
     fs::write(
-        repo_path.join("src/a.ts"),
+        dir.path().join("src/a.ts"),
         "export function a() { return 10; }\n",
     )
     .unwrap();
     fs::write(
-        repo_path.join("src/b.ts"),
+        dir.path().join("src/b.ts"),
         "export function b() { return 20; }\n",
     )
     .unwrap();
