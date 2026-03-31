@@ -6,6 +6,9 @@ authors = ["Skim Contributors"]
 license = "MIT"
 description = "Search and indexing layer for skim's code intelligence"
 repository = "https://github.com/dean0x/skim"
+readme = "README.md"
+keywords = ["code-search", "ast", "tree-sitter", "llm"]
+categories = ["parser-implementations", "development-tools"]
 
 [dependencies]
 rskim-core = { version = "2.0.0", path = "../rskim-core" }
@@ -17,10 +20,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [lints.clippy]
+# Enforce strict error handling in library code
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
-todo = "warn"
+todo = "warn"  # Allow during development, warn to remind removal
 
 [lib]
 name = "rskim_search"

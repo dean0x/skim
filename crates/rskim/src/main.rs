@@ -39,7 +39,10 @@ enum Invocation {
 
 /// Returns true if `flag` is a flag that consumes the next token as its value.
 ///
-/// SYNC NOTE: If you add a new flag with a value to `Args`, add it here too.
+/// SYNC NOTE: This list covers both `Args` struct flags (e.g. --mode, --language,
+/// --filename, --jobs, --max-lines, --last-lines, --tokens) and subcommand-only
+/// flags (e.g. --ast, --limit from `search`; --since, --session, --agent, --format
+/// from other subcommands). Both categories must be registered here.
 /// Failure to sync only causes a bug if the flag's value happens to match a
 /// known subcommand name AND no file with that name exists on disk.
 fn is_flag_with_value(flag: &str) -> bool {

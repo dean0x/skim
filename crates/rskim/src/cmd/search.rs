@@ -84,24 +84,6 @@ pub(super) fn command() -> clap::Command {
 }
 
 fn print_help() {
-    println!("skim search");
+    command().print_help().unwrap_or(());
     println!();
-    println!("  Search code using the 3-layer index");
-    println!();
-    println!("Usage: skim search [OPTIONS] [QUERY]");
-    println!();
-    println!("Arguments:");
-    println!("  [QUERY]              Search query string");
-    println!();
-    println!("Options:");
-    println!("  --build              Build the search index before querying");
-    println!("  --rebuild            Force rebuild the entire search index");
-    println!("  --update             Update the search index incrementally");
-    println!("  --ast <PATTERN>      AST pattern to search for");
-    println!("  --blast-radius       Filter results by blast radius");
-    println!("  --limit <N>          Maximum number of results to return");
-    println!("  --hot                Filter for recently active files");
-    println!("  --cold               Filter for stable/unchanged files");
-    println!("  --risky              Filter for files with high churn or complexity");
-    println!("  --help, -h           Print help information");
 }
