@@ -1,0 +1,547 @@
+//! Git output compression subcommand (#50, #103)
+//!
+//! Executes git commands and compresses output for LLM context windows.
+//! Supports `status`, `diff`, and `log` subcommands with flag-aware
+//! passthrough: when the user already specifies a compact format flag,
+//! output is passed through unmodified.
+//!
+//! The `diff` subcommand uses an AST-aware pipeline (#103): it parses
+//! unified diff output, overlays changed line ranges on tree-sitter ASTs,
+//! and renders changed nodes with full function boundaries and standard
+//! `+`/`-` markers.
+
+mod diff;
+mod log;
+mod status;
+
+use std::process::ExitCode;
+
+use crate::cmd::OutputFormat;
+use crate::output::canonical::GitResult;
+use crate::runner::CommandRunner;
+
+// ============================================================================
+// Public entry point
+// ============================================================================
+
+/// Run the `git` subcommand.
+///
+/// Dispatches to `status`, `diff`, or `log` parsers, or prints help.
+pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+    // Handle --help / -h at the git level
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let (filtered_args, show_stats) = crate::cmd::extract_show_stats(args);
+
+    let (global_flags, rest) = split_global_flags(&filtered_args);
+
+    let Some(subcmd) = rest.first() else {
+        print_help();
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let subcmd_args = &rest[1..];
+
+    match subcmd.as_str() {
+        "status" => status::run_status(&global_flags, subcmd_args, show_stats),
+        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats),
+        "log" => log::run_log(&global_flags, subcmd_args, show_stats),
+        other => {
+            anyhow::bail!(
+                "unknown git subcommand: '{other}'\n\n\
+                 Supported: status, diff, log\n\
+                 Run 'skim git --help' for usage"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Help
+// ============================================================================
+
+fn print_help() {
+    println!("skim git <status|diff|log> [args...]");
+    println!();
+    println!("  Compress git command output for LLM context windows.");
+    println!();
+    println!("Subcommands:");
+    println!("  status    Show compressed working tree status");
+    println!("  diff      AST-aware diff with full function boundaries");
+    println!("  log       Show compressed commit log");
+    println!();
+    println!("Global git flags (before subcommand):");
+    println!("  -C <path>    Run as if git was started in <path>");
+    println!("  --git-dir    Set the path to the repository");
+    println!("  --work-tree  Set the path to the working tree");
+    println!();
+    println!("Flags (all subcommands):");
+    println!("  --json           Machine-readable JSON output");
+    println!("  --show-stats     Show token savings statistics");
+    println!();
+    println!("Examples:");
+    println!("  skim git status");
+    println!("  skim git status --json");
+    println!("  skim git diff --cached");
+    println!("  skim git diff --mode structure");
+    println!("  skim git diff main..feature --json");
+    println!("  skim git log -n 5");
+    println!("  skim git diff --help                   Diff-specific options");
+}
+
+fn print_diff_help() {
+    println!("skim git diff \u{2014} AST-aware diff compression");
+    println!();
+    println!("USAGE:");
+    println!("    skim git diff [OPTIONS] [<commit>..] [-- <path>...]");
+    println!();
+    println!("SKIM OPTIONS:");
+    println!("    --mode <MODE>    Diff rendering mode:");
+    println!("                       (default)    Changed functions with boundaries");
+    println!("                       structure    + unchanged functions as signatures");
+    println!("                       full         Entire files with change markers");
+    println!("    --json           Machine-readable JSON output");
+    println!("    --show-stats     Show token savings statistics");
+    println!();
+    println!("GIT OPTIONS:");
+    println!("    --staged, --cached    Diff staged changes");
+    println!("    --stat, --shortstat   Passthrough to git (no AST processing)");
+    println!("    --name-only           Passthrough to git");
+    println!();
+    println!("EXAMPLES:");
+    println!("    skim git diff                    Working tree changes");
+    println!("    skim git diff --staged           Staged changes");
+    println!("    skim git diff HEAD~3             Last 3 commits");
+    println!("    skim git diff main..feature      Branch comparison");
+    println!("    skim git diff --mode structure   With context signatures");
+    println!("    skim git diff --json             JSON output");
+}
+
+// ============================================================================
+// Global flag splitting
+// ============================================================================
+
+/// Split leading git global flags (e.g., `-C <path>`, `--git-dir=...`)
+/// from the subcommand and its arguments.
+///
+/// Git global flags appear before the subcommand:
+///   `git -C /path --no-pager status --short`
+///         ^^^^^^^^^^^^^^^^^^ global  ^^^^^^ subcommand args
+///
+/// Returns `(global_flags, rest)` where `rest[0]` is the subcommand name.
+fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut global_flags = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        // Flags that consume a following value
+        if matches!(arg.as_str(), "-C" | "--git-dir" | "--work-tree" | "-c") {
+            global_flags.push(arg.clone());
+            if i + 1 < args.len() {
+                global_flags.push(args[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Flags with embedded value (--git-dir=..., --work-tree=...)
+        if arg.starts_with("--git-dir=")
+            || arg.starts_with("--work-tree=")
+            || arg.starts_with("-c=")
+        {
+            global_flags.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        // Boolean global flags
+        if arg == "--no-pager"
+            || arg == "--bare"
+            || arg == "--no-replace-objects"
+            || arg == "--no-optional-locks"
+        {
+            global_flags.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        // Not a global flag — this is the subcommand (or subcommand arg)
+        break;
+    }
+
+    let rest = args[i..].to_vec();
+    (global_flags, rest)
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Check whether the user has specified a limit flag (`-n`, `--max-count`).
+fn has_limit_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count="))
+}
+
+/// Convert an optional exit code to an ExitCode.
+fn map_exit_code(code: Option<i32>) -> ExitCode {
+    match code {
+        Some(0) => ExitCode::SUCCESS,
+        _ => ExitCode::FAILURE,
+    }
+}
+
+/// Run a git command with passthrough (no parsing).
+fn run_passthrough(
+    global_flags: &[String],
+    subcmd: &str,
+    args: &[String],
+    show_stats: bool,
+) -> anyhow::Result<ExitCode> {
+    let mut full_args: Vec<String> = global_flags.to_vec();
+    full_args.push(subcmd.to_string());
+    full_args.extend_from_slice(args);
+
+    let runner = CommandRunner::new(None);
+    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let output = runner.run("git", &arg_refs)?;
+
+    print!("{}", output.stdout);
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+    }
+
+    if show_stats {
+        // Passthrough: raw == compressed (no savings)
+        let raw = &output.stdout;
+        let (orig, comp) = crate::process::count_token_pair(raw, raw);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Record analytics (fire-and-forget, non-blocking).
+    // Passthrough: raw == compressed (no transformation applied).
+    // Guard behind is_analytics_enabled() to avoid cloning large git output
+    // (100 KB+) when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            output.stdout.clone(),
+            output.stdout,
+            format!("skim git {} {}", subcmd, args.join(" ")),
+            crate::analytics::CommandType::Git,
+            output.duration,
+            None,
+        );
+    }
+
+    Ok(map_exit_code(output.exit_code))
+}
+
+/// Run a git command and parse its output with the given parser function.
+///
+/// Callers are responsible for baking global flags into `subcmd_args` before
+/// calling this function.
+fn run_parsed_command<F>(
+    subcmd_args: &[String],
+    show_stats: bool,
+    output_format: OutputFormat,
+    parser: F,
+) -> anyhow::Result<ExitCode>
+where
+    F: FnOnce(&str) -> GitResult,
+{
+    let runner = CommandRunner::new(None);
+    let arg_refs: Vec<&str> = subcmd_args.iter().map(|s| s.as_str()).collect();
+    let output = runner.run("git", &arg_refs)?;
+
+    if output.exit_code != Some(0) {
+        // On failure, pass through stderr
+        if !output.stderr.is_empty() {
+            eprint!("{}", output.stderr);
+        }
+        if !output.stdout.is_empty() {
+            print!("{}", output.stdout);
+        }
+        return Ok(map_exit_code(output.exit_code));
+    }
+
+    let result = parser(&output.stdout);
+    let result_str = match output_format {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
+            println!("{json}");
+            json
+        }
+        OutputFormat::Text => {
+            let s = result.to_string();
+            println!("{s}");
+            s
+        }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &result_str);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    // Record analytics (fire-and-forget, non-blocking).
+    // Guard to avoid allocations when analytics are disabled.
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            output.stdout,
+            result_str,
+            format!("skim git {}", subcmd_args.join(" ")),
+            crate::analytics::CommandType::Git,
+            output.duration,
+            None,
+        );
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::user_has_flag;
+
+    // ========================================================================
+    // split_global_flags tests
+    // ========================================================================
+
+    #[test]
+    fn test_split_no_global_flags() {
+        let args: Vec<String> = vec!["status".into(), "--short".into()];
+        let (global, rest) = split_global_flags(&args);
+        assert!(global.is_empty());
+        assert_eq!(rest, vec!["status", "--short"]);
+    }
+
+    #[test]
+    fn test_split_with_c_flag() {
+        let args: Vec<String> = vec!["-C".into(), "/tmp".into(), "status".into()];
+        let (global, rest) = split_global_flags(&args);
+        assert_eq!(global, vec!["-C", "/tmp"]);
+        assert_eq!(rest, vec!["status"]);
+    }
+
+    #[test]
+    fn test_split_with_git_dir_equals() {
+        let args: Vec<String> = vec!["--git-dir=/repo/.git".into(), "log".into()];
+        let (global, rest) = split_global_flags(&args);
+        assert_eq!(global, vec!["--git-dir=/repo/.git"]);
+        assert_eq!(rest, vec!["log"]);
+    }
+
+    #[test]
+    fn test_split_with_no_pager() {
+        let args: Vec<String> = vec!["--no-pager".into(), "diff".into(), "--cached".into()];
+        let (global, rest) = split_global_flags(&args);
+        assert_eq!(global, vec!["--no-pager"]);
+        assert_eq!(rest, vec!["diff", "--cached"]);
+    }
+
+    #[test]
+    fn test_split_multiple_global_flags() {
+        let args: Vec<String> = vec![
+            "-C".into(),
+            "/tmp".into(),
+            "--no-pager".into(),
+            "status".into(),
+        ];
+        let (global, rest) = split_global_flags(&args);
+        assert_eq!(global, vec!["-C", "/tmp", "--no-pager"]);
+        assert_eq!(rest, vec!["status"]);
+    }
+
+    // ========================================================================
+    // --no-optional-locks global flag
+    // ========================================================================
+
+    #[test]
+    fn test_split_with_no_optional_locks() {
+        let args: Vec<String> = vec!["--no-optional-locks".into(), "status".into()];
+        let (global, rest) = split_global_flags(&args);
+        assert_eq!(global, vec!["--no-optional-locks"]);
+        assert_eq!(rest, vec!["status"]);
+    }
+
+    // ========================================================================
+    // Passthrough flag detection tests
+    // ========================================================================
+
+    #[test]
+    fn test_status_passthrough_with_porcelain() {
+        assert!(user_has_flag(
+            &["--porcelain".to_string()],
+            &["--porcelain", "--short", "-s"]
+        ));
+    }
+
+    #[test]
+    fn test_status_passthrough_with_short() {
+        assert!(user_has_flag(
+            &["-s".to_string()],
+            &["--porcelain", "--short", "-s"]
+        ));
+    }
+
+    #[test]
+    fn test_diff_passthrough_with_name_only() {
+        assert!(user_has_flag(
+            &["--name-only".to_string()],
+            &["--stat", "--name-only", "--name-status"]
+        ));
+    }
+
+    #[test]
+    fn test_diff_no_passthrough_without_flag() {
+        assert!(!user_has_flag(
+            &["--cached".to_string()],
+            &["--stat", "--name-only", "--name-status"]
+        ));
+    }
+
+    #[test]
+    fn test_log_passthrough_with_oneline() {
+        assert!(user_has_flag(
+            &["--oneline".to_string()],
+            &["--format", "--pretty", "--oneline"]
+        ));
+    }
+
+    #[test]
+    fn test_log_passthrough_with_format() {
+        assert!(user_has_flag(
+            &["--format".to_string()],
+            &["--format", "--pretty", "--oneline"]
+        ));
+    }
+
+    // ========================================================================
+    // user_has_flag / map_exit_code helpers
+    // ========================================================================
+
+    #[test]
+    fn test_user_has_flag_empty_args() {
+        assert!(!user_has_flag(&[], &["--flag"]));
+    }
+
+    #[test]
+    fn test_map_exit_code_success() {
+        let code = map_exit_code(Some(0));
+        // ExitCode doesn't impl PartialEq, so compare via Debug
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+    }
+
+    #[test]
+    fn test_map_exit_code_failure() {
+        let code = map_exit_code(Some(1));
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+    }
+
+    #[test]
+    fn test_map_exit_code_none() {
+        let code = map_exit_code(None);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
+    }
+
+    // ========================================================================
+    // has_limit detection for log
+    // ========================================================================
+
+    #[test]
+    fn test_log_detects_n_flag() {
+        let args: Vec<String> = vec!["-n".into(), "10".into()];
+        assert!(has_limit_flag(&args));
+    }
+
+    #[test]
+    fn test_log_detects_max_count() {
+        let args: Vec<String> = vec!["--max-count=5".into()];
+        assert!(has_limit_flag(&args));
+    }
+
+    #[test]
+    fn test_log_no_limit_flag() {
+        let args: Vec<String> = vec!["--all".into()];
+        assert!(!has_limit_flag(&args));
+    }
+
+    // ========================================================================
+    // Prefix-match passthrough (--format=%H, --porcelain=v2)
+    // ========================================================================
+
+    #[test]
+    fn test_log_passthrough_with_format_equals() {
+        assert!(user_has_flag(
+            &["--format=%H".to_string()],
+            &["--format", "--pretty", "--oneline"]
+        ));
+    }
+
+    #[test]
+    fn test_status_passthrough_with_porcelain_v2() {
+        assert!(user_has_flag(
+            &["--porcelain=v2".to_string()],
+            &["--porcelain", "--short", "-s"]
+        ));
+    }
+
+    // ========================================================================
+    // --check passthrough for diff
+    // ========================================================================
+
+    #[test]
+    fn test_diff_passthrough_with_check() {
+        assert!(user_has_flag(
+            &["--check".to_string()],
+            &["--stat", "--name-only", "--name-status", "--check"]
+        ));
+    }
+
+    // ========================================================================
+    // --shortstat and --numstat passthrough for diff
+    // ========================================================================
+
+    #[test]
+    fn test_diff_passthrough_with_shortstat() {
+        assert!(user_has_flag(
+            &["--shortstat".to_string()],
+            &[
+                "--stat",
+                "--shortstat",
+                "--numstat",
+                "--name-only",
+                "--name-status",
+                "--check"
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_diff_passthrough_with_numstat() {
+        assert!(user_has_flag(
+            &["--numstat".to_string()],
+            &[
+                "--stat",
+                "--shortstat",
+                "--numstat",
+                "--name-only",
+                "--name-status",
+                "--check"
+            ]
+        ));
+    }
+}

@@ -1,0 +1,432 @@
+//! Git status compression — porcelain v2 parsing.
+
+use std::process::ExitCode;
+
+use crate::cmd::{extract_output_format, user_has_flag};
+use crate::output::canonical::GitResult;
+
+use super::{run_parsed_command, run_passthrough};
+
+/// Run `git status` with compression.
+///
+/// Flag-aware passthrough: if user has `--porcelain`, `--short`, or `-s`,
+/// output is already compact — pass through unmodified.
+pub(super) fn run_status(
+    global_flags: &[String],
+    args: &[String],
+    show_stats: bool,
+) -> anyhow::Result<ExitCode> {
+    if user_has_flag(args, &["--porcelain", "--short", "-s"]) {
+        return run_passthrough(global_flags, "status", args, show_stats);
+    }
+
+    let (filtered_args, output_format) = extract_output_format(args);
+
+    let mut full_args: Vec<String> = global_flags.to_vec();
+    full_args.extend([
+        "status".to_string(),
+        "--porcelain=v2".to_string(),
+        "--branch".to_string(),
+    ]);
+    full_args.extend_from_slice(&filtered_args);
+
+    run_parsed_command(&full_args, show_stats, output_format, parse_status)
+}
+
+/// Parse porcelain v2 status output into a compressed GitResult.
+fn parse_status(output: &str) -> GitResult {
+    let mut branch = String::new();
+    let mut staged: Vec<String> = Vec::new();
+    let mut modified: Vec<String> = Vec::new();
+    let mut untracked: Vec<String> = Vec::new();
+    let mut renamed: Vec<String> = Vec::new();
+    let mut unmerged: Vec<String> = Vec::new();
+
+    for line in output.lines() {
+        if line.starts_with("# branch.head ") {
+            branch = line
+                .strip_prefix("# branch.head ")
+                .unwrap_or("")
+                .to_string();
+            continue;
+        }
+
+        if line.starts_with('#') {
+            continue;
+        }
+
+        if line.starts_with('?') {
+            // Untracked: "? <path>"
+            let path = line.get(2..).unwrap_or("").to_string();
+            untracked.push(path);
+            continue;
+        }
+
+        if line.starts_with('u') {
+            // Unmerged: "u <xy> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>"
+            let path = extract_last_path(line);
+            unmerged.push(path);
+            continue;
+        }
+
+        if line.starts_with('2') {
+            // Renamed: "2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X_score> <path>\t<origPath>"
+            let path = extract_renamed_path(line);
+            renamed.push(path);
+            continue;
+        }
+
+        if line.starts_with('1') {
+            // Tracked changed: "1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>"
+            // XY: index change (X) and worktree change (Y)
+            let xy = extract_xy(line);
+            let path = extract_last_path(line);
+
+            let x = xy.chars().next().unwrap_or('.');
+            let y = xy.chars().nth(1).unwrap_or('.');
+
+            if x != '.' {
+                // Staged change (added, modified, deleted in index)
+                staged.push(format!("{}{}", stage_prefix(x), path));
+            }
+            if y != '.' {
+                // Worktree change
+                modified.push(format!("{}{}", worktree_prefix(y), path));
+            }
+            continue;
+        }
+    }
+
+    // Build details: show ALL files (no cap per GRANITE #618 lesson)
+    let mut details: Vec<String> = Vec::new();
+
+    if !branch.is_empty() {
+        details.push(format!("branch: {branch}"));
+    }
+
+    for f in &staged {
+        details.push(format!("staged: {f}"));
+    }
+    for f in &modified {
+        details.push(format!("modified: {f}"));
+    }
+    for f in &untracked {
+        details.push(format!("untracked: {f}"));
+    }
+    for f in &renamed {
+        details.push(format!("renamed: {f}"));
+    }
+    for f in &unmerged {
+        details.push(format!("unmerged: {f}"));
+    }
+
+    let total_changes =
+        staged.len() + modified.len() + untracked.len() + renamed.len() + unmerged.len();
+
+    let summary = if total_changes == 0 {
+        "clean".to_string()
+    } else {
+        let mut parts: Vec<String> = Vec::new();
+        if !staged.is_empty() {
+            parts.push(format!("{} staged", staged.len()));
+        }
+        if !modified.is_empty() {
+            parts.push(format!("{} modified", modified.len()));
+        }
+        if !untracked.is_empty() {
+            parts.push(format!("{} untracked", untracked.len()));
+        }
+        if !renamed.is_empty() {
+            parts.push(format!("{} renamed", renamed.len()));
+        }
+        if !unmerged.is_empty() {
+            parts.push(format!("{} unmerged", unmerged.len()));
+        }
+        parts.join(", ")
+    };
+
+    GitResult::new("status".to_string(), summary, details)
+}
+
+/// Extract XY field from porcelain v2 tracked entry line.
+/// Format: "1 <XY> <rest...>"
+fn extract_xy(line: &str) -> String {
+    line.split_whitespace().nth(1).unwrap_or("..").to_string()
+}
+
+/// Extract the path from a porcelain v2 line using fixed field counts.
+///
+/// Type 1 entries: "1 XY sub mH mI mW hH hI <path>" (8 fields before path)
+/// Unmerged entries: "u XY sub m1 m2 m3 mW h1 h2 h3 <path>" (10 fields before path)
+///
+/// Uses `splitn` with the correct field count so paths with spaces are preserved.
+fn extract_last_path(line: &str) -> String {
+    let field_count = if line.starts_with('u') {
+        // Unmerged: 10 fixed fields + path
+        11
+    } else {
+        // Type 1: 8 fixed fields + path
+        9
+    };
+
+    let fields: Vec<&str> = line.splitn(field_count, ' ').collect();
+    fields.last().unwrap_or(&"").to_string()
+}
+
+/// Extract the renamed path from a porcelain v2 type 2 entry.
+/// Format: "2 XY sub mH mI mW hH hI X_score <path>\t<origPath>"
+fn extract_renamed_path(line: &str) -> String {
+    // Porcelain v2 type-2 entries always contain a tab separator:
+    // "2 XY sub mH mI mW hH hI X_score <path>\t<origPath>"
+    let tab_pos = line
+        .find('\t')
+        .expect("porcelain v2 type-2 entries always contain a tab");
+    let before_tab = &line[..tab_pos];
+    let after_tab = &line[tab_pos + 1..];
+    // Field 10 (0-indexed 9) is the new path; use splitn to preserve spaces in path
+    let new_path = before_tab.splitn(10, ' ').last().unwrap_or("");
+    format!("{after_tab} -> {new_path}")
+}
+
+/// Map index status character to a display prefix.
+fn stage_prefix(c: char) -> &'static str {
+    match c {
+        'M' => "M ",
+        'A' => "A ",
+        'D' => "D ",
+        'R' => "R ",
+        'C' => "C ",
+        _ => "",
+    }
+}
+
+/// Map worktree status character to a display prefix.
+fn worktree_prefix(c: char) -> &'static str {
+    match c {
+        'M' => "M ",
+        'D' => "D ",
+        _ => "",
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::LazyLock;
+    use regex::Regex;
+
+    /// Matches diff stat lines: " file | 42 +++++---"
+    static STAT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\|\s+(\d+)\s+([+-]+)").unwrap());
+
+    /// Matches diff stat summary lines: "3 files changed, ..."
+    static SUMMARY_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(\d+)\s+files?\s+changed").unwrap());
+
+    /// Matches binary diff stat lines: " file.bin | Bin 0 -> 1234 bytes"
+    static BINARY_STAT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*(.+?)\s+\|\s+Bin\s+").unwrap());
+
+    /// Parse `git diff --stat` output into a compressed GitResult.
+    ///
+    /// Retained for testing and potential future use (e.g., `--mode stat`).
+    fn parse_diff_stat(output: &str) -> GitResult {
+        let mut file_stats: Vec<String> = Vec::new();
+        let mut summary_line = String::new();
+
+        for line in output.lines() {
+            if let Some(caps) = STAT_RE.captures(line) {
+                let file = caps.get(1).map_or("", |m| m.as_str()).trim();
+                let count = caps.get(2).map_or("", |m| m.as_str());
+                let changes = caps.get(3).map_or("", |m| m.as_str());
+                file_stats.push(format!("{file} | {count} {changes}"));
+                continue;
+            }
+
+            // Binary files appear as "file.bin | Bin 0 -> 1234 bytes"
+            if let Some(caps) = BINARY_STAT_RE.captures(line) {
+                let file = caps.get(1).map_or("", |m| m.as_str()).trim();
+                file_stats.push(format!("{file} | Bin"));
+                continue;
+            }
+
+            if SUMMARY_RE.is_match(line) {
+                summary_line = line.trim().to_string();
+            }
+        }
+
+        if summary_line.is_empty() && file_stats.is_empty() {
+            return GitResult::new("diff".to_string(), "no changes".to_string(), vec![]);
+        }
+
+        if summary_line.is_empty() {
+            summary_line = format!("{} files changed", file_stats.len());
+        }
+
+        GitResult::new("diff".to_string(), summary_line, file_stats)
+    }
+
+    // ========================================================================
+    // parse_status tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_status_clean() {
+        let output = "# branch.oid abc123\n# branch.head main\n";
+        let result = parse_status(output);
+        assert_eq!(result.summary, "clean");
+        // Details should contain branch info only
+        assert!(result.details.iter().any(|d| d.contains("branch: main")));
+    }
+
+    #[test]
+    fn test_parse_status_dirty() {
+        let output = include_str!("../../../tests/fixtures/cmd/git/status_dirty.txt");
+        let result = parse_status(output);
+
+        // Verify summary contains counts
+        assert!(
+            result.summary.contains("staged"),
+            "expected 'staged' in summary, got: {}",
+            result.summary
+        );
+        assert!(
+            result.summary.contains("modified"),
+            "expected 'modified' in summary, got: {}",
+            result.summary
+        );
+        assert!(
+            result.summary.contains("untracked"),
+            "expected 'untracked' in summary, got: {}",
+            result.summary
+        );
+        assert!(
+            result.summary.contains("renamed"),
+            "expected 'renamed' in summary, got: {}",
+            result.summary
+        );
+    }
+
+    #[test]
+    fn test_parse_status_shows_all_files() {
+        // Generate 25 untracked files — ensure no cap
+        let mut output = String::from("# branch.head main\n");
+        for i in 0..25 {
+            output.push_str(&format!("? file_{i}.txt\n"));
+        }
+
+        let result = parse_status(&output);
+
+        // All 25 should appear in details (no 5/5/3 cap like GRANITE #618)
+        let untracked_count = result
+            .details
+            .iter()
+            .filter(|d| d.starts_with("untracked:"))
+            .count();
+        assert_eq!(
+            untracked_count, 25,
+            "expected all 25 untracked files, got {untracked_count}"
+        );
+    }
+
+    // ========================================================================
+    // parse_diff_stat tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_diff_stat() {
+        let output = include_str!("../../../tests/fixtures/cmd/git/diff_stat.txt");
+        let result = parse_diff_stat(output);
+
+        assert!(
+            result.summary.contains("3 files changed"),
+            "expected '3 files changed' in summary, got: {}",
+            result.summary
+        );
+        assert_eq!(result.details.len(), 3, "expected 3 file stat entries");
+    }
+
+    #[test]
+    fn test_parse_diff_stat_empty() {
+        let result = parse_diff_stat("");
+        assert_eq!(result.summary, "no changes");
+        assert!(result.details.is_empty());
+    }
+
+    // ========================================================================
+    // Paths with spaces in git status
+    // ========================================================================
+
+    #[test]
+    fn test_extract_last_path_with_spaces() {
+        // Type 1 entry with space in path: 8 fixed fields + path
+        let line = "1 M. N... 100644 100644 100644 abc1234 def5678 src/my file.rs";
+        assert_eq!(extract_last_path(line), "src/my file.rs");
+    }
+
+    #[test]
+    fn test_parse_status_path_with_spaces() {
+        let output = "# branch.head main\n\
+                      1 M. N... 100644 100644 100644 abc1234 def5678 src/my file.rs\n";
+        let result = parse_status(output);
+        assert!(
+            result.details.iter().any(|d| d.contains("my file.rs")),
+            "expected path with spaces in details, got: {:?}",
+            result.details
+        );
+    }
+
+    // ========================================================================
+    // Unmerged entries in status
+    // ========================================================================
+
+    #[test]
+    fn test_parse_status_unmerged_entries() {
+        let output = "# branch.head main\n\
+                      u UU N... 100644 100644 100644 100644 abc1234 def5678 ghi9012 src/conflict.rs\n";
+        let result = parse_status(output);
+        assert!(
+            result.summary.contains("unmerged"),
+            "expected 'unmerged' in summary, got: {}",
+            result.summary
+        );
+        assert!(
+            result
+                .details
+                .iter()
+                .any(|d| d.contains("unmerged:") && d.contains("conflict.rs")),
+            "expected unmerged detail for conflict.rs, got: {:?}",
+            result.details
+        );
+    }
+
+    // ========================================================================
+    // Binary files in diff stat
+    // ========================================================================
+
+    #[test]
+    fn test_parse_diff_stat_binary_files() {
+        let output = " src/main.rs   | 15 +++++++++------\n\
+                       image.png     | Bin 0 -> 1234 bytes\n\
+                       2 files changed, 10 insertions(+), 5 deletions(-)\n";
+        let result = parse_diff_stat(output);
+        assert_eq!(
+            result.details.len(),
+            2,
+            "expected 2 file stat entries (1 text + 1 binary), got: {:?}",
+            result.details
+        );
+        assert!(
+            result
+                .details
+                .iter()
+                .any(|d| d.contains("image.png") && d.contains("Bin")),
+            "expected binary file entry, got: {:?}",
+            result.details
+        );
+    }
+}
