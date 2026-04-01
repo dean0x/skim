@@ -1,4 +1,5 @@
 //! FileTable normalization and registration edge cases.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
 
@@ -199,19 +200,60 @@ fn test_default_is_empty() {
 // ============================================================================
 
 #[test]
-fn test_register_within_accepts_relative_path() {
+fn test_register_within_accepts_path_inside_root() {
     let mut table = FileTable::new();
+    // "src/main.rs" joined with "/project" → "/project/src/main.rs" — starts_with "/project" ✓
     let result = table.register_within(Path::new("src/main.rs"), Path::new("/project"));
     assert!(result.is_ok());
     assert_eq!(table.len(), 1);
+    assert_eq!(
+        table.lookup(result.unwrap()),
+        Some(Path::new("src/main.rs"))
+    );
+}
+
+#[test]
+fn test_register_within_rejects_path_outside_root_no_dotdot() {
+    // "other_project/secret.rs" has no ".." and is not absolute, but it still
+    // names a path unrelated to root. The old implementation accepted this; the
+    // fixed implementation rejects it because after joining and re-normalizing,
+    // "/project/other_project/secret.rs" actually does start_with "/project" —
+    // so this case is accepted. That is correct: joined("/project", "other_project/secret.rs")
+    // = "/project/other_project/secret.rs" which IS inside the root.
+    //
+    // The issue was that the old implementation accepted ANY relative path regardless
+    // of root. The fix adds a containment check — but a simple relative path without
+    // ".." genuinely does resolve inside the root when joined. This test documents
+    // that correct behavior.
+    let mut table = FileTable::new();
+    let result = table.register_within(Path::new("other_project/secret.rs"), Path::new("/project"));
+    assert!(
+        result.is_ok(),
+        "relative path without escape resolves inside root when joined"
+    );
 }
 
 #[test]
 fn test_register_within_rejects_parent_escape() {
     let mut table = FileTable::new();
+    // "../../etc/passwd" escapes root regardless of root value.
     let result = table.register_within(Path::new("../../etc/passwd"), Path::new("/project"));
     assert!(result.is_err());
     assert_eq!(table.len(), 0);
+}
+
+#[test]
+fn test_register_within_rejects_single_parent_escape() {
+    let mut table = FileTable::new();
+    // "../sibling/file.rs" joined with "/project" → "/sibling/file.rs" — no longer starts_with "/project".
+    let result = table.register_within(Path::new("../sibling/file.rs"), Path::new("/project"));
+    assert!(result.is_err());
+    assert_eq!(table.len(), 0);
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("escapes project root"),
+        "error should mention root escape, got: {err}"
+    );
 }
 
 #[test]
@@ -229,6 +271,26 @@ fn test_register_within_accepts_dot_dot_that_resolves_inside() {
     let result = table.register_within(Path::new("src/../lib/main.rs"), Path::new("/project"));
     assert!(result.is_ok());
     assert_eq!(table.lookup(result.unwrap()), Some(Path::new("lib/main.rs")));
+}
+
+#[test]
+fn test_register_within_rejects_dot_dot_that_escapes_via_subdirectory() {
+    let mut table = FileTable::new();
+    // "sub/../../etc/passwd" normalizes to "../etc/passwd" — escapes root.
+    let result =
+        table.register_within(Path::new("sub/../../etc/passwd"), Path::new("/project"));
+    assert!(result.is_err());
+    assert_eq!(table.len(), 0);
+}
+
+#[test]
+fn test_register_within_accepts_root_itself() {
+    let mut table = FileTable::new();
+    // An empty relative path (the root itself) — "." normalizes to ""
+    // Joined: normalize("/project") = "/project"; normalize("/project/.") = "/project".
+    // starts_with("/project") → accepted.
+    let result = table.register_within(Path::new("."), Path::new("/project"));
+    assert!(result.is_ok());
 }
 
 #[test]

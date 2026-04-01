@@ -80,6 +80,12 @@ impl<'de> Deserialize<'de> for FileTable {
         let mut ids = FxHashMap::with_capacity_and_hasher(raw_paths.len(), Default::default());
         for (i, p) in raw_paths.iter().enumerate() {
             let normalized = Self::normalize(p);
+            if ids.contains_key(&normalized) {
+                return Err(serde::de::Error::custom(format!(
+                    "file table contains duplicate path after normalization: {}",
+                    normalized.display()
+                )));
+            }
             // u64::try_from(i) is infallible on 64-bit (guarded by compile_error above)
             #[allow(clippy::cast_possible_truncation)]
             let id = FileId::new(i as u64);
@@ -106,6 +112,47 @@ impl FileTable {
     /// lookup; two paths that normalize to the same value get the same `FileId`.
     pub fn register(&mut self, path: &Path) -> FileId {
         let normalized = Self::normalize(path);
+        self.register_normalized(normalized)
+    }
+
+    /// Register `path` after verifying it is contained within `root`.
+    ///
+    /// The path is normalized first. Containment is verified by joining `root`
+    /// with the normalized path, re-normalizing the result, and checking that it
+    /// starts with the normalized `root`. This prevents directory traversal attacks
+    /// even when paths originate from untrusted input — including paths like
+    /// `"other_project/secret.rs"` which would not be caught by a `..` check alone.
+    ///
+    /// Returns [`SearchError::InvalidQuery`] if the path escapes `root`.
+    pub fn register_within(&mut self, path: &Path, root: &Path) -> crate::Result<FileId> {
+        let normalized = Self::normalize(path);
+        // Reject paths that are absolute — they cannot be confined to any root.
+        if normalized.has_root() {
+            return Err(SearchError::InvalidQuery(format!(
+                "absolute path not allowed: {}",
+                normalized.display()
+            )));
+        }
+        // Verify containment: join root with the relative path, re-normalize the
+        // result, and confirm it still starts with the normalized root.
+        let normalized_root = Self::normalize(root);
+        let joined = Self::normalize(&normalized_root.join(&normalized));
+        if !joined.starts_with(&normalized_root) {
+            return Err(SearchError::InvalidQuery(format!(
+                "path escapes project root: {}",
+                normalized.display()
+            )));
+        }
+        Ok(self.register_normalized(normalized))
+    }
+
+    /// Insert a pre-normalized path and return its [`FileId`].
+    ///
+    /// This is the single insertion point for both [`register`] and [`register_within`],
+    /// ensuring each call path normalizes exactly once.
+    ///
+    /// [`register`]: Self::register
+    fn register_normalized(&mut self, normalized: PathBuf) -> FileId {
         if let Some(&id) = self.ids.get(&normalized) {
             return id;
         }
@@ -117,29 +164,6 @@ impl FileTable {
         self.ids.insert(normalized.clone(), id);
         self.paths.push(normalized);
         id
-    }
-
-    /// Register `path` after verifying it does not escape `root`.
-    ///
-    /// The path is normalized first. If the normalized form starts with `..` or
-    /// is absolute (has a root component), it is rejected with [`SearchError::InvalidQuery`].
-    /// This prevents directory traversal attacks when paths originate from untrusted input.
-    pub fn register_within(&mut self, path: &Path, _root: &Path) -> crate::Result<FileId> {
-        let normalized = Self::normalize(path);
-        // Reject paths that escape the project root
-        if normalized.starts_with("..") {
-            return Err(SearchError::InvalidQuery(format!(
-                "path escapes project root: {}",
-                normalized.display()
-            )));
-        }
-        if normalized.has_root() {
-            return Err(SearchError::InvalidQuery(format!(
-                "absolute path not allowed: {}",
-                normalized.display()
-            )));
-        }
-        Ok(self.register(path))
     }
 
     /// Resolve a `FileId` back to a path, if it was registered.

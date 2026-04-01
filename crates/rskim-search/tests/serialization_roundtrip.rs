@@ -312,6 +312,53 @@ fn test_file_table_deserialization_rejects_oversized_input() {
 }
 
 #[test]
+fn test_file_table_deserialization_rejects_at_limit_plus_one() {
+    // Construct a JSON array of (MAX_FILE_TABLE_ENTRIES + 1) trivial path strings.
+    // Each path is a decimal number "0", "1", ..., so the JSON is compact.
+    // At 10_000_001 entries of ~4 bytes each this is ~40 MB — well within test budgets.
+    let n = rskim_search::MAX_FILE_TABLE_ENTRIES + 1;
+    let mut json = String::with_capacity(n * 5);
+    json.push('[');
+    for i in 0..n {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push('"');
+        json.push_str(&i.to_string());
+        json.push('"');
+    }
+    json.push(']');
+
+    let result: Result<FileTable, _> = serde_json::from_str(&json);
+    assert!(
+        result.is_err(),
+        "array of MAX_FILE_TABLE_ENTRIES+1 entries must be rejected"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("exceeds maximum"),
+        "error message should mention the limit, got: {err}"
+    );
+}
+
+#[test]
+fn test_file_table_deserialization_rejects_duplicate_normalized_paths() {
+    // "./src/main.rs" and "src/main.rs" both normalize to "src/main.rs".
+    // The deserializer must reject this rather than silently overwriting.
+    let json = r#"["./src/main.rs","src/main.rs"]"#;
+    let result: Result<FileTable, _> = serde_json::from_str(json);
+    assert!(
+        result.is_err(),
+        "duplicate normalized paths must be rejected during deserialization"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("duplicate"),
+        "error message should mention duplicate, got: {err}"
+    );
+}
+
+#[test]
 fn test_file_table_max_entries_constant_is_exported() {
     // Verify the constant exists and is a reasonable value
     assert!(rskim_search::MAX_FILE_TABLE_ENTRIES > 0);
