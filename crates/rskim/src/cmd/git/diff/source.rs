@@ -49,6 +49,9 @@ pub(super) fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Resul
     if ref_spec.starts_with('-') {
         anyhow::bail!("invalid ref spec: {ref_spec:?} (must not start with '-')");
     }
+    // SECURITY: `-c` values within `global_flags` are passed to git as-is. This is
+    // intentional: skim trusts its CLI caller. Agent hooks must not forward
+    // untrusted `-c` values from external sources.
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["show".to_string(), ref_spec.to_string()]);
     let runner = CommandRunner::new(None);
@@ -102,8 +105,9 @@ pub(super) fn get_file_source(path: &str, global_flags: &[String], args: &[Strin
     let base = match &root {
         Some(r) => r
             .canonicalize()
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default()),
-        None => std::env::current_dir().unwrap_or_default(),
+            .map_err(|e| anyhow::anyhow!("failed to resolve work tree {}: {e}", r.display()))?,
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?,
     };
     if !canonical.starts_with(&base) {
         anyhow::bail!(
@@ -171,5 +175,91 @@ mod tests {
         let result = get_file_source("test.txt", &global_flags, &args);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
         assert_eq!(result.unwrap(), "hello world");
+    }
+
+    // ========================================================================
+    // extract_range_right unit tests (Issue source:35:testing)
+    // ========================================================================
+
+    #[test]
+    fn test_extract_range_right_two_dot_with_content() {
+        let result = extract_range_right("main..feature", "..");
+        assert_eq!(result, Some("feature".to_string()));
+    }
+
+    #[test]
+    fn test_extract_range_right_two_dot_empty_right_returns_head() {
+        // "main.." has an empty right side — should default to "HEAD"
+        let result = extract_range_right("main..", "..");
+        assert_eq!(result, Some("HEAD".to_string()));
+    }
+
+    #[test]
+    fn test_extract_range_right_no_separator_returns_none() {
+        let result = extract_range_right("main", "..");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_range_right_three_dot_with_content() {
+        let result = extract_range_right("main...feature", "...");
+        assert_eq!(result, Some("feature".to_string()));
+    }
+
+    #[test]
+    fn test_extract_range_right_three_dot_empty_right_returns_head() {
+        let result = extract_range_right("main...", "...");
+        assert_eq!(result, Some("HEAD".to_string()));
+    }
+
+    // ========================================================================
+    // Security guard unit tests (Issue source:49:testing)
+    // ========================================================================
+
+    #[test]
+    fn test_git_show_rejects_dash_ref_spec() {
+        // A ref_spec beginning with '-' must be rejected to prevent flag injection.
+        let global_flags: Vec<String> = vec![];
+        let result = git_show(&global_flags, "-malicious-flag");
+        assert!(result.is_err(), "expected Err for dash-prefixed ref_spec");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("must not start with '-'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_get_file_source_rejects_null_byte() {
+        let global_flags: Vec<String> = vec![];
+        let args: Vec<String> = vec![];
+        let result = get_file_source("foo\0bar", &global_flags, &args);
+        assert!(result.is_err(), "expected Err for path with null byte");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("null byte"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_get_file_source_rejects_path_traversal() {
+        // Construct a temp dir and attempt to read a file outside it using `../`.
+        let dir = tempfile::TempDir::new().unwrap();
+        // Write a sentinel file one level above so the path can be canonicalized.
+        let outside = dir.path().parent().unwrap().join("secret.txt");
+        std::fs::write(&outside, "secret").unwrap();
+
+        let global_flags: Vec<String> =
+            vec!["-C".into(), dir.path().to_string_lossy().into_owned()];
+        let args: Vec<String> = vec![];
+
+        let result = get_file_source("../secret.txt", &global_flags, &args);
+        assert!(result.is_err(), "expected Err for path traversal attempt");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("path traversal") || msg.contains("escapes work tree"),
+            "unexpected error: {msg}"
+        );
+
+        // Cleanup the file we wrote outside the temp dir.
+        let _ = std::fs::remove_file(&outside);
     }
 }
