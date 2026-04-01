@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-04-01
+
+Minor release: Kotlin + Swift language support (17 total), AST-aware git diff, lint and package manager output compression, canonical output types, and expanded rewrite rules.
+
+### Added — Language Support
+- **Kotlin** — data classes, sealed classes, coroutines, interfaces (tree-sitter-kotlin-ng)
+- **Swift** — protocols, generics, SwiftUI structs (tree-sitter-swift)
+- Now 17 languages total (was 15 at v2.0.0)
+
+### Added — AST-Aware Git Diff (`skim git diff`)
+- Function-boundary-aware diff rendering with `+`/`-` markers
+- `--mode structure` — adds unchanged functions as signatures for architectural context
+- `--mode full` — shows entire files with change markers
+- `--json` output for machine-readable diff results
+- Supports `--staged`, commit ranges (`HEAD~3`, `main..feature`), and all git diff flags
+
+### Added — Lint Output Compression (`skim lint`)
+- New subcommand: `skim lint <linter> [args...]`
+- Supported linters: ESLint (JSON + text), Ruff (JSON + text), mypy (JSON + text), golangci-lint (JSON + text)
+- Canonical `LintResult` output with severity grouping
+- Three-tier degradation: Structured → Regex → Passthrough
+
+### Added — Package Manager Output Compression (`skim pkg`)
+- New subcommand: `skim pkg <tool> [subcmd] [args...]`
+- npm: audit, install, ls, outdated
+- pnpm: audit, install, outdated
+- pip: install, check, outdated
+- cargo: audit
+- Input sanitization for terminal escape injection prevention
+
+### Added — Infrastructure
+- **Canonical output module** — strongly-typed `TestResult`, `LintResult`, `GitResult` types with `Display` that is compact on success, verbose on failure
+- **Expanded rewrite rules** — `skim rewrite` now covers lint and pkg commands
+
+### Changed — Architecture
+- Git module refactored into `diff/`, `log.rs`, `status.rs` submodules
+- AST diff pipeline: `parse.rs` → `ast.rs` → `source.rs` → `render.rs` → `types.rs`
+- Tech debt from PRs #106 and #107 resolved
+
+### Testing
+- **1,993 tests passing** (up from 1,594 in v2.0.0 — 25% increase)
+- New test suites: `cli_diff.rs`, `cli_e2e_lint_parsers.rs`, `cli_e2e_pkg_parsers.rs`, `cli_e2e_rewrite.rs`
+- New fixtures: diff, lint, pkg, C#, Ruby, SQL, Kotlin, Swift
+
 ## [2.0.0] - 2026-03-28
 
 Major release: skim evolves from a streaming code reader into a full context optimization engine for AI coding agents. Adds command output compression, agent hook integration, persistent analytics, and MCP server mode.
@@ -553,6 +597,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.1.0** (2026-04-01): Kotlin + Swift, AST-aware git diff, lint/pkg compression, canonical output
 - **2.0.0** (2026-03-28): Context optimization engine — command compression, agent hooks, analytics, MCP server
 - **1.0.0** (2026-03-18): First stable release — minimal mode, token budgets, max-lines, C/C++/TOML, skimmer plugin
 - **0.9.0** (2026-03-16): C, C++, and TOML language support (12 languages total, 400 tests)

@@ -155,6 +155,8 @@ cargo fmt -- --check           # Format check
 - `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log. All support `--json`.
 - `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode)
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`)
+- `lint` — Lint output compression (eslint, ruff, mypy, golangci-lint)
+- `pkg` — Package manager output compression (npm, pnpm, pip, cargo)
 - `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
 - `stats` — Token analytics dashboard (`--since`, `--format json`, `--cost`, `--clear`)
 - `test` — Test output compression (pytest, vitest, jest, go test)

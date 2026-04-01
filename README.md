@@ -70,6 +70,15 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Parses cargo, clippy, tsc build output
 - Extracts errors, warnings, and summaries
 
+### Lint Output Compression (`skim lint`)
+- Parses ESLint, Ruff, mypy, golangci-lint output
+- Extracts errors and warnings with severity grouping
+- Three-tier degradation from structured parse to regex fallback to passthrough
+
+### Package Manager Compression (`skim pkg`)
+- Parses npm, pnpm, pip, cargo audit/install/outdated output
+- Extracts vulnerabilities, version conflicts, and dependency issues
+
 ### Git Output Compression (`skim git`)
 - **`skim git diff`** -- AST-aware: shows changed functions with full boundaries and `+`/`-` markers, strips diff noise
   - `--mode structure` adds unchanged functions as signatures for context
@@ -575,7 +584,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.0.0 — Stable
+**Current**: v2.1.0 — Stable
 
 ✅ **Core — Code Reading (17 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
