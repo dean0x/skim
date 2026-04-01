@@ -135,11 +135,10 @@ fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
         }
 
         // Boolean global flags
-        if arg == "--no-pager"
-            || arg == "--bare"
-            || arg == "--no-replace-objects"
-            || arg == "--no-optional-locks"
-        {
+        if matches!(
+            arg.as_str(),
+            "--no-pager" | "--bare" | "--no-replace-objects" | "--no-optional-locks"
+        ) {
             global_flags.push(arg.clone());
             i += 1;
             continue;

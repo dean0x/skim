@@ -38,27 +38,27 @@ pub(super) fn scan_extended_headers(lines: &[&str], start: usize) -> (FileMetada
 
     let mut i = start;
     while i < lines.len() && !lines[i].starts_with("diff --git ") {
-        let l = lines[i];
+        let line = lines[i];
 
-        if l.starts_with("new file mode") {
+        if line.starts_with("new file mode") {
             meta.change = FileChange::New;
-        } else if l.starts_with("deleted file mode") {
+        } else if line.starts_with("deleted file mode") {
             meta.change = FileChange::Deleted;
-        } else if l.starts_with("rename from ") {
-            let from = l.strip_prefix("rename from ").unwrap_or("").to_string();
+        } else if line.starts_with("rename from ") {
+            let from = line.strip_prefix("rename from ").unwrap_or("").to_string();
             meta.change = FileChange::Renamed { from: Some(from) };
-        } else if l.starts_with("rename to ") {
+        } else if line.starts_with("rename to ") {
             // Only update if not already set to Renamed (rename from comes first)
             if !matches!(meta.change, FileChange::Renamed { .. }) {
                 meta.change = FileChange::Renamed { from: None };
             }
-        } else if l.starts_with("Binary files") && l.contains("differ") {
+        } else if line.starts_with("Binary files") && line.contains("differ") {
             meta.change = FileChange::Binary;
-        } else if l.starts_with("--- ") {
-            meta.file_minus = l.strip_prefix("--- ").unwrap_or("").to_string();
-        } else if l.starts_with("+++ ") {
-            meta.file_plus = l.strip_prefix("+++ ").unwrap_or("").to_string();
-        } else if l.starts_with("@@") {
+        } else if line.starts_with("--- ") {
+            meta.file_minus = line.strip_prefix("--- ").unwrap_or("").to_string();
+        } else if line.starts_with("+++ ") {
+            meta.file_plus = line.strip_prefix("+++ ").unwrap_or("").to_string();
+        } else if line.starts_with("@@") {
             // Hunk header — extended headers are done, stop before consuming it
             break;
         }
@@ -79,25 +79,25 @@ pub(super) fn collect_hunks<'a>(lines: &[&'a str], start: usize) -> (Vec<DiffHun
     let mut i = start;
 
     while i < lines.len() && !lines[i].starts_with("diff --git ") {
-        let l = lines[i];
+        let line = lines[i];
 
-        if l.starts_with("@@") {
-            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(l) {
+        if line.starts_with("@@") {
+            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
                 let mut patch_lines: Vec<&'a str> = Vec::new();
                 i += 1;
 
                 while i < lines.len() {
-                    let pl = lines[i];
-                    if pl.starts_with("diff --git ") || pl.starts_with("@@") {
+                    let patch_line = lines[i];
+                    if patch_line.starts_with("diff --git ") || patch_line.starts_with("@@") {
                         break;
                     }
                     // Only keep actual patch lines (+, -, space, or \ no newline)
-                    if pl.starts_with('+')
-                        || pl.starts_with('-')
-                        || pl.starts_with(' ')
-                        || pl.starts_with('\\')
+                    if patch_line.starts_with('+')
+                        || patch_line.starts_with('-')
+                        || patch_line.starts_with(' ')
+                        || patch_line.starts_with('\\')
                     {
-                        patch_lines.push(pl);
+                        patch_lines.push(patch_line);
                     }
                     i += 1;
                 }
@@ -216,36 +216,22 @@ pub(super) fn parse_diff_git_header(line: &str) -> (String, String) {
     // Find the boundary between a/path and b/path.
     // We use rfind so that paths containing " b/" in a directory name
     // are split at the *last* occurrence (which is the real separator).
-    if let Some(pos) = rest.rfind(" b/") {
-        let a_part = &rest[..pos];
-        let b_part = &rest[pos + 1..];
-        (a_part.to_string(), b_part.to_string())
-    } else if let Some(pos) = rest.rfind(" b\\") {
-        let a_part = &rest[..pos];
-        let b_part = &rest[pos + 1..];
-        (a_part.to_string(), b_part.to_string())
+    // Try " b/" first, then " b\" (Windows), then fall back to last space.
+    let sep = rest.rfind(" b/").or_else(|| rest.rfind(" b\\")).or_else(|| rest.rfind(' '));
+    if let Some(pos) = sep {
+        (rest[..pos].to_string(), rest[pos + 1..].to_string())
     } else {
-        // Fallback: split on last space (handles unusual path formats)
-        if let Some(pos) = rest.rfind(' ') {
-            let a_part = &rest[..pos];
-            let b_part = &rest[pos + 1..];
-            (a_part.to_string(), b_part.to_string())
-        } else {
-            // No separator found — treat entire string as b-path
-            (rest.to_string(), rest.to_string())
-        }
+        // No separator found — treat entire string as b-path
+        (rest.to_string(), rest.to_string())
     }
 }
 
 /// Strip the `a/` or `b/` prefix from a diff path.
 pub(super) fn strip_ab_prefix(path: &str) -> String {
-    if let Some(stripped) = path.strip_prefix("a/") {
-        stripped.to_string()
-    } else if let Some(stripped) = path.strip_prefix("b/") {
-        stripped.to_string()
-    } else {
-        path.to_string()
-    }
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
 }
 
 // ============================================================================

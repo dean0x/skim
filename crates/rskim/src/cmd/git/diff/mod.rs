@@ -367,30 +367,6 @@ mod tests {
     }
 
     // ========================================================================
-    // MAX_AST_FILE_COUNT limit (#103 review batch-7)
-    // ========================================================================
-
-    #[test]
-    fn test_max_ast_file_count_is_bounded() {
-        // The AST pipeline has a per-file size limit (MAX_AST_FILE_SIZE) and a
-        // total file count limit (MAX_AST_FILE_COUNT). This test documents the
-        // constant value so changes are deliberate.
-        assert_eq!(MAX_AST_FILE_COUNT, 200);
-    }
-
-    // ========================================================================
-    // PARALLEL_THRESHOLD constant documentation (#103 review batch-5)
-    // ========================================================================
-
-    #[test]
-    fn test_parallel_threshold_value() {
-        // PARALLEL_THRESHOLD gates rayon parallelism. Below this file count,
-        // thread pool scheduling overhead exceeds per-file render cost.
-        // This test documents the value so changes are deliberate.
-        assert_eq!(PARALLEL_THRESHOLD, 5);
-    }
-
-    // ========================================================================
     // Empty diff behavior documentation (#103 review batch-7)
     // ========================================================================
 

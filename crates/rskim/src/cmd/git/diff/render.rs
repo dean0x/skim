@@ -429,11 +429,7 @@ fn render_node_with_hunks(
         // Output the hunk's patch lines
         for patch_line in &hunk.patch_lines {
             match patch_line.as_bytes().first() {
-                Some(b'+') => {
-                    let _ = writeln!(output, "{patch_line}");
-                    current_new_line += 1;
-                }
-                Some(b' ') => {
+                Some(b'+' | b' ') => {
                     let _ = writeln!(output, "{patch_line}");
                     current_new_line += 1;
                 }
