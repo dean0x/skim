@@ -18,7 +18,7 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
 
-use super::{map_exit_code, print_diff_help, run_passthrough};
+use super::{map_exit_code, run_passthrough};
 use parse::parse_unified_diff;
 use render::render_diff_file;
 
@@ -29,6 +29,10 @@ const MAX_AST_FILE_SIZE: usize = 100 * 1024;
 /// Maximum number of files processed through the AST pipeline. Files beyond
 /// this limit fall back to raw diff hunks to keep diff rendering bounded.
 const MAX_AST_FILE_COUNT: usize = 200;
+
+/// Minimum file count to engage rayon parallelism. Below this, thread pool
+/// scheduling overhead exceeds the per-file render cost.
+const PARALLEL_THRESHOLD: usize = 5;
 
 /// Controls how unchanged AST nodes are rendered alongside changed nodes.
 ///
@@ -96,6 +100,35 @@ fn parse_diff_mode_value(val: &str) -> Result<DiffMode, anyhow::Error> {
             "unknown diff mode: '{val}'\nValid modes: structure, full (default: changed-only)"
         )),
     }
+}
+
+/// Print help for `skim git diff`.
+fn print_diff_help() {
+    println!("skim git diff \u{2014} AST-aware diff compression");
+    println!();
+    println!("USAGE:");
+    println!("    skim git diff [OPTIONS] [<commit>..] [-- <path>...]");
+    println!();
+    println!("SKIM OPTIONS:");
+    println!("    --mode <MODE>    Diff rendering mode (no short flag; -m conflicts with git):");
+    println!("                       (default)    Changed functions with boundaries");
+    println!("                       structure    + unchanged functions as signatures");
+    println!("                       full         Entire files with change markers");
+    println!("    --json           Machine-readable JSON output");
+    println!("    --show-stats     Show token savings statistics");
+    println!();
+    println!("GIT OPTIONS:");
+    println!("    --staged, --cached    Diff staged changes");
+    println!("    --stat, --shortstat   Passthrough to git (no AST processing)");
+    println!("    --name-only           Passthrough to git");
+    println!();
+    println!("EXAMPLES:");
+    println!("    skim git diff                    Working tree changes");
+    println!("    skim git diff --staged           Staged changes");
+    println!("    skim git diff HEAD~3             Last 3 commits");
+    println!("    skim git diff main..feature      Branch comparison");
+    println!("    skim git diff --mode structure   With context signatures");
+    println!("    skim git diff --json             JSON output");
 }
 
 /// Run `git diff` with AST-aware pipeline (#103).
@@ -194,18 +227,12 @@ pub(super) fn run_diff(
             (rendered, entry)
         };
 
-        /// Minimum file count to engage rayon parallelism. Below this, the
-        /// thread pool scheduling overhead exceeds the per-file render cost.
-        const PARALLEL_THRESHOLD: usize = 5;
-
         let rendered_files: Vec<(String, DiffFileEntry)> = if file_diffs.len() >= PARALLEL_THRESHOLD
         {
             file_diffs
-                .iter()
-                .enumerate()
-                .collect::<Vec<_>>()
                 .par_iter()
-                .map(|&(i, file_diff)| render_one(i, file_diff))
+                .enumerate()
+                .map(|(i, file_diff)| render_one(i, file_diff))
                 .collect()
         } else {
             file_diffs
@@ -349,6 +376,18 @@ mod tests {
         // total file count limit (MAX_AST_FILE_COUNT). This test documents the
         // constant value so changes are deliberate.
         assert_eq!(MAX_AST_FILE_COUNT, 200);
+    }
+
+    // ========================================================================
+    // PARALLEL_THRESHOLD constant documentation (#103 review batch-5)
+    // ========================================================================
+
+    #[test]
+    fn test_parallel_threshold_value() {
+        // PARALLEL_THRESHOLD gates rayon parallelism. Below this file count,
+        // thread pool scheduling overhead exceeds per-file render cost.
+        // This test documents the value so changes are deliberate.
+        assert_eq!(PARALLEL_THRESHOLD, 5);
     }
 
     // ========================================================================

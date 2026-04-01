@@ -10,6 +10,7 @@
 //! and renders changed nodes with full function boundaries and standard
 //! `+`/`-` markers.
 
+// Private: only accessed via run() dispatch in this module
 mod diff;
 mod log;
 mod status;
@@ -90,34 +91,6 @@ fn print_help() {
     println!("  skim git diff main..feature --json");
     println!("  skim git log -n 5");
     println!("  skim git diff --help                   Diff-specific options");
-}
-
-fn print_diff_help() {
-    println!("skim git diff \u{2014} AST-aware diff compression");
-    println!();
-    println!("USAGE:");
-    println!("    skim git diff [OPTIONS] [<commit>..] [-- <path>...]");
-    println!();
-    println!("SKIM OPTIONS:");
-    println!("    --mode <MODE>    Diff rendering mode:");
-    println!("                       (default)    Changed functions with boundaries");
-    println!("                       structure    + unchanged functions as signatures");
-    println!("                       full         Entire files with change markers");
-    println!("    --json           Machine-readable JSON output");
-    println!("    --show-stats     Show token savings statistics");
-    println!();
-    println!("GIT OPTIONS:");
-    println!("    --staged, --cached    Diff staged changes");
-    println!("    --stat, --shortstat   Passthrough to git (no AST processing)");
-    println!("    --name-only           Passthrough to git");
-    println!();
-    println!("EXAMPLES:");
-    println!("    skim git diff                    Working tree changes");
-    println!("    skim git diff --staged           Staged changes");
-    println!("    skim git diff HEAD~3             Last 3 commits");
-    println!("    skim git diff main..feature      Branch comparison");
-    println!("    skim git diff --mode structure   With context signatures");
-    println!("    skim git diff --json             JSON output");
 }
 
 // ============================================================================
