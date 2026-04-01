@@ -39,7 +39,9 @@ fn parse_log(output: &str) -> GitResult {
         .collect();
 
     let count = lines.len();
-    let summary = if count == 1 {
+    let summary = if count == 0 {
+        "no commits".to_string()
+    } else if count == 1 {
         "1 commit".to_string()
     } else {
         format!("{count} commits")
@@ -84,7 +86,7 @@ mod tests {
     #[test]
     fn test_parse_log_empty() {
         let result = parse_log("");
-        assert_eq!(result.summary, "0 commits");
+        assert_eq!(result.summary, "no commits");
         assert!(result.details.is_empty());
     }
 }

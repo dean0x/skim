@@ -33,47 +33,45 @@ pub(super) fn run_status(
     run_parsed_command(&full_args, show_stats, output_format, parse_status)
 }
 
-/// Parse porcelain v2 status output into a compressed GitResult.
-fn parse_status(output: &str) -> GitResult {
-    let mut branch = String::new();
-    let mut staged: Vec<String> = Vec::new();
-    let mut modified: Vec<String> = Vec::new();
-    let mut untracked: Vec<String> = Vec::new();
-    let mut renamed: Vec<String> = Vec::new();
-    let mut unmerged: Vec<String> = Vec::new();
+/// Accumulated per-category file lists from a porcelain v2 status parse.
+#[derive(Default)]
+struct StatusCategories {
+    branch: String,
+    staged: Vec<String>,
+    modified: Vec<String>,
+    untracked: Vec<String>,
+    renamed: Vec<String>,
+    unmerged: Vec<String>,
+}
 
-    for line in output.lines() {
-        if line.starts_with("# branch.head ") {
-            branch = line
-                .strip_prefix("# branch.head ")
-                .unwrap_or("")
-                .to_string();
-            continue;
+impl StatusCategories {
+    /// Classify and accumulate a single porcelain v2 output line.
+    fn classify_line(&mut self, line: &str) {
+        if let Some(head) = line.strip_prefix("# branch.head ") {
+            self.branch = head.to_string();
+            return;
         }
 
         if line.starts_with('#') {
-            continue;
+            return;
         }
 
         if line.starts_with('?') {
             // Untracked: "? <path>"
-            let path = line.get(2..).unwrap_or("").to_string();
-            untracked.push(path);
-            continue;
+            self.untracked.push(line.get(2..).unwrap_or("").to_string());
+            return;
         }
 
         if line.starts_with('u') {
             // Unmerged: "u <xy> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>"
-            let path = extract_last_path(line);
-            unmerged.push(path);
-            continue;
+            self.unmerged.push(extract_last_path(line));
+            return;
         }
 
         if line.starts_with('2') {
-            // Renamed: "2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X_score> <path>\t<origPath>"
-            let path = extract_renamed_path(line);
-            renamed.push(path);
-            continue;
+            // Renamed/copied: "2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X_score> <path>\t<origPath>"
+            self.renamed.push(extract_renamed_path(line));
+            return;
         }
 
         if line.starts_with('1') {
@@ -86,66 +84,78 @@ fn parse_status(output: &str) -> GitResult {
             let y = xy.chars().nth(1).unwrap_or('.');
 
             if x != '.' {
-                // Staged change (added, modified, deleted in index)
-                staged.push(format!("{}{}", stage_prefix(x), path));
+                self.staged.push(format!("{}{}", stage_prefix(x), path));
             }
             if y != '.' {
-                // Worktree change
-                modified.push(format!("{}{}", worktree_prefix(y), path));
+                self.modified.push(format!("{}{}", worktree_prefix(y), path));
             }
-            continue;
         }
     }
 
-    // Build details: show ALL files (no cap per GRANITE #618 lesson)
-    let mut details: Vec<String> = Vec::new();
+    /// Build a compressed GitResult from the accumulated categories.
+    ///
+    /// Shows ALL files — no cap per GRANITE #618 lesson.
+    fn build_result(self) -> GitResult {
+        let mut details: Vec<String> = Vec::new();
 
-    if !branch.is_empty() {
-        details.push(format!("branch: {branch}"));
-    }
+        if !self.branch.is_empty() {
+            details.push(format!("branch: {}", self.branch));
+        }
+        for f in &self.staged {
+            details.push(format!("staged: {f}"));
+        }
+        for f in &self.modified {
+            details.push(format!("modified: {f}"));
+        }
+        for f in &self.untracked {
+            details.push(format!("untracked: {f}"));
+        }
+        for f in &self.renamed {
+            details.push(format!("renamed: {f}"));
+        }
+        for f in &self.unmerged {
+            details.push(format!("unmerged: {f}"));
+        }
 
-    for f in &staged {
-        details.push(format!("staged: {f}"));
-    }
-    for f in &modified {
-        details.push(format!("modified: {f}"));
-    }
-    for f in &untracked {
-        details.push(format!("untracked: {f}"));
-    }
-    for f in &renamed {
-        details.push(format!("renamed: {f}"));
-    }
-    for f in &unmerged {
-        details.push(format!("unmerged: {f}"));
-    }
+        let total_changes = self.staged.len()
+            + self.modified.len()
+            + self.untracked.len()
+            + self.renamed.len()
+            + self.unmerged.len();
 
-    let total_changes =
-        staged.len() + modified.len() + untracked.len() + renamed.len() + unmerged.len();
+        let summary = if total_changes == 0 {
+            "clean".to_string()
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if !self.staged.is_empty() {
+                parts.push(format!("{} staged", self.staged.len()));
+            }
+            if !self.modified.is_empty() {
+                parts.push(format!("{} modified", self.modified.len()));
+            }
+            if !self.untracked.is_empty() {
+                parts.push(format!("{} untracked", self.untracked.len()));
+            }
+            if !self.renamed.is_empty() {
+                parts.push(format!("{} renamed", self.renamed.len()));
+            }
+            if !self.unmerged.is_empty() {
+                parts.push(format!("{} unmerged", self.unmerged.len()));
+            }
+            parts.join(", ")
+        };
 
-    let summary = if total_changes == 0 {
-        "clean".to_string()
-    } else {
-        let mut parts: Vec<String> = Vec::new();
-        if !staged.is_empty() {
-            parts.push(format!("{} staged", staged.len()));
-        }
-        if !modified.is_empty() {
-            parts.push(format!("{} modified", modified.len()));
-        }
-        if !untracked.is_empty() {
-            parts.push(format!("{} untracked", untracked.len()));
-        }
-        if !renamed.is_empty() {
-            parts.push(format!("{} renamed", renamed.len()));
-        }
-        if !unmerged.is_empty() {
-            parts.push(format!("{} unmerged", unmerged.len()));
-        }
-        parts.join(", ")
-    };
+        GitResult::new("status".to_string(), summary, details)
+    }
+}
 
-    GitResult::new("status".to_string(), summary, details)
+/// Parse porcelain v2 status output into a compressed GitResult.
+fn parse_status(output: &str) -> GitResult {
+    let mut cats = StatusCategories::default();
+    for line in output.lines() {
+        cats.classify_line(line);
+    }
+    cats.build_result()
 }
 
 /// Extract XY field from porcelain v2 tracked entry line.
@@ -178,9 +188,10 @@ fn extract_last_path(line: &str) -> String {
 fn extract_renamed_path(line: &str) -> String {
     // Porcelain v2 type-2 entries always contain a tab separator:
     // "2 XY sub mH mI mW hH hI X_score <path>\t<origPath>"
-    let tab_pos = line
-        .find('\t')
-        .expect("porcelain v2 type-2 entries always contain a tab");
+    let Some(tab_pos) = line.find('\t') else {
+        // Malformed input: no tab found; fall back to the path portion after the prefix
+        return line.get(2..).unwrap_or("").to_string();
+    };
     let before_tab = &line[..tab_pos];
     let after_tab = &line[tab_pos + 1..];
     // Field 10 (0-indexed 9) is the new path; use splitn to preserve spaces in path
