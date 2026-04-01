@@ -8,7 +8,6 @@ pub(crate) mod golangci;
 pub(crate) mod mypy;
 pub(crate) mod ruff;
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -34,7 +33,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let (filtered_args, show_stats) = extract_show_stats(args);
 
     // Extract --json flag
-    let (filtered_args, json_output) = extract_json_flag(&filtered_args);
+    let (filtered_args, json_output) = super::extract_json_flag(&filtered_args);
 
     let Some((linter_name, linter_args)) = filtered_args.split_first() else {
         print_help();
@@ -80,17 +79,6 @@ fn print_help() {
     println!("  skim lint mypy src/            Run mypy");
     println!("  skim lint golangci run ./...   Run golangci-lint");
     println!("  eslint . 2>&1 | skim lint eslint  Pipe eslint output");
-}
-
-/// Extract `--json` flag from args, returning (filtered_args, json_output).
-fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
-    let json_output = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--json")
-        .cloned()
-        .collect();
-    (filtered, json_output)
 }
 
 // ============================================================================
@@ -154,17 +142,8 @@ pub(crate) fn run_linter(
     )
 }
 
-/// Combine stdout and stderr into a single string for regex fallback parsing.
-///
-/// Returns a borrowed reference to stdout when stderr is empty to avoid an
-/// unnecessary allocation.
-pub(crate) fn combine_stdout_stderr(output: &CommandOutput) -> Cow<'_, str> {
-    if output.stderr.is_empty() {
-        Cow::Borrowed(&output.stdout)
-    } else {
-        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
-    }
-}
+/// Re-export the shared `combine_output` under the name callers expect.
+pub(crate) use super::combine_output as combine_stdout_stderr;
 
 /// Group individual lint issues by rule into a `LintResult`.
 ///
@@ -205,6 +184,8 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use crate::output::canonical::{LintIssue, LintSeverity};
 
@@ -281,21 +262,5 @@ mod tests {
         let combined = combine_stdout_stderr(&output);
         assert_eq!(&*combined, "");
         assert!(matches!(combined, Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn test_extract_json_flag_present() {
-        let args = vec!["--json".to_string(), "eslint".to_string(), ".".to_string()];
-        let (filtered, json_output) = extract_json_flag(&args);
-        assert!(json_output);
-        assert_eq!(filtered, vec!["eslint".to_string(), ".".to_string()]);
-    }
-
-    #[test]
-    fn test_extract_json_flag_absent() {
-        let args = vec!["eslint".to_string(), ".".to_string()];
-        let (filtered, json_output) = extract_json_flag(&args);
-        assert!(!json_output);
-        assert_eq!(filtered, vec!["eslint".to_string(), ".".to_string()]);
     }
 }

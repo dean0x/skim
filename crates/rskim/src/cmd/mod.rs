@@ -22,6 +22,7 @@ mod session;
 mod stats;
 mod test;
 
+use std::borrow::Cow;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 
@@ -81,6 +82,47 @@ pub(crate) fn extract_show_stats(args: &[String]) -> (Vec<String>, bool) {
         .cloned()
         .collect();
     (filtered, show_stats)
+}
+
+/// Extract the `--json` flag from args, returning filtered args and whether
+/// the flag was present.
+///
+/// This centralises the pattern that was previously copy-pasted across git,
+/// lint, and pkg subcommand entry points.
+pub(crate) fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
+    let is_json = args.iter().any(|a| a == "--json");
+    let filtered: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--json")
+        .cloned()
+        .collect();
+    (filtered, is_json)
+}
+
+/// Extract `--json` flag from args and return the corresponding [`OutputFormat`].
+///
+/// Convenience wrapper that combines [`extract_json_flag`] with `OutputFormat`
+/// conversion, keeping subcommand handlers consistent.
+pub(crate) fn extract_output_format(args: &[String]) -> (Vec<String>, OutputFormat) {
+    let (filtered, is_json) = extract_json_flag(args);
+    let fmt = if is_json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    };
+    (filtered, fmt)
+}
+
+/// Merge stdout and stderr into a single string for fallback parsing.
+///
+/// Returns a `Cow::Borrowed` reference to stdout when stderr is empty
+/// (zero-copy fast path), or a `Cow::Owned` concatenation otherwise.
+pub(crate) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
+    if output.stderr.is_empty() {
+        Cow::Borrowed(&output.stdout)
+    } else {
+        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
+    }
 }
 
 /// Inject a flag before the `--` separator, or at the end if no separator exists.
@@ -315,5 +357,30 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "test" => test::run(args),
         // Unreachable: is_known_subcommand guard above rejects unknown names
         _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_json_flag_present() {
+        let args: Vec<String> = vec!["--json".into(), "--cached".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_extract_json_flag_absent() {
+        let args: Vec<String> = vec!["--cached".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(filtered, vec!["--cached"]);
     }
 }

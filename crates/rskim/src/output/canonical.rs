@@ -504,6 +504,90 @@ impl fmt::Display for PkgResult {
 }
 
 // ============================================================================
+// DiffResult types
+// ============================================================================
+
+/// Status of a file in a diff
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DiffFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Binary,
+}
+
+impl fmt::Display for DiffFileStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DiffFileStatus::Added => write!(f, "added"),
+            DiffFileStatus::Modified => write!(f, "modified"),
+            DiffFileStatus::Deleted => write!(f, "deleted"),
+            DiffFileStatus::Renamed => write!(f, "renamed"),
+            DiffFileStatus::Binary => write!(f, "binary"),
+        }
+    }
+}
+
+/// A single file entry within a diff result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DiffFileEntry {
+    pub(crate) path: String,
+    pub(crate) status: DiffFileStatus,
+    pub(crate) changed_regions: usize,
+}
+
+/// Complete diff result with file entries and pre-rendered display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DiffResult {
+    pub(crate) files_changed: usize,
+    pub(crate) files: Vec<DiffFileEntry>,
+    #[serde(default)]
+    rendered: String,
+}
+
+impl DiffResult {
+    /// Create a new DiffResult with pre-computed rendered output
+    pub(crate) fn new(files: Vec<DiffFileEntry>, rendered: String) -> Self {
+        let files_changed = files.len();
+        Self {
+            files_changed,
+            files,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization)
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            // Re-render from file entries as a summary fallback
+            use std::fmt::Write;
+            let mut output = format!("[diff] {} files changed", self.files_changed);
+            for file in &self.files {
+                let _ = write!(
+                    output,
+                    "\n  {} ({}, {} regions)",
+                    file.path, file.status, file.changed_regions
+                );
+            }
+            self.rendered = output;
+        }
+    }
+}
+
+impl AsRef<str> for DiffResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for DiffResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -969,5 +1053,57 @@ mod tests {
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
         assert_eq!(result.as_ref(), "PKG CHECK | pip | 0 issues");
+    }
+
+    // ========================================================================
+    // DiffResult ensure_rendered lossy fallback (#103 review batch-7)
+    // ========================================================================
+
+    #[test]
+    fn test_diff_result_ensure_rendered_produces_summary_fallback() {
+        // When `rendered` is empty (e.g., after deserialization that strips the
+        // rendered field), `ensure_rendered` produces a *lossy* summary: only
+        // file paths, statuses, and region counts -- not the full diff content.
+        // This is intentional: the rendered field is the source of truth; the
+        // fallback exists solely to provide a human-readable overview.
+        let mut result = DiffResult::new(
+            vec![
+                DiffFileEntry {
+                    path: "src/main.rs".to_string(),
+                    status: DiffFileStatus::Modified,
+                    changed_regions: 3,
+                },
+                DiffFileEntry {
+                    path: "src/lib.rs".to_string(),
+                    status: DiffFileStatus::Added,
+                    changed_regions: 1,
+                },
+            ],
+            String::new(), // simulate empty rendered field
+        );
+
+        result.ensure_rendered();
+        let output = result.as_ref();
+
+        // Summary header
+        assert!(
+            output.starts_with("[diff] 2 files changed"),
+            "expected summary header, got: {output}"
+        );
+        // Per-file entries with status and region counts
+        assert!(
+            output.contains("src/main.rs (modified, 3 regions)"),
+            "expected main.rs entry, got: {output}"
+        );
+        assert!(
+            output.contains("src/lib.rs (added, 1 regions)"),
+            "expected lib.rs entry, got: {output}"
+        );
+        // Intentionally does NOT contain actual diff hunks -- this is the lossy
+        // nature of the fallback.
+        assert!(
+            !output.contains('+') && !output.contains('-'),
+            "fallback should not contain diff markers"
+        );
     }
 }

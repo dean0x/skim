@@ -32,8 +32,8 @@ serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 
 [dev-dependencies]
-insta = "1.39"  # Snapshot testing
-criterion = "0.5"  # Benchmarking
+insta = { workspace = true }
+criterion = { workspace = true }
 
 [[bench]]
 name = "transform_bench"

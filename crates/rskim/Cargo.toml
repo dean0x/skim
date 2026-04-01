@@ -30,9 +30,13 @@ strip-ansi-escapes = { workspace = true }
 regex = { workspace = true }
 rusqlite = { workspace = true }
 colored = { workspace = true }
+# Required: `rskim_core::Parser::parse()` returns `tree_sitter::Tree`, so the
+# CLI needs this dep to work with Tree/Node types in the diff rendering pipeline
+# (git.rs: is_container_node, find_changed_node_ranges, render_with_unchanged_context).
+tree-sitter = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2.0"
-predicates = "3.0"
-tempfile = "3.0"
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
 serde_json = { workspace = true }

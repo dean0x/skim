@@ -1,0 +1,15 @@
+diff --git a/src/utils/helpers.ts b/src/utils/format.ts
+similarity index 85%
+rename from src/utils/helpers.ts
+rename to src/utils/format.ts
+index aaa1111..bbb2222 100644
+--- a/src/utils/helpers.ts
++++ b/src/utils/format.ts
+@@ -1,5 +1,5 @@
+-export function formatDate(date: Date): string {
+-  return date.toISOString();
++export function formatDate(date: Date, locale?: string): string {
++  return locale ? date.toLocaleDateString(locale) : date.toISOString();
+ }
+
+ export function capitalize(str: string): string {

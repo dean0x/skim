@@ -1,0 +1,14 @@
+diff --git a/src/legacy/old_auth.ts b/src/legacy/old_auth.ts
+deleted file mode 100644
+index fedcba9..0000000
+--- a/src/legacy/old_auth.ts
++++ /dev/null
+@@ -1,8 +0,0 @@
+-import { createHash } from "crypto";
+-
+-export function hashPassword(password: string): string {
+-  return createHash("md5").update(password).digest("hex");
+-}
+-
+-// DEPRECATED: Use bcrypt instead
+-export const SALT = "hardcoded-salt";

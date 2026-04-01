@@ -8,7 +8,6 @@ mod npm;
 mod pip;
 mod pnpm;
 
-use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -48,7 +47,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     }
 
     let (filtered_args, show_stats) = crate::cmd::extract_show_stats(args);
-    let (json_args, json_output) = extract_json_flag(&filtered_args);
+    let (json_args, json_output) = crate::cmd::extract_json_flag(&filtered_args);
 
     let Some((tool_name, tool_args)) = json_args.split_first() else {
         print_help();
@@ -75,29 +74,8 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     }
 }
 
-/// Extract the `--json` flag from args, returning filtered args and whether
-/// the flag was present.
-fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
-    let json_output = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--json")
-        .cloned()
-        .collect();
-    (filtered, json_output)
-}
-
-/// Merge stdout and stderr into a single string.
-///
-/// Returns a `Cow::Borrowed` reference to stdout when stderr is empty
-/// (zero-copy fast path), or a `Cow::Owned` concatenation otherwise.
-pub(super) fn combine_output(output: &CommandOutput) -> Cow<'_, str> {
-    if output.stderr.is_empty() {
-        Cow::Borrowed(&output.stdout)
-    } else {
-        Cow::Owned(format!("{}\n{}", output.stdout, output.stderr))
-    }
-}
+/// Re-export shared helper for child module use.
+pub(super) use super::combine_output;
 
 /// Configuration for a package subcommand invocation.
 ///
@@ -147,12 +125,35 @@ where
     )
 }
 
+fn print_help() {
+    println!("skim pkg <tool> [subcmd] [args...]");
+    println!();
+    println!("  Parse package manager output for AI context windows.");
+    println!();
+    println!("Available tools:");
+    for tool in KNOWN_TOOLS {
+        println!("  {tool}");
+    }
+    println!();
+    println!("Examples:");
+    println!("  skim pkg npm install              Run npm install");
+    println!("  skim pkg npm audit                Run npm audit");
+    println!("  skim pkg npm outdated             Run npm outdated");
+    println!("  skim pkg pip install flask        Run pip install flask");
+    println!("  skim pkg pip check                Run pip check");
+    println!("  skim pkg cargo audit              Run cargo audit");
+    println!("  skim pkg pnpm install             Run pnpm install");
+    println!("  npm install 2>&1 | skim pkg npm install  Pipe npm output");
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
 
     // ========================================================================
@@ -188,26 +189,6 @@ mod tests {
     }
 
     // ========================================================================
-    // extract_json_flag
-    // ========================================================================
-
-    #[test]
-    fn test_extract_json_flag_present() {
-        let args: Vec<String> = vec!["npm".into(), "--json".into(), "install".into()];
-        let (filtered, found) = extract_json_flag(&args);
-        assert!(found);
-        assert_eq!(filtered, vec!["npm".to_string(), "install".to_string()]);
-    }
-
-    #[test]
-    fn test_extract_json_flag_absent() {
-        let args: Vec<String> = vec!["npm".into(), "install".into()];
-        let (filtered, found) = extract_json_flag(&args);
-        assert!(!found);
-        assert_eq!(filtered, vec!["npm".to_string(), "install".to_string()]);
-    }
-
-    // ========================================================================
     // combine_output
     // ========================================================================
 
@@ -236,25 +217,4 @@ mod tests {
         assert!(matches!(combined, Cow::Owned(_)));
         assert_eq!(combined.as_ref(), "hello\nwarning");
     }
-}
-
-fn print_help() {
-    println!("skim pkg <tool> [subcmd] [args...]");
-    println!();
-    println!("  Parse package manager output for AI context windows.");
-    println!();
-    println!("Available tools:");
-    for tool in KNOWN_TOOLS {
-        println!("  {tool}");
-    }
-    println!();
-    println!("Examples:");
-    println!("  skim pkg npm install              Run npm install");
-    println!("  skim pkg npm audit                Run npm audit");
-    println!("  skim pkg npm outdated             Run npm outdated");
-    println!("  skim pkg pip install flask        Run pip install flask");
-    println!("  skim pkg pip check                Run pip check");
-    println!("  skim pkg cargo audit              Run cargo audit");
-    println!("  skim pkg pnpm install             Run pnpm install");
-    println!("  npm install 2>&1 | skim pkg npm install  Pipe npm output");
 }
