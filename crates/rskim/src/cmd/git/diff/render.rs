@@ -77,7 +77,9 @@ pub(super) fn render_diff_file(
 
     // Determine language for parser lookup — serde-based formats (JSON, YAML,
     // TOML) have no tree-sitter grammar, so fall back to raw hunks.
-    let Some(lang) = Language::from_path(Path::new(&file_diff.path)).filter(|l| !l.is_serde_based()) else {
+    let Some(lang) =
+        Language::from_path(Path::new(&file_diff.path)).filter(|l| !l.is_serde_based())
+    else {
         return render_raw_hunks(file_diff, &output);
     };
 
@@ -236,9 +238,7 @@ fn render_with_unchanged_context(
         // document order), so partition_point skips all ranges that end
         // before this node. We then scan forward only while range.start
         // is within the node boundary — O(log R + matches) instead of O(R).
-        let first = ctx
-            .changed_ranges
-            .partition_point(|r| r.start < node_start);
+        let first = ctx.changed_ranges.partition_point(|r| r.start < node_start);
         let has_changes = ctx.changed_ranges[first..].iter().any(|r| {
             if r.start > node_end {
                 return false;
@@ -397,9 +397,7 @@ fn render_node_with_hunks(
     // Hunks are sorted by new_start (they come from git's sequential output).
     // Use partition_point to skip hunks that end before node_start, then
     // take_while to stop once the hunk starts after node_end — O(log H + matches).
-    let first = hunks.partition_point(|h| {
-        h.new_start + h.new_count.saturating_sub(1) < node_start
-    });
+    let first = hunks.partition_point(|h| h.new_start + h.new_count.saturating_sub(1) < node_start);
     let relevant_hunks: Vec<&DiffHunk<'_>> = hunks[first..]
         .iter()
         .take_while(|h| h.new_start <= node_end)
@@ -629,12 +627,30 @@ mod tests {
 
         // Each output should contain only its own added line, not content
         // from the other file — proving cache reuse doesn't bleed state.
-        assert!(out_a.contains("foo.ts"), "first render should reference foo.ts");
-        assert!(out_a.contains("+const FOO = 1;"), "first render should contain its patch line");
-        assert!(out_b.contains("bar.ts"), "second render should reference bar.ts");
-        assert!(out_b.contains("+const BAR = 2;"), "second render should contain its patch line");
-        assert!(!out_a.contains("BAR"), "first render must not bleed second file content");
-        assert!(!out_b.contains("FOO"), "second render must not bleed first file content");
+        assert!(
+            out_a.contains("foo.ts"),
+            "first render should reference foo.ts"
+        );
+        assert!(
+            out_a.contains("+const FOO = 1;"),
+            "first render should contain its patch line"
+        );
+        assert!(
+            out_b.contains("bar.ts"),
+            "second render should reference bar.ts"
+        );
+        assert!(
+            out_b.contains("+const BAR = 2;"),
+            "second render should contain its patch line"
+        );
+        assert!(
+            !out_a.contains("BAR"),
+            "first render must not bleed second file content"
+        );
+        assert!(
+            !out_b.contains("FOO"),
+            "second render must not bleed first file content"
+        );
     }
 
     // ========================================================================
@@ -654,11 +670,7 @@ mod tests {
                 old_count: 3,
                 new_start: 1,
                 new_count: 4,
-                patch_lines: vec![
-                    " fn main() {",
-                    "+    println!(\"hello\");",
-                    " }",
-                ],
+                patch_lines: vec![" fn main() {", "+    println!(\"hello\");", " }"],
             }],
         };
 

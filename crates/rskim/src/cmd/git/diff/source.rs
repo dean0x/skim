@@ -68,7 +68,11 @@ pub(super) fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Resul
 /// - Unstaged (working tree): read from disk (respecting `-C` / `--work-tree`)
 /// - `--cached` / `--staged`: use `git show :path`
 /// - Commit range (`A..B` or `A B`): use `git show B:path`
-pub(super) fn get_file_source(path: &str, global_flags: &[String], args: &[String]) -> anyhow::Result<String> {
+pub(super) fn get_file_source(
+    path: &str,
+    global_flags: &[String],
+    args: &[String],
+) -> anyhow::Result<String> {
     // Reject null bytes — they could truncate the ref spec passed to git.
     if path.contains('\0') {
         anyhow::bail!("invalid diff path: contains null byte");

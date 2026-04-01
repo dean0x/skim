@@ -11,7 +11,11 @@ use super::{has_limit_flag, run_parsed_command, run_passthrough};
 ///
 /// Flag-aware passthrough: if user has `--format`, `--pretty`, or `--oneline`,
 /// output is already compact — pass through unmodified.
-pub(super) fn run_log(global_flags: &[String], args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+pub(super) fn run_log(
+    global_flags: &[String],
+    args: &[String],
+    show_stats: bool,
+) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--format", "--pretty", "--oneline"]) {
         return run_passthrough(global_flags, "log", args, show_stats);
     }

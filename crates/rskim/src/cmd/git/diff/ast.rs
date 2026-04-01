@@ -64,7 +64,10 @@ pub(super) fn is_container_node(node: &tree_sitter::Node<'_>) -> bool {
 /// parent range.
 ///
 /// Lines are 1-indexed to match diff output.
-pub(super) fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHunk<'_>]) -> Vec<ChangedNodeRange> {
+pub(super) fn find_changed_node_ranges(
+    tree: &tree_sitter::Tree,
+    hunks: &[DiffHunk<'_>],
+) -> Vec<ChangedNodeRange> {
     if hunks.is_empty() {
         return Vec::new();
     }
@@ -83,10 +86,7 @@ pub(super) fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHu
         let node_start = child.start_position().row + 1;
         let node_end = child.end_position().row + 1;
 
-        let overlaps = changed_lines
-            .range(node_start..=node_end)
-            .next()
-            .is_some();
+        let overlaps = changed_lines.range(node_start..=node_end).next().is_some();
 
         if !overlaps {
             continue;
@@ -101,10 +101,7 @@ pub(super) fn find_changed_node_ranges(tree: &tree_sitter::Tree, hunks: &[DiffHu
                 let gc_start = grandchild.start_position().row + 1;
                 let gc_end = grandchild.end_position().row + 1;
 
-                let gc_overlaps = changed_lines
-                    .range(gc_start..=gc_end)
-                    .next()
-                    .is_some();
+                let gc_overlaps = changed_lines.range(gc_start..=gc_end).next().is_some();
 
                 if gc_overlaps {
                     found_child = true;
@@ -158,11 +155,7 @@ mod tests {
             old_count: 1,
             new_start: 3,
             new_count: 3,
-            patch_lines: vec![
-                "-  old line",
-                "+  new line 1",
-                "+  new line 2",
-            ],
+            patch_lines: vec!["-  old line", "+  new line 1", "+  new line 2"],
         }];
         let lines = build_changed_lines(&hunks);
         // Deletion at new_start=3 inserts 3, additions insert 3 and 4
@@ -184,11 +177,7 @@ mod tests {
             old_count: 3,
             new_start: 1,
             new_count: 3,
-            patch_lines: vec![
-                " unchanged 1",
-                " unchanged 2",
-                " unchanged 3",
-            ],
+            patch_lines: vec![" unchanged 1", " unchanged 2", " unchanged 3"],
         }];
         let lines = build_changed_lines(&hunks);
         assert!(
@@ -211,10 +200,7 @@ mod tests {
             old_count: 2,
             new_start: 5,
             new_count: 0,
-            patch_lines: vec![
-                "-  removed line 1",
-                "-  removed line 2",
-            ],
+            patch_lines: vec!["-  removed line 1", "-  removed line 2"],
         }];
         let lines = build_changed_lines(&hunks);
         assert!(
@@ -231,20 +217,14 @@ mod tests {
                 old_count: 1,
                 new_start: 2,
                 new_count: 1,
-                patch_lines: vec![
-                    "-  old",
-                    "+  new",
-                ],
+                patch_lines: vec!["-  old", "+  new"],
             },
             DiffHunk {
                 old_start: 10,
                 old_count: 1,
                 new_start: 10,
                 new_count: 1,
-                patch_lines: vec![
-                    "-  old2",
-                    "+  new2",
-                ],
+                patch_lines: vec!["-  old2", "+  new2"],
             },
         ];
         let lines = build_changed_lines(&hunks);
@@ -341,11 +321,7 @@ mod tests {
             old_count: 1,
             new_start: 2,
             new_count: 2,
-            patch_lines: vec![
-                "-  return 1;",
-                "+  return 42;",
-                "+  console.log(42);",
-            ],
+            patch_lines: vec!["-  return 1;", "+  return 42;", "+  console.log(42);"],
         }];
 
         let ranges = find_changed_node_ranges(&tree, &hunks);

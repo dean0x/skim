@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::types::{DiffHunk, FileDiff, FileChange, FileMetadata};
+use super::types::{DiffHunk, FileChange, FileDiff, FileMetadata};
 use crate::output::canonical::DiffFileStatus;
 
 /// Matches hunk headers: `@@ -N,M +N,M @@ optional context`
@@ -217,7 +217,10 @@ pub(super) fn parse_diff_git_header(line: &str) -> (String, String) {
     // We use rfind so that paths containing " b/" in a directory name
     // are split at the *last* occurrence (which is the real separator).
     // Try " b/" first, then " b\" (Windows), then fall back to last space.
-    let sep = rest.rfind(" b/").or_else(|| rest.rfind(" b\\")).or_else(|| rest.rfind(' '));
+    let sep = rest
+        .rfind(" b/")
+        .or_else(|| rest.rfind(" b\\"))
+        .or_else(|| rest.rfind(' '));
     if let Some(pos) = sep {
         (rest[..pos].to_string(), rest[pos + 1..].to_string())
     } else {
@@ -587,10 +590,7 @@ mod tests {
 
     #[test]
     fn test_scan_extended_headers_stops_at_next_diff_header() {
-        let lines = vec![
-            "index abc..def 100644",
-            "diff --git a/other.rs b/other.rs",
-        ];
+        let lines = vec!["index abc..def 100644", "diff --git a/other.rs b/other.rs"];
         let (meta, idx) = scan_extended_headers(&lines, 0);
         assert_eq!(meta.change, FileChange::Modified);
         assert_eq!(idx, 1, "should stop at the diff --git line");
@@ -736,11 +736,8 @@ mod tests {
             file_minus: "a/src/utils/helpers.ts".to_string(),
             file_plus: "b/src/utils/format.ts".to_string(),
         };
-        let (status, path, old_path) = resolve_file_info(
-            "a/src/utils/helpers.ts",
-            "b/src/utils/format.ts",
-            &meta,
-        );
+        let (status, path, old_path) =
+            resolve_file_info("a/src/utils/helpers.ts", "b/src/utils/format.ts", &meta);
         assert_eq!(status, DiffFileStatus::Renamed);
         assert_eq!(path, "src/utils/format.ts");
         assert_eq!(old_path.as_deref(), Some("src/utils/helpers.ts"));

@@ -87,7 +87,8 @@ impl StatusCategories {
                 self.staged.push(format!("{}{}", stage_prefix(x), path));
             }
             if y != '.' {
-                self.modified.push(format!("{}{}", worktree_prefix(y), path));
+                self.modified
+                    .push(format!("{}{}", worktree_prefix(y), path));
             }
         }
     }
@@ -227,8 +228,8 @@ fn worktree_prefix(c: char) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::LazyLock;
     use regex::Regex;
+    use std::sync::LazyLock;
 
     /// Matches diff stat lines: " file | 42 +++++---"
     static STAT_RE: LazyLock<Regex> =
