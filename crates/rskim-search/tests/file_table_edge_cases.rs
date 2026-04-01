@@ -193,3 +193,49 @@ fn test_register_order_deterministic() {
 fn test_default_is_empty() {
     assert!(FileTable::default().is_empty());
 }
+
+// ============================================================================
+// Root-confined registration
+// ============================================================================
+
+#[test]
+fn test_register_within_accepts_relative_path() {
+    let mut table = FileTable::new();
+    let result = table.register_within(Path::new("src/main.rs"), Path::new("/project"));
+    assert!(result.is_ok());
+    assert_eq!(table.len(), 1);
+}
+
+#[test]
+fn test_register_within_rejects_parent_escape() {
+    let mut table = FileTable::new();
+    let result = table.register_within(Path::new("../../etc/passwd"), Path::new("/project"));
+    assert!(result.is_err());
+    assert_eq!(table.len(), 0);
+}
+
+#[test]
+fn test_register_within_rejects_absolute_path() {
+    let mut table = FileTable::new();
+    let result = table.register_within(Path::new("/etc/passwd"), Path::new("/project"));
+    assert!(result.is_err());
+    assert_eq!(table.len(), 0);
+}
+
+#[test]
+fn test_register_within_accepts_dot_dot_that_resolves_inside() {
+    let mut table = FileTable::new();
+    // src/../lib/main.rs normalizes to lib/main.rs — still inside root
+    let result = table.register_within(Path::new("src/../lib/main.rs"), Path::new("/project"));
+    assert!(result.is_ok());
+    assert_eq!(table.lookup(result.unwrap()), Some(Path::new("lib/main.rs")));
+}
+
+#[test]
+fn test_register_within_idempotent() {
+    let mut table = FileTable::new();
+    let id1 = table.register_within(Path::new("src/main.rs"), Path::new("/project")).unwrap();
+    let id2 = table.register_within(Path::new("./src/main.rs"), Path::new("/project")).unwrap();
+    assert_eq!(id1, id2);
+    assert_eq!(table.len(), 1);
+}

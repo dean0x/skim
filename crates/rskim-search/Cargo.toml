@@ -15,6 +15,7 @@ rskim-core = { version = "2.0.0", path = "../rskim-core" }
 tree-sitter = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+rustc-hash = "1.1"
 
 [dev-dependencies]
 serde_json = { workspace = true }

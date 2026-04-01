@@ -22,5 +22,5 @@ mod types;
 pub use traits::{FieldClassifier, LayerBuilder, SearchLayer};
 pub use types::{
     FileId, FileTable, IndexStats, LineRange, MatchSpan, Result, SearchError, SearchField,
-    SearchQuery, SearchResult, TemporalFlags,
+    SearchQuery, SearchResult, TemporalFlags, MAX_FILE_TABLE_ENTRIES,
 };

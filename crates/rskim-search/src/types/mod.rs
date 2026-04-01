@@ -10,6 +10,6 @@ mod query;
 mod result;
 
 pub use error::{Result, SearchError};
-pub use file_table::{FileId, FileTable};
+pub use file_table::{FileId, FileTable, MAX_FILE_TABLE_ENTRIES};
 pub use query::{SearchField, SearchQuery, TemporalFlags};
 pub use result::{IndexStats, LineRange, MatchSpan, SearchResult};

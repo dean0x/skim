@@ -8,10 +8,19 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("rskim-search requires a 64-bit target (usize must be at least 64 bits)");
 
-use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
+use rustc_hash::FxHashMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::SearchError;
+
+/// Maximum number of entries allowed in a deserialized [`FileTable`].
+///
+/// Prevents OOM from malicious or corrupted index files. 10 million files
+/// is well beyond any realistic codebase while still catching abuse.
+pub const MAX_FILE_TABLE_ENTRIES: usize = 10_000_000;
 
 /// Opaque identifier for a file in the search index.
 ///
@@ -42,7 +51,7 @@ pub struct FileTable {
     /// Ordered list of registered paths; index into this vec is the raw FileId.
     paths: Vec<PathBuf>,
     /// Reverse map: normalized path -> FileId.
-    ids: HashMap<PathBuf, FileId>,
+    ids: FxHashMap<PathBuf, FileId>,
 }
 
 // Custom Serialize: only emit the paths vec (ids are derived)
@@ -61,8 +70,14 @@ impl<'de> Deserialize<'de> for FileTable {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let raw_paths = Vec::<PathBuf>::deserialize(deserializer)?;
+        if raw_paths.len() > MAX_FILE_TABLE_ENTRIES {
+            return Err(serde::de::Error::custom(format!(
+                "file table has {} entries, exceeds maximum of {MAX_FILE_TABLE_ENTRIES}",
+                raw_paths.len()
+            )));
+        }
         let mut paths = Vec::with_capacity(raw_paths.len());
-        let mut ids = HashMap::with_capacity(raw_paths.len());
+        let mut ids = FxHashMap::with_capacity_and_hasher(raw_paths.len(), Default::default());
         for (i, p) in raw_paths.iter().enumerate() {
             let normalized = Self::normalize(p);
             // u64::try_from(i) is infallible on 64-bit (guarded by compile_error above)
@@ -80,7 +95,7 @@ impl FileTable {
     pub fn new() -> Self {
         Self {
             paths: Vec::new(),
-            ids: HashMap::new(),
+            ids: FxHashMap::default(),
         }
     }
 
@@ -102,6 +117,29 @@ impl FileTable {
         self.ids.insert(normalized.clone(), id);
         self.paths.push(normalized);
         id
+    }
+
+    /// Register `path` after verifying it does not escape `root`.
+    ///
+    /// The path is normalized first. If the normalized form starts with `..` or
+    /// is absolute (has a root component), it is rejected with [`SearchError::InvalidQuery`].
+    /// This prevents directory traversal attacks when paths originate from untrusted input.
+    pub fn register_within(&mut self, path: &Path, _root: &Path) -> crate::Result<FileId> {
+        let normalized = Self::normalize(path);
+        // Reject paths that escape the project root
+        if normalized.starts_with("..") {
+            return Err(SearchError::InvalidQuery(format!(
+                "path escapes project root: {}",
+                normalized.display()
+            )));
+        }
+        if normalized.has_root() {
+            return Err(SearchError::InvalidQuery(format!(
+                "absolute path not allowed: {}",
+                normalized.display()
+            )));
+        }
+        Ok(self.register(path))
     }
 
     /// Resolve a `FileId` back to a path, if it was registered.

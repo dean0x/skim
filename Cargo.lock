@@ -956,6 +956,7 @@ name = "rskim-search"
 version = "2.0.0"
 dependencies = [
  "rskim-core",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
