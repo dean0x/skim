@@ -36,13 +36,34 @@ pub(super) struct FileDiff<'a> {
     pub hunks: Vec<DiffHunk<'a>>,
 }
 
+/// The kind of change recorded in extended diff headers.
+///
+/// Encodes the mutually-exclusive file states that the boolean flags
+/// `is_new`, `is_deleted`, `is_renamed`, and `is_binary` previously
+/// represented. Using an enum makes illegal combinations unrepresentable
+/// at the type level.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) enum FileChange {
+    /// Regular modification — the default when no special header is seen.
+    #[default]
+    Modified,
+    /// `new file mode` header present.
+    New,
+    /// `deleted file mode` header present.
+    Deleted,
+    /// `rename from` / `rename to` headers present.
+    Renamed {
+        /// Source path from `rename from <path>`, if the header was present.
+        from: Option<String>,
+    },
+    /// `Binary files … differ` line present.
+    Binary,
+}
+
 /// Metadata collected from extended diff headers (new/deleted/renamed/binary).
 pub(super) struct FileMetadata {
-    pub is_binary: bool,
-    pub is_new: bool,
-    pub is_deleted: bool,
-    pub is_renamed: bool,
-    pub rename_from: Option<String>,
+    /// The kind of change — replaces the old `is_new`/`is_deleted`/`is_renamed`/`is_binary` booleans.
+    pub change: FileChange,
     pub file_minus: String,
     pub file_plus: String,
 }
@@ -70,9 +91,9 @@ pub(super) struct ParentContext {
 
 /// Shared context for mode-aware rendering functions.
 ///
-/// Groups the parameters that are threaded through the rendering call chain
-/// to stay within clippy's 7-argument limit. The tree-sitter `Parser` is
-/// passed separately as `&mut` (cannot be shared via an immutable context).
+/// Groups the parameters that are threaded through the rendering call chain.
+/// The tree-sitter `Parser` is passed separately as `&mut` (cannot be shared
+/// via an immutable context).
 pub(super) struct ModeRenderContext<'a> {
     pub changed_ranges: &'a [ChangedNodeRange],
     pub hunks: &'a [DiffHunk<'a>],

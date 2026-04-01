@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::types::{DiffHunk, FileDiff, FileMetadata};
+use super::types::{DiffHunk, FileDiff, FileChange, FileMetadata};
 use crate::output::canonical::DiffFileStatus;
 
 /// Matches hunk headers: `@@ -N,M +N,M @@ optional context`
@@ -31,11 +31,7 @@ pub(super) fn parse_hunk_header(line: &str) -> Option<(usize, usize, usize, usiz
 /// the next unprocessed line.
 pub(super) fn scan_extended_headers(lines: &[&str], start: usize) -> (FileMetadata, usize) {
     let mut meta = FileMetadata {
-        is_binary: false,
-        is_new: false,
-        is_deleted: false,
-        is_renamed: false,
-        rename_from: None,
+        change: FileChange::Modified,
         file_minus: String::new(),
         file_plus: String::new(),
     };
@@ -45,16 +41,19 @@ pub(super) fn scan_extended_headers(lines: &[&str], start: usize) -> (FileMetada
         let l = lines[i];
 
         if l.starts_with("new file mode") {
-            meta.is_new = true;
+            meta.change = FileChange::New;
         } else if l.starts_with("deleted file mode") {
-            meta.is_deleted = true;
+            meta.change = FileChange::Deleted;
         } else if l.starts_with("rename from ") {
-            meta.is_renamed = true;
-            meta.rename_from = Some(l.strip_prefix("rename from ").unwrap_or("").to_string());
+            let from = l.strip_prefix("rename from ").unwrap_or("").to_string();
+            meta.change = FileChange::Renamed { from: Some(from) };
         } else if l.starts_with("rename to ") {
-            meta.is_renamed = true;
+            // Only update if not already set to Renamed (rename from comes first)
+            if !matches!(meta.change, FileChange::Renamed { .. }) {
+                meta.change = FileChange::Renamed { from: None };
+            }
         } else if l.starts_with("Binary files") && l.contains("differ") {
-            meta.is_binary = true;
+            meta.change = FileChange::Binary;
         } else if l.starts_with("--- ") {
             meta.file_minus = l.strip_prefix("--- ").unwrap_or("").to_string();
         } else if l.starts_with("+++ ") {
@@ -126,16 +125,21 @@ pub(super) fn resolve_file_info(
     b_path: &str,
     meta: &FileMetadata,
 ) -> (DiffFileStatus, String, Option<String>) {
-    let status = if meta.is_binary {
-        DiffFileStatus::Binary
-    } else if meta.is_new || meta.file_minus == "/dev/null" || meta.file_minus == "a//dev/null" {
-        DiffFileStatus::Added
-    } else if meta.is_deleted || meta.file_plus == "/dev/null" || meta.file_plus == "b//dev/null" {
-        DiffFileStatus::Deleted
-    } else if meta.is_renamed {
-        DiffFileStatus::Renamed
-    } else {
-        DiffFileStatus::Modified
+    let status = match &meta.change {
+        FileChange::Binary => DiffFileStatus::Binary,
+        FileChange::New => DiffFileStatus::Added,
+        FileChange::Deleted => DiffFileStatus::Deleted,
+        FileChange::Renamed { .. } => DiffFileStatus::Renamed,
+        FileChange::Modified => {
+            // Also check --- / +++ paths as fallback for diffs without explicit headers
+            if meta.file_minus == "/dev/null" || meta.file_minus == "a//dev/null" {
+                DiffFileStatus::Added
+            } else if meta.file_plus == "/dev/null" || meta.file_plus == "b//dev/null" {
+                DiffFileStatus::Deleted
+            } else {
+                DiffFileStatus::Modified
+            }
+        }
     };
 
     let path = if status == DiffFileStatus::Deleted {
@@ -144,10 +148,8 @@ pub(super) fn resolve_file_info(
         strip_ab_prefix(b_path)
     };
 
-    let old_path = if meta.is_renamed {
-        meta.rename_from
-            .clone()
-            .or_else(|| Some(strip_ab_prefix(a_path)))
+    let old_path = if let FileChange::Renamed { from } = &meta.change {
+        from.clone().or_else(|| Some(strip_ab_prefix(a_path)))
     } else {
         None
     };
@@ -182,7 +184,7 @@ pub(super) fn parse_unified_diff<'a>(output: &'a str) -> Vec<FileDiff<'a>> {
 
         let (status, path, old_path) = resolve_file_info(&a_path, &b_path, &meta);
 
-        let hunks = if meta.is_binary {
+        let hunks = if meta.change == FileChange::Binary {
             // Skip remaining lines for binary files
             while i < lines.len() && !lines[i].starts_with("diff --git ") {
                 i += 1;
@@ -510,5 +512,315 @@ mod tests {
         // Both should be the same — no split possible
         assert_eq!(a, "noseparator");
         assert_eq!(b, "noseparator");
+    }
+
+    // ========================================================================
+    // scan_extended_headers direct unit tests (parse:51:testing)
+    // ========================================================================
+
+    #[test]
+    fn test_scan_extended_headers_new_file() {
+        let lines = vec![
+            "new file mode 100644",
+            "index 0000000..abc1234",
+            "--- /dev/null",
+            "+++ b/src/new.rs",
+        ];
+        let (meta, idx) = scan_extended_headers(&lines, 0);
+        assert_eq!(meta.change, FileChange::New);
+        assert_eq!(meta.file_minus, "/dev/null");
+        assert_eq!(meta.file_plus, "b/src/new.rs");
+        assert_eq!(idx, lines.len(), "should consume all lines");
+    }
+
+    #[test]
+    fn test_scan_extended_headers_deleted_file() {
+        let lines = vec![
+            "deleted file mode 100644",
+            "index abc1234..0000000",
+            "--- a/src/old.rs",
+            "+++ /dev/null",
+        ];
+        let (meta, idx) = scan_extended_headers(&lines, 0);
+        assert_eq!(meta.change, FileChange::Deleted);
+        assert_eq!(meta.file_minus, "a/src/old.rs");
+        assert_eq!(meta.file_plus, "/dev/null");
+        assert_eq!(idx, lines.len());
+    }
+
+    #[test]
+    fn test_scan_extended_headers_rename_with_from() {
+        let lines = vec![
+            "similarity index 95%",
+            "rename from src/utils/helpers.ts",
+            "rename to src/utils/format.ts",
+            "index abc..def 100644",
+            "--- a/src/utils/helpers.ts",
+            "+++ b/src/utils/format.ts",
+        ];
+        let (meta, idx) = scan_extended_headers(&lines, 0);
+        assert_eq!(
+            meta.change,
+            FileChange::Renamed {
+                from: Some("src/utils/helpers.ts".to_string())
+            }
+        );
+        assert_eq!(idx, lines.len());
+    }
+
+    #[test]
+    fn test_scan_extended_headers_rename_to_only() {
+        // `rename to` without a preceding `rename from` — sets Renamed { from: None }
+        let lines = vec!["rename to src/new.rs"];
+        let (meta, _) = scan_extended_headers(&lines, 0);
+        assert_eq!(meta.change, FileChange::Renamed { from: None });
+    }
+
+    #[test]
+    fn test_scan_extended_headers_binary() {
+        let lines = vec!["Binary files a/img.png and b/img.png differ"];
+        let (meta, idx) = scan_extended_headers(&lines, 0);
+        assert_eq!(meta.change, FileChange::Binary);
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn test_scan_extended_headers_stops_at_hunk_header() {
+        let lines = vec![
+            "index abc..def 100644",
+            "--- a/src/main.rs",
+            "+++ b/src/main.rs",
+            "@@ -1,3 +1,4 @@",
+            " context",
+        ];
+        let (meta, idx) = scan_extended_headers(&lines, 0);
+        assert_eq!(meta.change, FileChange::Modified);
+        // Must stop before consuming the @@ line
+        assert_eq!(idx, 3, "should stop at the @@ line");
+    }
+
+    #[test]
+    fn test_scan_extended_headers_stops_at_next_diff_header() {
+        let lines = vec![
+            "index abc..def 100644",
+            "diff --git a/other.rs b/other.rs",
+        ];
+        let (meta, idx) = scan_extended_headers(&lines, 0);
+        assert_eq!(meta.change, FileChange::Modified);
+        assert_eq!(idx, 1, "should stop at the diff --git line");
+    }
+
+    #[test]
+    fn test_scan_extended_headers_start_offset() {
+        // Verify the `start` parameter is respected
+        let lines = vec![
+            "diff --git a/ignore.rs b/ignore.rs",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/ignore.rs",
+        ];
+        let (meta, idx) = scan_extended_headers(&lines, 1);
+        assert_eq!(meta.change, FileChange::New);
+        assert_eq!(idx, lines.len());
+    }
+
+    // ========================================================================
+    // collect_hunks direct unit tests (parse:97:testing)
+    // ========================================================================
+
+    #[test]
+    fn test_collect_hunks_single_hunk() {
+        let lines = vec![
+            "@@ -1,3 +1,4 @@",
+            " context",
+            "-old line",
+            "+new line",
+            "+added line",
+            " context",
+        ];
+        let (hunks, idx) = collect_hunks(&lines, 0);
+        assert_eq!(hunks.len(), 1);
+        let h = &hunks[0];
+        assert_eq!(h.old_start, 1);
+        assert_eq!(h.old_count, 3);
+        assert_eq!(h.new_start, 1);
+        assert_eq!(h.new_count, 4);
+        assert_eq!(h.patch_lines.len(), 5);
+        assert_eq!(idx, lines.len());
+    }
+
+    #[test]
+    fn test_collect_hunks_two_hunks() {
+        let lines = vec![
+            "@@ -1,2 +1,2 @@",
+            "-a",
+            "+b",
+            "@@ -10,2 +10,3 @@",
+            " ctx",
+            "+new",
+            " ctx",
+        ];
+        let (hunks, idx) = collect_hunks(&lines, 0);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].old_start, 1);
+        assert_eq!(hunks[1].old_start, 10);
+        assert_eq!(hunks[1].new_count, 3);
+        assert_eq!(idx, lines.len());
+    }
+
+    #[test]
+    fn test_collect_hunks_stops_at_next_diff_header() {
+        let lines = vec![
+            "@@ -1,1 +1,1 @@",
+            "-x",
+            "+y",
+            "diff --git a/other.rs b/other.rs",
+            "@@ -5,1 +5,1 @@",
+        ];
+        let (hunks, idx) = collect_hunks(&lines, 0);
+        assert_eq!(hunks.len(), 1, "should stop before next diff --git header");
+        assert_eq!(idx, 3, "should point at the diff --git line");
+    }
+
+    #[test]
+    fn test_collect_hunks_skips_non_patch_lines() {
+        // Lines without +/-/space/\ prefix should be silently skipped
+        let lines = vec!["@@ -1,1 +1,1 @@", "index abc..def", "+added"];
+        let (hunks, _) = collect_hunks(&lines, 0);
+        assert_eq!(hunks[0].patch_lines.len(), 1);
+        assert_eq!(hunks[0].patch_lines[0], "+added");
+    }
+
+    #[test]
+    fn test_collect_hunks_empty_input() {
+        let (hunks, idx) = collect_hunks(&[], 0);
+        assert!(hunks.is_empty());
+        assert_eq!(idx, 0);
+    }
+
+    // ========================================================================
+    // resolve_file_info direct unit tests (parse:143:testing)
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_file_info_binary() {
+        let meta = FileMetadata {
+            change: FileChange::Binary,
+            file_minus: String::new(),
+            file_plus: String::new(),
+        };
+        let (status, path, old_path) = resolve_file_info("a/img.png", "b/img.png", &meta);
+        assert_eq!(status, DiffFileStatus::Binary);
+        assert_eq!(path, "img.png");
+        assert!(old_path.is_none());
+    }
+
+    #[test]
+    fn test_resolve_file_info_new_file() {
+        let meta = FileMetadata {
+            change: FileChange::New,
+            file_minus: "/dev/null".to_string(),
+            file_plus: "b/src/new.rs".to_string(),
+        };
+        let (status, path, old_path) = resolve_file_info("a/src/new.rs", "b/src/new.rs", &meta);
+        assert_eq!(status, DiffFileStatus::Added);
+        assert_eq!(path, "src/new.rs");
+        assert!(old_path.is_none());
+    }
+
+    #[test]
+    fn test_resolve_file_info_deleted_file_uses_a_path() {
+        let meta = FileMetadata {
+            change: FileChange::Deleted,
+            file_minus: "a/src/old.rs".to_string(),
+            file_plus: "/dev/null".to_string(),
+        };
+        let (status, path, old_path) = resolve_file_info("a/src/old.rs", "b/src/old.rs", &meta);
+        assert_eq!(status, DiffFileStatus::Deleted);
+        assert_eq!(path, "src/old.rs");
+        assert!(old_path.is_none());
+    }
+
+    #[test]
+    fn test_resolve_file_info_renamed_with_from() {
+        let meta = FileMetadata {
+            change: FileChange::Renamed {
+                from: Some("src/utils/helpers.ts".to_string()),
+            },
+            file_minus: "a/src/utils/helpers.ts".to_string(),
+            file_plus: "b/src/utils/format.ts".to_string(),
+        };
+        let (status, path, old_path) = resolve_file_info(
+            "a/src/utils/helpers.ts",
+            "b/src/utils/format.ts",
+            &meta,
+        );
+        assert_eq!(status, DiffFileStatus::Renamed);
+        assert_eq!(path, "src/utils/format.ts");
+        assert_eq!(old_path.as_deref(), Some("src/utils/helpers.ts"));
+    }
+
+    #[test]
+    fn test_resolve_file_info_renamed_without_from_falls_back_to_a_path() {
+        // `rename to` only — no `rename from` header captured
+        let meta = FileMetadata {
+            change: FileChange::Renamed { from: None },
+            file_minus: "a/src/old.rs".to_string(),
+            file_plus: "b/src/new.rs".to_string(),
+        };
+        let (status, path, old_path) = resolve_file_info("a/src/old.rs", "b/src/new.rs", &meta);
+        assert_eq!(status, DiffFileStatus::Renamed);
+        assert_eq!(path, "src/new.rs");
+        // Falls back to stripping a_path
+        assert_eq!(old_path.as_deref(), Some("src/old.rs"));
+    }
+
+    #[test]
+    fn test_resolve_file_info_modified_fallback_dev_null_plus() {
+        // No mode header, but +++ /dev/null signals deletion
+        let meta = FileMetadata {
+            change: FileChange::Modified,
+            file_minus: "a/src/old.rs".to_string(),
+            file_plus: "/dev/null".to_string(),
+        };
+        let (status, path, _) = resolve_file_info("a/src/old.rs", "b/src/old.rs", &meta);
+        assert_eq!(status, DiffFileStatus::Deleted);
+        assert_eq!(path, "src/old.rs");
+    }
+
+    #[test]
+    fn test_resolve_file_info_modified_fallback_dev_null_minus() {
+        // No mode header, but --- /dev/null signals addition
+        let meta = FileMetadata {
+            change: FileChange::Modified,
+            file_minus: "/dev/null".to_string(),
+            file_plus: "b/src/new.rs".to_string(),
+        };
+        let (status, path, _) = resolve_file_info("a/src/new.rs", "b/src/new.rs", &meta);
+        assert_eq!(status, DiffFileStatus::Added);
+        assert_eq!(path, "src/new.rs");
+    }
+
+    // ========================================================================
+    // parse_diff_git_header rfind edge case (parse:205:regression)
+    // ========================================================================
+
+    /// Regression test: a path where a directory component is literally named "b"
+    /// (e.g. `src/b/foo.rs`). With `find` the first " b/" occurrence would split
+    /// incorrectly; `rfind` always finds the true a/b separator.
+    #[test]
+    fn test_parse_diff_git_header_path_with_b_directory() {
+        // Both sides have "src/b/" as a directory — the separator is the *last* " b/"
+        let (a, b) = parse_diff_git_header("diff --git a/src/b/foo.rs b/src/b/foo.rs");
+        assert_eq!(a, "a/src/b/foo.rs");
+        assert_eq!(b, "b/src/b/foo.rs");
+    }
+
+    #[test]
+    fn test_parse_diff_git_header_multiple_b_components() {
+        // Deeper nesting: a/b/b/file.rs  b/b/b/file.rs
+        let (a, b) = parse_diff_git_header("diff --git a/b/b/file.rs b/b/b/file.rs");
+        assert_eq!(a, "a/b/b/file.rs");
+        assert_eq!(b, "b/b/b/file.rs");
     }
 }

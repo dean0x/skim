@@ -230,8 +230,19 @@ fn render_with_unchanged_context(
         let node_start = child.start_position().row + 1;
         let node_end = child.end_position().row + 1;
 
-        // Check if this top-level node contains any changed range
-        let has_changes = ctx.changed_ranges.iter().any(|r| {
+        // Check if this top-level node contains any changed range.
+        //
+        // changed_ranges is sorted by start (AST children are visited in
+        // document order), so partition_point skips all ranges that end
+        // before this node. We then scan forward only while range.start
+        // is within the node boundary — O(log R + matches) instead of O(R).
+        let first = ctx
+            .changed_ranges
+            .partition_point(|r| r.start < node_start);
+        let has_changes = ctx.changed_ranges[first..].iter().any(|r| {
+            if r.start > node_end {
+                return false;
+            }
             // Either the range is directly this node, or it's a child within this node
             (r.start >= node_start && r.end <= node_end)
                 || r.parent_context
@@ -288,9 +299,16 @@ fn render_container_with_mode(
             continue;
         }
 
-        let child_changed = ctx.changed_ranges.iter().any(|r| {
-            r.start == child_start
-                && r.end == child_end
+        // Binary search to the first range that could match child_start,
+        // then scan forward while start == child_start. Avoids O(R) scan.
+        let first = ctx
+            .changed_ranges
+            .partition_point(|r| r.start < child_start);
+        let child_changed = ctx.changed_ranges[first..].iter().any(|r| {
+            if r.start != child_start {
+                return false;
+            }
+            r.end == child_end
                 && r.parent_context
                     .as_ref()
                     .is_some_and(|p| p.header_line == node_start)
@@ -376,13 +394,15 @@ fn render_node_with_hunks(
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
 ) {
-    let relevant_hunks: Vec<&DiffHunk<'_>> = hunks
+    // Hunks are sorted by new_start (they come from git's sequential output).
+    // Use partition_point to skip hunks that end before node_start, then
+    // take_while to stop once the hunk starts after node_end — O(log H + matches).
+    let first = hunks.partition_point(|h| {
+        h.new_start + h.new_count.saturating_sub(1) < node_start
+    });
+    let relevant_hunks: Vec<&DiffHunk<'_>> = hunks[first..]
         .iter()
-        .filter(|h| {
-            let hunk_start = h.new_start;
-            let hunk_end = h.new_start + h.new_count.saturating_sub(1);
-            hunk_start <= node_end && hunk_end >= node_start
-        })
+        .take_while(|h| h.new_start <= node_end)
         .collect();
 
     if relevant_hunks.is_empty() {
@@ -566,6 +586,59 @@ mod tests {
         deserialized.ensure_rendered();
         // After deserialization+ensure_rendered, it should have some output
         assert!(!deserialized.as_ref().is_empty());
+    }
+
+    // ========================================================================
+    // Thread-local PARSERS cache tests
+    // ========================================================================
+
+    /// Validates that the thread-local parser cache does not corrupt state
+    /// across sequential renders of the same language.
+    ///
+    /// If the cached parser retained stale incremental-parse state from the
+    /// first call, the second render would produce wrong output. Correct
+    /// output from both calls proves the cache reuse path is safe.
+    #[test]
+    fn test_parser_cache_reuse_does_not_corrupt_output() {
+        // Both diffs are for TypeScript files — the second render must reuse
+        // the same parser instance (already in the thread-local cache after
+        // the first call) and still produce correct output.
+        let file_diff_a = FileDiff {
+            path: "src/foo.ts".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Added,
+            hunks: vec![DiffHunk {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                patch_lines: vec!["+const FOO = 1;"],
+            }],
+        };
+        let file_diff_b = FileDiff {
+            path: "src/bar.ts".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Added,
+            hunks: vec![DiffHunk {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                patch_lines: vec!["+const BAR = 2;"],
+            }],
+        };
+
+        let out_a = render_diff_file(&file_diff_a, &[], &[], DiffMode::Default, false);
+        let out_b = render_diff_file(&file_diff_b, &[], &[], DiffMode::Default, false);
+
+        // Each output should contain only its own added line, not content
+        // from the other file — proving cache reuse doesn't bleed state.
+        assert!(out_a.contains("foo.ts"), "first render should reference foo.ts");
+        assert!(out_a.contains("+const FOO = 1;"), "first render should contain its patch line");
+        assert!(out_b.contains("bar.ts"), "second render should reference bar.ts");
+        assert!(out_b.contains("+const BAR = 2;"), "second render should contain its patch line");
+        assert!(!out_a.contains("BAR"), "first render must not bleed second file content");
+        assert!(!out_b.contains("FOO"), "second render must not bleed first file content");
     }
 
     // ========================================================================
