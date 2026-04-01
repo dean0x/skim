@@ -912,7 +912,6 @@ dependencies = [
  "rayon",
  "regex",
  "rskim-core",
- "rskim-search",
  "rusqlite",
  "serde",
  "serde_json",
