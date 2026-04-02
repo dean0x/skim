@@ -108,6 +108,12 @@ pub(super) fn command() -> clap::Command {
                 .help("Remove hook and clean up"),
         )
         .arg(
+            clap::Arg::new("no-guidance")
+                .long("no-guidance")
+                .action(clap::ArgAction::SetTrue)
+                .help("Skip injecting guidance into agent instruction file"),
+        )
+        .arg(
             clap::Arg::new("force")
                 .long("force")
                 .action(clap::ArgAction::SetTrue)

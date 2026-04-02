@@ -156,6 +156,10 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
         let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, flags.agent.cli_name());
     }
 
+    // Remove guidance from instruction file
+    let global = !flags.project;
+    super::install::remove_guidance(flags.agent, global)?;
+
     println!();
     println!("  skim hook has been uninstalled.");
     println!();

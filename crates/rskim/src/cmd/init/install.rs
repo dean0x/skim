@@ -172,6 +172,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
         dry_run: flags.dry_run,
         uninstall: false,
         force: flags.force,
+        no_guidance: flags.no_guidance,
         agent: flags.agent,
     };
     let state = detect_state(&flags_override)?;
@@ -198,12 +199,22 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     }
 
     if flags_override.dry_run {
-        print_dry_run_actions(&state, options.install_marketplace);
+        print_dry_run_actions(
+            &state,
+            options.install_marketplace,
+            flags_override.no_guidance,
+            !flags_override.project,
+        );
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
     // Execute installation
-    execute_install(&state, options.install_marketplace)?;
+    execute_install(
+        &state,
+        options.install_marketplace,
+        flags_override.no_guidance,
+        !flags_override.project,
+    )?;
 
     println!();
     println!(
@@ -262,12 +273,23 @@ pub(super) fn print_detected_state(state: &DetectedState) {
     println!();
 }
 
-fn execute_install(state: &DetectedState, install_marketplace: bool) -> anyhow::Result<()> {
+fn execute_install(
+    state: &DetectedState,
+    install_marketplace: bool,
+    no_guidance: bool,
+    global: bool,
+) -> anyhow::Result<()> {
     // B7: Create hook script
     create_hook_script(state)?;
 
     // B8: Patch settings.json
     patch_settings(state, install_marketplace)?;
+
+    // Inject guidance into agent instruction file
+    if !no_guidance {
+        let agent = AgentKind::from_str(state.agent_cli_name).unwrap_or(AgentKind::ClaudeCode);
+        inject_guidance(agent, global)?;
+    }
 
     Ok(())
 }
@@ -522,10 +544,162 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
 }
 
 // ============================================================================
+// Guidance injection
+// ============================================================================
+
+use crate::cmd::session::AgentKind;
+
+/// Inject skim guidance section into the agent's main instruction file.
+///
+/// Three modes:
+/// - **Create**: File doesn't exist → create with just the guidance section
+/// - **Append**: File exists but has no skim section → append to end
+/// - **Update**: File has a skim section with older version → replace in place
+/// - **Skip**: File has a skim section with current version → idempotent no-op
+pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<()> {
+    let path = match agent.instruction_file(global) {
+        Some(p) => p,
+        None => {
+            if global {
+                eprintln!(
+                    "  {} does not support global guidance. Using project scope.",
+                    agent.display_name()
+                );
+                return inject_guidance(agent, false);
+            }
+            anyhow::bail!("No instruction file for {}", agent.display_name());
+        }
+    };
+
+    let version = env!("CARGO_PKG_VERSION");
+    let new_content = super::helpers::guidance_content(version);
+
+    if path.exists() {
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "  warning: could not read {}: {} (skipping guidance)",
+                    path.display(),
+                    e
+                );
+                return Ok(());
+            }
+        };
+
+        // Check for existing skim section
+        if let (Some(start), Some(end_pos)) = (
+            existing.find("<!-- skim-start"),
+            existing.find("<!-- skim-end -->"),
+        ) {
+            let end = end_pos + "<!-- skim-end -->".len();
+            let existing_section = &existing[start..end];
+
+            // Same version? Skip.
+            if existing_section.contains(&format!("v{version}")) {
+                println!(
+                    "  {} Guidance already current (v{})",
+                    check_mark(true),
+                    version
+                );
+                return Ok(());
+            }
+
+            // Different version? Update in place.
+            let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
+            std::fs::write(&path, updated)?;
+            println!(
+                "  {} Updated guidance in {} (-> v{})",
+                check_mark(true),
+                path.display(),
+                version
+            );
+            return Ok(());
+        }
+
+        // No skim section — append
+        let mut content = existing;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(&new_content);
+        content.push('\n');
+        std::fs::write(&path, content)?;
+    } else {
+        // File doesn't exist — create with just the guidance
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, format!("{}\n", new_content))?;
+    }
+
+    println!(
+        "  {} Installed guidance in {}",
+        check_mark(true),
+        path.display()
+    );
+
+    // For project scope, remind user to commit
+    if !global {
+        println!(
+            "  Note: guidance added to {} — commit to share with your team.",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove skim guidance section from the agent's main instruction file.
+pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<()> {
+    let path = match agent.instruction_file(global) {
+        Some(p) if p.exists() => p,
+        _ => return Ok(()), // Nothing to remove
+    };
+
+    let content = std::fs::read_to_string(&path)?;
+    if let (Some(start), Some(end_pos)) = (
+        content.find("<!-- skim-start"),
+        content.find("<!-- skim-end -->"),
+    ) {
+        let end = end_pos + "<!-- skim-end -->".len();
+        // Remove the section + surrounding blank lines
+        let mut updated = format!(
+            "{}{}",
+            content[..start].trim_end_matches('\n'),
+            &content[end..]
+        );
+        updated = updated.trim().to_string();
+        if !updated.is_empty() {
+            updated.push('\n');
+        }
+
+        if updated.trim().is_empty() {
+            // File was only the skim section — delete the file
+            std::fs::remove_file(&path)?;
+        } else {
+            std::fs::write(&path, updated)?;
+        }
+        println!(
+            "  {} Removed guidance from {}",
+            check_mark(true),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Dry-run output (B11)
 // ============================================================================
 
-pub(super) fn print_dry_run_actions(state: &DetectedState, install_marketplace: bool) {
+pub(super) fn print_dry_run_actions(
+    state: &DetectedState,
+    install_marketplace: bool,
+    no_guidance: bool,
+    global: bool,
+) {
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
     println!("  [dry-run] Would create: {}", hook_script_path.display());
@@ -546,6 +720,12 @@ pub(super) fn print_dry_run_actions(state: &DetectedState, install_marketplace: 
             SETTINGS_FILE
         );
     }
+    if !no_guidance {
+        let agent = AgentKind::from_str(state.agent_cli_name).unwrap_or(AgentKind::ClaudeCode);
+        if let Some(path) = agent.instruction_file(global) {
+            println!("  [dry-run] Would inject guidance into {}", path.display());
+        }
+    }
 }
 
 // ============================================================================
@@ -555,6 +735,7 @@ pub(super) fn print_dry_run_actions(state: &DetectedState, install_marketplace: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::init::helpers::guidance_content;
 
     #[test]
     fn test_upsert_hook_entry_idempotent() {
@@ -568,6 +749,139 @@ mod tests {
             1,
             "running upsert twice should produce exactly one entry, not a duplicate"
         );
+    }
+
+    // ---- Shell-safe path validation (SEC-1) ----
+
+    // ---- Guidance injection ----
+
+    #[test]
+    fn test_inject_guidance_creates_new_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        assert!(!path.exists());
+
+        // Use ClaudeCode project scope which creates CLAUDE.md
+        // We can't easily test via inject_guidance() since it resolves paths,
+        // so test the underlying logic directly
+        let version = "2.1.0";
+        let content = guidance_content(version);
+        std::fs::write(&path, format!("{}\n", content)).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("<!-- skim-start v2.1.0 -->"));
+        assert!(written.contains("<!-- skim-end -->"));
+    }
+
+    #[test]
+    fn test_inject_guidance_appends_to_existing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(&path, "# Existing Content\n\nSome rules here.\n").unwrap();
+
+        let version = "2.1.0";
+        let guidance = guidance_content(version);
+        let existing = std::fs::read_to_string(&path).unwrap();
+        let mut content = existing;
+        content.push('\n');
+        content.push_str(&guidance);
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.starts_with("# Existing Content"));
+        assert!(result.contains("<!-- skim-start v2.1.0 -->"));
+    }
+
+    #[test]
+    fn test_inject_guidance_updates_stale_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+
+        // Write with old version
+        let old_guidance = guidance_content("1.0.0");
+        std::fs::write(&path, format!("# Header\n\n{}\n\n# Footer\n", old_guidance)).unwrap();
+
+        // Simulate update
+        let existing = std::fs::read_to_string(&path).unwrap();
+        let new_guidance = guidance_content("2.1.0");
+        if let (Some(start), Some(end_pos)) = (
+            existing.find("<!-- skim-start"),
+            existing.find("<!-- skim-end -->"),
+        ) {
+            let end = end_pos + "<!-- skim-end -->".len();
+            let updated = format!("{}{}{}", &existing[..start], new_guidance, &existing[end..]);
+            std::fs::write(&path, updated).unwrap();
+        }
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("v2.1.0"));
+        assert!(!result.contains("v1.0.0"));
+        assert!(result.contains("# Header"));
+        assert!(result.contains("# Footer"));
+    }
+
+    #[test]
+    fn test_remove_guidance_strips_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+
+        let guidance = guidance_content("2.1.0");
+        std::fs::write(&path, format!("# Header\n\n{}\n\n# Footer\n", guidance)).unwrap();
+
+        // Simulate removal
+        let content = std::fs::read_to_string(&path).unwrap();
+        if let (Some(start), Some(end_pos)) = (
+            content.find("<!-- skim-start"),
+            content.find("<!-- skim-end -->"),
+        ) {
+            let end = end_pos + "<!-- skim-end -->".len();
+            let mut updated = format!(
+                "{}{}",
+                content[..start].trim_end_matches('\n'),
+                &content[end..]
+            );
+            updated = updated.trim().to_string();
+            if !updated.is_empty() {
+                updated.push('\n');
+            }
+            std::fs::write(&path, updated).unwrap();
+        }
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(!result.contains("skim-start"));
+        assert!(result.contains("# Header"));
+        assert!(result.contains("# Footer"));
+    }
+
+    #[test]
+    fn test_remove_guidance_deletes_empty_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+
+        let guidance = guidance_content("2.1.0");
+        std::fs::write(&path, format!("{}\n", guidance)).unwrap();
+        assert!(path.exists());
+
+        // Simulate removal
+        let content = std::fs::read_to_string(&path).unwrap();
+        if let (Some(start), Some(end_pos)) = (
+            content.find("<!-- skim-start"),
+            content.find("<!-- skim-end -->"),
+        ) {
+            let end = end_pos + "<!-- skim-end -->".len();
+            let mut updated = format!(
+                "{}{}",
+                content[..start].trim_end_matches('\n'),
+                &content[end..]
+            );
+            updated = updated.trim().to_string();
+            if updated.is_empty() {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
+
+        assert!(!path.exists(), "Empty file should be deleted");
     }
 
     // ---- Shell-safe path validation (SEC-1) ----

@@ -224,6 +224,28 @@ fn test_learn_no_bash_commands() {
 }
 
 // ============================================================================
+// Permission denial exclusion
+// ============================================================================
+
+#[test]
+fn test_learn_skips_permission_denials() {
+    let dir = TempDir::new().unwrap();
+    let project_dir = dir.path().join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let fixture = include_str!("fixtures/cmd/session/session_denial.jsonl");
+    std::fs::write(project_dir.join("denial-session.jsonl"), fixture).unwrap();
+
+    // Permission denials should not produce corrections
+    skim_cmd()
+        .args(["learn", "--since", "7d"])
+        .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No CLI error patterns detected"));
+}
+
+// ============================================================================
 // Phase 6: Cross-agent learn tests -- per-agent rules file format
 // ============================================================================
 
@@ -307,7 +329,7 @@ fn test_learn_generate_copilot_writes_instructions_md_with_frontmatter() {
     let copilot_dir = dir.path().join("copilot-sessions");
     std::fs::create_dir_all(&copilot_dir).unwrap();
 
-    // Copilot JSONL with an error-retry pair (carg test -> cargo test)
+    // Copilot JSONL with error-retry pairs (carg test -> cargo test, x2 for ≥2 filter)
     let copilot_session = concat!(
         r#"{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "carg test"}, "id": "t-001", "timestamp": "2024-06-15T10:01:00Z" }"#,
         "\n",
@@ -316,6 +338,14 @@ fn test_learn_generate_copilot_writes_instructions_md_with_frontmatter() {
         r#"{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "cargo test"}, "id": "t-002", "timestamp": "2024-06-15T10:02:00Z" }"#,
         "\n",
         r#"{ "type": "tool_result", "toolUseId": "t-002", "resultType": "success", "content": "test result: ok. 5 passed; 0 failed", "timestamp": "2024-06-15T10:02:05Z" }"#,
+        "\n",
+        r#"{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "carg test"}, "id": "t-003", "timestamp": "2024-06-15T10:03:00Z" }"#,
+        "\n",
+        r#"{ "type": "tool_result", "toolUseId": "t-003", "resultType": "error", "content": "error: command not found: carg", "timestamp": "2024-06-15T10:03:05Z" }"#,
+        "\n",
+        r#"{ "type": "tool_use", "toolName": "bash", "toolArgs": {"command": "cargo test"}, "id": "t-004", "timestamp": "2024-06-15T10:04:00Z" }"#,
+        "\n",
+        r#"{ "type": "tool_result", "toolUseId": "t-004", "resultType": "success", "content": "test result: ok. 5 passed; 0 failed", "timestamp": "2024-06-15T10:04:05Z" }"#,
         "\n"
     );
     std::fs::write(copilot_dir.join("error-session.jsonl"), copilot_session).unwrap();
@@ -364,7 +394,7 @@ fn test_learn_generate_codex_prints_to_stdout_no_file() {
     let codex_session_dir = codex_dir.join("2026/03/25");
     std::fs::create_dir_all(&codex_session_dir).unwrap();
 
-    // Codex JSONL with an error-retry pair (carg test -> cargo test)
+    // Codex JSONL with error-retry pairs (carg test -> cargo test, x2 for ≥2 filter)
     let codex_session = concat!(
         r#"{"type":"codex.tool_decision","tool":"bash","args":{"command":"carg test"},"timestamp":"2026-03-01T10:00:00Z","session_id":"sess-err","tool_decision_id":"td-001"}"#,
         "\n",
@@ -373,6 +403,14 @@ fn test_learn_generate_codex_prints_to_stdout_no_file() {
         r#"{"type":"codex.tool_decision","tool":"bash","args":{"command":"cargo test"},"timestamp":"2026-03-01T10:00:02Z","session_id":"sess-err","tool_decision_id":"td-002"}"#,
         "\n",
         r#"{"type":"codex.tool_result","tool":"bash","result":{"content":"test result: ok. 5 passed; 0 failed","is_error":false},"timestamp":"2026-03-01T10:00:03Z","session_id":"sess-err","tool_decision_id":"td-002"}"#,
+        "\n",
+        r#"{"type":"codex.tool_decision","tool":"bash","args":{"command":"carg test"},"timestamp":"2026-03-01T10:00:04Z","session_id":"sess-err","tool_decision_id":"td-003"}"#,
+        "\n",
+        r#"{"type":"codex.tool_result","tool":"bash","result":{"content":"error: command not found: carg","is_error":true},"timestamp":"2026-03-01T10:00:05Z","session_id":"sess-err","tool_decision_id":"td-003"}"#,
+        "\n",
+        r#"{"type":"codex.tool_decision","tool":"bash","args":{"command":"cargo test"},"timestamp":"2026-03-01T10:00:06Z","session_id":"sess-err","tool_decision_id":"td-004"}"#,
+        "\n",
+        r#"{"type":"codex.tool_result","tool":"bash","result":{"content":"test result: ok. 5 passed; 0 failed","is_error":false},"timestamp":"2026-03-01T10:00:07Z","session_id":"sess-err","tool_decision_id":"td-004"}"#,
         "\n"
     );
     std::fs::write(

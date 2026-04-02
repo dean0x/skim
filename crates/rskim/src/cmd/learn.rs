@@ -178,6 +178,21 @@ impl PatternType {
 // Pattern detection
 // ============================================================================
 
+/// Check if tool result content indicates an agent-user permission denial.
+///
+/// Permission denials happen when the user rejects a tool invocation. These are
+/// not CLI errors — they produce garbage pairings because the "failed" command
+/// was never actually executed. Standard Unix "permission denied" (filesystem
+/// errors) is NOT excluded.
+fn is_permission_denial(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("has been denied")
+        || lower.contains("user denied")
+        || lower.contains("aborted by user")
+        || lower.contains("user rejected")
+        || lower.contains("permission was denied by user")
+}
+
 /// Detect error-retry patterns in a sequence of Bash invocations.
 ///
 /// For each failed Bash command, look at the next N (default 5) Bash commands.
@@ -190,6 +205,11 @@ fn detect_corrections(bash_invocations: &[&ToolInvocation]) -> Vec<CorrectionPai
             Some(r) if r.is_error || looks_like_error(&r.content) => r,
             _ => continue,
         };
+
+        // Skip permission denials — these are agent-user rejections, not CLI errors
+        if is_permission_denial(&result.content) {
+            continue;
+        }
 
         if is_tdd_cycle(bash_invocations, i) {
             continue;
@@ -237,6 +257,13 @@ fn find_correction(
             ToolInput::Bash { command } => command.as_str(),
             _ => continue,
         };
+
+        // Pre-filter: base command must match (or be a typo with edit distance ≤1)
+        let failed_base = failed_cmd.split_whitespace().next().unwrap_or("");
+        let candidate_base = candidate_cmd.split_whitespace().next().unwrap_or("");
+        if failed_base != candidate_base && levenshtein(failed_base, candidate_base) > 1 {
+            continue;
+        }
 
         if let Some(pattern) = classify_correction(failed_cmd, candidate_cmd) {
             return Some(CorrectionPair {
@@ -539,8 +566,8 @@ fn deduplicate_and_filter(corrections: Vec<CorrectionPair>) -> Vec<CorrectionPai
     groups
         .into_values()
         .filter(|pair| {
-            // Minimum 2 occurrences, except for edit distance 1 typos
-            if pair.occurrences < 2 && pair.pattern_type != PatternType::FlagTypo {
+            // Minimum 2 occurrences for all pattern types
+            if pair.occurrences < 2 {
                 return false;
             }
             // Exclude path-only differences
@@ -1199,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_keeps_single_occurrence_typo() {
+    fn test_filter_rejects_single_occurrence_typo() {
         let pair = CorrectionPair {
             failed_command: "carg test".to_string(),
             successful_command: "cargo test".to_string(),
@@ -1211,7 +1238,10 @@ mod tests {
         };
 
         let result = deduplicate_and_filter(vec![pair]);
-        assert_eq!(result.len(), 1, "Single-occurrence FlagTypo should be kept");
+        assert!(
+            result.is_empty(),
+            "Single-occurrence FlagTypo should be filtered (requires ≥2)"
+        );
     }
 
     #[test]
@@ -1565,6 +1595,91 @@ mod tests {
         let content = generate_rules_content(&corrections, AgentKind::CopilotCli);
         assert!(content.starts_with("---\napplyTo:"));
         assert!(content.contains("# CLI Corrections"));
+    }
+
+    // ---- is_permission_denial ----
+
+    #[test]
+    fn test_is_permission_denial_positive() {
+        assert!(is_permission_denial(
+            "The tool use has been denied by the user"
+        ));
+        assert!(is_permission_denial("User denied this tool execution"));
+        assert!(is_permission_denial("Operation aborted by user"));
+        assert!(is_permission_denial("This user rejected the request"));
+        assert!(is_permission_denial(
+            "Permission was denied by user for this action"
+        ));
+    }
+
+    #[test]
+    fn test_is_permission_denial_negative() {
+        // Standard Unix permission denied — this is a real CLI error, not agent denial
+        assert!(!is_permission_denial("permission denied: /etc/shadow"));
+        assert!(!is_permission_denial("error: command not found: carg"));
+        assert!(!is_permission_denial("Build FAILED"));
+        assert!(!is_permission_denial("test result: ok. 5 passed; 0 failed"));
+        assert!(!is_permission_denial(""));
+    }
+
+    #[test]
+    fn test_detect_corrections_skips_permission_denial() {
+        // A permission denial followed by a successful command should NOT produce a correction
+        let denied = make_bash_invocation(
+            "rm -rf /tmp/test",
+            "The tool use has been denied by the user",
+            true,
+            "sess1",
+        );
+        let success = make_bash_invocation("rm -rf /tmp/test", "removed", false, "sess1");
+        let invocations = vec![&denied, &success];
+        let corrections = detect_corrections(&invocations);
+        assert!(
+            corrections.is_empty(),
+            "Permission denials should not produce corrections"
+        );
+    }
+
+    // ---- base command pre-filter ----
+
+    #[test]
+    fn test_find_correction_requires_same_base_command() {
+        // python (failed) → cargo (success) — completely different base commands, rejected
+        let failed = make_bash_invocation("python main.py", "error: file not found", true, "sess1");
+        let success = make_bash_invocation("cargo run", "ok", false, "sess1");
+        let invocations = vec![&failed, &success];
+        let corrections = detect_corrections(&invocations);
+        assert!(
+            corrections.is_empty(),
+            "python→cargo should be rejected (different base command)"
+        );
+    }
+
+    #[test]
+    fn test_find_correction_allows_typo_base_command() {
+        // carg → cargo has edit distance 1 on base command — allowed
+        let failed = make_bash_invocation("carg test", "error: command not found", true, "sess1");
+        let success = make_bash_invocation("cargo test", "ok. 5 passed", false, "sess1");
+        let invocations = vec![&failed, &success];
+        let corrections = detect_corrections(&invocations);
+        assert_eq!(
+            corrections.len(),
+            1,
+            "carg→cargo should be allowed (base command edit distance 1)"
+        );
+    }
+
+    #[test]
+    fn test_find_correction_rejects_distant_base_command() {
+        // gh → git has edit distance 2 on base command — rejected
+        let failed = make_bash_invocation("gh status", "error: not found", true, "sess1");
+        let success = make_bash_invocation("git status", "On branch main", false, "sess1");
+        let invocations = vec![&failed, &success];
+        let corrections = detect_corrections(&invocations);
+        assert!(
+            corrections.is_empty(),
+            "gh→git should be rejected (base command edit distance 2)"
+        );
     }
 
     #[test]

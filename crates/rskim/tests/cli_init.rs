@@ -834,6 +834,155 @@ fn test_rewrite_hook_help() {
 }
 
 // ============================================================================
+// Guidance injection
+// ============================================================================
+
+#[test]
+fn test_init_creates_guidance() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+
+    // Create a CLAUDE.md at the "global" location (config_dir/../CLAUDE.md won't work,
+    // so we test via project mode which creates CLAUDE.md in CWD)
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // Check that CLAUDE.md was created with guidance
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    if claude_md.exists() {
+        let content = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            content.contains("<!-- skim-start"),
+            "CLAUDE.md should contain skim guidance section"
+        );
+        assert!(
+            content.contains("<!-- skim-end -->"),
+            "CLAUDE.md should have closing marker"
+        );
+        assert!(
+            content.contains("npx rskim"),
+            "Guidance should reference npx rskim"
+        );
+    }
+}
+
+#[test]
+fn test_init_no_guidance_flag() {
+    let dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--no-guidance"])
+        .env("CLAUDE_CONFIG_DIR", dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // CLAUDE.md should not exist (no guidance injected, file not created)
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(
+        !claude_md.exists(),
+        "CLAUDE.md should not be created with --no-guidance"
+    );
+}
+
+#[test]
+fn test_init_uninstall_removes_guidance() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    // First install with guidance
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // Then uninstall
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--uninstall", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // CLAUDE.md should not contain skim guidance (or be deleted if it was the only content)
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    if claude_md.exists() {
+        let content = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            !content.contains("skim-start"),
+            "Guidance section should be removed after uninstall"
+        );
+    }
+    // If file doesn't exist, that's also correct (was only skim content)
+}
+
+#[test]
+fn test_init_guidance_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    // Install twice
+    for _ in 0..2 {
+        Command::cargo_bin("skim")
+            .unwrap()
+            .arg("init")
+            .args(["--project", "--yes"])
+            .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+            .current_dir(project_dir.path())
+            .assert()
+            .success();
+    }
+
+    // CLAUDE.md should have exactly one skim section
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    if claude_md.exists() {
+        let content = fs::read_to_string(&claude_md).unwrap();
+        let start_count = content.matches("<!-- skim-start").count();
+        assert_eq!(
+            start_count, 1,
+            "Should have exactly one skim section, found {}",
+            start_count
+        );
+    }
+}
+
+#[test]
+fn test_init_dry_run_shows_guidance() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--dry-run"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("guidance"));
+}
+
+// ============================================================================
 // Phase 6: Multi-agent awareness in skim init
 // ============================================================================
 

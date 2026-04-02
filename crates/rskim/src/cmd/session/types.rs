@@ -140,6 +140,30 @@ impl AgentKind {
         }
     }
 
+    /// Return the main instruction file path for guidance injection.
+    ///
+    /// Each agent has a "main instruction file" that is guaranteed to be loaded.
+    /// Returns `None` when the requested scope is not supported by the agent.
+    ///
+    /// For `global = true`: returns home-relative absolute path (e.g., `~/.claude/CLAUDE.md`).
+    /// For `global = false`: returns project-relative path (e.g., `CLAUDE.md`).
+    pub(crate) fn instruction_file(&self, global: bool) -> Option<std::path::PathBuf> {
+        match (self, global) {
+            // Global scope (home-relative)
+            (AgentKind::ClaudeCode, true) => dirs::home_dir().map(|h| h.join(".claude/CLAUDE.md")),
+            (AgentKind::GeminiCli, true) => dirs::home_dir().map(|h| h.join(".gemini/GEMINI.md")),
+            // Project scope (CWD-relative)
+            (AgentKind::ClaudeCode, false) => Some("CLAUDE.md".into()),
+            (AgentKind::Cursor, false) => Some(".cursorrules".into()),
+            (AgentKind::CopilotCli, false) => Some(".github/copilot-instructions.md".into()),
+            (AgentKind::CodexCli, false) => Some("AGENTS.md".into()),
+            (AgentKind::GeminiCli, false) => Some("GEMINI.md".into()),
+            (AgentKind::OpenCode, false) => Some("AGENTS.md".into()),
+            // Remaining agents don't support global instruction files
+            (_, true) => None,
+        }
+    }
+
     /// Return the rules filename for a given agent.
     pub(crate) fn rules_filename(&self) -> &'static str {
         match self {
@@ -511,6 +535,74 @@ mod tests {
             AgentKind::OpenCode.detect_dir(),
             Some(PathBuf::from(".opencode"))
         );
+    }
+
+    // ---- AgentKind::instruction_file ----
+
+    #[test]
+    fn test_instruction_file_claude_code_global() {
+        let path = AgentKind::ClaudeCode.instruction_file(true).unwrap();
+        assert!(
+            path.ends_with(".claude/CLAUDE.md"),
+            "got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn test_instruction_file_claude_code_project() {
+        let path = AgentKind::ClaudeCode.instruction_file(false).unwrap();
+        assert_eq!(path, PathBuf::from("CLAUDE.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_gemini_global() {
+        let path = AgentKind::GeminiCli.instruction_file(true).unwrap();
+        assert!(
+            path.ends_with(".gemini/GEMINI.md"),
+            "got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn test_instruction_file_gemini_project() {
+        let path = AgentKind::GeminiCli.instruction_file(false).unwrap();
+        assert_eq!(path, PathBuf::from("GEMINI.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_cursor_project() {
+        let path = AgentKind::Cursor.instruction_file(false).unwrap();
+        assert_eq!(path, PathBuf::from(".cursorrules"));
+    }
+
+    #[test]
+    fn test_instruction_file_cursor_global_unsupported() {
+        assert!(AgentKind::Cursor.instruction_file(true).is_none());
+    }
+
+    #[test]
+    fn test_instruction_file_copilot_project() {
+        let path = AgentKind::CopilotCli.instruction_file(false).unwrap();
+        assert_eq!(path, PathBuf::from(".github/copilot-instructions.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_copilot_global_unsupported() {
+        assert!(AgentKind::CopilotCli.instruction_file(true).is_none());
+    }
+
+    #[test]
+    fn test_instruction_file_codex_project() {
+        let path = AgentKind::CodexCli.instruction_file(false).unwrap();
+        assert_eq!(path, PathBuf::from("AGENTS.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_opencode_project() {
+        let path = AgentKind::OpenCode.instruction_file(false).unwrap();
+        assert_eq!(path, PathBuf::from("AGENTS.md"));
     }
 
     // ---- AgentKind::rules_filename ----

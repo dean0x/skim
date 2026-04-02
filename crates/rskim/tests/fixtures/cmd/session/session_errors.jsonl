@@ -6,3 +6,11 @@
 {"type":"user","message":{"content":[{"tool_use_id":"toolu_03","type":"tool_result","content":"error: unexpected argument '--nocapture'","is_error":true}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_04","name":"Bash","input":{"command":"cargo test -- --nocapture","description":"Run tests with output"}}]},"timestamp":"2024-01-01T00:03:00Z","sessionId":"error-session"}
 {"type":"user","message":{"content":[{"tool_use_id":"toolu_04","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_05","name":"Bash","input":{"command":"carg test","description":"Run tests again"}}]},"timestamp":"2024-01-01T00:04:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_05","type":"tool_result","content":"error: command not found: carg","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_06","name":"Bash","input":{"command":"cargo test","description":"Run tests again"}}]},"timestamp":"2024-01-01T00:05:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_06","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_07","name":"Bash","input":{"command":"cargo test --nocapture","description":"Run tests with output again"}}]},"timestamp":"2024-01-01T00:06:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_07","type":"tool_result","content":"error: unexpected argument '--nocapture'","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_08","name":"Bash","input":{"command":"cargo test -- --nocapture","description":"Run tests with output again"}}]},"timestamp":"2024-01-01T00:07:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_08","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}
