@@ -61,14 +61,15 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     if config.json_output {
         print_json_report(&corrections)?;
-    } else if config.generate {
+    } else {
         // Use the agent filter for rules output format, default to ClaudeCode
         let rules_agent = config.agent_filter.unwrap_or(AgentKind::ClaudeCode);
-        let content = generate_rules_content(&corrections, rules_agent);
-        write_rules_file(&content, rules_agent, config.dry_run)?;
-    } else {
-        let rules_agent = config.agent_filter.unwrap_or(AgentKind::ClaudeCode);
-        print_text_report(&corrections, rules_agent);
+        if config.generate {
+            let content = generate_rules_content(&corrections, rules_agent);
+            write_rules_file(&content, rules_agent, config.dry_run)?;
+        } else {
+            print_text_report(&corrections, rules_agent);
+        }
     }
 
     Ok(ExitCode::SUCCESS)
@@ -335,20 +336,15 @@ fn classify_by_edit_distance(
     failed_tokens: &[&str],
     success_tokens: &[&str],
 ) -> Option<PatternType> {
-    let edit_dist = levenshtein(failed, success);
-    if edit_dist > 3 {
+    if levenshtein(failed, success) > 3 {
         return None;
     }
 
-    if failed_tokens.len() < success_tokens.len() {
-        return Some(PatternType::MissingArg);
+    match failed_tokens.len().cmp(&success_tokens.len()) {
+        std::cmp::Ordering::Less => Some(PatternType::MissingArg),
+        std::cmp::Ordering::Equal => classify_same_length_tokens(failed_tokens, success_tokens),
+        std::cmp::Ordering::Greater => Some(PatternType::FlagTypo),
     }
-
-    if failed_tokens.len() == success_tokens.len() {
-        return classify_same_length_tokens(failed_tokens, success_tokens);
-    }
-
-    Some(PatternType::FlagTypo)
 }
 
 /// Classify when token counts match and edit distance is small.
@@ -593,7 +589,7 @@ fn is_path_only_difference(a: &str, b: &str) -> bool {
         return false;
     }
 
-    let diffs: Vec<(&&str, &&str)> = a_tokens
+    let diffs: Vec<_> = a_tokens
         .iter()
         .zip(b_tokens.iter())
         .filter(|(x, y)| x != y)
@@ -1066,14 +1062,8 @@ mod tests {
 
     fn make_bash_invocation_no_result(command: &str, session_id: &str) -> ToolInvocation {
         ToolInvocation {
-            tool_name: "Bash".to_string(),
-            input: ToolInput::Bash {
-                command: command.to_string(),
-            },
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            session_id: session_id.to_string(),
-            agent: AgentKind::ClaudeCode,
             result: None,
+            ..make_bash_invocation(command, "", false, session_id)
         }
     }
 

@@ -5,9 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::flags::InitFlags;
 use super::helpers::{
-    check_mark, confirm_proceed, prompt_choice, HOOK_SCRIPT_NAME, SETTINGS_BACKUP, SETTINGS_FILE,
+    atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings, prompt_choice,
+    resolve_real_settings_path, HOOK_SCRIPT_NAME, SETTINGS_BACKUP, SETTINGS_FILE,
 };
 use super::state::{detect_state, has_skim_hook_entry, DetectedState};
+use crate::cmd::session::AgentKind;
 
 /// Resolved install options from interactive prompts or --yes defaults.
 struct InstallOptions {
@@ -417,8 +419,6 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
 // Settings.json patching (B8)
 // ============================================================================
 
-use super::helpers::{atomic_write_settings, load_or_create_settings, resolve_real_settings_path};
-
 /// Back up the settings file before modification.
 ///
 /// Re-checks that `real_path` is not a symlink immediately before copying to
@@ -547,8 +547,6 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
 // Guidance injection
 // ============================================================================
 
-use crate::cmd::session::AgentKind;
-
 /// Inject skim guidance section into the agent's main instruction file.
 ///
 /// Three modes:
@@ -593,28 +591,33 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
             existing.find("<!-- skim-end -->"),
         ) {
             let end = end_pos + "<!-- skim-end -->".len();
-            let existing_section = &existing[start..end];
 
-            // Same version? Skip.
-            if existing_section.contains(&format!("v{version}")) {
+            // Guard: markers in wrong order (manually edited file) — skip
+            // in-place update and fall through to append path instead.
+            if start < end_pos {
+                let existing_section = &existing[start..end];
+
+                // Same version? Skip.
+                if existing_section.contains(&format!("v{version}")) {
+                    println!(
+                        "  {} Guidance already current (v{})",
+                        check_mark(true),
+                        version
+                    );
+                    return Ok(());
+                }
+
+                // Different version? Update in place.
+                let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
+                std::fs::write(&path, updated)?;
                 println!(
-                    "  {} Guidance already current (v{})",
+                    "  {} Updated guidance in {} (-> v{})",
                     check_mark(true),
+                    path.display(),
                     version
                 );
                 return Ok(());
             }
-
-            // Different version? Update in place.
-            let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
-            std::fs::write(&path, updated)?;
-            println!(
-                "  {} Updated guidance in {} (-> v{})",
-                check_mark(true),
-                path.display(),
-                version
-            );
-            return Ok(());
         }
 
         // No skim section — append
@@ -663,6 +666,11 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
         content.find("<!-- skim-start"),
         content.find("<!-- skim-end -->"),
     ) {
+        // Guard: markers in wrong order (manually edited file) — skip removal
+        if start >= end_pos {
+            return Ok(());
+        }
+
         let end = end_pos + "<!-- skim-end -->".len();
         // Remove the section + surrounding blank lines
         let mut updated = format!(
