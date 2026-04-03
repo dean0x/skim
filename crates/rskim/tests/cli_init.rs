@@ -1124,7 +1124,10 @@ fn test_init_guidance_upgrade_updates_stale_version() {
         .success();
 
     let claude_md = project_dir.path().join("CLAUDE.md");
-    assert!(claude_md.exists(), "CLAUDE.md should exist after initial install");
+    assert!(
+        claude_md.exists(),
+        "CLAUDE.md should exist after initial install"
+    );
 
     // Step 2: manually overwrite the guidance section with an old version marker
     let content = fs::read_to_string(&claude_md).unwrap();
@@ -1134,8 +1137,12 @@ fn test_init_guidance_upgrade_updates_stale_version() {
     );
     // Replace the versioned marker with an obviously stale one
     let stale_content = {
-        let start = content.find("<!-- skim-start").expect("start marker must exist");
-        let marker_end = content[start..].find(" -->").expect("marker closing must exist");
+        let start = content
+            .find("<!-- skim-start")
+            .expect("start marker must exist");
+        let marker_end = content[start..]
+            .find(" -->")
+            .expect("marker closing must exist");
         let mut s = content.clone();
         s.replace_range(start..start + marker_end + 4, "<!-- skim-start v0.0.1 -->");
         s
