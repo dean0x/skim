@@ -186,7 +186,8 @@ impl PatternType {
 /// was never actually executed. Standard Unix "permission denied" (filesystem
 /// errors) is NOT excluded.
 fn is_permission_denial(content: &str) -> bool {
-    let lower = content.to_ascii_lowercase();
+    let check = truncate_utf8(content, 512);
+    let lower = check.to_ascii_lowercase();
     lower.contains("has been denied")
         || lower.contains("user denied")
         || lower.contains("aborted by user")

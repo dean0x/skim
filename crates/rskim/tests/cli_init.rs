@@ -857,21 +857,20 @@ fn test_init_creates_guidance() {
 
     // Check that CLAUDE.md was created with guidance
     let claude_md = project_dir.path().join("CLAUDE.md");
-    if claude_md.exists() {
-        let content = fs::read_to_string(&claude_md).unwrap();
-        assert!(
-            content.contains("<!-- skim-start"),
-            "CLAUDE.md should contain skim guidance section"
-        );
-        assert!(
-            content.contains("<!-- skim-end -->"),
-            "CLAUDE.md should have closing marker"
-        );
-        assert!(
-            content.contains("npx rskim"),
-            "Guidance should reference npx rskim"
-        );
-    }
+    assert!(claude_md.exists(), "CLAUDE.md should be created with guidance");
+    let content = fs::read_to_string(&claude_md).unwrap();
+    assert!(
+        content.contains("<!-- skim-start"),
+        "CLAUDE.md should contain skim guidance section"
+    );
+    assert!(
+        content.contains("<!-- skim-end -->"),
+        "CLAUDE.md should have closing marker"
+    );
+    assert!(
+        content.contains("npx rskim"),
+        "Guidance should reference npx rskim"
+    );
 }
 
 #[test]
@@ -911,6 +910,10 @@ fn test_init_uninstall_removes_guidance() {
         .current_dir(project_dir.path())
         .assert()
         .success();
+
+    // Verify install created guidance
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(claude_md.exists(), "CLAUDE.md should exist after install");
 
     // Then uninstall
     Command::cargo_bin("skim")
@@ -954,15 +957,14 @@ fn test_init_guidance_idempotent() {
 
     // CLAUDE.md should have exactly one skim section
     let claude_md = project_dir.path().join("CLAUDE.md");
-    if claude_md.exists() {
-        let content = fs::read_to_string(&claude_md).unwrap();
-        let start_count = content.matches("<!-- skim-start").count();
-        assert_eq!(
-            start_count, 1,
-            "Should have exactly one skim section, found {}",
-            start_count
-        );
-    }
+    assert!(claude_md.exists(), "CLAUDE.md should exist after init");
+    let content = fs::read_to_string(&claude_md).unwrap();
+    let start_count = content.matches("<!-- skim-start").count();
+    assert_eq!(
+        start_count, 1,
+        "Should have exactly one skim section, found {}",
+        start_count
+    );
 }
 
 #[test]
