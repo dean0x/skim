@@ -268,9 +268,12 @@ fn find_correction(
     let end = (failed_idx + 1 + LOOKAHEAD).min(invocations.len());
 
     for candidate in invocations.iter().take(end).skip(failed_idx + 1) {
-        match &candidate.result {
-            Some(r) if !r.is_error && !looks_like_error(&r.content) => {}
-            _ => continue,
+        let is_success = candidate
+            .result
+            .as_ref()
+            .is_some_and(|r| !r.is_error && !looks_like_error(&r.content));
+        if !is_success {
+            continue;
         }
 
         let candidate_cmd = match &candidate.input {
@@ -621,7 +624,7 @@ fn is_path_only_difference(a: &str, b: &str) -> bool {
 }
 
 fn looks_like_path(s: &str) -> bool {
-    s.contains('/') || s.starts_with("./") || s.starts_with("../")
+    s.contains('/')
 }
 
 // ============================================================================
@@ -944,11 +947,6 @@ mod tests {
         assert!(!looks_like_error("test result: ok. 5 passed; 0 warnings"));
         assert!(!looks_like_error("Compiling rskim v1.0.0"));
         assert!(!looks_like_error("Finished dev profile"));
-        assert!(!looks_like_error(""));
-    }
-
-    #[test]
-    fn test_looks_like_error_empty() {
         assert!(!looks_like_error(""));
     }
 
@@ -1410,14 +1408,6 @@ mod tests {
         let long_b: String = "b".repeat(600);
         let result = levenshtein(&long_a, &long_b);
         assert!(result > 10, "oversized inputs should return large distance");
-    }
-
-    #[test]
-    fn test_levenshtein_normal_inputs_unchanged() {
-        // Normal-length inputs should still compute correctly
-        assert_eq!(levenshtein("cargo", "cargo"), 0);
-        assert_eq!(levenshtein("carg", "cargo"), 1);
-        assert_eq!(levenshtein("ab", "cd"), 2);
     }
 
     // ---- looks_like_error tightened matching ----

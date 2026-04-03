@@ -291,17 +291,8 @@ fn test_learn_generate_claude_code_writes_md_file() {
 
 #[test]
 fn test_learn_generate_default_dry_run_preview() {
-    // Cursor rules format test: use Claude Code sessions (the error patterns
-    // are agent-agnostic) but request Cursor format output.
-    //
-    // Since --agent cursor filters providers to Cursor-only (which requires
-    // a SQLite DB we can't easily mock in integration tests), we test via
-    // dry-run with the Claude Code provider but default agent, then verify
-    // the unit-test-covered cursor format separately.
-    //
-    // The unit tests in learn.rs::tests::test_generate_rules_content_cursor_frontmatter
-    // already validate the Cursor frontmatter format. This integration test
-    // confirms the default (Claude Code) pipeline works end-to-end.
+    // Confirms the default (Claude Code) dry-run pipeline works end-to-end.
+    // Cursor-specific frontmatter format is validated by unit tests in learn.rs.
     let dir = TempDir::new().unwrap();
     let project_dir = dir.path().join("test-project");
     std::fs::create_dir_all(&project_dir).unwrap();

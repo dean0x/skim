@@ -696,14 +696,7 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
 
     // Legacy cleanup: remove skim markers from .cursorrules if this is a Cursor agent
     if is_mdc && path.to_string_lossy().contains("skim.mdc") {
-        let legacy = std::path::PathBuf::from(".cursorrules");
-        if legacy.exists() {
-            if let Ok(content) = std::fs::read_to_string(&legacy) {
-                if find_skim_section(&content).is_some() {
-                    let _ = remove_skim_section_from_file(&legacy);
-                }
-            }
-        }
+        clean_legacy_cursorrules()?;
     }
 
     println!(
@@ -904,24 +897,6 @@ mod tests {
     // ---- Shell-safe path validation (SEC-1) ----
 
     // ---- Guidance injection ----
-
-    #[test]
-    fn test_inject_guidance_creates_new_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("CLAUDE.md");
-        assert!(!path.exists());
-
-        // Use ClaudeCode project scope which creates CLAUDE.md
-        // We can't easily test via inject_guidance() since it resolves paths,
-        // so test the underlying logic directly
-        let version = "2.1.0";
-        let content = guidance_content(version);
-        std::fs::write(&path, format!("{}\n", content)).unwrap();
-
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("<!-- skim-start v2.1.0 -->"));
-        assert!(written.contains("<!-- skim-end -->"));
-    }
 
     #[test]
     fn test_inject_guidance_appends_to_existing() {
