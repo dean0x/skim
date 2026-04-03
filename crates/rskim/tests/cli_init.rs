@@ -962,6 +962,74 @@ fn test_init_dry_run_shows_guidance() {
 }
 
 // ============================================================================
+// Cursor .mdc format
+// ============================================================================
+
+#[test]
+fn test_init_cursor_creates_mdc() {
+    let config_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // Should create .cursor/rules/skim.mdc with frontmatter
+    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    assert!(mdc.exists(), ".cursor/rules/skim.mdc should be created");
+    let content = fs::read_to_string(&mdc).unwrap();
+    assert!(content.starts_with("---\n"), "Should have YAML frontmatter");
+    assert!(
+        content.contains("alwaysApply: true"),
+        "Should have alwaysApply"
+    );
+    assert!(
+        content.contains("<!-- skim-start"),
+        "Should have skim start marker"
+    );
+    assert!(
+        content.contains("<!-- skim-end -->"),
+        "Should have skim end marker"
+    );
+}
+
+#[test]
+fn test_init_cursor_uninstall_deletes_mdc() {
+    let config_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    // Install
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    assert!(mdc.exists(), "skim.mdc should exist after install");
+
+    // Uninstall
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--uninstall", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    assert!(!mdc.exists(), "skim.mdc should be deleted on uninstall");
+}
+
+// ============================================================================
 // Phase 6: Multi-agent awareness in skim init
 // ============================================================================
 

@@ -602,7 +602,13 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
     let path = super::helpers::resolve_real_settings_path(&path)?;
 
     let version = env!("CARGO_PKG_VERSION");
-    let new_content = super::helpers::guidance_content(version);
+    let is_mdc = path.extension().is_some_and(|ext| ext == "mdc");
+    let new_content = if is_mdc {
+        super::helpers::guidance_content_mdc(version)
+    } else {
+        super::helpers::guidance_content(version)
+    };
+    let tmp_ext = if is_mdc { "mdc.tmp" } else { "md.tmp" };
 
     if path.exists() {
         // Issue 4: reject oversized files before reading
@@ -655,7 +661,7 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
 
             // Different version? Update in place. Issue 3: atomic write.
             let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
-            let tmp_path = path.with_extension("md.tmp");
+            let tmp_path = path.with_extension(tmp_ext);
             std::fs::write(&tmp_path, &updated)?;
             std::fs::rename(&tmp_path, &path)?;
             println!(
@@ -675,7 +681,7 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
         content.push('\n');
         content.push_str(&new_content);
         content.push('\n');
-        let tmp_path = path.with_extension("md.tmp");
+        let tmp_path = path.with_extension(tmp_ext);
         std::fs::write(&tmp_path, &content)?;
         std::fs::rename(&tmp_path, &path)?;
     } else {
@@ -683,9 +689,21 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp_path = path.with_extension("md.tmp");
+        let tmp_path = path.with_extension(tmp_ext);
         std::fs::write(&tmp_path, format!("{}\n", new_content))?;
         std::fs::rename(&tmp_path, &path)?;
+    }
+
+    // Legacy cleanup: remove skim markers from .cursorrules if this is a Cursor agent
+    if is_mdc && path.to_string_lossy().contains("skim.mdc") {
+        let legacy = std::path::PathBuf::from(".cursorrules");
+        if legacy.exists() {
+            if let Ok(content) = std::fs::read_to_string(&legacy) {
+                if find_skim_section(&content).is_some() {
+                    let _ = remove_skim_section_from_file(&legacy);
+                }
+            }
+        }
     }
 
     println!(
@@ -709,7 +727,13 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
 pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<()> {
     let path = match agent.instruction_file(global) {
         Some(p) if p.exists() => p,
-        _ => return Ok(()), // Nothing to remove
+        _ => {
+            // For Cursor, even if the new path doesn't exist, check legacy .cursorrules
+            if agent == AgentKind::Cursor {
+                clean_legacy_cursorrules()?;
+            }
+            return Ok(());
+        }
     };
 
     // Issue 5: resolve symlinks before operating on the path
@@ -731,31 +755,86 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
     let content = std::fs::read_to_string(&path)?;
     // Issue 1: use find_skim_section helper (handles wrong-order guard internally)
     if let Some((start, end)) = find_skim_section(&content) {
-        // Remove the section + surrounding blank lines
-        let mut updated = format!(
-            "{}{}",
-            content[..start].trim_end_matches('\n'),
-            &content[end..]
-        );
-        updated = updated.trim().to_string();
-        if !updated.is_empty() {
-            updated.push('\n');
-        }
-
-        if updated.trim().is_empty() {
-            // File was only the skim section — delete the file (intentional, no atomic needed)
+        if path.extension().is_some_and(|ext| ext == "mdc") {
+            // Skim owns .mdc files entirely — delete on removal
             std::fs::remove_file(&path)?;
         } else {
-            // Issue 3: atomic write
-            let tmp_path = path.with_extension("md.tmp");
-            std::fs::write(&tmp_path, &updated)?;
-            std::fs::rename(&tmp_path, &path)?;
+            // Remove the section + surrounding blank lines
+            let mut updated = format!(
+                "{}{}",
+                content[..start].trim_end_matches('\n'),
+                &content[end..]
+            );
+            updated = updated.trim().to_string();
+            if !updated.is_empty() {
+                updated.push('\n');
+            }
+
+            if updated.trim().is_empty() {
+                // File was only the skim section — delete the file (intentional, no atomic needed)
+                std::fs::remove_file(&path)?;
+            } else {
+                // Issue 3: atomic write
+                let tmp_path = path.with_extension("md.tmp");
+                std::fs::write(&tmp_path, &updated)?;
+                std::fs::rename(&tmp_path, &path)?;
+            }
         }
         println!(
             "  {} Removed guidance from {}",
             check_mark(true),
             path.display()
         );
+    }
+
+    // Also clean legacy .cursorrules for Cursor
+    if agent == AgentKind::Cursor {
+        clean_legacy_cursorrules()?;
+    }
+
+    Ok(())
+}
+
+/// Clean up skim markers from legacy `.cursorrules` during Cursor migration.
+///
+/// Leaves the file in place (even if empty) since the user may have created it
+/// intentionally. Only removes the skim section markers.
+fn clean_legacy_cursorrules() -> anyhow::Result<()> {
+    let legacy = std::path::PathBuf::from(".cursorrules");
+    if legacy.exists() {
+        if let Ok(content) = std::fs::read_to_string(&legacy) {
+            if find_skim_section(&content).is_some() {
+                let _ = remove_skim_section_from_file(&legacy);
+                println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove the skim guidance section from a file, keeping any surrounding content.
+///
+/// For `.cursorrules` during Cursor migration: leaves the file in place even if
+/// only skim content remains (user may have created it intentionally).
+fn remove_skim_section_from_file(path: &std::path::Path) -> anyhow::Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    if let Some((start, end)) = find_skim_section(&content) {
+        let mut updated = format!(
+            "{}{}",
+            content[..start].trim_end_matches('\n'),
+            &content[end..]
+        );
+        updated = updated.trim().to_string();
+        // Leave the file in place (even if empty) — user may have created it intentionally.
+        // Just write back the cleaned content (with trailing newline if non-empty).
+        let final_content = if updated.is_empty() {
+            String::new()
+        } else {
+            updated + "\n"
+        };
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &final_content)?;
+        std::fs::rename(&tmp_path, path)?;
     }
     Ok(())
 }

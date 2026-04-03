@@ -160,6 +160,16 @@ Still use Read when:
     )
 }
 
+/// Generate skim guidance content wrapped in Cursor `.mdc` frontmatter.
+///
+/// Cursor's `.mdc` format requires YAML frontmatter. Skim owns the entire file.
+pub(super) fn guidance_content_mdc(version: &str) -> String {
+    format!(
+        "---\ndescription: \"skim code reader \u{2014} use skim vs Read for structural code exploration\"\nalwaysApply: true\n---\n\n{content}",
+        content = guidance_content(version)
+    )
+}
+
 // ============================================================================
 // Interactive prompt helpers
 // ============================================================================
@@ -256,6 +266,19 @@ mod tests {
     fn test_guidance_content_different_version() {
         let content = guidance_content("3.0.0");
         assert!(content.contains("skim-start v3.0.0"));
+    }
+
+    #[test]
+    fn test_guidance_content_mdc_has_frontmatter() {
+        let content = guidance_content_mdc("2.1.0");
+        assert!(
+            content.starts_with("---\n"),
+            "Should start with YAML frontmatter"
+        );
+        assert!(content.contains("alwaysApply: true"));
+        assert!(content.contains("description:"));
+        assert!(content.contains("<!-- skim-start v2.1.0 -->"));
+        assert!(content.contains("<!-- skim-end -->"));
     }
 
     #[test]

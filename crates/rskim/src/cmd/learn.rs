@@ -52,7 +52,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     // Detect error-retry correction patterns
     let corrections = detect_corrections(&bash_invocations);
-    let corrections = deduplicate_and_filter(corrections);
+    let corrections = deduplicate_and_filter(corrections, config.min_occurrences);
 
     if corrections.is_empty() {
         println!("No CLI error patterns detected.");
@@ -86,6 +86,7 @@ struct LearnConfig {
     dry_run: bool,
     json_output: bool,
     agent_filter: Option<AgentKind>,
+    min_occurrences: usize,
 }
 
 fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
@@ -95,6 +96,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
         dry_run: false,
         json_output: false,
         agent_filter: None,
+        min_occurrences: 3,
     };
 
     let mut i = 0;
@@ -117,9 +119,25 @@ fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
                 }
                 config.agent_filter = Some(AgentKind::parse_cli_arg(&args[i])?);
             }
+            "--min-occurrences" => {
+                i += 1;
+                if i >= args.len() {
+                    anyhow::bail!("--min-occurrences requires a value (e.g., 3)");
+                }
+                let n: usize = args[i].parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "--min-occurrences must be a positive integer, got: '{}'",
+                        args[i]
+                    )
+                })?;
+                if n == 0 {
+                    anyhow::bail!("--min-occurrences must be at least 1");
+                }
+                config.min_occurrences = n;
+            }
             other => {
                 anyhow::bail!(
-                    "unknown flag: '{other}'\n\nUsage: skim learn [--since <duration>] [--generate] [--dry-run] [--json]"
+                    "unknown flag: '{other}'\n\nUsage: skim learn [--since <duration>] [--generate] [--dry-run] [--json] [--min-occurrences <N>]"
                 );
             }
         }
@@ -540,7 +558,10 @@ fn is_tdd_cycle(invocations: &[&ToolInvocation], start_idx: usize) -> bool {
 // ============================================================================
 
 /// Merge duplicate correction pairs and apply exclusion filters.
-fn deduplicate_and_filter(corrections: Vec<CorrectionPair>) -> Vec<CorrectionPair> {
+fn deduplicate_and_filter(
+    corrections: Vec<CorrectionPair>,
+    min_occurrences: usize,
+) -> Vec<CorrectionPair> {
     // Group by (normalized_failed, normalized_success)
     let mut groups: HashMap<(String, String), CorrectionPair> = HashMap::new();
 
@@ -563,7 +584,7 @@ fn deduplicate_and_filter(corrections: Vec<CorrectionPair>) -> Vec<CorrectionPai
     groups
         .into_values()
         .filter(|pair| {
-            pair.occurrences >= 2
+            pair.occurrences >= min_occurrences
                 && !is_path_only_difference(&pair.failed_command, &pair.successful_command)
         })
         .collect()
@@ -800,14 +821,15 @@ fn print_help() {
     println!("Usage: skim learn [OPTIONS]");
     println!();
     println!("Options:");
-    println!("  --since <duration>   Time window (e.g., 24h, 7d, 1w) [default: 7d]");
-    println!("                       (7d default provides enough history for");
-    println!("                        reliable error-pattern detection)");
-    println!("  --generate           Write rules to agent-specific rules file");
-    println!("  --dry-run            Preview rules without writing (requires --generate)");
-    println!("  --agent <name>       Only scan sessions from a specific agent");
-    println!("  --json               Output machine-readable JSON");
-    println!("  --help, -h           Print help information");
+    println!("  --since <duration>        Time window (e.g., 24h, 7d, 1w) [default: 7d]");
+    println!("                            (7d default provides enough history for");
+    println!("                             reliable error-pattern detection)");
+    println!("  --generate                Write rules to agent-specific rules file");
+    println!("  --dry-run                 Preview rules without writing (requires --generate)");
+    println!("  --agent <name>            Only scan sessions from a specific agent");
+    println!("  --min-occurrences <N>     Minimum occurrences to report [default: 3]");
+    println!("  --json                    Output machine-readable JSON");
+    println!("  --help, -h                Print help information");
     println!();
     println!("Examples:");
     println!("  skim learn                       Analyze last 7 days, print findings");
@@ -852,6 +874,12 @@ pub(super) fn command() -> clap::Command {
                 .long("json")
                 .action(clap::ArgAction::SetTrue)
                 .help("JSON output"),
+        )
+        .arg(
+            clap::Arg::new("min-occurrences")
+                .long("min-occurrences")
+                .value_name("N")
+                .help("Minimum occurrences to report [default: 3]"),
         )
 }
 
@@ -1183,11 +1211,20 @@ mod tests {
             sessions: vec!["sess2".to_string()],
             agent: AgentKind::ClaudeCode,
         };
+        let pair3 = CorrectionPair {
+            failed_command: "carg test".to_string(),
+            successful_command: "cargo test".to_string(),
+            error_output: "error: command not found".to_string(),
+            pattern_type: PatternType::FlagTypo,
+            occurrences: 1,
+            sessions: vec!["sess3".to_string()],
+            agent: AgentKind::ClaudeCode,
+        };
 
-        let result = deduplicate_and_filter(vec![pair1, pair2]);
+        let result = deduplicate_and_filter(vec![pair1, pair2, pair3], 3);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].occurrences, 2);
-        assert_eq!(result[0].sessions.len(), 2);
+        assert_eq!(result[0].occurrences, 3);
+        assert_eq!(result[0].sessions.len(), 3);
     }
 
     #[test]
@@ -1202,7 +1239,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
         };
 
-        let result = deduplicate_and_filter(vec![pair]);
+        let result = deduplicate_and_filter(vec![pair], 3);
         assert!(
             result.is_empty(),
             "Single-occurrence MissingArg should be filtered"
@@ -1211,6 +1248,7 @@ mod tests {
 
     #[test]
     fn test_filter_rejects_single_occurrence_typo() {
+        // Requires ≥3 occurrences by default
         let pair = CorrectionPair {
             failed_command: "carg test".to_string(),
             successful_command: "cargo test".to_string(),
@@ -1221,10 +1259,10 @@ mod tests {
             agent: AgentKind::ClaudeCode,
         };
 
-        let result = deduplicate_and_filter(vec![pair]);
+        let result = deduplicate_and_filter(vec![pair], 3);
         assert!(
             result.is_empty(),
-            "Single-occurrence FlagTypo should be filtered (requires ≥2)"
+            "Single-occurrence FlagTypo should be filtered (requires ≥3)"
         );
     }
 
@@ -1240,7 +1278,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
         };
 
-        let result = deduplicate_and_filter(vec![pair]);
+        let result = deduplicate_and_filter(vec![pair], 3);
         assert!(result.is_empty(), "Path-only difference should be filtered");
     }
 
@@ -1333,6 +1371,26 @@ mod tests {
     fn test_parse_args_agent_missing_value() {
         let result = parse_args(&["--agent".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_args_min_occurrences() {
+        let config = parse_args(&["--min-occurrences".to_string(), "5".to_string()]).unwrap();
+        assert_eq!(config.min_occurrences, 5);
+    }
+
+    #[test]
+    fn test_parse_args_min_occurrences_zero_rejected() {
+        let result = parse_args(&["--min-occurrences".to_string(), "0".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("at least 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parse_args_min_occurrences_default() {
+        let config = parse_args(&[]).unwrap();
+        assert_eq!(config.min_occurrences, 3);
     }
 
     // ---- levenshtein guards ----
