@@ -82,8 +82,6 @@ fn prompt_install_options(
 /// doesn't exist, returns an error with a helpful message rather than
 /// silently creating an orphan config.
 fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::Result<()> {
-    use crate::cmd::session::AgentKind;
-
     // Claude Code: always proceed (we create ~/.claude/ if needed)
     if flags.agent == AgentKind::ClaudeCode {
         return Ok(());
@@ -148,12 +146,10 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     }
 
     // Already up to date check
-    let guidance_current = if flags.no_guidance {
-        true
-    } else {
-        let agent = flags.agent;
+    let guidance_current = flags.no_guidance || {
         let global = !flags.project;
-        agent
+        flags
+            .agent
             .instruction_file(global)
             .map(|p| {
                 std::fs::read_to_string(&p)
@@ -873,21 +869,14 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("CLAUDE.md");
 
-        // Write with old version
         let old_guidance = guidance_content("1.0.0");
         std::fs::write(&path, format!("# Header\n\n{}\n\n# Footer\n", old_guidance)).unwrap();
 
-        // Simulate update
         let existing = std::fs::read_to_string(&path).unwrap();
         let new_guidance = guidance_content("2.1.0");
-        if let (Some(start), Some(end_pos)) = (
-            existing.find("<!-- skim-start"),
-            existing.find("<!-- skim-end -->"),
-        ) {
-            let end = end_pos + "<!-- skim-end -->".len();
-            let updated = format!("{}{}{}", &existing[..start], new_guidance, &existing[end..]);
-            std::fs::write(&path, updated).unwrap();
-        }
+        let (start, end) = find_skim_section(&existing).expect("markers should be present");
+        let updated = format!("{}{}{}", &existing[..start], new_guidance, &existing[end..]);
+        std::fs::write(&path, updated).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.contains("v2.1.0"));
@@ -904,24 +893,18 @@ mod tests {
         let guidance = guidance_content("2.1.0");
         std::fs::write(&path, format!("# Header\n\n{}\n\n# Footer\n", guidance)).unwrap();
 
-        // Simulate removal
         let content = std::fs::read_to_string(&path).unwrap();
-        if let (Some(start), Some(end_pos)) = (
-            content.find("<!-- skim-start"),
-            content.find("<!-- skim-end -->"),
-        ) {
-            let end = end_pos + "<!-- skim-end -->".len();
-            let mut updated = format!(
-                "{}{}",
-                content[..start].trim_end_matches('\n'),
-                &content[end..]
-            );
-            updated = updated.trim().to_string();
-            if !updated.is_empty() {
-                updated.push('\n');
-            }
-            std::fs::write(&path, updated).unwrap();
+        let (start, end) = find_skim_section(&content).expect("markers should be present");
+        let mut updated = format!(
+            "{}{}",
+            content[..start].trim_end_matches('\n'),
+            &content[end..]
+        );
+        updated = updated.trim().to_string();
+        if !updated.is_empty() {
+            updated.push('\n');
         }
+        std::fs::write(&path, &updated).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(!result.contains("skim-start"));
@@ -938,22 +921,15 @@ mod tests {
         std::fs::write(&path, format!("{}\n", guidance)).unwrap();
         assert!(path.exists());
 
-        // Simulate removal
         let content = std::fs::read_to_string(&path).unwrap();
-        if let (Some(start), Some(end_pos)) = (
-            content.find("<!-- skim-start"),
-            content.find("<!-- skim-end -->"),
-        ) {
-            let end = end_pos + "<!-- skim-end -->".len();
-            let mut updated = format!(
-                "{}{}",
-                content[..start].trim_end_matches('\n'),
-                &content[end..]
-            );
-            updated = updated.trim().to_string();
-            if updated.is_empty() {
-                std::fs::remove_file(&path).unwrap();
-            }
+        let (start, end) = find_skim_section(&content).expect("markers should be present");
+        let updated = format!(
+            "{}{}",
+            content[..start].trim_end_matches('\n'),
+            &content[end..]
+        );
+        if updated.trim().is_empty() {
+            std::fs::remove_file(&path).unwrap();
         }
 
         assert!(!path.exists(), "Empty file should be deleted");

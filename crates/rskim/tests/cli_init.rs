@@ -20,6 +20,21 @@ fn skim_init_cmd(config_dir: &std::path::Path) -> Command {
     cmd
 }
 
+/// Returns true if the hook entry references the skim-rewrite script.
+fn is_skim_hook(entry: &serde_json::Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("skim-rewrite"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 // ============================================================================
 // Fresh install tests
 // ============================================================================
@@ -80,19 +95,7 @@ fn test_init_creates_settings_from_scratch() {
     let arr = ptu.as_array().unwrap();
     assert!(!arr.is_empty(), "PreToolUse should have at least one entry");
 
-    // Find the skim entry
-    let skim_entry = arr.iter().find(|e| {
-        e.get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|s| s.contains("skim-rewrite"))
-                })
-            })
-            .unwrap_or(false)
-    });
+    let skim_entry = arr.iter().find(|e| is_skim_hook(e));
     assert!(skim_entry.is_some(), "Should have a skim hook entry");
 }
 
@@ -131,7 +134,6 @@ fn test_init_preserves_existing_hooks() {
         ptu.len()
     );
 
-    // The other hook should still be present
     let other_exists = ptu.iter().any(|e| {
         e.get("hooks")
             .and_then(|h| h.as_array())
@@ -166,21 +168,7 @@ fn test_init_idempotent_no_duplicates() {
 
     let ptu = json["hooks"]["PreToolUse"].as_array().unwrap();
     // Count skim entries
-    let skim_count = ptu
-        .iter()
-        .filter(|e| {
-            e.get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|s| s.contains("skim-rewrite"))
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .count();
+    let skim_count = ptu.iter().filter(|e| is_skim_hook(e)).count();
 
     assert_eq!(
         skim_count, 1,
@@ -231,21 +219,7 @@ fn test_init_hook_structure() {
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
 
     let ptu = json["hooks"]["PreToolUse"].as_array().unwrap();
-    let skim_entry = ptu
-        .iter()
-        .find(|e| {
-            e.get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|s| s.contains("skim-rewrite"))
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .unwrap();
+    let skim_entry = ptu.iter().find(|e| is_skim_hook(e)).unwrap();
 
     // Check structure: matcher, hooks array with type, command, timeout
     assert_eq!(skim_entry["matcher"], "Bash");
@@ -857,7 +831,10 @@ fn test_init_creates_guidance() {
 
     // Check that CLAUDE.md was created with guidance
     let claude_md = project_dir.path().join("CLAUDE.md");
-    assert!(claude_md.exists(), "CLAUDE.md should be created with guidance");
+    assert!(
+        claude_md.exists(),
+        "CLAUDE.md should be created with guidance"
+    );
     let content = fs::read_to_string(&claude_md).unwrap();
     assert!(
         content.contains("<!-- skim-start"),

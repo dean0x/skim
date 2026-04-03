@@ -563,15 +563,8 @@ fn deduplicate_and_filter(corrections: Vec<CorrectionPair>) -> Vec<CorrectionPai
     groups
         .into_values()
         .filter(|pair| {
-            // Minimum 2 occurrences for all pattern types
-            if pair.occurrences < 2 {
-                return false;
-            }
-            // Exclude path-only differences
-            if is_path_only_difference(&pair.failed_command, &pair.successful_command) {
-                return false;
-            }
-            true
+            pair.occurrences >= 2
+                && !is_path_only_difference(&pair.failed_command, &pair.successful_command)
         })
         .collect()
 }
