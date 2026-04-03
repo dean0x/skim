@@ -148,9 +148,25 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     }
 
     // Already up to date check
+    let guidance_current = if flags.no_guidance {
+        true
+    } else {
+        let agent = flags.agent;
+        let global = !flags.project;
+        agent
+            .instruction_file(global)
+            .map(|p| {
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .map(|c| c.contains(&format!("{} v{}", GUIDANCE_START, state.skim_version)))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true) // No instruction file path = no guidance feature for this agent
+    };
     if state.hook_installed
         && state.hook_version.as_deref() == Some(&state.skim_version)
         && state.marketplace_installed
+        && guidance_current
     {
         println!("  Already up to date. Nothing to do.");
         println!();
@@ -289,7 +305,8 @@ fn execute_install(
 
     // Inject guidance into agent instruction file
     if !no_guidance {
-        let agent = AgentKind::from_str(state.agent_cli_name).unwrap_or(AgentKind::ClaudeCode);
+        let agent = AgentKind::from_str(state.agent_cli_name)
+            .expect("agent_cli_name was validated during state detection");
         inject_guidance(agent, global)?;
     }
 
@@ -564,7 +581,7 @@ fn find_skim_section(content: &str) -> Option<(usize, usize)> {
 
 /// Inject skim guidance section into the agent's main instruction file.
 ///
-/// Three modes:
+/// Four modes:
 /// - **Create**: File doesn't exist → create with just the guidance section
 /// - **Append**: File exists but has no skim section → append to end
 /// - **Update**: File has a skim section with older version → replace in place
@@ -572,16 +589,17 @@ fn find_skim_section(content: &str) -> Option<(usize, usize)> {
 pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<()> {
     let path = match agent.instruction_file(global) {
         Some(p) => p,
-        None => {
-            if global {
-                eprintln!(
-                    "  {} does not support global guidance. Using project scope.",
-                    agent.display_name()
-                );
-                return inject_guidance(agent, false);
+        None if global => {
+            eprintln!(
+                "  {} does not support global guidance. Using project scope.",
+                agent.display_name()
+            );
+            match agent.instruction_file(false) {
+                Some(p) => p,
+                None => anyhow::bail!("No instruction file for {}", agent.display_name()),
             }
-            anyhow::bail!("No instruction file for {}", agent.display_name());
         }
+        None => anyhow::bail!("No instruction file for {}", agent.display_name()),
     };
 
     // Issue 5: resolve symlinks before operating on the path
@@ -777,7 +795,8 @@ pub(super) fn print_dry_run_actions(
         );
     }
     if !no_guidance {
-        let agent = AgentKind::from_str(state.agent_cli_name).unwrap_or(AgentKind::ClaudeCode);
+        let agent = AgentKind::from_str(state.agent_cli_name)
+            .expect("agent_cli_name was validated during state detection");
         if let Some(path) = agent.instruction_file(global) {
             println!("  [dry-run] Would inject guidance into {}", path.display());
         }
