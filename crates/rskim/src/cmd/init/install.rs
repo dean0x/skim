@@ -547,6 +547,21 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
 // Guidance injection
 // ============================================================================
 
+const GUIDANCE_START: &str = "<!-- skim-start";
+const GUIDANCE_END: &str = "<!-- skim-end -->";
+
+/// Find the skim guidance section markers in content.
+/// Returns `Some((start_byte, end_byte))` where end_byte includes the end marker.
+/// Returns `None` if markers are missing or in wrong order (corrupted file).
+fn find_skim_section(content: &str) -> Option<(usize, usize)> {
+    let start = content.find(GUIDANCE_START)?;
+    let end_marker = content.find(GUIDANCE_END)?;
+    if start >= end_marker {
+        return None; // Markers in wrong order
+    }
+    Some((start, end_marker + GUIDANCE_END.len()))
+}
+
 /// Inject skim guidance section into the agent's main instruction file.
 ///
 /// Three modes:
@@ -569,10 +584,26 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
         }
     };
 
+    // Issue 5: resolve symlinks before operating on the path
+    let path = super::helpers::resolve_real_settings_path(&path)?;
+
     let version = env!("CARGO_PKG_VERSION");
     let new_content = super::helpers::guidance_content(version);
 
     if path.exists() {
+        // Issue 4: reject oversized files before reading
+        const MAX_INSTRUCTION_FILE_SIZE: u64 = 1_048_576; // 1MB
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_INSTRUCTION_FILE_SIZE {
+                eprintln!(
+                    "  warning: {} is too large ({} bytes), skipping guidance",
+                    path.display(),
+                    meta.len()
+                );
+                return Ok(());
+            }
+        }
+
         let existing = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -585,42 +616,44 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
             }
         };
 
-        // Check for existing skim section
-        if let (Some(start), Some(end_pos)) = (
-            existing.find("<!-- skim-start"),
-            existing.find("<!-- skim-end -->"),
-        ) {
-            let end = end_pos + "<!-- skim-end -->".len();
+        // Issue 2: check for corrupted markers (present but in wrong order)
+        if find_skim_section(&existing).is_none() && existing.contains(GUIDANCE_START) {
+            eprintln!(
+                "  warning: skim markers in {} appear corrupted (skipping guidance update)",
+                path.display()
+            );
+            return Ok(());
+        }
 
-            // Guard: markers in wrong order (manually edited file) — skip
-            // in-place update and fall through to append path instead.
-            if start < end_pos {
-                let existing_section = &existing[start..end];
+        // Issue 1: use find_skim_section helper
+        if let Some((start, end)) = find_skim_section(&existing) {
+            let existing_section = &existing[start..end];
 
-                // Same version? Skip.
-                if existing_section.contains(&format!("v{version}")) {
-                    println!(
-                        "  {} Guidance already current (v{})",
-                        check_mark(true),
-                        version
-                    );
-                    return Ok(());
-                }
-
-                // Different version? Update in place.
-                let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
-                std::fs::write(&path, updated)?;
+            // Same version? Skip.
+            if existing_section.contains(&format!("v{version}")) {
                 println!(
-                    "  {} Updated guidance in {} (-> v{})",
+                    "  {} Guidance already current (v{})",
                     check_mark(true),
-                    path.display(),
                     version
                 );
                 return Ok(());
             }
+
+            // Different version? Update in place. Issue 3: atomic write.
+            let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
+            let tmp_path = path.with_extension("md.tmp");
+            std::fs::write(&tmp_path, &updated)?;
+            std::fs::rename(&tmp_path, &path)?;
+            println!(
+                "  {} Updated guidance in {} (-> v{})",
+                check_mark(true),
+                path.display(),
+                version
+            );
+            return Ok(());
         }
 
-        // No skim section — append
+        // No skim section — append. Issue 3: atomic write.
         let mut content = existing;
         if !content.ends_with('\n') {
             content.push('\n');
@@ -628,13 +661,17 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
         content.push('\n');
         content.push_str(&new_content);
         content.push('\n');
-        std::fs::write(&path, content)?;
+        let tmp_path = path.with_extension("md.tmp");
+        std::fs::write(&tmp_path, &content)?;
+        std::fs::rename(&tmp_path, &path)?;
     } else {
-        // File doesn't exist — create with just the guidance
+        // File doesn't exist — create with just the guidance. Issue 3: atomic write.
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, format!("{}\n", new_content))?;
+        let tmp_path = path.with_extension("md.tmp");
+        std::fs::write(&tmp_path, format!("{}\n", new_content))?;
+        std::fs::rename(&tmp_path, &path)?;
     }
 
     println!(
@@ -661,17 +698,25 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
         _ => return Ok(()), // Nothing to remove
     };
 
-    let content = std::fs::read_to_string(&path)?;
-    if let (Some(start), Some(end_pos)) = (
-        content.find("<!-- skim-start"),
-        content.find("<!-- skim-end -->"),
-    ) {
-        // Guard: markers in wrong order (manually edited file) — skip removal
-        if start >= end_pos {
+    // Issue 5: resolve symlinks before operating on the path
+    let path = super::helpers::resolve_real_settings_path(&path)?;
+
+    // Issue 4: reject oversized files before reading
+    const MAX_INSTRUCTION_FILE_SIZE: u64 = 1_048_576; // 1MB
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_INSTRUCTION_FILE_SIZE {
+            eprintln!(
+                "  warning: {} is too large ({} bytes), skipping guidance",
+                path.display(),
+                meta.len()
+            );
             return Ok(());
         }
+    }
 
-        let end = end_pos + "<!-- skim-end -->".len();
+    let content = std::fs::read_to_string(&path)?;
+    // Issue 1: use find_skim_section helper (handles wrong-order guard internally)
+    if let Some((start, end)) = find_skim_section(&content) {
         // Remove the section + surrounding blank lines
         let mut updated = format!(
             "{}{}",
@@ -684,10 +729,13 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
         }
 
         if updated.trim().is_empty() {
-            // File was only the skim section — delete the file
+            // File was only the skim section — delete the file (intentional, no atomic needed)
             std::fs::remove_file(&path)?;
         } else {
-            std::fs::write(&path, updated)?;
+            // Issue 3: atomic write
+            let tmp_path = path.with_extension("md.tmp");
+            std::fs::write(&tmp_path, &updated)?;
+            std::fs::rename(&tmp_path, &path)?;
         }
         println!(
             "  {} Removed guidance from {}",
