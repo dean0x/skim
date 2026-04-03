@@ -117,6 +117,30 @@ fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::R
     Ok(())
 }
 
+/// Return `true` when the guidance section in the agent's instruction file is
+/// already at the current skim version (or when guidance is disabled).
+///
+/// Returns `true` (treat as current) when:
+/// - `--no-guidance` is set, or
+/// - The agent has no instruction file (guidance feature not applicable), or
+/// - The file content contains the versioned start marker for `skim_version`.
+fn is_guidance_current(flags: &InitFlags, skim_version: &str) -> bool {
+    if flags.no_guidance {
+        return true;
+    }
+    let global = !flags.project;
+    flags
+        .agent
+        .instruction_file(global)
+        .map(|p| {
+            std::fs::read_to_string(&p)
+                .ok()
+                .map(|c| c.contains(&format!("{} v{}", GUIDANCE_START, skim_version)))
+                .unwrap_or(false)
+        })
+        .unwrap_or(true) // No instruction file path = guidance not applicable for this agent
+}
+
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
     let state = detect_state(flags)?;
 
@@ -146,19 +170,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     }
 
     // Already up to date check
-    let guidance_current = flags.no_guidance || {
-        let global = !flags.project;
-        flags
-            .agent
-            .instruction_file(global)
-            .map(|p| {
-                std::fs::read_to_string(&p)
-                    .ok()
-                    .map(|c| c.contains(&format!("{} v{}", GUIDANCE_START, state.skim_version)))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(true) // No instruction file path = no guidance feature for this agent
-    };
+    let guidance_current = is_guidance_current(flags, &state.skim_version);
     if state.hook_installed
         && state.hook_version.as_deref() == Some(&state.skim_version)
         && state.marketplace_installed
@@ -218,7 +230,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
             options.install_marketplace,
             flags_override.no_guidance,
             !flags_override.project,
-        );
+        )?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
@@ -301,8 +313,12 @@ fn execute_install(
 
     // Inject guidance into agent instruction file
     if !no_guidance {
-        let agent = AgentKind::from_str(state.agent_cli_name)
-            .expect("agent_cli_name was validated during state detection");
+        let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unrecognised agent CLI name {:?}; this is a bug in state detection",
+                state.agent_cli_name
+            )
+        })?;
         inject_guidance(agent, global)?;
     }
 
@@ -403,17 +419,27 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
 
     // Atomic write: write to tmp, then rename to final path.
     // A crash mid-write produces a tmp file instead of a truncated script.
+    // Cleanup guard: remove tmp on any failure (S1).
     let tmp_path = hooks_dir.join(format!("{HOOK_SCRIPT_NAME}.tmp"));
-    std::fs::write(&tmp_path, script_content)?;
+    if let Err(e) = std::fs::write(&tmp_path, script_content) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
 
     // Set executable permissions on the tmp file before renaming
     #[cfg(unix)]
     {
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&tmp_path, perms)?;
+        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
     }
 
-    std::fs::rename(&tmp_path, &script_path)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &script_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
 
     // Compute and store SHA-256 hash for integrity verification (#57)
     if let Ok(hash) = crate::cmd::integrity::compute_file_hash(&script_path) {
@@ -563,6 +589,10 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
 const GUIDANCE_START: &str = "<!-- skim-start";
 const GUIDANCE_END: &str = "<!-- skim-end -->";
 
+/// Maximum byte size for an instruction file before we skip reading it.
+/// Prevents unbounded allocations on corrupted or adversarially crafted files.
+const MAX_INSTRUCTION_FILE_SIZE: u64 = 1_048_576; // 1 MiB
+
 /// Find the skim guidance section markers in content.
 /// Returns `Some((start_byte, end_byte))` where end_byte includes the end marker.
 /// Returns `None` if markers are missing or in wrong order (corrupted file).
@@ -575,6 +605,87 @@ fn find_skim_section(content: &str) -> Option<(usize, usize)> {
     Some((start, end_marker + GUIDANCE_END.len()))
 }
 
+/// Resolve the instruction file path for `agent`, falling back from global to
+/// project scope when the agent does not support a global instruction file.
+fn resolve_instruction_path(
+    agent: AgentKind,
+    global: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    match agent.instruction_file(global) {
+        Some(p) => Ok(p),
+        None if global => {
+            eprintln!(
+                "  {} does not support global guidance. Using project scope.",
+                agent.display_name()
+            );
+            agent
+                .instruction_file(false)
+                .ok_or_else(|| anyhow::anyhow!("No instruction file for {}", agent.display_name()))
+        }
+        None => anyhow::bail!("No instruction file for {}", agent.display_name()),
+    }
+}
+
+/// Read the instruction file at `path`, applying size and read-error guards.
+///
+/// Returns `Ok(None)` when the file should be skipped (too large or unreadable),
+/// which is treated as a soft warning rather than a hard error.
+fn read_existing_safely(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_INSTRUCTION_FILE_SIZE {
+            eprintln!(
+                "  warning: {} is too large ({} bytes), skipping guidance",
+                path.display(),
+                meta.len()
+            );
+            return Ok(None);
+        }
+    }
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) => {
+            eprintln!(
+                "  warning: could not read {}: {} (skipping guidance)",
+                path.display(),
+                e
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Write `new_content` as a new instruction file at `path` (create mode).
+fn guidance_create(path: &std::path::Path, new_content: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write_stripped(path, &format!("{new_content}\n"))
+}
+
+/// Replace the existing skim section in `existing` with `new_content` (update mode).
+fn guidance_update(
+    path: &std::path::Path,
+    existing: &str,
+    start: usize,
+    end: usize,
+    new_content: &str,
+) -> anyhow::Result<()> {
+    let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
+    atomic_write_stripped(path, &updated)
+}
+
+/// Append `new_content` to the end of `existing` (append mode).
+fn guidance_append(path: &std::path::Path, existing: &str, new_content: &str) -> anyhow::Result<()> {
+    let mut content = existing.to_owned();
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push('\n');
+    content.push_str(new_content);
+    content.push('\n');
+    atomic_write_stripped(path, &content)
+}
+
 /// Inject skim guidance section into the agent's main instruction file.
 ///
 /// Four modes:
@@ -583,22 +694,7 @@ fn find_skim_section(content: &str) -> Option<(usize, usize)> {
 /// - **Update**: File has a skim section with older version → replace in place
 /// - **Skip**: File has a skim section with current version → idempotent no-op
 pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<()> {
-    let path = match agent.instruction_file(global) {
-        Some(p) => p,
-        None if global => {
-            eprintln!(
-                "  {} does not support global guidance. Using project scope.",
-                agent.display_name()
-            );
-            match agent.instruction_file(false) {
-                Some(p) => p,
-                None => anyhow::bail!("No instruction file for {}", agent.display_name()),
-            }
-        }
-        None => anyhow::bail!("No instruction file for {}", agent.display_name()),
-    };
-
-    // Issue 5: resolve symlinks before operating on the path
+    let path = resolve_instruction_path(agent, global)?;
     let path = super::helpers::resolve_real_settings_path(&path)?;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -608,35 +704,14 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
     } else {
         super::helpers::guidance_content(version)
     };
-    let tmp_ext = if is_mdc { "mdc.tmp" } else { "md.tmp" };
 
     if path.exists() {
-        // Issue 4: reject oversized files before reading
-        const MAX_INSTRUCTION_FILE_SIZE: u64 = 1_048_576; // 1MB
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > MAX_INSTRUCTION_FILE_SIZE {
-                eprintln!(
-                    "  warning: {} is too large ({} bytes), skipping guidance",
-                    path.display(),
-                    meta.len()
-                );
-                return Ok(());
-            }
-        }
-
-        let existing = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "  warning: could not read {}: {} (skipping guidance)",
-                    path.display(),
-                    e
-                );
-                return Ok(());
-            }
+        let existing = match read_existing_safely(&path)? {
+            Some(s) => s,
+            None => return Ok(()), // soft skip (too large or unreadable)
         };
 
-        // Issue 2: check for corrupted markers (present but in wrong order)
+        // Detect corrupted markers (present but in wrong order)
         if find_skim_section(&existing).is_none() && existing.contains(GUIDANCE_START) {
             eprintln!(
                 "  warning: skim markers in {} appear corrupted (skipping guidance update)",
@@ -645,12 +720,9 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
             return Ok(());
         }
 
-        // Issue 1: use find_skim_section helper
         if let Some((start, end)) = find_skim_section(&existing) {
-            let existing_section = &existing[start..end];
-
             // Same version? Skip.
-            if existing_section.contains(&format!("v{version}")) {
+            if existing[start..end].contains(&format!("v{version}")) {
                 println!(
                     "  {} Guidance already current (v{})",
                     check_mark(true),
@@ -659,11 +731,8 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
                 return Ok(());
             }
 
-            // Different version? Update in place. Issue 3: atomic write.
-            let updated = format!("{}{}{}", &existing[..start], new_content, &existing[end..]);
-            let tmp_path = path.with_extension(tmp_ext);
-            std::fs::write(&tmp_path, &updated)?;
-            std::fs::rename(&tmp_path, &path)?;
+            // Different version — update in place.
+            guidance_update(&path, &existing, start, end, &new_content)?;
             println!(
                 "  {} Updated guidance in {} (-> v{})",
                 check_mark(true),
@@ -673,25 +742,11 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
             return Ok(());
         }
 
-        // No skim section — append. Issue 3: atomic write.
-        let mut content = existing;
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push('\n');
-        content.push_str(&new_content);
-        content.push('\n');
-        let tmp_path = path.with_extension(tmp_ext);
-        std::fs::write(&tmp_path, &content)?;
-        std::fs::rename(&tmp_path, &path)?;
+        // No skim section — append.
+        guidance_append(&path, &existing, &new_content)?;
     } else {
-        // File doesn't exist — create with just the guidance. Issue 3: atomic write.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_path = path.with_extension(tmp_ext);
-        std::fs::write(&tmp_path, format!("{}\n", new_content))?;
-        std::fs::rename(&tmp_path, &path)?;
+        // File doesn't exist — create.
+        guidance_create(&path, &new_content)?;
     }
 
     // Legacy cleanup: remove skim markers from .cursorrules if this is a Cursor agent
@@ -732,8 +787,6 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
     // Issue 5: resolve symlinks before operating on the path
     let path = super::helpers::resolve_real_settings_path(&path)?;
 
-    // Issue 4: reject oversized files before reading
-    const MAX_INSTRUCTION_FILE_SIZE: u64 = 1_048_576; // 1MB
     if let Ok(meta) = std::fs::metadata(&path) {
         if meta.len() > MAX_INSTRUCTION_FILE_SIZE {
             eprintln!(
@@ -746,13 +799,11 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
     }
 
     let content = std::fs::read_to_string(&path)?;
-    // Issue 1: use find_skim_section helper (handles wrong-order guard internally)
     if let Some((start, end)) = find_skim_section(&content) {
         if path.extension().is_some_and(|ext| ext == "mdc") {
             // Skim owns .mdc files entirely — delete on removal
             std::fs::remove_file(&path)?;
         } else {
-            // Remove the section + surrounding blank lines
             let mut updated = format!(
                 "{}{}",
                 content[..start].trim_end_matches('\n'),
@@ -764,13 +815,11 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
             }
 
             if updated.trim().is_empty() {
-                // File was only the skim section — delete the file (intentional, no atomic needed)
+                // File was only the skim section — delete the file
                 std::fs::remove_file(&path)?;
             } else {
-                // Issue 3: atomic write
-                let tmp_path = path.with_extension("md.tmp");
-                std::fs::write(&tmp_path, &updated)?;
-                std::fs::rename(&tmp_path, &path)?;
+                // Atomic write using dynamic extension (issue 10)
+                atomic_write_stripped(&path, &updated)?;
             }
         }
         println!(
@@ -788,49 +837,72 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
     Ok(())
 }
 
+/// Remove the skim section from `content`, stripping surrounding blank lines.
+///
+/// Returns `None` if no skim section was found.
+/// Returns `Some(cleaned)` where `cleaned` is the trimmed remainder with a
+/// trailing newline appended when non-empty.
+fn strip_skim_section(content: &str) -> Option<String> {
+    let (start, end) = find_skim_section(content)?;
+    let mut updated = format!(
+        "{}{}",
+        content[..start].trim_end_matches('\n'),
+        &content[end..]
+    );
+    updated = updated.trim().to_string();
+    let final_content = if updated.is_empty() {
+        String::new()
+    } else {
+        updated + "\n"
+    };
+    Some(final_content)
+}
+
+/// Atomically write `content` to `path`, using a sibling `.tmp`-suffixed file.
+///
+/// The tmp extension mirrors the original file extension so rename targets the
+/// correct filesystem entry (e.g. `skim.mdc.tmp` → `skim.mdc`).
+///
+/// Cleans up the tmp file on both write and rename failures (S1).
+fn atomic_write_stripped(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    // Build tmp extension: "<original_ext>.tmp" or "tmp" if no extension.
+    let tmp_ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.tmp"),
+        None => "tmp".to_string(),
+    };
+    let tmp_path = path.with_extension(&tmp_ext);
+    if let Err(e) = std::fs::write(&tmp_path, content) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Clean up skim markers from legacy `.cursorrules` during Cursor migration.
 ///
 /// Leaves the file in place (even if empty) since the user may have created it
 /// intentionally. Only removes the skim section markers.
 fn clean_legacy_cursorrules() -> anyhow::Result<()> {
     let legacy = std::path::PathBuf::from(".cursorrules");
-    if legacy.exists() {
-        if let Ok(content) = std::fs::read_to_string(&legacy) {
-            if find_skim_section(&content).is_some() {
-                let _ = remove_skim_section_from_file(&legacy);
-                println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
-            }
+    if !legacy.exists() {
+        return Ok(());
+    }
+    // S2: apply resolve_real_settings_path so symlinks are handled consistently
+    let legacy = super::helpers::resolve_real_settings_path(&legacy)?;
+    if let Ok(content) = std::fs::read_to_string(&legacy) {
+        if let Some(cleaned) = strip_skim_section(&content) {
+            // Leave the file in place even when cleaned is empty (user may own it).
+            atomic_write_stripped(&legacy, &cleaned)?;
+            println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
         }
     }
     Ok(())
 }
 
-/// Remove the skim guidance section from a file, keeping any surrounding content.
-///
-/// For `.cursorrules` during Cursor migration: leaves the file in place even if
-/// only skim content remains (user may have created it intentionally).
-fn remove_skim_section_from_file(path: &std::path::Path) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(path)?;
-    if let Some((start, end)) = find_skim_section(&content) {
-        let mut updated = format!(
-            "{}{}",
-            content[..start].trim_end_matches('\n'),
-            &content[end..]
-        );
-        updated = updated.trim().to_string();
-        // Leave the file in place (even if empty) — user may have created it intentionally.
-        // Just write back the cleaned content (with trailing newline if non-empty).
-        let final_content = if updated.is_empty() {
-            String::new()
-        } else {
-            updated + "\n"
-        };
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &final_content)?;
-        std::fs::rename(&tmp_path, path)?;
-    }
-    Ok(())
-}
 
 // ============================================================================
 // Dry-run output (B11)
@@ -841,7 +913,7 @@ pub(super) fn print_dry_run_actions(
     install_marketplace: bool,
     no_guidance: bool,
     global: bool,
-) {
+) -> anyhow::Result<()> {
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
     println!("  [dry-run] Would create: {}", hook_script_path.display());
@@ -863,12 +935,17 @@ pub(super) fn print_dry_run_actions(
         );
     }
     if !no_guidance {
-        let agent = AgentKind::from_str(state.agent_cli_name)
-            .expect("agent_cli_name was validated during state detection");
+        let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unrecognised agent CLI name {:?}; this is a bug in state detection",
+                state.agent_cli_name
+            )
+        })?;
         if let Some(path) = agent.instruction_file(global) {
             println!("  [dry-run] Would inject guidance into {}", path.display());
         }
     }
+    Ok(())
 }
 
 // ============================================================================
