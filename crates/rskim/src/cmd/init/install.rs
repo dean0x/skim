@@ -973,22 +973,78 @@ mod tests {
 
     // ---- Shell-safe path validation (SEC-1) ----
 
+    // ---- find_skim_section unit tests ----
+
+    #[test]
+    fn test_find_skim_section_normal_case() {
+        let content = "Before\n<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->\nAfter\n";
+        let result = find_skim_section(content);
+        assert!(result.is_some(), "Should find section with both markers");
+        let (start, end) = result.unwrap();
+        assert_eq!(&content[start..], "<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->\nAfter\n");
+        assert_eq!(&content[..end], "Before\n<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->");
+    }
+
+    #[test]
+    fn test_find_skim_section_markers_in_wrong_order() {
+        // End marker appears before start marker — corrupted file
+        let content = "<!-- skim-end -->\nsome content\n<!-- skim-start v1.0.0 -->\n";
+        assert!(
+            find_skim_section(content).is_none(),
+            "Should return None when end marker precedes start marker"
+        );
+    }
+
+    #[test]
+    fn test_find_skim_section_only_start_marker() {
+        let content = "<!-- skim-start v1.0.0 -->\nsome guidance\nno end marker\n";
+        assert!(
+            find_skim_section(content).is_none(),
+            "Should return None when only start marker is present"
+        );
+    }
+
+    #[test]
+    fn test_find_skim_section_only_end_marker() {
+        let content = "some content\n<!-- skim-end -->\nmore content\n";
+        assert!(
+            find_skim_section(content).is_none(),
+            "Should return None when only end marker is present"
+        );
+    }
+
+    #[test]
+    fn test_find_skim_section_empty_input() {
+        assert!(
+            find_skim_section("").is_none(),
+            "Should return None for empty input"
+        );
+    }
+
+    #[test]
+    fn test_find_skim_section_adjacent_markers() {
+        // Start and end markers with no content between them
+        let content = "prefix\n<!-- skim-start v2.0.0 --><!-- skim-end -->\nsuffix\n";
+        let result = find_skim_section(content);
+        assert!(result.is_some(), "Should find section when markers are adjacent");
+        let (start, end) = result.unwrap();
+        // start should point to the start marker; end should cover the end marker
+        assert!(content[start..].starts_with("<!-- skim-start"));
+        assert!(content[..end].ends_with("<!-- skim-end -->"));
+    }
+
     // ---- Guidance injection ----
 
     #[test]
     fn test_inject_guidance_appends_to_existing() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("CLAUDE.md");
-        std::fs::write(&path, "# Existing Content\n\nSome rules here.\n").unwrap();
+        let existing = "# Existing Content\n\nSome rules here.\n";
+        std::fs::write(&path, existing).unwrap();
 
         let version = "2.1.0";
         let guidance = guidance_content(version);
-        let existing = std::fs::read_to_string(&path).unwrap();
-        let mut content = existing;
-        content.push('\n');
-        content.push_str(&guidance);
-        content.push('\n');
-        std::fs::write(&path, &content).unwrap();
+        guidance_append(&path, existing, &guidance).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.starts_with("# Existing Content"));
@@ -1001,13 +1057,12 @@ mod tests {
         let path = dir.path().join("CLAUDE.md");
 
         let old_guidance = guidance_content("1.0.0");
-        std::fs::write(&path, format!("# Header\n\n{}\n\n# Footer\n", old_guidance)).unwrap();
+        let existing = format!("# Header\n\n{}\n\n# Footer\n", old_guidance);
+        std::fs::write(&path, &existing).unwrap();
 
-        let existing = std::fs::read_to_string(&path).unwrap();
         let new_guidance = guidance_content("2.1.0");
         let (start, end) = find_skim_section(&existing).expect("markers should be present");
-        let updated = format!("{}{}{}", &existing[..start], new_guidance, &existing[end..]);
-        std::fs::write(&path, updated).unwrap();
+        guidance_update(&path, &existing, start, end, &new_guidance).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.contains("v2.1.0"));
@@ -1022,20 +1077,11 @@ mod tests {
         let path = dir.path().join("CLAUDE.md");
 
         let guidance = guidance_content("2.1.0");
-        std::fs::write(&path, format!("# Header\n\n{}\n\n# Footer\n", guidance)).unwrap();
+        let existing = format!("# Header\n\n{}\n\n# Footer\n", guidance);
+        std::fs::write(&path, &existing).unwrap();
 
-        let content = std::fs::read_to_string(&path).unwrap();
-        let (start, end) = find_skim_section(&content).expect("markers should be present");
-        let mut updated = format!(
-            "{}{}",
-            content[..start].trim_end_matches('\n'),
-            &content[end..]
-        );
-        updated = updated.trim().to_string();
-        if !updated.is_empty() {
-            updated.push('\n');
-        }
-        std::fs::write(&path, &updated).unwrap();
+        let stripped = strip_skim_section(&existing).expect("should find and strip skim section");
+        atomic_write_stripped(&path, &stripped).unwrap();
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(!result.contains("skim-start"));
@@ -1053,14 +1099,11 @@ mod tests {
         assert!(path.exists());
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let (start, end) = find_skim_section(&content).expect("markers should be present");
-        let updated = format!(
-            "{}{}",
-            content[..start].trim_end_matches('\n'),
-            &content[end..]
-        );
-        if updated.trim().is_empty() {
+        let stripped = strip_skim_section(&content).expect("should find skim section");
+        if stripped.trim().is_empty() {
             std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, &stripped).unwrap();
         }
 
         assert!(!path.exists(), "Empty file should be deleted");

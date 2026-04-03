@@ -1099,3 +1099,86 @@ fn test_rewrite_help_mentions_agent_flag() {
         .success()
         .stdout(predicate::str::contains("--agent"));
 }
+
+// ============================================================================
+// Guidance upgrade bypass tests (issue 11)
+// ============================================================================
+
+#[test]
+fn test_init_guidance_upgrade_updates_stale_version() {
+    // Verifies that is_guidance_current returns false when the guidance section
+    // contains a stale version marker, causing a re-run of init --yes to
+    // update guidance rather than print "Already up to date".
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    // Step 1: fresh install — creates guidance at the current version
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(claude_md.exists(), "CLAUDE.md should exist after initial install");
+
+    // Step 2: manually overwrite the guidance section with an old version marker
+    let content = fs::read_to_string(&claude_md).unwrap();
+    assert!(
+        content.contains("<!-- skim-start"),
+        "Initial install should have created a skim-start marker"
+    );
+    // Replace the versioned marker with an obviously stale one
+    let stale_content = {
+        let start = content.find("<!-- skim-start").expect("start marker must exist");
+        let marker_end = content[start..].find(" -->").expect("marker closing must exist");
+        let mut s = content.clone();
+        s.replace_range(start..start + marker_end + 4, "<!-- skim-start v0.0.1 -->");
+        s
+    };
+    fs::write(&claude_md, &stale_content).unwrap();
+    assert!(
+        stale_content.contains("<!-- skim-start v0.0.1 -->"),
+        "Stale marker should be present after manual overwrite"
+    );
+
+    // Step 3: re-run init --yes — should NOT say "Already up to date"
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+
+    assert!(
+        !stdout.contains("Already up to date"),
+        "Should not say 'Already up to date' when guidance version is stale; got:\n{stdout}"
+    );
+
+    // Step 4: verify the guidance was updated to the current version
+    let updated = fs::read_to_string(&claude_md).unwrap();
+    assert!(
+        !updated.contains("v0.0.1"),
+        "Stale version marker should have been replaced"
+    );
+    assert!(
+        updated.contains("<!-- skim-start v"),
+        "Updated file should have a versioned skim-start marker"
+    );
+    // The new marker should not be the old stale version
+    let current_version = env!("CARGO_PKG_VERSION");
+    assert!(
+        updated.contains(&format!("<!-- skim-start v{current_version} -->")),
+        "Updated marker should reference the current binary version ({current_version})"
+    );
+}
