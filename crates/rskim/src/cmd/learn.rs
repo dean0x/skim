@@ -641,7 +641,7 @@ fn generate_rules_content(corrections: &[CorrectionPair], agent: AgentKind) -> S
     match agent {
         AgentKind::Cursor => {
             output.push_str(
-                "---\nalwaysApply: true\ndescription: CLI corrections learned by skim\n---\n\n",
+                "---\ndescription: CLI corrections learned by skim\nalwaysApply: true\n---\n\n",
             );
         }
         AgentKind::CopilotCli => {
@@ -894,6 +894,55 @@ pub(super) fn command() -> clap::Command {
 mod tests {
     use super::*;
     use crate::cmd::session::ToolResult;
+
+    // ---- truncate_utf8 ----
+
+    #[test]
+    fn test_truncate_utf8_ascii_within_limit() {
+        assert_eq!(truncate_utf8("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_utf8_ascii_at_boundary() {
+        assert_eq!(truncate_utf8("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_utf8_ascii_over_limit() {
+        assert_eq!(truncate_utf8("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_utf8_empty_string() {
+        assert_eq!(truncate_utf8("", 10), "");
+    }
+
+    #[test]
+    fn test_truncate_utf8_zero_limit() {
+        assert_eq!(truncate_utf8("hello", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_utf8_multibyte_boundary() {
+        // "café" is 5 bytes: c(1) a(1) f(1) é(2)
+        // max_len=4 must not split the 2-byte 'é' at byte 4 — result is "caf"
+        let s = "café";
+        let result = truncate_utf8(s, 4);
+        assert_eq!(result, "caf");
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_truncate_utf8_multibyte_exactly_fits() {
+        // max_len=5 fits "café" exactly (5 bytes)
+        let s = "café";
+        assert_eq!(truncate_utf8(s, 5), "café");
+    }
+
+    #[test]
+    fn test_truncate_utf8_overflow_limit_larger_than_string() {
+        assert_eq!(truncate_utf8("hi", 1000), "hi");
+    }
 
     // ---- levenshtein ----
 
@@ -1391,6 +1440,18 @@ mod tests {
         assert_eq!(config.min_occurrences, 3);
     }
 
+    #[test]
+    fn test_parse_args_min_occurrences_non_integer_rejected() {
+        let result = parse_args(&["--min-occurrences".to_string(), "abc".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("positive integer"),
+            "error should mention 'positive integer', got: {msg}"
+        );
+        assert!(msg.contains("abc"), "error should echo the bad value, got: {msg}");
+    }
+
     // ---- levenshtein guards ----
 
     #[test]
@@ -1607,8 +1668,8 @@ mod tests {
         }];
 
         let content = generate_rules_content(&corrections, AgentKind::Cursor);
-        assert!(content.starts_with("---\nalwaysApply: true\n"));
-        assert!(content.contains("description: CLI corrections learned by skim"));
+        assert!(content.starts_with("---\ndescription: CLI corrections learned by skim\n"));
+        assert!(content.contains("alwaysApply: true"));
         assert!(content.contains("# CLI Corrections"));
     }
 
