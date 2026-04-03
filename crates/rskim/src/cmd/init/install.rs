@@ -844,16 +844,17 @@ pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
 /// trailing newline appended when non-empty.
 fn strip_skim_section(content: &str) -> Option<String> {
     let (start, end) = find_skim_section(content)?;
-    let mut updated = format!(
+    let trimmed = format!(
         "{}{}",
         content[..start].trim_end_matches('\n'),
         &content[end..]
-    );
-    updated = updated.trim().to_string();
-    let final_content = if updated.is_empty() {
+    )
+    .trim()
+    .to_string();
+    let final_content = if trimmed.is_empty() {
         String::new()
     } else {
-        updated + "\n"
+        trimmed + "\n"
     };
     Some(final_content)
 }
@@ -902,7 +903,6 @@ fn clean_legacy_cursorrules() -> anyhow::Result<()> {
     }
     Ok(())
 }
-
 
 // ============================================================================
 // Dry-run output (B11)

@@ -149,7 +149,6 @@ impl AgentKind {
     ///   Respects agent-specific env var overrides for global config directories.
     /// For `global = false`: returns project-relative path (e.g., `CLAUDE.md`).
     pub(crate) fn instruction_file(&self, global: bool) -> Option<std::path::PathBuf> {
-        use std::path::PathBuf;
         match (self, global) {
             // Global scope — with env var overrides
             (AgentKind::ClaudeCode, true) => {

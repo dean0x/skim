@@ -268,11 +268,11 @@ fn find_correction(
     let end = (failed_idx + 1 + LOOKAHEAD).min(invocations.len());
 
     for candidate in invocations.iter().take(end).skip(failed_idx + 1) {
-        let is_success = candidate
+        let succeeded = candidate
             .result
             .as_ref()
             .is_some_and(|r| !r.is_error && !looks_like_error(&r.content));
-        if !is_success {
+        if !succeeded {
             continue;
         }
 
@@ -781,7 +781,7 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
     }
 
     let target = match agent.rules_dir() {
-        Some(dir) => std::path::Path::new(&dir)
+        Some(dir) => std::path::Path::new(dir)
             .join(agent.rules_filename())
             .display()
             .to_string(),
