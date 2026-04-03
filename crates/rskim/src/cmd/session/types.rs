@@ -645,7 +645,9 @@ mod tests {
     fn test_instruction_file_claude_code_env_override() {
         let key = "CLAUDE_CONFIG_DIR";
         let old = std::env::var_os(key);
-        // SAFETY: env var tests are single-threaded via Rust test runner
+        // SAFETY: `CLAUDE_CONFIG_DIR` is only read by `instruction_file()`, which is
+        // called synchronously below before the variable is restored. No other test in
+        // this crate reads this env var, so there is no concurrent reader to race with.
         unsafe { std::env::set_var(key, "/tmp/test-claude") };
         let path = AgentKind::ClaudeCode.instruction_file(true).unwrap();
         match old {
@@ -659,6 +661,9 @@ mod tests {
     fn test_instruction_file_codex_env_override() {
         let key = "CODEX_HOME";
         let old = std::env::var_os(key);
+        // SAFETY: `CODEX_HOME` is only read by `instruction_file()`, which is called
+        // synchronously below before the variable is restored. No other test in this
+        // crate reads this env var, so there is no concurrent reader to race with.
         unsafe { std::env::set_var(key, "/tmp/test-codex") };
         let path = AgentKind::CodexCli.instruction_file(true).unwrap();
         match old {
@@ -672,6 +677,9 @@ mod tests {
     fn test_instruction_file_opencode_env_override() {
         let key = "OPENCODE_CONFIG_DIR";
         let old = std::env::var_os(key);
+        // SAFETY: `OPENCODE_CONFIG_DIR` is only read by `instruction_file()`, which is
+        // called synchronously below before the variable is restored. No other test in
+        // this crate reads this env var, so there is no concurrent reader to race with.
         unsafe { std::env::set_var(key, "/tmp/test-opencode") };
         let path = AgentKind::OpenCode.instruction_file(true).unwrap();
         match old {
