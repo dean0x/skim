@@ -1449,7 +1449,10 @@ mod tests {
             msg.contains("positive integer"),
             "error should mention 'positive integer', got: {msg}"
         );
-        assert!(msg.contains("abc"), "error should echo the bad value, got: {msg}");
+        assert!(
+            msg.contains("abc"),
+            "error should echo the bad value, got: {msg}"
+        );
     }
 
     // ---- levenshtein guards ----

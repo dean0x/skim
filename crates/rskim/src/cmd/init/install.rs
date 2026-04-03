@@ -607,10 +607,7 @@ fn find_skim_section(content: &str) -> Option<(usize, usize)> {
 
 /// Resolve the instruction file path for `agent`, falling back from global to
 /// project scope when the agent does not support a global instruction file.
-fn resolve_instruction_path(
-    agent: AgentKind,
-    global: bool,
-) -> anyhow::Result<std::path::PathBuf> {
+fn resolve_instruction_path(agent: AgentKind, global: bool) -> anyhow::Result<std::path::PathBuf> {
     match agent.instruction_file(global) {
         Some(p) => Ok(p),
         None if global => {
@@ -675,7 +672,11 @@ fn guidance_update(
 }
 
 /// Append `new_content` to the end of `existing` (append mode).
-fn guidance_append(path: &std::path::Path, existing: &str, new_content: &str) -> anyhow::Result<()> {
+fn guidance_append(
+    path: &std::path::Path,
+    existing: &str,
+    new_content: &str,
+) -> anyhow::Result<()> {
     let mut content = existing.to_owned();
     if !content.ends_with('\n') {
         content.push('\n');
@@ -977,12 +978,19 @@ mod tests {
 
     #[test]
     fn test_find_skim_section_normal_case() {
-        let content = "Before\n<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->\nAfter\n";
+        let content =
+            "Before\n<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->\nAfter\n";
         let result = find_skim_section(content);
         assert!(result.is_some(), "Should find section with both markers");
         let (start, end) = result.unwrap();
-        assert_eq!(&content[start..], "<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->\nAfter\n");
-        assert_eq!(&content[..end], "Before\n<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->");
+        assert_eq!(
+            &content[start..],
+            "<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->\nAfter\n"
+        );
+        assert_eq!(
+            &content[..end],
+            "Before\n<!-- skim-start v1.0.0 -->\nsome guidance\n<!-- skim-end -->"
+        );
     }
 
     #[test]
@@ -1026,7 +1034,10 @@ mod tests {
         // Start and end markers with no content between them
         let content = "prefix\n<!-- skim-start v2.0.0 --><!-- skim-end -->\nsuffix\n";
         let result = find_skim_section(content);
-        assert!(result.is_some(), "Should find section when markers are adjacent");
+        assert!(
+            result.is_some(),
+            "Should find section when markers are adjacent"
+        );
         let (start, end) = result.unwrap();
         // start should point to the start marker; end should cover the end marker
         assert!(content[start..].starts_with("<!-- skim-start"));
