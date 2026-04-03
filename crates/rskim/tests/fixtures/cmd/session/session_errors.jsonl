@@ -6,3 +6,19 @@
 {"type":"user","message":{"content":[{"tool_use_id":"toolu_03","type":"tool_result","content":"error: unexpected argument '--nocapture'","is_error":true}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_04","name":"Bash","input":{"command":"cargo test -- --nocapture","description":"Run tests with output"}}]},"timestamp":"2024-01-01T00:03:00Z","sessionId":"error-session"}
 {"type":"user","message":{"content":[{"tool_use_id":"toolu_04","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_05","name":"Bash","input":{"command":"carg test","description":"Run tests again"}}]},"timestamp":"2024-01-01T00:04:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_05","type":"tool_result","content":"error: command not found: carg","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_06","name":"Bash","input":{"command":"cargo test","description":"Run tests again"}}]},"timestamp":"2024-01-01T00:05:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_06","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_07","name":"Bash","input":{"command":"cargo test --nocapture","description":"Run tests with output again"}}]},"timestamp":"2024-01-01T00:06:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_07","type":"tool_result","content":"error: unexpected argument '--nocapture'","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_08","name":"Bash","input":{"command":"cargo test -- --nocapture","description":"Run tests with output again"}}]},"timestamp":"2024-01-01T00:07:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_08","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_09","name":"Bash","input":{"command":"carg test","description":"Run tests third time"}}]},"timestamp":"2024-01-01T00:08:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_09","type":"tool_result","content":"error: command not found: carg","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_10","name":"Bash","input":{"command":"cargo test","description":"Run tests third time"}}]},"timestamp":"2024-01-01T00:09:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_10","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_11","name":"Bash","input":{"command":"cargo test --nocapture","description":"Run tests with output third time"}}]},"timestamp":"2024-01-01T00:10:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_11","type":"tool_result","content":"error: unexpected argument '--nocapture'","is_error":true}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_12","name":"Bash","input":{"command":"cargo test -- --nocapture","description":"Run tests with output third time"}}]},"timestamp":"2024-01-01T00:11:00Z","sessionId":"error-session"}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_12","type":"tool_result","content":"test result: ok. 5 passed; 0 failed"}]}}

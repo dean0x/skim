@@ -10,6 +10,7 @@ pub(super) struct InitFlags {
     pub(super) dry_run: bool,
     pub(super) uninstall: bool,
     pub(super) force: bool,
+    pub(super) no_guidance: bool,
     /// Target agent for installation (default: ClaudeCode)
     pub(super) agent: AgentKind,
 }
@@ -20,6 +21,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
     let mut dry_run = false;
     let mut uninstall = false;
     let mut force = false;
+    let mut no_guidance = false;
     let mut agent = AgentKind::ClaudeCode;
 
     let mut i = 0;
@@ -31,6 +33,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
             "--dry-run" => dry_run = true,
             "--uninstall" => uninstall = true,
             "--force" => force = true,
+            "--no-guidance" => no_guidance = true,
             "--agent" => {
                 i += 1;
                 if i >= args.len() {
@@ -62,6 +65,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         dry_run,
         uninstall,
         force,
+        no_guidance,
         agent,
     })
 }

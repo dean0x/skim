@@ -20,6 +20,21 @@ fn skim_init_cmd(config_dir: &std::path::Path) -> Command {
     cmd
 }
 
+/// Returns true if the hook entry references the skim-rewrite script.
+fn is_skim_hook(entry: &serde_json::Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("skim-rewrite"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 // ============================================================================
 // Fresh install tests
 // ============================================================================
@@ -80,19 +95,7 @@ fn test_init_creates_settings_from_scratch() {
     let arr = ptu.as_array().unwrap();
     assert!(!arr.is_empty(), "PreToolUse should have at least one entry");
 
-    // Find the skim entry
-    let skim_entry = arr.iter().find(|e| {
-        e.get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|s| s.contains("skim-rewrite"))
-                })
-            })
-            .unwrap_or(false)
-    });
+    let skim_entry = arr.iter().find(|e| is_skim_hook(e));
     assert!(skim_entry.is_some(), "Should have a skim hook entry");
 }
 
@@ -131,7 +134,6 @@ fn test_init_preserves_existing_hooks() {
         ptu.len()
     );
 
-    // The other hook should still be present
     let other_exists = ptu.iter().any(|e| {
         e.get("hooks")
             .and_then(|h| h.as_array())
@@ -166,21 +168,7 @@ fn test_init_idempotent_no_duplicates() {
 
     let ptu = json["hooks"]["PreToolUse"].as_array().unwrap();
     // Count skim entries
-    let skim_count = ptu
-        .iter()
-        .filter(|e| {
-            e.get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|s| s.contains("skim-rewrite"))
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .count();
+    let skim_count = ptu.iter().filter(|e| is_skim_hook(e)).count();
 
     assert_eq!(
         skim_count, 1,
@@ -231,21 +219,7 @@ fn test_init_hook_structure() {
     let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
 
     let ptu = json["hooks"]["PreToolUse"].as_array().unwrap();
-    let skim_entry = ptu
-        .iter()
-        .find(|e| {
-            e.get("hooks")
-                .and_then(|h| h.as_array())
-                .map(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|s| s.contains("skim-rewrite"))
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .unwrap();
+    let skim_entry = ptu.iter().find(|e| is_skim_hook(e)).unwrap();
 
     // Check structure: matcher, hooks array with type, command, timeout
     assert_eq!(skim_entry["matcher"], "Bash");
@@ -834,6 +808,273 @@ fn test_rewrite_hook_help() {
 }
 
 // ============================================================================
+// Guidance injection
+// ============================================================================
+
+#[test]
+fn test_init_creates_guidance() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+
+    // Create a CLAUDE.md at the "global" location (config_dir/../CLAUDE.md won't work,
+    // so we test via project mode which creates CLAUDE.md in CWD)
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // Check that CLAUDE.md was created with guidance
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(
+        claude_md.exists(),
+        "CLAUDE.md should be created with guidance"
+    );
+    let content = fs::read_to_string(&claude_md).unwrap();
+    assert!(
+        content.contains("<!-- skim-start"),
+        "CLAUDE.md should contain skim guidance section"
+    );
+    assert!(
+        content.contains("<!-- skim-end -->"),
+        "CLAUDE.md should have closing marker"
+    );
+    assert!(
+        content.contains("npx rskim"),
+        "Guidance should reference npx rskim"
+    );
+}
+
+#[test]
+fn test_init_no_guidance_flag() {
+    let dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--no-guidance"])
+        .env("CLAUDE_CONFIG_DIR", dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // CLAUDE.md should not exist (no guidance injected, file not created)
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(
+        !claude_md.exists(),
+        "CLAUDE.md should not be created with --no-guidance"
+    );
+}
+
+#[test]
+fn test_init_uninstall_removes_guidance() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    // First install with guidance
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // Verify install created guidance
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(claude_md.exists(), "CLAUDE.md should exist after install");
+
+    // Then uninstall
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--uninstall", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // CLAUDE.md should not contain skim guidance (or be deleted if it was the only content)
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    if claude_md.exists() {
+        let content = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            !content.contains("skim-start"),
+            "Guidance section should be removed after uninstall"
+        );
+    }
+    // If file doesn't exist, that's also correct (was only skim content)
+}
+
+#[test]
+fn test_init_guidance_idempotent() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    // Install twice
+    for _ in 0..2 {
+        Command::cargo_bin("skim")
+            .unwrap()
+            .arg("init")
+            .args(["--project", "--yes"])
+            .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+            .current_dir(project_dir.path())
+            .assert()
+            .success();
+    }
+
+    // CLAUDE.md should have exactly one skim section
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(claude_md.exists(), "CLAUDE.md should exist after init");
+    let content = fs::read_to_string(&claude_md).unwrap();
+    let start_count = content.matches("<!-- skim-start").count();
+    assert_eq!(
+        start_count, 1,
+        "Should have exactly one skim section, found {}",
+        start_count
+    );
+}
+
+#[test]
+fn test_init_dry_run_shows_guidance() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--dry-run"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("guidance"));
+}
+
+// ============================================================================
+// Cursor .mdc format
+// ============================================================================
+
+#[test]
+fn test_init_cursor_creates_mdc() {
+    let config_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // Should create .cursor/rules/skim.mdc with frontmatter
+    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    assert!(mdc.exists(), ".cursor/rules/skim.mdc should be created");
+    let content = fs::read_to_string(&mdc).unwrap();
+    assert!(content.starts_with("---\n"), "Should have YAML frontmatter");
+    assert!(
+        content.contains("alwaysApply: true"),
+        "Should have alwaysApply"
+    );
+    assert!(
+        content.contains("<!-- skim-start"),
+        "Should have skim start marker"
+    );
+    assert!(
+        content.contains("<!-- skim-end -->"),
+        "Should have skim end marker"
+    );
+}
+
+#[test]
+fn test_init_cursor_uninstall_deletes_mdc() {
+    let config_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    // Install
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    assert!(mdc.exists(), "skim.mdc should exist after install");
+
+    // Uninstall
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--uninstall", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    assert!(!mdc.exists(), "skim.mdc should be deleted on uninstall");
+}
+
+#[test]
+fn test_init_cursor_cleans_legacy_cursorrules() {
+    let config_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    // Pre-populate a .cursorrules with skim markers (legacy format)
+    let cursorrules = project_dir.path().join(".cursorrules");
+    fs::write(
+        &cursorrules,
+        "# User rules\n\n<!-- skim-start v1.0.0 -->\nold guidance\n<!-- skim-end -->\n\n# More user rules\n",
+    )
+    .unwrap();
+
+    // Install Cursor (should create .mdc AND clean legacy .cursorrules)
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // New .mdc should exist
+    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    assert!(mdc.exists(), ".cursor/rules/skim.mdc should be created");
+
+    // Legacy .cursorrules should still exist (user may have created it)
+    assert!(
+        cursorrules.exists(),
+        ".cursorrules should NOT be deleted (user owns it)"
+    );
+
+    // But skim markers should be removed from .cursorrules
+    let content = fs::read_to_string(&cursorrules).unwrap();
+    assert!(
+        !content.contains("skim-start"),
+        "Skim markers should be removed from .cursorrules, got: {content}"
+    );
+    assert!(
+        content.contains("User rules"),
+        "User content should be preserved in .cursorrules"
+    );
+}
+
+// ============================================================================
 // Phase 6: Multi-agent awareness in skim init
 // ============================================================================
 
@@ -857,4 +1098,94 @@ fn test_rewrite_help_mentions_agent_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--agent"));
+}
+
+// ============================================================================
+// Guidance upgrade bypass tests (issue 11)
+// ============================================================================
+
+#[test]
+fn test_init_guidance_upgrade_updates_stale_version() {
+    // Verifies that is_guidance_current returns false when the guidance section
+    // contains a stale version marker, causing a re-run of init --yes to
+    // update guidance rather than print "Already up to date".
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+    let project_dir = TempDir::new().unwrap();
+
+    // Step 1: fresh install — creates guidance at the current version
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    let claude_md = project_dir.path().join("CLAUDE.md");
+    assert!(
+        claude_md.exists(),
+        "CLAUDE.md should exist after initial install"
+    );
+
+    // Step 2: manually overwrite the guidance section with an old version marker
+    let content = fs::read_to_string(&claude_md).unwrap();
+    assert!(
+        content.contains("<!-- skim-start"),
+        "Initial install should have created a skim-start marker"
+    );
+    // Replace the versioned marker with an obviously stale one
+    let stale_content = {
+        let start = content
+            .find("<!-- skim-start")
+            .expect("start marker must exist");
+        let marker_end = content[start..]
+            .find(" -->")
+            .expect("marker closing must exist");
+        let mut s = content.clone();
+        s.replace_range(start..start + marker_end + 4, "<!-- skim-start v0.0.1 -->");
+        s
+    };
+    fs::write(&claude_md, &stale_content).unwrap();
+    assert!(
+        stale_content.contains("<!-- skim-start v0.0.1 -->"),
+        "Stale marker should be present after manual overwrite"
+    );
+
+    // Step 3: re-run init --yes — should NOT say "Already up to date"
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", config.as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+
+    assert!(
+        !stdout.contains("Already up to date"),
+        "Should not say 'Already up to date' when guidance version is stale; got:\n{stdout}"
+    );
+
+    // Step 4: verify the guidance was updated to the current version
+    let updated = fs::read_to_string(&claude_md).unwrap();
+    assert!(
+        !updated.contains("v0.0.1"),
+        "Stale version marker should have been replaced"
+    );
+    assert!(
+        updated.contains("<!-- skim-start v"),
+        "Updated file should have a versioned skim-start marker"
+    );
+    // The new marker should not be the old stale version
+    let current_version = env!("CARGO_PKG_VERSION");
+    assert!(
+        updated.contains(&format!("<!-- skim-start v{current_version} -->")),
+        "Updated marker should reference the current binary version ({current_version})"
+    );
 }

@@ -130,6 +130,47 @@ pub(super) fn atomic_write_settings(
 }
 
 // ============================================================================
+// Guidance content
+// ============================================================================
+
+/// Generate the skim guidance section content with version markers.
+///
+/// This is a short (~300 token), self-contained preamble that tells agents
+/// skim is available for structural code exploration. Uses `npx rskim` for
+/// portability. Framed as soft guidance, not an override.
+pub(super) fn guidance_content(version: &str) -> String {
+    format!(
+        r#"<!-- skim-start v{version} -->
+## Skim — Context-Optimized Code Reading
+
+`skim` is installed. When you need a structural overview of code (not editing), use
+`npx rskim <file>` via Bash for 60-80% token reduction.
+
+Good for:
+- Exploring unfamiliar code or understanding structure
+- Understanding API surfaces: `npx rskim <file> --mode=signatures`
+- Scanning entire directories: `npx rskim 'src/**/*.ts'`
+
+Still use Read when:
+- You need exact line content for editing
+- You need specific line numbers
+- The file is small (<50 lines)
+<!-- skim-end -->"#,
+        version = version
+    )
+}
+
+/// Generate skim guidance content wrapped in Cursor `.mdc` frontmatter.
+///
+/// Cursor's `.mdc` format requires YAML frontmatter. Skim owns the entire file.
+pub(super) fn guidance_content_mdc(version: &str) -> String {
+    let body = guidance_content(version);
+    format!(
+        "---\ndescription: \"skim code reader — use skim vs Read for structural code exploration\"\nalwaysApply: true\n---\n\n{body}"
+    )
+}
+
+// ============================================================================
 // Interactive prompt helpers
 // ============================================================================
 
@@ -191,6 +232,7 @@ pub(super) fn print_help() {
     println!("  --yes, -y           Non-interactive mode (skip prompts)");
     println!("  --dry-run           Print actions without writing");
     println!("  --uninstall         Remove hook and clean up");
+    println!("  --no-guidance       Skip injecting guidance into agent instruction file");
     println!("  --force             Force uninstall even if hook script was modified");
     println!("  --help, -h          Print help information");
     println!();
@@ -211,6 +253,27 @@ pub(super) fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_guidance_content_has_version_markers() {
+        let content = guidance_content("2.1.0");
+        assert!(content.starts_with("<!-- skim-start v2.1.0 -->"));
+        assert!(content.ends_with("<!-- skim-end -->"));
+        assert!(content.contains("npx rskim"));
+    }
+
+    #[test]
+    fn test_guidance_content_mdc_has_frontmatter() {
+        let content = guidance_content_mdc("2.1.0");
+        assert!(
+            content.starts_with("---\n"),
+            "Should start with YAML frontmatter"
+        );
+        assert!(content.contains("alwaysApply: true"));
+        assert!(content.contains("description:"));
+        assert!(content.contains("<!-- skim-start v2.1.0 -->"));
+        assert!(content.contains("<!-- skim-end -->"));
+    }
 
     #[test]
     fn test_load_or_create_settings_missing_file() {

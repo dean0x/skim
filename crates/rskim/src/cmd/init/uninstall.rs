@@ -13,45 +13,35 @@ use super::state::{has_skim_hook_entry, read_settings_json};
 /// 2. Cleans up empty arrays/objects
 /// 3. Removes `skim` from `extraKnownMarketplaces`
 fn remove_skim_from_settings(settings: &mut serde_json::Value) {
-    let obj = match settings.as_object_mut() {
-        Some(obj) => obj,
-        None => return,
+    let Some(obj) = settings.as_object_mut() else {
+        return;
     };
 
-    // Remove skim from PreToolUse
-    let hooks_empty = obj
-        .get_mut("hooks")
-        .and_then(|h| h.as_object_mut())
-        .map(|hooks_obj| {
-            let ptu_empty = hooks_obj
-                .get_mut("PreToolUse")
-                .and_then(|ptu| ptu.as_array_mut())
-                .map(|arr| {
-                    arr.retain(|entry| !has_skim_hook_entry(entry));
-                    arr.is_empty()
-                })
-                .unwrap_or(false);
-            if ptu_empty {
+    // Remove skim from PreToolUse; clean up empty objects
+    if let Some(hooks_obj) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        if let Some(arr) = hooks_obj
+            .get_mut("PreToolUse")
+            .and_then(|p| p.as_array_mut())
+        {
+            arr.retain(|entry| !has_skim_hook_entry(entry));
+            if arr.is_empty() {
                 hooks_obj.remove("PreToolUse");
             }
-            hooks_obj.is_empty()
-        })
-        .unwrap_or(false);
-    if hooks_empty {
-        obj.remove("hooks");
+        }
+        if hooks_obj.is_empty() {
+            obj.remove("hooks");
+        }
     }
 
-    // Remove from extraKnownMarketplaces
-    let mkts_empty = obj
+    // Remove skim from extraKnownMarketplaces; clean up if empty
+    if let Some(mkts_obj) = obj
         .get_mut("extraKnownMarketplaces")
         .and_then(|m| m.as_object_mut())
-        .map(|mkts_obj| {
-            mkts_obj.remove("skim");
-            mkts_obj.is_empty()
-        })
-        .unwrap_or(false);
-    if mkts_empty {
-        obj.remove("extraKnownMarketplaces");
+    {
+        mkts_obj.remove("skim");
+        if mkts_obj.is_empty() {
+            obj.remove("extraKnownMarketplaces");
+        }
     }
 }
 
@@ -155,6 +145,10 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
         // Clean up hash manifest (#57)
         let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, flags.agent.cli_name());
     }
+
+    // Remove guidance from instruction file
+    let global = !flags.project;
+    super::install::remove_guidance(flags.agent, global)?;
 
     println!();
     println!("  skim hook has been uninstalled.");
