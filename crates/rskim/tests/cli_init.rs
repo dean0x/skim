@@ -1029,6 +1029,51 @@ fn test_init_cursor_uninstall_deletes_mdc() {
     assert!(!mdc.exists(), "skim.mdc should be deleted on uninstall");
 }
 
+#[test]
+fn test_init_cursor_cleans_legacy_cursorrules() {
+    let config_dir = TempDir::new().unwrap();
+    let project_dir = TempDir::new().unwrap();
+
+    // Pre-populate a .cursorrules with skim markers (legacy format)
+    let cursorrules = project_dir.path().join(".cursorrules");
+    fs::write(
+        &cursorrules,
+        "# User rules\n\n<!-- skim-start v1.0.0 -->\nold guidance\n<!-- skim-end -->\n\n# More user rules\n",
+    )
+    .unwrap();
+
+    // Install Cursor (should create .mdc AND clean legacy .cursorrules)
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("init")
+        .args(["--project", "--yes", "--agent", "cursor"])
+        .env("CLAUDE_CONFIG_DIR", config_dir.path().as_os_str())
+        .current_dir(project_dir.path())
+        .assert()
+        .success();
+
+    // New .mdc should exist
+    let mdc = project_dir.path().join(".cursor/rules/skim.mdc");
+    assert!(mdc.exists(), ".cursor/rules/skim.mdc should be created");
+
+    // Legacy .cursorrules should still exist (user may have created it)
+    assert!(
+        cursorrules.exists(),
+        ".cursorrules should NOT be deleted (user owns it)"
+    );
+
+    // But skim markers should be removed from .cursorrules
+    let content = fs::read_to_string(&cursorrules).unwrap();
+    assert!(
+        !content.contains("skim-start"),
+        "Skim markers should be removed from .cursorrules, got: {content}"
+    );
+    assert!(
+        content.contains("User rules"),
+        "User content should be preserved in .cursorrules"
+    );
+}
+
 // ============================================================================
 // Phase 6: Multi-agent awareness in skim init
 // ============================================================================
