@@ -73,6 +73,7 @@ fn build_full_command() -> Command {
     cmd = cmd.subcommand(super::init::command());
     cmd = cmd.subcommand(super::discover::command());
     cmd = cmd.subcommand(super::learn::command());
+    cmd = cmd.subcommand(super::search::command());
 
     // Subcommands with full arg definitions added above -- skip in the stub loop.
     const IMPLEMENTED_SUBCOMMANDS: &[&str] = &[
@@ -82,6 +83,7 @@ fn build_full_command() -> Command {
         "init",
         "learn",
         "rewrite",
+        "search",
     ];
 
     // Add stub subcommands for all OTHER known subcommands
