@@ -1,6 +1,6 @@
 [package]
 name = "rskim-search"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -11,7 +11,7 @@ keywords = ["code-search", "ast", "tree-sitter", "llm"]
 categories = ["parser-implementations", "development-tools"]
 
 [dependencies]
-rskim-core = { version = "2.0.0", path = "../rskim-core" }
+rskim-core = { version = "2.1.0", path = "../rskim-core" }
 tree-sitter = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
