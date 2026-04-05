@@ -83,14 +83,14 @@ fn try_parse_json_body(
         });
     }
 
-    let (key_count, summary_str) = match &json_val {
+    let summary_str = match &json_val {
         serde_json::Value::Array(arr) => {
             let count = arr.len();
             items.push(InfraItem {
                 label: "count".to_string(),
                 value: count.to_string(),
             });
-            (count, format!("array with {count} element{}", if count == 1 { "" } else { "s" }))
+            format!("array with {count} element{}", if count == 1 { "" } else { "s" })
         }
         serde_json::Value::Object(map) => {
             let count = map.len();
@@ -106,12 +106,11 @@ fn try_parse_json_body(
                     value: v_str,
                 });
             }
-            (count, format!("object with {count} key{}", if count == 1 { "" } else { "s" }))
+            format!("object with {count} key{}", if count == 1 { "" } else { "s" })
         }
         _ => return None,
     };
 
-    let _ = key_count; // suppress unused warning
     Some(InfraResult::new(
         "curl".to_string(),
         "response".to_string(),

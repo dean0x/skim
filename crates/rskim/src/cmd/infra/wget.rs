@@ -40,6 +40,9 @@ static RE_WGET_SAVED: LazyLock<Regex> =
 static RE_WGET_ERROR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"ERROR\s+(\d+):\s+(.+)").unwrap());
 
+static RE_WGET_ANY_STATUS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b([1-5]\d{2})\b").unwrap());
+
 /// Run `skim infra wget [args...]`.
 pub(crate) fn run(
     args: &[String],
@@ -146,11 +149,8 @@ fn try_parse_wget_full(text: &str) -> Option<InfraResult> {
 
 /// Simpler fallback: look for any HTTP status code in output.
 fn try_parse_wget_simple(text: &str) -> Option<InfraResult> {
-    static RE_ANY_STATUS: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b([1-5]\d{2})\b").unwrap());
-
     for line in text.lines() {
-        if let Some(caps) = RE_ANY_STATUS.captures(line) {
+        if let Some(caps) = RE_WGET_ANY_STATUS.captures(line) {
             let code = &caps[1];
             let items = vec![InfraItem {
                 label: "status".to_string(),

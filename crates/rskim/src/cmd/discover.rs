@@ -561,6 +561,24 @@ mod tests {
     }
 
     #[test]
+    fn test_check_has_rewrite_lint_and_infra_tools() {
+        // lint tools
+        assert!(check_has_rewrite(&["prettier", "--check", "."]));
+        assert!(check_has_rewrite(&["rustfmt", "--check", "src/main.rs"]));
+        assert!(check_has_rewrite(&["npx", "prettier", "--check", "."]));
+        // infra tools
+        assert!(check_has_rewrite(&["gh", "pr", "list"]));
+        assert!(check_has_rewrite(&["gh", "issue", "list"]));
+        assert!(check_has_rewrite(&["gh", "run", "list"]));
+        assert!(check_has_rewrite(&["gh", "release", "list"]));
+        assert!(check_has_rewrite(&["aws", "s3", "ls"]));
+        assert!(check_has_rewrite(&["curl", "https://api.example.com"]));
+        assert!(check_has_rewrite(&["wget", "https://example.com/file"]));
+        // gh without a recognized subcommand should not match
+        assert!(!check_has_rewrite(&["gh", "auth", "login"]));
+    }
+
+    #[test]
     fn test_get_rewrite_target() {
         assert_eq!(
             get_rewrite_target(&["cargo", "test"]),
@@ -575,6 +593,38 @@ mod tests {
             Some("skim <file> --mode=pseudo".to_string())
         );
         assert_eq!(get_rewrite_target(&["ls"]), None);
+    }
+
+    #[test]
+    fn test_get_rewrite_target_lint_and_infra_tools() {
+        assert_eq!(
+            get_rewrite_target(&["prettier"]),
+            Some("skim lint prettier".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["rustfmt"]),
+            Some("skim lint rustfmt".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["npx", "prettier"]),
+            Some("skim lint prettier".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["gh", "pr"]),
+            Some("skim infra gh pr".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["aws"]),
+            Some("skim infra aws".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["curl"]),
+            Some("skim infra curl".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["wget"]),
+            Some("skim infra wget".to_string())
+        );
     }
 
     #[test]

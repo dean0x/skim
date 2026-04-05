@@ -87,12 +87,12 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
             let count = arr.len();
             let items = extract_array_items(arr);
             let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-            return Some(InfraResult::new(
+            Some(InfraResult::new(
                 "aws".to_string(),
                 "result".to_string(),
                 summary,
                 items,
-            ));
+            ))
         }
         serde_json::Value::Object(map) => {
             // Find the primary data key (skip metadata keys)
@@ -120,17 +120,15 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
             };
 
             let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-            return Some(InfraResult::new(
+            Some(InfraResult::new(
                 "aws".to_string(),
                 data_key.clone(),
                 summary,
                 items,
-            ));
+            ))
         }
-        _ => {}
+        _ => None,
     }
-
-    None
 }
 
 /// Extract display items from a JSON array.

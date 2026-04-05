@@ -42,18 +42,17 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    let linter = linter_name.as_str();
-
-    match linter {
+    match linter_name.as_str() {
         "eslint" => eslint::run(linter_args, show_stats, json_output),
         "golangci" => golangci::run(linter_args, show_stats, json_output),
         "mypy" => mypy::run(linter_args, show_stats, json_output),
         "prettier" => prettier::run(linter_args, show_stats, json_output),
         "ruff" => ruff::run(linter_args, show_stats, json_output),
         "rustfmt" => rustfmt::run(linter_args, show_stats, json_output),
-        _ => {
+        linter => {
+            let safe_linter = crate::cmd::infra::sanitize_for_display(linter);
             eprintln!(
-                "skim lint: unknown linter '{linter}'\n\
+                "skim lint: unknown linter '{safe_linter}'\n\
                  Available linters: {}\n\
                  Run 'skim lint --help' for usage information",
                 KNOWN_LINTERS.join(", ")
