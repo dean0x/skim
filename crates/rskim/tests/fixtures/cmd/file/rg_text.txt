@@ -1,0 +1,6 @@
+src/main.rs:5:fn main() {
+src/main.rs:12:    let result = run();
+src/lib.rs:3:pub fn run() -> Result<(), Error> {
+src/lib.rs:47:    run_pipeline()
+src/cmd/infra/mod.rs:98:pub(crate) fn run_infra_tool(
+tests/cli_test.rs:15:fn test_run_produces_output() {

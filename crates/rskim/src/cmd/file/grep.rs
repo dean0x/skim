@@ -1,0 +1,236 @@
+//! grep parser with Tier 2 only (#116).
+//!
+//! Parses `grep` output into structured `FileResult`.
+//! grep has no JSON output mode, so only Tier 2 (regex) is available.
+//!
+//! Tiers:
+//! - **Tier 2 (Degraded)**: Parse `file:line:content` format, group by file
+//! - **Tier 3 (Passthrough)**: Raw output
+
+use std::collections::BTreeMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use crate::output::canonical::FileResult;
+use crate::output::ParseResult;
+use crate::runner::CommandOutput;
+
+use super::{run_file_tool, FileToolConfig, MAX_INPUT_LINES};
+
+const CONFIG: FileToolConfig<'static> = FileToolConfig {
+    program: "grep",
+    env_overrides: &[],
+    install_hint: "grep is typically pre-installed. For better compression, install ripgrep: https://github.com/BurntSushi/ripgrep",
+};
+
+/// Maximum matches shown per file.
+const MAX_MATCHES_PER_FILE: usize = 5;
+
+/// Maximum number of files shown in output.
+const MAX_FILES_SHOWN: usize = 50;
+
+/// Matches `file:line_number:content` format from `grep -n` output.
+static RE_GREP_MATCH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
+
+/// Run `skim file grep [args...]`.
+pub(crate) fn run(
+    args: &[String],
+    show_stats: bool,
+    json_output: bool,
+) -> anyhow::Result<std::process::ExitCode> {
+    // No flag injection for grep — flags are too varied
+    run_file_tool(CONFIG, args, show_stats, json_output, |_| {}, parse_impl)
+}
+
+/// Two-tier parse function: Tier 2 regex → Passthrough.
+fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
+    let text = if output.stderr.is_empty() {
+        output.stdout.as_str()
+    } else {
+        // Grep writes errors to stderr; ignore them for parsing
+        output.stdout.as_str()
+    };
+
+    if let Some(result) = try_parse_regex(text) {
+        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+    }
+
+    ParseResult::Passthrough(output.stdout.clone())
+}
+
+// ============================================================================
+// Tier 2: file:line:content regex
+// ============================================================================
+
+/// Group grep matches by file, limit per-file and total-file counts.
+fn try_parse_regex(text: &str) -> Option<FileResult> {
+    // BTreeMap maintains stable file ordering for deterministic output
+    let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut total_matches = 0usize;
+
+    for line in text.lines().take(MAX_INPUT_LINES) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(caps) = RE_GREP_MATCH.captures(line) {
+            let file = caps[1].to_string();
+            let lineno = &caps[2];
+            let content = caps[3].trim();
+            total_matches += 1;
+            let file_entry = file_matches.entry(file).or_default();
+            if file_entry.len() < MAX_MATCHES_PER_FILE {
+                file_entry.push(format!("  :{lineno}: {content}"));
+            }
+        } else if !line.starts_with("Binary file") {
+            // Plain match line without line number (grep without -n)
+            let file_entry = file_matches.entry("<stdin>".to_string()).or_default();
+            total_matches += 1;
+            if file_entry.len() < MAX_MATCHES_PER_FILE {
+                file_entry.push(format!("  {line}"));
+            }
+        }
+    }
+
+    if total_matches == 0 {
+        return None;
+    }
+
+    let file_count = file_matches.len();
+    let shown_files = file_count.min(MAX_FILES_SHOWN);
+
+    let mut entries: Vec<String> = Vec::with_capacity(shown_files * (MAX_MATCHES_PER_FILE + 1));
+    for (file, matches) in file_matches.iter().take(MAX_FILES_SHOWN) {
+        entries.push(file.clone());
+        entries.extend(matches.iter().cloned());
+    }
+
+    let shown_count = entries.len();
+    let footer = if file_count > MAX_FILES_SHOWN {
+        Some(format!("... and {} more files", file_count - MAX_FILES_SHOWN))
+    } else {
+        None
+    };
+
+    // Summary as first entry
+    let summary = format!(
+        "GREP: {total_matches} matches in {file_count} files (showing {shown_files})"
+    );
+    let mut all_entries = vec![summary];
+    all_entries.extend(entries);
+
+    Some(FileResult::new(
+        "grep".to_string(),
+        total_matches,
+        shown_count,
+        all_entries,
+        footer,
+    ))
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn load_fixture(name: &str) -> String {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/cmd/file");
+        path.push(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+    }
+
+    fn make_output(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_tier2_grep_basic() {
+        let input = load_fixture("grep_basic.txt");
+        let result = try_parse_regex(&input);
+        assert!(result.is_some(), "Expected Tier 2 grep parse to succeed");
+        let result = result.unwrap();
+        assert!(result.total_count > 0);
+    }
+
+    #[test]
+    fn test_parse_impl_produces_degraded() {
+        let input = load_fixture("grep_basic.txt");
+        let output = make_output(&input);
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "grep output should be Degraded tier, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_empty_is_passthrough() {
+        let output = make_output("");
+        let result = parse_impl(&output);
+        assert!(
+            result.is_passthrough(),
+            "Empty grep output should be Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_file_grouping() {
+        let input = "src/a.rs:1:fn main() {}\nsrc/a.rs:2:    println!()\nsrc/b.rs:5:fn run() {}";
+        let result = try_parse_regex(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(rendered.contains("src/a.rs"), "Should include file a.rs");
+        assert!(rendered.contains("src/b.rs"), "Should include file b.rs");
+    }
+
+    #[test]
+    fn test_max_matches_per_file_cap() {
+        // Build 10 matches for same file — should cap at MAX_MATCHES_PER_FILE
+        let input: String = (1..=10)
+            .map(|i| format!("src/big.rs:{i}:match line {i}\n"))
+            .collect();
+        let result = try_parse_regex(&input).unwrap();
+        let rendered = format!("{result}");
+        let match_lines: usize = rendered
+            .lines()
+            .filter(|l| l.trim().starts_with(':'))
+            .count();
+        assert!(
+            match_lines <= MAX_MATCHES_PER_FILE,
+            "Expected at most {MAX_MATCHES_PER_FILE} match lines per file, got {match_lines}"
+        );
+    }
+
+    #[test]
+    fn test_summary_line_present() {
+        let input = "src/a.rs:1:hello world\n";
+        let result = try_parse_regex(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(
+            rendered.contains("GREP:"),
+            "Should contain GREP summary, got: {rendered}"
+        );
+        assert!(rendered.contains("matches in"));
+    }
+
+    #[test]
+    fn test_display_format() {
+        let input = "src/a.rs:1:fn main() {}\nsrc/b.rs:2:fn run() {}";
+        let result = try_parse_regex(input).unwrap();
+        let rendered = format!("{result}");
+        assert!(rendered.contains("GREP: grep |"), "Header should start with GREP:");
+    }
+}

@@ -1,0 +1,24 @@
+.
+|-- Cargo.lock
+|-- Cargo.toml
+|-- CLAUDE.md
+|-- README.md
+|-- src
+|   |-- main.rs
+|   |-- lib.rs
+|   |-- cmd
+|   |   |-- mod.rs
+|   |   |-- infra
+|   |   |   |-- mod.rs
+|   |   |   `-- curl.rs
+|   |   `-- lint
+|   |       |-- mod.rs
+|   |       `-- eslint.rs
+|   `-- output
+|       |-- mod.rs
+|       `-- canonical.rs
+`-- tests
+    |-- fixtures
+    `-- integration.rs
+
+4 directories, 13 files

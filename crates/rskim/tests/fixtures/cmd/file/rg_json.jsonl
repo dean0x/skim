@@ -1,0 +1,8 @@
+{"type":"begin","data":{"path":{"text":"src/main.rs"}}}
+{"type":"match","data":{"path":{"text":"src/main.rs"},"lines":{"text":"fn main() {\n"},"line_number":5,"absolute_offset":42,"submatches":[{"match":{"text":"main"},"start":3,"end":7}]}}
+{"type":"match","data":{"path":{"text":"src/main.rs"},"lines":{"text":"    let result = run();\n"},"line_number":12,"absolute_offset":120,"submatches":[{"match":{"text":"run"},"start":17,"end":20}]}}
+{"type":"end","data":{"path":{"text":"src/main.rs"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":1000000,"human":"0.001s"},"searches":1,"searches_with_match":1,"bytes_searched":1024,"bytes_printed":200,"matched_lines":2,"matches":2}}}
+{"type":"begin","data":{"path":{"text":"src/lib.rs"}}}
+{"type":"match","data":{"path":{"text":"src/lib.rs"},"lines":{"text":"pub fn run() -> Result<(), Error> {\n"},"line_number":3,"absolute_offset":0,"submatches":[{"match":{"text":"run"},"start":7,"end":10}]}}
+{"type":"end","data":{"path":{"text":"src/lib.rs"},"binary_offset":null,"stats":{"elapsed":{"secs":0,"nanos":500000,"human":"0.001s"},"searches":1,"searches_with_match":1,"bytes_searched":512,"bytes_printed":80,"matched_lines":1,"matches":1}}}
+{"type":"summary","data":{"elapsed_total":{"secs":0,"nanos":5000000,"human":"0.005s"},"stats":{"elapsed":{"secs":0,"nanos":5000000,"human":"0.005s"},"searches":2,"searches_with_match":2,"bytes_searched":1536,"bytes_printed":280,"matched_lines":3,"matches":3}}}
