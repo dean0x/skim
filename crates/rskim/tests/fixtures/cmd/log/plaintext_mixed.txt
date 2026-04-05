@@ -1,0 +1,12 @@
+2024-01-15T10:00:00Z [INFO] server starting on port 8080
+2024-01-15T10:00:01Z [INFO] database connected to localhost:5432
+2024-01-15T10:00:05Z [INFO] request received GET /api/users
+2024-01-15T10:00:05Z [DEBUG] processing user list query
+2024-01-15T10:00:05Z [DEBUG] cache lookup for user:123
+2024-01-15T10:00:06Z [INFO] request received GET /api/users
+2024-01-15T10:00:08Z [WARN] slow query detected (1200ms)
+2024-01-15T10:00:09Z [ERROR] connection refused: redis:6379
+2024-01-15T10:00:09Z [INFO] request completed 200 OK
+2024-01-15T10:00:10Z [ERROR] connection refused: redis:6379
+2024-01-15T10:00:11Z [ERROR] connection refused: redis:6379
+2024-01-15T10:00:11Z [INFO] request completed 500 Internal Server Error
