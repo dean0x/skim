@@ -1,0 +1,10 @@
+Diff in /home/user/project/src/main.rs at line 15:
+ fn main() {
+-    let x=1;
++    let x = 1;
+ }
+Diff in /home/user/project/src/lib.rs at line 42:
+ fn helper() {
+-    if(true){
++    if true {
+ }
