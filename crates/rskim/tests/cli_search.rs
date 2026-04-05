@@ -314,8 +314,14 @@ fn test_search_stats_json_after_build() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("--stats --json must produce valid JSON: {e}\ngot: {stdout}"));
-    assert!(parsed.get("file_count").is_some(), "stats JSON missing file_count");
-    assert!(parsed.get("total_ngrams").is_some(), "stats JSON missing total_ngrams");
+    assert!(
+        parsed.get("file_count").is_some(),
+        "stats JSON missing file_count"
+    );
+    assert!(
+        parsed.get("total_ngrams").is_some(),
+        "stats JSON missing total_ngrams"
+    );
 }
 
 #[test]

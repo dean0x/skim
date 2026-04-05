@@ -29,6 +29,7 @@ pub struct Bm25Scorer {
 
 impl Bm25Scorer {
     /// Create a new scorer from BM25 parameters and the total number of indexed documents.
+    #[must_use]
     pub fn new(params: Bm25Params, doc_count: u64) -> Self {
         Self { params, doc_count }
     }
@@ -43,12 +44,7 @@ impl Bm25Scorer {
     /// - `df`: document frequency — number of documents in the index containing this term.
     ///
     /// Returns `0.0` if `field_tfs` is empty or `df == 0`.
-    pub fn score_term(
-        &self,
-        field_tfs: &[(SearchField, u16)],
-        doc_len: u32,
-        df: u64,
-    ) -> f32 {
+    pub fn score_term(&self, field_tfs: &[(SearchField, u16)], doc_len: u32, df: u64) -> f32 {
         if field_tfs.is_empty() || df == 0 {
             return 0.0;
         }
@@ -114,8 +110,8 @@ impl Bm25Scorer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SearchField;
     use crate::lexical::Bm25Params;
+    use crate::SearchField;
 
     fn default_scorer(doc_count: u64) -> Bm25Scorer {
         Bm25Scorer::new(Bm25Params::default(), doc_count)
@@ -144,7 +140,10 @@ mod tests {
 
     #[test]
     fn zero_avg_doc_len_does_not_crash() {
-        let params = Bm25Params { avg_doc_len: 0.0, ..Bm25Params::default() };
+        let params = Bm25Params {
+            avg_doc_len: 0.0,
+            ..Bm25Params::default()
+        };
         let scorer = Bm25Scorer::new(params, 100);
         let score = scorer.score_term(&[(SearchField::TypeDefinition, 2)], 100, 5);
         assert!(score.is_finite());
@@ -165,7 +164,10 @@ mod tests {
         let scorer = default_scorer(1000);
         let score_rare = scorer.score_term(&[(SearchField::TypeDefinition, 3)], 50, 1);
         let score_common = scorer.score_term(&[(SearchField::TypeDefinition, 3)], 50, 900);
-        assert!(score_rare > score_common, "rare term should score higher: rare={score_rare}, common={score_common}");
+        assert!(
+            score_rare > score_common,
+            "rare term should score higher: rare={score_rare}, common={score_common}"
+        );
     }
 
     #[test]
@@ -186,7 +188,10 @@ mod tests {
         // Matching in multiple fields should score higher than one field alone.
         let scorer = default_scorer(100);
         let multi = scorer.score_term(
-            &[(SearchField::TypeDefinition, 1), (SearchField::SymbolName, 1)],
+            &[
+                (SearchField::TypeDefinition, 1),
+                (SearchField::SymbolName, 1),
+            ],
             50,
             5,
         );
@@ -199,5 +204,34 @@ mod tests {
         let scorer = default_scorer(50);
         let score = scorer.score_term(&[(SearchField::Comment, 1)], 200, 10);
         assert!(score >= 0.0);
+    }
+
+    #[test]
+    fn function_signature_outscores_function_body() {
+        // FunctionSignature boost = 4.0 > FunctionBody boost = 1.0
+        let scorer = default_scorer(200);
+        let sig = scorer.score_term(&[(SearchField::FunctionSignature, 1)], 100, 5);
+        let body = scorer.score_term(&[(SearchField::FunctionBody, 1)], 100, 5);
+        assert!(
+            sig > body,
+            "FunctionSignature (boost 4.0) must outscore FunctionBody (boost 1.0)"
+        );
+    }
+
+    #[test]
+    fn score_is_always_non_negative_and_finite() {
+        let scorer = default_scorer(500);
+        let cases: &[(&[(SearchField, u16)], u32, u64)] = &[
+            (&[(SearchField::TypeDefinition, 1)], 100, 1),
+            (&[(SearchField::Comment, 10)], 5000, 499),
+            (&[(SearchField::SymbolName, 0)], 50, 20),
+            (&[(SearchField::ImportExport, 7)], 200, 50),
+            (&[(SearchField::FunctionBody, 100)], 1, 1),
+        ];
+        for (field_tfs, doc_len, df) in cases {
+            let score = scorer.score_term(field_tfs, *doc_len, *df);
+            assert!(score.is_finite(), "score must be finite: {score}");
+            assert!(score >= 0.0, "score must be non-negative: {score}");
+        }
     }
 }

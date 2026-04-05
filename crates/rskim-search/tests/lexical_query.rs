@@ -16,22 +16,30 @@ use rskim_search::{
 // Helpers
 // ============================================================================
 
-/// Absolute path to `tests/fixtures/search/<name>`.
-fn fixture_path(name: &str) -> PathBuf {
+/// Workspace root directory (absolute).
+fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crate parent")
         .parent()
         .expect("workspace root")
-        .join("tests/fixtures/search")
-        .join(name)
+        .to_path_buf()
+}
+
+/// Absolute path to `tests/fixtures/search/<name>` (for file reads).
+fn fixture_abs(name: &str) -> PathBuf {
+    workspace_root().join("tests/fixtures/search").join(name)
+}
+
+/// Relative path to `tests/fixtures/search/<name>` (for register_within).
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from("tests/fixtures/search").join(name)
 }
 
 /// Read a fixture file. Panics if the file does not exist.
 fn read_fixture(name: &str) -> String {
-    let path = fixture_path(name);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
+    let path = fixture_abs(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
 }
 
 /// Build a `SearchIndex` from all fixture files.
@@ -48,10 +56,7 @@ fn build_all_fixtures(dir: &Path) -> Box<dyn SearchIndex> {
         ("utils.py", Language::Python),
     ];
 
-    let mut builder = LexicalLayerBuilder::new(
-        dir.to_path_buf(),
-        fixture_path(""),
-    );
+    let mut builder = LexicalLayerBuilder::new(dir.to_path_buf(), workspace_root());
 
     for (name, lang) in fixtures {
         let path = fixture_path(name);
@@ -81,11 +86,14 @@ fn empty_text_query_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer.search(&SearchQuery::new()).expect("search");
-    assert!(results.is_empty(), "no text query should return empty results");
+    assert!(
+        results.is_empty(),
+        "no text query should return empty results"
+    );
 }
 
 // ============================================================================
@@ -97,13 +105,14 @@ fn blank_text_query_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
-    let results = layer
-        .search(&SearchQuery::text(""))
-        .expect("search");
-    assert!(results.is_empty(), "empty string query should return empty results");
+    let results = layer.search(&SearchQuery::text("")).expect("search");
+    assert!(
+        results.is_empty(),
+        "empty string query should return empty results"
+    );
 }
 
 // ============================================================================
@@ -115,8 +124,8 @@ fn search_userservice_finds_user_service_ts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("UserService"))
@@ -151,8 +160,8 @@ fn search_authhandler_finds_auth_handler_rs() {
     let dir = tempfile::tempdir().expect("tempdir");
     let index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("AuthHandler"))
@@ -181,8 +190,8 @@ fn search_database_url_finds_config_json() {
     let dir = tempfile::tempdir().expect("tempdir");
     let index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("database_url"))
@@ -193,10 +202,13 @@ fn search_database_url_finds_config_json() {
         "search for 'database_url' should return results"
     );
 
-    let has_config = results.iter().any(|(fid, _)| {
-        file_name_of(index.as_ref(), *fid).as_deref() == Some("config.json")
-    });
-    assert!(has_config, "config.json should appear in results for 'database_url'");
+    let has_config = results
+        .iter()
+        .any(|(fid, _)| file_name_of(index.as_ref(), *fid).as_deref() == Some("config.json"));
+    assert!(
+        has_config,
+        "config.json should appear in results for 'database_url'"
+    );
 }
 
 // ============================================================================
@@ -208,8 +220,8 @@ fn search_replicas_finds_deploy_yaml() {
     let dir = tempfile::tempdir().expect("tempdir");
     let index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("replicas"))
@@ -220,10 +232,13 @@ fn search_replicas_finds_deploy_yaml() {
         "search for 'replicas' should return results"
     );
 
-    let has_deploy = results.iter().any(|(fid, _)| {
-        file_name_of(index.as_ref(), *fid).as_deref() == Some("deploy.yaml")
-    });
-    assert!(has_deploy, "deploy.yaml should appear in results for 'replicas'");
+    let has_deploy = results
+        .iter()
+        .any(|(fid, _)| file_name_of(index.as_ref(), *fid).as_deref() == Some("deploy.yaml"));
+    assert!(
+        has_deploy,
+        "deploy.yaml should appear in results for 'replicas'"
+    );
 }
 
 // ============================================================================
@@ -238,13 +253,11 @@ fn single_char_query_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     // A single printable character produces no bigrams → must return empty.
-    let results = layer
-        .search(&SearchQuery::text("z"))
-        .expect("search");
+    let results = layer.search(&SearchQuery::text("z")).expect("search");
 
     assert!(
         results.is_empty(),
@@ -262,8 +275,8 @@ fn limit_one_returns_at_most_one_result() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("fn").with_limit(1))
@@ -285,8 +298,8 @@ fn offset_past_end_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("fn").with_offset(100_000))
@@ -308,13 +321,11 @@ fn results_are_sorted_by_score_descending() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     // Use a generic term likely to match multiple files.
-    let results = layer
-        .search(&SearchQuery::text("fn"))
-        .expect("search");
+    let results = layer.search(&SearchQuery::text("fn")).expect("search");
 
     // Verify descending score order.
     for window in results.windows(2) {
@@ -336,8 +347,8 @@ fn all_scores_are_positive() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("UserService"))
@@ -366,8 +377,8 @@ fn type_definition_context_ranks_first() {
     let dir = tempfile::tempdir().expect("tempdir");
     let index = build_all_fixtures(dir.path());
 
-    let layer = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer");
+    let layer =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer");
 
     let results = layer
         .search(&SearchQuery::text("UserService"))
@@ -395,10 +406,10 @@ fn reopened_index_produces_same_results() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _index = build_all_fixtures(dir.path());
 
-    let layer_a = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer a");
-    let layer_b = rskim_search::lexical::query::LexicalSearchLayer::open(dir.path())
-        .expect("open layer b");
+    let layer_a =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer a");
+    let layer_b =
+        rskim_search::lexical::query::LexicalSearchLayer::open(dir.path()).expect("open layer b");
 
     let query = SearchQuery::text("UserService");
 

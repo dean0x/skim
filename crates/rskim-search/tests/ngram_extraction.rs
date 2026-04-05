@@ -52,7 +52,10 @@ fn two_char_token_single_ngram_with_border_weight() {
     assert_eq!(result.len(), 1);
     let (ngram, w) = result[0];
     assert_eq!(ngram, ng(b"if"));
-    assert!((w - 2.0).abs() < f32::EPSILON, "2-char border weight should be 2.0, got {w}");
+    assert!(
+        (w - 2.0).abs() < f32::EPSILON,
+        "2-char border weight should be 2.0, got {w}"
+    );
 }
 
 #[test]
@@ -69,10 +72,22 @@ fn five_char_token_interior_is_one() {
     // "hello": "he"(2), "el"(1), "ll"(1), "lo"(2)
     let map = into_map(extract_ngrams("hello"));
     assert_eq!(map.len(), 4);
-    assert!((map[&ng(b"he")] - 2.0).abs() < f32::EPSILON, "he should be border 2.0");
-    assert!((map[&ng(b"el")] - 1.0).abs() < f32::EPSILON, "el should be interior 1.0");
-    assert!((map[&ng(b"ll")] - 1.0).abs() < f32::EPSILON, "ll should be interior 1.0");
-    assert!((map[&ng(b"lo")] - 2.0).abs() < f32::EPSILON, "lo should be border 2.0");
+    assert!(
+        (map[&ng(b"he")] - 2.0).abs() < f32::EPSILON,
+        "he should be border 2.0"
+    );
+    assert!(
+        (map[&ng(b"el")] - 1.0).abs() < f32::EPSILON,
+        "el should be interior 1.0"
+    );
+    assert!(
+        (map[&ng(b"ll")] - 1.0).abs() < f32::EPSILON,
+        "ll should be interior 1.0"
+    );
+    assert!(
+        (map[&ng(b"lo")] - 2.0).abs() < f32::EPSILON,
+        "lo should be border 2.0"
+    );
 }
 
 #[test]
@@ -188,7 +203,10 @@ fn query_uniform_weights() {
     let result = extract_query_ngrams("hello world");
     assert!(!result.is_empty());
     for (_, w) in result {
-        assert!((w - 1.0).abs() < f32::EPSILON, "query weight must be 1.0, got {w}");
+        assert!(
+            (w - 1.0).abs() < f32::EPSILON,
+            "query weight must be 1.0, got {w}"
+        );
     }
 }
 
@@ -197,8 +215,16 @@ fn query_no_duplicate_ngrams() {
     // "aaaaaa" → only one distinct bigram b"aa", must appear once in result.
     let result = extract_query_ngrams("aaaaaa");
     let ngrams: Vec<Ngram> = result.iter().map(|(ng, _)| *ng).collect();
-    let unique_count = ngrams.iter().map(|ng| ng.as_u64()).collect::<std::collections::HashSet<_>>().len();
-    assert_eq!(ngrams.len(), unique_count, "query result contains duplicate ngrams");
+    let unique_count = ngrams
+        .iter()
+        .map(|ng| ng.as_u64())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert_eq!(
+        ngrams.len(),
+        unique_count,
+        "query result contains duplicate ngrams"
+    );
 }
 
 #[test]
@@ -243,10 +269,14 @@ fn query_ngrams_for_single_word_are_subset_of_index_ngrams() {
     // Multi-word queries cannot satisfy this property because extract_query_ngrams
     // operates on raw bytes (including spaces), while extract_ngrams skips whitespace.
     let token = "AstVisitor";
-    let index_set: std::collections::HashSet<u64> =
-        extract_ngrams(token).iter().map(|(ng, _)| ng.as_u64()).collect();
-    let query_set: std::collections::HashSet<u64> =
-        extract_query_ngrams(token).iter().map(|(ng, _)| ng.as_u64()).collect();
+    let index_set: std::collections::HashSet<u64> = extract_ngrams(token)
+        .iter()
+        .map(|(ng, _)| ng.as_u64())
+        .collect();
+    let query_set: std::collections::HashSet<u64> = extract_query_ngrams(token)
+        .iter()
+        .map(|(ng, _)| ng.as_u64())
+        .collect();
 
     for ng_hash in &query_set {
         assert!(

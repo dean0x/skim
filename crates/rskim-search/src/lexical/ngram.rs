@@ -2,7 +2,7 @@
 //!
 //! Provides two extraction modes:
 //! - [`extract_ngrams`] — index-time: all bigrams with border weighting
-//! - [`extract_query_ngrams`] — query-time: covering-set strategy for selective matching
+//! - [`extract_query_ngrams`] — query-time: unique bigrams up to cap
 
 use rustc_hash::FxHashMap;
 
@@ -36,6 +36,7 @@ const INTERIOR_WEIGHT: f32 = 1.0;
 /// - All whitespace → empty vec
 /// - Unicode multi-byte chars → byte-level bigrams (valid for UTF-8 byte sequences)
 /// - Repeated bigrams → accumulated weight in result
+#[must_use]
 pub fn extract_ngrams(text: &str) -> Vec<(Ngram, f32)> {
     if text.len() < 2 {
         return Vec::new();
@@ -71,24 +72,25 @@ pub fn extract_ngrams(text: &str) -> Vec<(Ngram, f32)> {
     acc.into_iter().collect()
 }
 
-/// Extract query n-grams using a covering-set strategy.
+/// Extract query n-grams as the unique set of bigrams, limited to [`MAX_QUERY_NGRAMS`].
 ///
-/// Used at query time — selects the minimum set of bigrams that cover
-/// all query character positions, limited to [`MAX_QUERY_NGRAMS`].
+/// Used at query time. For 2-byte n-grams the greedy covering-set optimization
+/// is over-engineered: adjacent bigrams share at most one byte, so coverage
+/// overlap is minimal. Taking all unique bigrams up to the cap is O(n) and
+/// produces equivalent recall at query time.
 ///
 /// # Algorithm
 ///
-/// 1. Collect all unique byte positions covered by each distinct bigram.
-/// 2. Greedily select the bigram that covers the most uncovered positions.
-/// 3. Remove those positions from the uncovered set.
-/// 4. Repeat until all positions are covered or no bigram helps.
-/// 5. Return at most `MAX_QUERY_NGRAMS` bigrams, each with weight 1.0.
+/// 1. Slide a 2-byte window over the trimmed query bytes.
+/// 2. Insert each bigram into a seen-set (deduplication).
+/// 3. Collect up to [`MAX_QUERY_NGRAMS`] unique bigrams, each weighted 1.0.
 ///
 /// # Edge cases
 ///
 /// - Empty query → empty vec
 /// - Single byte → empty vec (no bigram)
 /// - All whitespace → empty vec
+#[must_use]
 pub fn extract_query_ngrams(query: &str) -> Vec<(Ngram, f32)> {
     // Reject queries that are entirely whitespace — they carry no searchable signal.
     let trimmed = query.trim();
@@ -97,67 +99,30 @@ pub fn extract_query_ngrams(query: &str) -> Vec<(Ngram, f32)> {
     }
     let bytes = trimmed.as_bytes();
 
-    // Build a map: Ngram → set of byte positions it covers.
-    // We track positions as a bitmask in a u128 for queries up to 128 bytes,
-    // but for longer queries we use a Vec<bool> coverage approach.
-    //
-    // Use the simpler Vec<bool> approach for correctness across all lengths.
-
     let total_positions = bytes.len().saturating_sub(1); // number of bigram start positions
     if total_positions == 0 {
         return Vec::new();
     }
 
-    // Map: Ngram → sorted list of byte-window start positions.
-    let mut ngram_positions: FxHashMap<Ngram, Vec<usize>> = FxHashMap::default();
-
-    for i in 0..total_positions {
-        let ng = Ngram::from_bytes(&bytes[i..i + 2]);
-        ngram_positions.entry(ng).or_default().push(i);
-    }
-
-    // Greedy covering-set selection.
-    let mut covered = vec![false; total_positions];
-    let mut uncovered_count = total_positions;
+    // Collect all unique bigrams up to the cap.
+    let mut seen: rustc_hash::FxHashSet<Ngram> = rustc_hash::FxHashSet::default();
     let mut selected: Vec<(Ngram, f32)> = Vec::new();
 
-    while uncovered_count > 0 && selected.len() < MAX_QUERY_NGRAMS {
-        // Find the bigram that covers the most currently uncovered positions.
-        let best = ngram_positions
-            .iter()
-            .map(|(ng, positions)| {
-                let gain = positions.iter().filter(|&&p| !covered[p]).count();
-                (gain, *ng)
-            })
-            .filter(|(gain, _)| *gain > 0)
-            .max_by_key(|(gain, _)| *gain);
-
-        let (_, best_ng) = match best {
-            Some(b) => b,
-            None => break, // No bigram adds coverage — stop.
-        };
-
-        // Mark those positions as covered.
-        if let Some(positions) = ngram_positions.get(&best_ng) {
-            for &p in positions {
-                if !covered[p] {
-                    covered[p] = true;
-                    uncovered_count -= 1;
-                }
-            }
+    for i in 0..total_positions {
+        if selected.len() >= MAX_QUERY_NGRAMS {
+            break;
         }
-
-        selected.push((best_ng, INTERIOR_WEIGHT));
-
-        // Remove the chosen ngram so it isn't selected again.
-        ngram_positions.remove(&best_ng);
+        let ng = Ngram::from_bytes(&bytes[i..i + 2]);
+        if seen.insert(ng) {
+            selected.push((ng, INTERIOR_WEIGHT));
+        }
     }
 
     selected
 }
 
 // ============================================================================
-// Unit tests
+// Unit Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -204,8 +169,14 @@ mod tests {
         let fo = Ngram::from_bytes(b"fo");
         let oo = Ngram::from_bytes(b"oo");
 
-        assert!((map[&fo] - 2.0).abs() < f32::EPSILON, "fo should be 2.0 (first border)");
-        assert!((map[&oo] - 2.0).abs() < f32::EPSILON, "oo should be 2.0 (last border)");
+        assert!(
+            (map[&fo] - 2.0).abs() < f32::EPSILON,
+            "fo should be 2.0 (first border)"
+        );
+        assert!(
+            (map[&oo] - 2.0).abs() < f32::EPSILON,
+            "oo should be 2.0 (last border)"
+        );
     }
 
     #[test]
@@ -225,7 +196,11 @@ mod tests {
         let result = extract_ngrams("ab ab");
         let map: FxHashMap<Ngram, f32> = result.into_iter().collect();
         let ab = Ngram::from_bytes(b"ab");
-        assert!((map[&ab] - 4.0).abs() < f32::EPSILON, "expected 4.0, got {}", map[&ab]);
+        assert!(
+            (map[&ab] - 4.0).abs() < f32::EPSILON,
+            "expected 4.0, got {}",
+            map[&ab]
+        );
     }
 
     #[test]
@@ -300,13 +275,9 @@ mod tests {
 
     #[test]
     fn query_covers_all_positions() {
-        // For "abcd", we have positions 0,1,2 (bigrams "ab","bc","cd").
-        // The greedy algorithm picks enough to cover all.
+        // For "abcd", all three unique bigrams ("ab","bc","cd") are included.
         let result = extract_query_ngrams("abcd");
-        // Each bigram covers 1 unique position (non-overlapping), so 3 bigrams needed.
-        // But overlapping bigrams — "ab" covers pos 0, "bc" covers pos 1, "cd" covers pos 2.
-        // Greedy picks all 3 since each covers 1 distinct position.
-        assert!(!result.is_empty());
+        assert_eq!(result.len(), 3);
 
         // All weights are uniform 1.0.
         for (_, w) in &result {
@@ -319,9 +290,12 @@ mod tests {
         // Even with repeated chars, each Ngram appears at most once.
         let result = extract_query_ngrams("aabbaabb");
         let ngrams: Vec<Ngram> = result.iter().map(|(ng, _)| *ng).collect();
-        let unique: std::collections::HashSet<u64> =
-            ngrams.iter().map(|ng| ng.as_u64()).collect();
-        assert_eq!(ngrams.len(), unique.len(), "duplicate ngrams in query result");
+        let unique: std::collections::HashSet<u64> = ngrams.iter().map(|ng| ng.as_u64()).collect();
+        assert_eq!(
+            ngrams.len(),
+            unique.len(),
+            "duplicate ngrams in query result"
+        );
     }
 
     #[test]
@@ -329,14 +303,20 @@ mod tests {
         // Generate a very long query to test the 32-bigram cap.
         let long_query: String = (0..200u8).map(|b| b as char).collect();
         let result = extract_query_ngrams(&long_query);
-        assert!(result.len() <= MAX_QUERY_NGRAMS, "exceeded MAX_QUERY_NGRAMS");
+        assert!(
+            result.len() <= MAX_QUERY_NGRAMS,
+            "exceeded MAX_QUERY_NGRAMS"
+        );
     }
 
     #[test]
     fn query_uniform_weights() {
         let result = extract_query_ngrams("hello world");
         for (_, w) in result {
-            assert!((w - 1.0).abs() < f32::EPSILON, "expected uniform 1.0, got {w}");
+            assert!(
+                (w - 1.0).abs() < f32::EPSILON,
+                "expected uniform 1.0, got {w}"
+            );
         }
     }
 
@@ -347,8 +327,8 @@ mod tests {
     #[test]
     fn large_text_does_not_panic() {
         // ~30KB of repeated ASCII — simulates a 1000-line file.
-        let text: String = "fn process_item(item: Item) -> Result<Output> { /* ... */ }\n"
-            .repeat(500);
+        let text: String =
+            "fn process_item(item: Item) -> Result<Output> { /* ... */ }\n".repeat(500);
         let result = extract_ngrams(&text);
         // Must produce some ngrams and not explode.
         assert!(!result.is_empty());

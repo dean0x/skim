@@ -191,6 +191,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn search_query_new_defaults() {
+        let q = SearchQuery::new();
+        assert_eq!(q.text_query, None);
+        assert_eq!(q.ast_pattern, None);
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.offset, 0);
+        assert!(!q.temporal_flags.blast_radius);
+        assert!(!q.temporal_flags.hot);
+        assert!(!q.temporal_flags.cold);
+        assert!(!q.temporal_flags.risky);
+    }
+
+    #[test]
+    fn search_query_text_convenience() {
+        let q = SearchQuery::text("parse_file");
+        assert_eq!(q.text_query, Some("parse_file".to_string()));
+        // All other fields remain at defaults.
+        assert_eq!(q.limit, 50);
+        assert_eq!(q.offset, 0);
+        assert_eq!(q.ast_pattern, None);
+    }
+
+    #[test]
+    fn temporal_flags_default_all_false() {
+        let flags = TemporalFlags::default();
+        assert!(!flags.blast_radius);
+        assert!(!flags.hot);
+        assert!(!flags.cold);
+        assert!(!flags.risky);
+    }
+
+    #[test]
     fn search_query_builder_chain() {
         let flags = TemporalFlags {
             hot: true,
@@ -212,11 +244,32 @@ mod tests {
     }
 
     #[test]
+    fn field_boost_exact_values() {
+        // These exact values are the contract for BM25F scoring weights.
+        // Changing them is a breaking change to search quality.
+        assert!((SearchField::TypeDefinition.default_boost() - 5.0).abs() < f32::EPSILON);
+        assert!((SearchField::FunctionSignature.default_boost() - 4.0).abs() < f32::EPSILON);
+        assert!((SearchField::SymbolName.default_boost() - 3.5).abs() < f32::EPSILON);
+        assert!((SearchField::ImportExport.default_boost() - 3.0).abs() < f32::EPSILON);
+        assert!((SearchField::FunctionBody.default_boost() - 1.0).abs() < f32::EPSILON);
+        assert!((SearchField::Comment.default_boost() - 0.8).abs() < f32::EPSILON);
+        assert!((SearchField::StringLiteral.default_boost() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn field_boosts_rank_type_definition_highest() {
         // Verify the ordering assumption that scoring relies on.
-        assert!(SearchField::TypeDefinition.default_boost() > SearchField::FunctionSignature.default_boost());
-        assert!(SearchField::FunctionSignature.default_boost() > SearchField::SymbolName.default_boost());
-        assert!(SearchField::SymbolName.default_boost() > SearchField::ImportExport.default_boost());
+        assert!(
+            SearchField::TypeDefinition.default_boost()
+                > SearchField::FunctionSignature.default_boost()
+        );
+        assert!(
+            SearchField::FunctionSignature.default_boost()
+                > SearchField::SymbolName.default_boost()
+        );
+        assert!(
+            SearchField::SymbolName.default_boost() > SearchField::ImportExport.default_boost()
+        );
         assert!(SearchField::FunctionBody.default_boost() > SearchField::Comment.default_boost());
         assert!(SearchField::Comment.default_boost() > SearchField::StringLiteral.default_boost());
     }

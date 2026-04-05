@@ -7,27 +7,37 @@
 use std::path::{Path, PathBuf};
 
 use rskim_core::Language;
-use rskim_search::{LayerBuilder, SearchIndex};
 use rskim_search::lexical::{builder::LexicalLayerBuilder, query::LexicalSearchLayer};
+use rskim_search::{LayerBuilder, SearchIndex};
 
 // ============================================================================
 // Helpers
 // ============================================================================
 
-/// Path to `tests/fixtures/search/` relative to the workspace root.
-fn fixture(name: &str) -> PathBuf {
+/// Workspace root directory (absolute).
+fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crate parent")
         .parent()
         .expect("workspace root")
-        .join("tests/fixtures/search")
-        .join(name)
+        .to_path_buf()
+}
+
+/// Absolute path to a fixture file.
+fn fixture_abs(name: &str) -> PathBuf {
+    workspace_root().join("tests/fixtures/search").join(name)
+}
+
+/// Relative path to a fixture file (relative to workspace root).
+/// This is what `register_within` expects — no absolute paths.
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from("tests/fixtures/search").join(name)
 }
 
 /// Read a fixture file. Panics if the file does not exist.
 fn read_fixture(name: &str) -> String {
-    std::fs::read_to_string(fixture(name))
+    std::fs::read_to_string(fixture_abs(name))
         .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"))
 }
 
@@ -38,10 +48,7 @@ fn read_fixture(name: &str) -> String {
 #[test]
 fn empty_builder_produces_valid_empty_index() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let builder = LexicalLayerBuilder::new(
-        dir.path().to_path_buf(),
-        PathBuf::from("/repo"),
-    );
+    let builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
     let layer = Box::new(builder).build().expect("build");
 
     let stats = layer.stats();
@@ -59,12 +66,11 @@ fn single_typescript_file_indexes_correctly() {
     let path = fixture("user_service.ts");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut builder = LexicalLayerBuilder::new(
-        dir.path().to_path_buf(),
-        PathBuf::from("/repo"),
-    );
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
 
-    builder.add_file(&path, &content, Language::TypeScript).expect("add_file");
+    builder
+        .add_file(&path, &content, Language::TypeScript)
+        .expect("add_file");
     let layer = Box::new(builder).build().expect("build");
 
     let stats = layer.stats();
@@ -86,12 +92,11 @@ fn single_rust_file_indexes_correctly() {
     let path = fixture("auth_handler.rs");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut builder = LexicalLayerBuilder::new(
-        dir.path().to_path_buf(),
-        PathBuf::from("/repo"),
-    );
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
 
-    builder.add_file(&path, &content, Language::Rust).expect("add_file");
+    builder
+        .add_file(&path, &content, Language::Rust)
+        .expect("add_file");
     let layer = Box::new(builder).build().expect("build");
 
     assert_eq!(layer.stats().file_count, 1);
@@ -108,12 +113,11 @@ fn single_json_file_indexes_via_serde_path() {
     let path = fixture("config.json");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut builder = LexicalLayerBuilder::new(
-        dir.path().to_path_buf(),
-        PathBuf::from("/repo"),
-    );
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
 
-    builder.add_file(&path, &content, Language::Json).expect("add_file");
+    builder
+        .add_file(&path, &content, Language::Json)
+        .expect("add_file");
     let layer = Box::new(builder).build().expect("build");
 
     assert_eq!(layer.stats().file_count, 1);
@@ -134,10 +138,7 @@ fn multiple_files_across_languages() {
     ];
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut builder = LexicalLayerBuilder::new(
-        dir.path().to_path_buf(),
-        PathBuf::from("/repo"),
-    );
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
 
     for (name, lang) in fixtures {
         let path = fixture(name);
@@ -163,12 +164,11 @@ fn minified_file_is_skipped() {
     let path = PathBuf::from("minified.js");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut builder = LexicalLayerBuilder::new(
-        dir.path().to_path_buf(),
-        PathBuf::from("/repo"),
-    );
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
 
-    builder.add_file(&path, &minified, Language::JavaScript).expect("add_file should not error");
+    builder
+        .add_file(&path, &minified, Language::JavaScript)
+        .expect("add_file should not error");
     let layer = Box::new(builder).build().expect("build");
 
     // Skipped file should not appear in the file table.
@@ -190,12 +190,11 @@ fn large_file_is_skipped() {
     let path = PathBuf::from("huge.rs");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut builder = LexicalLayerBuilder::new(
-        dir.path().to_path_buf(),
-        PathBuf::from("/repo"),
-    );
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
 
-    builder.add_file(&path, &large, Language::Rust).expect("add_file should not error");
+    builder
+        .add_file(&path, &large, Language::Rust)
+        .expect("add_file should not error");
     let layer = Box::new(builder).build().expect("build");
 
     assert_eq!(
@@ -218,7 +217,9 @@ fn index_files_exist_on_disk_after_build() {
     let index_dir = dir.path().to_path_buf();
 
     let mut builder = LexicalLayerBuilder::new(index_dir.clone(), PathBuf::from("/repo"));
-    builder.add_file(&path, &content, Language::TypeScript).expect("add_file");
+    builder
+        .add_file(&path, &content, Language::TypeScript)
+        .expect("add_file");
     Box::new(builder).build().expect("build");
 
     assert!(
@@ -247,13 +248,19 @@ fn built_layer_can_be_reopened() {
     let dir = tempfile::tempdir().expect("tempdir");
     let index_dir = dir.path().to_path_buf();
 
-    let mut builder = LexicalLayerBuilder::new(index_dir.clone(), PathBuf::from("/repo"));
-    builder.add_file(&path, &content, Language::Rust).expect("add_file");
+    let mut builder = LexicalLayerBuilder::new(index_dir.clone(), workspace_root());
+    builder
+        .add_file(&path, &content, Language::Rust)
+        .expect("add_file");
     Box::new(builder).build().expect("build");
 
     // Re-open independently.
     let reopened = LexicalSearchLayer::open(&index_dir).expect("reopen");
-    assert_eq!(reopened.stats().file_count, 1, "reopened index should have 1 file");
+    assert_eq!(
+        reopened.stats().file_count,
+        1,
+        "reopened index should have 1 file"
+    );
 }
 
 // ============================================================================
@@ -264,13 +271,15 @@ fn built_layer_can_be_reopened() {
 fn metadata_roundtrip() {
     let content = read_fixture("user_service.ts");
     let path = fixture("user_service.ts");
-    let repo_root = PathBuf::from("/my/repo");
+    let repo_root = workspace_root();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let index_dir = dir.path().to_path_buf();
 
     let mut builder = LexicalLayerBuilder::new(index_dir.clone(), repo_root.clone());
-    builder.add_file(&path, &content, Language::TypeScript).expect("add_file");
+    builder
+        .add_file(&path, &content, Language::TypeScript)
+        .expect("add_file");
     Box::new(builder).build().expect("build");
 
     // Read metadata.json directly and verify fields.
@@ -286,6 +295,63 @@ fn metadata_roundtrip() {
     );
 
     // file_mtimes should be non-empty.
-    let mtimes = meta["file_mtimes"].as_array().expect("file_mtimes is array");
-    assert!(!mtimes.is_empty(), "file_mtimes should be non-empty after indexing one file");
+    let mtimes = meta["file_mtimes"]
+        .as_array()
+        .expect("file_mtimes is array");
+    assert!(
+        !mtimes.is_empty(),
+        "file_mtimes should be non-empty after indexing one file"
+    );
+}
+
+// ============================================================================
+// 11. stored_file_mtimes() returns expected (path, mtime) pairs after reopen
+// ============================================================================
+
+#[test]
+fn stored_file_mtimes_after_reopen() {
+    let content = read_fixture("user_service.ts");
+    let rel_path = fixture("user_service.ts");
+    let repo_root = workspace_root();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index_dir = dir.path().to_path_buf();
+
+    let mut builder = LexicalLayerBuilder::new(index_dir.clone(), repo_root.clone());
+    builder
+        .add_file(&rel_path, &content, Language::TypeScript)
+        .expect("add_file");
+    let built = Box::new(builder).build().expect("build");
+
+    // Capture the mtime that was stored during build (may be 0 if the path
+    // cannot be stat'd from the test runner's CWD).
+    let built_mtimes = built.stored_file_mtimes().to_vec();
+
+    // Reopen the index and inspect stored_file_mtimes.
+    use rskim_search::SearchIndex;
+    let layer = LexicalSearchLayer::open(&index_dir).expect("reopen");
+    let mtimes = layer.stored_file_mtimes();
+
+    assert_eq!(
+        mtimes.len(),
+        1,
+        "stored_file_mtimes must contain exactly one entry after indexing one file, got {}",
+        mtimes.len()
+    );
+
+    let (stored_path, stored_mtime) = &mtimes[0];
+    assert_eq!(
+        stored_path, &rel_path,
+        "stored path must match the registered relative path"
+    );
+
+    // Verify the mtime roundtrips correctly through build → persist → reopen.
+    assert_eq!(
+        *stored_mtime, built_mtimes[0].1,
+        "mtime must roundtrip: built={}, reopened={}",
+        built_mtimes[0].1, stored_mtime,
+    );
+
+    // The mtime must be a valid u64 (0 is allowed when stat fails for a relative path).
+    let _ = *stored_mtime; // u64 is always a valid unix timestamp or 0
 }

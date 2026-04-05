@@ -16,30 +16,46 @@ use std::ops::Range;
 
 use crate::SearchField;
 
+use super::newline_len;
+
 // ============================================================================
 // JSON classification
 // ============================================================================
 
+/// Maximum recursion depth for `classify_json_object`.
+///
+/// Prevents stack overflow on pathologically nested JSON (e.g., 100+ levels).
+const MAX_JSON_DEPTH: usize = 64;
+
 /// Classify regions in JSON content into `SearchField` spans.
 ///
 /// On parse error returns an empty vec (graceful degradation for search indexing).
-pub fn classify_json_fields(
-    source: &str,
-) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
+pub fn classify_json_fields(source: &str) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
     let value: serde_json::Value = match serde_json::from_str(source) {
         Ok(v) => v,
         Err(_) => return Ok(vec![]),
     };
 
     let mut results = Vec::new();
+    // search_start tracks how far into `source` we have already consumed so that
+    // each substring search advances forward rather than rescanning from byte 0.
+    // This turns the O(n*m) scan into O(n) for non-duplicate key names and
+    // ensures duplicate key/value strings resolve to the correct occurrence.
+    let mut search_start: usize = 0;
     match &value {
         serde_json::Value::Object(map) => {
-            classify_json_object(source, map, /* depth */ 0, &mut results);
+            classify_json_object(
+                source,
+                map,
+                /* depth */ 0,
+                &mut results,
+                &mut search_start,
+            );
         }
         serde_json::Value::Array(items) => {
             for item in items {
                 if let serde_json::Value::Object(map) = item {
-                    classify_json_object(source, map, 0, &mut results);
+                    classify_json_object(source, map, 0, &mut results, &mut search_start);
                 }
             }
         }
@@ -50,12 +66,22 @@ pub fn classify_json_fields(
 }
 
 /// Walk a JSON object at a given nesting depth, appending classified spans.
+///
+/// `search_start` is a shared cursor that advances past each located token so
+/// that later searches do not re-scan already-consumed bytes, and duplicate key
+/// names at different positions are resolved to the correct occurrence.
 fn classify_json_object(
     source: &str,
     map: &serde_json::Map<String, serde_json::Value>,
     depth: usize,
     out: &mut Vec<(Range<usize>, SearchField)>,
+    search_start: &mut usize,
 ) {
+    // Guard against deeply nested JSON causing a stack overflow.
+    if depth > MAX_JSON_DEPTH {
+        return;
+    }
+
     for (key, value) in map {
         // Classify the key.
         let key_field = if depth == 0 {
@@ -64,33 +90,44 @@ fn classify_json_object(
             SearchField::SymbolName
         };
 
-        // Locate the key string in source (search for `"key"`).
-        // This is a best-effort linear scan — adequate for search indexing.
+        // Locate the key string in source (search for "key").
+        // Searching from `search_start` finds the *next* occurrence of this
+        // token, not always the first one in the file — correct for in-order
+        // JSON serialisation and avoids the O(n*m) rescan.
         let quoted_key = format!("\"{}\"", key);
-        if let Some(pos) = source.find(quoted_key.as_str()) {
-            out.push((pos..pos + quoted_key.len(), key_field));
+        if let Some(rel_pos) = source[*search_start..].find(quoted_key.as_str()) {
+            let abs_pos = *search_start + rel_pos;
+            *search_start = abs_pos + quoted_key.len();
+            out.push((abs_pos..abs_pos + quoted_key.len(), key_field));
         }
 
         // Classify the value.
         match value {
             serde_json::Value::String(s) => {
                 let quoted_val = format!("\"{}\"", s);
-                if let Some(pos) = source.find(quoted_val.as_str()) {
-                    out.push((pos..pos + quoted_val.len(), SearchField::StringLiteral));
+                if let Some(rel_pos) = source[*search_start..].find(quoted_val.as_str()) {
+                    let abs_pos = *search_start + rel_pos;
+                    *search_start = abs_pos + quoted_val.len();
+                    out.push((
+                        abs_pos..abs_pos + quoted_val.len(),
+                        SearchField::StringLiteral,
+                    ));
                 }
             }
             serde_json::Value::Object(nested) => {
-                classify_json_object(source, nested, depth + 1, out);
+                classify_json_object(source, nested, depth + 1, out, search_start);
             }
             serde_json::Value::Array(items) => {
                 for item in items {
                     if let serde_json::Value::Object(nested) = item {
-                        classify_json_object(source, nested, depth + 1, out);
+                        classify_json_object(source, nested, depth + 1, out, search_start);
                     } else if let serde_json::Value::String(s) = item {
                         let quoted_val = format!("\"{}\"", s);
-                        if let Some(pos) = source.find(quoted_val.as_str()) {
+                        if let Some(rel_pos) = source[*search_start..].find(quoted_val.as_str()) {
+                            let abs_pos = *search_start + rel_pos;
+                            *search_start = abs_pos + quoted_val.len();
                             out.push((
-                                pos..pos + quoted_val.len(),
+                                abs_pos..abs_pos + quoted_val.len(),
                                 SearchField::StringLiteral,
                             ));
                         }
@@ -110,26 +147,24 @@ fn classify_json_object(
 ///
 /// Uses line-by-line scanning to avoid pulling in `serde_yaml_ng` as a dep.
 /// Returns `(byte_range, SearchField)` pairs for meaningful regions.
-pub fn classify_yaml_fields(
-    source: &str,
-) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
+pub fn classify_yaml_fields(source: &str) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
     let mut results = Vec::new();
     let mut byte_offset: usize = 0;
 
     for line in source.lines() {
         let line_len = line.len();
+        let sep = newline_len(source, byte_offset + line_len);
 
         // Skip blank lines.
         if line.trim().is_empty() {
-            // +1 for the newline character.
-            byte_offset += line_len + 1;
+            byte_offset += line_len + sep;
             continue;
         }
 
         // Comment lines.
         if line.trim_start().starts_with('#') {
             results.push((byte_offset..byte_offset + line_len, SearchField::Comment));
-            byte_offset += line_len + 1;
+            byte_offset += line_len + sep;
             continue;
         }
 
@@ -173,7 +208,7 @@ pub fn classify_yaml_fields(
             }
         }
 
-        byte_offset += line_len + 1;
+        byte_offset += line_len + sep;
     }
 
     Ok(results)
@@ -201,33 +236,35 @@ fn is_yaml_key(s: &str) -> bool {
 ///
 /// Uses line-by-line scanning. Pattern matching on `[section]` headers,
 /// `key = value` assignments, and `#` comments.
-pub fn classify_toml_fields(
-    source: &str,
-) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
+pub fn classify_toml_fields(source: &str) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
     let mut results = Vec::new();
     let mut byte_offset: usize = 0;
 
     for line in source.lines() {
         let line_len = line.len();
         let trimmed = line.trim();
+        let sep = newline_len(source, byte_offset + line_len);
 
         // Skip blank lines.
         if trimmed.is_empty() {
-            byte_offset += line_len + 1;
+            byte_offset += line_len + sep;
             continue;
         }
 
         // Comment lines.
         if trimmed.starts_with('#') {
             results.push((byte_offset..byte_offset + line_len, SearchField::Comment));
-            byte_offset += line_len + 1;
+            byte_offset += line_len + sep;
             continue;
         }
 
         // Section headers: `[table]` or `[[array_of_tables]]`.
         if trimmed.starts_with('[') {
-            results.push((byte_offset..byte_offset + line_len, SearchField::TypeDefinition));
-            byte_offset += line_len + 1;
+            results.push((
+                byte_offset..byte_offset + line_len,
+                SearchField::TypeDefinition,
+            ));
+            byte_offset += line_len + sep;
             continue;
         }
 
@@ -236,9 +273,7 @@ pub fn classify_toml_fields(
             let key = trimmed[..eq_pos].trim();
             if !key.is_empty() {
                 // Key span: locate within the original line.
-                let key_start_in_line = line
-                    .find(key)
-                    .unwrap_or(0);
+                let key_start_in_line = line.find(key).unwrap_or(0);
                 let key_end = key_start_in_line + key.len();
                 results.push((
                     byte_offset + key_start_in_line..byte_offset + key_end,
@@ -259,7 +294,7 @@ pub fn classify_toml_fields(
             }
         }
 
-        byte_offset += line_len + 1;
+        byte_offset += line_len + sep;
     }
 
     Ok(results)
@@ -301,10 +336,41 @@ mod tests {
     fn json_string_value_is_string_literal() {
         let source = r#"{"name": "alice"}"#;
         let result = classify_json_fields(source).expect("should succeed");
-        let has_str_lit = result
-            .iter()
-            .any(|(_, f)| *f == SearchField::StringLiteral);
+        let has_str_lit = result.iter().any(|(_, f)| *f == SearchField::StringLiteral);
         assert!(has_str_lit, "string value should be StringLiteral");
+    }
+
+    #[test]
+    fn json_duplicate_string_values_get_distinct_offsets() {
+        // Two keys with the same string value.  Both occurrences should be found
+        // and their ranges should be distinct (i.e. the second search picks up
+        // the second occurrence, not the first again).
+        let source = r#"{"a": "x", "b": "x"}"#;
+        let result = classify_json_fields(source).expect("should succeed");
+        let string_lits: Vec<_> = result
+            .iter()
+            .filter(|(_, f)| *f == SearchField::StringLiteral)
+            .collect();
+        // Expect two StringLiteral spans for the two "x" values.
+        assert_eq!(string_lits.len(), 2, "should find both \"x\" occurrences");
+        // They must be at different offsets.
+        assert_ne!(string_lits[0].0.start, string_lits[1].0.start);
+    }
+
+    #[test]
+    fn json_deeply_nested_does_not_panic() {
+        // Build JSON nested 100 levels deep — beyond MAX_JSON_DEPTH (64).
+        // The classifier should return without stack overflow.
+        let mut s = String::new();
+        for _ in 0..100 {
+            s.push_str(r#"{"k": "#);
+        }
+        s.push('1');
+        for _ in 0..100 {
+            s.push('}');
+        }
+        // We just need it not to panic; any result is acceptable.
+        let _result = classify_json_fields(&s).expect("should succeed");
     }
 
     // ---- YAML ----
@@ -341,6 +407,24 @@ mod tests {
         assert!(has_symbol, "nested YAML key should be SymbolName");
     }
 
+    #[test]
+    fn yaml_crlf_byte_ranges_within_bounds() {
+        // CRLF-terminated YAML.  Each line separator is 2 bytes (\r\n).
+        // Without newline_len, byte_offset drifts +1 per line causing
+        // spans to exceed source.len() on the second line onwards.
+        let source = "name: alice\r\nage: 30\r\n";
+        let result = classify_yaml_fields(source).expect("should succeed");
+        assert!(!result.is_empty(), "expected spans for CRLF YAML source");
+        for (range, _) in &result {
+            assert!(
+                range.end <= source.len(),
+                "YAML range {:?} out of bounds for source len {}",
+                range,
+                source.len()
+            );
+        }
+    }
+
     // ---- TOML ----
 
     #[test]
@@ -373,5 +457,21 @@ mod tests {
         let result = classify_toml_fields(source).expect("should succeed");
         let has_comment = result.iter().any(|(_, f)| *f == SearchField::Comment);
         assert!(has_comment, "# comment should be Comment");
+    }
+
+    #[test]
+    fn toml_crlf_byte_ranges_within_bounds() {
+        // CRLF-terminated TOML.  Without newline_len, offset drifts +1 per line.
+        let source = "[pkg]\r\nname = \"x\"\r\n";
+        let result = classify_toml_fields(source).expect("should succeed");
+        assert!(!result.is_empty(), "expected spans for CRLF TOML source");
+        for (range, _) in &result {
+            assert!(
+                range.end <= source.len(),
+                "TOML range {:?} out of bounds for source len {}",
+                range,
+                source.len()
+            );
+        }
     }
 }

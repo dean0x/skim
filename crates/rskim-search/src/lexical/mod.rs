@@ -39,6 +39,7 @@ pub struct Ngram(u64);
 
 impl Ngram {
     /// Hash a byte slice into an `Ngram` using FxHash.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self(fxhash_bytes(bytes))
     }
@@ -93,6 +94,7 @@ impl PostingEntry {
     /// Deserialize from a 12-byte little-endian slice.
     ///
     /// Returns `None` if the slice is too short.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < POSTING_ENTRY_SIZE {
             return None;
@@ -148,6 +150,7 @@ impl IndexHeader {
     /// Deserialize from a 32-byte little-endian slice.
     ///
     /// Returns `None` if the slice is too short.
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < INDEX_HEADER_SIZE {
             return None;
@@ -212,6 +215,14 @@ pub struct IndexMetadata {
     /// Canonical repo root path (for collision detection across repos
     /// that hash to the same directory name).
     pub repo_root: PathBuf,
+    /// Per-document token counts, indexed by `doc_id`.
+    ///
+    /// Used for BM25F length normalization at query time. Absent in
+    /// indexes built before this field was added; defaults to empty
+    /// (which causes the scorer to fall back to `avg_doc_len`-only
+    /// normalization, the same behavior as the previous implementation).
+    #[serde(default)]
+    pub doc_lengths: Vec<u32>,
 }
 
 // ============================================================================
@@ -220,8 +231,13 @@ pub struct IndexMetadata {
 
 /// FxHash for byte slices. Deterministic, fast, non-cryptographic.
 ///
-/// Used for n-gram hashing. Not suitable for security-sensitive contexts.
-fn fxhash_bytes(bytes: &[u8]) -> u64 {
+/// Used for n-gram hashing and cache key derivation. Not suitable for
+/// security-sensitive contexts.
+///
+/// Public so that downstream crates (e.g. the CLI) can compute the same
+/// hash without duplicating the algorithm. Changing this function would
+/// invalidate all existing on-disk indexes.
+pub fn fxhash_bytes(bytes: &[u8]) -> u64 {
     // FxHash algorithm: multiply-rotate on each byte.
     const SEED: u64 = 0x517c_c1b7_2722_0a95;
     let mut hash: u64 = 0;

@@ -25,6 +25,12 @@ use super::{
     Bm25Params, IndexMetadata,
 };
 
+/// Maximum `metadata.json` file size in bytes (100 MB).
+///
+/// Guards against crafted metadata with millions of `file_mtimes` or
+/// `doc_lengths` entries that would cause OOM during deserialization.
+const MAX_METADATA_BYTES: u64 = 100_000_000;
+
 // ============================================================================
 // LexicalSearchLayer
 // ============================================================================
@@ -36,43 +42,61 @@ use super::{
 pub struct LexicalSearchLayer {
     pub(crate) reader: IndexReader,
     pub(crate) scorer: Bm25Scorer,
-    pub(crate) file_table: FileTable,
     pub(crate) metadata: IndexMetadata,
-    /// Index directory — required to locate delta and tombstone files at query time.
-    pub(crate) index_dir: PathBuf,
+    /// Tombstoned doc_ids, loaded once at open time.
+    tombstones: Tombstones,
+    /// Delta reader (if a delta file is present), loaded once at open time.
+    delta: Option<DeltaReader>,
 }
 
 impl LexicalSearchLayer {
     /// Open a previously built index from `dir`.
     ///
     /// Reads `metadata.json`, constructs a [`Bm25Scorer`], and opens the
-    /// mmap'd index files.
+    /// mmap'd index files. Tombstones and the delta reader are loaded once
+    /// here and reused across all queries.
     ///
     /// # Errors
     ///
     /// - [`SearchError::Io`] if any file cannot be read.
     /// - [`SearchError::SerializationError`] if `metadata.json` is malformed.
-    /// - [`SearchError::CorruptedIndex`] if the binary index files are invalid.
+    /// - [`SearchError::CorruptedIndex`] if the binary index files are invalid
+    ///   or the metadata file exceeds `MAX_METADATA_BYTES`.
+    #[must_use = "the opened LexicalSearchLayer must be used for queries"]
     pub fn open(dir: &Path) -> crate::Result<Self> {
         let meta_path = dir.join("metadata.json");
-        let meta_str =
-            std::fs::read_to_string(&meta_path).map_err(crate::SearchError::Io)?;
+
+        // Guard against OOM from crafted oversized metadata files.
+        let meta_len = std::fs::metadata(&meta_path)
+            .map_err(crate::SearchError::Io)?
+            .len();
+        if meta_len > MAX_METADATA_BYTES {
+            return Err(crate::SearchError::CorruptedIndex {
+                path: meta_path.display().to_string(),
+                reason: format!(
+                    "metadata.json is {meta_len} bytes, exceeds maximum of {MAX_METADATA_BYTES}"
+                ),
+            });
+        }
+
+        let meta_str = std::fs::read_to_string(&meta_path).map_err(crate::SearchError::Io)?;
         let metadata: IndexMetadata = serde_json::from_str(&meta_str)
             .map_err(|e| crate::SearchError::SerializationError(e.to_string()))?;
 
         let reader = IndexReader::open(dir)?;
 
-        let scorer = Bm25Scorer::new(
-            metadata.bm25_params.clone(),
-            metadata.stats.file_count,
-        );
+        let scorer = Bm25Scorer::new(metadata.bm25_params.clone(), metadata.stats.file_count);
+
+        // Load tombstones and delta once so every search() call reuses them.
+        let tombstones = Tombstones::load(dir)?;
+        let delta = DeltaReader::open(dir)?;
 
         Ok(Self {
             reader,
             scorer,
-            file_table: metadata.file_table.clone(),
             metadata,
-            index_dir: dir.to_path_buf(),
+            tombstones,
+            delta,
         })
     }
 
@@ -100,11 +124,7 @@ impl SearchLayer for LexicalSearchLayer {
             return Ok(vec![]);
         }
 
-        // Step 3: Load tombstones (returns empty set if file absent).
-        let tombstones = Tombstones::load(&self.index_dir)?;
-
-        // Step 4: Load delta reader (returns None if delta absent or empty).
-        let delta = DeltaReader::open(&self.index_dir)?;
+        // Steps 3–4 are now cached in self.tombstones and self.delta.
 
         // Step 5: For each query n-gram, accumulate per-document scores.
         //
@@ -126,7 +146,7 @@ impl SearchLayer for LexicalSearchLayer {
             // Main index postings.
             if let Some(postings) = self.reader.lookup(*ngram) {
                 for entry in postings {
-                    if tombstones.contains(entry.doc_id) {
+                    if self.tombstones.contains(entry.doc_id) {
                         continue;
                     }
                     if let Some(field) = SearchField::from_u8(entry.field_id) {
@@ -139,7 +159,7 @@ impl SearchLayer for LexicalSearchLayer {
             }
 
             // Delta postings (merged on top of main index — newest wins by union).
-            if let Some(ref dr) = delta {
+            if let Some(ref dr) = self.delta {
                 for entry in dr.scan(*ngram) {
                     if let Some(field) = SearchField::from_u8(entry.field_id) {
                         ngram_docs
@@ -157,21 +177,24 @@ impl SearchLayer for LexicalSearchLayer {
             let df = ngram_docs.len() as u64;
 
             // Score each doc for this query term and accumulate.
+            // Look up the per-document token count for accurate BM25F length
+            // normalization. Falls back to 0 for indexes built without doc_lengths
+            // (the scorer treats doc_len=0 the same as avg_doc_len when b > 0).
             for (doc_id, field_tfs) in &ngram_docs {
-                // doc_len = 0: length normalization falls back to 1.0 when avg_doc_len = 0.
-                // The builder stores avg_doc_len in metadata; for queries we pass 0 here
-                // and rely on the scorer's guard (when avg_doc_len = 0, len_norm = 1.0).
-                // TODO(phase-4): store per-doc lengths in metadata for accurate normalization.
-                let score = self.scorer.score_term(field_tfs, 0, df);
+                let doc_len = self
+                    .metadata
+                    .doc_lengths
+                    .get(*doc_id as usize)
+                    .copied()
+                    .unwrap_or(0);
+                let score = self.scorer.score_term(field_tfs, doc_len, df);
                 *doc_scores.entry(*doc_id).or_insert(0.0) += score;
             }
         }
 
         // Step 6: Sort by score descending.
         let mut results: Vec<(u32, f32)> = doc_scores.into_iter().collect();
-        results.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Step 7: Apply offset + limit and map to FileId.
         let results: Vec<(FileId, f32)> = results
@@ -187,7 +210,7 @@ impl SearchLayer for LexicalSearchLayer {
 
 impl SearchIndex for LexicalSearchLayer {
     fn file_table(&self) -> &FileTable {
-        &self.file_table
+        &self.metadata.file_table
     }
 
     fn stats(&self) -> IndexStats {
@@ -198,4 +221,3 @@ impl SearchIndex for LexicalSearchLayer {
         &self.metadata.file_mtimes
     }
 }
-

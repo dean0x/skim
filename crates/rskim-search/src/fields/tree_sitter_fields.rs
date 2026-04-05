@@ -1,9 +1,19 @@
 //! Data-driven field classifier for tree-sitter languages.
 //!
 //! Uses `FxHashMap` lookup tables (O(1)) instead of match statements.
-//! Each language defines static slices of `(node_kind, SearchField)` pairs.
+//! Static data tables live in [`super::tree_sitter_tables`]; this module
+//! contains only the classifier struct and its construction logic (~35 lines).
+//!
 //! Identifiers are classified only in declaration contexts to avoid
 //! indexing every variable reference.
+//!
+//! # Caching
+//!
+//! [`TreeSitterClassifier::for_language`] returns a shared `&'static` reference.
+//! Each language's classifier is built once via `OnceLock` and reused across
+//! all subsequent calls, eliminating per-call `FxHashMap` allocation.
+
+use std::sync::OnceLock;
 
 use rustc_hash::FxHashMap;
 
@@ -11,304 +21,7 @@ use rskim_core::Language;
 
 use crate::{FieldClassifier, SearchField};
 
-// ============================================================================
-// Per-language static data tables
-// ============================================================================
-
-// Each language exports two slices:
-//   FIELD_MAP        — container node kind → SearchField (direct mapping)
-//   DECL_PARENTS     — parent node kind → SearchField for identifier nodes
-
-// --- TypeScript / JavaScript ---
-
-const TS_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("type_alias_declaration", SearchField::TypeDefinition),
-    ("interface_declaration", SearchField::TypeDefinition),
-    ("enum_declaration", SearchField::TypeDefinition),
-    ("class_declaration", SearchField::TypeDefinition),
-    ("function_declaration", SearchField::FunctionSignature),
-    ("method_definition", SearchField::FunctionSignature),
-    ("arrow_function", SearchField::FunctionSignature),
-    ("import_statement", SearchField::ImportExport),
-    ("export_statement", SearchField::ImportExport),
-    ("statement_block", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("string", SearchField::StringLiteral),
-    ("template_string", SearchField::StringLiteral),
-];
-
-const TS_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_declaration", SearchField::SymbolName),
-    ("class_declaration", SearchField::SymbolName),
-    ("type_alias_declaration", SearchField::SymbolName),
-    ("variable_declarator", SearchField::SymbolName),
-    ("method_definition", SearchField::SymbolName),
-    ("interface_declaration", SearchField::SymbolName),
-    ("enum_declaration", SearchField::SymbolName),
-    ("import_specifier", SearchField::ImportExport),
-];
-
-// JavaScript shares the same tables as TypeScript.
-const JS_FIELD_MAP: &[(&str, SearchField)] = TS_FIELD_MAP;
-const JS_DECL_PARENTS: &[(&str, SearchField)] = TS_DECL_PARENTS;
-
-// --- Python ---
-
-const PY_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("class_definition", SearchField::TypeDefinition),
-    ("function_definition", SearchField::FunctionSignature),
-    ("decorated_definition", SearchField::FunctionSignature),
-    ("import_statement", SearchField::ImportExport),
-    ("import_from_statement", SearchField::ImportExport),
-    ("block", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("string", SearchField::StringLiteral),
-];
-
-const PY_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_definition", SearchField::SymbolName),
-    ("class_definition", SearchField::SymbolName),
-    ("assignment", SearchField::SymbolName),
-];
-
-// --- Rust ---
-
-const RS_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("struct_item", SearchField::TypeDefinition),
-    ("enum_item", SearchField::TypeDefinition),
-    ("type_item", SearchField::TypeDefinition),
-    ("trait_item", SearchField::TypeDefinition),
-    ("impl_item", SearchField::TypeDefinition),
-    ("function_item", SearchField::FunctionSignature),
-    ("function_signature_item", SearchField::FunctionSignature),
-    ("use_declaration", SearchField::ImportExport),
-    ("block", SearchField::FunctionBody),
-    ("line_comment", SearchField::Comment),
-    ("block_comment", SearchField::Comment),
-    ("string_literal", SearchField::StringLiteral),
-    ("raw_string_literal", SearchField::StringLiteral),
-];
-
-const RS_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_item", SearchField::SymbolName),
-    ("struct_item", SearchField::SymbolName),
-    ("enum_item", SearchField::SymbolName),
-    ("trait_item", SearchField::SymbolName),
-    ("type_item", SearchField::SymbolName),
-    ("const_item", SearchField::SymbolName),
-    ("static_item", SearchField::SymbolName),
-    ("mod_item", SearchField::SymbolName),
-];
-
-// --- Go ---
-
-const GO_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("type_declaration", SearchField::TypeDefinition),
-    ("type_spec", SearchField::TypeDefinition),
-    ("function_declaration", SearchField::FunctionSignature),
-    ("method_declaration", SearchField::FunctionSignature),
-    ("import_declaration", SearchField::ImportExport),
-    ("block", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("interpreted_string_literal", SearchField::StringLiteral),
-    ("raw_string_literal", SearchField::StringLiteral),
-];
-
-const GO_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_declaration", SearchField::SymbolName),
-    ("method_declaration", SearchField::SymbolName),
-    ("type_spec", SearchField::SymbolName),
-    ("const_spec", SearchField::SymbolName),
-    ("var_spec", SearchField::SymbolName),
-];
-
-// --- Java ---
-
-const JAVA_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("class_declaration", SearchField::TypeDefinition),
-    ("interface_declaration", SearchField::TypeDefinition),
-    ("enum_declaration", SearchField::TypeDefinition),
-    ("annotation_type_declaration", SearchField::TypeDefinition),
-    ("method_declaration", SearchField::FunctionSignature),
-    ("constructor_declaration", SearchField::FunctionSignature),
-    ("import_declaration", SearchField::ImportExport),
-    ("block", SearchField::FunctionBody),
-    ("line_comment", SearchField::Comment),
-    ("block_comment", SearchField::Comment),
-    ("string_literal", SearchField::StringLiteral),
-];
-
-const JAVA_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("class_declaration", SearchField::SymbolName),
-    ("method_declaration", SearchField::SymbolName),
-    ("interface_declaration", SearchField::SymbolName),
-    ("enum_declaration", SearchField::SymbolName),
-    ("variable_declarator", SearchField::SymbolName),
-];
-
-// --- C ---
-
-const C_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("struct_specifier", SearchField::TypeDefinition),
-    ("enum_specifier", SearchField::TypeDefinition),
-    ("type_definition", SearchField::TypeDefinition),
-    ("union_specifier", SearchField::TypeDefinition),
-    ("function_definition", SearchField::FunctionSignature),
-    ("declaration", SearchField::FunctionSignature),
-    ("preproc_include", SearchField::ImportExport),
-    ("compound_statement", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("string_literal", SearchField::StringLiteral),
-];
-
-const C_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_definition", SearchField::SymbolName),
-    ("function_declarator", SearchField::SymbolName),
-    ("struct_specifier", SearchField::SymbolName),
-    ("enum_specifier", SearchField::SymbolName),
-    ("type_definition", SearchField::SymbolName),
-    ("init_declarator", SearchField::SymbolName),
-];
-
-// --- C++ ---
-
-const CPP_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("struct_specifier", SearchField::TypeDefinition),
-    ("enum_specifier", SearchField::TypeDefinition),
-    ("type_definition", SearchField::TypeDefinition),
-    ("union_specifier", SearchField::TypeDefinition),
-    ("class_specifier", SearchField::TypeDefinition),
-    ("namespace_definition", SearchField::TypeDefinition),
-    ("template_declaration", SearchField::TypeDefinition),
-    ("function_definition", SearchField::FunctionSignature),
-    ("declaration", SearchField::FunctionSignature),
-    ("preproc_include", SearchField::ImportExport),
-    ("using_declaration", SearchField::ImportExport),
-    ("compound_statement", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("string_literal", SearchField::StringLiteral),
-];
-
-const CPP_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_definition", SearchField::SymbolName),
-    ("function_declarator", SearchField::SymbolName),
-    ("struct_specifier", SearchField::SymbolName),
-    ("enum_specifier", SearchField::SymbolName),
-    ("type_definition", SearchField::SymbolName),
-    ("init_declarator", SearchField::SymbolName),
-    ("class_specifier", SearchField::SymbolName),
-    ("namespace_definition", SearchField::SymbolName),
-];
-
-// --- C# ---
-
-const CS_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("class_declaration", SearchField::TypeDefinition),
-    ("struct_declaration", SearchField::TypeDefinition),
-    ("interface_declaration", SearchField::TypeDefinition),
-    ("enum_declaration", SearchField::TypeDefinition),
-    ("method_declaration", SearchField::FunctionSignature),
-    ("constructor_declaration", SearchField::FunctionSignature),
-    ("using_directive", SearchField::ImportExport),
-    ("block", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("string_literal", SearchField::StringLiteral),
-    ("verbatim_string_literal", SearchField::StringLiteral),
-];
-
-const CS_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("class_declaration", SearchField::SymbolName),
-    ("struct_declaration", SearchField::SymbolName),
-    ("method_declaration", SearchField::SymbolName),
-    ("interface_declaration", SearchField::SymbolName),
-    ("variable_declarator", SearchField::SymbolName),
-];
-
-// --- Ruby ---
-
-const RB_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("class", SearchField::TypeDefinition),
-    ("module", SearchField::TypeDefinition),
-    ("method", SearchField::FunctionSignature),
-    ("singleton_method", SearchField::FunctionSignature),
-    ("call", SearchField::ImportExport), // require / include
-    ("body_statement", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("string", SearchField::StringLiteral),
-];
-
-const RB_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("class", SearchField::SymbolName),
-    ("module", SearchField::SymbolName),
-    ("method", SearchField::SymbolName),
-    ("assignment", SearchField::SymbolName),
-];
-
-// --- Kotlin ---
-
-const KT_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("class_declaration", SearchField::TypeDefinition),
-    ("object_declaration", SearchField::TypeDefinition),
-    ("type_alias", SearchField::TypeDefinition),
-    ("function_declaration", SearchField::FunctionSignature),
-    ("import_header", SearchField::ImportExport),
-    ("function_body", SearchField::FunctionBody),
-    ("line_comment", SearchField::Comment),
-    ("multiline_comment", SearchField::Comment),
-    ("string_literal", SearchField::StringLiteral),
-];
-
-const KT_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_declaration", SearchField::SymbolName),
-    ("class_declaration", SearchField::SymbolName),
-    ("object_declaration", SearchField::SymbolName),
-    ("property_declaration", SearchField::SymbolName),
-];
-
-// --- Swift ---
-
-const SWIFT_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("class_declaration", SearchField::TypeDefinition),
-    ("struct_declaration", SearchField::TypeDefinition),
-    ("protocol_declaration", SearchField::TypeDefinition),
-    ("enum_declaration", SearchField::TypeDefinition),
-    ("function_declaration", SearchField::FunctionSignature),
-    ("init_declaration", SearchField::FunctionSignature),
-    ("import_declaration", SearchField::ImportExport),
-    ("code_block", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("multiline_comment", SearchField::Comment),
-    ("line_string_literal", SearchField::StringLiteral),
-];
-
-const SWIFT_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("function_declaration", SearchField::SymbolName),
-    ("class_declaration", SearchField::SymbolName),
-    ("struct_declaration", SearchField::SymbolName),
-    ("protocol_declaration", SearchField::SymbolName),
-    ("enum_declaration", SearchField::SymbolName),
-];
-
-// --- SQL ---
-
-const SQL_FIELD_MAP: &[(&str, SearchField)] = &[
-    ("create_table", SearchField::TypeDefinition),
-    ("create_view", SearchField::TypeDefinition),
-    ("create_function", SearchField::FunctionSignature),
-    ("create_procedure", SearchField::FunctionSignature),
-    ("select", SearchField::FunctionBody),
-    ("insert", SearchField::FunctionBody),
-    ("update", SearchField::FunctionBody),
-    ("delete", SearchField::FunctionBody),
-    ("comment", SearchField::Comment),
-    ("string", SearchField::StringLiteral),
-];
-
-const SQL_DECL_PARENTS: &[(&str, SearchField)] = &[
-    ("create_table", SearchField::SymbolName),
-    ("create_function", SearchField::SymbolName),
-    ("column_definition", SearchField::SymbolName),
-];
+use super::tree_sitter_tables as tables;
 
 // ============================================================================
 // Classifier implementation
@@ -327,38 +40,57 @@ pub struct TreeSitterClassifier {
 }
 
 impl TreeSitterClassifier {
-    /// Create a classifier for the given language.
+    /// Return a shared reference to the classifier for the given language.
     ///
-    /// Returns `None` for serde-based languages (JSON, YAML, TOML) and Markdown.
-    pub fn for_language(language: Language) -> Option<Self> {
-        #[allow(clippy::type_complexity)]
-        let (field_pairs, parent_pairs): (&[(&str, SearchField)], &[(&str, SearchField)]) =
-            match language {
-                Language::Json | Language::Yaml | Language::Toml | Language::Markdown => {
-                    return None;
-                }
-                Language::TypeScript => (TS_FIELD_MAP, TS_DECL_PARENTS),
-                Language::JavaScript => (JS_FIELD_MAP, JS_DECL_PARENTS),
-                Language::Python => (PY_FIELD_MAP, PY_DECL_PARENTS),
-                Language::Rust => (RS_FIELD_MAP, RS_DECL_PARENTS),
-                Language::Go => (GO_FIELD_MAP, GO_DECL_PARENTS),
-                Language::Java => (JAVA_FIELD_MAP, JAVA_DECL_PARENTS),
-                Language::C => (C_FIELD_MAP, C_DECL_PARENTS),
-                Language::Cpp => (CPP_FIELD_MAP, CPP_DECL_PARENTS),
-                Language::CSharp => (CS_FIELD_MAP, CS_DECL_PARENTS),
-                Language::Ruby => (RB_FIELD_MAP, RB_DECL_PARENTS),
-                Language::Kotlin => (KT_FIELD_MAP, KT_DECL_PARENTS),
-                Language::Swift => (SWIFT_FIELD_MAP, SWIFT_DECL_PARENTS),
-                Language::Sql => (SQL_FIELD_MAP, SQL_DECL_PARENTS),
-            };
+    /// The classifier is built once per language and cached for the process
+    /// lifetime. Returns `None` for serde-based languages (JSON, YAML, TOML)
+    /// and Markdown, which use `classify_serde_fields` instead.
+    pub fn for_language(language: Language) -> Option<&'static Self> {
+        macro_rules! cached {
+            ($id:ident, $field_map:expr, $parents:expr) => {{
+                static $id: OnceLock<TreeSitterClassifier> = OnceLock::new();
+                $id.get_or_init(|| Self::build($field_map, $parents))
+            }};
+        }
 
-        let field_map = field_pairs.iter().copied().collect();
-        let declaration_parents = parent_pairs.iter().copied().collect();
+        let classifier = match language {
+            Language::Json | Language::Yaml | Language::Toml | Language::Markdown => {
+                return None;
+            }
+            Language::TypeScript => cached!(TS, tables::TS_FIELD_MAP, tables::TS_DECL_PARENTS),
+            Language::JavaScript => cached!(JS, tables::JS_FIELD_MAP, tables::JS_DECL_PARENTS),
+            Language::Python => cached!(PY, tables::PY_FIELD_MAP, tables::PY_DECL_PARENTS),
+            Language::Rust => cached!(RS, tables::RS_FIELD_MAP, tables::RS_DECL_PARENTS),
+            Language::Go => cached!(GO, tables::GO_FIELD_MAP, tables::GO_DECL_PARENTS),
+            Language::Java => cached!(JAVA, tables::JAVA_FIELD_MAP, tables::JAVA_DECL_PARENTS),
+            Language::C => cached!(C, tables::C_FIELD_MAP, tables::C_DECL_PARENTS),
+            Language::Cpp => cached!(CPP, tables::CPP_FIELD_MAP, tables::CPP_DECL_PARENTS),
+            Language::CSharp => cached!(CS, tables::CS_FIELD_MAP, tables::CS_DECL_PARENTS),
+            Language::Ruby => cached!(RB, tables::RB_FIELD_MAP, tables::RB_DECL_PARENTS),
+            Language::Kotlin => cached!(KT, tables::KT_FIELD_MAP, tables::KT_DECL_PARENTS),
+            Language::Swift => cached!(SWIFT, tables::SWIFT_FIELD_MAP, tables::SWIFT_DECL_PARENTS),
+            Language::Sql => cached!(SQL, tables::SQL_FIELD_MAP, tables::SQL_DECL_PARENTS),
+        };
 
-        Some(Self {
-            field_map,
-            declaration_parents,
-        })
+        Some(classifier)
+    }
+
+    fn build(
+        field_pairs: &'static [(&'static str, SearchField)],
+        parent_pairs: &'static [(&'static str, SearchField)],
+    ) -> Self {
+        Self {
+            field_map: field_pairs.iter().copied().collect(),
+            declaration_parents: parent_pairs.iter().copied().collect(),
+        }
+    }
+}
+
+/// Forward `FieldClassifier` through a shared reference so that
+/// `Box::new(&'static classifier)` can coerce to `Box<dyn FieldClassifier>`.
+impl FieldClassifier for &TreeSitterClassifier {
+    fn classify_node(&self, node: &tree_sitter::Node<'_>, source: &str) -> Option<SearchField> {
+        (**self).classify_node(node, source)
     }
 }
 
@@ -371,11 +103,7 @@ impl FieldClassifier for TreeSitterClassifier {
     ///    - Check parent node's kind against `declaration_parents`.
     ///    - Only classify identifiers in declaration contexts.
     /// 3. Otherwise return `None`.
-    fn classify_node(
-        &self,
-        node: &tree_sitter::Node<'_>,
-        _source: &str,
-    ) -> Option<SearchField> {
+    fn classify_node(&self, node: &tree_sitter::Node<'_>, _source: &str) -> Option<SearchField> {
         let kind = node.kind();
 
         // Step 1: direct container node lookup.
@@ -384,7 +112,10 @@ impl FieldClassifier for TreeSitterClassifier {
         }
 
         // Step 2: identifier in declaration context.
-        if matches!(kind, "identifier" | "type_identifier" | "property_identifier") {
+        if matches!(
+            kind,
+            "identifier" | "type_identifier" | "property_identifier"
+        ) {
             if let Some(parent) = node.parent() {
                 if let Some(&field) = self.declaration_parents.get(parent.kind()) {
                     return Some(field);
@@ -397,7 +128,7 @@ impl FieldClassifier for TreeSitterClassifier {
 }
 
 // ============================================================================
-// Unit tests
+// Unit Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -438,9 +169,20 @@ mod tests {
     }
 
     #[test]
+    fn same_language_returns_same_pointer() {
+        // Caching guarantee: two calls return the same static reference.
+        let a = TreeSitterClassifier::for_language(Language::Rust).unwrap();
+        let b = TreeSitterClassifier::for_language(Language::Rust).unwrap();
+        assert!(
+            std::ptr::eq(a, b),
+            "for_language(Rust) must return the same cached pointer on every call"
+        );
+    }
+
+    #[test]
     fn rust_field_map_contains_expected_entries() {
-        let classifier = TreeSitterClassifier::for_language(Language::Rust)
-            .expect("Rust classifier must exist");
+        let classifier =
+            TreeSitterClassifier::for_language(Language::Rust).expect("Rust classifier must exist");
         assert_eq!(
             classifier.field_map.get("struct_item"),
             Some(&SearchField::TypeDefinition)

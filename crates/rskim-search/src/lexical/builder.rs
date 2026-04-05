@@ -42,12 +42,15 @@ pub struct LexicalLayerBuilder {
     file_mtimes: Vec<(PathBuf, u64)>,
     /// Cached classifiers per language. `None` means language uses serde path.
     classifier_cache: FxHashMap<Language, Option<Box<dyn FieldClassifier>>>,
+    /// Cached tree-sitter parsers per language (reused across files).
+    parser_cache: FxHashMap<Language, rskim_core::Parser>,
 }
 
 impl LexicalLayerBuilder {
     /// Create a new builder targeting `index_dir`.
     ///
     /// `repo_root` is stored in metadata for cross-repo collision detection.
+    #[must_use]
     pub fn new(index_dir: PathBuf, repo_root: PathBuf) -> Self {
         Self {
             index_dir,
@@ -57,6 +60,95 @@ impl LexicalLayerBuilder {
             doc_lengths: Vec::new(),
             file_mtimes: Vec::new(),
             classifier_cache: FxHashMap::default(),
+            parser_cache: FxHashMap::default(),
+        }
+    }
+
+    /// Index `content` using the tree-sitter AST path.
+    ///
+    /// Reuses the cached parser for `language` if available; creates and caches
+    /// a new one otherwise. Falls through silently on parse failure so the
+    /// caller's `doc_len == 0` guard triggers the whole-file fallback.
+    fn index_tree_sitter(
+        &mut self,
+        content: &str,
+        language: Language,
+        doc_id: u32,
+        doc_len: &mut u32,
+    ) {
+        // Ensure a parser exists in the cache for this language.
+        if let std::collections::hash_map::Entry::Vacant(e) = self.parser_cache.entry(language) {
+            match rskim_core::Parser::new(language) {
+                Ok(parser) => {
+                    e.insert(parser);
+                }
+                Err(_) => {
+                    // Parser creation failed — caller's doc_len == 0 guard triggers fallback.
+                    return;
+                }
+            }
+        }
+
+        let parser = match self.parser_cache.get_mut(&language) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tree = match parser.parse(content) {
+            Ok(t) => t,
+            Err(_) => {
+                // Parse failed — caller's doc_len == 0 guard triggers fallback.
+                return;
+            }
+        };
+
+        // SAFETY: classifier_cache entry was populated by add_file and is Some
+        // (only tree-sitter languages reach this path).
+        let classifier = match self
+            .classifier_cache
+            .get(&language)
+            .and_then(Option::as_deref)
+        {
+            Some(c) => c,
+            None => return,
+        };
+
+        walk_and_classify(
+            tree.root_node(),
+            content,
+            classifier,
+            doc_id,
+            &mut self.postings,
+            doc_len,
+        );
+    }
+
+    /// Index `content` using the serde-based path (JSON, YAML, TOML).
+    ///
+    /// Falls through silently on classification failure so the caller's
+    /// `doc_len == 0` guard triggers the whole-file fallback.
+    fn index_serde(&mut self, content: &str, language: Language, doc_id: u32, doc_len: &mut u32) {
+        let regions = match crate::fields::classify_serde_fields(content, language) {
+            Ok(r) => r,
+            Err(_) => {
+                // Classification failed — caller's doc_len == 0 guard triggers fallback.
+                return;
+            }
+        };
+
+        for (range, field) in regions {
+            let text = &content[range.clone()];
+            let ngrams = extract_ngrams(text);
+            for (ngram, weight) in &ngrams {
+                let entry = PostingEntry {
+                    doc_id,
+                    field_id: field.as_u8(),
+                    position: range.start as u32,
+                    tf: weight.max(1.0).min(f32::from(u16::MAX)) as u16,
+                };
+                self.postings.entry(*ngram).or_default().push(entry);
+            }
+            *doc_len = doc_len.saturating_add(ngrams.len() as u32);
         }
     }
 }
@@ -79,8 +171,9 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
             return Ok(());
         }
 
-        // --- Register path and get doc_id ----------------------------------
-        let file_id: FileId = self.file_table.register(path);
+        // --- Register path with traversal guard ----------------------------
+        // PF-003: use register_within to prevent path traversal attacks.
+        let file_id: FileId = self.file_table.register_within(path, &self.repo_root)?;
 
         // Validate that doc_id fits in u32 (in practice never fails for real repos).
         let doc_id: u32 = u32::try_from(file_id.as_u64())
@@ -93,7 +186,7 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
         // --- Extract and accumulate postings --------------------------------
         let mut doc_len: u32 = 0;
 
-        // Populate the cache entry if absent; `None` means serde-based language.
+        // Populate the classifier cache entry if absent; `None` means serde-based language.
         self.classifier_cache
             .entry(language)
             .or_insert_with(|| crate::fields::for_language(language));
@@ -103,75 +196,28 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
             .is_some_and(Option::is_some);
 
         if use_tree_sitter {
-            // Tree-sitter path: parse AST and classify nodes.
-            match rskim_core::Parser::new(language) {
-                Ok(mut parser) => {
-                    match parser.parse(content) {
-                        Ok(tree) => {
-                            // SAFETY: classifier_cache entry was populated above and is Some.
-                            let classifier = self
-                                .classifier_cache
-                                .get(&language)
-                                .and_then(Option::as_deref);
-                            if let Some(classifier) = classifier {
-                                walk_and_classify(
-                                    tree.root_node(),
-                                    content,
-                                    classifier,
-                                    doc_id,
-                                    &mut self.postings,
-                                    &mut doc_len,
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            // Parse failed — fall through to whole-file fallback below.
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Parser creation failed — fall through to whole-file fallback below.
-                }
-            }
+            self.index_tree_sitter(content, language, doc_id, &mut doc_len);
         } else {
-            // Serde path: classify regions directly from the serialized format.
-            match crate::fields::classify_serde_fields(content, language) {
-                Ok(regions) => {
-                    for (range, field) in regions {
-                        let text = &content[range.clone()];
-                        let ngrams = extract_ngrams(text);
-                        for (ngram, weight) in &ngrams {
-                            let entry = PostingEntry {
-                                doc_id,
-                                field_id: field.as_u8(),
-                                position: range.start as u32,
-                                tf: (*weight).max(1.0) as u16,
-                            };
-                            self.postings.entry(*ngram).or_default().push(entry);
-                        }
-                        doc_len = doc_len.saturating_add(ngrams.len() as u32);
-                    }
-                }
-                Err(_) => {
-                    // Classification failed — fall through to whole-file fallback below.
-                }
-            }
+            self.index_serde(content, language, doc_id, &mut doc_len);
         }
 
         // --- Whole-file fallback -------------------------------------------
-        // Always index the entire file under FunctionBody to guarantee that
-        // every registered file has at least some searchable content.
-        let fallback_ngrams = extract_ngrams(content);
-        for (ngram, _) in &fallback_ngrams {
-            let entry = PostingEntry {
-                doc_id,
-                field_id: SearchField::FunctionBody.as_u8(),
-                position: 0,
-                tf: 1,
-            };
-            self.postings.entry(*ngram).or_default().push(entry);
+        // Only runs when the classified path produced no ngrams (parse failure,
+        // classification failure, or empty file). Guards against doubling posting
+        // lists and inflating doc_len for successfully classified files.
+        if doc_len == 0 {
+            let fallback_ngrams = extract_ngrams(content);
+            for (ngram, _) in &fallback_ngrams {
+                let entry = PostingEntry {
+                    doc_id,
+                    field_id: SearchField::FunctionBody.as_u8(),
+                    position: 0,
+                    tf: 1,
+                };
+                self.postings.entry(*ngram).or_default().push(entry);
+            }
+            doc_len = doc_len.saturating_add(fallback_ngrams.len() as u32);
         }
-        doc_len = doc_len.saturating_add(fallback_ngrams.len() as u32);
 
         self.doc_lengths.push(doc_len);
         Ok(())
@@ -232,6 +278,7 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
             stats,
             file_mtimes: self.file_mtimes,
             repo_root: self.repo_root,
+            doc_lengths: self.doc_lengths,
         };
 
         let json = serde_json::to_string_pretty(&metadata)
@@ -249,7 +296,11 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
 // Tree-sitter node walker
 // ============================================================================
 
-/// Recursively walk a tree-sitter AST, classifying and indexing each node.
+/// Maximum AST traversal depth. Prevents stack overflow on pathologically
+/// deep or adversarial ASTs. 128 levels covers all realistic source files.
+const MAX_AST_DEPTH: u32 = 128;
+
+/// Walk a tree-sitter AST, classifying and indexing each node up to `MAX_AST_DEPTH`.
 fn walk_and_classify(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -258,6 +309,22 @@ fn walk_and_classify(
     postings: &mut FxHashMap<Ngram, Vec<PostingEntry>>,
     doc_len: &mut u32,
 ) {
+    walk_and_classify_inner(node, source, classifier, doc_id, postings, doc_len, 0);
+}
+
+fn walk_and_classify_inner(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    classifier: &dyn FieldClassifier,
+    doc_id: u32,
+    postings: &mut FxHashMap<Ngram, Vec<PostingEntry>>,
+    doc_len: &mut u32,
+    depth: u32,
+) {
+    if depth >= MAX_AST_DEPTH {
+        return;
+    }
+
     if let Some(field) = classifier.classify_node(&node, source) {
         if let Ok(text) = node.utf8_text(source.as_bytes()) {
             let ngrams = extract_ngrams(text);
@@ -266,7 +333,7 @@ fn walk_and_classify(
                     doc_id,
                     field_id: field.as_u8(),
                     position: node.start_byte() as u32,
-                    tf: (*weight).max(1.0) as u16,
+                    tf: weight.max(1.0).min(f32::from(u16::MAX)) as u16,
                 };
                 postings.entry(*ngram).or_default().push(entry);
             }
@@ -277,7 +344,15 @@ fn walk_and_classify(
     // Recurse into children.
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
-            walk_and_classify(child, source, classifier, doc_id, postings, doc_len);
+            walk_and_classify_inner(
+                child,
+                source,
+                classifier,
+                doc_id,
+                postings,
+                doc_len,
+                depth + 1,
+            );
         }
     }
 }
@@ -316,7 +391,7 @@ fn file_mtime_unix(path: &Path) -> u64 {
 }
 
 // ============================================================================
-// Unit tests
+// Unit Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -325,12 +400,10 @@ mod tests {
 
     #[test]
     fn new_builder_is_empty() {
-        let builder = LexicalLayerBuilder::new(
-            PathBuf::from("/tmp/idx"),
-            PathBuf::from("/repo"),
-        );
+        let builder = LexicalLayerBuilder::new(PathBuf::from("/tmp/idx"), PathBuf::from("/repo"));
         assert!(builder.file_table.is_empty());
         assert!(builder.postings.is_empty());
+        assert!(builder.parser_cache.is_empty());
     }
 
     #[test]
@@ -340,5 +413,14 @@ mod tests {
         let long_line: String = "x".repeat(501);
         assert_eq!(long_line.len() / 1usize.max(1), 501);
         assert!(501 > 500); // confirms skip condition
+    }
+
+    #[test]
+    fn max_ast_depth_is_reasonable() {
+        assert!(
+            MAX_AST_DEPTH >= 64,
+            "depth limit too low for realistic ASTs"
+        );
+        assert!(MAX_AST_DEPTH <= 512, "depth limit suspiciously high");
     }
 }

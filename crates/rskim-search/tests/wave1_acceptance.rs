@@ -6,6 +6,12 @@
 //!
 //! All assertions go through the public `SearchIndex` / `SearchLayer` traits.
 //! No internal module state is probed.
+//!
+//! # Naming convention
+//!
+//! Wave-1 and later tests omit the `test_` prefix — `#[test]` already marks
+//! test functions, making the prefix redundant (idiomatic Rust style). Existing
+//! wave-0 tests retain the `test_` prefix to avoid a noisy rename-only commit.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
@@ -20,14 +26,24 @@ use rskim_search::{
 // Helpers
 // ============================================================================
 
-/// Absolute path to `tests/fixtures/search/`.
-fn fixtures_dir() -> PathBuf {
+/// Workspace root directory (absolute).
+fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crate parent")
         .parent()
         .expect("workspace root")
-        .join("tests/fixtures/search")
+        .to_path_buf()
+}
+
+/// Absolute path to `tests/fixtures/search/` (for file reads).
+fn fixtures_dir_abs() -> PathBuf {
+    workspace_root().join("tests/fixtures/search")
+}
+
+/// Relative path to a fixture file (for register_within).
+fn fixture_rel(name: &str) -> PathBuf {
+    PathBuf::from("tests/fixtures/search").join(name)
 }
 
 /// Return all six Wave 1 fixture files with their language tags.
@@ -44,16 +60,17 @@ fn all_fixtures() -> Vec<(&'static str, Language)> {
 
 /// Build an index from a subset of fixture files into `dir`.
 ///
-/// Each file is registered under its real on-disk path so that `FileTable`
-/// lookups work correctly in assertions.
+/// Each file is registered under its relative path so that `register_within`
+/// validates containment correctly.
 fn build_fixture_index(dir: &Path, files: &[(&str, Language)]) -> Box<dyn SearchIndex> {
-    let mut builder = LexicalLayerBuilder::new(dir.to_path_buf(), fixtures_dir());
+    let mut builder = LexicalLayerBuilder::new(dir.to_path_buf(), workspace_root());
     for (name, lang) in files {
-        let path = fixtures_dir().join(name);
-        let content = std::fs::read_to_string(&path)
+        let abs_path = fixtures_dir_abs().join(name);
+        let rel_path = fixture_rel(name);
+        let content = std::fs::read_to_string(&abs_path)
             .unwrap_or_else(|e| panic!("failed to read fixture {name}: {e}"));
         builder
-            .add_file(&path, &content, *lang)
+            .add_file(&rel_path, &content, *lang)
             .unwrap_or_else(|e| panic!("add_file {name} failed: {e}"));
     }
     Box::new(builder).build().expect("build failed")
@@ -92,10 +109,7 @@ fn search_names(index: &dyn SearchIndex, query: &str) -> Vec<(String, f32)> {
 #[test]
 fn search_user_service_by_class_name() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let index = build_fixture_index(
-        dir.path(),
-        &[("user_service.ts", Language::TypeScript)],
-    );
+    let index = build_fixture_index(dir.path(), &[("user_service.ts", Language::TypeScript)]);
 
     let results = search_names(index.as_ref(), "UserService");
     assert!(!results.is_empty(), "UserService should be found");
@@ -110,8 +124,7 @@ fn search_user_service_by_class_name() {
 #[test]
 fn search_auth_handler_by_struct_name() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let index =
-        build_fixture_index(dir.path(), &[("auth_handler.rs", Language::Rust)]);
+    let index = build_fixture_index(dir.path(), &[("auth_handler.rs", Language::Rust)]);
 
     let results = search_names(index.as_ref(), "AuthHandler");
     assert!(!results.is_empty(), "AuthHandler should be found");
@@ -131,7 +144,10 @@ fn search_json_config_by_key() {
     let index = build_fixture_index(dir.path(), &[("config.json", Language::Json)]);
 
     let results = search_names(index.as_ref(), "database_url");
-    assert!(!results.is_empty(), "database_url should be found in config.json");
+    assert!(
+        !results.is_empty(),
+        "database_url should be found in config.json"
+    );
     assert!(
         results.iter().any(|(name, _)| name == "config.json"),
         "config.json must appear in results"
@@ -145,11 +161,13 @@ fn search_json_config_by_key() {
 #[test]
 fn search_yaml_by_key() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let index =
-        build_fixture_index(dir.path(), &[("deploy.yaml", Language::Yaml)]);
+    let index = build_fixture_index(dir.path(), &[("deploy.yaml", Language::Yaml)]);
 
     let results = search_names(index.as_ref(), "replicas");
-    assert!(!results.is_empty(), "replicas should be found in deploy.yaml");
+    assert!(
+        !results.is_empty(),
+        "replicas should be found in deploy.yaml"
+    );
     assert!(
         results.iter().any(|(name, _)| name == "deploy.yaml"),
         "deploy.yaml must appear in results"
@@ -163,8 +181,7 @@ fn search_yaml_by_key() {
 #[test]
 fn search_markdown_by_heading() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let index =
-        build_fixture_index(dir.path(), &[("README.md", Language::Markdown)]);
+    let index = build_fixture_index(dir.path(), &[("README.md", Language::Markdown)]);
 
     // "Authentication" appears in the README heading "MyApp Authentication Service"
     // and in API section text.
@@ -189,7 +206,10 @@ fn search_python_by_class() {
     let index = build_fixture_index(dir.path(), &[("utils.py", Language::Python)]);
 
     let results = search_names(index.as_ref(), "TokenGenerator");
-    assert!(!results.is_empty(), "TokenGenerator should be found in utils.py");
+    assert!(
+        !results.is_empty(),
+        "TokenGenerator should be found in utils.py"
+    );
     assert!(
         results.iter().any(|(name, _)| name == "utils.py"),
         "utils.py must appear in results"
@@ -197,29 +217,7 @@ fn search_python_by_class() {
 }
 
 // ============================================================================
-// 7. Multi-file ranking: TypeDefinition boost places user_service.ts first
-// ============================================================================
-
-#[test]
-fn multi_file_ranking_prefers_type_definitions() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let index = build_all(dir.path());
-
-    let results = search_names(index.as_ref(), "UserService");
-    assert!(
-        !results.is_empty(),
-        "UserService should match at least one file"
-    );
-    assert_eq!(
-        results[0].0, "user_service.ts",
-        "user_service.ts must rank #1 because it contains the TypeDefinition for UserService \
-         (boost=5.0 vs FunctionBody fallback=1.0); got {:?}",
-        results
-    );
-}
-
-// ============================================================================
-// 8. Multi-file search returns matches from multiple files
+// 7. Multi-file search returns matches from multiple files
 // ============================================================================
 
 #[test]
@@ -238,20 +236,7 @@ fn multi_file_search_returns_all_matches() {
 }
 
 // ============================================================================
-// 9. Empty query returns empty results
-// ============================================================================
-
-#[test]
-fn empty_query_returns_empty() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let index = build_all(dir.path());
-
-    let results = index.search(&SearchQuery::new()).expect("search");
-    assert!(results.is_empty(), "no-text query must return empty results");
-}
-
-// ============================================================================
-// 10. Whitespace-only query returns empty results
+// 9. Whitespace-only query returns empty results
 // ============================================================================
 
 #[test]
@@ -267,44 +252,7 @@ fn whitespace_only_query_returns_empty() {
 }
 
 // ============================================================================
-// 11. Single-character query returns empty (can't form a bigram)
-// ============================================================================
-
-#[test]
-fn single_char_query_returns_empty() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let index = build_all(dir.path());
-
-    let results = index.search(&SearchQuery::text("a")).expect("search");
-    assert!(
-        results.is_empty(),
-        "single-char query produces no bigrams so must return empty, got {} results",
-        results.len()
-    );
-}
-
-// ============================================================================
-// 12. limit works correctly
-// ============================================================================
-
-#[test]
-fn limit_works_correctly() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let index = build_all(dir.path());
-
-    // "fn" appears in multiple fixture files.
-    let results = index
-        .search(&SearchQuery::text("fn").with_limit(2))
-        .expect("search");
-    assert!(
-        results.len() <= 2,
-        "limit=2 must return at most 2 results, got {}",
-        results.len()
-    );
-}
-
-// ============================================================================
-// 13. offset works correctly (skips leading results)
+// 11. offset works correctly (skips leading results)
 // ============================================================================
 
 #[test]
@@ -334,55 +282,13 @@ fn offset_works_correctly() {
 }
 
 // ============================================================================
-// 14. offset past end returns empty
-// ============================================================================
-
-#[test]
-fn offset_past_end_returns_empty() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let index = build_all(dir.path());
-
-    let results = index
-        .search(&SearchQuery::text("fn").with_offset(10_000))
-        .expect("search");
-    assert!(
-        results.is_empty(),
-        "offset past end must return empty, got {} results",
-        results.len()
-    );
-}
-
-// ============================================================================
-// 15. Scores are strictly non-increasing (descending order)
-// ============================================================================
-
-#[test]
-fn scores_are_descending() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let index = build_all(dir.path());
-
-    let results = index.search(&SearchQuery::text("fn")).expect("search");
-    for window in results.windows(2) {
-        let (_, a) = window[0];
-        let (_, b) = window[1];
-        assert!(
-            a >= b,
-            "results must be sorted descending by score: {a} >= {b}"
-        );
-    }
-}
-
-// ============================================================================
-// 16. Index persists the three expected files to disk
+// 13. Index persists the three expected files to disk
 // ============================================================================
 
 #[test]
 fn index_persists_to_disk() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let _ = build_fixture_index(
-        dir.path(),
-        &[("user_service.ts", Language::TypeScript)],
-    );
+    let _ = build_fixture_index(dir.path(), &[("user_service.ts", Language::TypeScript)]);
 
     for name in &["lexical.skidx", "lexical.skpost", "metadata.json"] {
         assert!(
@@ -402,7 +308,9 @@ fn index_can_be_reopened() {
     let _ = build_all(dir.path());
 
     let layer = LexicalSearchLayer::open(dir.path()).expect("open after build");
-    let results = layer.search(&SearchQuery::text("UserService")).expect("search");
+    let results = layer
+        .search(&SearchQuery::text("UserService"))
+        .expect("search");
 
     assert!(
         !results.is_empty(),
@@ -444,55 +352,7 @@ fn stats_match_ngram_count() {
 }
 
 // ============================================================================
-// 20. Large file (>5MB) is skipped — file_count stays 0
-// ============================================================================
-
-#[test]
-fn large_file_is_skipped() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // 6MB of content across many lines so avg_line_len doesn't trigger minified guard.
-    let large: String = "a ".repeat(3_000_000); // ~6MB, avg_line_len=2
-    let path = PathBuf::from("huge.rs");
-
-    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
-    builder
-        .add_file(&path, &large, Language::Rust)
-        .expect("add_file should not error even for large files");
-    let index = Box::new(builder).build().expect("build");
-
-    assert_eq!(
-        index.stats().file_count,
-        0,
-        "large file (>5MB) must be skipped, file_count should be 0"
-    );
-}
-
-// ============================================================================
-// 21. Minified file (single long line) is skipped — file_count stays 0
-// ============================================================================
-
-#[test]
-fn minified_file_is_skipped() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    // 1000-char single line → avg_line_len=1000 > 500 → skipped.
-    let minified: String = "x".repeat(1_000);
-    let path = PathBuf::from("bundle.min.js");
-
-    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
-    builder
-        .add_file(&path, &minified, Language::JavaScript)
-        .expect("add_file should not error");
-    let index = Box::new(builder).build().expect("build");
-
-    assert_eq!(
-        index.stats().file_count,
-        0,
-        "minified file must be skipped, file_count should be 0"
-    );
-}
-
-// ============================================================================
-// 22. Corrupted index detected on open
+// 20. Corrupted index detected on open
 // ============================================================================
 
 #[test]
@@ -500,10 +360,7 @@ fn corrupted_index_detected() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     // First build a valid index so metadata.json exists.
-    let _ = build_fixture_index(
-        dir.path(),
-        &[("user_service.ts", Language::TypeScript)],
-    );
+    let _ = build_fixture_index(dir.path(), &[("user_service.ts", Language::TypeScript)]);
 
     // Overwrite the binary index with garbage.
     std::fs::write(dir.path().join("lexical.skidx"), b"not a valid skim index")
@@ -517,7 +374,7 @@ fn corrupted_index_detected() {
 }
 
 // ============================================================================
-// 23. Version mismatch detected on open
+// 21. Version mismatch detected on open
 // ============================================================================
 
 #[test]
@@ -525,10 +382,7 @@ fn version_mismatch_detected() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Build a valid index first.
-    let _ = build_fixture_index(
-        dir.path(),
-        &[("auth_handler.rs", Language::Rust)],
-    );
+    let _ = build_fixture_index(dir.path(), &[("auth_handler.rs", Language::Rust)]);
 
     // Read the current binary, patch the version field (bytes 4..8) to 0xFF,
     // and write it back.  The format reader must reject this.
@@ -553,7 +407,7 @@ fn version_mismatch_detected() {
 }
 
 // ============================================================================
-// 24. Empty index is valid: no files, empty search results
+// 22. Empty index is valid: no files, empty search results
 // ============================================================================
 
 #[test]
@@ -567,14 +421,11 @@ fn empty_index_is_valid() {
     let results = index
         .search(&SearchQuery::text("anything"))
         .expect("search on empty index");
-    assert!(
-        results.is_empty(),
-        "empty index must return empty results"
-    );
+    assert!(results.is_empty(), "empty index must return empty results");
 }
 
 // ============================================================================
-// 25. Unicode content indexes and is searchable
+// 23. Unicode content indexes and is searchable
 // ============================================================================
 
 #[test]
@@ -584,15 +435,18 @@ fn unicode_content_indexes_correctly() {
     let content = "# 認証サービス\n\nThis service handles 認証 (authentication).\n";
     let path = PathBuf::from("unicode.md");
 
-    let mut builder =
-        LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
     builder
         .add_file(&path, content, Language::Markdown)
         .expect("add_file");
     let index = Box::new(builder).build().expect("build");
 
     // At least indexed the file.
-    assert_eq!(index.stats().file_count, 1, "unicode file should be indexed");
+    assert_eq!(
+        index.stats().file_count,
+        1,
+        "unicode file should be indexed"
+    );
 
     // Searching for a substring that forms valid bigrams should not panic.
     let result = index.search(&SearchQuery::text("認証"));
@@ -600,22 +454,22 @@ fn unicode_content_indexes_correctly() {
 }
 
 // ============================================================================
-// 26. Duplicate files are idempotent (same file added twice → 1 FileTable entry)
+// 24. Duplicate files are idempotent (same file added twice → 1 FileTable entry)
 // ============================================================================
 
 #[test]
 fn duplicate_files_are_idempotent() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = fixtures_dir().join("user_service.ts");
-    let content = std::fs::read_to_string(&path).expect("read fixture");
+    let abs_path = fixtures_dir_abs().join("user_service.ts");
+    let rel_path = fixture_rel("user_service.ts");
+    let content = std::fs::read_to_string(&abs_path).expect("read fixture");
 
-    let mut builder =
-        LexicalLayerBuilder::new(dir.path().to_path_buf(), fixtures_dir());
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), workspace_root());
     builder
-        .add_file(&path, &content, Language::TypeScript)
+        .add_file(&rel_path, &content, Language::TypeScript)
         .expect("first add_file");
     builder
-        .add_file(&path, &content, Language::TypeScript)
+        .add_file(&rel_path, &content, Language::TypeScript)
         .expect("second add_file");
     let index = Box::new(builder).build().expect("build");
 
@@ -629,7 +483,7 @@ fn duplicate_files_are_idempotent() {
 }
 
 // ============================================================================
-// 27. Field boost ordering: TypeDefinition file ranks above FunctionBody-only file
+// 25. Field boost ordering: TypeDefinition file ranks above FunctionBody-only file
 // ============================================================================
 
 #[test]

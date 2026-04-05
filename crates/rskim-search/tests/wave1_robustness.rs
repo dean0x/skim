@@ -17,13 +17,21 @@ use rskim_search::{
 // Helpers
 // ============================================================================
 
-fn fixtures_dir() -> PathBuf {
+fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crate parent")
         .parent()
         .expect("workspace root")
-        .join("tests/fixtures/search")
+        .to_path_buf()
+}
+
+fn fixtures_dir_abs() -> PathBuf {
+    workspace_root().join("tests/fixtures/search")
+}
+
+fn fixture_rel(name: &str) -> PathBuf {
+    PathBuf::from("tests/fixtures/search").join(name)
 }
 
 /// Build an index containing all Wave 1 fixtures.
@@ -37,13 +45,14 @@ fn build_all_fixtures(dir: &Path) -> Box<dyn SearchIndex> {
         ("utils.py", Language::Python),
     ];
 
-    let mut builder = LexicalLayerBuilder::new(dir.to_path_buf(), fixtures_dir());
+    let mut builder = LexicalLayerBuilder::new(dir.to_path_buf(), workspace_root());
     for (name, lang) in fixtures {
-        let path = fixtures_dir().join(name);
-        let content = std::fs::read_to_string(&path)
+        let abs_path = fixtures_dir_abs().join(name);
+        let rel_path = fixture_rel(name);
+        let content = std::fs::read_to_string(&abs_path)
             .unwrap_or_else(|e| panic!("read fixture {name}: {e}"));
         builder
-            .add_file(&path, &content, *lang)
+            .add_file(&rel_path, &content, *lang)
             .unwrap_or_else(|e| panic!("add_file {name}: {e}"));
     }
     Box::new(builder).build().expect("build")
@@ -60,8 +69,11 @@ fn very_long_query_does_not_panic() {
 
     let long_query = "UserService".repeat(1_000); // ~11 000 chars
     let result = index.search(&SearchQuery::text(&long_query));
-    // Must not panic.  A Result (Ok or Err) is fine.
-    let _ = result;
+    assert!(
+        result.is_ok(),
+        "very long query must not error: {:?}",
+        result
+    );
 }
 
 // ============================================================================
@@ -114,7 +126,10 @@ fn newlines_in_query_handled() {
     let index = build_all_fixtures(dir.path());
 
     let result = index.search(&SearchQuery::text("foo\nbar\tbaz\r\n"));
-    assert!(result.is_ok(), "query with whitespace escapes must not error");
+    assert!(
+        result.is_ok(),
+        "query with whitespace escapes must not error"
+    );
 }
 
 // ============================================================================
@@ -127,11 +142,13 @@ fn null_bytes_in_content_handled() {
     let content = "fn foo() {\0 let x = 1;\0 }";
     let path = PathBuf::from("null_bytes.rs");
 
-    let mut builder =
-        LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
     let result = builder.add_file(&path, content, Language::Rust);
-    // add_file should not panic; it may return Ok or Err.
-    let _ = result;
+    assert!(
+        result.is_ok(),
+        "add_file must not error on null bytes: {:?}",
+        result
+    );
 }
 
 // ============================================================================
@@ -143,8 +160,7 @@ fn empty_file_content() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = PathBuf::from("empty.ts");
 
-    let mut builder =
-        LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
     let result = builder.add_file(&path, "", Language::TypeScript);
     assert!(result.is_ok(), "empty content must not error");
 
@@ -166,8 +182,7 @@ fn all_whitespace_content() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = PathBuf::from("blank.rs");
 
-    let mut builder =
-        LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
+    let mut builder = LexicalLayerBuilder::new(dir.path().to_path_buf(), PathBuf::from("/repo"));
     let result = builder.add_file(&path, "   \n\n  \t  \n", Language::Rust);
     assert!(result.is_ok(), "all-whitespace content must not error");
     let _ = Box::new(builder).build().expect("build");
@@ -224,25 +239,24 @@ fn index_size_is_reasonable() {
     let source_bytes: u64 = fixtures
         .iter()
         .map(|(name, _)| {
-            std::fs::metadata(fixtures_dir().join(name))
+            std::fs::metadata(fixtures_dir_abs().join(name))
                 .map(|m| m.len())
                 .unwrap_or(0)
         })
         .sum();
 
     let stats = index.stats();
-    // Allow up to 50× overhead: n-gram indexes for small files can be large
-    // relative to source, but should not grow unboundedly.
+    // Allow up to 5× overhead or 512 KB floor, whichever is larger.
+    // n-gram indexes add posting lists but should not grow unboundedly.
+    let expected_max = (source_bytes * 5).max(512 * 1024);
     assert!(
-        stats.index_size_bytes < source_bytes * 50,
-        "index_size_bytes ({}) must be < 50× source bytes ({})",
+        stats.index_size_bytes < expected_max,
+        "index_size_bytes ({}) must be < 5× source bytes ({}) or 512KB floor ({})",
         stats.index_size_bytes,
-        source_bytes
+        source_bytes,
+        expected_max,
     );
-    assert!(
-        stats.index_size_bytes > 0,
-        "index must have non-zero size"
-    );
+    assert!(stats.index_size_bytes > 0, "index must have non-zero size");
 }
 
 // ============================================================================
@@ -251,9 +265,13 @@ fn index_size_is_reasonable() {
 //     Target from CLAUDE.md: <50ms per file parse+transform; search should
 //     be much faster than parsing.  500ms for 100 queries is 5ms average —
 //     very conservative for a mmap'd index.
+//
+//     Marked #[ignore] because wall-clock timing tests are flaky on slow CI
+//     runners.  Run explicitly with: cargo test -- --ignored
 // ============================================================================
 
 #[test]
+#[ignore]
 fn search_performance_under_500ms() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _ = build_all_fixtures(dir.path());

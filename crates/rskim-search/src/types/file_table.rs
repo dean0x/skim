@@ -56,7 +56,10 @@ pub struct FileTable {
 
 // Custom Serialize: only emit the paths vec (ids are derived)
 impl Serialize for FileTable {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         self.paths.serialize(serializer)
     }
 }

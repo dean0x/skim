@@ -27,7 +27,7 @@ pub enum SearchError {
     SerializationError(String),
 
     /// The index file is corrupted or has an incompatible format version.
-    #[error("corrupted index at {path}: {reason}")]
+    #[error("Corrupted index at {path}: {reason}")]
     CorruptedIndex {
         /// Path to the corrupted index file.
         path: String,

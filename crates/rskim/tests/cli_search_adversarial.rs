@@ -62,11 +62,7 @@ fn special_chars_dont_crash() {
     // Note: null bytes (\u{0000}) cannot be passed as CLI arguments on any OS —
     // the kernel rejects them before the process receives them.  We therefore
     // only test printable special characters here.
-    for query in &[
-        "!@#$%^&*()",
-        "{}[]<>?",
-        "'; DROP TABLE users;--",
-    ] {
+    for query in &["!@#$%^&*()", "{}[]<>?", "'; DROP TABLE users;--"] {
         let output = skim_cmd()
             .args(["search", query])
             .env("SKIM_CACHE_DIR", &cache_dir)
@@ -242,10 +238,7 @@ fn limit_zero_returns_empty() {
 
 #[test]
 fn help_contains_all_documented_flags() {
-    let output = skim_cmd()
-        .args(["search", "--help"])
-        .output()
-        .unwrap();
+    let output = skim_cmd().args(["search", "--help"]).output().unwrap();
 
     assert!(output.status.success(), "search --help must exit 0");
 

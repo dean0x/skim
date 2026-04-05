@@ -105,9 +105,9 @@ fn typescript_function_declaration_is_function_signature() {
     let classifier = for_language(Language::TypeScript).expect("TypeScript classifier must exist");
 
     let classified = walk_and_classify(&tree, source, classifier.as_ref());
-    let has_sig = classified
-        .iter()
-        .any(|(kind, field)| kind == "function_declaration" && *field == SearchField::FunctionSignature);
+    let has_sig = classified.iter().any(|(kind, field)| {
+        kind == "function_declaration" && *field == SearchField::FunctionSignature
+    });
     assert!(
         has_sig,
         "function_declaration should map to FunctionSignature; got: {classified:?}"
@@ -122,10 +122,13 @@ fn typescript_interface_declaration_is_type_definition() {
     let classifier = for_language(Language::TypeScript).expect("classifier exists");
 
     let classified = walk_and_classify(&tree, source, classifier.as_ref());
-    let has_type_def = classified
-        .iter()
-        .any(|(kind, field)| kind == "interface_declaration" && *field == SearchField::TypeDefinition);
-    assert!(has_type_def, "interface_declaration → TypeDefinition; got: {classified:?}");
+    let has_type_def = classified.iter().any(|(kind, field)| {
+        kind == "interface_declaration" && *field == SearchField::TypeDefinition
+    });
+    assert!(
+        has_type_def,
+        "interface_declaration → TypeDefinition; got: {classified:?}"
+    );
 }
 
 #[test]
@@ -157,7 +160,10 @@ fn typescript_class_declaration_is_type_definition() {
     let has_class = classified
         .iter()
         .any(|(kind, field)| kind == "class_declaration" && *field == SearchField::TypeDefinition);
-    assert!(has_class, "class_declaration → TypeDefinition; got: {classified:?}");
+    assert!(
+        has_class,
+        "class_declaration → TypeDefinition; got: {classified:?}"
+    );
 }
 
 #[test]
@@ -171,7 +177,10 @@ fn typescript_import_is_import_export() {
     let has_import = classified
         .iter()
         .any(|(kind, field)| kind == "import_statement" && *field == SearchField::ImportExport);
-    assert!(has_import, "import_statement → ImportExport; got: {classified:?}");
+    assert!(
+        has_import,
+        "import_statement → ImportExport; got: {classified:?}"
+    );
 }
 
 // ============================================================================
@@ -189,7 +198,10 @@ fn rust_struct_item_is_type_definition() {
     let has_struct = classified
         .iter()
         .any(|(kind, field)| kind == "struct_item" && *field == SearchField::TypeDefinition);
-    assert!(has_struct, "struct_item → TypeDefinition; got: {classified:?}");
+    assert!(
+        has_struct,
+        "struct_item → TypeDefinition; got: {classified:?}"
+    );
 }
 
 #[test]
@@ -203,7 +215,10 @@ fn rust_function_item_is_function_signature() {
     let has_fn = classified
         .iter()
         .any(|(kind, field)| kind == "function_item" && *field == SearchField::FunctionSignature);
-    assert!(has_fn, "function_item → FunctionSignature; got: {classified:?}");
+    assert!(
+        has_fn,
+        "function_item → FunctionSignature; got: {classified:?}"
+    );
 }
 
 // ============================================================================
@@ -233,7 +248,16 @@ fn typescript_fixture_from_file() {
         .iter()
         .any(|(_, f)| *f == SearchField::ImportExport);
 
-    assert!(has_class, "fixture should contain at least one TypeDefinition");
-    assert!(has_fn, "fixture should contain at least one FunctionSignature");
-    assert!(has_import, "fixture should contain at least one ImportExport");
+    assert!(
+        has_class,
+        "fixture should contain at least one TypeDefinition"
+    );
+    assert!(
+        has_fn,
+        "fixture should contain at least one FunctionSignature"
+    );
+    assert!(
+        has_import,
+        "fixture should contain at least one ImportExport"
+    );
 }

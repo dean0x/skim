@@ -199,8 +199,13 @@ fn test_search_field_all_boosts_positive() {
 
 #[test]
 fn test_search_field_boost_ordering() {
-    assert!(SearchField::TypeDefinition.default_boost() > SearchField::FunctionSignature.default_boost());
-    assert!(SearchField::FunctionSignature.default_boost() > SearchField::SymbolName.default_boost());
+    assert!(
+        SearchField::TypeDefinition.default_boost()
+            > SearchField::FunctionSignature.default_boost()
+    );
+    assert!(
+        SearchField::FunctionSignature.default_boost() > SearchField::SymbolName.default_boost()
+    );
     assert!(SearchField::SymbolName.default_boost() > SearchField::ImportExport.default_boost());
     assert!(SearchField::ImportExport.default_boost() > SearchField::FunctionBody.default_boost());
     assert!(SearchField::FunctionBody.default_boost() > SearchField::Comment.default_boost());

@@ -14,65 +14,7 @@ use std::ops::Range;
 
 use crate::SearchField;
 
-/// Classify regions in Markdown content into `SearchField` spans.
-///
-/// Returns `(byte_range, SearchField)` pairs for each semantically meaningful line.
-pub fn classify_markdown_fields(
-    source: &str,
-) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
-    let mut results = Vec::new();
-    let mut byte_offset: usize = 0;
-    let mut in_code_block = false;
-
-    for line in source.lines() {
-        let line_len = line.len();
-        let trimmed = line.trim();
-
-        // Toggle code fence state.
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_code_block = !in_code_block;
-            // The fence line itself is part of the code block region.
-            results.push((byte_offset..byte_offset + line_len, SearchField::FunctionBody));
-            byte_offset += line_len + 1;
-            continue;
-        }
-
-        if in_code_block {
-            // Inside a code block — classify as FunctionBody.
-            if !trimmed.is_empty() {
-                results.push((byte_offset..byte_offset + line_len, SearchField::FunctionBody));
-            }
-            byte_offset += line_len + 1;
-            continue;
-        }
-
-        // Skip blank lines outside code blocks.
-        if trimmed.is_empty() {
-            byte_offset += line_len + 1;
-            continue;
-        }
-
-        // Headings: H1-H3 (`# `, `## `, `### `).
-        if is_heading(trimmed) {
-            results.push((byte_offset..byte_offset + line_len, SearchField::TypeDefinition));
-            byte_offset += line_len + 1;
-            continue;
-        }
-
-        // Links: any line containing at least one `[text](url)` pattern.
-        if contains_markdown_link(trimmed) {
-            results.push((byte_offset..byte_offset + line_len, SearchField::ImportExport));
-            byte_offset += line_len + 1;
-            continue;
-        }
-
-        // Default: prose → Comment.
-        results.push((byte_offset..byte_offset + line_len, SearchField::Comment));
-        byte_offset += line_len + 1;
-    }
-
-    Ok(results)
-}
+use super::newline_len;
 
 // ============================================================================
 // Private helpers
@@ -114,6 +56,81 @@ fn contains_markdown_link(line: &str) -> bool {
         i += 1;
     }
     false
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Classify regions in Markdown content into `SearchField` spans.
+///
+/// Returns `(byte_range, SearchField)` pairs for each semantically meaningful line.
+pub fn classify_markdown_fields(source: &str) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
+    let mut results = Vec::new();
+    let mut byte_offset: usize = 0;
+    let mut in_code_block = false;
+
+    for line in source.lines() {
+        let line_len = line.len();
+        let trimmed = line.trim();
+        let sep = newline_len(source, byte_offset + line_len);
+
+        // Toggle code fence state.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_block = !in_code_block;
+            // The fence line itself is part of the code block region.
+            results.push((
+                byte_offset..byte_offset + line_len,
+                SearchField::FunctionBody,
+            ));
+            byte_offset += line_len + sep;
+            continue;
+        }
+
+        if in_code_block {
+            // Inside a code block — classify as FunctionBody.
+            if !trimmed.is_empty() {
+                results.push((
+                    byte_offset..byte_offset + line_len,
+                    SearchField::FunctionBody,
+                ));
+            }
+            byte_offset += line_len + sep;
+            continue;
+        }
+
+        // Skip blank lines outside code blocks.
+        if trimmed.is_empty() {
+            byte_offset += line_len + sep;
+            continue;
+        }
+
+        // Headings: H1-H3 (`# `, `## `, `### `).
+        if is_heading(trimmed) {
+            results.push((
+                byte_offset..byte_offset + line_len,
+                SearchField::TypeDefinition,
+            ));
+            byte_offset += line_len + sep;
+            continue;
+        }
+
+        // Links: any line containing at least one `[text](url)` pattern.
+        if contains_markdown_link(trimmed) {
+            results.push((
+                byte_offset..byte_offset + line_len,
+                SearchField::ImportExport,
+            ));
+            byte_offset += line_len + sep;
+            continue;
+        }
+
+        // Default: prose → Comment.
+        results.push((byte_offset..byte_offset + line_len, SearchField::Comment));
+        byte_offset += line_len + sep;
+    }
+
+    Ok(results)
 }
 
 // ============================================================================
@@ -178,7 +195,11 @@ mod tests {
         let source = "```rust\nfn main() {}\n```\n";
         let result = classify_markdown_fields(source).expect("should succeed");
         for (_, field) in &result {
-            assert_eq!(*field, SearchField::FunctionBody, "all code block lines should be FunctionBody");
+            assert_eq!(
+                *field,
+                SearchField::FunctionBody,
+                "all code block lines should be FunctionBody"
+            );
         }
     }
 
@@ -207,11 +228,33 @@ mod tests {
     }
 
     #[test]
+    fn crlf_byte_ranges_within_bounds() {
+        // CRLF-terminated Markdown.  Without newline_len, byte_offset drifts
+        // +1 per line and the second span's range would exceed source.len().
+        let source = "# Title\r\nProse line.\r\n";
+        let result = classify_markdown_fields(source).expect("should succeed");
+        assert!(!result.is_empty(), "should classify CRLF markdown");
+        for (range, _) in &result {
+            assert!(
+                range.end <= source.len(),
+                "CRLF range {:?} out of bounds for source len {}",
+                range,
+                source.len()
+            );
+        }
+    }
+
+    #[test]
     fn byte_ranges_are_within_source_bounds() {
         let source = "# Title\nProse line.\n";
         let result = classify_markdown_fields(source).expect("should succeed");
         for (range, _) in &result {
-            assert!(range.end <= source.len(), "range {:?} out of bounds for source len {}", range, source.len());
+            assert!(
+                range.end <= source.len(),
+                "range {:?} out of bounds for source len {}",
+                range,
+                source.len()
+            );
         }
     }
 }

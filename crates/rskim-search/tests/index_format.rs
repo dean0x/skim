@@ -125,7 +125,10 @@ fn write_and_lookup_multiple_ngrams() {
         && absent.as_u64() != ng_let.as_u64()
         && absent.as_u64() != ng_pub.as_u64()
     {
-        assert!(reader.lookup(absent).is_none(), "absent ngram should be None");
+        assert!(
+            reader.lookup(absent).is_none(),
+            "absent ngram should be None"
+        );
     }
 }
 
@@ -340,9 +343,7 @@ fn delta_reader_scan_filters_by_ngram() {
         .expect("append b");
     drop(writer);
 
-    let reader = DeltaReader::open(dir.path())
-        .expect("open")
-        .expect("Some");
+    let reader = DeltaReader::open(dir.path()).expect("open").expect("Some");
     let results_a = reader.scan(ng_a);
     let results_b = reader.scan(ng_b);
 

@@ -18,6 +18,7 @@ pub mod lexical;
 mod traits;
 mod types;
 
+pub use lexical::fxhash_bytes;
 pub use traits::{FieldClassifier, LayerBuilder, SearchIndex, SearchLayer};
 pub use types::{
     FileId, FileTable, IndexStats, LineRange, MatchSpan, Result, SearchError, SearchField,

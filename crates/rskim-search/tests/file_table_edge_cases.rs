@@ -48,20 +48,14 @@ fn test_register_unicode_path() {
     let mut table = FileTable::new();
     let id = table.register(Path::new("src/日本語/файл.rs"));
     assert_eq!(table.len(), 1);
-    assert_eq!(
-        table.lookup(id),
-        Some(Path::new("src/日本語/файл.rs"))
-    );
+    assert_eq!(table.lookup(id), Some(Path::new("src/日本語/файл.rs")));
 }
 
 #[test]
 fn test_register_spaces_in_path() {
     let mut table = FileTable::new();
     let id = table.register(Path::new("my project/src/main.rs"));
-    assert_eq!(
-        table.lookup(id),
-        Some(Path::new("my project/src/main.rs"))
-    );
+    assert_eq!(table.lookup(id), Some(Path::new("my project/src/main.rs")));
 }
 
 // ============================================================================
@@ -157,10 +151,7 @@ fn test_register_many_files() {
     // All lookupable
     for i in 0..1000 {
         let path = format!("src/file_{i}.rs");
-        assert_eq!(
-            table.lookup(FileId::new(i as u64)),
-            Some(Path::new(&path)),
-        );
+        assert_eq!(table.lookup(FileId::new(i as u64)), Some(Path::new(&path)),);
     }
 }
 
@@ -270,15 +261,17 @@ fn test_register_within_accepts_dot_dot_that_resolves_inside() {
     // src/../lib/main.rs normalizes to lib/main.rs — still inside root
     let result = table.register_within(Path::new("src/../lib/main.rs"), Path::new("/project"));
     assert!(result.is_ok());
-    assert_eq!(table.lookup(result.unwrap()), Some(Path::new("lib/main.rs")));
+    assert_eq!(
+        table.lookup(result.unwrap()),
+        Some(Path::new("lib/main.rs"))
+    );
 }
 
 #[test]
 fn test_register_within_rejects_dot_dot_that_escapes_via_subdirectory() {
     let mut table = FileTable::new();
     // "sub/../../etc/passwd" normalizes to "../etc/passwd" — escapes root.
-    let result =
-        table.register_within(Path::new("sub/../../etc/passwd"), Path::new("/project"));
+    let result = table.register_within(Path::new("sub/../../etc/passwd"), Path::new("/project"));
     assert!(result.is_err());
     assert_eq!(table.len(), 0);
 }
@@ -296,8 +289,12 @@ fn test_register_within_accepts_root_itself() {
 #[test]
 fn test_register_within_idempotent() {
     let mut table = FileTable::new();
-    let id1 = table.register_within(Path::new("src/main.rs"), Path::new("/project")).unwrap();
-    let id2 = table.register_within(Path::new("./src/main.rs"), Path::new("/project")).unwrap();
+    let id1 = table
+        .register_within(Path::new("src/main.rs"), Path::new("/project"))
+        .unwrap();
+    let id2 = table
+        .register_within(Path::new("./src/main.rs"), Path::new("/project"))
+        .unwrap();
     assert_eq!(id1, id2);
     assert_eq!(table.len(), 1);
 }
