@@ -236,11 +236,23 @@ fn check_has_rewrite(tokens: &[&str]) -> bool {
             Some("test" | "nextest" | "clippy" | "build")
         ),
         "pytest" | "python" | "python3" => true,
-        "npx" => matches!(tokens.get(1).copied(), Some("vitest" | "jest" | "tsc")),
+        "npx" => matches!(
+            tokens.get(1).copied(),
+            Some("vitest" | "jest" | "tsc" | "prettier")
+        ),
         "vitest" | "jest" => true,
         "go" => tokens.get(1) == Some(&"test"),
         "git" => matches!(tokens.get(1).copied(), Some("status" | "diff" | "log")),
         "tsc" => true,
+        "prettier" => true,
+        "rustfmt" => true,
+        "gh" => matches!(
+            tokens.get(1).copied(),
+            Some("pr" | "issue" | "run" | "release")
+        ),
+        "aws" => true,
+        "curl" => true,
+        "wget" => true,
         "cat" | "head" | "tail" => {
             // Only rewritable if operating on code files
             tokens
@@ -269,9 +281,19 @@ fn get_rewrite_target(tokens: &[&str]) -> Option<String> {
             Some("skim test vitest".to_string())
         }
         "npx" if tokens.get(1) == Some(&"tsc") => Some("skim build tsc".to_string()),
+        "npx" if tokens.get(1) == Some(&"prettier") => Some("skim lint prettier".to_string()),
         "go" if tokens.get(1) == Some(&"test") => Some("skim test go".to_string()),
         "git" => Some(format!("skim git {}", tokens.get(1).unwrap_or(&""))),
         "tsc" => Some("skim build tsc".to_string()),
+        "prettier" => Some("skim lint prettier".to_string()),
+        "rustfmt" => Some("skim lint rustfmt".to_string()),
+        "gh" => Some(format!(
+            "skim infra gh {}",
+            tokens.get(1).unwrap_or(&"")
+        )),
+        "aws" => Some("skim infra aws".to_string()),
+        "curl" => Some("skim infra curl".to_string()),
+        "wget" => Some("skim infra wget".to_string()),
         "cat" | "head" | "tail" => Some("skim <file> --mode=pseudo".to_string()),
         _ => None,
     }

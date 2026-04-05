@@ -36,6 +36,7 @@ enum RewriteCategory {
     Read,
     Lint,
     Pkg,
+    Infra,
 }
 
 struct RewriteRule {
@@ -392,6 +393,84 @@ const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "pkg", "pip", "list"],
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Pkg,
+    },
+    // lint — prettier (longest prefix first: npx prettier, prettier)
+    RewriteRule {
+        prefix: &["npx", "prettier", "--check"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["prettier", "--check"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    // lint — rustfmt (longest prefix first)
+    RewriteRule {
+        prefix: &["cargo", "fmt", "--", "--check"],
+        rewrite_to: &["skim", "lint", "rustfmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["cargo", "fmt", "--check"],
+        rewrite_to: &["skim", "lint", "rustfmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["rustfmt", "--check"],
+        rewrite_to: &["skim", "lint", "rustfmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    // infra — gh (longest prefix first)
+    RewriteRule {
+        prefix: &["gh", "pr", "list"],
+        rewrite_to: &["skim", "infra", "gh", "pr", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "issue", "list"],
+        rewrite_to: &["skim", "infra", "gh", "issue", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "run", "list"],
+        rewrite_to: &["skim", "infra", "gh", "run", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "release", "list"],
+        rewrite_to: &["skim", "infra", "gh", "release", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    // infra — aws
+    RewriteRule {
+        prefix: &["aws"],
+        rewrite_to: &["skim", "infra", "aws"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Infra,
+    },
+    // infra — curl
+    RewriteRule {
+        prefix: &["curl"],
+        rewrite_to: &["skim", "infra", "curl"],
+        skip_if_flag_prefix: &["-o", "--output"],
+        category: RewriteCategory::Infra,
+    },
+    // infra — wget
+    RewriteRule {
+        prefix: &["wget"],
+        rewrite_to: &["skim", "infra", "wget"],
+        skip_if_flag_prefix: &["-O", "-q", "--quiet"],
+        category: RewriteCategory::Infra,
     },
 ];
 
