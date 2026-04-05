@@ -1,0 +1,5 @@
+[
+  {"number": 42, "title": "feat: add new feature", "state": "OPEN", "author": {"login": "alice"}},
+  {"number": 41, "title": "fix: resolve login bug", "state": "MERGED", "author": {"login": "bob"}},
+  {"number": 40, "title": "docs: update README", "state": "CLOSED", "author": {"login": "carol"}}
+]

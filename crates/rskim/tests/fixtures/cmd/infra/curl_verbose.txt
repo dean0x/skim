@@ -1,0 +1,16 @@
+* Trying 93.184.216.34:443...
+* Connected to example.com (93.184.216.34) port 443
+* ALPN: offering h2,http/1.1
+> GET / HTTP/2
+> Host: example.com
+> User-Agent: curl/8.1.2
+> Accept: */*
+>
+< HTTP/2 200
+< content-type: text/html; charset=UTF-8
+< content-length: 1256
+<
+<!doctype html>
+<html>
+<head><title>Example Domain</title></head>
+</html>

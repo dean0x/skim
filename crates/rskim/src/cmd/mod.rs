@@ -12,6 +12,7 @@ mod discover;
 mod git;
 mod hook_log;
 mod hooks;
+mod infra;
 mod init;
 mod integrity;
 mod learn;
@@ -39,6 +40,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "completions",
     "discover",
     "git",
+    "infra",
     "init",
     "learn",
     "lint",
@@ -348,6 +350,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "completions" => completions::run(args),
         "discover" => discover::run(args),
         "git" => git::run(args),
+        "infra" => infra::run(args),
         "init" => init::run(args),
         "learn" => learn::run(args),
         "lint" => lint::run(args),

@@ -1,0 +1,183 @@
+//! Infrastructure tool subcommand dispatcher (#116)
+//!
+//! Routes `skim infra <tool> [args...]` to the appropriate infra tool parser.
+//! Currently supported tools: `aws`, `curl`, `gh`, `wget`.
+
+pub(crate) mod aws;
+pub(crate) mod curl;
+pub(crate) mod gh;
+pub(crate) mod wget;
+
+use std::io::IsTerminal;
+use std::process::ExitCode;
+
+use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
+use crate::output::canonical::InfraResult;
+use crate::output::ParseResult;
+use crate::runner::CommandOutput;
+
+/// Known infra tools that `skim infra` can dispatch to.
+const KNOWN_TOOLS: &[&str] = &["aws", "curl", "gh", "wget"];
+
+/// Entry point for `skim infra <tool> [args...]`.
+///
+/// If no tool is specified or `--help` / `-h` is passed, prints usage
+/// and exits. Otherwise dispatches to the tool-specific handler.
+pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let (filtered_args, show_stats) = extract_show_stats(args);
+    let (filtered_args, json_output) = super::extract_json_flag(&filtered_args);
+
+    let Some((tool_name, tool_args)) = filtered_args.split_first() else {
+        print_help();
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    match tool_name.as_str() {
+        "aws" => aws::run(tool_args, show_stats, json_output),
+        "curl" => curl::run(tool_args, show_stats, json_output),
+        "gh" => gh::run(tool_args, show_stats, json_output),
+        "wget" => wget::run(tool_args, show_stats, json_output),
+        _ => {
+            let safe_tool = sanitize_for_display(tool_name);
+            eprintln!(
+                "skim infra: unknown tool '{safe_tool}'\n\
+                 Available tools: {}\n\
+                 Run 'skim infra --help' for usage information",
+                KNOWN_TOOLS.join(", ")
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn print_help() {
+    println!("skim infra <tool> [args...]");
+    println!();
+    println!("  Run infrastructure tools and parse the output for AI context windows.");
+    println!();
+    println!("Available tools:");
+    for tool in KNOWN_TOOLS {
+        println!("  {tool}");
+    }
+    println!();
+    println!("Flags:");
+    println!("  --json          Emit structured JSON output");
+    println!("  --show-stats    Show token statistics");
+    println!();
+    println!("Examples:");
+    println!("  skim infra gh pr list              List GitHub pull requests");
+    println!("  skim infra aws s3 ls               List S3 buckets");
+    println!("  skim infra curl https://api.example.com/data  Make HTTP request");
+    println!("  skim infra wget https://example.com/file.txt  Download a file");
+}
+
+// ============================================================================
+// Shared infra tool execution helper
+// ============================================================================
+
+/// Static configuration for an infra tool binary.
+pub(crate) struct InfraToolConfig<'a> {
+    /// Binary name of the tool (e.g., "gh", "aws").
+    pub program: &'a str,
+    /// Environment variable overrides for the child process.
+    pub env_overrides: &'a [(&'a str, &'a str)],
+    /// Hint printed when the tool binary is not found.
+    pub install_hint: &'a str,
+}
+
+/// Execute an infra tool, parse its output, and emit the result.
+///
+/// This is the single implementation shared by all infra parsers, handling both
+/// text and JSON output modes. It eliminates per-tool `run()` boilerplate by
+/// delegating to [`super::run_parsed_command_with_mode`].
+pub(crate) fn run_infra_tool(
+    config: InfraToolConfig<'_>,
+    args: &[String],
+    show_stats: bool,
+    json_output: bool,
+    prepare_args: impl FnOnce(&mut Vec<String>),
+    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<InfraResult>,
+) -> anyhow::Result<ExitCode> {
+    let mut cmd_args = args.to_vec();
+    prepare_args(&mut cmd_args);
+
+    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let output_format = if json_output {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    };
+
+    run_parsed_command_with_mode(
+        ParsedCommandConfig {
+            program: config.program,
+            args: &cmd_args,
+            env_overrides: config.env_overrides,
+            install_hint: config.install_hint,
+            use_stdin,
+            show_stats,
+            command_type: crate::analytics::CommandType::Infra,
+            output_format,
+        },
+        |output, _args| parse_fn(output),
+    )
+}
+
+/// Re-export the shared `combine_output` under the name callers expect.
+pub(crate) use super::combine_output as combine_stdout_stderr;
+
+// ============================================================================
+// Shared security helper
+// ============================================================================
+
+/// Sanitize user input for safe display in error messages.
+///
+/// Filters to printable ASCII characters to prevent terminal escape
+/// injection attacks. Non-printable and non-ASCII bytes are replaced
+/// with `?`, and the string is truncated to 64 characters.
+pub(crate) fn sanitize_for_display(input: &str) -> String {
+    input
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_for_display_clean_input() {
+        assert_eq!(sanitize_for_display("hello-world"), "hello-world");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_rejects_non_ascii() {
+        let input = "tool\x1b[31mred\x1b[0m";
+        let sanitized = sanitize_for_display(input);
+        assert!(!sanitized.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_sanitize_for_display_truncates_at_64() {
+        let long_input = "a".repeat(100);
+        let sanitized = sanitize_for_display(&long_input);
+        assert_eq!(sanitized.len(), 64);
+    }
+}

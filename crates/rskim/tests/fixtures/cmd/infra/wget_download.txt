@@ -1,0 +1,10 @@
+--2024-01-15 10:30:00--  https://example.com/file.tar.gz
+Resolving example.com (example.com)... 93.184.216.34
+Connecting to example.com (example.com)|93.184.216.34|:443... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 5242880 (5.0M) [application/x-gzip]
+Saving to: 'file.tar.gz'
+
+file.tar.gz         100%[===================>]   5.00M  1.23MB/s    in 4.1s
+
+2024-01-15 10:30:04 (1.23 MB/s) - 'file.tar.gz' saved [5242880/5242880]
