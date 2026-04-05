@@ -41,6 +41,7 @@ pub(crate) enum CommandType {
     Git,
     Lint,
     Pkg,
+    Infra,
 }
 
 impl CommandType {
@@ -52,6 +53,7 @@ impl CommandType {
             CommandType::Git => "git",
             CommandType::Lint => "lint",
             CommandType::Pkg => "pkg",
+            CommandType::Infra => "infra",
         }
     }
 }

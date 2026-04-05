@@ -504,6 +504,75 @@ impl fmt::Display for PkgResult {
 }
 
 // ============================================================================
+// InfraResult types
+// ============================================================================
+
+/// Result of an infrastructure tool operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InfraResult {
+    pub(crate) tool: String,
+    pub(crate) operation: String,
+    pub(crate) summary: String,
+    pub(crate) items: Vec<InfraItem>,
+    #[serde(default)]
+    rendered: String,
+}
+
+/// A single key-value item within an infrastructure result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InfraItem {
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+impl InfraResult {
+    pub(crate) fn new(
+        tool: String,
+        operation: String,
+        summary: String,
+        items: Vec<InfraItem>,
+    ) -> Self {
+        let rendered = Self::render(&tool, &operation, &summary, &items);
+        Self {
+            tool,
+            operation,
+            summary,
+            items,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization)
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            self.rendered =
+                Self::render(&self.tool, &self.operation, &self.summary, &self.items);
+        }
+    }
+
+    fn render(tool: &str, operation: &str, summary: &str, items: &[InfraItem]) -> String {
+        use std::fmt::Write;
+        let mut output = format!("INFRA: {tool} {operation} | {summary}");
+        for item in items {
+            let _ = write!(output, "\n  {}: {}", item.label, item.value);
+        }
+        output
+    }
+}
+
+impl AsRef<str> for InfraResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for InfraResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+// ============================================================================
 // DiffResult types
 // ============================================================================
 
@@ -1058,6 +1127,66 @@ mod tests {
     // ========================================================================
     // DiffResult ensure_rendered lossy fallback (#103 review batch-7)
     // ========================================================================
+
+    // ========================================================================
+    // InfraResult tests
+    // ========================================================================
+
+    #[test]
+    fn test_infra_result_display() {
+        let items = vec![
+            InfraItem {
+                label: "#1".to_string(),
+                value: "fix: update deps (open)".to_string(),
+            },
+            InfraItem {
+                label: "#2".to_string(),
+                value: "feat: add feature (merged)".to_string(),
+            },
+        ];
+        let result = InfraResult::new(
+            "gh".to_string(),
+            "pr list".to_string(),
+            "2 items".to_string(),
+            items,
+        );
+        let display = format!("{result}");
+        assert!(display.contains("INFRA: gh pr list | 2 items"));
+        assert!(display.contains("#1: fix: update deps (open)"));
+        assert!(display.contains("#2: feat: add feature (merged)"));
+    }
+
+    #[test]
+    fn test_infra_result_serde_roundtrip() {
+        let items = vec![InfraItem {
+            label: "bucket".to_string(),
+            value: "my-bucket".to_string(),
+        }];
+        let original = InfraResult::new(
+            "aws".to_string(),
+            "s3 ls".to_string(),
+            "1 bucket".to_string(),
+            items,
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: InfraResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(format!("{original}"), format!("{deserialized}"));
+    }
+
+    #[test]
+    fn test_infra_result_ensure_rendered_recomputes_when_empty() {
+        let mut result = InfraResult {
+            tool: "curl".to_string(),
+            operation: "GET".to_string(),
+            summary: "200 OK".to_string(),
+            items: vec![],
+            rendered: String::new(),
+        };
+        assert_eq!(result.as_ref(), "");
+        result.ensure_rendered();
+        assert!(result.as_ref().contains("INFRA: curl GET | 200 OK"));
+    }
 
     #[test]
     fn test_diff_result_ensure_rendered_produces_summary_fallback() {
