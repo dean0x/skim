@@ -233,12 +233,13 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         if trimmed.is_empty() {
             continue;
         }
-        total_lines += 1;
 
         // Skip stack trace lines — check original line (preserves leading whitespace).
+        // Count these separately so they don't inflate the dedup statistics.
         if RE_STACK_TRACE.is_match(line) {
             continue;
         }
+        total_lines += 1;
 
         // Strip timestamp prefix
         let without_ts = if flags.keep_timestamps {

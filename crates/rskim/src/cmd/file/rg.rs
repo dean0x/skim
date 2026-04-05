@@ -54,7 +54,7 @@ fn prepare_args(cmd_args: &mut Vec<String>) {
 
 /// Three-tier parse function for rg output.
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    if let Some(result) = try_parse_json_lines(&output.stdout) {
+    if let Some(result) = try_parse_json(&output.stdout) {
         return ParseResult::Full(result);
     }
 
@@ -73,7 +73,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
 ///
 /// rg emits one JSON object per line with a `type` field:
 /// `"begin"`, `"match"`, `"end"`, `"summary"`.
-fn try_parse_json_lines(stdout: &str) -> Option<FileResult> {
+fn try_parse_json(stdout: &str) -> Option<FileResult> {
     let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut total_matches = 0usize;
     let mut found_any = false;
@@ -175,13 +175,14 @@ fn build_file_result(
     }
     let shown_files = file_count.min(MAX_FILES_SHOWN);
 
+    let mut shown_matches = 0usize;
     let mut entries: Vec<String> = Vec::with_capacity(shown_files * (MAX_MATCHES_PER_FILE + 1));
     for (file, matches) in file_matches.iter().take(MAX_FILES_SHOWN) {
         entries.push(file.clone());
+        shown_matches += matches.len();
         entries.extend(matches.iter().cloned());
     }
 
-    let shown_count = entries.len();
     let footer = if file_count > MAX_FILES_SHOWN {
         Some(format!("... and {} more files", file_count - MAX_FILES_SHOWN))
     } else {
@@ -198,7 +199,7 @@ fn build_file_result(
     Some(FileResult::new(
         tool.to_string(),
         total_matches,
-        shown_count,
+        shown_matches,
         all_entries,
         footer,
     ))
@@ -233,7 +234,7 @@ mod tests {
     #[test]
     fn test_tier1_rg_json() {
         let input = load_fixture("rg_json.jsonl");
-        let result = try_parse_json_lines(&input);
+        let result = try_parse_json(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON Lines parse to succeed");
         let result = result.unwrap();
         assert!(result.total_count > 0, "Expected matches in JSON fixture");
@@ -330,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_tier1_non_json_returns_none() {
-        let result = try_parse_json_lines("not json at all");
+        let result = try_parse_json("not json at all");
         assert!(result.is_none(), "Non-JSON input should return None from Tier 1");
     }
 }

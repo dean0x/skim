@@ -1,11 +1,10 @@
-//! find parser with three-tier degradation (#116).
+//! find parser (#116).
 //!
 //! Parses `find` output (line-per-path) into structured `FileResult`.
 //!
-//! Three tiers:
+//! Tiers:
 //! - **Tier 1 (Full)**: Line-per-path counting with streaming truncation
-//! - **Tier 2 (Degraded)**: Same as Tier 1 (find only has one output format)
-//! - **Tier 3 (Passthrough)**: Empty or unrecognizable output
+//! - **Tier 3 (Passthrough)**: Empty output on non-zero exit
 
 use std::process::ExitCode;
 
@@ -33,7 +32,7 @@ pub(crate) fn run(
 
 /// Three-tier parse function for find output.
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    if let Some(result) = try_parse_structured(&output.stdout, output.exit_code) {
+    if let Some(result) = try_parse_lines(&output.stdout, output.exit_code) {
         return ParseResult::Full(result);
     }
 
@@ -48,7 +47,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
 ///
 /// Returns None only when there is literally nothing to show (empty output
 /// on a successful run).
-fn try_parse_structured(stdout: &str, exit_code: Option<i32>) -> Option<FileResult> {
+fn try_parse_lines(stdout: &str, exit_code: Option<i32>) -> Option<FileResult> {
     // Empty output on non-zero exit is passthrough (error condition)
     if stdout.trim().is_empty() && exit_code != Some(0) {
         return None;
@@ -116,7 +115,7 @@ mod tests {
     #[test]
     fn test_tier1_find_small() {
         let input = load_fixture("find_small.txt");
-        let result = try_parse_structured(&input, Some(0));
+        let result = try_parse_lines(&input, Some(0));
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
         assert!(result.total_count > 0);
@@ -127,7 +126,7 @@ mod tests {
     #[test]
     fn test_tier1_find_large_truncates() {
         let input = load_fixture("find_large.txt");
-        let result = try_parse_structured(&input, Some(0));
+        let result = try_parse_lines(&input, Some(0));
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
         assert!(result.total_count > MAX_DISPLAY_ENTRIES, "Large fixture should exceed cap");
@@ -139,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_tier1_empty_on_success_returns_zero_result() {
-        let result = try_parse_structured("", Some(0));
+        let result = try_parse_lines("", Some(0));
         // Empty output on exit code 0: return a zero-entry FileResult
         assert!(result.is_some(), "Empty-on-success should produce a result");
         let result = result.unwrap();
@@ -173,7 +172,7 @@ mod tests {
     #[test]
     fn test_display_format() {
         let input = "./src/main.rs\n./src/lib.rs\n./Cargo.toml\n";
-        let result = try_parse_structured(input, Some(0)).unwrap();
+        let result = try_parse_lines(input, Some(0)).unwrap();
         let rendered = format!("{result}");
         assert!(rendered.contains("FIND: find |"), "Header should start with FIND:");
         assert!(rendered.contains("./src/main.rs"), "Entries should appear in output");

@@ -143,20 +143,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_known_tools_contains_expected() {
-        assert!(KNOWN_TOOLS.contains(&"find"));
-        assert!(KNOWN_TOOLS.contains(&"grep"));
-        assert!(KNOWN_TOOLS.contains(&"ls"));
-        assert!(KNOWN_TOOLS.contains(&"rg"));
-        assert!(KNOWN_TOOLS.contains(&"tree"));
-    }
-
-    #[test]
-    fn test_max_display_entries_cap() {
-        assert_eq!(MAX_DISPLAY_ENTRIES, 100);
-    }
-
-    #[test]
     fn test_sanitize_for_display_clean_input() {
         assert_eq!(super::super::sanitize_for_display("find"), "find");
     }

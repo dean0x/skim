@@ -46,14 +46,7 @@ pub(crate) fn run(
 
 /// Two-tier parse function: Tier 2 regex → Passthrough.
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    let text = if output.stderr.is_empty() {
-        output.stdout.as_str()
-    } else {
-        // Grep writes errors to stderr; ignore them for parsing
-        output.stdout.as_str()
-    };
-
-    if let Some(result) = try_parse_regex(text) {
+    if let Some(result) = try_parse_regex(&output.stdout) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
@@ -100,13 +93,14 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
     let file_count = file_matches.len();
     let shown_files = file_count.min(MAX_FILES_SHOWN);
 
+    let mut shown_matches = 0usize;
     let mut entries: Vec<String> = Vec::with_capacity(shown_files * (MAX_MATCHES_PER_FILE + 1));
     for (file, matches) in file_matches.iter().take(MAX_FILES_SHOWN) {
         entries.push(file.clone());
+        shown_matches += matches.len();
         entries.extend(matches.iter().cloned());
     }
 
-    let shown_count = entries.len();
     let footer = if file_count > MAX_FILES_SHOWN {
         Some(format!("... and {} more files", file_count - MAX_FILES_SHOWN))
     } else {
@@ -123,7 +117,7 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
     Some(FileResult::new(
         "grep".to_string(),
         total_matches,
-        shown_count,
+        shown_matches,
         all_entries,
         footer,
     ))

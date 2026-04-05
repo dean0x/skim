@@ -136,22 +136,21 @@ fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
         return None;
     }
 
-    let total_count = line_count;
     let shown_count = entries.len();
-    let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!("... and {} more", total_count - MAX_DISPLAY_ENTRIES))
+    let footer = if line_count > MAX_DISPLAY_ENTRIES {
+        Some(format!("... and {} more", line_count - MAX_DISPLAY_ENTRIES))
     } else {
         None
     };
 
-    let summary_entry = format!("LS: {total_count} entries ({dirs} dirs, {files} files)");
+    let summary_entry = format!("LS: {line_count} entries ({dirs} dirs, {files} files)");
     // Prepend summary as first entry
     let mut all_entries = vec![summary_entry];
     all_entries.extend(entries);
 
     Some(FileResult::new(
         "ls".to_string(),
-        total_count,
+        line_count,
         shown_count,
         all_entries,
         footer,
