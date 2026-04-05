@@ -10,6 +10,7 @@
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde_json::Value;
 
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
@@ -23,11 +24,16 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     install_hint: "Install curl: https://curl.se/",
 };
 
-static RE_HTTP_STATUS: LazyLock<Regex> =
+/// Maximum number of source fields in a JSON response before a truncation notice is added.
+const MAX_ITEMS: usize = 100;
+
+static RE_CURL_HTTP_STATUS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^< HTTP/[\d.]+ (\d{3})\s*(.*)").unwrap());
 
-static RE_VERBOSE_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[*><{}\s]").unwrap());
+/// Matches lines that are curl verbose metadata (not response body).
+/// Uses literal space instead of \s so indented body content is preserved.
+static RE_CURL_VERBOSE_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[*><{} ]").unwrap());
 
 /// Run `skim infra curl [args...]`.
 pub(crate) fn run(
@@ -44,13 +50,13 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     // Check stderr for HTTP status (curl -v outputs headers to stderr)
     let http_status = extract_http_status(&output.stderr);
 
-    if let Some(result) = try_parse_json_body(&output.stdout, http_status.as_deref()) {
+    if let Some(result) = try_parse_json(&output.stdout, http_status.as_deref()) {
         return ParseResult::Full(result);
     }
 
     let combined = combine_stdout_stderr(output);
 
-    if let Some(result) = try_parse_verbose(&combined) {
+    if let Some(result) = try_parse_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
@@ -61,8 +67,43 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // Tier 1: JSON body detection
 // ============================================================================
 
-/// Parse JSON body from curl response and summarize.
-fn try_parse_json_body(
+/// Summarize a JSON object: collect top-level key-value items (up to 5).
+/// Returns a human-readable summary string and the collected items.
+fn summarize_json_object(map: &serde_json::Map<String, Value>) -> (String, Vec<InfraItem>) {
+    let count = map.len();
+    let items: Vec<InfraItem> = map
+        .iter()
+        .take(5)
+        .map(|(k, v)| InfraItem {
+            label: k.clone(),
+            value: json_value_to_string(v),
+        })
+        .collect();
+    let summary = format!("object with {count} key{}", if count == 1 { "" } else { "s" });
+    (summary, items)
+}
+
+/// Summarize a JSON array: record element count.
+fn summarize_json_array(arr: &[Value]) -> (String, Vec<InfraItem>) {
+    let count = arr.len();
+    let items = vec![InfraItem {
+        label: "count".to_string(),
+        value: count.to_string(),
+    }];
+    let summary = format!("array with {count} element{}", if count == 1 { "" } else { "s" });
+    (summary, items)
+}
+
+/// Convert a JSON value to a compact display string.
+fn json_value_to_string(val: &Value) -> String {
+    val.as_str()
+        .map(|s| s.to_string())
+        .or_else(|| val.as_u64().map(|n| n.to_string()))
+        .unwrap_or_else(|| val.to_string())
+}
+
+/// Parse JSON body from curl response and summarize (slim dispatcher).
+fn try_parse_json(
     stdout: &str,
     http_status: Option<&str>,
 ) -> Option<InfraResult> {
@@ -74,8 +115,6 @@ fn try_parse_json_body(
     let json_val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
 
     let mut items: Vec<InfraItem> = Vec::new();
-
-    // Add HTTP status if available
     if let Some(status) = http_status {
         items.push(InfraItem {
             label: "status".to_string(),
@@ -84,29 +123,29 @@ fn try_parse_json_body(
     }
 
     let summary_str = match &json_val {
-        serde_json::Value::Array(arr) => {
-            let count = arr.len();
-            items.push(InfraItem {
-                label: "count".to_string(),
-                value: count.to_string(),
-            });
-            format!("array with {count} element{}", if count == 1 { "" } else { "s" })
-        }
-        serde_json::Value::Object(map) => {
-            let count = map.len();
-            // Add top-level fields as items (up to 5)
-            for (k, v) in map.iter().take(5) {
-                let v_str = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| {
-                    v.as_u64()
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| v.to_string())
-                });
+        Value::Array(arr) => {
+            let (summary, extra) = summarize_json_array(arr);
+            items.extend(extra);
+            // Truncation notice when source array exceeds cap
+            if arr.len() > MAX_ITEMS {
                 items.push(InfraItem {
-                    label: k.clone(),
-                    value: v_str,
+                    label: "truncated".to_string(),
+                    value: format!("output capped at {MAX_ITEMS} items"),
                 });
             }
-            format!("object with {count} key{}", if count == 1 { "" } else { "s" })
+            summary
+        }
+        Value::Object(map) => {
+            let (summary, extra) = summarize_json_object(map);
+            items.extend(extra);
+            // Truncation notice when source object exceeds cap
+            if map.len() > MAX_ITEMS {
+                items.push(InfraItem {
+                    label: "truncated".to_string(),
+                    value: format!("output capped at {MAX_ITEMS} items"),
+                });
+            }
+            summary
         }
         _ => return None,
     };
@@ -126,7 +165,7 @@ fn try_parse_json_body(
 /// Extract HTTP status line from curl verbose stderr output.
 fn extract_http_status(stderr: &str) -> Option<String> {
     for line in stderr.lines() {
-        if let Some(caps) = RE_HTTP_STATUS.captures(line) {
+        if let Some(caps) = RE_CURL_HTTP_STATUS.captures(line) {
             let code = &caps[1];
             let reason = caps[2].trim();
             return Some(if reason.is_empty() {
@@ -140,12 +179,12 @@ fn extract_http_status(stderr: &str) -> Option<String> {
 }
 
 /// Parse curl verbose output by extracting non-verbose lines.
-fn try_parse_verbose(text: &str) -> Option<InfraResult> {
+fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
 
     // Extract HTTP status
     for line in text.lines() {
-        if let Some(caps) = RE_HTTP_STATUS.captures(line) {
+        if let Some(caps) = RE_CURL_HTTP_STATUS.captures(line) {
             items.push(InfraItem {
                 label: "status".to_string(),
                 value: format!("{} {}", &caps[1], caps[2].trim()),
@@ -156,7 +195,7 @@ fn try_parse_verbose(text: &str) -> Option<InfraResult> {
     // Extract body lines (non-verbose, non-header lines)
     let body_lines: Vec<&str> = text
         .lines()
-        .filter(|line| !RE_VERBOSE_LINE.is_match(line) && !line.is_empty())
+        .filter(|line| !RE_CURL_VERBOSE_LINE.is_match(line) && !line.is_empty())
         .take(3)
         .collect();
 
@@ -204,7 +243,7 @@ mod tests {
     #[test]
     fn test_tier1_curl_json_response() {
         let input = load_fixture("curl_json_response.txt");
-        let result = try_parse_json_body(&input, Some("200 OK"));
+        let result = try_parse_json(&input, Some("200 OK"));
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
         assert!(result.as_ref().contains("INFRA: curl response"));
@@ -212,14 +251,14 @@ mod tests {
 
     #[test]
     fn test_tier1_curl_non_json_fails() {
-        let result = try_parse_json_body("not json at all", None);
+        let result = try_parse_json("not json at all", None);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_tier2_curl_regex() {
         let input = load_fixture("curl_verbose.txt");
-        let result = try_parse_verbose(&input);
+        let result = try_parse_regex(&input);
         assert!(result.is_some(), "Expected Tier 2 parse to succeed");
         let result = result.unwrap();
         assert!(result.items.iter().any(|i| i.label == "status"));
@@ -256,6 +295,84 @@ mod tests {
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_tier2_preserves_indented_body_content() {
+        // Regression: RE_CURL_VERBOSE_LINE must not drop tab-indented lines.
+        // \s was incorrectly filtering indented body content in Tier 2.
+        let text = "< HTTP/1.1 200 OK\n<\n\t<html>\n\t<body>hello</body>\n";
+        let result = try_parse_regex(text);
+        let result = result.unwrap();
+        let body = result.items.iter().find(|i| i.label == "body_preview");
+        assert!(body.is_some(), "Expected indented body lines to be captured");
+        let val = &body.unwrap().value;
+        assert!(
+            val.contains("<html>") || val.contains("<body>"),
+            "Indented body content should be preserved, got: {val}"
+        );
+    }
+
+    #[test]
+    fn test_tier1_max_items_cap() {
+        // Build a JSON object with more than MAX_ITEMS fields to verify truncation.
+        let fields: String = (0..200)
+            .map(|i| format!("\"key{i}\": \"val{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let json = format!("{{{fields}}}");
+        let result = try_parse_json(&json, None);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert!(
+            result.items.iter().any(|i| i.label == "truncated"),
+            "Expected truncation notice item when JSON has > {MAX_ITEMS} fields"
+        );
+    }
+
+    #[test]
+    fn test_summarize_json_object() {
+        let json: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":"two","c":true}"#).unwrap();
+        let map = json.as_object().unwrap();
+        let (summary, items) = summarize_json_object(map);
+        assert!(summary.contains("3 key"), "Got: {summary}");
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn test_summarize_json_array() {
+        let json: serde_json::Value = serde_json::from_str(r#"[1,2,3]"#).unwrap();
+        let arr = json.as_array().unwrap();
+        let (summary, items) = summarize_json_array(arr);
+        assert!(summary.contains("3 element"), "Got: {summary}");
+        assert_eq!(items[0].value, "3");
+    }
+
+    #[test]
+    fn test_json_value_to_string() {
+        assert_eq!(json_value_to_string(&Value::String("hello".into())), "hello");
+        assert_eq!(json_value_to_string(&Value::Number(42u64.into())), "42");
+        assert_eq!(json_value_to_string(&Value::Bool(true)), "true");
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        // Tier 2 input: curl verbose output with HTTP status in stderr and no JSON
+        // in stdout. The `< HTTP/...` line triggers try_parse_verbose (Tier 2) but
+        // try_parse_json_body returns None because stdout is not valid JSON.
+        let output = CommandOutput {
+            stdout: String::new(),
+            stderr: "* Connected to api.example.com\n> GET / HTTP/1.1\n< HTTP/1.1 200 OK\n<\n"
+                .to_string(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
             result.tier_name()
         );
     }

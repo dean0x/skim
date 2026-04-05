@@ -30,6 +30,9 @@ static RE_PRETTIER_WARN: LazyLock<Regex> =
 static RE_PRETTIER_SUMMARY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[warn\]\s+Code style issues found").unwrap());
 
+static RE_PRETTIER_FILE_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^([^\s]+\.[a-zA-Z]{1,6})\s+needs? formatting").unwrap());
+
 /// Run `skim lint prettier [args...]`.
 pub(crate) fn run(
     args: &[String],
@@ -48,7 +51,7 @@ fn prepare_args(cmd_args: &mut Vec<String>) {
 
 /// Three-tier parse function for prettier output.
 fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
-    if let Some(result) = try_parse_warn_lines(&output.stdout) {
+    if let Some(result) = try_parse_structured(&output.stdout) {
         return ParseResult::Full(result);
     }
 
@@ -78,7 +81,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 /// [warn] src/utils/format.ts
 /// [warn] Code style issues found in the above file(s). Forgot to run Prettier?
 /// ```
-fn try_parse_warn_lines(stdout: &str) -> Option<LintResult> {
+fn try_parse_structured(stdout: &str) -> Option<LintResult> {
     if !stdout.contains("[warn]") {
         return None;
     }
@@ -111,14 +114,9 @@ fn try_parse_warn_lines(stdout: &str) -> Option<LintResult> {
 
 /// Regex fallback for other output formats.
 fn try_parse_regex(text: &str) -> Option<LintResult> {
-    // Look for any file paths that look like they have formatting issues
-    static RE_FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?m)^([^\s]+\.[a-zA-Z]{1,6})\s+needs? formatting").unwrap()
-    });
-
     let mut issues: Vec<LintIssue> = Vec::new();
 
-    for caps in RE_FILE_PATH.captures_iter(text) {
+    for caps in RE_PRETTIER_FILE_PATH.captures_iter(text) {
         issues.push(LintIssue {
             file: caps[1].to_string(),
             line: 0,
@@ -174,8 +172,8 @@ mod tests {
     #[test]
     fn test_tier1_prettier_fail() {
         let input = load_fixture("prettier_check_fail.txt");
-        let result = try_parse_warn_lines(&input);
-        assert!(result.is_some(), "Expected Tier 1 warn-line parse to succeed");
+        let result = try_parse_structured(&input);
+        assert!(result.is_some(), "Expected Tier 1 structured parse to succeed");
         let result = result.unwrap();
         assert_eq!(result.warnings, 3);
         assert_eq!(result.errors, 0);
@@ -220,6 +218,25 @@ mod tests {
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        // Tier 2 input: matches the `<path> needs formatting` regex but NOT the
+        // `[warn]` Tier 1 format.
+        let output = CommandOutput {
+            stdout: "src/main.ts needs formatting\nsrc/utils/helper.js needs formatting\n"
+                .to_string(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
             result.tier_name()
         );
     }

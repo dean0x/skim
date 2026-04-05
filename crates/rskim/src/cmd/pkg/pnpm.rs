@@ -44,7 +44,7 @@ pub(crate) fn run(
         "audit" => run_audit(subcmd_args, show_stats, json_output),
         "outdated" => run_outdated(subcmd_args, show_stats, json_output),
         other => {
-            let safe = super::sanitize_for_display(other);
+            let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
                 "skim pkg pnpm: unknown subcommand '{safe}'\n\
                  Available: install, audit, outdated\n\

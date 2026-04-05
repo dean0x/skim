@@ -50,7 +50,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "ruff" => ruff::run(linter_args, show_stats, json_output),
         "rustfmt" => rustfmt::run(linter_args, show_stats, json_output),
         linter => {
-            let safe_linter = crate::cmd::infra::sanitize_for_display(linter);
+            let safe_linter = crate::cmd::sanitize_for_display(linter);
             eprintln!(
                 "skim lint: unknown linter '{safe_linter}'\n\
                  Available linters: {}\n\

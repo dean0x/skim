@@ -83,6 +83,12 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // Tier 1: JSON parsing
 // ============================================================================
 
+/// Maximum number of items to include in a parsed result.
+///
+/// Prevents unbounded memory growth when `gh` returns very large JSON arrays
+/// (e.g., repositories with thousands of open issues or PRs).
+const MAX_ITEMS: usize = 100;
+
 /// Parse gh JSON array output.
 fn try_parse_json(stdout: &str) -> Option<InfraResult> {
     let trimmed = stdout.trim();
@@ -91,10 +97,12 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
     }
 
     let arr: Vec<serde_json::Value> = serde_json::from_str(trimmed).ok()?;
-    let count = arr.len();
+    let total = arr.len();
+    let truncated = total > MAX_ITEMS;
 
     let items: Vec<InfraItem> = arr
         .into_iter()
+        .take(MAX_ITEMS)
         .map(|entry| {
             let label = entry
                 .get("number")
@@ -127,7 +135,12 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
         })
         .collect();
 
-    let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
+    let count = items.len();
+    let summary = if truncated {
+        format!("showing first {MAX_ITEMS} of {total} items")
+    } else {
+        format!("{count} item{}", if count == 1 { "" } else { "s" })
+    };
     Some(InfraResult::new("gh".to_string(), "list".to_string(), summary, items))
 }
 
@@ -230,6 +243,24 @@ mod tests {
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        // Tier 2 input: tab-separated tabular text output (not JSON) that matches
+        // the `^\d+\t.+` regex. This is what `gh pr list` emits without `--json`.
+        let output = CommandOutput {
+            stdout: "42\tFix login bug\tOPEN\n57\tAdd dark mode\tOPEN\n".to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
             result.tier_name()
         );
     }

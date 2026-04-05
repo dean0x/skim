@@ -462,7 +462,7 @@ const REWRITE_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["curl"],
         rewrite_to: &["skim", "infra", "curl"],
-        skip_if_flag_prefix: &["-o", "--output"],
+        skip_if_flag_prefix: &["-o", "--output", "-X", "--request", "-F", "--upload-file", "-T"],
         category: RewriteCategory::Infra,
     },
     // infra — wget
@@ -3071,6 +3071,172 @@ mod tests {
             updated.trim(),
             today_date_string(),
             "stamp should be updated to today"
+        );
+    }
+
+    // ========================================================================
+    // New lint and infra rewrite rules (#116)
+    // ========================================================================
+
+    #[test]
+    fn test_rewrite_prettier_check() {
+        let result = try_rewrite(&["prettier", "--check", "."]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "prettier".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint prettier', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_npx_prettier() {
+        let result = try_rewrite(&["npx", "prettier", "--check", "src/"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "prettier".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint prettier', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rustfmt_check() {
+        let result = try_rewrite(&["rustfmt", "--check", "src/main.rs"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "rustfmt".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint rustfmt', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_cargo_fmt_check() {
+        let result = try_rewrite(&["cargo", "fmt", "--check"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "rustfmt".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint rustfmt', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_pr_list() {
+        let result = try_rewrite(&["gh", "pr", "list"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "gh".to_string(),
+                "pr".to_string(),
+                "list".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra gh pr list', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_pr_list_skip_json() {
+        assert!(
+            try_rewrite(&["gh", "pr", "list", "--json", "number"]).is_none(),
+            "Expected no rewrite when --json flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_issue_list() {
+        let result = try_rewrite(&["gh", "issue", "list"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "gh".to_string(),
+                "issue".to_string(),
+                "list".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra gh issue list', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_aws_s3_ls() {
+        let result = try_rewrite(&["aws", "s3", "ls"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "aws".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra aws', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_aws_skip_output() {
+        assert!(
+            try_rewrite(&["aws", "s3", "ls", "--output", "table"]).is_none(),
+            "Expected no rewrite when --output flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_curl() {
+        let result = try_rewrite(&["curl", "https://api.example.com"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "curl".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra curl', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_curl_skip_output() {
+        assert!(
+            try_rewrite(&["curl", "-o", "file.json", "https://api.example.com"]).is_none(),
+            "Expected no rewrite when -o flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_wget() {
+        let result = try_rewrite(&["wget", "https://example.com"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "wget".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra wget', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_wget_skip_quiet() {
+        assert!(
+            try_rewrite(&["wget", "-q", "https://example.com"]).is_none(),
+            "Expected no rewrite when -q flag is present"
         );
     }
 }

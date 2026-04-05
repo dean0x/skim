@@ -47,7 +47,7 @@ pub(crate) fn run(
         "check" => run_check(subcmd_args, show_stats, json_output),
         "list" => run_list(subcmd_args, show_stats, json_output),
         other => {
-            let safe = super::sanitize_for_display(other);
+            let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
                 "skim pkg pip: unknown subcommand '{safe}'\n\
                  Available: install, check, list\n\

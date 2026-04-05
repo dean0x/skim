@@ -43,7 +43,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "gh" => gh::run(tool_args, show_stats, json_output),
         "wget" => wget::run(tool_args, show_stats, json_output),
         _ => {
-            let safe_tool = sanitize_for_display(tool_name);
+            let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(
                 "skim infra: unknown tool '{safe_tool}'\n\
                  Available tools: {}\n\
@@ -132,29 +132,6 @@ pub(crate) fn run_infra_tool(
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
 // ============================================================================
-// Shared security helper
-// ============================================================================
-
-/// Sanitize user input for safe display in error messages.
-///
-/// Filters to printable ASCII characters to prevent terminal escape
-/// injection attacks. Non-printable and non-ASCII bytes are replaced
-/// with `?`, and the string is truncated to 64 characters.
-pub(crate) fn sanitize_for_display(input: &str) -> String {
-    input
-        .chars()
-        .take(64)
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
-}
-
-// ============================================================================
 // Unit tests
 // ============================================================================
 
@@ -162,22 +139,24 @@ pub(crate) fn sanitize_for_display(input: &str) -> String {
 mod tests {
     use super::*;
 
+    // sanitize_for_display is now in crate::cmd; tests remain here as
+    // a usage-site smoke-check to catch regressions at the call site.
     #[test]
     fn test_sanitize_for_display_clean_input() {
-        assert_eq!(sanitize_for_display("hello-world"), "hello-world");
+        assert_eq!(super::super::sanitize_for_display("hello-world"), "hello-world");
     }
 
     #[test]
     fn test_sanitize_for_display_rejects_non_ascii() {
         let input = "tool\x1b[31mred\x1b[0m";
-        let sanitized = sanitize_for_display(input);
+        let sanitized = super::super::sanitize_for_display(input);
         assert!(!sanitized.contains('\x1b'));
     }
 
     #[test]
     fn test_sanitize_for_display_truncates_at_64() {
         let long_input = "a".repeat(100);
-        let sanitized = sanitize_for_display(&long_input);
+        let sanitized = super::super::sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
     }
 }

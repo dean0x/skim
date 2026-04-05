@@ -50,7 +50,7 @@ fn prepare_args(cmd_args: &mut Vec<String>) {
 fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     let combined = combine_stdout_stderr(output);
 
-    if let Some(result) = try_parse_diff_headers(&combined) {
+    if let Some(result) = try_parse_structured(&combined) {
         return ParseResult::Full(result);
     }
 
@@ -59,7 +59,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
         return ParseResult::Full(group_issues("rustfmt", vec![]));
     }
 
-    if let Some(result) = try_parse_unified_headers(&combined) {
+    if let Some(result) = try_parse_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
@@ -80,7 +80,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 /// +    let x = 1;
 ///  }
 /// ```
-fn try_parse_diff_headers(text: &str) -> Option<LintResult> {
+fn try_parse_structured(text: &str) -> Option<LintResult> {
     if !text.contains("Diff in ") {
         return None;
     }
@@ -109,7 +109,7 @@ fn try_parse_diff_headers(text: &str) -> Option<LintResult> {
 // ============================================================================
 
 /// Parse unified diff `--- <path>` headers as a fallback.
-fn try_parse_unified_headers(text: &str) -> Option<LintResult> {
+fn try_parse_regex(text: &str) -> Option<LintResult> {
     let mut issues: Vec<LintIssue> = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
 
@@ -181,10 +181,10 @@ mod tests {
     #[test]
     fn test_tier1_rustfmt_fail() {
         let input = load_fixture("rustfmt_check_fail.txt");
-        let result = try_parse_diff_headers(&input);
+        let result = try_parse_structured(&input);
         assert!(
             result.is_some(),
-            "Expected Tier 1 diff-header parse to succeed"
+            "Expected Tier 1 structured parse to succeed"
         );
         let result = result.unwrap();
         assert_eq!(result.warnings, 2);
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn test_tier2_rustfmt_regex() {
         let input = "--- src/main.rs\n+++ src/main.rs\n-old line\n+new line\n";
-        let result = try_parse_unified_headers(input);
+        let result = try_parse_regex(input);
         assert!(result.is_some(), "Expected Tier 2 regex parse to succeed");
         let result = result.unwrap();
         assert_eq!(result.warnings, 1);
@@ -230,6 +230,24 @@ mod tests {
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        // Tier 2 input: unified diff headers (`--- <path>`) that pass Tier 2
+        // but NOT Tier 1 (`Diff in <path> at line <N>:`).
+        let output = CommandOutput {
+            stdout: "--- src/main.rs\n+++ src/main.rs\n-old line\n+new line\n".to_string(),
+            stderr: String::new(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
             result.tier_name()
         );
     }

@@ -38,8 +38,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "vitest" | "jest" => vitest::run(runner, runner_args, show_stats),
         "pytest" => pytest::run(runner_args, show_stats),
         _ => {
+            let safe_runner = crate::cmd::sanitize_for_display(runner);
             eprintln!(
-                "skim test: unknown runner '{runner}'\n\
+                "skim test: unknown runner '{safe_runner}'\n\
                  Available runners: {}\n\
                  Run 'skim test --help' for usage information",
                 KNOWN_RUNNERS.join(", ")

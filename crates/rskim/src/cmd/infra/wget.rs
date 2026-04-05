@@ -40,8 +40,9 @@ static RE_WGET_SAVED: LazyLock<Regex> =
 static RE_WGET_ERROR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"ERROR\s+(\d+):\s+(.+)").unwrap());
 
-static RE_WGET_ANY_STATUS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b([1-5]\d{2})\b").unwrap());
+static RE_WGET_ANY_STATUS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:HTTP|response|status)[^\n]*?\b([1-5]\d{2})\b").unwrap()
+});
 
 /// Run `skim infra wget [args...]`.
 pub(crate) fn run(
@@ -58,11 +59,11 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     // wget outputs to stderr, so use combined output
     let combined = combine_stdout_stderr(output);
 
-    if let Some(result) = try_parse_wget_full(&combined) {
+    if let Some(result) = try_parse_structured(&combined) {
         return ParseResult::Full(result);
     }
 
-    if let Some(result) = try_parse_wget_simple(&combined) {
+    if let Some(result) = try_parse_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
@@ -74,56 +75,20 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // ============================================================================
 
 /// Parse wget output extracting HTTP status, filename, and size.
-fn try_parse_wget_full(text: &str) -> Option<InfraResult> {
+fn try_parse_structured(text: &str) -> Option<InfraResult> {
     if !text.contains("HTTP request") && !text.contains("ERROR") {
         return None;
     }
 
     let mut items: Vec<InfraItem> = Vec::new();
 
-    // HTTP status
-    if let Some(caps) = RE_WGET_HTTP_STATUS.captures(text) {
-        items.push(InfraItem {
-            label: "status".to_string(),
-            value: format!("{} {}", &caps[1], caps[2].trim()),
-        });
+    append_http_status(text, &mut items);
+
+    if let Some(result) = try_build_error_result(text, &mut items) {
+        return Some(result);
     }
 
-    // Error status
-    if let Some(caps) = RE_WGET_ERROR.captures(text) {
-        items.push(InfraItem {
-            label: "error".to_string(),
-            value: format!("{} {}", &caps[1], caps[2].trim()),
-        });
-        let summary = format!("ERROR {}", &caps[1]);
-        return Some(InfraResult::new(
-            "wget".to_string(),
-            "download".to_string(),
-            summary,
-            items,
-        ));
-    }
-
-    // File size
-    if let Some(caps) = RE_WGET_LENGTH.captures(text) {
-        items.push(InfraItem {
-            label: "size".to_string(),
-            value: caps[1].to_string(),
-        });
-    }
-
-    // Saved filename
-    if let Some(caps) = RE_WGET_SAVING.captures(text) {
-        items.push(InfraItem {
-            label: "file".to_string(),
-            value: caps[1].to_string(),
-        });
-    } else if let Some(caps) = RE_WGET_SAVED.captures(text) {
-        items.push(InfraItem {
-            label: "file".to_string(),
-            value: caps[1].to_string(),
-        });
-    }
+    append_size_and_file(text, &mut items);
 
     if items.is_empty() {
         return None;
@@ -135,12 +100,50 @@ fn try_parse_wget_full(text: &str) -> Option<InfraResult> {
         .map(|i| i.value.clone())
         .unwrap_or_else(|| "download complete".to_string());
 
-    Some(InfraResult::new(
-        "wget".to_string(),
-        "download".to_string(),
-        summary,
-        items,
-    ))
+    Some(InfraResult::new("wget".to_string(), "download".to_string(), summary, items))
+}
+
+/// Append an HTTP status item if a status line is present.
+fn append_http_status(text: &str, items: &mut Vec<InfraItem>) {
+    if let Some(caps) = RE_WGET_HTTP_STATUS.captures(text) {
+        items.push(InfraItem {
+            label: "status".to_string(),
+            value: format!("{} {}", &caps[1], caps[2].trim()),
+        });
+    }
+}
+
+/// If an ERROR line is present, append the error item and return the finished result.
+fn try_build_error_result(text: &str, items: &mut Vec<InfraItem>) -> Option<InfraResult> {
+    let caps = RE_WGET_ERROR.captures(text)?;
+    items.push(InfraItem {
+        label: "error".to_string(),
+        value: format!("{} {}", &caps[1], caps[2].trim()),
+    });
+    let summary = format!("ERROR {}", &caps[1]);
+    Some(InfraResult::new("wget".to_string(), "download".to_string(), summary, items.clone()))
+}
+
+/// Append file size and saved-filename items.
+fn append_size_and_file(text: &str, items: &mut Vec<InfraItem>) {
+    if let Some(caps) = RE_WGET_LENGTH.captures(text) {
+        items.push(InfraItem {
+            label: "size".to_string(),
+            value: caps[1].to_string(),
+        });
+    }
+
+    if let Some(caps) = RE_WGET_SAVING.captures(text) {
+        items.push(InfraItem {
+            label: "file".to_string(),
+            value: caps[1].to_string(),
+        });
+    } else if let Some(caps) = RE_WGET_SAVED.captures(text) {
+        items.push(InfraItem {
+            label: "file".to_string(),
+            value: caps[1].to_string(),
+        });
+    }
 }
 
 // ============================================================================
@@ -148,7 +151,7 @@ fn try_parse_wget_full(text: &str) -> Option<InfraResult> {
 // ============================================================================
 
 /// Simpler fallback: look for any HTTP status code in output.
-fn try_parse_wget_simple(text: &str) -> Option<InfraResult> {
+fn try_parse_regex(text: &str) -> Option<InfraResult> {
     for line in text.lines() {
         if let Some(caps) = RE_WGET_ANY_STATUS.captures(line) {
             let code = &caps[1];
@@ -187,7 +190,7 @@ mod tests {
     #[test]
     fn test_tier1_wget_download() {
         let input = load_fixture("wget_download.txt");
-        let result = try_parse_wget_full(&input);
+        let result = try_parse_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
         assert!(result.as_ref().contains("INFRA: wget download"));
@@ -197,7 +200,7 @@ mod tests {
     #[test]
     fn test_tier1_wget_error() {
         let input = load_fixture("wget_error.txt");
-        let result = try_parse_wget_full(&input);
+        let result = try_parse_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed for error");
         let result = result.unwrap();
         assert!(result.items.iter().any(|i| i.label == "error"));
@@ -205,9 +208,21 @@ mod tests {
 
     #[test]
     fn test_tier2_wget_regex() {
-        let input = "Connecting... 200\n";
-        let result = try_parse_wget_simple(input);
+        // Tier 2 requires HTTP context before the status code
+        let input = "HTTP response 200\n";
+        let result = try_parse_regex(input);
         assert!(result.is_some(), "Expected Tier 2 fallback to succeed");
+    }
+
+    #[test]
+    fn test_tier2_wget_no_false_positive() {
+        // A bare number without HTTP context must NOT match (e.g. "Downloaded 256 bytes")
+        let input = "Downloaded 256 bytes\n";
+        let result = try_parse_regex(input);
+        assert!(
+            result.is_none(),
+            "Expected no match for bare number without HTTP context"
+        );
     }
 
     #[test]
@@ -239,6 +254,25 @@ mod tests {
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        // Tier 2 input: wget progress output containing an HTTP status code with
+        // HTTP context (matches RE_WGET_ANY_STATUS) but does NOT contain
+        // "HTTP request" or "ERROR" (which would trigger Tier 1).
+        let output = CommandOutput {
+            stdout: String::new(),
+            stderr: "HTTP response 200\n".to_string(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
             result.tier_name()
         );
     }

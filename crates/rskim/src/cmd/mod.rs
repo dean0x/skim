@@ -364,6 +364,29 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
 }
 
 // ============================================================================
+// Shared security helper
+// ============================================================================
+
+/// Sanitize user input for safe display in error messages.
+///
+/// Filters to printable ASCII characters to prevent terminal escape
+/// injection attacks. Non-printable and non-ASCII bytes are replaced
+/// with `?`, and the string is truncated to 64 characters.
+pub(crate) fn sanitize_for_display(input: &str) -> String {
+    input
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -385,5 +408,24 @@ mod tests {
         let (filtered, is_json) = extract_json_flag(&args);
         assert!(!is_json);
         assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_sanitize_for_display_clean_input() {
+        assert_eq!(sanitize_for_display("hello-world"), "hello-world");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_rejects_non_ascii() {
+        let input = "tool\x1b[31mred\x1b[0m";
+        let sanitized = sanitize_for_display(input);
+        assert!(!sanitized.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_sanitize_for_display_truncates_at_64() {
+        let long_input = "a".repeat(100);
+        let sanitized = sanitize_for_display(&long_input);
+        assert_eq!(sanitized.len(), 64);
     }
 }

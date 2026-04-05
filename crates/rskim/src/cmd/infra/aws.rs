@@ -27,6 +27,9 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
 /// Keys stripped from AWS JSON responses (metadata, not useful data).
 const METADATA_KEYS: &[&str] = &["ResponseMetadata", "NextToken", "RequestId"];
 
+/// Maximum number of items surfaced from arrays or tables (prevents runaway output).
+const MAX_ITEMS: usize = 100;
+
 static RE_AWS_TABLE_ROW: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\|\s+(\S[^|]+\S)\s+\|").unwrap());
 
@@ -62,7 +65,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 
     let combined = combine_stdout_stderr(output);
 
-    if let Some(result) = try_parse_table(&combined) {
+    if let Some(result) = try_parse_regex(&combined) {
         return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
     }
 
@@ -87,54 +90,40 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
             let count = arr.len();
             let items = extract_array_items(arr);
             let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-            Some(InfraResult::new(
-                "aws".to_string(),
-                "result".to_string(),
-                summary,
-                items,
-            ))
+            Some(InfraResult::new("aws".to_string(), "result".to_string(), summary, items))
         }
-        serde_json::Value::Object(map) => {
-            // Find the primary data key (skip metadata keys)
-            let data_key = map
-                .keys()
-                .find(|k| !METADATA_KEYS.contains(&k.as_str()))?;
-
-            let data = &map[data_key];
-            let (count, items) = match data {
-                serde_json::Value::Array(arr) => {
-                    let count = arr.len();
-                    (count, extract_array_items(arr))
-                }
-                _ => {
-                    let summary_val = data
-                        .as_str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| data.to_string());
-                    let items = vec![InfraItem {
-                        label: data_key.clone(),
-                        value: summary_val,
-                    }];
-                    (1, items)
-                }
-            };
-
-            let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-            Some(InfraResult::new(
-                "aws".to_string(),
-                data_key.clone(),
-                summary,
-                items,
-            ))
-        }
+        serde_json::Value::Object(map) => parse_json_object(map),
         _ => None,
     }
 }
 
-/// Extract display items from a JSON array.
+/// Parse an AWS JSON object response, routing on the primary data key.
+fn parse_json_object(map: &serde_json::Map<String, serde_json::Value>) -> Option<InfraResult> {
+    // Find the primary data key (skip metadata keys)
+    let data_key = map.keys().find(|k| !METADATA_KEYS.contains(&k.as_str()))?;
+
+    let data = &map[data_key];
+    let (count, items) = match data {
+        serde_json::Value::Array(arr) => (arr.len(), extract_array_items(arr)),
+        _ => {
+            let summary_val = data
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| data.to_string());
+            let items = vec![InfraItem { label: data_key.to_string(), value: summary_val }];
+            (1, items)
+        }
+    };
+
+    let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
+    Some(InfraResult::new("aws".to_string(), data_key.to_string(), summary, items))
+}
+
+/// Extract display items from a JSON array, capped at MAX_ITEMS.
 fn extract_array_items(arr: &[serde_json::Value]) -> Vec<InfraItem> {
     arr.iter()
         .enumerate()
+        .take(MAX_ITEMS)
         .map(|(i, entry)| {
             // Try to find a meaningful identifier (Name, Id, Arn, etc.)
             let label = find_identifier(entry).unwrap_or_else(|| format!("item-{}", i + 1));
@@ -184,7 +173,7 @@ fn summarize_object(value: &serde_json::Value) -> String {
 // ============================================================================
 
 /// Parse AWS table/text formatted output via regex.
-fn try_parse_table(text: &str) -> Option<InfraResult> {
+fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -197,7 +186,7 @@ fn try_parse_table(text: &str) -> Option<InfraResult> {
                 if cell.chars().all(|c| c == '-' || c == '+') {
                     continue;
                 }
-                if seen.insert(cell.clone()) && !cell.is_empty() {
+                if seen.insert(cell.clone()) && !cell.is_empty() && items.len() < MAX_ITEMS {
                     items.push(InfraItem {
                         label: format!("item-{}", items.len() + 1),
                         value: cell,
@@ -252,7 +241,7 @@ mod tests {
     #[test]
     fn test_tier2_aws_regex() {
         let input = "| i-0abc123  | t3.micro  | running |\n| i-0def456  | t3.small  | stopped |";
-        let result = try_parse_table(input);
+        let result = try_parse_regex(input);
         assert!(result.is_some(), "Expected Tier 2 regex parse to succeed");
     }
 
@@ -285,6 +274,25 @@ mod tests {
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_text_produces_degraded() {
+        // Tier 2 input: AWS table-formatted output (not JSON) that matches the
+        // `| value |` pipe-delimited table regex.
+        let output = CommandOutput {
+            stdout: "| i-0abc123def  | t3.micro  | running |\n| i-0def456ghi  | t3.small  | stopped |\n"
+                .to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_impl(&output);
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded parse result, got {}",
             result.tier_name()
         );
     }

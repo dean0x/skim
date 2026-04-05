@@ -40,8 +40,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         Some("clippy") => cargo::run_clippy(remaining, show_stats),
         Some("tsc") => tsc::run(remaining, show_stats),
         Some(unknown) => {
+            let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             anyhow::bail!(
-                "unknown build tool: '{unknown}'\n\n\
+                "unknown build tool: '{safe_unknown}'\n\n\
                  Usage: skim build {{cargo|clippy|tsc}} [args...]\n\n\
                  Supported tools: cargo, clippy, tsc"
             );

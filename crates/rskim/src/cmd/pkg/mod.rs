@@ -17,25 +17,6 @@ use crate::runner::CommandOutput;
 /// Known package manager tools that `skim pkg` can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["npm", "pnpm", "pip", "cargo"];
 
-/// Sanitize user input for safe display in error messages.
-///
-/// Filters to printable ASCII characters to prevent terminal escape
-/// injection attacks. Non-printable and non-ASCII bytes are replaced
-/// with `?`, and the string is truncated to 64 characters.
-pub(super) fn sanitize_for_display(input: &str) -> String {
-    input
-        .chars()
-        .take(64)
-        .map(|c| {
-            if c.is_ascii_graphic() || c == ' ' {
-                c
-            } else {
-                '?'
-            }
-        })
-        .collect()
-}
-
 /// Entry point for `skim pkg <tool> [subcmd] [args...]`.
 ///
 /// If no tool is specified or `--help` / `-h` is passed, prints usage
@@ -62,7 +43,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "pip" => pip::run(tool_args, show_stats, json_output),
         "cargo" => cargo::run(tool_args, show_stats, json_output),
         _ => {
-            let safe_tool = sanitize_for_display(tool);
+            let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(
                 "skim pkg: unknown tool '{safe_tool}'\n\
                  Available tools: {}\n\
@@ -162,14 +143,14 @@ mod tests {
 
     #[test]
     fn test_sanitize_ascii_passthrough() {
-        assert_eq!(sanitize_for_display("hello-world"), "hello-world");
+        assert_eq!(crate::cmd::sanitize_for_display("hello-world"), "hello-world");
     }
 
     #[test]
     fn test_sanitize_strips_escape_sequences() {
         // ANSI escape: \x1b[31m (set red color)
         let malicious = "\x1b[31mevil\x1b[0m";
-        let sanitized = sanitize_for_display(malicious);
+        let sanitized = crate::cmd::sanitize_for_display(malicious);
         assert!(!sanitized.contains('\x1b'));
         assert_eq!(sanitized, "?[31mevil?[0m");
     }
@@ -177,14 +158,14 @@ mod tests {
     #[test]
     fn test_sanitize_truncates_long_input() {
         let long_input = "a".repeat(200);
-        let sanitized = sanitize_for_display(&long_input);
+        let sanitized = crate::cmd::sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
     }
 
     #[test]
     fn test_sanitize_replaces_control_chars() {
         let input = "hello\0world\ttab\nnewline";
-        let sanitized = sanitize_for_display(input);
+        let sanitized = crate::cmd::sanitize_for_display(input);
         assert_eq!(sanitized, "hello?world?tab?newline");
     }
 
