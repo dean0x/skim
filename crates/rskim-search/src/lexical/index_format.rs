@@ -660,26 +660,6 @@ fn remove_if_exists(path: &Path) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexical::{INDEX_FORMAT_VERSION, INDEX_MAGIC};
-
-    fn make_header(ngram_count: u64, file_count: u64) -> IndexHeader {
-        IndexHeader {
-            magic: INDEX_MAGIC,
-            version: INDEX_FORMAT_VERSION,
-            ngram_count,
-            file_count,
-            created_at: 0,
-        }
-    }
-
-    fn make_posting(doc_id: u32, field_id: u8, position: u32, tf: u16) -> PostingEntry {
-        PostingEntry {
-            doc_id,
-            field_id,
-            position,
-            tf,
-        }
-    }
 
     #[test]
     fn index_entry_roundtrip() {
