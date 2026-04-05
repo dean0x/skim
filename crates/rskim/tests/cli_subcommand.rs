@@ -199,23 +199,25 @@ fn test_full_path_to_file_named_as_subcommand_uses_separator_heuristic() {
 }
 
 #[test]
-fn test_bare_file_named_as_subcommand_routes_to_file_operation() {
+fn test_bare_file_named_as_subcommand_routes_to_subcommand() {
     let dir = TempDir::new().unwrap();
     // Create a file called "init" (a known subcommand name) in the temp dir
     let file = dir.path().join("init");
     fs::write(&file, "fn setup() {}").unwrap();
 
-    // Pass bare "init" with cwd set so path.exists() finds the file on disk.
-    // This exercises the backward-compat precedence: on-disk file wins over subcommand.
+    // After the router fix, bare "init" ALWAYS routes to the subcommand
+    // regardless of whether a file with that name exists on disk.
+    // To read such a file, users must use ./init or the full path.
     Command::cargo_bin("skim")
         .unwrap()
         .current_dir(dir.path())
         .arg("init")
-        .arg("-l")
-        .arg("rust")
+        .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("fn setup"));
+        // Should show the subcommand help, not the file contents
+        .stdout(predicate::str::contains("skim init"))
+        .stdout(predicate::str::contains("fn setup").not());
 }
 
 #[test]
@@ -236,7 +238,7 @@ fn test_full_path_to_dir_named_as_subcommand_uses_separator_heuristic() {
 }
 
 #[test]
-fn test_bare_dir_named_as_subcommand_routes_to_file_operation() {
+fn test_bare_dir_named_as_subcommand_routes_to_subcommand() {
     let dir = TempDir::new().unwrap();
     // Create a directory called "build" (a known subcommand name) with a source file inside
     let build_dir = dir.path().join("build");
@@ -244,14 +246,18 @@ fn test_bare_dir_named_as_subcommand_routes_to_file_operation() {
     let file = build_dir.join("main.rs");
     fs::write(&file, "fn main() {}").unwrap();
 
-    // Pass bare "build" with cwd set so path.exists() finds the directory on disk.
-    // This exercises the backward-compat precedence: on-disk directory wins over subcommand.
+    // After the router fix, bare "build" ALWAYS routes to the subcommand
+    // regardless of whether a directory with that name exists on disk.
+    // To process such a directory, users must use ./build or the full path.
     Command::cargo_bin("skim")
         .unwrap()
         .current_dir(dir.path())
         .arg("build")
+        .arg("--help")
         .assert()
-        .success();
+        .success()
+        // Should show the subcommand help, not process the directory
+        .stdout(predicate::str::contains("skim build"));
 }
 
 // ============================================================================

@@ -181,22 +181,22 @@ fn test_completions_bash_syntax_valid() {
 // ============================================================================
 
 #[test]
-fn test_completions_file_on_disk_takes_precedence() {
+fn test_completions_subcommand_always_routes_to_subcommand() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("completions");
     fs::write(&file, "fn setup() {}").unwrap();
 
-    // When a file named "completions" exists on disk, the pre-parse router
-    // should route to file operation, NOT the completions subcommand.
+    // After the router fix, bare "completions" ALWAYS routes to the subcommand
+    // even when a file named "completions" exists on disk.
+    // To read such a file, users must use ./completions or the full path.
     Command::cargo_bin("skim")
         .unwrap()
         .current_dir(dir.path())
         .arg("completions")
-        .arg("-l")
-        .arg("rust")
+        .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("fn setup"));
+        .stdout(predicate::str::contains("skim completions"));
 }
 
 // ============================================================================

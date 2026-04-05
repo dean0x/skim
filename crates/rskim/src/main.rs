@@ -88,7 +88,7 @@ fn looks_like_file_or_glob(token: &str) -> bool {
 /// | Contains `/` or `\`                           | FileOperation |
 /// | Is `-`                                        | FileOperation |
 /// | Contains `*`, `?`, `[`, or `{`                  | FileOperation |
-/// | Is known subcommand AND no file/dir on disk   | Subcommand    |
+/// | Is known subcommand                           | Subcommand    |
 /// | Everything else                               | FileOperation |
 fn resolve_invocation() -> Invocation {
     let raw_args: Vec<String> = std::env::args().collect();
@@ -138,14 +138,9 @@ fn resolve_invocation() -> Invocation {
         return Invocation::FileOperation;
     }
 
-    // Known subcommand check — only if no file/dir with that name exists on disk
+    // Known subcommand check — subcommands always take priority.
+    // Use `skim ./name` or a full path to read a file that shares a subcommand name.
     if cmd::is_known_subcommand(positional) {
-        let path = std::path::Path::new(positional);
-        if path.exists() {
-            // On-disk file/dir takes precedence (backward compat)
-            return Invocation::FileOperation;
-        }
-
         let name = positional.to_string();
         let remaining_args: Vec<String> = args[pos_idx + 1..].to_vec();
         return Invocation::Subcommand {
