@@ -1,0 +1,17 @@
+{
+  "database_url": "postgres://localhost:5432/myapp",
+  "redis_url": "redis://localhost:6379",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "workers": 4
+  },
+  "auth": {
+    "jwt_secret": "change-me-in-production",
+    "token_ttl_seconds": 3600
+  },
+  "features": {
+    "enable_caching": true,
+    "enable_rate_limiting": false
+  }
+}

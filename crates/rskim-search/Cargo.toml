@@ -16,6 +16,8 @@ tree-sitter = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 rustc-hash = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

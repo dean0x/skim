@@ -40,6 +40,48 @@ impl SearchField {
             Self::StringLiteral => 0.5,
         }
     }
+
+    /// Convert to a compact `u8` for on-disk posting entries.
+    ///
+    /// Stable mapping — must not change between index format versions.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::TypeDefinition => 0,
+            Self::FunctionSignature => 1,
+            Self::SymbolName => 2,
+            Self::ImportExport => 3,
+            Self::FunctionBody => 4,
+            Self::Comment => 5,
+            Self::StringLiteral => 6,
+        }
+    }
+
+    /// Reconstruct from `u8`. Returns `None` for unknown values.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::TypeDefinition),
+            1 => Some(Self::FunctionSignature),
+            2 => Some(Self::SymbolName),
+            3 => Some(Self::ImportExport),
+            4 => Some(Self::FunctionBody),
+            5 => Some(Self::Comment),
+            6 => Some(Self::StringLiteral),
+            _ => None,
+        }
+    }
+
+    /// Return all variants in discriminant order.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::TypeDefinition,
+            Self::FunctionSignature,
+            Self::SymbolName,
+            Self::ImportExport,
+            Self::FunctionBody,
+            Self::Comment,
+            Self::StringLiteral,
+        ]
+    }
 }
 
 /// Temporal filter flags for query-time filtering by git activity signals.

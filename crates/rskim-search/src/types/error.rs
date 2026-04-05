@@ -25,6 +25,15 @@ pub enum SearchError {
     /// A serialization or deserialization error occurred.
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    /// The index file is corrupted or has an incompatible format version.
+    #[error("corrupted index at {path}: {reason}")]
+    CorruptedIndex {
+        /// Path to the corrupted index file.
+        path: String,
+        /// Human-readable description of the corruption.
+        reason: String,
+    },
 }
 
 /// Result type alias for search operations.
