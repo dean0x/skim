@@ -42,6 +42,8 @@ pub(crate) enum CommandType {
     Lint,
     Pkg,
     Infra,
+    FileOps,
+    Log,
 }
 
 impl CommandType {
@@ -54,6 +56,8 @@ impl CommandType {
             CommandType::Lint => "lint",
             CommandType::Pkg => "pkg",
             CommandType::Infra => "infra",
+            CommandType::FileOps => "fileops",
+            CommandType::Log => "log",
         }
     }
 }
