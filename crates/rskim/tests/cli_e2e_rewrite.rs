@@ -252,10 +252,11 @@ fn test_rewrite_hook_passthrough_already_rewritten() {
 
 #[test]
 fn test_rewrite_hook_passthrough_no_match() {
-    // Non-matching commands pass through silently (exit 0, no output)
+    // Non-matching commands pass through silently (exit 0, no output).
+    // Use a command that has no rewrite rule (bare ls without flags is not rewritten).
     let input = serde_json::json!({
         "tool_input": {
-            "command": "ls -la"
+            "command": "ls"
         }
     });
     skim_cmd()
@@ -645,10 +646,11 @@ fn test_rewrite_hook_all_agents_zero_stderr() {
 
 #[test]
 fn test_rewrite_hook_passthrough_zero_stderr() {
-    // Non-matching command with no agent flag
+    // Non-matching command with no agent flag.
+    // Use bare ls (no flags) which has no rewrite rule.
     let input = serde_json::json!({
         "tool_input": {
-            "command": "ls -la"
+            "command": "ls"
         }
     });
     let output = skim_cmd()
