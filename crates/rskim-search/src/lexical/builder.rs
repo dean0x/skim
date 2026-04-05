@@ -93,17 +93,14 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
         // --- Extract and accumulate postings --------------------------------
         let mut doc_len: u32 = 0;
 
-        // Check if this is a tree-sitter language by attempting to get/create a classifier.
-        let use_tree_sitter = {
-            // Populate the cache entry if absent; `None` means serde-based language.
-            self.classifier_cache
-                .entry(language)
-                .or_insert_with(|| crate::fields::for_language(language));
-            self.classifier_cache
-                .get(&language)
-                .map(Option::is_some)
-                .unwrap_or(false)
-        };
+        // Populate the cache entry if absent; `None` means serde-based language.
+        self.classifier_cache
+            .entry(language)
+            .or_insert_with(|| crate::fields::for_language(language));
+        let use_tree_sitter = self
+            .classifier_cache
+            .get(&language)
+            .is_some_and(Option::is_some);
 
         if use_tree_sitter {
             // Tree-sitter path: parse AST and classify nodes.

@@ -151,21 +151,20 @@ pub fn classify_yaml_fields(
                 results.push((key_start..key_end, key_field));
 
                 // Check for an inline string value after the colon.
-                let after_colon = &trimmed[colon_pos + 1..].trim_start().to_string();
-                let after_colon_str = after_colon.as_str();
-                if !after_colon_str.is_empty()
-                    && !after_colon_str.starts_with('{')
-                    && !after_colon_str.starts_with('[')
-                    && !after_colon_str.starts_with('#')
+                let after_colon = trimmed[colon_pos + 1..].trim_start();
+                if !after_colon.is_empty()
+                    && !after_colon.starts_with('{')
+                    && !after_colon.starts_with('[')
+                    && !after_colon.starts_with('#')
                 {
                     // Strip optional quotes for string values.
-                    let val = after_colon_str.trim_matches('"').trim_matches('\'');
+                    let val = after_colon.trim_matches('"').trim_matches('\'');
                     if !val.is_empty() {
                         // Locate the value within this line.
-                        if let Some(val_pos_in_line) = line.find(after_colon_str) {
+                        if let Some(val_pos_in_line) = line.find(after_colon) {
                             let val_start = byte_offset + val_pos_in_line;
                             results.push((
-                                val_start..val_start + after_colon_str.len(),
+                                val_start..val_start + after_colon.len(),
                                 SearchField::StringLiteral,
                             ));
                         }

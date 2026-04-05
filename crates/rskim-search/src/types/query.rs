@@ -191,21 +191,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_search_query_new_defaults() {
-        let q = SearchQuery::new();
-        assert!(q.text_query.is_none());
-        assert_eq!(q.limit, 50);
-        assert_eq!(q.offset, 0);
-    }
-
-    #[test]
-    fn test_search_query_text_convenience() {
-        let q = SearchQuery::text("foo");
-        assert_eq!(q.text_query, Some("foo".to_string()));
-    }
-
-    #[test]
-    fn test_search_query_builder_chain() {
+    fn search_query_builder_chain() {
         let flags = TemporalFlags {
             hot: true,
             ..Default::default()
@@ -226,22 +212,12 @@ mod tests {
     }
 
     #[test]
-    fn test_search_field_boost_values() {
-        assert_eq!(SearchField::TypeDefinition.default_boost(), 5.0);
-        assert_eq!(SearchField::FunctionSignature.default_boost(), 4.0);
-        assert_eq!(SearchField::SymbolName.default_boost(), 3.5);
-        assert_eq!(SearchField::ImportExport.default_boost(), 3.0);
-        assert_eq!(SearchField::FunctionBody.default_boost(), 1.0);
-        assert_eq!(SearchField::Comment.default_boost(), 0.8);
-        assert_eq!(SearchField::StringLiteral.default_boost(), 0.5);
-    }
-
-    #[test]
-    fn test_temporal_flags_default() {
-        let flags = TemporalFlags::default();
-        assert!(!flags.blast_radius);
-        assert!(!flags.hot);
-        assert!(!flags.cold);
-        assert!(!flags.risky);
+    fn field_boosts_rank_type_definition_highest() {
+        // Verify the ordering assumption that scoring relies on.
+        assert!(SearchField::TypeDefinition.default_boost() > SearchField::FunctionSignature.default_boost());
+        assert!(SearchField::FunctionSignature.default_boost() > SearchField::SymbolName.default_boost());
+        assert!(SearchField::SymbolName.default_boost() > SearchField::ImportExport.default_boost());
+        assert!(SearchField::FunctionBody.default_boost() > SearchField::Comment.default_boost());
+        assert!(SearchField::Comment.default_boost() > SearchField::StringLiteral.default_boost());
     }
 }

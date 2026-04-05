@@ -28,7 +28,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Read, Write},
     path::Path,
-    time::SystemTime,
 };
 
 use memmap2::Mmap;
@@ -652,17 +651,6 @@ fn remove_if_exists(path: &Path) -> crate::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(SearchError::Io(e)),
     }
-}
-
-/// Return the current Unix timestamp (seconds since epoch).
-///
-/// Falls back to 0 if `SystemTime` is before the Unix epoch (pathological case).
-#[allow(dead_code)]
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 // ============================================================================

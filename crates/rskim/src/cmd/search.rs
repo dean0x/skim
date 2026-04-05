@@ -162,35 +162,28 @@ fn find_repo_root() -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Return the per-repo index directory under the skim cache.
+/// Return the skim cache root directory.
 ///
 /// Uses `SKIM_CACHE_DIR` environment variable if set; otherwise uses
 /// the platform cache dir (`~/.cache/skim/` on Linux/macOS).
-fn get_index_dir(repo_root: &Path) -> anyhow::Result<PathBuf> {
-    let cache_dir = if let Ok(dir) = std::env::var("SKIM_CACHE_DIR") {
-        PathBuf::from(dir)
-    } else {
-        dirs::cache_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine platform cache directory"))?
-            .join("skim")
-    };
+fn skim_cache_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("SKIM_CACHE_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    dirs::cache_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not determine platform cache directory"))
+        .map(|d| d.join("skim"))
+}
 
-    // Hash the repo root path to produce a stable, collision-resistant directory name.
+/// Return the per-repo index directory under the skim cache.
+fn get_index_dir(repo_root: &Path) -> anyhow::Result<PathBuf> {
     let repo_hash = hash_path(repo_root);
-    Ok(cache_dir.join("search").join(repo_hash))
+    Ok(skim_cache_dir()?.join("search").join(repo_hash))
 }
 
 /// Delete the entire skim search cache directory.
 fn clear_search_cache() -> anyhow::Result<()> {
-    let cache_dir = if let Ok(dir) = std::env::var("SKIM_CACHE_DIR") {
-        PathBuf::from(dir)
-    } else {
-        dirs::cache_dir()
-            .ok_or_else(|| anyhow::anyhow!("could not determine platform cache directory"))?
-            .join("skim")
-    };
-
-    let search_cache = cache_dir.join("search");
+    let search_cache = skim_cache_dir()?.join("search");
     if search_cache.exists() {
         std::fs::remove_dir_all(&search_cache)?;
     }

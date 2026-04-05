@@ -22,7 +22,7 @@ use super::{
     index_format::{DeltaReader, IndexReader, Tombstones},
     ngram::extract_query_ngrams,
     scoring::Bm25Scorer,
-    Bm25Params, IndexMetadata, PostingEntry,
+    Bm25Params, IndexMetadata,
 };
 
 // ============================================================================
@@ -199,30 +199,3 @@ impl SearchIndex for LexicalSearchLayer {
     }
 }
 
-// ============================================================================
-// Helpers shared across query.rs and tests
-// ============================================================================
-
-/// Merge accumulated per-doc field TF entries, deduplicating by (doc_id, field)
-/// by summing TF values. This is used when the same n-gram appears in both the
-/// main index and the delta for the same doc/field.
-///
-/// Not currently used by the production pipeline (which simply appends delta
-/// entries), but available for callers that need deduplication.
-#[allow(dead_code)]
-fn merge_field_tfs(entries: &[(SearchField, u16)]) -> Vec<(SearchField, u16)> {
-    let mut merged: FxHashMap<SearchField, u16> = FxHashMap::default();
-    for (field, tf) in entries {
-        *merged.entry(*field).or_insert(0) = merged
-            .get(field)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(*tf);
-    }
-    merged.into_iter().collect()
-}
-
-// Silence unused-import warnings for PostingEntry (used implicitly through index_format).
-const _: () = {
-    let _ = std::mem::size_of::<PostingEntry>();
-};
