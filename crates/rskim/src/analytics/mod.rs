@@ -521,9 +521,10 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 // Fire-and-forget recording functions
 // ============================================================================
 
-/// Compute token savings as a percentage (0.0 when raw_tokens is zero).
+/// Compute token savings as a percentage (0.0 when raw_tokens is zero or
+/// compressed_tokens >= raw_tokens, which would indicate invalid data).
 pub(crate) fn savings_percentage(raw_tokens: usize, compressed_tokens: usize) -> f32 {
-    if raw_tokens == 0 {
+    if raw_tokens == 0 || compressed_tokens >= raw_tokens {
         0.0
     } else {
         (raw_tokens as f32 - compressed_tokens as f32) / raw_tokens as f32 * 100.0
@@ -572,7 +573,7 @@ pub(crate) fn record_fire_and_forget(
             command_type,
             original_cmd,
             raw_tokens,
-            compressed_tokens: comp_tokens,
+            compressed_tokens: comp_tokens.min(raw_tokens),
             savings_pct: savings_percentage(raw_tokens, comp_tokens),
             duration_ms: duration.as_millis() as u64,
             project_path,
@@ -661,7 +662,7 @@ pub(crate) fn try_record_command_with_counts(
         command_type,
         original_cmd,
         raw_tokens,
-        compressed_tokens,
+        compressed_tokens: compressed_tokens.min(raw_tokens),
         savings_pct: savings_percentage(raw_tokens, compressed_tokens),
         duration_ms: duration.as_millis() as u64,
         project_path: cwd,
@@ -1173,6 +1174,23 @@ mod tests {
             mode, 0o600,
             "DB file should have 0600 permissions, got {:o}",
             mode
+        );
+    }
+
+    // ========================================================================
+    // savings_percentage underflow guard tests
+    // ========================================================================
+
+    #[test]
+    fn test_negative_savings_clamped_at_recording() {
+        // savings_percentage should return 0.0 when compressed >= raw
+        assert_eq!(savings_percentage(10, 20), 0.0);
+        assert_eq!(savings_percentage(0, 5), 0.0);
+        assert_eq!(savings_percentage(10, 10), 0.0);
+        // Normal case still works
+        assert!(
+            (savings_percentage(100, 20) - 80.0).abs() < 0.01,
+            "expected ~80.0%"
         );
     }
 
