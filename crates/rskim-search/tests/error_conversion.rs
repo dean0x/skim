@@ -47,11 +47,11 @@ fn test_question_mark_skim_error() {
 
 #[test]
 fn test_search_error_non_exhaustive_match() {
-    let err = SearchError::IndexError("test".to_string());
+    let err = SearchError::IndexBuildError("test".to_string());
     // Wildcard arm required by #[non_exhaustive]
     match err {
         SearchError::Io(_) => panic!("wrong variant"),
-        SearchError::IndexError(_) => {} // expected
+        SearchError::IndexBuildError(_) => {} // expected
         SearchError::InvalidQuery(_) => panic!("wrong variant"),
         SearchError::CoreError(_) => panic!("wrong variant"),
         SearchError::SerializationError(_) => panic!("wrong variant"),

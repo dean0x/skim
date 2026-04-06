@@ -59,7 +59,7 @@ pub fn write_index(
     for (ngram, postings) in entries {
         let posting_offset = post_buf.len() as u64;
         let posting_length = u32::try_from(postings.len()).map_err(|_| {
-            SearchError::IndexError(format!(
+            SearchError::IndexBuildError(format!(
                 "posting list for ngram {:?} exceeds u32::MAX entries",
                 ngram
             ))

@@ -391,7 +391,7 @@ fn test_search_error_display_io() {
 
 #[test]
 fn test_search_error_display_index() {
-    let err = rskim_search::SearchError::IndexError("corrupt".to_string());
+    let err = rskim_search::SearchError::IndexBuildError("corrupt".to_string());
     assert_eq!(format!("{err}"), "Index error: corrupt");
 }
 

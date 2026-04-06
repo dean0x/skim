@@ -178,7 +178,7 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
 
         // Validate that doc_id fits in u32 (in practice never fails for real repos).
         let doc_id: u32 = u32::try_from(file_id.as_u64())
-            .map_err(|_| SearchError::IndexError("file_id exceeds u32::MAX".to_string()))?;
+            .map_err(|_| SearchError::IndexBuildError("file_id exceeds u32::MAX".to_string()))?;
 
         // --- Record mtime --------------------------------------------------
         let mtime = file_mtime_unix(path);

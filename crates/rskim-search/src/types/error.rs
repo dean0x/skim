@@ -10,9 +10,9 @@ pub enum SearchError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The index is corrupt, missing, or in an incompatible format.
+    /// An error occurred while building (writing) the index.
     #[error("Index error: {0}")]
-    IndexError(String),
+    IndexBuildError(String),
 
     /// The query is malformed or contains unsupported constructs.
     #[error("Invalid query: {0}")]
