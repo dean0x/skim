@@ -83,8 +83,9 @@ fn try_parse_structured(text: &str) -> Option<InfraResult> {
 
     append_http_status(text, &mut items);
 
-    if let Some(result) = try_build_error_result(text, &mut items) {
-        return Some(result);
+    match try_build_error_result(text, items) {
+        Ok(result) => return Some(result),
+        Err(returned_items) => items = returned_items,
     }
 
     append_size_and_file(text, &mut items);
@@ -118,18 +119,25 @@ fn append_http_status(text: &str, items: &mut Vec<InfraItem>) {
 }
 
 /// If an ERROR line is present, append the error item and return the finished result.
-fn try_build_error_result(text: &str, items: &mut Vec<InfraItem>) -> Option<InfraResult> {
-    let caps = RE_WGET_ERROR.captures(text)?;
+/// Takes ownership of `items`; on success returns `Ok(result)`, on no-match returns
+/// `Err(items)` so the caller can continue using the vector.
+fn try_build_error_result(
+    text: &str,
+    mut items: Vec<InfraItem>,
+) -> Result<InfraResult, Vec<InfraItem>> {
+    let Some(caps) = RE_WGET_ERROR.captures(text) else {
+        return Err(items);
+    };
     items.push(InfraItem {
         label: "error".to_string(),
         value: format!("{} {}", &caps[1], caps[2].trim()),
     });
     let summary = format!("ERROR {}", &caps[1]);
-    Some(InfraResult::new(
+    Ok(InfraResult::new(
         "wget".to_string(),
         "download".to_string(),
         summary,
-        items.clone(),
+        items,
     ))
 }
 
