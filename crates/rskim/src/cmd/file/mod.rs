@@ -137,6 +137,75 @@ pub(crate) fn run_file_tool(
 }
 
 // ============================================================================
+// Shared grep/rg regex constants and parser
+// ============================================================================
+
+/// Maximum matches shown per file (shared by grep and rg parsers).
+pub(super) const MAX_MATCHES_PER_FILE: usize = 5;
+
+/// Maximum number of files shown in output (shared by grep and rg parsers).
+pub(super) const MAX_FILES_SHOWN: usize = 50;
+
+/// Matches `file:line_number:content` format produced by both `grep -n` and `rg`.
+pub(super) static RE_FILE_LINE_CONTENT: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
+
+/// Parse `file:line:content` text output shared by grep and rg.
+///
+/// Groups matches by file path, capping per-file lines at `MAX_MATCHES_PER_FILE`
+/// and total files at `MAX_FILES_SHOWN`.
+///
+/// `tool` — binary name used in the result summary (e.g. `"grep"`, `"rg"`).
+/// `text` — raw stdout from the tool.
+/// `allow_stdin_fallback` — when `true`, lines that do not match the regex
+///   (and are not binary-file notices) are bucketed under `<stdin>` instead of
+///   being silently skipped.  grep uses `true` (output without `-n` has no
+///   line numbers); rg uses `false`.
+pub(super) fn try_parse_file_line_content(
+    tool: &str,
+    text: &str,
+    allow_stdin_fallback: bool,
+) -> Option<FileResult> {
+    let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut total_matches = 0usize;
+
+    for line in text.lines().take(MAX_INPUT_LINES) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(caps) = RE_FILE_LINE_CONTENT.captures(line) {
+            let file = caps[1].to_string();
+            let lineno = &caps[2];
+            let content = caps[3].trim();
+            total_matches += 1;
+            let file_entry = file_matches.entry(file).or_default();
+            if file_entry.len() < MAX_MATCHES_PER_FILE {
+                file_entry.push(format!("  :{lineno}: {content}"));
+            }
+        } else if allow_stdin_fallback && !line.starts_with("Binary file") {
+            // Plain match line without line number (grep without -n)
+            let file_entry = file_matches.entry("<stdin>".to_string()).or_default();
+            total_matches += 1;
+            if file_entry.len() < MAX_MATCHES_PER_FILE {
+                file_entry.push(format!("  {line}"));
+            }
+        }
+    }
+
+    if total_matches == 0 {
+        return None;
+    }
+
+    build_file_result(
+        tool,
+        total_matches,
+        file_matches,
+        MAX_FILES_SHOWN,
+        MAX_MATCHES_PER_FILE,
+    )
+}
+
+// ============================================================================
 // Shared result builder for grep/rg parsers
 // ============================================================================
 
@@ -188,6 +257,33 @@ pub(super) fn build_file_result(
         all_entries,
         footer,
     ))
+}
+
+/// Build the clap `Command` definition for shell completions.
+///
+/// Models `tool` as a positional value with the known tool names so that
+/// `skim file <TAB>` suggests `find`, `grep`, `ls`, `rg`, `tree`.
+pub(super) fn command() -> clap::Command {
+    clap::Command::new("file")
+        .about("Run file operation tools and parse output for AI context windows")
+        .arg(
+            clap::Arg::new("tool")
+                .value_name("TOOL")
+                .value_parser(["find", "grep", "ls", "rg", "tree"])
+                .help("File tool to run (find, grep, ls, rg, tree)"),
+        )
+        .arg(
+            clap::Arg::new("json")
+                .long("json")
+                .action(clap::ArgAction::SetTrue)
+                .help("Emit structured JSON output"),
+        )
+        .arg(
+            clap::Arg::new("show-stats")
+                .long("show-stats")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show token statistics"),
+        )
 }
 
 // ============================================================================

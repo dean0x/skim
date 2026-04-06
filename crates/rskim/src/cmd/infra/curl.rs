@@ -27,6 +27,12 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
 /// Maximum number of source fields in a JSON response before a truncation notice is added.
 const MAX_ITEMS: usize = 100;
 
+/// Maximum byte length of JSON input accepted for Tier 1 parsing.
+///
+/// Inputs larger than this are skipped and fall through to the regex tier,
+/// preventing unbounded allocation on pathological or adversarial responses.
+const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 static RE_CURL_HTTP_STATUS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^< HTTP/[\d.]+ (\d{3})\s*(.*)").unwrap());
 
@@ -111,6 +117,9 @@ fn json_value_to_string(val: &Value) -> String {
 fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() > MAX_JSON_BYTES {
         return None;
     }
 

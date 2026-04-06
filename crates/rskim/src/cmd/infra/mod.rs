@@ -131,6 +131,33 @@ pub(crate) fn run_infra_tool(
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
+/// Build the clap `Command` definition for shell completions.
+///
+/// Models `tool` as a positional value with the known tool names so that
+/// `skim infra <TAB>` suggests `aws`, `curl`, `gh`, `wget`.
+pub(super) fn command() -> clap::Command {
+    clap::Command::new("infra")
+        .about("Run infrastructure tools and parse output for AI context windows")
+        .arg(
+            clap::Arg::new("tool")
+                .value_name("TOOL")
+                .value_parser(["aws", "curl", "gh", "wget"])
+                .help("Infrastructure tool to run (aws, curl, gh, wget)"),
+        )
+        .arg(
+            clap::Arg::new("json")
+                .long("json")
+                .action(clap::ArgAction::SetTrue)
+                .help("Emit structured JSON output"),
+        )
+        .arg(
+            clap::Arg::new("show-stats")
+                .long("show-stats")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show token statistics"),
+        )
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================

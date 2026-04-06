@@ -30,6 +30,12 @@ const METADATA_KEYS: &[&str] = &["ResponseMetadata", "NextToken", "RequestId"];
 /// Maximum number of items surfaced from arrays or tables (prevents runaway output).
 const MAX_ITEMS: usize = 100;
 
+/// Maximum byte length of JSON input accepted for Tier 1 parsing.
+///
+/// Inputs larger than this are skipped and fall through to the regex tier,
+/// preventing unbounded allocation on pathological or adversarial responses.
+const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 static RE_AWS_TABLE_ROW: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\|\s+(\S[^|]+\S)\s+\|").unwrap());
 
@@ -87,6 +93,9 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 fn try_parse_json(stdout: &str) -> Option<InfraResult> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() || (!trimmed.starts_with('{') && !trimmed.starts_with('[')) {
+        return None;
+    }
+    if trimmed.len() > MAX_JSON_BYTES {
         return None;
     }
 
@@ -197,16 +206,19 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for line in text.lines() {
+    'lines: for line in text.lines() {
         // AWS table format: | value1  | value2 |
         if line.trim_start().starts_with('|') {
             for caps in RE_AWS_TABLE_ROW.captures_iter(line) {
+                if items.len() >= MAX_ITEMS {
+                    break 'lines;
+                }
                 let cell = caps[1].trim().to_string();
                 // Skip header-like rows and separators
                 if cell.chars().all(|c| c == '-' || c == '+') {
                     continue;
                 }
-                if seen.insert(cell.clone()) && !cell.is_empty() && items.len() < MAX_ITEMS {
+                if seen.insert(cell.clone()) && !cell.is_empty() {
                     items.push(InfraItem {
                         label: format!("item-{}", items.len() + 1),
                         value: cell,

@@ -95,10 +95,19 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 /// (e.g., repositories with thousands of open issues or PRs).
 const MAX_ITEMS: usize = 100;
 
+/// Maximum byte length of JSON input accepted for Tier 1 parsing.
+///
+/// Inputs larger than this are skipped and fall through to the regex tier,
+/// preventing unbounded allocation on pathological or adversarial responses.
+const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Parse gh JSON array output.
 fn try_parse_json(stdout: &str) -> Option<InfraResult> {
     let trimmed = stdout.trim();
     if !trimmed.starts_with('[') {
+        return None;
+    }
+    if trimmed.len() > MAX_JSON_BYTES {
         return None;
     }
 
@@ -164,6 +173,9 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
 
     for line in text.lines() {
+        if items.len() >= MAX_ITEMS {
+            break;
+        }
         if let Some(caps) = RE_GH_TAB_ROW.captures(line) {
             let num = caps[1].to_string();
             let rest = caps[2].trim().to_string();

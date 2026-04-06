@@ -24,6 +24,12 @@ use crate::runner::CommandOutput;
 
 use super::{run_file_tool, FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
 
+/// Maximum byte length of JSON input accepted for Tier 1 tree JSON parsing.
+///
+/// Inputs larger than this are skipped and fall through to the regex tier,
+/// preventing unbounded allocation on pathological or adversarial responses.
+const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 const CONFIG_LS: FileToolConfig<'static> = FileToolConfig {
     program: "ls",
     env_overrides: &[],
@@ -220,6 +226,9 @@ fn parse_tree(output: &CommandOutput) -> ParseResult<FileResult> {
 fn try_parse_tree_json(stdout: &str) -> Option<FileResult> {
     let trimmed = stdout.trim();
     if !trimmed.starts_with('[') && !trimmed.starts_with('{') {
+        return None;
+    }
+    if trimmed.len() > MAX_JSON_BYTES {
         return None;
     }
     let json: serde_json::Value = serde_json::from_str(trimmed).ok()?;

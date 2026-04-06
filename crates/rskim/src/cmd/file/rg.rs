@@ -6,31 +6,22 @@
 //! - **Tier 3 (Passthrough)**: Raw output
 
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
-
-use regex::Regex;
 
 use crate::cmd::user_has_flag;
 use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{build_file_result, run_file_tool, FileToolConfig, MAX_INPUT_LINES};
+use super::{
+    build_file_result, run_file_tool, try_parse_file_line_content, FileToolConfig,
+    MAX_FILES_SHOWN, MAX_INPUT_LINES, MAX_MATCHES_PER_FILE,
+};
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {
     program: "rg",
     env_overrides: &[],
     install_hint: "Install ripgrep: https://github.com/BurntSushi/ripgrep",
 };
-
-/// Maximum matches shown per file.
-const MAX_MATCHES_PER_FILE: usize = 5;
-
-/// Maximum number of files shown in output.
-const MAX_FILES_SHOWN: usize = 50;
-
-/// Matches `file:line_number:content` grep-style output from rg.
-static RE_RG_GREP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
 
 /// Run `skim file rg [args...]`.
 pub(crate) fn run(
@@ -158,37 +149,12 @@ fn try_parse_json(stdout: &str) -> Option<FileResult> {
 // ============================================================================
 
 /// Parse rg text output in `file:line:content` format.
+///
+/// Delegates to the shared `try_parse_file_line_content` in `file/mod.rs`.
+/// `allow_stdin_fallback = false` because rg always includes file paths and
+/// line numbers in its text output.
 fn try_parse_regex(text: &str) -> Option<FileResult> {
-    let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut total_matches = 0usize;
-
-    for line in text.lines().take(MAX_INPUT_LINES) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(caps) = RE_RG_GREP.captures(line) {
-            let file = caps[1].to_string();
-            let lineno = &caps[2];
-            let content = caps[3].trim();
-            total_matches += 1;
-            let file_entry = file_matches.entry(file).or_default();
-            if file_entry.len() < MAX_MATCHES_PER_FILE {
-                file_entry.push(format!("  :{lineno}: {content}"));
-            }
-        }
-    }
-
-    if total_matches == 0 {
-        return None;
-    }
-
-    build_file_result(
-        "rg",
-        total_matches,
-        file_matches,
-        MAX_FILES_SHOWN,
-        MAX_MATCHES_PER_FILE,
-    )
+    try_parse_file_line_content("rg", text, false)
 }
 
 // ============================================================================

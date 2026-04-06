@@ -7,16 +7,11 @@
 //! - **Tier 1 (Full)**: Parse `file:line:content` format, group by file
 //! - **Tier 2 (Passthrough)**: Raw output
 
-use std::collections::BTreeMap;
-use std::sync::LazyLock;
-
-use regex::Regex;
-
 use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{build_file_result, run_file_tool, FileToolConfig, MAX_INPUT_LINES};
+use super::{run_file_tool, try_parse_file_line_content, FileToolConfig, MAX_MATCHES_PER_FILE};
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {
     program: "grep",
@@ -24,27 +19,17 @@ const CONFIG: FileToolConfig<'static> = FileToolConfig {
     install_hint: "grep is typically pre-installed. For better compression, install ripgrep: https://github.com/BurntSushi/ripgrep",
 };
 
-/// Maximum matches shown per file.
-const MAX_MATCHES_PER_FILE: usize = 5;
-
-/// Maximum number of files shown in output.
-const MAX_FILES_SHOWN: usize = 50;
-
-/// Matches `file:line_number:content` format from `grep -n` output.
-static RE_GREP_MATCH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
-
 /// Run `skim file grep [args...]`.
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    // No flag injection for grep — flags are too varied
+    // No flag injection for grep -- flags are too varied
     run_file_tool(CONFIG, args, show_stats, json_output, |_| {}, parse_impl)
 }
 
-/// Two-tier parse function: Tier 1 regex → Passthrough.
+/// Two-tier parse function: Tier 1 regex -> Passthrough.
 ///
 /// grep has no JSON output mode, so regex is the best available format
 /// and is returned as `Full` (not Degraded).
@@ -61,45 +46,12 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
 // ============================================================================
 
 /// Group grep matches by file, limit per-file and total-file counts.
+///
+/// Delegates to the shared `try_parse_file_line_content` in `file/mod.rs`.
+/// `allow_stdin_fallback = true` so that plain lines (grep without `-n`) are
+/// bucketed under `<stdin>` rather than silently dropped.
 fn try_parse_regex(text: &str) -> Option<FileResult> {
-    // BTreeMap maintains stable file ordering for deterministic output
-    let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut total_matches = 0usize;
-
-    for line in text.lines().take(MAX_INPUT_LINES) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(caps) = RE_GREP_MATCH.captures(line) {
-            let file = caps[1].to_string();
-            let lineno = &caps[2];
-            let content = caps[3].trim();
-            total_matches += 1;
-            let file_entry = file_matches.entry(file).or_default();
-            if file_entry.len() < MAX_MATCHES_PER_FILE {
-                file_entry.push(format!("  :{lineno}: {content}"));
-            }
-        } else if !line.starts_with("Binary file") {
-            // Plain match line without line number (grep without -n)
-            let file_entry = file_matches.entry("<stdin>".to_string()).or_default();
-            total_matches += 1;
-            if file_entry.len() < MAX_MATCHES_PER_FILE {
-                file_entry.push(format!("  {line}"));
-            }
-        }
-    }
-
-    if total_matches == 0 {
-        return None;
-    }
-
-    build_file_result(
-        "grep",
-        total_matches,
-        file_matches,
-        MAX_FILES_SHOWN,
-        MAX_MATCHES_PER_FILE,
-    )
+    try_parse_file_line_content("grep", text, true)
 }
 
 // ============================================================================
@@ -171,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_max_matches_per_file_cap() {
-        // Build 10 matches for same file — should cap at MAX_MATCHES_PER_FILE
+        // Build 10 matches for same file -- should cap at MAX_MATCHES_PER_FILE
         let input: String = (1..=10)
             .map(|i| format!("src/big.rs:{i}:match line {i}\n"))
             .collect();
