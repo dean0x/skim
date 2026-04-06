@@ -5,6 +5,7 @@
 //! JSON output (`--format json`), cost estimates (`--cost`), and data clearing
 //! (`--clear`).
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
@@ -150,15 +151,17 @@ fn run_json(
     if show_cost {
         let pricing = PricingModel::from_env_or_default();
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
-        root.as_object_mut().unwrap().insert(
-            "cost_estimate".to_string(),
-            serde_json::json!({
-                "model": pricing.model_name,
-                "input_cost_per_mtok": pricing.input_cost_per_mtok,
-                "estimated_savings_usd": (cost_savings * 100.0).round() / 100.0,
-                "tokens_saved": summary.tokens_saved,
-            }),
-        );
+        if let Some(obj) = root.as_object_mut() {
+            obj.insert(
+                "cost_estimate".to_string(),
+                serde_json::json!({
+                    "model": pricing.model_name,
+                    "input_cost_per_mtok": pricing.input_cost_per_mtok,
+                    "estimated_savings_usd": (cost_savings * 100.0).round() / 100.0,
+                    "tokens_saved": summary.tokens_saved,
+                }),
+            );
+        }
     }
 
     writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
@@ -183,20 +186,26 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// Apply the standard efficiency color to a pre-formatted string.
+///
+/// Green for >=70%, yellow for >=40%, red below 40%.
+fn apply_efficiency_color(s: String, pct: f64) -> ColoredString {
+    if pct >= 70.0 {
+        s.green()
+    } else if pct >= 40.0 {
+        s.yellow()
+    } else {
+        s.red()
+    }
+}
+
 /// Colorise a savings percentage with ANSI codes.
 ///
 /// Clamps to [0.0, 100.0] then formats right-aligned in a 6-char field
 /// before applying color so ANSI escape sequences do not affect alignment.
 fn color_pct(pct: f64) -> ColoredString {
     let clamped = pct.clamp(0.0, 100.0);
-    let s = format!("{clamped:>5.1}%");
-    if clamped >= 70.0 {
-        s.green()
-    } else if clamped >= 40.0 {
-        s.yellow()
-    } else {
-        s.red()
-    }
+    apply_efficiency_color(format!("{clamped:>5.1}%"), clamped)
 }
 
 /// Render a block-character progress bar.
@@ -207,14 +216,7 @@ fn render_bar(pct: f64, width: usize) -> String {
     let clamped = pct.clamp(0.0, 100.0);
     let filled = ((clamped / 100.0) * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
-    let filled_str = "\u{2588}".repeat(filled);
-    let colored_fill: ColoredString = if clamped >= 70.0 {
-        filled_str.green()
-    } else if clamped >= 40.0 {
-        filled_str.yellow()
-    } else {
-        filled_str.red()
-    };
+    let colored_fill = apply_efficiency_color("\u{2588}".repeat(filled), clamped);
     format!("[{}{}]", colored_fill, "\u{2591}".repeat(empty))
 }
 
@@ -235,7 +237,6 @@ fn render_sparkline(daily: &[DailyStats]) -> String {
     let window: Vec<&DailyStats> = sorted.into_iter().rev().take(14).rev().collect();
 
     // Build a date-indexed map of tokens_saved.
-    use std::collections::HashMap;
     let mut by_date: HashMap<&str, u64> = HashMap::new();
     for entry in &window {
         by_date.insert(entry.date.as_str(), entry.tokens_saved);
@@ -398,14 +399,8 @@ fn run_dashboard(
         color_pct(summary.avg_savings_pct)
     )?;
 
-    // Efficiency meter using render_bar
-    let bar = render_bar(summary.avg_savings_pct, 20);
-    writeln!(
-        w,
-        "  {} {}",
-        bar,
-        color_pct(summary.avg_savings_pct)
-    )?;
+    // Efficiency meter
+    writeln!(w, "  {}", render_bar(summary.avg_savings_pct, 20))?;
     writeln!(w)?;
 
     // ── Daily Trend ──────────────────────────────────────────────────────────
@@ -486,17 +481,15 @@ fn run_dashboard(
 
     // ── Parse Quality ─────────────────────────────────────────────────────────
     let tier = db.query_tier_distribution(since)?;
+    writeln!(w, "{}", section_header("Parse Quality"))?;
     if tier.full_pct > 0.0 || tier.degraded_pct > 0.0 || tier.passthrough_pct > 0.0 {
-        writeln!(w, "{}", section_header("Parse Quality"))?;
         writeln!(w, "  Full:        {:.1}%", tier.full_pct)?;
         writeln!(w, "  Degraded:    {:.1}%", tier.degraded_pct)?;
         writeln!(w, "  Passthrough: {:.1}%", tier.passthrough_pct)?;
-        writeln!(w)?;
     } else {
-        writeln!(w, "{}", section_header("Parse Quality"))?;
         writeln!(w, "  No tier data recorded yet.")?;
-        writeln!(w)?;
     }
+    writeln!(w)?;
 
     // ── Cost Estimates ────────────────────────────────────────────────────────
     if show_cost {
