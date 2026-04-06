@@ -21,6 +21,13 @@ const DELTA_RECORD_SIZE: usize = 8 + POSTING_ENTRY_SIZE;
 
 const DELTA_FILE: &str = "lexical.delta";
 
+/// Maximum delta file size in bytes (100 MB).
+///
+/// At 20 bytes per record this allows up to 5 million incremental postings.
+/// A legitimate delta file beyond this size indicates either corruption or a
+/// runaway writer that should have triggered a full rebuild instead.
+const MAX_DELTA_BYTES: u64 = 100_000_000;
+
 /// Append-only delta segment for incremental index updates.
 ///
 /// New postings are appended here instead of rebuilding the full index on every
@@ -79,7 +86,8 @@ impl DeltaReader {
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError::Io`] if the file exists but cannot be opened or mapped.
+    /// - [`SearchError::Io`] if the file exists but cannot be opened or mapped.
+    /// - [`SearchError::CorruptedIndex`] if the file exceeds [`MAX_DELTA_BYTES`].
     #[must_use = "the opened DeltaReader must be used to scan entries"]
     pub fn open(dir: &Path) -> crate::Result<Option<Self>> {
         let path = dir.join(DELTA_FILE);
@@ -92,6 +100,17 @@ impl DeltaReader {
         let metadata = file.metadata().map_err(SearchError::Io)?;
         if metadata.len() == 0 {
             return Ok(None);
+        }
+
+        if metadata.len() > MAX_DELTA_BYTES {
+            return Err(SearchError::CorruptedIndex {
+                path: path.display().to_string(),
+                reason: format!(
+                    "delta file is {} bytes, exceeds maximum of {} bytes",
+                    metadata.len(),
+                    MAX_DELTA_BYTES
+                ),
+            });
         }
 
         // SAFETY: The delta file is opened read-only and is only written via
