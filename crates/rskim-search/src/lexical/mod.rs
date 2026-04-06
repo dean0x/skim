@@ -18,6 +18,7 @@ pub mod index_format;
 pub mod ngram;
 pub mod query;
 pub mod scoring;
+pub(crate) mod walker;
 
 use std::path::PathBuf;
 

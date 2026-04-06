@@ -18,6 +18,7 @@ use super::{
 };
 
 use super::ngram::extract_ngrams;
+use super::walker::{walk_and_classify, WalkContext};
 
 // ============================================================================
 // LexicalLayerBuilder
@@ -113,14 +114,14 @@ impl LexicalLayerBuilder {
             None => return,
         };
 
-        walk_and_classify(
-            tree.root_node(),
-            content,
+        let mut ctx = WalkContext {
+            source: content,
             classifier,
             doc_id,
-            &mut self.postings,
+            postings: &mut self.postings,
             doc_len,
-        );
+        };
+        walk_and_classify(tree.root_node(), &mut ctx);
     }
 
     /// Index `content` using the serde-based path (JSON, YAML, TOML).
@@ -293,71 +294,6 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
 }
 
 // ============================================================================
-// Tree-sitter node walker
-// ============================================================================
-
-/// Maximum AST traversal depth. Prevents stack overflow on pathologically
-/// deep or adversarial ASTs. 128 levels covers all realistic source files.
-const MAX_AST_DEPTH: u32 = 128;
-
-/// Walk a tree-sitter AST, classifying and indexing each node up to `MAX_AST_DEPTH`.
-fn walk_and_classify(
-    node: tree_sitter::Node<'_>,
-    source: &str,
-    classifier: &dyn FieldClassifier,
-    doc_id: u32,
-    postings: &mut FxHashMap<Ngram, Vec<PostingEntry>>,
-    doc_len: &mut u32,
-) {
-    walk_and_classify_inner(node, source, classifier, doc_id, postings, doc_len, 0);
-}
-
-fn walk_and_classify_inner(
-    node: tree_sitter::Node<'_>,
-    source: &str,
-    classifier: &dyn FieldClassifier,
-    doc_id: u32,
-    postings: &mut FxHashMap<Ngram, Vec<PostingEntry>>,
-    doc_len: &mut u32,
-    depth: u32,
-) {
-    if depth >= MAX_AST_DEPTH {
-        return;
-    }
-
-    if let Some(field) = classifier.classify_node(&node, source) {
-        if let Ok(text) = node.utf8_text(source.as_bytes()) {
-            let ngrams = extract_ngrams(text);
-            for (ngram, weight) in &ngrams {
-                let entry = PostingEntry {
-                    doc_id,
-                    field_id: field.as_u8(),
-                    position: node.start_byte() as u32,
-                    tf: weight.max(1.0).min(f32::from(u16::MAX)) as u16,
-                };
-                postings.entry(*ngram).or_default().push(entry);
-            }
-            *doc_len = doc_len.saturating_add(ngrams.len() as u32);
-        }
-    }
-
-    // Recurse into children.
-    for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            walk_and_classify_inner(
-                child,
-                source,
-                classifier,
-                doc_id,
-                postings,
-                doc_len,
-                depth + 1,
-            );
-        }
-    }
-}
-
-// ============================================================================
 // Helper functions
 // ============================================================================
 
@@ -415,12 +351,4 @@ mod tests {
         assert!(501 > 500); // confirms skip condition
     }
 
-    #[test]
-    fn max_ast_depth_is_reasonable() {
-        assert!(
-            MAX_AST_DEPTH >= 64,
-            "depth limit too low for realistic ASTs"
-        );
-        assert!(MAX_AST_DEPTH <= 512, "depth limit suspiciously high");
-    }
 }
