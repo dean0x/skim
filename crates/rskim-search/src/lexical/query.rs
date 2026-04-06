@@ -40,9 +40,9 @@ const MAX_METADATA_BYTES: u64 = 100_000_000;
 /// Constructed by [`super::builder::LexicalLayerBuilder::build`] or opened
 /// directly via [`LexicalSearchLayer::open`].
 pub struct LexicalSearchLayer {
-    pub(crate) reader: IndexReader,
-    pub(crate) scorer: Bm25Scorer,
-    pub(crate) metadata: IndexMetadata,
+    reader: IndexReader,
+    scorer: Bm25Scorer,
+    metadata: IndexMetadata,
     /// Tombstoned doc_ids, loaded once at open time.
     tombstones: Tombstones,
     /// Delta reader (if a delta file is present), loaded once at open time.
