@@ -66,7 +66,7 @@ struct ResolvedResult {
 
 /// Resolve a `(FileId, score)` pair to a path string and snippet.
 fn resolve_result(
-    layer: &LexicalSearchLayer,
+    layer: &dyn SearchIndex,
     file_id: FileId,
     score: f32,
     query_text: &str,
@@ -94,7 +94,7 @@ fn resolve_result(
 
 /// Print results as human-readable text to stdout.
 pub(super) fn print_text_results(
-    layer: &LexicalSearchLayer,
+    layer: &dyn SearchIndex,
     results: &[(FileId, f32)],
     query_text: &str,
     repo_root: &Path,
@@ -116,7 +116,7 @@ pub(super) fn print_text_results(
 
 /// Print results as JSON to stdout.
 pub(super) fn print_json_results(
-    layer: &LexicalSearchLayer,
+    layer: &dyn SearchIndex,
     results: &[(FileId, f32)],
     query_text: &str,
     repo_root: &Path,
