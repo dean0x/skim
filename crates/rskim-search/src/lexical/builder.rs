@@ -51,7 +51,7 @@ impl LexicalLayerBuilder {
     /// Create a new builder targeting `index_dir`.
     ///
     /// `repo_root` is stored in metadata for cross-repo collision detection.
-    #[must_use]
+    #[must_use = "the builder must be used to construct an index; dropping it discards all accumulated state"]
     pub fn new(index_dir: PathBuf, repo_root: PathBuf) -> Self {
         Self {
             index_dir,
@@ -144,12 +144,12 @@ impl LexicalLayerBuilder {
                 let entry = PostingEntry {
                     doc_id,
                     field_id: field.as_u8(),
-                    position: range.start as u32,
+                    position: u32::try_from(range.start).unwrap_or(u32::MAX),
                     tf: weight.max(1.0).min(f32::from(u16::MAX)) as u16,
                 };
                 self.postings.entry(*ngram).or_default().push(entry);
             }
-            *doc_len = doc_len.saturating_add(ngrams.len() as u32);
+            *doc_len = doc_len.saturating_add(u32::try_from(ngrams.len()).unwrap_or(u32::MAX));
         }
     }
 }
@@ -185,6 +185,11 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
         self.file_mtimes.push((path.to_path_buf(), mtime));
 
         // --- Extract and accumulate postings --------------------------------
+        // Reserve capacity on first file to reduce rehash overhead.
+        // Estimate: ~1 unique ngram per 4 bytes of source is a conservative upper bound.
+        if self.postings.is_empty() {
+            self.postings.reserve(content.len() / 4);
+        }
         let mut doc_len: u32 = 0;
 
         // Populate the classifier cache entry if absent; `None` means serde-based language.
@@ -217,7 +222,7 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
                 };
                 self.postings.entry(*ngram).or_default().push(entry);
             }
-            doc_len = doc_len.saturating_add(fallback_ngrams.len() as u32);
+            doc_len = doc_len.saturating_add(u32::try_from(fallback_ngrams.len()).unwrap_or(u32::MAX));
         }
 
         self.doc_lengths.push(doc_len);
