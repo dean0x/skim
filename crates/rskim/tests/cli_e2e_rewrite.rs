@@ -919,3 +919,133 @@ fn test_rewrite_pip3_list() {
         .success()
         .stdout(predicate::str::contains("skim pkg pip list"));
 }
+
+// ============================================================================
+// Phase 8: Wave B rewrite rules (#116)
+// ============================================================================
+
+#[test]
+fn test_rewrite_prettier_check() {
+    skim_cmd()
+        .args(["rewrite", "prettier", "--check", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint prettier"));
+}
+
+#[test]
+fn test_rewrite_rustfmt_check() {
+    skim_cmd()
+        .args(["rewrite", "rustfmt", "--check", "src/main.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint rustfmt"));
+}
+
+#[test]
+fn test_rewrite_gh_pr_list() {
+    skim_cmd()
+        .args(["rewrite", "gh", "pr", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim infra gh"));
+}
+
+#[test]
+fn test_rewrite_aws_s3_ls() {
+    skim_cmd()
+        .args(["rewrite", "aws", "s3", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim infra aws"));
+}
+
+#[test]
+fn test_rewrite_curl_api() {
+    skim_cmd()
+        .args(["rewrite", "curl", "https://api.example.com"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim infra curl"));
+}
+
+#[test]
+fn test_rewrite_wget_file() {
+    skim_cmd()
+        .args(["rewrite", "wget", "https://example.com/f.tar.gz"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim infra wget"));
+}
+
+#[test]
+fn test_rewrite_find_name() {
+    skim_cmd()
+        .args(["rewrite", "find", ".", "-name", "*.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file find"));
+}
+
+#[test]
+fn test_rewrite_ls_la() {
+    skim_cmd()
+        .args(["rewrite", "ls", "-la"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file ls"));
+}
+
+#[test]
+fn test_rewrite_tree_bare() {
+    skim_cmd()
+        .args(["rewrite", "tree"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file tree"));
+}
+
+#[test]
+fn test_rewrite_grep_r() {
+    skim_cmd()
+        .args(["rewrite", "grep", "-r", "TODO", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file grep"));
+}
+
+#[test]
+fn test_rewrite_rg_pattern() {
+    skim_cmd()
+        .args(["rewrite", "rg", "pattern"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file rg"));
+}
+
+#[test]
+fn test_rewrite_find_exec_skipped() {
+    // -exec is in skip_if_flag_prefix for find: no match = exit 1
+    skim_cmd()
+        .args(["rewrite", "find", ".", "-exec", "rm", "{}", ";"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_rg_json_skipped() {
+    // --json is in skip_if_flag_prefix for rg: no match = exit 1
+    skim_cmd()
+        .args(["rewrite", "rg", "--json", "pattern"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_rewrite_gh_json_skipped() {
+    // --json is in skip_if_flag_prefix for gh pr list: no match = exit 1
+    skim_cmd()
+        .args(["rewrite", "gh", "pr", "list", "--json", "title"])
+        .assert()
+        .failure();
+}

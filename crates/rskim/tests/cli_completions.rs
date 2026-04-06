@@ -237,3 +237,71 @@ fn test_completions_help() {
         .success()
         .stdout(predicate::str::contains("Generate shell completion"));
 }
+
+// ============================================================================
+// Nested subcommand completions (#116)
+// ============================================================================
+
+#[test]
+fn test_completions_include_file_subcommands() {
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["completions", "bash"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // file subcommand and its tools should appear in completions
+    assert!(
+        stdout.contains("file"),
+        "Bash completions should include 'file' subcommand"
+    );
+    // Check for at least some known file tools
+    for tool in &["find", "grep", "ls", "rg", "tree"] {
+        assert!(
+            stdout.contains(tool),
+            "Bash completions should include '{tool}' as file tool"
+        );
+    }
+}
+
+#[test]
+fn test_completions_include_infra_subcommands() {
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["completions", "bash"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("infra"),
+        "Bash completions should include 'infra' subcommand"
+    );
+    for tool in &["aws", "curl", "gh", "wget"] {
+        assert!(
+            stdout.contains(tool),
+            "Bash completions should include '{tool}' as infra tool"
+        );
+    }
+}
+
+#[test]
+fn test_completions_include_log_flags() {
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["completions", "bash"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("log"),
+        "Bash completions should include 'log' subcommand"
+    );
+    // Check for log-specific flags
+    assert!(
+        stdout.contains("no-dedup") || stdout.contains("--no-dedup"),
+        "Bash completions should include log's --no-dedup flag"
+    );
+}
