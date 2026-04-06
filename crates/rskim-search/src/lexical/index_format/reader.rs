@@ -140,7 +140,19 @@ impl IndexReader {
             )));
         }
 
-        // Validate .skpost size: must be divisible by POSTING_ENTRY_SIZE
+        // Validate .skpost size: must be below the hard cap and divisible by POSTING_ENTRY_SIZE.
+        //
+        // MAX_SKPOST_BYTES is a sanity guard against crafted indexes that claim an absurdly
+        // large posting file. 4 GiB covers ~357 million PostingEntry records (12 bytes each),
+        // which is well beyond any real-world repository.
+        const MAX_SKPOST_BYTES: usize = 4_000_000_000;
+        if post_mmap.len() > MAX_SKPOST_BYTES {
+            return Err(post_corrupted(format!(
+                ".skpost size {} exceeds maximum allowed size {} bytes",
+                post_mmap.len(),
+                MAX_SKPOST_BYTES
+            )));
+        }
         if post_mmap.len() % POSTING_ENTRY_SIZE != 0 {
             return Err(post_corrupted(format!(
                 ".skpost size {} is not a multiple of posting entry size {}",
@@ -242,7 +254,12 @@ impl IndexReader {
     fn read_postings(&self, entry: &IndexEntry) -> Vec<PostingEntry> {
         // `posting_offset` is already a byte offset into .skpost.
         let start = entry.posting_offset as usize;
-        let count = entry.posting_length as usize;
+        // Cap the capacity hint against the maximum number of entries that could
+        // physically exist in the mapped file. An untrusted index could claim
+        // posting_length = u32::MAX, which would attempt a ~51 GiB allocation
+        // before any bounds check fires. Capping here prevents that.
+        let max_possible = self.post_mmap.len() / POSTING_ENTRY_SIZE;
+        let count = (entry.posting_length as usize).min(max_possible);
         let file_count = self.header.file_count;
 
         let mut result = Vec::with_capacity(count);
