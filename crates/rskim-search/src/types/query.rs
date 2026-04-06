@@ -111,7 +111,7 @@ pub struct TemporalFlags {
 ///
 /// let q = SearchQuery::text("parse_file").with_limit(20);
 /// ```
-#[must_use]
+#[must_use = "a SearchQuery does nothing unless passed to a search index"]
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     /// Free-text query string for lexical matching.

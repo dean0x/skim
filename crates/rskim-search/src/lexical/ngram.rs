@@ -36,7 +36,7 @@ const INTERIOR_WEIGHT: f32 = 1.0;
 /// - All whitespace → empty vec
 /// - Unicode multi-byte chars → byte-level bigrams (valid for UTF-8 byte sequences)
 /// - Repeated bigrams → accumulated weight in result
-#[must_use]
+#[must_use = "returns the extracted bigrams with weights; ignoring them discards indexing data"]
 pub fn extract_ngrams(text: &str) -> Vec<(Ngram, f32)> {
     if text.len() < 2 {
         return Vec::new();
@@ -90,7 +90,7 @@ pub fn extract_ngrams(text: &str) -> Vec<(Ngram, f32)> {
 /// - Empty query → empty vec
 /// - Single byte → empty vec (no bigram)
 /// - All whitespace → empty vec
-#[must_use]
+#[must_use = "returns the query bigrams needed for index lookup; ignoring them skips the search"]
 pub fn extract_query_ngrams(query: &str) -> Vec<(Ngram, f32)> {
     // Reject queries that are entirely whitespace — they carry no searchable signal.
     let trimmed = query.trim();

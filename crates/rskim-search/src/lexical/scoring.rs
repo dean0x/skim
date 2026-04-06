@@ -29,7 +29,7 @@ pub struct Bm25Scorer {
 
 impl Bm25Scorer {
     /// Create a new scorer from BM25 parameters and the total number of indexed documents.
-    #[must_use]
+    #[must_use = "the scorer must be used to compute BM25F relevance scores; dropping it is always a bug"]
     pub fn new(params: Bm25Params, doc_count: u64) -> Self {
         Self { params, doc_count }
     }

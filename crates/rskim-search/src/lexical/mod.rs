@@ -40,7 +40,7 @@ pub struct Ngram(u64);
 
 impl Ngram {
     /// Hash a byte slice into an `Ngram` using FxHash.
-    #[must_use]
+    #[must_use = "the resulting Ngram hash must be used for indexing or lookup"]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self(fxhash_bytes(bytes))
     }
@@ -95,7 +95,7 @@ impl PostingEntry {
     /// Deserialize from a 12-byte little-endian slice.
     ///
     /// Returns `None` if the slice is too short.
-    #[must_use]
+    #[must_use = "returns None on short input; ignoring loses the deserialized entry"]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < POSTING_ENTRY_SIZE {
             return None;
@@ -151,7 +151,7 @@ impl IndexHeader {
     /// Deserialize from a 32-byte little-endian slice.
     ///
     /// Returns `None` if the slice is too short.
-    #[must_use]
+    #[must_use = "returns None on short or invalid input; ignoring loses the parsed header"]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < INDEX_HEADER_SIZE {
             return None;

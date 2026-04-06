@@ -220,7 +220,7 @@ impl IndexReader {
     ///
     /// Returns the decoded posting entries, filtering out any with invalid
     /// `field_id` values. Returns `None` if the n-gram is not present.
-    #[must_use]
+    #[must_use = "returns the posting list for scoring; ignoring it silently skips matching documents"]
     pub fn lookup(&self, ngram: Ngram) -> Option<Vec<PostingEntry>> {
         let target_hash = ngram.as_u64();
 
