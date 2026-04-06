@@ -358,13 +358,20 @@ fn run_dashboard(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Header
+    // ── Header ──────────────────────────────────────────────────────────────
     let period = since_str.map_or("all time".to_string(), |s| format!("last {s}"));
-    writeln!(w, "{}", format!("Token Analytics ({period})").bold())?;
+    let border = "\u{2550}".repeat(78);
+    writeln!(w, "{}", border.bold())?;
+    writeln!(
+        w,
+        "{}",
+        format!("  skim Token Analytics ({period})").bold()
+    )?;
+    writeln!(w, "{}", border.bold())?;
     writeln!(w)?;
 
-    // Summary section
-    writeln!(w, "{}", "Summary".bold().underline())?;
+    // ── Summary ─────────────────────────────────────────────────────────────
+    writeln!(w, "{}", section_header("Summary"))?;
     writeln!(
         w,
         "  Invocations:    {}",
@@ -385,87 +392,117 @@ fn run_dashboard(
         "  Tokens saved:   {}",
         tokens::format_number(summary.tokens_saved as usize).green()
     )?;
-    writeln!(w, "  Avg reduction:  {:.1}%", summary.avg_savings_pct)?;
+    writeln!(
+        w,
+        "  Avg reduction:  {}",
+        color_pct(summary.avg_savings_pct)
+    )?;
 
-    // Efficiency meter
-    let pct = summary.avg_savings_pct.clamp(0.0, 100.0);
-    let filled = (pct / 5.0).round() as usize;
-    let empty = 20_usize.saturating_sub(filled);
-    let bar = format!(
-        "  [{}{}] {:.1}%",
-        "\u{2588}".repeat(filled).green(),
-        "\u{2591}".repeat(empty),
-        pct
-    );
-    writeln!(w, "{bar}")?;
+    // Efficiency meter using render_bar
+    let bar = render_bar(summary.avg_savings_pct, 20);
+    writeln!(
+        w,
+        "  {} {}",
+        bar,
+        color_pct(summary.avg_savings_pct)
+    )?;
     writeln!(w)?;
 
-    // By command type
+    // ── Daily Trend ──────────────────────────────────────────────────────────
+    let daily = db.query_daily(since)?;
+    if !daily.is_empty() {
+        writeln!(w, "{}", section_header("Daily Trend"))?;
+        let sparkline = render_sparkline(&daily);
+        if !sparkline.is_empty() {
+            // Sort ascending for display labels
+            let mut sorted = daily.clone();
+            sorted.sort_by(|a, b| a.date.cmp(&b.date));
+            let first = sorted.first().map(|d| d.date.as_str()).unwrap_or("");
+            let last = sorted.last().map(|d| d.date.as_str()).unwrap_or("");
+            writeln!(w, "  {sparkline}")?;
+            writeln!(w, "  {first}  ──  {last}")?;
+        }
+        writeln!(w)?;
+    }
+
+    // ── By Command ───────────────────────────────────────────────────────────
     let by_command = db.query_by_command(since)?;
     if !by_command.is_empty() {
-        writeln!(w, "{}", "By Command".bold().underline())?;
+        writeln!(w, "{}", section_header("By Command"))?;
+        let max_saved = by_command
+            .iter()
+            .map(|c| c.tokens_saved)
+            .max()
+            .unwrap_or(1)
+            .max(1);
         for cmd in &by_command {
+            let rel_pct = cmd.tokens_saved as f64 / max_saved as f64 * 100.0;
             writeln!(
                 w,
-                "  {:<8} {:>6} invocations, {} tokens saved ({:.1}%)",
+                "  {:<10} {:>5} invocations  {:>8} saved  {}  {}",
                 cmd.command_type,
                 tokens::format_number(cmd.invocations as usize),
-                tokens::format_number(cmd.tokens_saved as usize),
-                cmd.avg_savings_pct,
+                format_tokens(cmd.tokens_saved),
+                color_pct(cmd.avg_savings_pct),
+                render_bar(rel_pct, 12),
             )?;
         }
         writeln!(w)?;
     }
 
-    // By language
+    // ── By Language ──────────────────────────────────────────────────────────
     let by_language = db.query_by_language(since)?;
     if !by_language.is_empty() {
-        writeln!(w, "{}", "By Language".bold().underline())?;
+        writeln!(w, "{}", section_header("By Language"))?;
         for lang in &by_language {
             writeln!(
                 w,
-                "  {:<12} {:>6} files, {} tokens saved ({:.1}%)",
+                "  {:<12} {:>6} files  {:>8} saved  {}",
                 lang.language,
                 tokens::format_number(lang.files as usize),
-                tokens::format_number(lang.tokens_saved as usize),
-                lang.avg_savings_pct,
+                format_tokens(lang.tokens_saved),
+                color_pct(lang.avg_savings_pct),
             )?;
         }
         writeln!(w)?;
     }
 
-    // By mode
+    // ── By Mode ───────────────────────────────────────────────────────────────
     let by_mode = db.query_by_mode(since)?;
     if !by_mode.is_empty() {
-        writeln!(w, "{}", "By Mode".bold().underline())?;
+        writeln!(w, "{}", section_header("By Mode"))?;
         for mode in &by_mode {
             writeln!(
                 w,
-                "  {:<12} {:>6} files, {} tokens saved ({:.1}%)",
+                "  {:<12} {:>6} files  {:>8} saved  {}",
                 mode.mode,
                 tokens::format_number(mode.files as usize),
-                tokens::format_number(mode.tokens_saved as usize),
-                mode.avg_savings_pct,
+                format_tokens(mode.tokens_saved),
+                color_pct(mode.avg_savings_pct),
             )?;
         }
         writeln!(w)?;
     }
 
-    // Parse tier distribution
+    // ── Parse Quality ─────────────────────────────────────────────────────────
     let tier = db.query_tier_distribution(since)?;
     if tier.full_pct > 0.0 || tier.degraded_pct > 0.0 || tier.passthrough_pct > 0.0 {
-        writeln!(w, "{}", "Parse Quality".bold().underline())?;
+        writeln!(w, "{}", section_header("Parse Quality"))?;
         writeln!(w, "  Full:        {:.1}%", tier.full_pct)?;
         writeln!(w, "  Degraded:    {:.1}%", tier.degraded_pct)?;
         writeln!(w, "  Passthrough: {:.1}%", tier.passthrough_pct)?;
         writeln!(w)?;
+    } else {
+        writeln!(w, "{}", section_header("Parse Quality"))?;
+        writeln!(w, "  No tier data recorded yet.")?;
+        writeln!(w)?;
     }
 
-    // Cost estimates
+    // ── Cost Estimates ────────────────────────────────────────────────────────
     if show_cost {
         let pricing = PricingModel::from_env_or_default();
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
-        writeln!(w, "{}", "Cost Estimates".bold().underline())?;
+        writeln!(w, "{}", section_header("Cost Estimates"))?;
         writeln!(w, "  Model:          {}", pricing.model_name)?;
         writeln!(
             w,
@@ -475,7 +512,7 @@ fn run_dashboard(
         writeln!(
             w,
             "  Estimated savings: {}",
-            format!("${:.2}", cost_savings).green()
+            format!("${:.2}", cost_savings).green().bold()
         )?;
         writeln!(w)?;
     }
@@ -620,12 +657,39 @@ mod tests {
                     tokens_saved: 70_000,
                     avg_savings_pct: 70.0,
                 },
-                daily: vec![DailyStats {
-                    date: "2026-03-24".to_string(),
-                    invocations: 42,
-                    tokens_saved: 70_000,
-                    avg_savings_pct: 70.0,
-                }],
+                // Multiple non-consecutive dates for sparkline coverage
+                daily: vec![
+                    DailyStats {
+                        date: "2026-03-20".to_string(),
+                        invocations: 8,
+                        tokens_saved: 10_000,
+                        avg_savings_pct: 65.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-22".to_string(),
+                        invocations: 12,
+                        tokens_saved: 20_000,
+                        avg_savings_pct: 70.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-24".to_string(),
+                        invocations: 42,
+                        tokens_saved: 70_000,
+                        avg_savings_pct: 70.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-26".to_string(),
+                        invocations: 5,
+                        tokens_saved: 8_000,
+                        avg_savings_pct: 60.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-28".to_string(),
+                        invocations: 7,
+                        tokens_saved: 15_000,
+                        avg_savings_pct: 72.0,
+                    },
+                ],
                 by_command: vec![CommandStats {
                     command_type: "file".to_string(),
                     invocations: 30,
@@ -822,5 +886,48 @@ mod tests {
     fn test_parse_value_flag_missing() {
         let args: Vec<String> = vec!["--cost".into()];
         assert_eq!(parse_value_flag(&args, "--format"), None);
+    }
+
+    // ========================================================================
+    // Daily Trend section integration tests
+    // ========================================================================
+
+    #[test]
+    fn test_dashboard_has_daily_trend() {
+        let store = MockStore {
+            daily: vec![
+                DailyStats {
+                    date: "2026-04-01".to_string(),
+                    invocations: 5,
+                    tokens_saved: 100,
+                    avg_savings_pct: 50.0,
+                },
+                DailyStats {
+                    date: "2026-04-03".to_string(),
+                    invocations: 3,
+                    tokens_saved: 200,
+                    avg_savings_pct: 60.0,
+                },
+            ],
+            ..MockStore::with_data()
+        };
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            output.contains("Daily Trend"),
+            "dashboard should show daily trend section"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_no_daily_trend_when_empty() {
+        let store = MockStore {
+            daily: vec![],
+            ..MockStore::with_data()
+        };
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            !output.contains("Daily Trend"),
+            "dashboard should skip daily trend section when no daily data"
+        );
     }
 }
