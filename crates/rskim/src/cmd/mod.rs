@@ -18,6 +18,7 @@ mod learn;
 mod lint;
 mod pkg;
 mod rewrite;
+mod search;
 mod session;
 mod stats;
 mod test;
@@ -44,6 +45,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "lint",
     "pkg",
     "rewrite",
+    "search",
     "stats",
     "test",
 ];
@@ -353,6 +355,7 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "lint" => lint::run(args),
         "pkg" => pkg::run(args),
         "rewrite" => rewrite::run(args),
+        "search" => search::run(args),
         "stats" => stats::run(args),
         "test" => test::run(args),
         // Unreachable: is_known_subcommand guard above rejects unknown names

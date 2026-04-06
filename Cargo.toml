@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rskim-core",
+    "crates/rskim-search",
     "crates/rskim",
 ]
 resolver = "2"
@@ -46,6 +47,8 @@ predicates = "3.0"
 tempfile = "3.0"
 insta = "1.39"
 criterion = "0.5"
+rustc-hash = "1.1"
+memmap2 = "0.9"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"

@@ -39,7 +39,10 @@ enum Invocation {
 
 /// Returns true if `flag` is a flag that consumes the next token as its value.
 ///
-/// SYNC NOTE: If you add a new flag with a value to `Args`, add it here too.
+/// SYNC NOTE: This list covers both `Args` struct flags (e.g. --mode, --language,
+/// --filename, --jobs, --max-lines, --last-lines, --tokens) and subcommand-only
+/// flags (e.g. --ast, --limit from `search`; --since, --session, --agent, --format
+/// from other subcommands). Both categories must be registered here.
 /// Failure to sync only causes a bug if the flag's value happens to match a
 /// known subcommand name AND no file with that name exists on disk.
 fn is_flag_with_value(flag: &str) -> bool {
@@ -60,6 +63,8 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--session"
             | "--agent"
             | "--format"
+            | "--ast"
+            | "--limit"
     )
 }
 
@@ -195,6 +200,7 @@ SUBCOMMANDS:\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns and generate correction rules\n  \
     rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
+    search [QUERY]                           Search code using the 3-layer index\n  \
     stats [--since N] [--format json]        Show token analytics dashboard\n  \
     test                                     Run test with output parsing\n\n\
 For more info: https://github.com/dean0x/skim")]
@@ -680,6 +686,8 @@ mod tests {
         "--session",
         "--agent",
         "--format",
+        "--ast",
+        "--limit",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`
