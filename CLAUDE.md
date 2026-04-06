@@ -152,10 +152,13 @@ cargo fmt -- --check           # Format check
 - `build` — Build output compression (cargo, clippy, tsc)
 - `completions` — Shell completion scripts
 - `discover` — Scan agent sessions for missed skim optimization opportunities (`--since`, `--agent`, `--json`)
+- `file` — File operations compression: find, ls, tree, grep, rg output parsing (`--json`, `--show-stats`)
 - `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log. All support `--json`.
+- `infra` — Infrastructure tool compression: gh, aws, curl, wget output parsing (`--json`, `--show-stats`)
 - `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode)
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`)
 - `lint` — Lint output compression (eslint, ruff, mypy, golangci-lint)
+- `log` — Log compression: JSON structured + regex plaintext deduplication, debug filtering, stack trace collapsing (`--json`, `--show-stats`)
 - `pkg` — Package manager output compression (npm, pnpm, pip, cargo)
 - `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
 - `stats` — Token analytics dashboard (`--since`, `--format json`, `--cost`, `--clear`)
