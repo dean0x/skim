@@ -82,7 +82,18 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     // --stats: show index statistics.
     if stats_flag {
-        return output::show_stats(&index_dir, json_output);
+        if !index_dir.join("metadata.json").exists() {
+            eprintln!("No search index found. Run 'skim search --build' first.");
+            return Ok(ExitCode::FAILURE);
+        }
+        let layer = match LexicalSearchLayer::open(&index_dir) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("error: failed to open search index: {e}");
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        return output::show_stats(&layer, json_output);
     }
 
     // --build / --rebuild: build (or force-rebuild) the index.

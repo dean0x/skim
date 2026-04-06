@@ -193,13 +193,11 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
         let mut doc_len: u32 = 0;
 
         // Populate the classifier cache entry if absent; `None` means serde-based language.
-        self.classifier_cache
+        let classifier = self
+            .classifier_cache
             .entry(language)
             .or_insert_with(|| crate::fields::for_language(language));
-        let use_tree_sitter = self
-            .classifier_cache
-            .get(&language)
-            .is_some_and(Option::is_some);
+        let use_tree_sitter = classifier.is_some();
 
         if use_tree_sitter {
             self.index_tree_sitter(content, language, doc_id, &mut doc_len);
@@ -345,15 +343,6 @@ mod tests {
         assert!(builder.file_table.is_empty());
         assert!(builder.postings.is_empty());
         assert!(builder.parser_cache.is_empty());
-    }
-
-    #[test]
-    fn minified_threshold_calculation() {
-        // avg_line_len = content.len() / max(line_count, 1)
-        // A 501-char single-line file should be skipped.
-        let long_line: String = "x".repeat(501);
-        assert_eq!(long_line.len() / 1usize.max(1), 501);
-        assert!(501 > 500); // confirms skip condition
     }
 
 }

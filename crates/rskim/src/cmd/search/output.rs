@@ -4,27 +4,14 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
-use rskim_search::{lexical::query::LexicalSearchLayer, FileId, SearchIndex};
+use rskim_search::{FileId, SearchIndex};
 
 // ============================================================================
 // Stats
 // ============================================================================
 
 /// Print index statistics.
-pub(super) fn show_stats(index_dir: &Path, json_output: bool) -> anyhow::Result<ExitCode> {
-    if !index_dir.join("metadata.json").exists() {
-        eprintln!("No search index found. Run 'skim search --build' first.");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    let layer = match LexicalSearchLayer::open(index_dir) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: failed to open search index: {e}");
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-
+pub(super) fn show_stats(layer: &dyn SearchIndex, json_output: bool) -> anyhow::Result<ExitCode> {
     let stats = layer.stats();
 
     if json_output {

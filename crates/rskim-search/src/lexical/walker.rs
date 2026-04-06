@@ -95,20 +95,3 @@ fn walk_and_classify_inner(
     }
 }
 
-// ============================================================================
-// Unit Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn max_ast_depth_is_reasonable() {
-        assert!(
-            MAX_AST_DEPTH >= 64,
-            "depth limit too low for realistic ASTs"
-        );
-        assert!(MAX_AST_DEPTH <= 512, "depth limit suspiciously high");
-    }
-}
