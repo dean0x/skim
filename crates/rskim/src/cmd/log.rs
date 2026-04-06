@@ -24,7 +24,7 @@ const MAX_INPUT_LINES: usize = 100_000;
 
 /// Matches ISO8601 / common log timestamp prefix to strip before dedup.
 /// e.g. `2024-01-15T10:30:00Z `, `2024-01-15 10:30:00 `, `[2024-01-15T10:30:00]`
-static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+static RE_LOG_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*",
     )
@@ -32,15 +32,15 @@ static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Matches bracket-style level: `[ERROR]`, `[INFO]`, etc.
-static RE_LEVEL_BRACKET: LazyLock<Regex> =
+static RE_LOG_LEVEL_BRACKET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[(?i)(ERROR|WARN|WARNING|INFO|DEBUG|TRACE)\]\s*(.*)").unwrap());
 
 /// Matches bare-level format: `ERROR message` or `ERROR: message`
-static RE_LEVEL_BARE: LazyLock<Regex> =
+static RE_LOG_LEVEL_BARE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?i)(ERROR|WARN|WARNING|INFO|DEBUG|TRACE):?\s+(.*)").unwrap());
 
 /// Matches Java/Node.js stack trace lines.
-static RE_STACK_TRACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+at\s+").unwrap());
+static RE_LOG_STACK_TRACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+at\s+").unwrap());
 
 // ============================================================================
 // Flags
@@ -67,7 +67,8 @@ fn parse_flags(args: &[String]) -> LogFlags {
             "--show-stats" => flags.show_stats = true,
             "--json" => flags.json_output = true,
             unknown if unknown.starts_with("--") => {
-                eprintln!("warning: unknown flag '{unknown}' — ignoring");
+                let safe = crate::cmd::sanitize_for_display(unknown);
+                eprintln!("warning: unknown flag '{safe}' — ignoring");
             }
             _ => {}
         }
@@ -167,6 +168,48 @@ fn print_help() {
     println!("  --show-stats        Show token statistics");
 }
 
+/// Build the clap `Command` definition for shell completions.
+pub(super) fn command() -> clap::Command {
+    clap::Command::new("log")
+        .about("Compress log output from stdin for AI context windows")
+        .arg(
+            clap::Arg::new("no-dedup")
+                .long("no-dedup")
+                .action(clap::ArgAction::SetTrue)
+                .help("Disable message deduplication"),
+        )
+        .arg(
+            clap::Arg::new("keep-timestamps")
+                .long("keep-timestamps")
+                .action(clap::ArgAction::SetTrue)
+                .help("Preserve timestamp prefixes"),
+        )
+        .arg(
+            clap::Arg::new("keep-debug")
+                .long("keep-debug")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show all levels including DEBUG/TRACE"),
+        )
+        .arg(
+            clap::Arg::new("debug-only")
+                .long("debug-only")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show ONLY DEBUG/TRACE lines"),
+        )
+        .arg(
+            clap::Arg::new("json")
+                .long("json")
+                .action(clap::ArgAction::SetTrue)
+                .help("Emit structured JSON output"),
+        )
+        .arg(
+            clap::Arg::new("show-stats")
+                .long("show-stats")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show token statistics"),
+        )
+}
+
 // ============================================================================
 // Compression pipeline
 // ============================================================================
@@ -249,7 +292,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
-        if trimmed.is_empty() || RE_STACK_TRACE.is_match(line) {
+        if trimmed.is_empty() || RE_LOG_STACK_TRACE.is_match(line) {
             // Skip blank lines and stack trace lines (checked on original line to
             // preserve leading whitespace detection).
             continue;
@@ -280,7 +323,7 @@ fn strip_timestamp(line: &str, keep_timestamps: bool) -> &str {
     if keep_timestamps {
         line
     } else {
-        RE_TIMESTAMP
+        RE_LOG_TIMESTAMP
             .find(line)
             .map(|m| &line[m.end()..])
             .unwrap_or(line)
@@ -291,10 +334,10 @@ fn strip_timestamp(line: &str, keep_timestamps: bool) -> &str {
 ///
 /// Returns `None` if the line has no recognised log level prefix.
 fn classify_log_line(line: &str) -> Option<(String, String)> {
-    if let Some(caps) = RE_LEVEL_BRACKET.captures(line) {
+    if let Some(caps) = RE_LOG_LEVEL_BRACKET.captures(line) {
         return Some((caps[1].to_uppercase(), caps[2].trim().to_string()));
     }
-    if let Some(caps) = RE_LEVEL_BARE.captures(line) {
+    if let Some(caps) = RE_LOG_LEVEL_BARE.captures(line) {
         return Some((caps[1].to_uppercase(), caps[2].trim().to_string()));
     }
     None
