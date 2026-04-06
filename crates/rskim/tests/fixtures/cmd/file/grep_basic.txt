@@ -1,0 +1,8 @@
+src/main.rs:5:fn main() {
+src/main.rs:12:    let result = main_handler();
+src/lib.rs:3:pub fn main_handler() -> Result<(), Error> {
+src/lib.rs:47:    // main logic here
+src/cmd/mod.rs:1:// main entry for subcommands
+src/cmd/mod.rs:88:fn dispatch_main(args: &[String]) {
+tests/integration.rs:15:fn test_main_invocation() {
+tests/integration.rs:16:    let result = main_handler();

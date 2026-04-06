@@ -36,7 +36,7 @@ pub(crate) fn run(
     match subcmd.as_str() {
         "audit" => run_audit(subcmd_args, show_stats, json_output),
         other => {
-            let safe = super::sanitize_for_display(other);
+            let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
                 "skim pkg cargo: unknown subcommand '{safe}'\n\
                  Available: audit\n\

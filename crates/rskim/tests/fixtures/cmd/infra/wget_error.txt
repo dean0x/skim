@@ -1,0 +1,5 @@
+--2024-01-15 10:30:00--  https://example.com/missing.tar.gz
+Resolving example.com (example.com)... 93.184.216.34
+Connecting to example.com (example.com)|93.184.216.34|:443... connected.
+HTTP request sent, awaiting response... 404 Not Found
+2024-01-15 10:30:01 ERROR 404: Not Found.

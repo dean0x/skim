@@ -504,6 +504,74 @@ impl fmt::Display for PkgResult {
 }
 
 // ============================================================================
+// InfraResult types
+// ============================================================================
+
+/// Result of an infrastructure tool operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InfraResult {
+    pub(crate) tool: String,
+    pub(crate) operation: String,
+    pub(crate) summary: String,
+    pub(crate) items: Vec<InfraItem>,
+    #[serde(default)]
+    rendered: String,
+}
+
+/// A single key-value item within an infrastructure result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InfraItem {
+    pub(crate) label: String,
+    pub(crate) value: String,
+}
+
+impl InfraResult {
+    pub(crate) fn new(
+        tool: String,
+        operation: String,
+        summary: String,
+        items: Vec<InfraItem>,
+    ) -> Self {
+        let rendered = Self::render(&tool, &operation, &summary, &items);
+        Self {
+            tool,
+            operation,
+            summary,
+            items,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization)
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            self.rendered = Self::render(&self.tool, &self.operation, &self.summary, &self.items);
+        }
+    }
+
+    fn render(tool: &str, operation: &str, summary: &str, items: &[InfraItem]) -> String {
+        use std::fmt::Write;
+        let mut output = format!("INFRA: {tool} {operation} | {summary}");
+        for item in items {
+            let _ = write!(output, "\n  {}: {}", item.label, item.value);
+        }
+        output
+    }
+}
+
+impl AsRef<str> for InfraResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for InfraResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+// ============================================================================
 // DiffResult types
 // ============================================================================
 
@@ -582,6 +650,225 @@ impl AsRef<str> for DiffResult {
 }
 
 impl fmt::Display for DiffResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+// ============================================================================
+// FileResult types
+// ============================================================================
+
+/// Result of a file operations tool (find, ls, tree, grep, rg)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FileResult {
+    pub(crate) tool: String,
+    pub(crate) total_count: usize,
+    pub(crate) shown_count: usize,
+    pub(crate) entries: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) footer: Option<String>,
+    #[serde(default)]
+    rendered: String,
+}
+
+impl FileResult {
+    /// Create a new FileResult with pre-computed rendered output.
+    pub(crate) fn new(
+        tool: String,
+        total_count: usize,
+        shown_count: usize,
+        entries: Vec<String>,
+        footer: Option<String>,
+    ) -> Self {
+        let rendered = Self::render(&tool, total_count, shown_count, &entries, footer.as_deref());
+        Self {
+            tool,
+            total_count,
+            shown_count,
+            entries,
+            footer,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization).
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            self.rendered = Self::render(
+                &self.tool,
+                self.total_count,
+                self.shown_count,
+                &self.entries,
+                self.footer.as_deref(),
+            );
+        }
+    }
+
+    fn render(
+        tool: &str,
+        total_count: usize,
+        shown_count: usize,
+        entries: &[String],
+        footer: Option<&str>,
+    ) -> String {
+        use std::fmt::Write;
+
+        let tool_upper = tool.to_uppercase();
+        let mut output =
+            format!("{tool_upper}: {tool} | {total_count} entries (showing {shown_count})");
+        for entry in entries {
+            let _ = write!(output, "\n  {entry}");
+        }
+        if let Some(f) = footer {
+            let _ = write!(output, "\n  {f}");
+        }
+        output
+    }
+}
+
+impl AsRef<str> for FileResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for FileResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+// ============================================================================
+// LogResult types
+// ============================================================================
+
+/// A single log entry with optional level and deduplication count
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LogEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) level: Option<String>,
+    pub(crate) message: String,
+    pub(crate) count: usize,
+}
+
+/// Result of log compression
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LogResult {
+    pub(crate) total_lines: usize,
+    pub(crate) unique_messages: usize,
+    pub(crate) debug_hidden: usize,
+    pub(crate) deduplicated_count: usize,
+    pub(crate) entries: Vec<LogEntry>,
+    /// True when --debug-only mode was requested.
+    #[serde(default)]
+    pub(crate) debug_only: bool,
+    #[serde(default)]
+    rendered: String,
+}
+
+impl LogResult {
+    /// Create a new LogResult with pre-computed rendered output.
+    pub(crate) fn new(
+        total_lines: usize,
+        unique_messages: usize,
+        debug_hidden: usize,
+        deduplicated_count: usize,
+        entries: Vec<LogEntry>,
+        debug_only: bool,
+    ) -> Self {
+        let rendered = Self::render(
+            total_lines,
+            unique_messages,
+            debug_hidden,
+            deduplicated_count,
+            &entries,
+            debug_only,
+        );
+        Self {
+            total_lines,
+            unique_messages,
+            debug_hidden,
+            deduplicated_count,
+            entries,
+            debug_only,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization).
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            self.rendered = Self::render(
+                self.total_lines,
+                self.unique_messages,
+                self.debug_hidden,
+                self.deduplicated_count,
+                &self.entries,
+                self.debug_only,
+            );
+        }
+    }
+
+    fn render(
+        total_lines: usize,
+        unique_messages: usize,
+        debug_hidden: usize,
+        deduplicated_count: usize,
+        entries: &[LogEntry],
+        debug_only: bool,
+    ) -> String {
+        use std::fmt::Write;
+
+        let mut output = if debug_only {
+            format!("LOG DEBUG: {debug_hidden} debug lines")
+        } else {
+            format!(
+                "LOG: {total_lines} lines \u{2192} {unique_messages} unique ({deduplicated_count} duplicates removed)"
+            )
+        };
+
+        if !debug_only && debug_hidden > 0 {
+            let _ = write!(
+                output,
+                "\n[notice] {debug_hidden} DEBUG lines hidden. To see debug output: skim log --debug-only"
+            );
+        }
+
+        for entry in entries {
+            match &entry.level {
+                Some(level) => {
+                    if entry.count > 1 {
+                        let _ = write!(
+                            output,
+                            "\n  [{level}] {} (\u{d7}{})",
+                            entry.message, entry.count
+                        );
+                    } else {
+                        let _ = write!(output, "\n  [{level}] {}", entry.message);
+                    }
+                }
+                None => {
+                    if entry.count > 1 {
+                        let _ = write!(output, "\n  {} (\u{d7}{})", entry.message, entry.count);
+                    } else {
+                        let _ = write!(output, "\n  {}", entry.message);
+                    }
+                }
+            }
+        }
+
+        output
+    }
+}
+
+impl AsRef<str> for LogResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for LogResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.rendered)
     }
@@ -1059,6 +1346,66 @@ mod tests {
     // DiffResult ensure_rendered lossy fallback (#103 review batch-7)
     // ========================================================================
 
+    // ========================================================================
+    // InfraResult tests
+    // ========================================================================
+
+    #[test]
+    fn test_infra_result_display() {
+        let items = vec![
+            InfraItem {
+                label: "#1".to_string(),
+                value: "fix: update deps (open)".to_string(),
+            },
+            InfraItem {
+                label: "#2".to_string(),
+                value: "feat: add feature (merged)".to_string(),
+            },
+        ];
+        let result = InfraResult::new(
+            "gh".to_string(),
+            "pr list".to_string(),
+            "2 items".to_string(),
+            items,
+        );
+        let display = format!("{result}");
+        assert!(display.contains("INFRA: gh pr list | 2 items"));
+        assert!(display.contains("#1: fix: update deps (open)"));
+        assert!(display.contains("#2: feat: add feature (merged)"));
+    }
+
+    #[test]
+    fn test_infra_result_serde_roundtrip() {
+        let items = vec![InfraItem {
+            label: "bucket".to_string(),
+            value: "my-bucket".to_string(),
+        }];
+        let original = InfraResult::new(
+            "aws".to_string(),
+            "s3 ls".to_string(),
+            "1 bucket".to_string(),
+            items,
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: InfraResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(format!("{original}"), format!("{deserialized}"));
+    }
+
+    #[test]
+    fn test_infra_result_ensure_rendered_recomputes_when_empty() {
+        let mut result = InfraResult {
+            tool: "curl".to_string(),
+            operation: "GET".to_string(),
+            summary: "200 OK".to_string(),
+            items: vec![],
+            rendered: String::new(),
+        };
+        assert_eq!(result.as_ref(), "");
+        result.ensure_rendered();
+        assert!(result.as_ref().contains("INFRA: curl GET | 200 OK"));
+    }
+
     #[test]
     fn test_diff_result_ensure_rendered_produces_summary_fallback() {
         // When `rendered` is empty (e.g., after deserialization that strips the
@@ -1105,5 +1452,185 @@ mod tests {
             !output.contains('+') && !output.contains('-'),
             "fallback should not contain diff markers"
         );
+    }
+
+    // ========================================================================
+    // FileResult tests
+    // ========================================================================
+
+    #[test]
+    fn test_file_result_display_basic() {
+        let result = FileResult::new(
+            "find".to_string(),
+            5,
+            5,
+            vec![
+                "./src/main.rs".to_string(),
+                "./src/lib.rs".to_string(),
+                "./Cargo.toml".to_string(),
+                "./README.md".to_string(),
+                "./Makefile".to_string(),
+            ],
+            None,
+        );
+        let output = format!("{result}");
+        assert!(output.starts_with("FIND: find | 5 entries (showing 5)"));
+        assert!(output.contains("  ./src/main.rs"));
+        assert!(output.contains("  ./Cargo.toml"));
+    }
+
+    #[test]
+    fn test_file_result_display_with_footer() {
+        let result = FileResult::new(
+            "find".to_string(),
+            200,
+            100,
+            (0..100).map(|i| format!("./path/file{i}.rs")).collect(),
+            Some("... and 100 more".to_string()),
+        );
+        let output = format!("{result}");
+        assert!(output.contains("FIND: find | 200 entries (showing 100)"));
+        assert!(output.contains("... and 100 more"));
+    }
+
+    #[test]
+    fn test_file_result_serde_roundtrip() {
+        let original = FileResult::new(
+            "ls".to_string(),
+            3,
+            3,
+            vec![
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "c.txt".to_string(),
+            ],
+            None,
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: FileResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(deserialized.tool, "ls");
+        assert_eq!(deserialized.total_count, 3);
+        assert!(!deserialized.as_ref().is_empty());
+    }
+
+    #[test]
+    fn test_file_result_ensure_rendered() {
+        let mut result = FileResult {
+            tool: "rg".to_string(),
+            total_count: 2,
+            shown_count: 2,
+            entries: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            footer: None,
+            rendered: String::new(),
+        };
+        result.ensure_rendered();
+        assert!(!result.rendered.is_empty());
+        assert!(result.rendered.contains("RG: rg | 2 entries"));
+    }
+
+    #[test]
+    fn test_file_result_empty_entries() {
+        let result = FileResult::new("find".to_string(), 0, 0, vec![], None);
+        let output = format!("{result}");
+        assert!(output.contains("FIND: find | 0 entries (showing 0)"));
+    }
+
+    // ========================================================================
+    // LogResult tests
+    // ========================================================================
+
+    #[test]
+    fn test_log_result_display_default() {
+        let entries = vec![
+            LogEntry {
+                level: Some("ERROR".to_string()),
+                message: "connection refused".to_string(),
+                count: 47,
+            },
+            LogEntry {
+                level: Some("INFO".to_string()),
+                message: "request completed".to_string(),
+                count: 312,
+            },
+        ];
+        let result = LogResult::new(4281, 87, 0, 3194, entries, false);
+        let output = format!("{result}");
+        assert!(output.contains("LOG: 4281 lines"));
+        assert!(output.contains("87 unique"));
+        assert!(output.contains("3194 duplicates removed"));
+        assert!(output.contains("[ERROR] connection refused (\u{d7}47)"));
+        assert!(output.contains("[INFO] request completed (\u{d7}312)"));
+    }
+
+    #[test]
+    fn test_log_result_display_debug_hidden() {
+        let entries = vec![LogEntry {
+            level: Some("ERROR".to_string()),
+            message: "connection refused".to_string(),
+            count: 47,
+        }];
+        let result = LogResult::new(4281, 87, 847, 3194, entries, false);
+        let output = format!("{result}");
+        assert!(output.contains("[notice] 847 DEBUG lines hidden"));
+        assert!(output.contains("skim log --debug-only"));
+    }
+
+    #[test]
+    fn test_log_result_display_debug_only() {
+        let entries = vec![LogEntry {
+            level: Some("DEBUG".to_string()),
+            message: "cache miss for key=user:123".to_string(),
+            count: 203,
+        }];
+        let result = LogResult::new(847, 1, 847, 846, entries, true);
+        let output = format!("{result}");
+        assert!(output.starts_with("LOG DEBUG: 847 debug lines"));
+        assert!(!output.contains("[notice]"));
+        assert!(output.contains("[DEBUG] cache miss for key=user:123 (\u{d7}203)"));
+    }
+
+    #[test]
+    fn test_log_result_serde_roundtrip() {
+        let entries = vec![LogEntry {
+            level: Some("WARN".to_string()),
+            message: "retrying".to_string(),
+            count: 5,
+        }];
+        let original = LogResult::new(100, 10, 0, 90, entries, false);
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: LogResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(deserialized.total_lines, 100);
+        assert!(!deserialized.as_ref().is_empty());
+    }
+
+    #[test]
+    fn test_log_result_ensure_rendered() {
+        let mut result = LogResult {
+            total_lines: 50,
+            unique_messages: 5,
+            debug_hidden: 0,
+            deduplicated_count: 45,
+            entries: vec![],
+            debug_only: false,
+            rendered: String::new(),
+        };
+        result.ensure_rendered();
+        assert!(!result.rendered.is_empty());
+        assert!(result.rendered.contains("LOG: 50 lines"));
+    }
+
+    #[test]
+    fn test_log_result_no_level_entry() {
+        let entries = vec![LogEntry {
+            level: None,
+            message: "plain message".to_string(),
+            count: 1,
+        }];
+        let result = LogResult::new(1, 1, 0, 0, entries, false);
+        let output = format!("{result}");
+        assert!(output.contains("  plain message"));
+        assert!(!output.contains('['));
     }
 }

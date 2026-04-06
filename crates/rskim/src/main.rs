@@ -88,7 +88,7 @@ fn looks_like_file_or_glob(token: &str) -> bool {
 /// | Contains `/` or `\`                           | FileOperation |
 /// | Is `-`                                        | FileOperation |
 /// | Contains `*`, `?`, `[`, or `{`                  | FileOperation |
-/// | Is known subcommand AND no file/dir on disk   | Subcommand    |
+/// | Is known subcommand                           | Subcommand    |
 /// | Everything else                               | FileOperation |
 fn resolve_invocation() -> Invocation {
     let raw_args: Vec<String> = std::env::args().collect();
@@ -138,14 +138,9 @@ fn resolve_invocation() -> Invocation {
         return Invocation::FileOperation;
     }
 
-    // Known subcommand check — only if no file/dir with that name exists on disk
+    // Known subcommand check — subcommands always take priority.
+    // Use `skim ./name` or a full path to read a file that shares a subcommand name.
     if cmd::is_known_subcommand(positional) {
-        let path = std::path::Path::new(positional);
-        if path.exists() {
-            // On-disk file/dir takes precedence (backward compat)
-            return Invocation::FileOperation;
-        }
-
         let name = positional.to_string();
         let remaining_args: Vec<String> = args[pos_idx + 1..].to_vec();
         return Invocation::Subcommand {
@@ -188,12 +183,18 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
 SUBCOMMANDS:\n  \
+    agents                                   Show detected AI agents and hook/session status\n  \
     build                                    Build with output parsing\n  \
     completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n  \
     discover                                 Identify missed optimization opportunities\n  \
+    file                                     Read and transform source files (default)\n  \
     git                                      Git helpers (AST-aware diff, status, log)\n  \
+    infra                                    Infrastructure output compression (terraform, k8s)\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns and generate correction rules\n  \
+    lint                                     Lint output compression (eslint, ruff, mypy, ...)\n  \
+    log                                      Log output compression (JSON + regex)\n  \
+    pkg                                      Package manager output compression (npm, pip, cargo)\n  \
     rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
     stats [--since N] [--format json]        Show token analytics dashboard\n  \
     test                                     Run test with output parsing\n\n\

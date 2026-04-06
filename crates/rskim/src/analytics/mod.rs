@@ -41,6 +41,9 @@ pub(crate) enum CommandType {
     Git,
     Lint,
     Pkg,
+    Infra,
+    FileOps,
+    Log,
 }
 
 impl CommandType {
@@ -52,6 +55,9 @@ impl CommandType {
             CommandType::Git => "git",
             CommandType::Lint => "lint",
             CommandType::Pkg => "pkg",
+            CommandType::Infra => "infra",
+            CommandType::FileOps => "fileops",
+            CommandType::Log => "log",
         }
     }
 }
@@ -635,7 +641,6 @@ pub(crate) fn try_record_command(
 ///
 /// Delegates to [`record_with_counts`] after resolving cwd and building
 /// the record.
-#[allow(dead_code)]
 pub(crate) fn try_record_command_with_counts(
     raw_tokens: usize,
     compressed_tokens: usize,

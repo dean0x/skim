@@ -1,0 +1,11 @@
+total 64
+drwxr-xr-x  8 user group  256 Jan 15 10:30 .
+drwxr-xr-x 12 user group  384 Jan 15 10:00 ..
+-rw-r--r--  1 user group 8192 Jan 15 09:45 Cargo.lock
+-rw-r--r--  1 user group 1024 Jan 15 09:44 Cargo.toml
+-rw-r--r--  1 user group 2048 Jan 15 08:30 CLAUDE.md
+-rw-r--r--  1 user group  512 Jan 10 14:22 LICENSE
+-rw-r--r--  1 user group 4096 Jan 15 09:00 README.md
+-rw-r--r--  1 user group  256 Jan 14 16:00 build.rs
+drwxr-xr-x  4 user group  128 Jan 15 10:29 src
+drwxr-xr-x  3 user group   96 Jan 15 10:28 tests

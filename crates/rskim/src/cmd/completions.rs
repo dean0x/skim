@@ -73,14 +73,20 @@ fn build_full_command() -> Command {
     cmd = cmd.subcommand(super::init::command());
     cmd = cmd.subcommand(super::discover::command());
     cmd = cmd.subcommand(super::learn::command());
+    cmd = cmd.subcommand(super::file::command());
+    cmd = cmd.subcommand(super::infra::command());
+    cmd = cmd.subcommand(super::log::command());
 
     // Subcommands with full arg definitions added above -- skip in the stub loop.
     const IMPLEMENTED_SUBCOMMANDS: &[&str] = &[
         "agents",
         "completions",
         "discover",
+        "file",
+        "infra",
         "init",
         "learn",
+        "log",
         "rewrite",
     ];
 

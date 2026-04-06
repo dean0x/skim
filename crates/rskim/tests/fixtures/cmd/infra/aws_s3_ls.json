@@ -1,0 +1,8 @@
+{
+  "Buckets": [
+    {"Name": "my-app-production", "CreationDate": "2023-01-15T10:00:00Z"},
+    {"Name": "my-app-staging", "CreationDate": "2023-02-20T14:30:00Z"},
+    {"Name": "my-backups", "CreationDate": "2023-03-10T09:00:00Z"}
+  ],
+  "Owner": {"DisplayName": "myaccount", "ID": "abc123"}
+}

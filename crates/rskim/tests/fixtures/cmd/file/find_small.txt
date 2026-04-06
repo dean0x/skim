@@ -1,0 +1,10 @@
+./src/main.rs
+./src/lib.rs
+./src/types.rs
+./Cargo.toml
+./Cargo.lock
+./README.md
+./tests/integration.rs
+./.gitignore
+./CLAUDE.md
+./build.rs

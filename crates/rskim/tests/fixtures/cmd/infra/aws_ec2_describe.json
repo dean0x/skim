@@ -1,0 +1,21 @@
+{
+  "Reservations": [
+    {
+      "Instances": [
+        {
+          "InstanceId": "i-0abc123def456",
+          "InstanceType": "t3.micro",
+          "State": {"Code": 16, "Name": "running"},
+          "PublicIpAddress": "54.123.45.67",
+          "Tags": [{"Key": "Name", "Value": "web-server-1"}]
+        },
+        {
+          "InstanceId": "i-0def456abc789",
+          "InstanceType": "t3.small",
+          "State": {"Code": 80, "Name": "stopped"},
+          "Tags": [{"Key": "Name", "Value": "worker-1"}]
+        }
+      ]
+    }
+  ]
+}

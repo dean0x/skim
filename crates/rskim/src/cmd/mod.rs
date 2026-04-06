@@ -9,13 +9,16 @@ mod agents;
 mod build;
 mod completions;
 mod discover;
+mod file;
 mod git;
 mod hook_log;
 mod hooks;
+mod infra;
 mod init;
 mod integrity;
 mod learn;
 mod lint;
+mod log;
 mod pkg;
 mod rewrite;
 mod session;
@@ -38,10 +41,13 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "build",
     "completions",
     "discover",
+    "file",
     "git",
+    "infra",
     "init",
     "learn",
     "lint",
+    "log",
     "pkg",
     "rewrite",
     "stats",
@@ -347,10 +353,13 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         "build" => build::run(args),
         "completions" => completions::run(args),
         "discover" => discover::run(args),
+        "file" => file::run(args),
         "git" => git::run(args),
+        "infra" => infra::run(args),
         "init" => init::run(args),
         "learn" => learn::run(args),
         "lint" => lint::run(args),
+        "log" => log::run(args),
         "pkg" => pkg::run(args),
         "rewrite" => rewrite::run(args),
         "stats" => stats::run(args),
@@ -358,6 +367,29 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
         // Unreachable: is_known_subcommand guard above rejects unknown names
         _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
     }
+}
+
+// ============================================================================
+// Shared security helper
+// ============================================================================
+
+/// Sanitize user input for safe display in error messages.
+///
+/// Filters to printable ASCII characters to prevent terminal escape
+/// injection attacks. Non-printable and non-ASCII bytes are replaced
+/// with `?`, and the string is truncated to 64 characters.
+pub(crate) fn sanitize_for_display(input: &str) -> String {
+    input
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -382,5 +414,24 @@ mod tests {
         let (filtered, is_json) = extract_json_flag(&args);
         assert!(!is_json);
         assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    #[test]
+    fn test_sanitize_for_display_clean_input() {
+        assert_eq!(sanitize_for_display("hello-world"), "hello-world");
+    }
+
+    #[test]
+    fn test_sanitize_for_display_rejects_non_ascii() {
+        let input = "tool\x1b[31mred\x1b[0m";
+        let sanitized = sanitize_for_display(input);
+        assert!(!sanitized.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_sanitize_for_display_truncates_at_64() {
+        let long_input = "a".repeat(100);
+        let sanitized = sanitize_for_display(&long_input);
+        assert_eq!(sanitized.len(), 64);
     }
 }

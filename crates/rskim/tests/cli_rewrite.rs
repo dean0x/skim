@@ -23,9 +23,10 @@ fn test_rewrite_cargo_test_with_separator() {
 
 #[test]
 fn test_rewrite_ls_no_match() {
+    // bare `ls` without flags is not rewritten (no compression benefit)
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["rewrite", "ls", "-la"])
+        .args(["rewrite", "ls"])
         .assert()
         .failure();
 }
@@ -378,9 +379,10 @@ fn test_suggest_mode_match() {
 
 #[test]
 fn test_suggest_mode_no_match() {
+    // bare `ls` has no rewrite rule — confirm suggest emits match:false
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["rewrite", "--suggest", "ls", "-la"])
+        .args(["rewrite", "--suggest", "ls"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -516,10 +518,11 @@ fn test_suggest_mode_stdin_match() {
 
 #[test]
 fn test_suggest_mode_stdin_no_match() {
+    // bare `ls` has no rewrite rule — confirm suggest emits match:false via stdin
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--suggest"])
-        .write_stdin("ls -la\n")
+        .write_stdin("ls\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));

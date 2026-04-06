@@ -36,6 +36,8 @@ enum RewriteCategory {
     Read,
     Lint,
     Pkg,
+    Infra,
+    FileOps,
 }
 
 struct RewriteRule {
@@ -392,6 +394,139 @@ const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "pkg", "pip", "list"],
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Pkg,
+    },
+    // lint — prettier (longest prefix first: npx prettier, prettier)
+    RewriteRule {
+        prefix: &["npx", "prettier", "--check"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["prettier", "--check"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    // lint — rustfmt (longest prefix first)
+    RewriteRule {
+        prefix: &["cargo", "fmt", "--", "--check"],
+        rewrite_to: &["skim", "lint", "rustfmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["cargo", "fmt", "--check"],
+        rewrite_to: &["skim", "lint", "rustfmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["rustfmt", "--check"],
+        rewrite_to: &["skim", "lint", "rustfmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    // infra — gh (longest prefix first)
+    RewriteRule {
+        prefix: &["gh", "pr", "list"],
+        rewrite_to: &["skim", "infra", "gh", "pr", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "issue", "list"],
+        rewrite_to: &["skim", "infra", "gh", "issue", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "run", "list"],
+        rewrite_to: &["skim", "infra", "gh", "run", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "release", "list"],
+        rewrite_to: &["skim", "infra", "gh", "release", "list"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Infra,
+    },
+    // infra — aws
+    RewriteRule {
+        prefix: &["aws"],
+        rewrite_to: &["skim", "infra", "aws"],
+        skip_if_flag_prefix: &["--output"],
+        category: RewriteCategory::Infra,
+    },
+    // infra — curl
+    RewriteRule {
+        prefix: &["curl"],
+        rewrite_to: &["skim", "infra", "curl"],
+        skip_if_flag_prefix: &[
+            "-o",
+            "--output",
+            "-X",
+            "--request",
+            "-F",
+            "--upload-file",
+            "-T",
+        ],
+        category: RewriteCategory::Infra,
+    },
+    // infra — wget
+    RewriteRule {
+        prefix: &["wget"],
+        rewrite_to: &["skim", "infra", "wget"],
+        skip_if_flag_prefix: &["-O", "-q", "--quiet"],
+        category: RewriteCategory::Infra,
+    },
+    // file — find
+    RewriteRule {
+        prefix: &["find"],
+        rewrite_to: &["skim", "file", "find"],
+        skip_if_flag_prefix: &["-exec", "-delete", "-printf", "-print0"],
+        category: RewriteCategory::FileOps,
+    },
+    // file — ls (verbose/recursive only)
+    RewriteRule {
+        prefix: &["ls", "-la"],
+        rewrite_to: &["skim", "file", "ls"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::FileOps,
+    },
+    RewriteRule {
+        prefix: &["ls", "-R"],
+        rewrite_to: &["skim", "file", "ls"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::FileOps,
+    },
+    // file — tree
+    RewriteRule {
+        prefix: &["tree"],
+        rewrite_to: &["skim", "file", "tree"],
+        skip_if_flag_prefix: &["-J", "--json"],
+        category: RewriteCategory::FileOps,
+    },
+    // file — grep (recursive only)
+    RewriteRule {
+        prefix: &["grep", "-rn"],
+        rewrite_to: &["skim", "file", "grep"],
+        skip_if_flag_prefix: &["-c", "--count", "-l"],
+        category: RewriteCategory::FileOps,
+    },
+    RewriteRule {
+        prefix: &["grep", "-r"],
+        rewrite_to: &["skim", "file", "grep"],
+        skip_if_flag_prefix: &["-c", "--count", "-l"],
+        category: RewriteCategory::FileOps,
+    },
+    // file — rg
+    RewriteRule {
+        prefix: &["rg"],
+        rewrite_to: &["skim", "file", "rg"],
+        skip_if_flag_prefix: &["--json", "-c", "--count", "-l", "--files"],
+        category: RewriteCategory::FileOps,
     },
 ];
 
@@ -2260,7 +2395,12 @@ mod tests {
 
     #[test]
     fn test_unknown_command() {
-        assert!(try_rewrite(&["ls", "-la"]).is_none());
+        // bare `ls` without flags is not rewritten (too generic, no compression benefit)
+        assert!(try_rewrite(&["ls"]).is_none());
+        // cd is not rewritten
+        assert!(try_rewrite(&["cd", "src"]).is_none());
+        // ls -la IS now rewritten by the file ops rule
+        assert!(try_rewrite(&["ls", "-la"]).is_some());
     }
 
     #[test]
@@ -2992,6 +3132,324 @@ mod tests {
             updated.trim(),
             today_date_string(),
             "stamp should be updated to today"
+        );
+    }
+
+    // ========================================================================
+    // New lint and infra rewrite rules (#116)
+    // ========================================================================
+
+    #[test]
+    fn test_rewrite_prettier_check() {
+        let result = try_rewrite(&["prettier", "--check", "."]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "prettier".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint prettier', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_npx_prettier() {
+        let result = try_rewrite(&["npx", "prettier", "--check", "src/"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "prettier".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint prettier', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rustfmt_check() {
+        let result = try_rewrite(&["rustfmt", "--check", "src/main.rs"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "rustfmt".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint rustfmt', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_cargo_fmt_check() {
+        let result = try_rewrite(&["cargo", "fmt", "--check"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "lint".to_string(),
+                "rustfmt".to_string(),
+            ]),
+            "Expected tokens to start with 'skim lint rustfmt', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_pr_list() {
+        let result = try_rewrite(&["gh", "pr", "list"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "gh".to_string(),
+                "pr".to_string(),
+                "list".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra gh pr list', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_pr_list_skip_json() {
+        assert!(
+            try_rewrite(&["gh", "pr", "list", "--json", "number"]).is_none(),
+            "Expected no rewrite when --json flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_issue_list() {
+        let result = try_rewrite(&["gh", "issue", "list"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "gh".to_string(),
+                "issue".to_string(),
+                "list".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra gh issue list', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_aws_s3_ls() {
+        let result = try_rewrite(&["aws", "s3", "ls"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "aws".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra aws', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_aws_skip_output() {
+        assert!(
+            try_rewrite(&["aws", "s3", "ls", "--output", "table"]).is_none(),
+            "Expected no rewrite when --output flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_curl() {
+        let result = try_rewrite(&["curl", "https://api.example.com"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "curl".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra curl', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_curl_skip_output() {
+        assert!(
+            try_rewrite(&["curl", "-o", "file.json", "https://api.example.com"]).is_none(),
+            "Expected no rewrite when -o flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_wget() {
+        let result = try_rewrite(&["wget", "https://example.com"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "infra".to_string(),
+                "wget".to_string(),
+            ]),
+            "Expected tokens to start with 'skim infra wget', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_wget_skip_quiet() {
+        assert!(
+            try_rewrite(&["wget", "-q", "https://example.com"]).is_none(),
+            "Expected no rewrite when -q flag is present"
+        );
+    }
+
+    // ========================================================================
+    // Wave B: file ops rewrite rules
+    // ========================================================================
+
+    #[test]
+    fn test_rewrite_find_basic() {
+        let result = try_rewrite(&["find", ".", "-name", "*.rs"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "file".to_string(),
+                "find".to_string()
+            ]),
+            "Expected skim file find prefix, got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_find_skip_exec() {
+        assert!(
+            try_rewrite(&["find", ".", "-exec", "rm", "{}", ";"]).is_none(),
+            "Should not rewrite find with -exec"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_find_skip_print0() {
+        assert!(
+            try_rewrite(&["find", ".", "-name", "*.rs", "-print0"]).is_none(),
+            "Should not rewrite find with -print0"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ls_la() {
+        let result = try_rewrite(&["ls", "-la"]).unwrap();
+        assert!(
+            result
+                .tokens
+                .starts_with(&["skim".to_string(), "file".to_string(), "ls".to_string()]),
+            "Expected skim file ls prefix, got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ls_recursive() {
+        let result = try_rewrite(&["ls", "-R", "src/"]).unwrap();
+        assert!(
+            result
+                .tokens
+                .starts_with(&["skim".to_string(), "file".to_string(), "ls".to_string()]),
+            "Expected skim file ls prefix, got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ls_bare_not_rewritten() {
+        assert!(
+            try_rewrite(&["ls"]).is_none(),
+            "Bare ls should not be rewritten"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_tree() {
+        let result = try_rewrite(&["tree", "src/"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "file".to_string(),
+                "tree".to_string()
+            ]),
+            "Expected skim file tree prefix, got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_tree_skip_json() {
+        assert!(
+            try_rewrite(&["tree", "-J", "src/"]).is_none(),
+            "Should not rewrite tree when -J is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_grep_recursive() {
+        let result = try_rewrite(&["grep", "-r", "TODO", "src/"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "file".to_string(),
+                "grep".to_string()
+            ]),
+            "Expected skim file grep prefix, got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_grep_rn() {
+        let result = try_rewrite(&["grep", "-rn", "fn main", "."]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "file".to_string(),
+                "grep".to_string()
+            ]),
+            "Expected skim file grep prefix for grep -rn, got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_grep_skip_count() {
+        assert!(
+            try_rewrite(&["grep", "-r", "-c", "pattern", "src/"]).is_none(),
+            "Should not rewrite grep when -c flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rg() {
+        let result = try_rewrite(&["rg", "fn main", "src/"]).unwrap();
+        assert!(
+            result
+                .tokens
+                .starts_with(&["skim".to_string(), "file".to_string(), "rg".to_string()]),
+            "Expected skim file rg prefix, got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rg_skip_json_flag() {
+        assert!(
+            try_rewrite(&["rg", "--json", "pattern"]).is_none(),
+            "Should not rewrite rg when --json flag is present"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rg_skip_files_flag() {
+        assert!(
+            try_rewrite(&["rg", "--files"]).is_none(),
+            "Should not rewrite rg when --files flag is present"
         );
     }
 }

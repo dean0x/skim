@@ -51,8 +51,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats),
         "log" => log::run_log(&global_flags, subcmd_args, show_stats),
         other => {
+            let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
-                "unknown git subcommand: '{other}'\n\n\
+                "unknown git subcommand: '{safe_other}'\n\n\
                  Supported: status, diff, log\n\
                  Run 'skim git --help' for usage"
             );

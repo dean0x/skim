@@ -1,12 +1,14 @@
-//! Lint subcommand dispatcher (#104)
+//! Lint subcommand dispatcher (#104, #116)
 //!
 //! Routes `skim lint <linter> [args...]` to the appropriate linter parser.
-//! Currently supported linters: `eslint`, `ruff`, `mypy`, `golangci`.
+//! Currently supported linters: `eslint`, `golangci`, `mypy`, `prettier`, `ruff`, `rustfmt`.
 
 pub(crate) mod eslint;
 pub(crate) mod golangci;
 pub(crate) mod mypy;
+pub(crate) mod prettier;
 pub(crate) mod ruff;
+pub(crate) mod rustfmt;
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -18,7 +20,7 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known linters that `skim lint` can dispatch to.
-const KNOWN_LINTERS: &[&str] = &["eslint", "ruff", "mypy", "golangci"];
+const KNOWN_LINTERS: &[&str] = &["eslint", "golangci", "mypy", "prettier", "ruff", "rustfmt"];
 
 /// Entry point for `skim lint <linter> [args...]`.
 ///
@@ -40,16 +42,17 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    let linter = linter_name.as_str();
-
-    match linter {
+    match linter_name.as_str() {
         "eslint" => eslint::run(linter_args, show_stats, json_output),
-        "ruff" => ruff::run(linter_args, show_stats, json_output),
-        "mypy" => mypy::run(linter_args, show_stats, json_output),
         "golangci" => golangci::run(linter_args, show_stats, json_output),
-        _ => {
+        "mypy" => mypy::run(linter_args, show_stats, json_output),
+        "prettier" => prettier::run(linter_args, show_stats, json_output),
+        "ruff" => ruff::run(linter_args, show_stats, json_output),
+        "rustfmt" => rustfmt::run(linter_args, show_stats, json_output),
+        linter => {
+            let safe_linter = crate::cmd::sanitize_for_display(linter);
             eprintln!(
-                "skim lint: unknown linter '{linter}'\n\
+                "skim lint: unknown linter '{safe_linter}'\n\
                  Available linters: {}\n\
                  Run 'skim lint --help' for usage information",
                 KNOWN_LINTERS.join(", ")
@@ -75,9 +78,11 @@ fn print_help() {
     println!();
     println!("Examples:");
     println!("  skim lint eslint .             Run eslint");
-    println!("  skim lint ruff check .         Run ruff check");
-    println!("  skim lint mypy src/            Run mypy");
     println!("  skim lint golangci run ./...   Run golangci-lint");
+    println!("  skim lint mypy src/            Run mypy");
+    println!("  skim lint prettier .           Run prettier --check");
+    println!("  skim lint ruff check .         Run ruff check");
+    println!("  skim lint rustfmt src/         Run rustfmt --check");
     println!("  eslint . 2>&1 | skim lint eslint  Pipe eslint output");
 }
 

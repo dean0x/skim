@@ -236,11 +236,28 @@ fn check_has_rewrite(tokens: &[&str]) -> bool {
             Some("test" | "nextest" | "clippy" | "build")
         ),
         "pytest" | "python" | "python3" => true,
-        "npx" => matches!(tokens.get(1).copied(), Some("vitest" | "jest" | "tsc")),
+        "npx" => matches!(
+            tokens.get(1).copied(),
+            Some("vitest" | "jest" | "tsc" | "prettier")
+        ),
         "vitest" | "jest" => true,
         "go" => tokens.get(1) == Some(&"test"),
         "git" => matches!(tokens.get(1).copied(), Some("status" | "diff" | "log")),
         "tsc" => true,
+        "prettier" => true,
+        "rustfmt" => true,
+        "gh" => matches!(
+            tokens.get(1).copied(),
+            Some("pr" | "issue" | "run" | "release")
+        ),
+        "aws" => true,
+        "curl" => true,
+        "wget" => true,
+        "find" => true,
+        "tree" => true,
+        "rg" => true,
+        "ls" => matches!(tokens.get(1).copied(), Some("-la" | "-R")),
+        "grep" => matches!(tokens.get(1).copied(), Some("-r" | "-rn")),
         "cat" | "head" | "tail" => {
             // Only rewritable if operating on code files
             tokens
@@ -269,9 +286,25 @@ fn get_rewrite_target(tokens: &[&str]) -> Option<String> {
             Some("skim test vitest".to_string())
         }
         "npx" if tokens.get(1) == Some(&"tsc") => Some("skim build tsc".to_string()),
+        "npx" if tokens.get(1) == Some(&"prettier") => Some("skim lint prettier".to_string()),
         "go" if tokens.get(1) == Some(&"test") => Some("skim test go".to_string()),
         "git" => Some(format!("skim git {}", tokens.get(1).unwrap_or(&""))),
         "tsc" => Some("skim build tsc".to_string()),
+        "prettier" => Some("skim lint prettier".to_string()),
+        "rustfmt" => Some("skim lint rustfmt".to_string()),
+        "gh" => Some(format!("skim infra gh {}", tokens.get(1).unwrap_or(&""))),
+        "aws" => Some("skim infra aws".to_string()),
+        "curl" => Some("skim infra curl".to_string()),
+        "wget" => Some("skim infra wget".to_string()),
+        "find" => Some("skim file find".to_string()),
+        "tree" => Some("skim file tree".to_string()),
+        "rg" => Some("skim file rg".to_string()),
+        "ls" if matches!(tokens.get(1).copied(), Some("-la" | "-R")) => {
+            Some("skim file ls".to_string())
+        }
+        "grep" if matches!(tokens.get(1).copied(), Some("-r" | "-rn")) => {
+            Some("skim file grep".to_string())
+        }
         "cat" | "head" | "tail" => Some("skim <file> --mode=pseudo".to_string()),
         _ => None,
     }
@@ -539,6 +572,24 @@ mod tests {
     }
 
     #[test]
+    fn test_check_has_rewrite_lint_and_infra_tools() {
+        // lint tools
+        assert!(check_has_rewrite(&["prettier", "--check", "."]));
+        assert!(check_has_rewrite(&["rustfmt", "--check", "src/main.rs"]));
+        assert!(check_has_rewrite(&["npx", "prettier", "--check", "."]));
+        // infra tools
+        assert!(check_has_rewrite(&["gh", "pr", "list"]));
+        assert!(check_has_rewrite(&["gh", "issue", "list"]));
+        assert!(check_has_rewrite(&["gh", "run", "list"]));
+        assert!(check_has_rewrite(&["gh", "release", "list"]));
+        assert!(check_has_rewrite(&["aws", "s3", "ls"]));
+        assert!(check_has_rewrite(&["curl", "https://api.example.com"]));
+        assert!(check_has_rewrite(&["wget", "https://example.com/file"]));
+        // gh without a recognized subcommand should not match
+        assert!(!check_has_rewrite(&["gh", "auth", "login"]));
+    }
+
+    #[test]
     fn test_get_rewrite_target() {
         assert_eq!(
             get_rewrite_target(&["cargo", "test"]),
@@ -552,6 +603,82 @@ mod tests {
             get_rewrite_target(&["cat", "file.rs"]),
             Some("skim <file> --mode=pseudo".to_string())
         );
+        assert_eq!(get_rewrite_target(&["ls"]), None);
+    }
+
+    #[test]
+    fn test_get_rewrite_target_lint_and_infra_tools() {
+        assert_eq!(
+            get_rewrite_target(&["prettier"]),
+            Some("skim lint prettier".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["rustfmt"]),
+            Some("skim lint rustfmt".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["npx", "prettier"]),
+            Some("skim lint prettier".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["gh", "pr"]),
+            Some("skim infra gh pr".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["aws"]),
+            Some("skim infra aws".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["curl"]),
+            Some("skim infra curl".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["wget"]),
+            Some("skim infra wget".to_string())
+        );
+    }
+
+    #[test]
+    fn test_check_has_rewrite_file_ops() {
+        // find always matches
+        assert!(check_has_rewrite(&["find", ".", "-name", "*.rs"]));
+        // tree always matches
+        assert!(check_has_rewrite(&["tree", "src/"]));
+        // rg always matches
+        assert!(check_has_rewrite(&["rg", "fn main", "src/"]));
+        // grep -r/-rn matches; bare grep does not
+        assert!(check_has_rewrite(&["grep", "-r", "TODO", "src/"]));
+        assert!(check_has_rewrite(&["grep", "-rn", "TODO", "src/"]));
+        assert!(!check_has_rewrite(&["grep", "TODO", "file.rs"]));
+        // ls -la/-R matches; bare ls does not
+        assert!(check_has_rewrite(&["ls", "-la"]));
+        assert!(check_has_rewrite(&["ls", "-R", "src/"]));
+        assert!(!check_has_rewrite(&["ls"]));
+    }
+
+    #[test]
+    fn test_get_rewrite_target_file_ops() {
+        assert_eq!(
+            get_rewrite_target(&["find", "."]),
+            Some("skim file find".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["tree", "src/"]),
+            Some("skim file tree".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["rg", "pattern"]),
+            Some("skim file rg".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["grep", "-r", "pattern"]),
+            Some("skim file grep".to_string())
+        );
+        assert_eq!(
+            get_rewrite_target(&["ls", "-la"]),
+            Some("skim file ls".to_string())
+        );
+        // bare ls returns None
         assert_eq!(get_rewrite_target(&["ls"]), None);
     }
 
