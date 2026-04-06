@@ -9,9 +9,9 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
-use colored::Colorize;
+use colored::{ColoredString, Colorize};
 
-use crate::analytics::{AnalyticsDb, AnalyticsStore, PricingModel};
+use crate::analytics::{AnalyticsDb, AnalyticsStore, DailyStats, PricingModel};
 use crate::cmd::session::types::parse_duration_ago;
 use crate::tokens;
 
@@ -36,6 +36,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     if clear {
         return run_clear(&db);
+    }
+
+    // Auto-clean: one-time self-healing for pre-fix corrupt records where
+    // compressed_tokens > raw_tokens.  Runs on concrete AnalyticsDb, reports
+    // to stderr so it never pollutes JSON stdout.
+    let cleaned = db.clean_invalid_records().unwrap_or(0);
+    if cleaned > 0 {
+        eprintln!("skim: cleaned {cleaned} invalid analytics record(s)");
     }
 
     let since_ts = if let Some(s) = &since_str {
@@ -155,6 +163,175 @@ fn run_json(
 
     writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
     Ok(ExitCode::SUCCESS)
+}
+
+// ============================================================================
+// Dashboard formatting helpers
+// ============================================================================
+
+/// Format a token count in compact human-readable form: 1.5K, 2.4M, 1.2B.
+/// Values under 1000 are rendered as plain integers.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Colorise a savings percentage with ANSI codes.
+///
+/// Clamps to [0.0, 100.0] then formats right-aligned in a 6-char field
+/// before applying color so ANSI escape sequences do not affect alignment.
+fn color_pct(pct: f64) -> ColoredString {
+    let clamped = pct.clamp(0.0, 100.0);
+    let s = format!("{clamped:>5.1}%");
+    if clamped >= 70.0 {
+        s.green()
+    } else if clamped >= 40.0 {
+        s.yellow()
+    } else {
+        s.red()
+    }
+}
+
+/// Render a block-character progress bar.
+///
+/// Uses `█` for filled and `░` for empty cells, colored by efficiency tier.
+/// `pct` is clamped to [0, 100] before computing fill width.
+fn render_bar(pct: f64, width: usize) -> String {
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    let filled_str = "\u{2588}".repeat(filled);
+    let colored_fill: ColoredString = if clamped >= 70.0 {
+        filled_str.green()
+    } else if clamped >= 40.0 {
+        filled_str.yellow()
+    } else {
+        filled_str.red()
+    };
+    format!("[{}{}]", colored_fill, "\u{2591}".repeat(empty))
+}
+
+/// Render a sparkline from daily stats using block chars `▁▂▃▄▅▆▇█`.
+///
+/// Takes up to the last 14 days of data.  Gaps between dates are filled
+/// with `▁` (minimum bar).  Returns an empty string when `daily` is empty.
+fn render_sparkline(daily: &[DailyStats]) -> String {
+    const BARS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    if daily.is_empty() {
+        return String::new();
+    }
+
+    // Work with data sorted ascending by date; take last 14 entries.
+    let mut sorted: Vec<&DailyStats> = daily.iter().collect();
+    sorted.sort_by(|a, b| a.date.cmp(&b.date));
+    let window: Vec<&DailyStats> = sorted.into_iter().rev().take(14).rev().collect();
+
+    // Build a date-indexed map of tokens_saved.
+    use std::collections::HashMap;
+    let mut by_date: HashMap<&str, u64> = HashMap::new();
+    for entry in &window {
+        by_date.insert(entry.date.as_str(), entry.tokens_saved);
+    }
+
+    let first_date = window.first().map(|d| d.date.as_str()).unwrap_or("");
+    let last_date = window.last().map(|d| d.date.as_str()).unwrap_or("");
+
+    // Enumerate every calendar day between first and last inclusive.
+    let dates = calendar_dates_between(first_date, last_date);
+
+    let max_val = by_date.values().copied().max().unwrap_or(0);
+
+    dates
+        .iter()
+        .map(|date| {
+            let tokens = by_date.get(date.as_str()).copied().unwrap_or(0);
+            if max_val == 0 {
+                BARS[0]
+            } else {
+                let idx =
+                    ((tokens as f64 / max_val as f64) * (BARS.len() - 1) as f64).round() as usize;
+                BARS[idx.min(BARS.len() - 1)]
+            }
+        })
+        .collect()
+}
+
+/// Enumerate calendar dates (YYYY-MM-DD strings) from `start` to `end` inclusive.
+///
+/// Falls back to just returning the start date when date arithmetic is not
+/// possible (e.g. malformed strings), keeping output safe.
+fn calendar_dates_between(start: &str, end: &str) -> Vec<String> {
+    // Parse YYYY-MM-DD manually to avoid pulling in chrono.
+    fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+        let parts: Vec<&str> = s.splitn(3, '-').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let y = parts[0].parse::<i32>().ok()?;
+        let m = parts[1].parse::<u32>().ok()?;
+        let d = parts[2].parse::<u32>().ok()?;
+        Some((y, m, d))
+    }
+
+    fn days_in_month(year: i32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 30,
+        }
+    }
+
+    fn advance_day(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
+        let max_day = days_in_month(year, month);
+        if day < max_day {
+            (year, month, day + 1)
+        } else if month < 12 {
+            (year, month + 1, 1)
+        } else {
+            (year + 1, 1, 1)
+        }
+    }
+
+    let (mut y, mut m, mut d) = match parse_ymd(start) {
+        Some(v) => v,
+        None => return vec![start.to_string()],
+    };
+    let end_parsed = match parse_ymd(end) {
+        Some(v) => v,
+        None => return vec![start.to_string()],
+    };
+
+    let mut dates = Vec::new();
+    // Safety cap: never generate more than 100 dates to prevent runaway loops.
+    while (y, m, d) <= end_parsed && dates.len() < 100 {
+        dates.push(format!("{y:04}-{m:02}-{d:02}"));
+        let next = advance_day(y, m, d);
+        (y, m, d) = next;
+    }
+    dates
+}
+
+/// Format a section header padded to 76 characters with thin horizontal lines.
+fn section_header(title: &str) -> String {
+    // "── {title} " + trailing dashes to 76 chars total
+    let prefix = format!("\u{2500}\u{2500} {title} ");
+    let remaining = 76_usize.saturating_sub(prefix.len());
+    format!("{}{}", prefix, "\u{2500}".repeat(remaining))
 }
 
 // ============================================================================
@@ -314,6 +491,93 @@ fn run_dashboard(
 mod tests {
     use super::*;
     use crate::analytics::*;
+
+    // ========================================================================
+    // format_tokens tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_tokens() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1.0K");
+        assert_eq!(format_tokens(1_500), "1.5K");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(2_400_000), "2.4M");
+        assert_eq!(format_tokens(1_000_000_000), "1.0B");
+    }
+
+    // ========================================================================
+    // color_pct tests
+    // ========================================================================
+
+    #[test]
+    fn test_color_pct_clamping() {
+        // Negative clamps to 0.0
+        let s = color_pct(-5.0).to_string();
+        assert!(s.contains("0.0%"), "negative should clamp to 0.0%, got: {s}");
+        // Over 100 clamps to 100.0
+        let s = color_pct(150.0).to_string();
+        assert!(
+            s.contains("100.0%"),
+            "over-100 should clamp to 100.0%, got: {s}"
+        );
+    }
+
+    // ========================================================================
+    // render_sparkline tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_sparkline_empty() {
+        let result = render_sparkline(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_sparkline_with_gaps() {
+        let daily = vec![
+            DailyStats {
+                date: "2026-04-01".to_string(),
+                invocations: 5,
+                tokens_saved: 100,
+                avg_savings_pct: 50.0,
+            },
+            DailyStats {
+                date: "2026-04-03".to_string(),
+                invocations: 3,
+                tokens_saved: 200,
+                avg_savings_pct: 60.0,
+            },
+            DailyStats {
+                date: "2026-04-05".to_string(),
+                invocations: 7,
+                tokens_saved: 50,
+                avg_savings_pct: 40.0,
+            },
+        ];
+        let sparkline = render_sparkline(&daily);
+        assert_eq!(sparkline.chars().count(), 5, "Apr 1-5 = 5 days");
+        let chars: Vec<char> = sparkline.chars().collect();
+        assert_eq!(chars[1], '▁', "Apr 2 gap should be min bar");
+        assert_eq!(chars[3], '▁', "Apr 4 gap should be min bar");
+    }
+
+    // ========================================================================
+    // section_header test
+    // ========================================================================
+
+    #[test]
+    fn test_section_header_total_width() {
+        let hdr = section_header("Summary");
+        // Should be close to 76 chars (allow for unicode char width)
+        assert!(
+            hdr.len() >= 70,
+            "section header should pad to ~76 chars, got {}",
+            hdr.len()
+        );
+        assert!(hdr.contains("Summary"), "header must contain title");
+    }
 
     /// In-memory mock store for testing dashboard rendering without a real DB.
     struct MockStore {
