@@ -7,6 +7,7 @@ use std::{
 };
 
 use memmap2::Mmap;
+use rustc_hash::FxHashMap;
 
 use crate::SearchError;
 
@@ -76,13 +77,22 @@ impl DeltaWriter {
     }
 }
 
-/// Memory-mapped reader for the delta file.
+/// Memory-mapped reader for the delta file with an in-memory hash index.
+///
+/// The `index` field maps each `ngram_hash` to the byte offsets of its matching
+/// records, built once at open time. This makes [`DeltaReader::scan`] O(1) per
+/// query n-gram instead of O(n) over the full mmap.
 pub struct DeltaReader {
     mmap: Mmap,
+    /// ngram_hash → list of record start byte offsets into `mmap`.
+    index: FxHashMap<u64, Vec<usize>>,
 }
 
 impl DeltaReader {
     /// Open the delta file. Returns `Ok(None)` if no delta file exists.
+    ///
+    /// Builds an in-memory hash index over all complete records so that
+    /// [`scan`] is O(1) rather than O(n).
     ///
     /// # Errors
     ///
@@ -118,24 +128,18 @@ impl DeltaReader {
         // Concurrent rebuilds use atomic rename on the main index files; the
         // delta file itself is append-only, so any data visible at `mmap` time
         // remains valid for the lifetime of this mapping. Incomplete records
-        // at the tail are handled by `scan` via integer division on record_count.
+        // at the tail are handled below via integer division on record_count.
         let mmap = unsafe { Mmap::map(&file) }.map_err(SearchError::Io)?;
-        Ok(Some(Self { mmap }))
-    }
 
-    /// Linear scan for all entries matching the given n-gram.
-    ///
-    /// Returns all [`PostingEntry`] items whose `ngram_hash` matches.
-    /// Incomplete records at the end of the file are silently skipped.
-    pub fn scan(&self, ngram: Ngram) -> Vec<PostingEntry> {
-        let target = ngram.as_u64();
-        let mut results = Vec::new();
-        let data = &self.mmap[..];
+        // Build the hash index in a single pass over all complete records.
+        let data = &mmap[..];
         let record_count = data.len() / DELTA_RECORD_SIZE;
+        let mut index: FxHashMap<u64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(record_count, Default::default());
 
         for i in 0..record_count {
             let base = i * DELTA_RECORD_SIZE;
-            let hash_bytes: [u8; 8] = [
+            let hash = u64::from_le_bytes([
                 data[base],
                 data[base + 1],
                 data[base + 2],
@@ -144,16 +148,28 @@ impl DeltaReader {
                 data[base + 5],
                 data[base + 6],
                 data[base + 7],
-            ];
-            let hash = u64::from_le_bytes(hash_bytes);
-            if hash != target {
-                continue;
-            }
+            ]);
+            index.entry(hash).or_default().push(base);
+        }
+
+        Ok(Some(Self { mmap, index }))
+    }
+
+    /// Look up all postings matching the given n-gram.
+    ///
+    /// Uses the in-memory hash index built at open time for O(1) dispatch.
+    /// Returns all [`PostingEntry`] items whose `ngram_hash` matches.
+    pub fn scan(&self, ngram: Ngram) -> Vec<PostingEntry> {
+        let Some(offsets) = self.index.get(&ngram.as_u64()) else {
+            return Vec::new();
+        };
+        let data = &self.mmap[..];
+        let mut results = Vec::with_capacity(offsets.len());
+        for &base in offsets {
             if let Some(posting) = PostingEntry::from_bytes(&data[base + 8..]) {
                 results.push(posting);
             }
         }
-
         results
     }
 }
