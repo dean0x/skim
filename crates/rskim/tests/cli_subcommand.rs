@@ -8,6 +8,14 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
+const FIND_FIXTURE: &str = include_str!("fixtures/cmd/file/find_small.txt");
+const GH_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_pr_list.json");
+const LOG_FIXTURE: &str = include_str!("fixtures/cmd/log/plaintext_mixed.txt");
+
+fn skim_cmd() -> Command {
+    Command::cargo_bin("skim").unwrap()
+}
+
 // ============================================================================
 // File operation routing (backward compatibility)
 // ============================================================================
@@ -329,4 +337,170 @@ fn test_unknown_word_routes_to_file_operation() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not yet implemented").not());
+}
+
+// ============================================================================
+// Subcommand help
+// ============================================================================
+
+#[test]
+fn test_subcommand_file_help() {
+    skim_cmd()
+        .args(["file", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("find"));
+}
+
+#[test]
+fn test_subcommand_infra_help() {
+    skim_cmd()
+        .args(["infra", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gh"));
+}
+
+#[test]
+fn test_subcommand_log_help() {
+    skim_cmd()
+        .args(["log", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dedup"));
+}
+
+// ============================================================================
+// Error/edge paths
+// ============================================================================
+
+#[test]
+fn test_subcommand_file_unknown_tool() {
+    skim_cmd()
+        .args(["file", "unknown-tool-xyz"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_subcommand_log_empty_stdin() {
+    skim_cmd().arg("log").write_stdin("").assert().success();
+}
+
+#[test]
+fn test_log_conflicting_flags() {
+    skim_cmd()
+        .args(["log", "--debug-only", "--keep-debug"])
+        .write_stdin(LOG_FIXTURE)
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_file_find_empty_stdin() {
+    skim_cmd()
+        .args(["file", "find"])
+        .write_stdin("")
+        .assert()
+        .success();
+}
+
+// ============================================================================
+// JSON output
+// ============================================================================
+
+#[test]
+fn test_subcommand_file_json() {
+    let output = skim_cmd()
+        .args(["file", "find", "--json"])
+        .write_stdin(FIND_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(json.get("tool").is_some(), "JSON should have 'tool' field");
+}
+
+#[test]
+fn test_subcommand_infra_json() {
+    let output = skim_cmd()
+        .args(["infra", "gh", "--json"])
+        .write_stdin(GH_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(json.get("tool").is_some(), "JSON should have 'tool' field");
+}
+
+#[test]
+fn test_subcommand_log_json() {
+    let output = skim_cmd()
+        .args(["log", "--json"])
+        .write_stdin(LOG_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    // total_lines is nested under the "result" key
+    let has_total_lines = json
+        .get("result")
+        .and_then(|r| r.get("total_lines"))
+        .is_some();
+    assert!(
+        has_total_lines,
+        "JSON should have 'result.total_lines' field"
+    );
+}
+
+// ============================================================================
+// --show-stats token output
+// ============================================================================
+
+#[test]
+fn test_subcommand_file_show_stats() {
+    let output = skim_cmd()
+        .args(["file", "find", "--show-stats"])
+        .write_stdin(FIND_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.to_lowercase().contains("token"),
+        "stderr should contain token stats, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_show_stats() {
+    let output = skim_cmd()
+        .args(["infra", "gh", "--show-stats"])
+        .write_stdin(GH_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.to_lowercase().contains("token"),
+        "stderr should contain token stats, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_subcommand_log_show_stats() {
+    let output = skim_cmd()
+        .args(["log", "--show-stats"])
+        .write_stdin(LOG_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.to_lowercase().contains("token"),
+        "stderr should contain token stats, got: {stderr}"
+    );
 }
