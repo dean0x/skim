@@ -164,8 +164,6 @@ pub(super) fn command() -> clap::Command {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // sanitize_for_display is now in crate::cmd; tests remain here as
     // a usage-site smoke-check to catch regressions at the call site.
     #[test]

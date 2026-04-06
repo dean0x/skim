@@ -11,7 +11,7 @@ use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{run_file_tool, try_parse_file_line_content, FileToolConfig, MAX_MATCHES_PER_FILE};
+use super::{run_file_tool, try_parse_file_line_content, FileToolConfig};
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {
     program: "grep",
@@ -123,6 +123,7 @@ mod tests {
 
     #[test]
     fn test_max_matches_per_file_cap() {
+        use crate::cmd::file::MAX_MATCHES_PER_FILE;
         // Build 10 matches for same file -- should cap at MAX_MATCHES_PER_FILE
         let input: String = (1..=10)
             .map(|i| format!("src/big.rs:{i}:match line {i}\n"))
