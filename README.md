@@ -584,7 +584,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.1.0 — Stable
+**Current**: v2.2.0 — Stable
 
 ✅ **Core — Code Reading (17 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
@@ -596,6 +596,9 @@ cargo bench
 - Test runners: cargo test, pytest, vitest/jest, go test
 - Build tools: cargo build, cargo clippy, tsc
 - Git: status, diff, log
+- File tools: find, ls, tree, grep, rg
+- Log: JSON structured + plaintext dedup, debug filtering, stack trace collapsing
+- Infra: gh, aws, curl, wget
 - Three-tier degradation: Structured → Regex → Passthrough
 
 ✅ **Agent Integration:**
@@ -610,7 +613,7 @@ cargo bench
 
 ✅ **Distribution:**
 - cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
-- 1,594 tests passing, 14.6ms performance (3x under target)
+- 2,226 tests passing, 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 

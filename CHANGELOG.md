@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-04-06
+
+Minor release: File, log, and infrastructure output compression (12 new tool parsers), learn command fix, rewrite/discover integration.
+
+### Added — File Output Compression (`skim file`)
+- New subcommand: `skim file <tool> [args...]`
+- Supported tools: find, ls, tree, grep, rg
+- grep/rg deduplication and match grouping
+- Item limits and byte caps for large outputs
+
+### Added — Log Output Compression (`skim log`)
+- New subcommand: `skim log [args...]`
+- JSON structured log deduplication with counts
+- Regex-based plaintext log deduplication
+- Debug/trace level filtering with `--debug-only` and `--keep-debug`
+- Stack trace collapsing
+
+### Added — Infrastructure Output Compression (`skim infra`)
+- New subcommand: `skim infra <tool> [args...]`
+- Supported tools: gh, aws, curl, wget
+- Metadata stripping, pagination removal, response body extraction
+
+### Added — Lint Extensions
+- prettier check-mode output compression
+- rustfmt check-mode output compression
+
+### Added — Integration
+- Rewrite rules updated for file, log, and infra subcommands
+- Discover integration for new subcommands
+- Shell completions for new subcommands
+
+### Fixed
+- Router: subcommands always take priority over filesystem paths (no more collisions with files/dirs named `test`, `log`, etc.)
+- Learn command: fixed guidance injection and improved error handling (#115)
+
+### Testing
+- **2,226 tests passing** (up from 1,993 in v2.1.0 — 12% increase)
+
 ## [2.1.0] - 2026-04-01
 
 Minor release: Kotlin + Swift language support (17 total), AST-aware git diff, lint and package manager output compression, canonical output types, and expanded rewrite rules.
@@ -597,6 +635,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.2.0** (2026-04-06): File, log, infra output compression (12 new parsers), learn fix, rewrite/discover integration
 - **2.1.0** (2026-04-01): Kotlin + Swift, AST-aware git diff, lint/pkg compression, canonical output
 - **2.0.0** (2026-03-28): Context optimization engine — command compression, agent hooks, analytics, MCP server
 - **1.0.0** (2026-03-18): First stable release — minimal mode, token budgets, max-lines, C/C++/TOML, skimmer plugin
