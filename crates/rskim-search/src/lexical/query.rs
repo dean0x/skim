@@ -22,7 +22,7 @@ use super::{
     index_format::{DeltaReader, IndexReader, Tombstones},
     ngram::extract_query_ngrams,
     scoring::Bm25Scorer,
-    Bm25Params, IndexMetadata,
+    Bm25Params, IndexMetadata, PostingEntry,
 };
 
 /// Maximum `metadata.json` file size in bytes (100 MB).
@@ -137,15 +137,16 @@ impl SearchLayer for LexicalSearchLayer {
         //   c. Group by doc_id → per-field TF list.
         //   d. Compute df (unique doc count) and score each doc for this term.
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
+        let mut postings_buf: Vec<PostingEntry> = Vec::new();
+        let mut ngram_docs: FxHashMap<u32, Vec<(SearchField, u16)>> = FxHashMap::default();
 
         for (ngram, _query_weight) in &query_ngrams {
             // Collect per-doc field-TF pairs from main index + delta.
-            // ngram_docs: doc_id → Vec<(SearchField, tf)>
-            let mut ngram_docs: FxHashMap<u32, Vec<(SearchField, u16)>> = FxHashMap::default();
+            ngram_docs.clear();
 
             // Main index postings.
-            if let Some(postings) = self.reader.lookup(*ngram) {
-                for entry in postings {
+            if self.reader.lookup_into(*ngram, &mut postings_buf) {
+                for entry in &postings_buf {
                     if self.tombstones.contains(entry.doc_id) {
                         continue;
                     }
@@ -160,7 +161,8 @@ impl SearchLayer for LexicalSearchLayer {
 
             // Delta postings (merged on top of main index — newest wins by union).
             if let Some(ref dr) = self.delta {
-                for entry in dr.scan(*ngram) {
+                dr.scan_into(*ngram, &mut postings_buf);
+                for entry in &postings_buf {
                     if let Some(field) = SearchField::from_u8(entry.field_id) {
                         ngram_docs
                             .entry(entry.doc_id)

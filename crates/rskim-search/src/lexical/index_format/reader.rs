@@ -16,6 +16,17 @@ use super::{
 };
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum `.skpost` file size in bytes (4 GiB).
+///
+/// At 12 bytes per `PostingEntry` this allows ~357 million records, well
+/// beyond any real-world repository. Exceeding this limit indicates either
+/// corruption or a crafted index designed to trigger a large allocation.
+const MAX_SKPOST_BYTES: usize = 4_000_000_000;
+
+// ============================================================================
 // IndexReader — mmap'd reader
 // ============================================================================
 
@@ -141,11 +152,6 @@ impl IndexReader {
         }
 
         // Validate .skpost size: must be below the hard cap and divisible by POSTING_ENTRY_SIZE.
-        //
-        // MAX_SKPOST_BYTES is a sanity guard against crafted indexes that claim an absurdly
-        // large posting file. 4 GiB covers ~357 million PostingEntry records (12 bytes each),
-        // which is well beyond any real-world repository.
-        const MAX_SKPOST_BYTES: usize = 4_000_000_000;
         if post_mmap.len() > MAX_SKPOST_BYTES {
             return Err(post_corrupted(format!(
                 ".skpost size {} exceeds maximum allowed size {} bytes",
@@ -222,6 +228,22 @@ impl IndexReader {
     /// `field_id` values. Returns `None` if the n-gram is not present.
     #[must_use = "returns the posting list for scoring; ignoring it silently skips matching documents"]
     pub fn lookup(&self, ngram: Ngram) -> Option<Vec<PostingEntry>> {
+        let mut buf = Vec::new();
+        if self.lookup_into(ngram, &mut buf) {
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    /// Binary search for an n-gram, writing results into a caller-owned buffer.
+    ///
+    /// Clears `buf` before use and fills it with decoded posting entries. The
+    /// caller can reuse the same buffer across multiple lookups to avoid
+    /// per-call allocation. Returns `true` if the n-gram was found.
+    pub fn lookup_into(&self, ngram: Ngram, buf: &mut Vec<PostingEntry>) -> bool {
+        buf.clear();
+
         let target_hash = ngram.as_u64();
 
         // Binary search over IndexEntry array (sorted by ngram_hash)
@@ -231,18 +253,22 @@ impl IndexReader {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let offset = INDEX_HEADER_SIZE + mid * INDEX_ENTRY_SIZE;
-            let entry = IndexEntry::from_bytes(&self.idx_mmap[offset..])?;
+            let Some(entry) = IndexEntry::from_bytes(&self.idx_mmap[offset..]) else {
+                buf.clear();
+                return false;
+            };
 
             match entry.ngram_hash.cmp(&target_hash) {
                 std::cmp::Ordering::Equal => {
-                    return Some(self.read_postings(&entry));
+                    self.read_postings_into(&entry, buf);
+                    return true;
                 }
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
             }
         }
 
-        None
+        false
     }
 
     /// Return the index header.
@@ -250,8 +276,10 @@ impl IndexReader {
         &self.header
     }
 
-    /// Decode posting entries for the given IndexEntry, filtering invalid ones.
-    fn read_postings(&self, entry: &IndexEntry) -> Vec<PostingEntry> {
+    /// Decode posting entries into a caller-owned buffer, filtering invalid ones.
+    fn read_postings_into(&self, entry: &IndexEntry, buf: &mut Vec<PostingEntry>) {
+        buf.clear();
+
         // `posting_offset` is already a byte offset into .skpost.
         let start = entry.posting_offset as usize;
         // Cap the capacity hint against the maximum number of entries that could
@@ -262,7 +290,7 @@ impl IndexReader {
         let count = (entry.posting_length as usize).min(max_possible);
         let file_count = self.header.file_count;
 
-        let mut result = Vec::with_capacity(count);
+        buf.reserve(count);
         for i in 0..count {
             let byte_offset = start + i * POSTING_ENTRY_SIZE;
             let end = byte_offset + POSTING_ENTRY_SIZE;
@@ -280,9 +308,8 @@ impl IndexReader {
             if u64::from(p.doc_id) >= file_count {
                 continue;
             }
-            result.push(p);
+            buf.push(p);
         }
-        result
     }
 
     /// Return the path to the directory this reader was opened from.

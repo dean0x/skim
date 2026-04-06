@@ -160,16 +160,28 @@ impl DeltaReader {
     /// Uses the in-memory hash index built at open time for O(1) dispatch.
     /// Returns all [`PostingEntry`] items whose `ngram_hash` matches.
     pub fn scan(&self, ngram: Ngram) -> Vec<PostingEntry> {
+        let mut buf = Vec::new();
+        self.scan_into(ngram, &mut buf);
+        buf
+    }
+
+    /// Look up all postings matching the given n-gram into a caller-owned buffer.
+    ///
+    /// Clears `buf` before use and fills it with decoded posting entries. The
+    /// caller can reuse the same buffer across multiple scans to avoid
+    /// per-call allocation.
+    pub fn scan_into(&self, ngram: Ngram, buf: &mut Vec<PostingEntry>) {
+        buf.clear();
+
         let Some(offsets) = self.index.get(&ngram.as_u64()) else {
-            return Vec::new();
+            return;
         };
         let data = &self.mmap[..];
-        let mut results = Vec::with_capacity(offsets.len());
+        buf.reserve(offsets.len());
         for &base in offsets {
             if let Some(posting) = PostingEntry::from_bytes(&data[base + 8..]) {
-                results.push(posting);
+                buf.push(posting);
             }
         }
-        results
     }
 }
