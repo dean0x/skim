@@ -463,7 +463,15 @@ const REWRITE_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["curl"],
         rewrite_to: &["skim", "infra", "curl"],
-        skip_if_flag_prefix: &["-o", "--output", "-X", "--request", "-F", "--upload-file", "-T"],
+        skip_if_flag_prefix: &[
+            "-o",
+            "--output",
+            "-X",
+            "--request",
+            "-F",
+            "--upload-file",
+            "-T",
+        ],
         category: RewriteCategory::Infra,
     },
     // infra — wget
@@ -3331,11 +3339,9 @@ mod tests {
     fn test_rewrite_ls_la() {
         let result = try_rewrite(&["ls", "-la"]).unwrap();
         assert!(
-            result.tokens.starts_with(&[
-                "skim".to_string(),
-                "file".to_string(),
-                "ls".to_string()
-            ]),
+            result
+                .tokens
+                .starts_with(&["skim".to_string(), "file".to_string(), "ls".to_string()]),
             "Expected skim file ls prefix, got {:?}",
             result.tokens
         );
@@ -3345,11 +3351,9 @@ mod tests {
     fn test_rewrite_ls_recursive() {
         let result = try_rewrite(&["ls", "-R", "src/"]).unwrap();
         assert!(
-            result.tokens.starts_with(&[
-                "skim".to_string(),
-                "file".to_string(),
-                "ls".to_string()
-            ]),
+            result
+                .tokens
+                .starts_with(&["skim".to_string(), "file".to_string(), "ls".to_string()]),
             "Expected skim file ls prefix, got {:?}",
             result.tokens
         );
@@ -3425,11 +3429,9 @@ mod tests {
     fn test_rewrite_rg() {
         let result = try_rewrite(&["rg", "fn main", "src/"]).unwrap();
         assert!(
-            result.tokens.starts_with(&[
-                "skim".to_string(),
-                "file".to_string(),
-                "rg".to_string()
-            ]),
+            result
+                .tokens
+                .starts_with(&["skim".to_string(), "file".to_string(), "rg".to_string()]),
             "Expected skim file rg prefix, got {:?}",
             result.tokens
         );

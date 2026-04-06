@@ -72,7 +72,10 @@ fn try_parse_lines(stdout: &str, exit_code: Option<i32>) -> Option<FileResult> {
 
     let shown_count = entries.len();
     let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!("... and {} more", total_count - MAX_DISPLAY_ENTRIES))
+        Some(format!(
+            "... and {} more",
+            total_count - MAX_DISPLAY_ENTRIES
+        ))
     } else {
         None
     };
@@ -119,8 +122,14 @@ mod tests {
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
         assert!(result.total_count > 0);
-        assert!(result.total_count <= 10, "Small fixture should have <=10 entries");
-        assert!(result.footer.is_none(), "Small fixture should not be truncated");
+        assert!(
+            result.total_count <= 10,
+            "Small fixture should have <=10 entries"
+        );
+        assert!(
+            result.footer.is_none(),
+            "Small fixture should not be truncated"
+        );
     }
 
     #[test]
@@ -129,11 +138,20 @@ mod tests {
         let result = try_parse_lines(&input, Some(0));
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
-        assert!(result.total_count > MAX_DISPLAY_ENTRIES, "Large fixture should exceed cap");
-        assert_eq!(result.shown_count, MAX_DISPLAY_ENTRIES, "Shown should be capped at 100");
+        assert!(
+            result.total_count > MAX_DISPLAY_ENTRIES,
+            "Large fixture should exceed cap"
+        );
+        assert_eq!(
+            result.shown_count, MAX_DISPLAY_ENTRIES,
+            "Shown should be capped at 100"
+        );
         assert!(result.footer.is_some(), "Large fixture should have footer");
         let footer = result.footer.unwrap();
-        assert!(footer.contains("more"), "Footer should mention remaining count");
+        assert!(
+            footer.contains("more"),
+            "Footer should mention remaining count"
+        );
     }
 
     #[test]
@@ -174,8 +192,14 @@ mod tests {
         let input = "./src/main.rs\n./src/lib.rs\n./Cargo.toml\n";
         let result = try_parse_lines(input, Some(0)).unwrap();
         let rendered = format!("{result}");
-        assert!(rendered.contains("FIND: find |"), "Header should start with FIND:");
-        assert!(rendered.contains("./src/main.rs"), "Entries should appear in output");
+        assert!(
+            rendered.contains("FIND: find |"),
+            "Header should start with FIND:"
+        );
+        assert!(
+            rendered.contains("./src/main.rs"),
+            "Entries should appear in output"
+        );
     }
 
     #[test]

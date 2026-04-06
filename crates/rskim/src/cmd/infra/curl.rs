@@ -32,8 +32,7 @@ static RE_CURL_HTTP_STATUS: LazyLock<Regex> =
 
 /// Matches lines that are curl verbose metadata (not response body).
 /// Uses literal space instead of \s so indented body content is preserved.
-static RE_CURL_VERBOSE_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[*><{} ]").unwrap());
+static RE_CURL_VERBOSE_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[*><{} ]").unwrap());
 
 /// Run `skim infra curl [args...]`.
 pub(crate) fn run(
@@ -79,7 +78,10 @@ fn summarize_json_object(map: &serde_json::Map<String, Value>) -> (String, Vec<I
             value: json_value_to_string(v),
         })
         .collect();
-    let summary = format!("object with {count} key{}", if count == 1 { "" } else { "s" });
+    let summary = format!(
+        "object with {count} key{}",
+        if count == 1 { "" } else { "s" }
+    );
     (summary, items)
 }
 
@@ -90,7 +92,10 @@ fn summarize_json_array(arr: &[Value]) -> (String, Vec<InfraItem>) {
         label: "count".to_string(),
         value: count.to_string(),
     }];
-    let summary = format!("array with {count} element{}", if count == 1 { "" } else { "s" });
+    let summary = format!(
+        "array with {count} element{}",
+        if count == 1 { "" } else { "s" }
+    );
     (summary, items)
 }
 
@@ -103,10 +108,7 @@ fn json_value_to_string(val: &Value) -> String {
 }
 
 /// Parse JSON body from curl response and summarize (slim dispatcher).
-fn try_parse_json(
-    stdout: &str,
-    http_status: Option<&str>,
-) -> Option<InfraResult> {
+fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return None;
@@ -307,7 +309,10 @@ mod tests {
         let result = try_parse_regex(text);
         let result = result.unwrap();
         let body = result.items.iter().find(|i| i.label == "body_preview");
-        assert!(body.is_some(), "Expected indented body lines to be captured");
+        assert!(
+            body.is_some(),
+            "Expected indented body lines to be captured"
+        );
         let val = &body.unwrap().value;
         assert!(
             val.contains("<html>") || val.contains("<body>"),
@@ -334,7 +339,8 @@ mod tests {
 
     #[test]
     fn test_summarize_json_object() {
-        let json: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":"two","c":true}"#).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"a":1,"b":"two","c":true}"#).unwrap();
         let map = json.as_object().unwrap();
         let (summary, items) = summarize_json_object(map);
         assert!(summary.contains("3 key"), "Got: {summary}");
@@ -352,7 +358,10 @@ mod tests {
 
     #[test]
     fn test_json_value_to_string() {
-        assert_eq!(json_value_to_string(&Value::String("hello".into())), "hello");
+        assert_eq!(
+            json_value_to_string(&Value::String("hello".into())),
+            "hello"
+        );
         assert_eq!(json_value_to_string(&Value::Number(42u64.into())), "42");
         assert_eq!(json_value_to_string(&Value::Bool(true)), "true");
     }

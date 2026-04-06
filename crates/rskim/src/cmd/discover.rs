@@ -292,10 +292,7 @@ fn get_rewrite_target(tokens: &[&str]) -> Option<String> {
         "tsc" => Some("skim build tsc".to_string()),
         "prettier" => Some("skim lint prettier".to_string()),
         "rustfmt" => Some("skim lint rustfmt".to_string()),
-        "gh" => Some(format!(
-            "skim infra gh {}",
-            tokens.get(1).unwrap_or(&"")
-        )),
+        "gh" => Some(format!("skim infra gh {}", tokens.get(1).unwrap_or(&""))),
         "aws" => Some("skim infra aws".to_string()),
         "curl" => Some("skim infra curl".to_string()),
         "wget" => Some("skim infra wget".to_string()),

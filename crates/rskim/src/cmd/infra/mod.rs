@@ -143,7 +143,10 @@ mod tests {
     // a usage-site smoke-check to catch regressions at the call site.
     #[test]
     fn test_sanitize_for_display_clean_input() {
-        assert_eq!(super::super::sanitize_for_display("hello-world"), "hello-world");
+        assert_eq!(
+            super::super::sanitize_for_display("hello-world"),
+            "hello-world"
+        );
     }
 
     #[test]

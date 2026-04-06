@@ -143,7 +143,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_ascii_passthrough() {
-        assert_eq!(crate::cmd::sanitize_for_display("hello-world"), "hello-world");
+        assert_eq!(
+            crate::cmd::sanitize_for_display("hello-world"),
+            "hello-world"
+        );
     }
 
     #[test]

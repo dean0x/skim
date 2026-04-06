@@ -30,8 +30,7 @@ const MAX_MATCHES_PER_FILE: usize = 5;
 const MAX_FILES_SHOWN: usize = 50;
 
 /// Matches `file:line_number:content` grep-style output from rg.
-static RE_RG_GREP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
+static RE_RG_GREP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
 
 /// Run `skim file rg [args...]`.
 pub(crate) fn run(
@@ -39,13 +38,27 @@ pub(crate) fn run(
     show_stats: bool,
     json_output: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_file_tool(CONFIG, args, show_stats, json_output, prepare_args, parse_impl)
+    run_file_tool(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        prepare_args,
+        parse_impl,
+    )
 }
 
 /// Inject `--json` unless user has conflicting flags.
 fn prepare_args(cmd_args: &mut Vec<String>) {
     // Skip injection if user already has JSON or count/files-only modes
-    let conflicting = &["--json", "-c", "--count", "-l", "--files", "--files-with-matches"];
+    let conflicting = &[
+        "--json",
+        "-c",
+        "--count",
+        "-l",
+        "--files",
+        "--files-with-matches",
+    ];
     if user_has_flag(cmd_args, conflicting) {
         return;
     }
@@ -84,7 +97,10 @@ fn extract_match_fields(obj: &serde_json::Value) -> Option<(String, String)> {
         .and_then(|t| t.as_str())
         .unwrap_or("<unknown>")
         .to_string();
-    let lineno = data.get("line_number").and_then(|n| n.as_u64()).unwrap_or(0);
+    let lineno = data
+        .get("line_number")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
     let text = data
         .get("lines")
         .and_then(|l| l.get("text"))
@@ -128,7 +144,13 @@ fn try_parse_json(stdout: &str) -> Option<FileResult> {
         return None;
     }
 
-    build_file_result("rg", total_matches, file_matches, MAX_FILES_SHOWN, MAX_MATCHES_PER_FILE)
+    build_file_result(
+        "rg",
+        total_matches,
+        file_matches,
+        MAX_FILES_SHOWN,
+        MAX_MATCHES_PER_FILE,
+    )
 }
 
 // ============================================================================
@@ -160,7 +182,13 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
         return None;
     }
 
-    build_file_result("rg", total_matches, file_matches, MAX_FILES_SHOWN, MAX_MATCHES_PER_FILE)
+    build_file_result(
+        "rg",
+        total_matches,
+        file_matches,
+        MAX_FILES_SHOWN,
+        MAX_MATCHES_PER_FILE,
+    )
 }
 
 // ============================================================================
@@ -193,7 +221,10 @@ mod tests {
     fn test_tier1_rg_json() {
         let input = load_fixture("rg_json.jsonl");
         let result = try_parse_json(&input);
-        assert!(result.is_some(), "Expected Tier 1 JSON Lines parse to succeed");
+        assert!(
+            result.is_some(),
+            "Expected Tier 1 JSON Lines parse to succeed"
+        );
         let result = result.unwrap();
         assert!(result.total_count > 0, "Expected matches in JSON fixture");
     }
@@ -290,6 +321,9 @@ mod tests {
     #[test]
     fn test_tier1_non_json_returns_none() {
         let result = try_parse_json("not json at all");
-        assert!(result.is_none(), "Non-JSON input should return None from Tier 1");
+        assert!(
+            result.is_none(),
+            "Non-JSON input should return None from Tier 1"
+        );
     }
 }

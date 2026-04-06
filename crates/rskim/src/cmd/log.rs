@@ -25,8 +25,10 @@ const MAX_INPUT_LINES: usize = 100_000;
 /// Matches ISO8601 / common log timestamp prefix to strip before dedup.
 /// e.g. `2024-01-15T10:30:00Z `, `2024-01-15 10:30:00 `, `[2024-01-15T10:30:00]`
 static RE_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*")
-        .unwrap()
+    Regex::new(
+        r"^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*",
+    )
+    .unwrap()
 });
 
 /// Matches bracket-style level: `[ERROR]`, `[INFO]`, etc.
@@ -38,8 +40,7 @@ static RE_LEVEL_BARE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?i)(ERROR|WARN|WARNING|INFO|DEBUG|TRACE):?\s+(.*)").unwrap());
 
 /// Matches Java/Node.js stack trace lines.
-static RE_STACK_TRACE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s+at\s+").unwrap());
+static RE_STACK_TRACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+at\s+").unwrap());
 
 // ============================================================================
 // Flags
@@ -279,7 +280,10 @@ fn strip_timestamp(line: &str, keep_timestamps: bool) -> &str {
     if keep_timestamps {
         line
     } else {
-        RE_TIMESTAMP.find(line).map(|m| &line[m.end()..]).unwrap_or(line)
+        RE_TIMESTAMP
+            .find(line)
+            .map(|m| &line[m.end()..])
+            .unwrap_or(line)
     }
 }
 
@@ -333,10 +337,7 @@ fn filter_debug_entries(
 /// Deduplicate entries by normalized message, incrementing count on collision.
 ///
 /// Returns the deduplicated output entries.
-fn deduplicate_entries(
-    entries: Vec<(Option<String>, String)>,
-    no_dedup: bool,
-) -> Vec<LogEntry> {
+fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -> Vec<LogEntry> {
     // Issue 6: pre-size the dedup map and output vec to avoid repeated reallocation.
     let mut dedup_map: HashMap<String, usize> = HashMap::with_capacity(1024);
     let mut output_entries: Vec<LogEntry> = Vec::with_capacity(256);
@@ -346,14 +347,22 @@ fn deduplicate_entries(
 
         if no_dedup {
             // Issue 3: `level` and `message` are owned — no clone needed.
-            output_entries.push(LogEntry { level, message, count: 1 });
+            output_entries.push(LogEntry {
+                level,
+                message,
+                count: 1,
+            });
         } else if let Some(&idx) = dedup_map.get(&normalized) {
             output_entries[idx].count += 1;
         } else {
             let idx = output_entries.len();
             dedup_map.insert(normalized, idx);
             // Issue 3: `level` and `message` are owned — no clone needed.
-            output_entries.push(LogEntry { level, message, count: 1 });
+            output_entries.push(LogEntry {
+                level,
+                message,
+                count: 1,
+            });
         }
     }
 
@@ -473,7 +482,10 @@ mod tests {
             ..Default::default()
         };
         let result = try_parse_regex_logs(&input, &flags).unwrap();
-        assert_eq!(result.debug_hidden, 0, "Expected no DEBUG lines hidden with --keep-debug");
+        assert_eq!(
+            result.debug_hidden, 0,
+            "Expected no DEBUG lines hidden with --keep-debug"
+        );
     }
 
     #[test]
@@ -497,7 +509,10 @@ mod tests {
             ..Default::default()
         };
         let result = try_parse_regex_logs(input, &flags).unwrap();
-        assert_eq!(result.unique_messages, 3, "With --no-dedup, all entries kept");
+        assert_eq!(
+            result.unique_messages, 3,
+            "With --no-dedup, all entries kept"
+        );
     }
 
     #[test]
@@ -509,9 +524,10 @@ mod tests {
         };
         let result = try_parse_regex_logs(input, &flags).unwrap();
         assert!(
-            result.entries.iter().all(|e| {
-                e.level.as_deref() == Some("DEBUG")
-            }),
+            result
+                .entries
+                .iter()
+                .all(|e| { e.level.as_deref() == Some("DEBUG") }),
             "With --debug-only, only DEBUG entries should appear"
         );
     }
@@ -576,7 +592,8 @@ mod tests {
         let level = extract_json_level(&obj);
         assert_eq!(level.as_deref(), Some("INFO"));
 
-        let obj2: Value = serde_json::from_str(r#"{"severity": "warn", "message": "test"}"#).unwrap();
+        let obj2: Value =
+            serde_json::from_str(r#"{"severity": "warn", "message": "test"}"#).unwrap();
         let level2 = extract_json_level(&obj2);
         assert_eq!(level2.as_deref(), Some("WARN"));
     }
@@ -588,7 +605,10 @@ mod tests {
         let result = try_parse_regex_logs(input, &flags).unwrap();
         // Stack trace lines should be skipped
         assert!(
-            result.entries.iter().all(|e| !e.message.contains("at main()")),
+            result
+                .entries
+                .iter()
+                .all(|e| !e.message.contains("at main()")),
             "Stack trace lines should not appear in entries"
         );
     }
@@ -598,11 +618,15 @@ mod tests {
         // With keep_timestamps=false (default) on TIMESTAMP [LEVEL] message format:
         // the timestamp prefix is stripped before level detection, so entries should
         // not contain timestamp text.
-        let input = "2024-01-15T10:30:00Z [INFO] server started\n2024-01-15T10:30:01Z [INFO] ready\n";
+        let input =
+            "2024-01-15T10:30:00Z [INFO] server started\n2024-01-15T10:30:01Z [INFO] ready\n";
         let flags_strip = make_flags();
         let result_strip = try_parse_regex_logs(input, &flags_strip).unwrap();
         assert!(
-            result_strip.entries.iter().all(|e| !e.message.contains("2024-01-15")),
+            result_strip
+                .entries
+                .iter()
+                .all(|e| !e.message.contains("2024-01-15")),
             "Default should strip timestamps from messages"
         );
     }
@@ -613,8 +637,12 @@ mod tests {
         // parser cannot detect log levels (anchored at ^, timestamp comes first), so
         // try_parse_regex_logs returns None and compress_log falls through to Passthrough.
         // Passthrough preserves the raw input verbatim, including timestamps.
-        let input = "2024-01-15T10:30:00Z [INFO] server started\n2024-01-15T10:30:01Z [INFO] ready\n";
-        let flags_keep = LogFlags { keep_timestamps: true, ..LogFlags::default() };
+        let input =
+            "2024-01-15T10:30:00Z [INFO] server started\n2024-01-15T10:30:01Z [INFO] ready\n";
+        let flags_keep = LogFlags {
+            keep_timestamps: true,
+            ..LogFlags::default()
+        };
         let result = compress_log(input, &flags_keep);
         // Tier 2 cannot detect structure when timestamps block the ^ anchor, so
         // output falls to Passthrough — raw content is preserved including timestamps.
@@ -659,13 +687,16 @@ mod tests {
             (Some("TRACE".to_string()), "trace msg".to_string()),
             (Some("ERROR".to_string()), "error msg".to_string()),
         ];
-        let flags = LogFlags { debug_only: true, ..Default::default() };
+        let flags = LogFlags {
+            debug_only: true,
+            ..Default::default()
+        };
         let (filtered, hidden) = filter_debug_entries(entries, &flags);
         assert_eq!(hidden, 0);
         assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().all(|(l, _)| {
-            matches!(l.as_deref(), Some("DEBUG") | Some("TRACE"))
-        }));
+        assert!(filtered
+            .iter()
+            .all(|(l, _)| { matches!(l.as_deref(), Some("DEBUG") | Some("TRACE")) }));
     }
 
     #[test]

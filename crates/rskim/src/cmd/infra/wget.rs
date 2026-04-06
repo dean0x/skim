@@ -40,9 +40,8 @@ static RE_WGET_SAVED: LazyLock<Regex> =
 static RE_WGET_ERROR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"ERROR\s+(\d+):\s+(.+)").unwrap());
 
-static RE_WGET_ANY_STATUS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:HTTP|response|status)[^\n]*?\b([1-5]\d{2})\b").unwrap()
-});
+static RE_WGET_ANY_STATUS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:HTTP|response|status)[^\n]*?\b([1-5]\d{2})\b").unwrap());
 
 /// Run `skim infra wget [args...]`.
 pub(crate) fn run(
@@ -100,7 +99,12 @@ fn try_parse_structured(text: &str) -> Option<InfraResult> {
         .map(|i| i.value.clone())
         .unwrap_or_else(|| "download complete".to_string());
 
-    Some(InfraResult::new("wget".to_string(), "download".to_string(), summary, items))
+    Some(InfraResult::new(
+        "wget".to_string(),
+        "download".to_string(),
+        summary,
+        items,
+    ))
 }
 
 /// Append an HTTP status item if a status line is present.
@@ -121,7 +125,12 @@ fn try_build_error_result(text: &str, items: &mut Vec<InfraItem>) -> Option<Infr
         value: format!("{} {}", &caps[1], caps[2].trim()),
     });
     let summary = format!("ERROR {}", &caps[1]);
-    Some(InfraResult::new("wget".to_string(), "download".to_string(), summary, items.clone()))
+    Some(InfraResult::new(
+        "wget".to_string(),
+        "download".to_string(),
+        summary,
+        items.clone(),
+    ))
 }
 
 /// Append file size and saved-filename items.
@@ -201,7 +210,10 @@ mod tests {
     fn test_tier1_wget_error() {
         let input = load_fixture("wget_error.txt");
         let result = try_parse_structured(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed for error");
+        assert!(
+            result.is_some(),
+            "Expected Tier 1 parse to succeed for error"
+        );
         let result = result.unwrap();
         assert!(result.items.iter().any(|i| i.label == "error"));
     }

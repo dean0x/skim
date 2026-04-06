@@ -36,7 +36,14 @@ pub(crate) fn run(
     show_stats: bool,
     json_output: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, show_stats, json_output, prepare_args, parse_impl)
+    super::run_linter(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        prepare_args,
+        parse_impl,
+    )
 }
 
 /// Inject `--check` if not already present.
@@ -117,9 +124,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
         if let Some(caps) = RE_RUSTFMT_UNIFIED_HEADER.captures(line) {
             let raw_path = caps[1].trim();
             // Skip "a/..." or "b/..." git diff prefixes, and /dev/null
-            let path = raw_path
-                .trim_start_matches("a/")
-                .trim_start_matches("b/");
+            let path = raw_path.trim_start_matches("a/").trim_start_matches("b/");
             if path == "/dev/null" || path.is_empty() {
                 continue;
             }

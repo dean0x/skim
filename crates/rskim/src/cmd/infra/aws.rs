@@ -39,7 +39,14 @@ pub(crate) fn run(
     show_stats: bool,
     json_output: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_infra_tool(CONFIG, args, show_stats, json_output, prepare_args, parse_impl)
+    run_infra_tool(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        prepare_args,
+        parse_impl,
+    )
 }
 
 /// Inject `--output json` if not already present and subcommand supports it.
@@ -90,7 +97,12 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
             let count = arr.len();
             let items = extract_array_items(arr);
             let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-            Some(InfraResult::new("aws".to_string(), "result".to_string(), summary, items))
+            Some(InfraResult::new(
+                "aws".to_string(),
+                "result".to_string(),
+                summary,
+                items,
+            ))
         }
         serde_json::Value::Object(map) => parse_json_object(map),
         _ => None,
@@ -110,13 +122,21 @@ fn parse_json_object(map: &serde_json::Map<String, serde_json::Value>) -> Option
                 .as_str()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| data.to_string());
-            let items = vec![InfraItem { label: data_key.to_string(), value: summary_val }];
+            let items = vec![InfraItem {
+                label: data_key.to_string(),
+                value: summary_val,
+            }];
             (1, items)
         }
     };
 
     let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-    Some(InfraResult::new("aws".to_string(), data_key.to_string(), summary, items))
+    Some(InfraResult::new(
+        "aws".to_string(),
+        data_key.to_string(),
+        summary,
+        items,
+    ))
 }
 
 /// Extract display items from a JSON array, capped at MAX_ITEMS.
@@ -202,7 +222,12 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 
     let count = items.len();
     let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-    Some(InfraResult::new("aws".to_string(), "result".to_string(), summary, items))
+    Some(InfraResult::new(
+        "aws".to_string(),
+        "result".to_string(),
+        summary,
+        items,
+    ))
 }
 
 // ============================================================================
@@ -283,8 +308,9 @@ mod tests {
         // Tier 2 input: AWS table-formatted output (not JSON) that matches the
         // `| value |` pipe-delimited table regex.
         let output = CommandOutput {
-            stdout: "| i-0abc123def  | t3.micro  | running |\n| i-0def456ghi  | t3.small  | stopped |\n"
-                .to_string(),
+            stdout:
+                "| i-0abc123def  | t3.micro  | running |\n| i-0def456ghi  | t3.small  | stopped |\n"
+                    .to_string(),
             stderr: String::new(),
             exit_code: Some(0),
             duration: std::time::Duration::ZERO,

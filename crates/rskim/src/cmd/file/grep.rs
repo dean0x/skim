@@ -93,7 +93,13 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
         return None;
     }
 
-    build_file_result("grep", total_matches, file_matches, MAX_FILES_SHOWN, MAX_MATCHES_PER_FILE)
+    build_file_result(
+        "grep",
+        total_matches,
+        file_matches,
+        MAX_FILES_SHOWN,
+        MAX_MATCHES_PER_FILE,
+    )
 }
 
 // ============================================================================
@@ -198,6 +204,9 @@ mod tests {
         let input = "src/a.rs:1:fn main() {}\nsrc/b.rs:2:fn run() {}";
         let result = try_parse_regex(input).unwrap();
         let rendered = format!("{result}");
-        assert!(rendered.contains("GREP: grep |"), "Header should start with GREP:");
+        assert!(
+            rendered.contains("GREP: grep |"),
+            "Header should start with GREP:"
+        );
     }
 }

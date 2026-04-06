@@ -39,7 +39,14 @@ pub(crate) fn run(
     show_stats: bool,
     json_output: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, show_stats, json_output, prepare_args, parse_impl)
+    super::run_linter(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        prepare_args,
+        parse_impl,
+    )
 }
 
 /// Inject `--check` if not already present.
@@ -173,7 +180,10 @@ mod tests {
     fn test_tier1_prettier_fail() {
         let input = load_fixture("prettier_check_fail.txt");
         let result = try_parse_structured(&input);
-        assert!(result.is_some(), "Expected Tier 1 structured parse to succeed");
+        assert!(
+            result.is_some(),
+            "Expected Tier 1 structured parse to succeed"
+        );
         let result = result.unwrap();
         assert_eq!(result.warnings, 3);
         assert_eq!(result.errors, 0);

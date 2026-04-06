@@ -545,8 +545,7 @@ impl InfraResult {
     /// Recompute rendered field if empty (e.g., after deserialization)
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
-            self.rendered =
-                Self::render(&self.tool, &self.operation, &self.summary, &self.items);
+            self.rendered = Self::render(&self.tool, &self.operation, &self.summary, &self.items);
         }
     }
 
@@ -716,9 +715,8 @@ impl FileResult {
         use std::fmt::Write;
 
         let tool_upper = tool.to_uppercase();
-        let mut output = format!(
-            "{tool_upper}: {tool} | {total_count} entries (showing {shown_count})"
-        );
+        let mut output =
+            format!("{tool_upper}: {tool} | {total_count} entries (showing {shown_count})");
         for entry in entries {
             let _ = write!(output, "\n  {entry}");
         }
@@ -841,7 +839,11 @@ impl LogResult {
             match &entry.level {
                 Some(level) => {
                     if entry.count > 1 {
-                        let _ = write!(output, "\n  [{level}] {} (\u{d7}{})", entry.message, entry.count);
+                        let _ = write!(
+                            output,
+                            "\n  [{level}] {} (\u{d7}{})",
+                            entry.message, entry.count
+                        );
                     } else {
                         let _ = write!(output, "\n  [{level}] {}", entry.message);
                     }
@@ -1483,9 +1485,7 @@ mod tests {
             "find".to_string(),
             200,
             100,
-            (0..100)
-                .map(|i| format!("./path/file{i}.rs"))
-                .collect(),
+            (0..100).map(|i| format!("./path/file{i}.rs")).collect(),
             Some("... and 100 more".to_string()),
         );
         let output = format!("{result}");
@@ -1499,7 +1499,11 @@ mod tests {
             "ls".to_string(),
             3,
             3,
-            vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+            vec![
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "c.txt".to_string(),
+            ],
             None,
         );
         let json = serde_json::to_string(&original).unwrap();

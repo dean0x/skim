@@ -24,8 +24,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     install_hint: "Install gh: https://cli.github.com/",
 };
 
-static RE_GH_TAB_ROW: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+)\t(.+)").unwrap());
+static RE_GH_TAB_ROW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)\t(.+)").unwrap());
 
 /// Run `skim infra gh [args...]`.
 pub(crate) fn run(
@@ -33,7 +32,14 @@ pub(crate) fn run(
     show_stats: bool,
     json_output: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_infra_tool(CONFIG, args, show_stats, json_output, prepare_args, parse_impl)
+    run_infra_tool(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        prepare_args,
+        parse_impl,
+    )
 }
 
 /// Inject `--json` fields for list commands if not already present.
@@ -141,7 +147,12 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
     } else {
         format!("{count} item{}", if count == 1 { "" } else { "s" })
     };
-    Some(InfraResult::new("gh".to_string(), "list".to_string(), summary, items))
+    Some(InfraResult::new(
+        "gh".to_string(),
+        "list".to_string(),
+        summary,
+        items,
+    ))
 }
 
 // ============================================================================
@@ -169,7 +180,12 @@ fn try_parse_regex(text: &str) -> Option<InfraResult> {
 
     let count = items.len();
     let summary = format!("{count} item{}", if count == 1 { "" } else { "s" });
-    Some(InfraResult::new("gh".to_string(), "list".to_string(), summary, items))
+    Some(InfraResult::new(
+        "gh".to_string(),
+        "list".to_string(),
+        summary,
+        items,
+    ))
 }
 
 // ============================================================================

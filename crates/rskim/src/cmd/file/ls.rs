@@ -69,14 +69,7 @@ pub(crate) fn run(
             prepare_tree_args,
             parse_tree,
         ),
-        _ => run_file_tool(
-            CONFIG_LS,
-            args,
-            show_stats,
-            json_output,
-            |_| {},
-            parse_ls,
-        ),
+        _ => run_file_tool(CONFIG_LS, args, show_stats, json_output, |_| {}, parse_ls),
     }
 }
 
@@ -183,7 +176,10 @@ fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
 
     let shown_count = entries.len();
     let footer = if total_count > MAX_DISPLAY_ENTRIES {
-        Some(format!("... and {} more", total_count - MAX_DISPLAY_ENTRIES))
+        Some(format!(
+            "... and {} more",
+            total_count - MAX_DISPLAY_ENTRIES
+        ))
     } else {
         None
     };
@@ -289,7 +285,13 @@ fn try_parse_tree_text(stdout: &str) -> Option<FileResult> {
     if total_count == 0 {
         total_count = shown_count;
     }
-    Some(FileResult::new("tree".to_string(), total_count, shown_count, entries, footer))
+    Some(FileResult::new(
+        "tree".to_string(),
+        total_count,
+        shown_count,
+        entries,
+        footer,
+    ))
 }
 
 /// Parse a tree summary line (`N directories, M files`) and return `(dirs, files)`.
@@ -372,7 +374,10 @@ mod tests {
     fn test_tier2_ls_basic() {
         let input = load_fixture("ls_basic.txt");
         let result = try_parse_ls_plain(&input);
-        assert!(result.is_some(), "Expected Tier 2 ls plain parse to succeed");
+        assert!(
+            result.is_some(),
+            "Expected Tier 2 ls plain parse to succeed"
+        );
         let result = result.unwrap();
         assert!(result.total_count > 0);
     }
@@ -427,9 +432,15 @@ mod tests {
     fn test_empty_output_passthrough() {
         let output = make_output("");
         let ls_result = parse_ls(&output);
-        assert!(ls_result.is_passthrough(), "Empty ls output should be Passthrough");
+        assert!(
+            ls_result.is_passthrough(),
+            "Empty ls output should be Passthrough"
+        );
         let tree_result = parse_tree(&output);
-        assert!(tree_result.is_passthrough(), "Empty tree output should be Passthrough");
+        assert!(
+            tree_result.is_passthrough(),
+            "Empty tree output should be Passthrough"
+        );
     }
 
     #[test]
