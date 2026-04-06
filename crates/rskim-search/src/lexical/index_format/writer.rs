@@ -48,16 +48,12 @@ pub fn write_index(
     remove_if_exists(&skidx_tmp)?;
     remove_if_exists(&skpost_tmp)?;
 
-    // --- Build postings file in memory first to compute offsets ---------------
+    // --- Pass 1: Compute offsets (no I/O, no large allocation) ----------------
     // Each posting list is written contiguously; IndexEntry records the byte offset.
-    let mut post_buf: Vec<u8> = Vec::with_capacity(
-        entries.len() * POSTING_ENTRY_SIZE * 4, /* rough estimate */
-    );
-
     let mut index_entries: Vec<IndexEntry> = Vec::with_capacity(entries.len());
+    let mut offset: u64 = 0;
 
     for (ngram, postings) in entries {
-        let posting_offset = post_buf.len() as u64;
         let posting_length = u32::try_from(postings.len()).map_err(|_| {
             SearchError::IndexBuildError(format!(
                 "posting list for ngram {:?} exceeds u32::MAX entries",
@@ -65,22 +61,31 @@ pub fn write_index(
             ))
         })?;
 
-        for p in postings {
-            post_buf.extend_from_slice(&p.to_bytes());
-        }
-
         index_entries.push(IndexEntry {
             ngram_hash: ngram.as_u64(),
-            posting_offset,
+            posting_offset: offset,
             posting_length,
         });
+
+        let byte_len = (postings.len() as u64)
+            .checked_mul(POSTING_ENTRY_SIZE as u64)
+            .ok_or_else(|| {
+                SearchError::IndexBuildError("posting byte length overflows u64".into())
+            })?;
+        offset = offset.checked_add(byte_len).ok_or_else(|| {
+            SearchError::IndexBuildError("total postings size overflows u64".into())
+        })?;
     }
 
-    // --- Write .skpost.tmp ---------------------------------------------------
+    // --- Pass 2: Stream postings directly to disk ----------------------------
     {
         let file = File::create(&skpost_tmp).map_err(SearchError::Io)?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(&post_buf).map_err(SearchError::Io)?;
+        for (_ngram, postings) in entries {
+            for p in postings {
+                writer.write_all(&p.to_bytes()).map_err(SearchError::Io)?;
+            }
+        }
         writer.flush().map_err(SearchError::Io)?;
     }
 
