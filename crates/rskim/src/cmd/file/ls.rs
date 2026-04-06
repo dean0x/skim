@@ -38,8 +38,9 @@ const CONFIG_TREE: FileToolConfig<'static> = FileToolConfig {
 
 /// Matches a long-form ls entry line: permissions + link count + owner + ...
 /// e.g. `drwxr-xr-x  2 user group  4096 Jan 01 ...`
+/// Includes setuid/setgid/sticky permission characters (s, S, t, T).
 static RE_LS_LONG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[dl\-][rwx\-]{9}").unwrap());
+    LazyLock::new(|| Regex::new(r"^[dl\-][rwxsStT\-]{9}").unwrap());
 
 /// Matches tree summary line: `N directories, M files`
 static RE_TREE_SUMMARY: LazyLock<Regex> =
@@ -251,37 +252,29 @@ fn try_parse_tree_json(stdout: &str) -> Option<FileResult> {
 
 /// Tier 2: regex on tree text output.
 fn try_parse_tree_text(stdout: &str) -> Option<FileResult> {
+    const MAX_DEPTH: usize = 3;
     let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
     let mut total_count = 0usize;
     let mut summary: Option<String> = None;
     let mut depth_cap_active = false;
-    const MAX_DEPTH: usize = 3;
 
     for line in stdout.lines().take(MAX_INPUT_LINES) {
-        // Capture summary line
-        if let Some(caps) = RE_TREE_SUMMARY.captures(line) {
-            let dirs: usize = caps[1].parse().unwrap_or(0);
-            let files: usize = caps[2].parse().unwrap_or(0);
+        if let Some((dirs, files)) = parse_tree_summary_line(line) {
             total_count = dirs + files;
             summary = Some(format!("{dirs} directories, {files} files"));
             continue;
         }
-
         if !RE_TREE_ENTRY.is_match(line) {
-            // First line is usually the root dir name (e.g., ".")
             if !line.is_empty() && entries.len() < MAX_DISPLAY_ENTRIES {
                 entries.push(line.to_string());
             }
             continue;
         }
-
-        // Count indentation depth by leading whitespace / pipe chars
         let depth = count_tree_depth(line);
         if depth > MAX_DEPTH {
             depth_cap_active = true;
             continue;
         }
-
         if entries.len() < MAX_DISPLAY_ENTRIES {
             entries.push(line.to_string());
         }
@@ -292,30 +285,39 @@ fn try_parse_tree_text(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let mut footer_parts: Vec<String> = Vec::new();
-    if depth_cap_active {
-        footer_parts.push("(deeper levels truncated)".to_string());
-    }
-    if let Some(s) = &summary {
-        footer_parts.push(s.clone());
-    }
-    let footer = if footer_parts.is_empty() {
-        None
-    } else {
-        Some(footer_parts.join(" — "))
-    };
-
+    let footer = build_tree_footer(depth_cap_active, summary.as_deref());
     if total_count == 0 {
         total_count = shown_count;
     }
+    Some(FileResult::new("tree".to_string(), total_count, shown_count, entries, footer))
+}
 
-    Some(FileResult::new(
-        "tree".to_string(),
-        total_count,
-        shown_count,
-        entries,
-        footer,
-    ))
+/// Parse a tree summary line (`N directories, M files`) and return `(dirs, files)`.
+///
+/// Returns `None` if the line does not match the summary pattern.
+fn parse_tree_summary_line(line: &str) -> Option<(usize, usize)> {
+    let caps = RE_TREE_SUMMARY.captures(line)?;
+    let dirs: usize = caps[1].parse().unwrap_or(0);
+    let files: usize = caps[2].parse().unwrap_or(0);
+    Some((dirs, files))
+}
+
+/// Assemble the tree footer from depth-cap and summary parts.
+///
+/// Returns `None` when neither part is present.
+fn build_tree_footer(depth_cap_active: bool, summary: Option<&str>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if depth_cap_active {
+        parts.push("(deeper levels truncated)".to_string());
+    }
+    if let Some(s) = summary {
+        parts.push(s.to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" — "))
+    }
 }
 
 /// Count indentation depth of a tree line by counting leading whitespace/pipe pairs.

@@ -11,6 +11,8 @@ pub(crate) mod rg;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use std::collections::BTreeMap;
+
 use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
 use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
@@ -135,22 +137,74 @@ pub(crate) fn run_file_tool(
 }
 
 // ============================================================================
+// Shared result builder for grep/rg parsers
+// ============================================================================
+
+/// Build a [`FileResult`] from grouped file matches.
+///
+/// `tool` — binary name (e.g. `"grep"`, `"rg"`).
+/// `total_matches` — total match count across all files.
+/// `file_matches` — map from file path to formatted match lines (already capped per-file).
+/// `max_files` — maximum number of files to include in entries.
+/// `max_per_file` — maximum match lines shown per file (used only for Vec capacity hint).
+pub(super) fn build_file_result(
+    tool: &str,
+    total_matches: usize,
+    file_matches: BTreeMap<String, Vec<String>>,
+    max_files: usize,
+    max_per_file: usize,
+) -> Option<FileResult> {
+    let file_count = file_matches.len();
+    if file_count == 0 {
+        return None;
+    }
+    let shown_files = file_count.min(max_files);
+
+    let mut shown_matches = 0usize;
+    let mut entries: Vec<String> = Vec::with_capacity(shown_files * (max_per_file + 1));
+    for (file, matches) in file_matches.iter().take(max_files) {
+        entries.push(file.clone());
+        shown_matches += matches.len();
+        entries.extend(matches.iter().cloned());
+    }
+
+    let footer = if file_count > max_files {
+        Some(format!("... and {} more files", file_count - max_files))
+    } else {
+        None
+    };
+
+    let summary = format!(
+        "{}: {total_matches} matches in {file_count} files (showing {shown_files})",
+        tool.to_uppercase()
+    );
+    let mut all_entries = vec![summary];
+    all_entries.extend(entries);
+
+    Some(FileResult::new(
+        tool.to_string(),
+        total_matches,
+        shown_matches,
+        all_entries,
+        footer,
+    ))
+}
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_sanitize_for_display_clean_input() {
-        assert_eq!(super::super::sanitize_for_display("find"), "find");
+        assert_eq!(crate::cmd::sanitize_for_display("find"), "find");
     }
 
     #[test]
     fn test_sanitize_for_display_rejects_non_ascii() {
         let input = "tool\x1b[31mred\x1b[0m";
-        let sanitized = super::super::sanitize_for_display(input);
+        let sanitized = crate::cmd::sanitize_for_display(input);
         assert!(!sanitized.contains('\x1b'));
     }
 }

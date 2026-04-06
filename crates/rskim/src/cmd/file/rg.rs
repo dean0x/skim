@@ -15,7 +15,7 @@ use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{run_file_tool, FileToolConfig, MAX_INPUT_LINES};
+use super::{build_file_result, run_file_tool, FileToolConfig, MAX_INPUT_LINES};
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {
     program: "rg",
@@ -69,6 +69,32 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
 // Tier 1: JSON Lines
 // ============================================================================
 
+/// Extract `(file_path, formatted_match_line)` from a single rg JSON Lines match entry.
+///
+/// Returns `None` if the entry is not a valid `"match"` type object.
+fn extract_match_fields(obj: &serde_json::Value) -> Option<(String, String)> {
+    let msg_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    if msg_type != "match" {
+        return None;
+    }
+    let data = obj.get("data")?;
+    let file_path = data
+        .get("path")
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("<unknown>")
+        .to_string();
+    let lineno = data.get("line_number").and_then(|n| n.as_u64()).unwrap_or(0);
+    let text = data
+        .get("lines")
+        .and_then(|l| l.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some((file_path, format!("  :{lineno}: {text}")))
+}
+
 /// Parse rg `--json` JSON Lines output.
 ///
 /// rg emits one JSON object per line with a `type` field:
@@ -89,34 +115,12 @@ fn try_parse_json(stdout: &str) -> Option<FileResult> {
         };
         found_any = true;
 
-        let msg_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if msg_type != "match" {
-            continue;
-        }
-
-        let data = obj.get("data")?;
-        let file_path = data
-            .get("path")
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("<unknown>")
-            .to_string();
-        let lineno = data
-            .get("line_number")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-        let text = data
-            .get("lines")
-            .and_then(|l| l.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        total_matches += 1;
-        let file_entry = file_matches.entry(file_path).or_default();
-        if file_entry.len() < MAX_MATCHES_PER_FILE {
-            file_entry.push(format!("  :{lineno}: {text}"));
+        if let Some((file_path, formatted)) = extract_match_fields(&obj) {
+            total_matches += 1;
+            let file_entry = file_matches.entry(file_path).or_default();
+            if file_entry.len() < MAX_MATCHES_PER_FILE {
+                file_entry.push(formatted);
+            }
         }
     }
 
@@ -124,7 +128,7 @@ fn try_parse_json(stdout: &str) -> Option<FileResult> {
         return None;
     }
 
-    build_file_result("rg", total_matches, file_matches)
+    build_file_result("rg", total_matches, file_matches, MAX_FILES_SHOWN, MAX_MATCHES_PER_FILE)
 }
 
 // ============================================================================
@@ -156,53 +160,7 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
         return None;
     }
 
-    build_file_result("rg", total_matches, file_matches)
-}
-
-// ============================================================================
-// Shared builder
-// ============================================================================
-
-/// Build a FileResult from grouped file matches.
-fn build_file_result(
-    tool: &str,
-    total_matches: usize,
-    file_matches: BTreeMap<String, Vec<String>>,
-) -> Option<FileResult> {
-    let file_count = file_matches.len();
-    if file_count == 0 {
-        return None;
-    }
-    let shown_files = file_count.min(MAX_FILES_SHOWN);
-
-    let mut shown_matches = 0usize;
-    let mut entries: Vec<String> = Vec::with_capacity(shown_files * (MAX_MATCHES_PER_FILE + 1));
-    for (file, matches) in file_matches.iter().take(MAX_FILES_SHOWN) {
-        entries.push(file.clone());
-        shown_matches += matches.len();
-        entries.extend(matches.iter().cloned());
-    }
-
-    let footer = if file_count > MAX_FILES_SHOWN {
-        Some(format!("... and {} more files", file_count - MAX_FILES_SHOWN))
-    } else {
-        None
-    };
-
-    let summary = format!(
-        "{}: {total_matches} matches in {file_count} files (showing {shown_files})",
-        tool.to_uppercase()
-    );
-    let mut all_entries = vec![summary];
-    all_entries.extend(entries);
-
-    Some(FileResult::new(
-        tool.to_string(),
-        total_matches,
-        shown_matches,
-        all_entries,
-        footer,
-    ))
+    build_file_result("rg", total_matches, file_matches, MAX_FILES_SHOWN, MAX_MATCHES_PER_FILE)
 }
 
 // ============================================================================

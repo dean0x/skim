@@ -641,7 +641,6 @@ pub(crate) fn try_record_command(
 ///
 /// Delegates to [`record_with_counts`] after resolving cwd and building
 /// the record.
-#[allow(dead_code)]
 pub(crate) fn try_record_command_with_counts(
     raw_tokens: usize,
     compressed_tokens: usize,

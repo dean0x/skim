@@ -65,6 +65,9 @@ fn parse_flags(args: &[String]) -> LogFlags {
             "--debug-only" => flags.debug_only = true,
             "--show-stats" => flags.show_stats = true,
             "--json" => flags.json_output = true,
+            unknown if unknown.starts_with("--") => {
+                eprintln!("warning: unknown flag '{unknown}' — ignoring");
+            }
             _ => {}
         }
     }
@@ -84,49 +87,64 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let flags = parse_flags(args);
-
-    // Read stdin — log is stdin-only
-    if io::stdin().is_terminal() && args.is_empty() {
+    // Issue 1: check terminal BEFORE flag parsing, regardless of args.
+    // Without this, `skim log --keep-debug` with no pipe hangs on stdin.
+    if io::stdin().is_terminal() {
         eprintln!("error: 'skim log' reads from stdin. Pipe log output to it:");
         eprintln!("  kubectl logs deploy/foo | skim log");
         eprintln!("  cat app.log | skim log");
         return Ok(ExitCode::FAILURE);
     }
 
+    let flags = parse_flags(args);
+    // Issue 5: capture start time before reading stdin for real duration tracking.
+    let start = std::time::Instant::now();
+    let stdin_buf = read_stdin()?;
+    let raw_input = stdin_buf.as_str();
+    let result = compress_log(raw_input, &flags);
+    let compressed = emit_result(&result, &flags)?;
+
+    // Issue 4: compute token counts before analytics to avoid re-tokenizing in
+    // the background thread (avoids copying up to 64 MiB via raw_input.to_string()).
+    let duration = start.elapsed();
+    let (raw_tokens, compressed_tokens) = crate::process::count_token_pair(raw_input, &compressed);
+
+    if flags.show_stats {
+        crate::process::report_token_stats(raw_tokens, compressed_tokens, "");
+    }
+
+    record_analytics(raw_tokens, compressed_tokens, duration, result.tier_name());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Read up to 64 MiB from stdin into a String.
+fn read_stdin() -> anyhow::Result<String> {
     const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
-    let mut stdin_buf = String::new();
-    let bytes_read = io::stdin()
-        .take(MAX_STDIN_BYTES)
-        .read_to_string(&mut stdin_buf)?;
+    let mut buf = String::new();
+    let bytes_read = io::stdin().take(MAX_STDIN_BYTES).read_to_string(&mut buf)?;
     if bytes_read as u64 >= MAX_STDIN_BYTES {
         anyhow::bail!("stdin input exceeded 64 MiB limit");
     }
+    Ok(buf)
+}
 
-    let raw_input = stdin_buf.as_str();
-    let result = compress_log(raw_input, &flags);
-
-    // Emit output
-    let compressed = emit_result(&result, &flags)?;
-
-    if flags.show_stats {
-        let (orig, comp) = crate::process::count_token_pair(raw_input, &compressed);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    // Record analytics (fire-and-forget)
+/// Record analytics for this command invocation (fire-and-forget).
+fn record_analytics(
+    raw_tokens: Option<usize>,
+    compressed_tokens: Option<usize>,
+    duration: std::time::Duration,
+    tier: &str,
+) {
     if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw_input.to_string(),
-            compressed,
+        crate::analytics::try_record_command_with_counts(
+            raw_tokens.unwrap_or(0),
+            compressed_tokens.unwrap_or(0),
             "skim log".to_string(),
             crate::analytics::CommandType::Log,
-            std::time::Duration::ZERO,
-            Some(result.tier_name()),
+            duration,
+            Some(tier),
         );
     }
-
-    Ok(ExitCode::SUCCESS)
 }
 
 fn print_help() {
@@ -177,7 +195,7 @@ fn try_parse_json_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     // Probe first line; bail if not JSON
     let _probe: Value = serde_json::from_str(first_line.trim()).ok()?;
 
-    let mut all_entries: Vec<(Option<String>, String)> = Vec::new();
+    let mut all_entries: Vec<(Option<String>, String)> = Vec::with_capacity(256);
     let mut total_lines = 0usize;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
@@ -224,40 +242,21 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 // ============================================================================
 
 fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
-    let mut all_entries: Vec<(Option<String>, String)> = Vec::new();
+    let mut all_entries: Vec<(Option<String>, String)> = Vec::with_capacity(256);
     let mut total_lines = 0usize;
     let mut found_structured = false;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Skip stack trace lines — check original line (preserves leading whitespace).
-        // Count these separately so they don't inflate the dedup statistics.
-        if RE_STACK_TRACE.is_match(line) {
+        if trimmed.is_empty() || RE_STACK_TRACE.is_match(line) {
+            // Skip blank lines and stack trace lines (checked on original line to
+            // preserve leading whitespace detection).
             continue;
         }
         total_lines += 1;
 
-        // Strip timestamp prefix
-        let without_ts = if flags.keep_timestamps {
-            trimmed
-        } else {
-            RE_TIMESTAMP.find(trimmed)
-                .map(|m| &trimmed[m.end()..])
-                .unwrap_or(trimmed)
-        };
-
-        if let Some(caps) = RE_LEVEL_BRACKET.captures(without_ts) {
-            let level = caps[1].to_uppercase();
-            let message = caps[2].trim().to_string();
-            all_entries.push((Some(level), message));
-            found_structured = true;
-        } else if let Some(caps) = RE_LEVEL_BARE.captures(without_ts) {
-            let level = caps[1].to_uppercase();
-            let message = caps[2].trim().to_string();
+        let without_ts = strip_timestamp(trimmed, flags.keep_timestamps);
+        if let Some((level, message)) = classify_log_line(without_ts) {
             all_entries.push((Some(level), message));
             found_structured = true;
         } else {
@@ -265,64 +264,109 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         }
     }
 
-    if !found_structured && all_entries.is_empty() {
+    // Issue 8: if no structured log levels were found, entries are plain text —
+    // return None to fall through to Passthrough rather than producing a
+    // misleading Degraded result.
+    if !found_structured {
         return None;
     }
 
     Some(apply_compression(all_entries, total_lines, flags))
 }
 
+/// Strip the timestamp prefix from a log line, unless `keep_timestamps` is true.
+fn strip_timestamp(line: &str, keep_timestamps: bool) -> &str {
+    if keep_timestamps {
+        line
+    } else {
+        RE_TIMESTAMP.find(line).map(|m| &line[m.end()..]).unwrap_or(line)
+    }
+}
+
+/// Classify a single log line (after timestamp stripping) into `(level, message)`.
+///
+/// Returns `None` if the line has no recognised log level prefix.
+fn classify_log_line(line: &str) -> Option<(String, String)> {
+    if let Some(caps) = RE_LEVEL_BRACKET.captures(line) {
+        return Some((caps[1].to_uppercase(), caps[2].trim().to_string()));
+    }
+    if let Some(caps) = RE_LEVEL_BARE.captures(line) {
+        return Some((caps[1].to_uppercase(), caps[2].trim().to_string()));
+    }
+    None
+}
+
 // ============================================================================
 // Shared compression logic
 // ============================================================================
 
-fn apply_compression(
-    all_entries: Vec<(Option<String>, String)>,
-    total_lines: usize,
+/// Filter entries by debug/trace level according to flags.
+///
+/// Returns `(filtered_entries, debug_hidden_count)`.
+fn filter_debug_entries(
+    entries: Vec<(Option<String>, String)>,
     flags: &LogFlags,
-) -> LogResult {
+) -> (Vec<(Option<String>, String)>, usize) {
     let mut debug_hidden = 0usize;
-    // HashMap<normalized_message, index in output_entries>
-    let mut dedup_map: HashMap<String, usize> = HashMap::new();
-    let mut output_entries: Vec<LogEntry> = Vec::new();
+    let mut filtered = Vec::with_capacity(entries.len());
 
-    for (level, message) in all_entries {
+    for (level, message) in entries {
         let is_debug = level
             .as_deref()
             .map(|l| matches!(l, "DEBUG" | "TRACE"))
             .unwrap_or(false);
 
-        // Filter by mode
         if flags.debug_only {
-            if !is_debug {
-                continue;
+            if is_debug {
+                filtered.push((level, message));
             }
         } else if is_debug && !flags.keep_debug {
             debug_hidden += 1;
-            continue;
+        } else {
+            filtered.push((level, message));
         }
+    }
 
+    (filtered, debug_hidden)
+}
+
+/// Deduplicate entries by normalized message, incrementing count on collision.
+///
+/// Returns the deduplicated output entries.
+fn deduplicate_entries(
+    entries: Vec<(Option<String>, String)>,
+    no_dedup: bool,
+) -> Vec<LogEntry> {
+    // Issue 6: pre-size the dedup map and output vec to avoid repeated reallocation.
+    let mut dedup_map: HashMap<String, usize> = HashMap::with_capacity(1024);
+    let mut output_entries: Vec<LogEntry> = Vec::with_capacity(256);
+
+    for (level, message) in entries {
         let normalized = message.to_lowercase();
 
-        if flags.no_dedup {
-            output_entries.push(LogEntry {
-                level: level.clone(),
-                message: message.clone(),
-                count: 1,
-            });
+        if no_dedup {
+            // Issue 3: `level` and `message` are owned — no clone needed.
+            output_entries.push(LogEntry { level, message, count: 1 });
         } else if let Some(&idx) = dedup_map.get(&normalized) {
             output_entries[idx].count += 1;
         } else {
             let idx = output_entries.len();
             dedup_map.insert(normalized, idx);
-            output_entries.push(LogEntry {
-                level: level.clone(),
-                message: message.clone(),
-                count: 1,
-            });
+            // Issue 3: `level` and `message` are owned — no clone needed.
+            output_entries.push(LogEntry { level, message, count: 1 });
         }
     }
 
+    output_entries
+}
+
+/// Assemble the final LogResult from deduplicated entries and counters.
+fn build_log_result(
+    output_entries: Vec<LogEntry>,
+    total_lines: usize,
+    debug_hidden: usize,
+    debug_only: bool,
+) -> LogResult {
     let unique_messages = output_entries.len();
     let deduplicated_count = total_lines
         .saturating_sub(unique_messages)
@@ -334,8 +378,18 @@ fn apply_compression(
         debug_hidden,
         deduplicated_count,
         output_entries,
-        flags.debug_only,
+        debug_only,
     )
+}
+
+fn apply_compression(
+    all_entries: Vec<(Option<String>, String)>,
+    total_lines: usize,
+    flags: &LogFlags,
+) -> LogResult {
+    let (filtered, debug_hidden) = filter_debug_entries(all_entries, flags);
+    let output_entries = deduplicate_entries(filtered, flags.no_dedup);
+    build_log_result(output_entries, total_lines, debug_hidden, flags.debug_only)
 }
 
 // ============================================================================
@@ -537,5 +591,106 @@ mod tests {
             result.entries.iter().all(|e| !e.message.contains("at main()")),
             "Stack trace lines should not appear in entries"
         );
+    }
+
+    #[test]
+    fn test_keep_timestamps_strips_by_default() {
+        // With keep_timestamps=false (default) on TIMESTAMP [LEVEL] message format:
+        // the timestamp prefix is stripped before level detection, so entries should
+        // not contain timestamp text.
+        let input = "2024-01-15T10:30:00Z [INFO] server started\n2024-01-15T10:30:01Z [INFO] ready\n";
+        let flags_strip = make_flags();
+        let result_strip = try_parse_regex_logs(input, &flags_strip).unwrap();
+        assert!(
+            result_strip.entries.iter().all(|e| !e.message.contains("2024-01-15")),
+            "Default should strip timestamps from messages"
+        );
+    }
+
+    #[test]
+    fn test_keep_timestamps_passthrough_preserves_raw() {
+        // With keep_timestamps=true on TIMESTAMP [LEVEL] message format: the regex
+        // parser cannot detect log levels (anchored at ^, timestamp comes first), so
+        // try_parse_regex_logs returns None and compress_log falls through to Passthrough.
+        // Passthrough preserves the raw input verbatim, including timestamps.
+        let input = "2024-01-15T10:30:00Z [INFO] server started\n2024-01-15T10:30:01Z [INFO] ready\n";
+        let flags_keep = LogFlags { keep_timestamps: true, ..LogFlags::default() };
+        let result = compress_log(input, &flags_keep);
+        // Tier 2 cannot detect structure when timestamps block the ^ anchor, so
+        // output falls to Passthrough — raw content is preserved including timestamps.
+        assert!(
+            result.is_passthrough(),
+            "TIMESTAMP [LEVEL] format with keep_timestamps falls to Passthrough (level detection blocked by timestamp prefix)"
+        );
+        assert!(
+            result.content().contains("2024-01-15"),
+            "Passthrough should preserve raw content including timestamps"
+        );
+    }
+
+    #[test]
+    fn test_plain_text_without_levels_returns_passthrough() {
+        // Issue 8: plain text with no log levels should fall through to Passthrough,
+        // not produce a misleading Degraded result.
+        let input = "some plain text\nanother line\nno levels here\n";
+        let flags = make_flags();
+        let result = compress_log(input, &flags);
+        assert!(
+            result.is_passthrough(),
+            "Plain text without log levels should produce Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_unknown_flag_warning_does_not_panic() {
+        // Issue 7: unknown flags should warn to stderr but not crash.
+        let args: Vec<String> = vec!["--unknown-flag".into(), "--keep-debug".into()];
+        let flags = parse_flags(&args);
+        // Known flag still parsed correctly despite unknown neighbor
+        assert!(flags.keep_debug);
+    }
+
+    #[test]
+    fn test_filter_debug_entries_debug_only() {
+        let entries = vec![
+            (Some("INFO".to_string()), "info msg".to_string()),
+            (Some("DEBUG".to_string()), "debug msg".to_string()),
+            (Some("TRACE".to_string()), "trace msg".to_string()),
+            (Some("ERROR".to_string()), "error msg".to_string()),
+        ];
+        let flags = LogFlags { debug_only: true, ..Default::default() };
+        let (filtered, hidden) = filter_debug_entries(entries, &flags);
+        assert_eq!(hidden, 0);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|(l, _)| {
+            matches!(l.as_deref(), Some("DEBUG") | Some("TRACE"))
+        }));
+    }
+
+    #[test]
+    fn test_filter_debug_entries_hidden_by_default() {
+        let entries = vec![
+            (Some("INFO".to_string()), "info msg".to_string()),
+            (Some("DEBUG".to_string()), "debug msg".to_string()),
+            (Some("TRACE".to_string()), "trace msg".to_string()),
+        ];
+        let flags = LogFlags::default(); // keep_debug = false
+        let (filtered, hidden) = filter_debug_entries(entries, &flags);
+        assert_eq!(hidden, 2);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn test_deduplicate_entries_counts_duplicates() {
+        let entries = vec![
+            (Some("INFO".to_string()), "hello".to_string()),
+            (Some("INFO".to_string()), "hello".to_string()),
+            (Some("INFO".to_string()), "world".to_string()),
+        ];
+        let output = deduplicate_entries(entries, false);
+        assert_eq!(output.len(), 2);
+        let hello = output.iter().find(|e| e.message == "hello").unwrap();
+        assert_eq!(hello.count, 2);
     }
 }

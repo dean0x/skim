@@ -1,11 +1,11 @@
-//! grep parser with Tier 2 only (#116).
+//! grep parser (#116).
 //!
 //! Parses `grep` output into structured `FileResult`.
-//! grep has no JSON output mode, so only Tier 2 (regex) is available.
+//! grep has no JSON output mode, so regex is the best (and only) structured tier.
 //!
 //! Tiers:
-//! - **Tier 2 (Degraded)**: Parse `file:line:content` format, group by file
-//! - **Tier 3 (Passthrough)**: Raw output
+//! - **Tier 1 (Full)**: Parse `file:line:content` format, group by file
+//! - **Tier 2 (Passthrough)**: Raw output
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -16,7 +16,7 @@ use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{run_file_tool, FileToolConfig, MAX_INPUT_LINES};
+use super::{build_file_result, run_file_tool, FileToolConfig, MAX_INPUT_LINES};
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {
     program: "grep",
@@ -44,17 +44,20 @@ pub(crate) fn run(
     run_file_tool(CONFIG, args, show_stats, json_output, |_| {}, parse_impl)
 }
 
-/// Two-tier parse function: Tier 2 regex → Passthrough.
+/// Two-tier parse function: Tier 1 regex → Passthrough.
+///
+/// grep has no JSON output mode, so regex is the best available format
+/// and is returned as `Full` (not Degraded).
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
     if let Some(result) = try_parse_regex(&output.stdout) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Full(result);
     }
 
     ParseResult::Passthrough(output.stdout.clone())
 }
 
 // ============================================================================
-// Tier 2: file:line:content regex
+// Tier 1: file:line:content regex
 // ============================================================================
 
 /// Group grep matches by file, limit per-file and total-file counts.
@@ -90,37 +93,7 @@ fn try_parse_regex(text: &str) -> Option<FileResult> {
         return None;
     }
 
-    let file_count = file_matches.len();
-    let shown_files = file_count.min(MAX_FILES_SHOWN);
-
-    let mut shown_matches = 0usize;
-    let mut entries: Vec<String> = Vec::with_capacity(shown_files * (MAX_MATCHES_PER_FILE + 1));
-    for (file, matches) in file_matches.iter().take(MAX_FILES_SHOWN) {
-        entries.push(file.clone());
-        shown_matches += matches.len();
-        entries.extend(matches.iter().cloned());
-    }
-
-    let footer = if file_count > MAX_FILES_SHOWN {
-        Some(format!("... and {} more files", file_count - MAX_FILES_SHOWN))
-    } else {
-        None
-    };
-
-    // Summary as first entry
-    let summary = format!(
-        "GREP: {total_matches} matches in {file_count} files (showing {shown_files})"
-    );
-    let mut all_entries = vec![summary];
-    all_entries.extend(entries);
-
-    Some(FileResult::new(
-        "grep".to_string(),
-        total_matches,
-        shown_matches,
-        all_entries,
-        footer,
-    ))
+    build_file_result("grep", total_matches, file_matches, MAX_FILES_SHOWN, MAX_MATCHES_PER_FILE)
 }
 
 // ============================================================================
@@ -150,22 +123,22 @@ mod tests {
     }
 
     #[test]
-    fn test_tier2_grep_basic() {
+    fn test_tier1_grep_basic() {
         let input = load_fixture("grep_basic.txt");
         let result = try_parse_regex(&input);
-        assert!(result.is_some(), "Expected Tier 2 grep parse to succeed");
+        assert!(result.is_some(), "Expected Tier 1 grep parse to succeed");
         let result = result.unwrap();
         assert!(result.total_count > 0);
     }
 
     #[test]
-    fn test_parse_impl_produces_degraded() {
+    fn test_parse_impl_produces_full() {
         let input = load_fixture("grep_basic.txt");
         let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(
-            result.is_degraded(),
-            "grep output should be Degraded tier, got {}",
+            result.is_full(),
+            "grep regex output should be Full tier (best available), got {}",
             result.tier_name()
         );
     }
