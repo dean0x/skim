@@ -18,7 +18,12 @@ use std::path::{Path, PathBuf};
 
 use rskim_core::Language;
 use rskim_search::{
-    lexical::{builder::LexicalLayerBuilder, query::LexicalSearchLayer},
+    lexical::{
+        builder::LexicalLayerBuilder,
+        index_format::{DeltaWriter, Tombstones},
+        query::LexicalSearchLayer,
+        Ngram, PostingEntry,
+    },
     LayerBuilder, SearchIndex, SearchLayer, SearchQuery,
 };
 
@@ -479,6 +484,146 @@ fn duplicate_files_are_idempotent() {
         "adding the same file twice must result in exactly 1 FileTable entry, \
          got {}",
         index.file_table().len()
+    );
+}
+
+// ============================================================================
+// 26. Tombstone filtering: tombstoned doc_id is excluded from search results
+// ============================================================================
+
+/// Build an index from a single file, tombstone it (doc_id=0), then verify
+/// that searching the query engine returns empty results — the tombstone is
+/// applied end-to-end through the query pipeline.
+#[test]
+fn tombstoned_file_is_excluded_from_search_results() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Build an index with exactly one file (doc_id=0).
+    let _ = build_fixture_index(dir.path(), &[("user_service.ts", Language::TypeScript)]);
+
+    // Verify the file is found before tombstoning.
+    let layer_before = LexicalSearchLayer::open(dir.path()).expect("open before tombstone");
+    let results_before = search_names(&layer_before, "UserService");
+    assert!(
+        !results_before.is_empty(),
+        "UserService must be found before tombstoning"
+    );
+
+    // Tombstone doc_id=0 (the only file).
+    let mut ts = Tombstones::default();
+    ts.add(0);
+    ts.save(dir.path()).expect("save tombstones");
+
+    // Reopen the layer so it picks up the tombstones at load time.
+    let layer_after = LexicalSearchLayer::open(dir.path()).expect("open after tombstone");
+    let results_after = search_names(&layer_after, "UserService");
+    assert!(
+        results_after.is_empty(),
+        "UserService must not appear after its doc_id is tombstoned, \
+         got: {results_after:?}"
+    );
+}
+
+// ============================================================================
+// 27. Delta filtering: new postings added via delta appear in search results
+// ============================================================================
+
+/// Build an empty index, then append a delta entry for a synthetic term
+/// ("DELTA_UNIQUE_TERM"). Verify that the query engine returns a result for
+/// that term — the delta is merged end-to-end through the pipeline.
+///
+/// This test uses an empty main index plus a hand-crafted delta entry to
+/// isolate the delta merge path. The doc_id we register (0) refers to a
+/// synthetic file inserted into the metadata's file_table after the fact;
+/// here we sidestep that by using a fixture file so file_table[0] is valid.
+#[test]
+fn delta_entries_appear_in_search_results() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Build an index with one real file so the file_table and metadata are valid
+    // and file_count ≥ 1 (so doc_id=0 is within bounds when the query engine
+    // reads it back from the header — note: post-build file_count reflects what
+    // the builder wrote, which is checked by IndexReader).
+    let _ = build_fixture_index(dir.path(), &[("auth_handler.rs", Language::Rust)]);
+
+    // The term "DELTATERM" is guaranteed absent from auth_handler.rs.
+    // Confirm it returns no results from the main index.
+    let layer_main = LexicalSearchLayer::open(dir.path()).expect("open main");
+    let baseline = search_names(&layer_main, "DELTATERM");
+    assert!(
+        baseline.is_empty(),
+        "DELTATERM must not exist in main index, got: {baseline:?}"
+    );
+    drop(layer_main);
+
+    // Append a delta entry for "DELTATERM" pointing at doc_id=0 (auth_handler.rs).
+    let ng = Ngram::from_bytes(b"DE"); // first bigram of "DELTATERM"
+    let posting = PostingEntry {
+        doc_id: 0,
+        field_id: 1, // SearchField::SymbolName
+        position: 0,
+        tf: 1,
+    };
+    let mut writer = DeltaWriter::open_or_create(dir.path()).expect("DeltaWriter");
+    writer.append(&[(ng, posting)]).expect("append delta");
+    drop(writer);
+
+    // Reopen so the delta reader is constructed with the new delta file.
+    let layer_delta = LexicalSearchLayer::open(dir.path()).expect("open with delta");
+    // Search for "DE" directly (the bigram we injected) to avoid n-gram extraction
+    // differences between the bigram and the full term.
+    let results = search_names(&layer_delta, "DE");
+    assert!(
+        results.iter().any(|(name, _)| name == "auth_handler.rs"),
+        "auth_handler.rs must appear via the delta entry for bigram 'DE', \
+         got: {results:?}"
+    );
+}
+
+// ============================================================================
+// 28. Delta + tombstone interaction: tombstoned main-index entry is suppressed
+//     even when the same doc_id has a delta entry
+// ============================================================================
+
+/// Build an index from one file. Tombstone it. Also add a delta entry pointing
+/// at the same doc_id. The tombstone applies only to main-index postings;
+/// delta postings are NOT tombstoned (delta represents new/updated state).
+/// Verify that the doc_id still appears (via delta) — this is the intended
+/// merge semantics.
+#[test]
+fn delta_bypasses_tombstone_for_new_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Build a one-file index.
+    let _ = build_fixture_index(dir.path(), &[("utils.py", Language::Python)]);
+
+    // Tombstone doc_id=0.
+    let mut ts = Tombstones::default();
+    ts.add(0);
+    ts.save(dir.path()).expect("save tombstones");
+
+    // Add a delta entry for doc_id=0 under a new term.
+    let ng = Ngram::from_bytes(b"py"); // bigram present in Python source
+    let posting = PostingEntry {
+        doc_id: 0,
+        field_id: 1, // SymbolName
+        position: 999,
+        tf: 5,
+    };
+    let mut writer = DeltaWriter::open_or_create(dir.path()).expect("DeltaWriter");
+    writer.append(&[(ng, posting)]).expect("append");
+    drop(writer);
+
+    // Reopen and search for "py".
+    let layer = LexicalSearchLayer::open(dir.path()).expect("open");
+    let results = search_names(&layer, "py");
+
+    // The delta entry for doc_id=0 must appear because tombstones only
+    // suppress main-index postings.
+    assert!(
+        results.iter().any(|(name, _)| name == "utils.py"),
+        "utils.py must appear via delta even when tombstoned in main index, \
+         got: {results:?}"
     );
 }
 

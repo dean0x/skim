@@ -505,6 +505,99 @@ fn lookup_filters_invalid_field_id() {
 }
 
 // ============================================================================
+// 15b. IndexReader::validate — happy path (valid index passes)
+// ============================================================================
+
+/// A freshly written, correct index passes `validate()` without error.
+#[test]
+fn validate_passes_on_valid_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let ng = ngram(b"ok");
+    let posting = make_posting(0, 2, 10, 1);
+    let entries = vec![(ng, vec![posting])];
+    let header = make_header(1, 1);
+
+    rskim_search::lexical::index_format::write_index(dir.path(), &entries, &header)
+        .expect("write_index failed");
+
+    let reader = IndexReader::open(dir.path()).expect("open failed");
+    let result = reader.validate();
+    assert!(
+        result.is_ok(),
+        "validate() must return Ok on a valid index, got: {result:?}"
+    );
+}
+
+/// An empty index (0 ngrams) also passes `validate()` — no entries to check.
+#[test]
+fn validate_passes_on_empty_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let header = make_header(0, 0);
+    rskim_search::lexical::index_format::write_index(dir.path(), &[], &header)
+        .expect("write_index failed");
+
+    let reader = IndexReader::open(dir.path()).expect("open failed");
+    assert!(
+        reader.validate().is_ok(),
+        "validate() must return Ok on an empty index"
+    );
+}
+
+/// Manually craft an index whose IndexEntry claims a posting range that
+/// extends beyond `.skpost`, then verify that `validate()` catches it.
+#[test]
+fn validate_detects_out_of_bounds_posting_range() {
+    use rskim_search::lexical::{INDEX_HEADER_SIZE, POSTING_ENTRY_SIZE};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Write a valid 1-ngram index so the files exist with the right structure.
+    let ng = ngram(b"vl");
+    let posting = make_posting(0, 2, 0, 1);
+    let entries = vec![(ng, vec![posting])];
+    let header = make_header(1, 1);
+    rskim_search::lexical::index_format::write_index(dir.path(), &entries, &header)
+        .expect("write_index failed");
+
+    // Corrupt the IndexEntry's posting_length field so it claims far more
+    // entries than actually exist in .skpost.
+    //
+    // IndexEntry layout (20 bytes):
+    //   ngram_hash [0..8]  u64 LE
+    //   posting_offset [8..12]  u32 LE  (byte offset)
+    //   posting_length [12..16]  u32 LE  (entry count)
+    //   _pad [16..20]
+    let skidx_path = dir.path().join("lexical.skidx");
+    let mut bytes = std::fs::read(&skidx_path).expect("read");
+
+    // The first (and only) IndexEntry starts at INDEX_HEADER_SIZE.
+    // posting_length occupies bytes [entry_start+12 .. entry_start+16].
+    let entry_start = INDEX_HEADER_SIZE;
+    // Claim 1 million posting entries — far more than .skpost holds.
+    let corrupt_length: u32 = 1_000_000;
+    bytes[entry_start + 12..entry_start + 16]
+        .copy_from_slice(&corrupt_length.to_le_bytes());
+    std::fs::write(&skidx_path, &bytes).expect("write corrupted skidx");
+
+    // Reopen — `open()` only checks structural sizes, not per-entry bounds.
+    // This may or may not succeed depending on whether the size check fires.
+    let Ok(reader) = IndexReader::open(dir.path()) else {
+        // If open() itself rejects the file (unexpected .skidx size), the
+        // corruption is caught even earlier — which is equally acceptable.
+        return;
+    };
+
+    // validate() must catch the out-of-bounds posting range.
+    let result = reader.validate();
+    assert!(
+        result.is_err(),
+        "validate() must return Err when a posting range exceeds .skpost, \
+         got Ok (POSTING_ENTRY_SIZE={POSTING_ENTRY_SIZE})"
+    );
+}
+
+// ============================================================================
 // 16. lookup filters doc_id >= file_count
 // ============================================================================
 
