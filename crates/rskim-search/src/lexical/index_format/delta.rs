@@ -132,22 +132,21 @@ impl DeltaReader {
         let mmap = unsafe { Mmap::map(&file) }.map_err(SearchError::Io)?;
 
         // Build the hash index in a single pass over all complete records.
-        let data = &mmap[..];
-        let record_count = data.len() / DELTA_RECORD_SIZE;
+        let record_count = mmap.len() / DELTA_RECORD_SIZE;
         let mut index: FxHashMap<u64, Vec<usize>> =
             FxHashMap::with_capacity_and_hasher(record_count, Default::default());
 
         for i in 0..record_count {
             let base = i * DELTA_RECORD_SIZE;
             let hash = u64::from_le_bytes([
-                data[base],
-                data[base + 1],
-                data[base + 2],
-                data[base + 3],
-                data[base + 4],
-                data[base + 5],
-                data[base + 6],
-                data[base + 7],
+                mmap[base],
+                mmap[base + 1],
+                mmap[base + 2],
+                mmap[base + 3],
+                mmap[base + 4],
+                mmap[base + 5],
+                mmap[base + 6],
+                mmap[base + 7],
             ]);
             index.entry(hash).or_default().push(base);
         }
@@ -176,10 +175,9 @@ impl DeltaReader {
         let Some(offsets) = self.index.get(&ngram.as_u64()) else {
             return;
         };
-        let data = &self.mmap[..];
         buf.reserve(offsets.len());
         for &base in offsets {
-            if let Some(posting) = PostingEntry::from_bytes(&data[base + 8..]) {
+            if let Some(posting) = PostingEntry::from_bytes(&self.mmap[base + 8..]) {
                 buf.push(posting);
             }
         }

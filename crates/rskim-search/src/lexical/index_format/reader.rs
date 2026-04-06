@@ -241,6 +241,7 @@ impl IndexReader {
     /// Clears `buf` before use and fills it with decoded posting entries. The
     /// caller can reuse the same buffer across multiple lookups to avoid
     /// per-call allocation. Returns `true` if the n-gram was found.
+    #[must_use = "ignoring the found/not-found signal silently skips scoring for this n-gram"]
     pub fn lookup_into(&self, ngram: Ngram, buf: &mut Vec<PostingEntry>) -> bool {
         buf.clear();
 

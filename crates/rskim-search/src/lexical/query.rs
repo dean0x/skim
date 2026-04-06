@@ -124,18 +124,15 @@ impl SearchLayer for LexicalSearchLayer {
             return Ok(vec![]);
         }
 
-        // Steps 3–4 are now cached in self.tombstones and self.delta.
-
-        // Step 5: For each query n-gram, accumulate per-document scores.
+        // Steps 2–5: For each query n-gram, load postings, filter tombstones,
+        // accumulate per-field TFs, and score each document.
         //
-        // Structure:
-        //   doc_scores: doc_id → cumulative BM25F score across all query terms
-        //
-        // For each ngram we:
-        //   a. Gather main-index postings, filter tombstoned doc_ids.
-        //   b. Gather delta postings (no tombstone filter — delta only adds new docs).
-        //   c. Group by doc_id → per-field TF list.
-        //   d. Compute df (unique doc count) and score each doc for this term.
+        // doc_scores accumulates the cumulative BM25F score across all query terms.
+        // For each ngram:
+        //   a. Load main-index postings (step 2), filter tombstoned doc_ids (step 3).
+        //   b. Load delta postings — no tombstone filter; delta only adds new docs.
+        //   c. Group by doc_id → per-field TF list (step 4).
+        //   d. Compute df (unique doc count) and score each doc for this term (step 5).
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
         let mut postings_buf: Vec<PostingEntry> = Vec::new();
         let mut ngram_docs: FxHashMap<u32, Vec<(SearchField, u16)>> = FxHashMap::default();
@@ -194,11 +191,9 @@ impl SearchLayer for LexicalSearchLayer {
             }
         }
 
-        // Step 6: Sort by score descending.
+        // Step 6: Sort by score descending, apply offset + limit, map to FileId.
         let mut results: Vec<(u32, f32)> = doc_scores.into_iter().collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Step 7: Apply offset + limit and map to FileId.
         let results: Vec<(FileId, f32)> = results
             .into_iter()
             .skip(query.offset)
