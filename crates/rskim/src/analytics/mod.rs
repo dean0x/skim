@@ -333,7 +333,7 @@ impl AnalyticsDb {
             Ok(DailyStats {
                 date: row.get(0)?,
                 invocations: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -351,7 +351,7 @@ impl AnalyticsDb {
             Ok(CommandStats {
                 command_type: row.get(0)?,
                 invocations: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -372,7 +372,7 @@ impl AnalyticsDb {
             Ok(LanguageStats {
                 language: row.get(0)?,
                 files: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -390,7 +390,7 @@ impl AnalyticsDb {
             Ok(ModeStats {
                 mode: row.get(0)?,
                 files: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -1180,6 +1180,29 @@ mod tests {
     // ========================================================================
     // savings_percentage underflow guard tests
     // ========================================================================
+
+    #[test]
+    fn test_query_negative_savings_returns_zero() {
+        let (db, _tmp) = test_db();
+        // Insert a record where compressed > raw directly (simulates pre-fix corrupt data)
+        db.conn
+            .execute(
+                "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path)
+                 VALUES (1711300000, 'file', 'test', 10, 20, -100.0, 5, '/tmp')",
+                [],
+            )
+            .unwrap();
+        let daily = db.query_daily(None).unwrap();
+        assert_eq!(
+            daily[0].tokens_saved, 0,
+            "negative savings from corrupt DB should be clamped to 0"
+        );
+        let by_cmd = db.query_by_command(None).unwrap();
+        assert_eq!(
+            by_cmd[0].tokens_saved, 0,
+            "negative savings in query_by_command should clamp to 0"
+        );
+    }
 
     #[test]
     fn test_negative_savings_clamped_at_recording() {
