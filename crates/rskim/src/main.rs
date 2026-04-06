@@ -183,12 +183,18 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
 SUBCOMMANDS:\n  \
+    agents                                   Show detected AI agents and hook/session status\n  \
     build                                    Build with output parsing\n  \
     completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n  \
     discover                                 Identify missed optimization opportunities\n  \
+    file                                     Read and transform source files (default)\n  \
     git                                      Git helpers (AST-aware diff, status, log)\n  \
+    infra                                    Infrastructure output compression (terraform, k8s)\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns and generate correction rules\n  \
+    lint                                     Lint output compression (eslint, ruff, mypy, ...)\n  \
+    log                                      Log output compression (JSON + regex)\n  \
+    pkg                                      Package manager output compression (npm, pip, cargo)\n  \
     rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
     stats [--since N] [--format json]        Show token analytics dashboard\n  \
     test                                     Run test with output parsing\n\n\
