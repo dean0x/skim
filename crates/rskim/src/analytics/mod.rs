@@ -463,6 +463,19 @@ impl AnalyticsDb {
         }
     }
 
+    /// Delete records where compressed_tokens > raw_tokens (invalid data from
+    /// pre-fix versions that did not clamp at recording time).
+    ///
+    /// This is a one-time self-healing operation: call it once at startup to
+    /// purge any corrupt rows so they never appear in dashboard queries.
+    pub(crate) fn clean_invalid_records(&self) -> anyhow::Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM token_savings WHERE compressed_tokens > raw_tokens",
+            [],
+        )?;
+        Ok(count)
+    }
+
     /// Delete all analytics data.
     fn clear_data(&self) -> anyhow::Result<()> {
         self.conn.execute("DELETE FROM token_savings", [])?;
@@ -1180,6 +1193,25 @@ mod tests {
     // ========================================================================
     // savings_percentage underflow guard tests
     // ========================================================================
+
+    #[test]
+    fn test_clean_invalid_records() {
+        let (db, _tmp) = test_db();
+        // Insert a valid record
+        db.record(&sample_record()).unwrap();
+        // Insert an invalid record directly (compressed > raw)
+        db.conn
+            .execute(
+                "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path)
+                 VALUES (1711300000, 'file', 'test', 10, 20, -100.0, 5, '/tmp')",
+                [],
+            )
+            .unwrap();
+        let cleaned = db.clean_invalid_records().unwrap();
+        assert_eq!(cleaned, 1, "should remove exactly the 1 invalid record");
+        let summary = db.query_summary(None).unwrap();
+        assert_eq!(summary.invocations, 1, "only the valid record should remain");
+    }
 
     #[test]
     fn test_query_negative_savings_returns_zero() {
