@@ -51,7 +51,7 @@ pub(crate) struct ProcessResult {
     /// - "full"        — clean parse, no errors
     ///
     /// `None` for cache hits (tier was not recorded at write time).
-    pub(crate) parse_tier: Option<String>,
+    pub(crate) parse_tier: Option<&'static str>,
 }
 
 /// Determine the parse quality tier from the mode and whether the parser reported errors.
@@ -59,13 +59,13 @@ pub(crate) struct ProcessResult {
 /// - "passthrough" — Mode::Full; no transformation was applied
 /// - "degraded"    — tree-sitter reported syntax errors
 /// - "full"        — clean parse, no syntax errors
-pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool) -> String {
+pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool) -> &'static str {
     if mode == Mode::Full {
-        "passthrough".to_string()
+        "passthrough"
     } else if has_errors {
-        "degraded".to_string()
+        "degraded"
     } else {
-        "full".to_string()
+        "full"
     }
 }
 
@@ -374,7 +374,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             transformed_tokens: trans_tokens,
             trunc: options.trunc,
             effective_mode,
-            parse_tier: parse_tier.clone(),
+            parse_tier: parse_tier.map(str::to_string),
         });
     }
 
@@ -459,13 +459,13 @@ mod tests {
             original_tokens: Some(10),
             transformed_tokens: Some(5),
             guardrail_triggered: false,
-            parse_tier: Some("full".to_string()),
+            parse_tier: Some("full"),
         };
         assert_eq!(result.output, "test");
         assert_eq!(result.original_tokens, Some(10));
         assert_eq!(result.transformed_tokens, Some(5));
         assert!(!result.guardrail_triggered);
-        assert_eq!(result.parse_tier.as_deref(), Some("full"));
+        assert_eq!(result.parse_tier, Some("full"));
     }
 
     // ========================================================================

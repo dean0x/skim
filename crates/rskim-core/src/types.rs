@@ -161,7 +161,11 @@ impl Language {
         matches!(self, Self::Json | Self::Yaml | Self::Toml)
     }
 
-    /// Transform source code for this language
+    /// Transform source code for this language, returning `(content, has_errors)`.
+    ///
+    /// `has_errors` is `true` when the tree-sitter parser encountered syntax
+    /// errors in the source. For serde-based languages and passthrough paths
+    /// (Mode::Full) it is always `false` on success.
     ///
     /// ARCHITECTURE: Encapsulates language-specific parsing strategy.
     /// - JSON: Uses serde_json parser
@@ -174,11 +178,6 @@ impl Language {
     ///
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
-    /// Transform source code, returning `(content, has_errors)`.
-    ///
-    /// `has_errors` is `true` when the tree-sitter parser encountered syntax
-    /// errors in the source. For serde-based languages and passthrough paths
-    /// (Mode::Full) it is always `false` on success.
     pub(crate) fn transform_source(
         self,
         source: &str,
