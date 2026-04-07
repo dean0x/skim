@@ -151,17 +151,12 @@ fn run_json(
     if show_cost {
         let pricing = PricingModel::from_env_or_default();
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
-        if let Some(obj) = root.as_object_mut() {
-            obj.insert(
-                "cost_estimate".to_string(),
-                serde_json::json!({
-                    "tier": pricing.tier_name,
-                    "input_cost_per_mtok": pricing.input_cost_per_mtok,
-                    "estimated_savings_usd": (cost_savings * 100.0).round() / 100.0,
-                    "tokens_saved": summary.tokens_saved,
-                }),
-            );
-        }
+        root["cost_estimate"] = serde_json::json!({
+            "tier": pricing.tier_name,
+            "input_cost_per_mtok": pricing.input_cost_per_mtok,
+            "estimated_savings_usd": (cost_savings * 100.0).round() / 100.0,
+            "tokens_saved": summary.tokens_saved,
+        });
     }
 
     writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
@@ -511,12 +506,13 @@ fn run_dashboard(
     }
 
     // ── Parse Quality ─────────────────────────────────────────────────────────
-    let tier = db.query_tier_distribution(since)?;
+    let tier_dist = db.query_tier_distribution(since)?;
     writeln!(w, "{}", section_header("Parse Quality"))?;
-    if tier.full_pct > 0.0 || tier.degraded_pct > 0.0 || tier.passthrough_pct > 0.0 {
-        writeln!(w, "  Full:        {:.1}%", tier.full_pct)?;
-        writeln!(w, "  Degraded:    {:.1}%", tier.degraded_pct)?;
-        writeln!(w, "  Passthrough: {:.1}%", tier.passthrough_pct)?;
+    if tier_dist.full_pct > 0.0 || tier_dist.degraded_pct > 0.0 || tier_dist.passthrough_pct > 0.0
+    {
+        writeln!(w, "  Full:        {:.1}%", tier_dist.full_pct)?;
+        writeln!(w, "  Degraded:    {:.1}%", tier_dist.degraded_pct)?;
+        writeln!(w, "  Passthrough: {:.1}%", tier_dist.passthrough_pct)?;
     } else {
         writeln!(w, "  No tier data recorded yet.")?;
     }
@@ -533,13 +529,13 @@ fn run_dashboard(
         )?;
         writeln!(w)?;
 
-        for tier in PricingModel::all_tiers() {
-            let savings = tier.estimate_savings(summary.tokens_saved);
+        for price_tier in PricingModel::all_tiers() {
+            let savings = price_tier.estimate_savings(summary.tokens_saved);
             let line = format!(
                 "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
-                tier.tier_name, tier.input_cost_per_mtok, savings
+                price_tier.tier_name, price_tier.input_cost_per_mtok, savings
             );
-            if tier.tier_name == pricing.tier_name {
+            if price_tier.tier_name == pricing.tier_name {
                 writeln!(w, "{}", line.green().bold())?;
             } else {
                 writeln!(w, "{}", line)?;

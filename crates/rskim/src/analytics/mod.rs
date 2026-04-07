@@ -489,7 +489,6 @@ impl AnalyticsDb {
         )?;
         Ok(count)
     }
-
 }
 
 impl AnalyticsStore for AnalyticsDb {
