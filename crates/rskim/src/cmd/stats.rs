@@ -155,7 +155,7 @@ fn run_json(
             obj.insert(
                 "cost_estimate".to_string(),
                 serde_json::json!({
-                    "model": pricing.model_name,
+                    "tier": pricing.tier_name,
                     "input_cost_per_mtok": pricing.input_cost_per_mtok,
                     "estimated_savings_usd": (cost_savings * 100.0).round() / 100.0,
                     "tokens_saved": summary.tokens_saved,
@@ -167,6 +167,16 @@ fn run_json(
     writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
     Ok(ExitCode::SUCCESS)
 }
+
+// ============================================================================
+// Dashboard layout constants
+// ============================================================================
+
+const COL_NAME: usize = 14;
+const COL_COUNT: usize = 6;
+const COL_SAVED: usize = 8;
+const BAR_WIDTH: usize = 16;
+const SPARKLINE_CHAR_WIDTH: usize = 4;
 
 // ============================================================================
 // Dashboard formatting helpers
@@ -254,15 +264,16 @@ fn render_sparkline(daily: &[DailyStats]) -> String {
         .iter()
         .map(|date| {
             let tokens = by_date.get(date.as_str()).copied().unwrap_or(0);
-            if max_val == 0 {
-                BARS[0]
+            let idx = if max_val == 0 {
+                0
             } else {
-                let idx =
-                    ((tokens as f64 / max_val as f64) * (BARS.len() - 1) as f64).round() as usize;
-                BARS[idx.min(BARS.len() - 1)]
-            }
+                ((tokens as f64 / max_val as f64) * (BARS.len() - 1) as f64).round() as usize
+            };
+            let ch = BARS[idx.min(BARS.len() - 1)];
+            std::iter::repeat_n(ch, SPARKLINE_CHAR_WIDTH).collect::<String>()
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Enumerate calendar dates (YYYY-MM-DD strings) from `start` to `end` inclusive.
@@ -333,6 +344,22 @@ fn section_header(title: &str) -> String {
     let prefix = format!("\u{2500}\u{2500} {title} ");
     let remaining = 76_usize.saturating_sub(prefix.len());
     format!("{}{}", prefix, "\u{2500}".repeat(remaining))
+}
+
+/// Map a stored command_type string to a human-readable label.
+fn command_label(stored: &str) -> &'static str {
+    match stored {
+        "file" => "Source files",
+        "test" => "Test output",
+        "build" => "Build output",
+        "git" => "Git output",
+        "lint" => "Lint output",
+        "pkg" => "Pkg output",
+        "infra" => "Infra output",
+        "fileops" => "File ops",
+        "log" => "Log output",
+        _ => "Other",
+    }
 }
 
 // ============================================================================
@@ -415,7 +442,7 @@ fn run_dashboard(
             let first = sorted.first().map(|d| d.date.as_str()).unwrap_or("");
             let last = sorted.last().map(|d| d.date.as_str()).unwrap_or("");
             writeln!(w, "  {sparkline}")?;
-            writeln!(w, "  {first}  ──  {last}")?;
+            writeln!(w, "  {} to {}", first.dimmed(), last.dimmed())?;
         }
         writeln!(w)?;
     }
@@ -424,22 +451,18 @@ fn run_dashboard(
     let by_command = db.query_by_command(since)?;
     if !by_command.is_empty() {
         writeln!(w, "{}", section_header("By Command"))?;
-        let max_saved = by_command
-            .iter()
-            .map(|c| c.tokens_saved)
-            .max()
-            .unwrap_or(1)
-            .max(1);
         for cmd in &by_command {
-            let rel_pct = cmd.tokens_saved as f64 / max_saved as f64 * 100.0;
             writeln!(
                 w,
-                "  {:<10} {:>5} invocations  {:>8} saved  {}  {}",
-                cmd.command_type,
+                "  {:<width$} {:>col_count$} calls  {:>col_saved$} saved  {}  {}",
+                command_label(&cmd.command_type),
                 tokens::format_number(cmd.invocations as usize),
                 format_tokens(cmd.tokens_saved),
                 color_pct(cmd.avg_savings_pct),
-                render_bar(rel_pct, 12),
+                render_bar(cmd.avg_savings_pct, BAR_WIDTH),
+                width = COL_NAME,
+                col_count = COL_COUNT,
+                col_saved = COL_SAVED,
             )?;
         }
         writeln!(w)?;
@@ -452,11 +475,15 @@ fn run_dashboard(
         for lang in &by_language {
             writeln!(
                 w,
-                "  {:<12} {:>6} files  {:>8} saved  {}",
+                "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
                 lang.language,
                 tokens::format_number(lang.files as usize),
                 format_tokens(lang.tokens_saved),
                 color_pct(lang.avg_savings_pct),
+                render_bar(lang.avg_savings_pct, BAR_WIDTH),
+                width = COL_NAME,
+                col_count = COL_COUNT,
+                col_saved = COL_SAVED,
             )?;
         }
         writeln!(w)?;
@@ -469,11 +496,15 @@ fn run_dashboard(
         for mode in &by_mode {
             writeln!(
                 w,
-                "  {:<12} {:>6} files  {:>8} saved  {}",
+                "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
                 mode.mode,
                 tokens::format_number(mode.files as usize),
                 format_tokens(mode.tokens_saved),
                 color_pct(mode.avg_savings_pct),
+                render_bar(mode.avg_savings_pct, BAR_WIDTH),
+                width = COL_NAME,
+                col_count = COL_COUNT,
+                col_saved = COL_SAVED,
             )?;
         }
         writeln!(w)?;
@@ -494,19 +525,37 @@ fn run_dashboard(
     // ── Cost Estimates ────────────────────────────────────────────────────────
     if show_cost {
         let pricing = PricingModel::from_env_or_default();
-        let cost_savings = pricing.estimate_savings(summary.tokens_saved);
         writeln!(w, "{}", section_header("Cost Estimates"))?;
-        writeln!(w, "  Model:          {}", pricing.model_name)?;
         writeln!(
             w,
-            "  Input cost:     ${:.2}/MTok",
-            pricing.input_cost_per_mtok
+            "  Rate:      ${:.2}/MTok ({})",
+            pricing.input_cost_per_mtok, pricing.tier_name
         )?;
-        writeln!(
-            w,
-            "  Estimated savings: {}",
-            format!("${:.2}", cost_savings).green().bold()
-        )?;
+        writeln!(w)?;
+
+        for tier in PricingModel::all_tiers() {
+            let savings = tier.estimate_savings(summary.tokens_saved);
+            let line = format!(
+                "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
+                tier.tier_name, tier.input_cost_per_mtok, savings
+            );
+            if tier.tier_name == pricing.tier_name {
+                writeln!(w, "{}", line.green().bold())?;
+            } else {
+                writeln!(w, "{}", line)?;
+            }
+        }
+
+        // Show custom tier row if env var was used
+        if pricing.tier_name == "Custom" {
+            let savings = pricing.estimate_savings(summary.tokens_saved);
+            let line = format!(
+                "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
+                pricing.tier_name, pricing.input_cost_per_mtok, savings
+            );
+            writeln!(w, "{}", line.green().bold())?;
+        }
+
         writeln!(w)?;
     }
 
@@ -587,10 +636,27 @@ mod tests {
             },
         ];
         let sparkline = render_sparkline(&daily);
-        assert_eq!(sparkline.chars().count(), 5, "Apr 1-5 = 5 days");
-        let chars: Vec<char> = sparkline.chars().collect();
-        assert_eq!(chars[1], '▁', "Apr 2 gap should be min bar");
-        assert_eq!(chars[3], '▁', "Apr 4 gap should be min bar");
+        // 5 days × SPARKLINE_CHAR_WIDTH chars + 4 spaces between blocks
+        let expected_len = 5 * SPARKLINE_CHAR_WIDTH + 4;
+        assert_eq!(
+            sparkline.chars().count(),
+            expected_len,
+            "Apr 1-5 = 5 days, each {} chars wide with space separators",
+            SPARKLINE_CHAR_WIDTH
+        );
+        // Split on space to get individual blocks; gaps (Apr 2, Apr 4) are min-bar blocks
+        let blocks: Vec<&str> = sparkline.split(' ').collect();
+        assert_eq!(blocks.len(), 5, "should have 5 blocks");
+        // Gap blocks (Apr 2 at index 1, Apr 4 at index 3) should be all minimum-bar chars
+        let min_bar = '▁';
+        assert!(
+            blocks[1].chars().all(|c| c == min_bar),
+            "Apr 2 gap block should be min bar"
+        );
+        assert!(
+            blocks[3].chars().all(|c| c == min_bar),
+            "Apr 4 gap block should be min bar"
+        );
     }
 
     // ========================================================================
@@ -922,5 +988,87 @@ mod tests {
             !output.contains("Daily Trend"),
             "dashboard should skip daily trend section when no daily data"
         );
+    }
+
+    // ========================================================================
+    // command_label tests
+    // ========================================================================
+
+    #[test]
+    fn test_command_label() {
+        assert_eq!(command_label("file"), "Source files");
+        assert_eq!(command_label("test"), "Test output");
+        assert_eq!(command_label("build"), "Build output");
+        assert_eq!(command_label("git"), "Git output");
+        assert_eq!(command_label("lint"), "Lint output");
+        assert_eq!(command_label("pkg"), "Pkg output");
+        assert_eq!(command_label("infra"), "Infra output");
+        assert_eq!(command_label("fileops"), "File ops");
+        assert_eq!(command_label("log"), "Log output");
+        assert_eq!(command_label("unknown_cmd"), "Other");
+    }
+
+    // ========================================================================
+    // Wider sparkline tests
+    // ========================================================================
+
+    #[test]
+    fn test_sparkline_width_with_spaces() {
+        let daily: Vec<DailyStats> = (1..=5)
+            .map(|i| DailyStats {
+                date: format!("2026-04-{:02}", i),
+                invocations: i as u64,
+                tokens_saved: i as u64 * 100,
+                avg_savings_pct: 50.0,
+            })
+            .collect();
+        let sparkline = render_sparkline(&daily);
+        // N days → N * SPARKLINE_CHAR_WIDTH + (N-1) spaces
+        let expected_len = 5 * SPARKLINE_CHAR_WIDTH + 4;
+        assert_eq!(
+            sparkline.chars().count(),
+            expected_len,
+            "5 days should produce {} chars, got {}",
+            expected_len,
+            sparkline.chars().count()
+        );
+    }
+
+    // ========================================================================
+    // Dashboard command labels test
+    // ========================================================================
+
+    #[test]
+    fn test_dashboard_shows_command_labels() {
+        let store = MockStore::with_data();
+        // MockStore::with_data() has command_type: "file"
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            output.contains("Source files"),
+            "dashboard should show 'Source files' label for 'file' command type"
+        );
+    }
+
+    // ========================================================================
+    // Multi-tier cost table test
+    // ========================================================================
+
+    #[test]
+    fn test_dashboard_multi_tier_cost() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_dashboard(w, &store, None, true, None));
+        assert!(
+            output.contains("Economy"),
+            "cost section should show Economy tier"
+        );
+        assert!(
+            output.contains("Standard"),
+            "cost section should show Standard tier"
+        );
+        assert!(
+            output.contains("Premium"),
+            "cost section should show Premium tier"
+        );
+        assert!(output.contains("/MTok"), "cost section should show rate");
     }
 }
