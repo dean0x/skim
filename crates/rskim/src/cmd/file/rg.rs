@@ -63,7 +63,10 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
     }
 
     if let Some(result) = try_parse_regex(&output.stdout) {
-        return ParseResult::Degraded(result, vec!["rg: JSON parse failed, using regex".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["rg: JSON parse failed, using regex".to_string()],
+        );
     }
 
     ParseResult::Passthrough(output.stdout.clone())

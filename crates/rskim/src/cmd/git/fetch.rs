@@ -101,11 +101,7 @@ fn parse_fetch(input: &str) -> GitResult {
     let lines: Vec<&str> = input.lines().collect();
 
     if lines.iter().all(|l| l.trim().is_empty()) {
-        return GitResult::new(
-            "fetch".to_string(),
-            "up to date".to_string(),
-            Vec::new(),
-        );
+        return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new());
     }
 
     let mut remote = String::new();
@@ -144,11 +140,7 @@ fn parse_fetch(input: &str) -> GitResult {
         if trimmed.contains("[new branch]") {
             if let Some(name) = extract_ref_name(trimmed) {
                 if let Some(ref sub) = current_submodule {
-                    add_to_submodule(
-                        &mut submodule_sections,
-                        sub,
-                        &format!("new branch: {name}"),
-                    );
+                    add_to_submodule(&mut submodule_sections, sub, &format!("new branch: {name}"));
                 } else {
                     new_branches.push(name);
                 }
@@ -220,11 +212,7 @@ fn parse_fetch(input: &str) -> GitResult {
     }
 
     if parts.is_empty() && submodule_sections.is_empty() {
-        return GitResult::new(
-            "fetch".to_string(),
-            "up to date".to_string(),
-            Vec::new(),
-        );
+        return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new());
     }
 
     // Build detail lines
@@ -375,7 +363,10 @@ mod tests {
             "expected '1 new tag' in summary, got: {}",
             result.summary
         );
-        assert!(result.summary.contains("github.com:user/repo"), "expected remote in summary");
+        assert!(
+            result.summary.contains("github.com:user/repo"),
+            "expected remote in summary"
+        );
     }
 
     #[test]
@@ -414,7 +405,10 @@ mod tests {
             "expected '2 new branches', got: {}",
             result.summary
         );
-        assert!(!result.summary.contains("updated"), "should not mention updated");
+        assert!(
+            !result.summary.contains("updated"),
+            "should not mention updated"
+        );
     }
 
     #[test]

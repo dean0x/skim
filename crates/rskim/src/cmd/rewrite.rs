@@ -216,7 +216,14 @@ const REWRITE_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["git", "diff"],
         rewrite_to: &["skim", "git", "diff"],
-        skip_if_flag_prefix: &["--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--check"],
+        skip_if_flag_prefix: &[
+            "--stat",
+            "--shortstat",
+            "--numstat",
+            "--name-only",
+            "--name-status",
+            "--check",
+        ],
         category: RewriteCategory::Git,
     },
     RewriteRule {

@@ -154,7 +154,10 @@ fn parse(output: &str) -> ParseResult<TestResult> {
 
     // Tier 2: Regex fallback
     if let Some(result) = try_parse_regex(output) {
-        return ParseResult::Degraded(result, vec!["go test: JSON parse failed, using regex".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["go test: JSON parse failed, using regex".to_string()],
+        );
     }
 
     // Tier 3: Passthrough

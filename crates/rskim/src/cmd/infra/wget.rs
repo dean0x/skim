@@ -63,7 +63,10 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     }
 
     if let Some(result) = try_parse_regex(&combined) {
-        return ParseResult::Degraded(result, vec!["wget: structured parse failed, using regex".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["wget: structured parse failed, using regex".to_string()],
+        );
     }
 
     ParseResult::Passthrough(combined.into_owned())

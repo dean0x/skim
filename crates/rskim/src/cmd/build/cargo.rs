@@ -426,7 +426,9 @@ mod tests {
         if let ParseResult::Degraded(build_result, markers) = &result {
             assert_eq!(build_result.errors, 2, "expected 2 errors from regex");
             assert!(!build_result.success, "expected failure");
-            assert!(markers.contains(&"cargo build: structured parse failed, using regex".to_string()));
+            assert!(
+                markers.contains(&"cargo build: structured parse failed, using regex".to_string())
+            );
         }
     }
 

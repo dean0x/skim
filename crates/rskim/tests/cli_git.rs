@@ -142,10 +142,7 @@ fn test_skim_git_fetch_in_repo() {
         .args(["git", "fetch"])
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("[fetch]")
-                .or(predicate::str::contains("up to date")),
-        );
+        .stdout(predicate::str::contains("[fetch]").or(predicate::str::contains("up to date")));
 }
 
 // ============================================================================

@@ -88,7 +88,10 @@ impl<T: AsRef<str>> ParseResult<T> {
                 Ok(())
             }
             ParseResult::Passthrough(_) => {
-                writeln!(writer, "[skim:notice] output passed through without parsing")
+                writeln!(
+                    writer,
+                    "[skim:notice] output passed through without parsing"
+                )
             }
         }
     }
