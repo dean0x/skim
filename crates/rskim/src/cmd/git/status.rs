@@ -30,7 +30,7 @@ pub(super) fn run_status(
     ]);
     full_args.extend_from_slice(&filtered_args);
 
-    run_parsed_command(&full_args, show_stats, output_format, parse_status)
+    run_parsed_command(&full_args, show_stats, output_format, false, parse_status)
 }
 
 /// Accumulated per-category file lists from a porcelain v2 status parse.

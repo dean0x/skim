@@ -31,7 +31,7 @@ pub(super) fn run_log(
 
     full_args.extend_from_slice(&filtered_args);
 
-    run_parsed_command(&full_args, show_stats, output_format, parse_log)
+    run_parsed_command(&full_args, show_stats, output_format, false, parse_log)
 }
 
 /// Parse formatted `git log` output into a compressed GitResult.

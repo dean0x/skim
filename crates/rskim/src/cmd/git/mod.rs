@@ -225,10 +225,15 @@ fn run_passthrough(
 ///
 /// Callers are responsible for baking global flags into `subcmd_args` before
 /// calling this function.
-fn run_parsed_command<F>(
+///
+/// When `combine_stderr` is `true`, the parser receives `stderr + stdout`
+/// combined. Git fetch writes its output to stderr, so fetch uses `true`;
+/// all other subcommands use `false` (stdout only).
+pub(super) fn run_parsed_command<F>(
     subcmd_args: &[String],
     show_stats: bool,
     output_format: OutputFormat,
+    combine_stderr: bool,
     parser: F,
 ) -> anyhow::Result<ExitCode>
 where
@@ -249,7 +254,14 @@ where
         return Ok(map_exit_code(output.exit_code));
     }
 
-    let result = parser(&output.stdout);
+    // Git fetch writes to stderr; other subcommands write to stdout.
+    let raw: String = if combine_stderr {
+        format!("{}\n{}", output.stderr, output.stdout)
+    } else {
+        output.stdout
+    };
+
+    let result = parser(&raw);
     let result_str = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
@@ -265,7 +277,7 @@ where
     };
 
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &result_str);
+        let (orig, comp) = crate::process::count_token_pair(&raw, &result_str);
         crate::process::report_token_stats(orig, comp, "");
     }
 
@@ -273,7 +285,7 @@ where
     // Guard to avoid allocations when analytics are disabled.
     if crate::analytics::is_analytics_enabled() {
         crate::analytics::try_record_command(
-            output.stdout,
+            raw,
             result_str,
             format!("skim git {}", subcmd_args.join(" ")),
             crate::analytics::CommandType::Git,

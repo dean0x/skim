@@ -8,15 +8,17 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
+use crate::cmd::{extract_output_format, user_has_flag};
 use crate::output::canonical::GitResult;
-use crate::runner::CommandRunner;
 
-use super::{map_exit_code, run_passthrough};
+use super::{run_parsed_command, run_passthrough};
 
 /// Run `git fetch` with output compression.
 ///
 /// Flag-aware passthrough: `--dry-run`, `-q`, `--quiet` pass through unmodified.
+///
+/// Git fetch writes its ref updates to stderr, so `run_parsed_command` is
+/// called with `combine_stderr: true` to merge stderr+stdout before parsing.
 pub(super) fn run_fetch(
     global_flags: &[String],
     args: &[String],
@@ -32,56 +34,7 @@ pub(super) fn run_fetch(
     full_args.push("fetch".to_string());
     full_args.extend_from_slice(&filtered_args);
 
-    let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
-    let output = runner.run("git", &arg_refs)?;
-
-    if output.exit_code != Some(0) {
-        // On failure, pass through stderr
-        if !output.stderr.is_empty() {
-            eprint!("{}", output.stderr);
-        }
-        if !output.stdout.is_empty() {
-            print!("{}", output.stdout);
-        }
-        return Ok(map_exit_code(output.exit_code));
-    }
-
-    // Git fetch writes its output to stderr; combine both for parsing
-    let combined = format!("{}\n{}", output.stderr, output.stdout);
-    let result = parse_fetch(&combined);
-
-    let result_str = match output_format {
-        OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&result)
-                .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
-            println!("{json}");
-            json
-        }
-        OutputFormat::Text => {
-            let s = result.to_string();
-            println!("{s}");
-            s
-        }
-    };
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&combined, &result_str);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            combined,
-            result_str,
-            format!("skim git fetch {}", args.join(" ")),
-            crate::analytics::CommandType::Git,
-            output.duration,
-            None,
-        );
-    }
-
-    Ok(ExitCode::SUCCESS)
+    run_parsed_command(&full_args, show_stats, output_format, true, parse_fetch)
 }
 
 // ============================================================================
