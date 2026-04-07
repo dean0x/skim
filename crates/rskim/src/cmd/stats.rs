@@ -233,7 +233,8 @@ fn render_sparkline(daily: &[DailyStats]) -> String {
     // Work with data sorted ascending by date; take last 14 entries.
     let mut sorted: Vec<&DailyStats> = daily.iter().collect();
     sorted.sort_by(|a, b| a.date.cmp(&b.date));
-    let window: Vec<&DailyStats> = sorted.into_iter().rev().take(14).rev().collect();
+    let start = sorted.len().saturating_sub(14);
+    let window: Vec<&DailyStats> = sorted[start..].to_vec();
 
     // Build a date-indexed map of tokens_saved.
     let mut by_date: HashMap<&str, u64> = HashMap::new();
@@ -279,6 +280,9 @@ fn calendar_dates_between(start: &str, end: &str) -> Vec<String> {
         let y = parts[0].parse::<i32>().ok()?;
         let m = parts[1].parse::<u32>().ok()?;
         let d = parts[2].parse::<u32>().ok()?;
+        if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+            return None;
+        }
         Some((y, m, d))
     }
 
@@ -1026,6 +1030,251 @@ mod tests {
             expected_len,
             sparkline.chars().count()
         );
+    }
+
+    // ========================================================================
+    // render_bar tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_bar_zero_pct() {
+        let bar = render_bar(0.0, 10);
+        // All cells should be empty (░), no filled cells
+        assert!(bar.starts_with('['), "bar should start with '['");
+        assert!(bar.ends_with(']'), "bar should end with ']'");
+        // Strip ANSI for counting: just verify the empty block char count
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(empty_count, 10, "0% bar should have 10 empty cells");
+    }
+
+    #[test]
+    fn test_render_bar_full_pct() {
+        let bar = render_bar(100.0, 10);
+        let fill_count = bar.chars().filter(|&c| c == '█').count();
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(fill_count, 10, "100% bar should have 10 filled cells");
+        assert_eq!(empty_count, 0, "100% bar should have 0 empty cells");
+    }
+
+    #[test]
+    fn test_render_bar_clamps_negative() {
+        // Negative percentage should clamp to 0
+        let bar = render_bar(-20.0, 10);
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(empty_count, 10, "negative pct should clamp to 0% (all empty)");
+    }
+
+    #[test]
+    fn test_render_bar_clamps_over_100() {
+        // Over-100 percentage should clamp to 100
+        let bar = render_bar(150.0, 10);
+        let fill_count = bar.chars().filter(|&c| c == '█').count();
+        assert_eq!(
+            fill_count,
+            10,
+            "pct > 100 should clamp to 100% (all filled)"
+        );
+    }
+
+    #[test]
+    fn test_render_bar_zero_width() {
+        // Zero-width bar should still have brackets with no cells
+        let bar = render_bar(50.0, 0);
+        assert_eq!(bar, "[]", "zero-width bar should be '[]'");
+    }
+
+    #[test]
+    fn test_render_bar_half_pct() {
+        let bar = render_bar(50.0, 10);
+        let fill_count = bar.chars().filter(|&c| c == '█').count();
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(fill_count, 5, "50% bar (width 10) should have 5 filled cells");
+        assert_eq!(empty_count, 5, "50% bar (width 10) should have 5 empty cells");
+    }
+
+    // ========================================================================
+    // render_sparkline sort correctness tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_sparkline_sort_order() {
+        // Provide daily data in reverse order; sparkline should sort ascending
+        let daily = vec![
+            DailyStats {
+                date: "2026-04-03".to_string(),
+                invocations: 3,
+                tokens_saved: 300,
+                avg_savings_pct: 60.0,
+            },
+            DailyStats {
+                date: "2026-04-01".to_string(),
+                invocations: 1,
+                tokens_saved: 100,
+                avg_savings_pct: 50.0,
+            },
+            DailyStats {
+                date: "2026-04-02".to_string(),
+                invocations: 2,
+                tokens_saved: 200,
+                avg_savings_pct: 55.0,
+            },
+        ];
+        // Sorted ascending and with gaps filled: Apr 1, 2, 3 — 3 blocks
+        let sparkline = render_sparkline(&daily);
+        let blocks: Vec<&str> = sparkline.split(' ').collect();
+        assert_eq!(blocks.len(), 3, "3 days should produce 3 blocks");
+        // Apr 3 has the highest tokens_saved (300), so its block should be max bar '█'
+        let max_bar = '█';
+        assert!(
+            blocks[2].chars().all(|c| c == max_bar),
+            "last block (Apr 3, highest) should be max bar"
+        );
+    }
+
+    #[test]
+    fn test_render_sparkline_takes_last_14() {
+        // Provide 20 days; sparkline should use only the last 14
+        let daily: Vec<DailyStats> = (1..=20)
+            .map(|i| DailyStats {
+                date: format!("2026-04-{:02}", i),
+                invocations: i as u64,
+                tokens_saved: i as u64 * 100,
+                avg_savings_pct: 50.0,
+            })
+            .collect();
+        let sparkline = render_sparkline(&daily);
+        let blocks: Vec<&str> = sparkline.split(' ').collect();
+        assert_eq!(
+            blocks.len(),
+            14,
+            "20 days of data should yield only last 14 blocks"
+        );
+    }
+
+    // ========================================================================
+    // calendar_dates_between tests
+    // ========================================================================
+
+    #[test]
+    fn test_calendar_same_day() {
+        let dates = calendar_dates_between("2026-04-05", "2026-04-05");
+        assert_eq!(dates, vec!["2026-04-05"]);
+    }
+
+    #[test]
+    fn test_calendar_month_boundary() {
+        // Jan 30 → Feb 2
+        let dates = calendar_dates_between("2026-01-30", "2026-02-02");
+        assert_eq!(
+            dates,
+            vec!["2026-01-30", "2026-01-31", "2026-02-01", "2026-02-02"]
+        );
+    }
+
+    #[test]
+    fn test_calendar_year_boundary() {
+        // Dec 30 → Jan 2 next year
+        let dates = calendar_dates_between("2025-12-30", "2026-01-02");
+        assert_eq!(
+            dates,
+            vec!["2025-12-30", "2025-12-31", "2026-01-01", "2026-01-02"]
+        );
+    }
+
+    #[test]
+    fn test_calendar_leap_year() {
+        // Feb 28 → Mar 1 in 2024 (leap year)
+        let dates = calendar_dates_between("2024-02-28", "2024-03-01");
+        assert_eq!(
+            dates,
+            vec!["2024-02-28", "2024-02-29", "2024-03-01"]
+        );
+    }
+
+    #[test]
+    fn test_calendar_non_leap_year() {
+        // Feb 28 → Mar 1 in 2025 (non-leap year, no Feb 29)
+        let dates = calendar_dates_between("2025-02-28", "2025-03-01");
+        assert_eq!(dates, vec!["2025-02-28", "2025-03-01"]);
+    }
+
+    #[test]
+    fn test_calendar_malformed_start() {
+        // Malformed start returns vec with just the start string
+        let dates = calendar_dates_between("not-a-date", "2026-04-05");
+        assert_eq!(dates, vec!["not-a-date"]);
+    }
+
+    #[test]
+    fn test_calendar_malformed_end() {
+        // Malformed end returns vec with just the start string
+        let dates = calendar_dates_between("2026-04-01", "not-a-date");
+        assert_eq!(dates, vec!["2026-04-01"]);
+    }
+
+    #[test]
+    fn test_calendar_invalid_month() {
+        // Month 13 is invalid; parse_ymd should return None → fallback to start string
+        let dates = calendar_dates_between("2026-13-01", "2026-13-05");
+        assert_eq!(dates, vec!["2026-13-01"]);
+    }
+
+    #[test]
+    fn test_calendar_invalid_day() {
+        // Day 0 is invalid
+        let dates = calendar_dates_between("2026-04-00", "2026-04-03");
+        assert_eq!(dates, vec!["2026-04-00"]);
+    }
+
+    #[test]
+    fn test_calendar_safety_cap() {
+        // 365+ days apart should be capped at 100 entries
+        let dates = calendar_dates_between("2026-01-01", "2027-12-31");
+        assert_eq!(dates.len(), 100, "safety cap should limit output to 100 dates");
+    }
+
+    // ========================================================================
+    // JSON output value assertions
+    // ========================================================================
+
+    #[test]
+    fn test_run_json_tier_distribution_values() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_json(w, &store, None, false));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let tier = &parsed["tier_distribution"];
+        assert!(
+            tier.is_object(),
+            "tier_distribution should be a JSON object"
+        );
+        assert_eq!(
+            tier["full_pct"].as_f64().unwrap(),
+            90.0,
+            "full_pct should be 90.0"
+        );
+        assert_eq!(
+            tier["degraded_pct"].as_f64().unwrap(),
+            8.0,
+            "degraded_pct should be 8.0"
+        );
+        assert_eq!(
+            tier["passthrough_pct"].as_f64().unwrap(),
+            2.0,
+            "passthrough_pct should be 2.0"
+        );
+    }
+
+    #[test]
+    fn test_run_json_cost_tier_value() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_json(w, &store, None, true));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let cost = &parsed["cost_estimate"];
+        let tier = cost["tier"].as_str().expect("tier should be a string");
+        // Default pricing model tier should be "Standard"
+        assert_eq!(tier, "Standard", "default cost tier should be 'Standard'");
     }
 
     // ========================================================================
