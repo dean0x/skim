@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-04-08
+
+Minor release: Stats dashboard v3, debug-gated warnings, git fetch compression.
+
+### Added
+- `skim git fetch` subcommand — parses git fetch output (ref updates, new branches/tags, pruned refs, forced updates, submodule fetches)
+- `--debug` flag and `SKIM_DEBUG` env var — gates `[skim:warning]`/`[skim:notice]` stderr markers (silent by default)
+- `transform_with_quality()` public API in rskim-core — returns parse quality flag alongside content
+- Enriched degradation markers across all 23 parsers (e.g., `"eslint: JSON parse failed, using regex"`)
+- Stats dashboard v3 — green-only efficiency colors, daily trend subtitle, parse tier tracking
+
+### Fixed
+- Parse tier tracking through ProcessResult/cache/analytics chain
+- Git diff rewrite rules: added `--shortstat`/`--numstat` to skip-flags
+- `parse_fetch` submodule context bug (refs after submodule block incorrectly attributed)
+- Debug module: atomic ordering upgraded to Release/Acquire, env var cached at startup
+- Test pollution: `force_enable_debug()` now has `reset_debug_for_tests()` cleanup
+
+### Testing
+- **2,306 tests passing** (up from 2,226 in v2.2.0)
+
 ## [2.2.0] - 2026-04-06
 
 Minor release: File, log, and infrastructure output compression (12 new tool parsers), learn command fix, rewrite/discover integration.
@@ -635,6 +656,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.3.0** (2026-04-08): Stats dashboard v3, debug-gated warnings, git fetch compression, parse tier tracking
 - **2.2.0** (2026-04-06): File, log, infra output compression (12 new parsers), learn fix, rewrite/discover integration
 - **2.1.0** (2026-04-01): Kotlin + Swift, AST-aware git diff, lint/pkg compression, canonical output
 - **2.0.0** (2026-03-28): Context optimization engine — command compression, agent hooks, analytics, MCP server
