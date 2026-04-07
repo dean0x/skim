@@ -39,6 +39,11 @@ struct CacheEntry {
     /// intentionally not returned by [`read_cache`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effective_mode: Option<String>,
+    /// Parse quality tier at transform time: "full", "degraded", or "passthrough".
+    ///
+    /// Old cache entries without this field deserialize with `None` (backward-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parse_tier: Option<String>,
 }
 
 /// Data returned on a successful cache lookup.
@@ -68,6 +73,8 @@ pub(crate) struct CacheWriteParams<'a> {
     pub(crate) trunc: TruncationOptions,
     /// Effective mode after cascade (diagnostic metadata only).
     pub(crate) effective_mode: Option<Mode>,
+    /// Parse quality tier: "full", "degraded", or "passthrough" (diagnostic metadata).
+    pub(crate) parse_tier: Option<String>,
 }
 
 /// Returns the platform-specific cache directory (`~/.cache/skim/` on Linux/macOS),
@@ -178,6 +185,7 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
         original_tokens: params.original_tokens,
         transformed_tokens: params.transformed_tokens,
         effective_mode: params.effective_mode.map(|m| format!("{m:?}")),
+        parse_tier: params.parse_tier.clone(),
     };
 
     let json = serde_json::to_string(&entry)?;
@@ -308,6 +316,7 @@ mod tests {
             transformed_tokens: Some(50),
             trunc: default_trunc,
             effective_mode: None,
+            parse_tier: None,
         })
         .unwrap();
 
@@ -365,6 +374,7 @@ mod tests {
             transformed_tokens: Some(80),
             trunc,
             effective_mode: None,
+            parse_tier: None,
         })
         .unwrap();
 
@@ -409,6 +419,7 @@ mod tests {
             transformed_tokens: Some(60),
             trunc,
             effective_mode: Some(Mode::Signatures),
+            parse_tier: None,
         })
         .unwrap();
 
@@ -457,6 +468,7 @@ mod tests {
             transformed_tokens: None,
             trunc: default_trunc,
             effective_mode: None,
+            parse_tier: None,
         })
         .unwrap();
         let hit = read_cache(&path, Mode::Structure, &default_trunc).unwrap();
