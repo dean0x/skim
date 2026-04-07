@@ -476,6 +476,10 @@ fn main() -> ExitCode {
         analytics::force_disable_analytics();
     }
 
+    // Initialise debug flag from SKIM_DEBUG env var once, before any threads
+    // are spawned. After this call, is_debug_enabled() is a pure atomic load.
+    debug::init_debug_from_env();
+
     // Extract --debug before routing so it applies to all subcommands.
     if std::env::args().any(|a| a == "--debug") {
         debug::force_enable_debug();
