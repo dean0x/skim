@@ -74,18 +74,23 @@ impl FetchCategories {
 
     /// Add an entry to a submodule section in O(1) time.
     fn add_submodule_entry(&mut self, sub: &str, entry: String) {
-        let entries = self.submodule_map.entry(sub.to_string()).or_insert_with(|| {
-            self.submodule_order.push(sub.to_string());
-            Vec::new()
-        });
+        let entries = self
+            .submodule_map
+            .entry(sub.to_string())
+            .or_insert_with(|| {
+                self.submodule_order.push(sub.to_string());
+                Vec::new()
+            });
         entries.push(entry);
     }
 
     /// Iterate submodule sections in the order they were first encountered.
     fn submodule_sections(&self) -> impl Iterator<Item = (&str, &[String])> {
-        self.submodule_order
-            .iter()
-            .filter_map(|name| self.submodule_map.get(name).map(|v| (name.as_str(), v.as_slice())))
+        self.submodule_order.iter().filter_map(|name| {
+            self.submodule_map
+                .get(name)
+                .map(|v| (name.as_str(), v.as_slice()))
+        })
     }
 }
 
@@ -104,9 +109,7 @@ fn classify_lines<'a>(lines: impl Iterator<Item = &'a str>) -> FetchCategories {
 
     for trimmed in lines.map(str::trim) {
         // Skip progress/noise lines
-        if trimmed.starts_with("remote:")
-            || trimmed.starts_with("Unpacking")
-            || trimmed.is_empty()
+        if trimmed.starts_with("remote:") || trimmed.starts_with("Unpacking") || trimmed.is_empty()
         {
             continue;
         }
@@ -239,7 +242,11 @@ fn parse_fetch(input: &str) -> GitResult {
         parts.push(format!(
             "{} new branch{}",
             cats.new_branches.len(),
-            if cats.new_branches.len() == 1 { "" } else { "es" }
+            if cats.new_branches.len() == 1 {
+                ""
+            } else {
+                "es"
+            }
         ));
     }
     if !cats.new_tags.is_empty() {

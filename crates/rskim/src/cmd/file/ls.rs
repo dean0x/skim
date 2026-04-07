@@ -104,7 +104,10 @@ fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
     }
 
     if let Some(result) = try_parse_ls_plain(&output.stdout) {
-        return ParseResult::Degraded(result, vec!["ls: structured parse failed, using plain text".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["ls: structured parse failed, using plain text".to_string()],
+        );
     }
 
     ParseResult::Passthrough(output.stdout.clone())
