@@ -193,15 +193,9 @@ fn format_tokens(n: u64) -> String {
 
 /// Apply the standard efficiency color to a pre-formatted string.
 ///
-/// Green for >=70%, yellow for >=40%, red below 40%.
-fn apply_efficiency_color(s: String, pct: f64) -> ColoredString {
-    if pct >= 70.0 {
-        s.green()
-    } else if pct >= 40.0 {
-        s.yellow()
-    } else {
-        s.red()
-    }
+/// All values render green — a single unified color for a cleaner visual.
+fn apply_efficiency_color(s: String, _pct: f64) -> ColoredString {
+    s.green()
 }
 
 /// Colorise a savings percentage with ANSI codes.
@@ -428,7 +422,8 @@ fn run_dashboard(
     // ── Daily Trend ──────────────────────────────────────────────────────────
     let daily = db.query_daily(since)?;
     if !daily.is_empty() {
-        writeln!(w, "{}", section_header("Daily Trend"))?;
+        writeln!(w, "{}", section_header("Daily Trend (tokens saved)"))?;
+        writeln!(w)?;
         let sparkline = render_sparkline(&daily);
         if !sparkline.is_empty() {
             // Sort ascending for display labels
@@ -535,11 +530,7 @@ fn run_dashboard(
                 "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
                 price_tier.tier_name, price_tier.input_cost_per_mtok, savings
             );
-            if price_tier.tier_name == pricing.tier_name {
-                writeln!(w, "{}", line.green().bold())?;
-            } else {
-                writeln!(w, "{}", line)?;
-            }
+            writeln!(w, "{}", line)?;
         }
 
         // Show custom tier row if env var was used
@@ -549,7 +540,7 @@ fn run_dashboard(
                 "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
                 pricing.tier_name, pricing.input_cost_per_mtok, savings
             );
-            writeln!(w, "{}", line.green().bold())?;
+            writeln!(w, "{}", line)?;
         }
 
         writeln!(w)?;
@@ -968,8 +959,18 @@ mod tests {
         };
         let output = capture(|w| run_dashboard(w, &store, None, false, None));
         assert!(
-            output.contains("Daily Trend"),
-            "dashboard should show daily trend section"
+            output.contains("Daily Trend (tokens saved)"),
+            "dashboard should show daily trend section with subtitle"
+        );
+    }
+
+    #[test]
+    fn test_daily_trend_subtitle() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            output.contains("tokens saved"),
+            "daily trend header should include 'tokens saved' subtitle"
         );
     }
 
