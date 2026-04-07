@@ -21,8 +21,10 @@
 //! `~/.cache/skim/search/<repo-hash>/temporal.db`, alongside the lexical
 //! index files.
 
+pub mod cochange;
 pub mod git_parser;
 pub mod types;
 
+pub use cochange::build_cochange_matrix;
 pub use git_parser::parse_history;
 pub use types::{CochangeEntry, CommitInfo, HotspotScore, RiskScore, TemporalFileId};
