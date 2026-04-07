@@ -63,6 +63,18 @@ pub(crate) fn is_known_subcommand(name: &str) -> bool {
 // Shared helpers for subcommand parsers
 // ============================================================================
 
+/// Determine whether to read from stdin vs execute the command.
+///
+/// Returns `true` only when BOTH conditions hold:
+/// 1. stdin is not a terminal (data may be piped), AND
+/// 2. no user args were provided (bare `skim <subcmd>` invocation)
+///
+/// This prevents empty-stdin issues in agent/CI environments where
+/// stdin is a pipe with no data but args indicate a command should run.
+pub(crate) fn should_use_stdin(args: &[String]) -> bool {
+    !io::stdin().is_terminal() && args.is_empty()
+}
+
 /// Check whether the user-supplied args already contain any of the given flags.
 ///
 /// Accepts multiple flag prefixes (e.g., `&["--color", "-c"]`) for checking
@@ -433,5 +445,30 @@ mod tests {
         let long_input = "a".repeat(100);
         let sanitized = sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
+    }
+}
+
+#[cfg(test)]
+mod stdin_detection_tests {
+    use super::should_use_stdin;
+
+    #[test]
+    fn with_args_never_reads_stdin() {
+        let args = vec!["run".to_string(), "test.ts".to_string()];
+        assert!(!should_use_stdin(&args), "args present → run command, never stdin");
+    }
+
+    #[test]
+    fn with_single_arg_never_reads_stdin() {
+        let args = vec!["--help".to_string()];
+        assert!(!should_use_stdin(&args), "single arg → run command");
+    }
+
+    #[test]
+    fn empty_args_in_pipe_reads_stdin() {
+        // When running under `cargo test`, stdin is a pipe (not a terminal),
+        // so empty args triggers the stdin path — this is the correct behavior.
+        let args: Vec<String> = vec![];
+        assert!(should_use_stdin(&args), "no args + pipe → read stdin");
     }
 }

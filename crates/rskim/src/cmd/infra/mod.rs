@@ -8,7 +8,6 @@ pub(crate) mod curl;
 pub(crate) mod gh;
 pub(crate) mod wget;
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
@@ -106,7 +105,7 @@ pub(crate) fn run_infra_tool(
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let use_stdin = crate::cmd::should_use_stdin(args);
     let output_format = if json_output {
         OutputFormat::Json
     } else {

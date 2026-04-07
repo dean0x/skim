@@ -8,7 +8,6 @@ pub(crate) mod grep;
 pub(crate) mod ls;
 pub(crate) mod rg;
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use std::collections::BTreeMap;
@@ -114,7 +113,7 @@ pub(crate) fn run_file_tool(
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let use_stdin = crate::cmd::should_use_stdin(args);
     let output_format = if json_output {
         OutputFormat::Json
     } else {

@@ -8,7 +8,6 @@ mod npm;
 mod pip;
 mod pnpm;
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use crate::output::ParseResult;
@@ -89,7 +88,7 @@ where
     cmd_args.extend(user_args.iter().cloned());
     inject_flags(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && user_args.is_empty();
+    let use_stdin = crate::cmd::should_use_stdin(user_args);
 
     crate::cmd::run_parsed_command_with_mode(
         crate::cmd::ParsedCommandConfig {

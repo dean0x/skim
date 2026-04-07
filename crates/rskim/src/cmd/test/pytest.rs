@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -35,11 +35,12 @@ use crate::runner::{CommandOutput, CommandRunner};
 
 /// Run pytest and parse its output, or parse piped stdin.
 ///
-/// Detection logic:
-/// - If stdin is a terminal → run pytest (execution mode)
-/// - If stdin is not a terminal → attempt to read stdin; if empty, fall back
-///   to running pytest (handles test harness environments where stdin is a
-///   pipe with no data)
+/// Detection logic (via [`crate::cmd::should_use_stdin`]):
+/// - If args are present → always run pytest (execution mode)
+/// - If no args and stdin is piped → read stdin (pipe mode)
+///
+/// This prevents empty-stdin issues in agent/CI environments where stdin is
+/// a pipe with no data but user args indicate a command should run.
 pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     // Intercept --help/-h: show skim's pytest help, then forward to real pytest
     // so the user sees both skim's flags and pytest's own options.
@@ -47,22 +48,12 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
         print_pytest_help();
     }
 
-    let output = if io::stdin().is_terminal() {
-        // Terminal: always run pytest
+    let output = if crate::cmd::should_use_stdin(args) {
+        read_stdin()?
+    } else {
         let final_args = build_args(args);
         let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
         run_pytest(&arg_refs)?
-    } else {
-        // Pipe: read stdin, fall back to execution if empty
-        let stdin_output = read_stdin()?;
-        if stdin_output.stdout.trim().is_empty() {
-            // Empty pipe (e.g., test harness) — run pytest instead
-            let final_args = build_args(args);
-            let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-            run_pytest(&arg_refs)?
-        } else {
-            stdin_output
-        }
     };
 
     let combined = combine_output(&output);

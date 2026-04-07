@@ -9,7 +9,7 @@
 //!   parsing fails.
 //! - **Tier 3 (passthrough)**: Returns raw output unchanged when nothing parses.
 
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -30,7 +30,7 @@ use crate::runner::CommandRunner;
 /// stdin is not piped and we need to spawn the process directly.
 pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
-    let raw_output = if stdin_has_data() {
+    let raw_output = if crate::cmd::should_use_stdin(args) {
         read_stdin()?
     } else {
         run_vitest(program, args)?
@@ -86,11 +86,6 @@ pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::R
 // ============================================================================
 // Command execution
 // ============================================================================
-
-/// Check whether stdin has piped data (not a terminal).
-fn stdin_has_data() -> bool {
-    !io::stdin().is_terminal()
-}
 
 /// Maximum bytes we will read from stdin (64 MiB).
 ///
@@ -721,6 +716,18 @@ Duration: 1.5s";
             "expected Passthrough, got {}",
             result.tier_name()
         );
+    }
+
+    #[test]
+    fn test_empty_input_produces_passthrough() {
+        let result = parse("");
+        assert!(result.is_passthrough(), "empty input should be Passthrough");
+    }
+
+    #[test]
+    fn test_whitespace_only_input_produces_passthrough() {
+        let result = parse("   \n\n  ");
+        assert!(result.is_passthrough(), "whitespace-only should be Passthrough");
     }
 
     // ========================================================================

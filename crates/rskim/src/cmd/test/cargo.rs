@@ -15,7 +15,6 @@
 //! compatibility when libtest stabilizes the JSON format.
 
 use std::collections::HashSet;
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -63,7 +62,7 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     // 2. no user args were provided (bare `skim test cargo` with piped data)
     // This prevents empty-stdin issues when test frameworks (e.g., assert_cmd)
     // pipe stdin without providing data.
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let use_stdin = crate::cmd::should_use_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
