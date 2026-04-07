@@ -1,0 +1,3 @@
+From github.com:user/repo
+ + ccc3333...ddd4444 feature/z  -> origin/feature/z  (forced update)
+   abc1234..def5678  main       -> origin/main
