@@ -41,13 +41,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_debug_disabled_by_default() {
-        // Don't call force_enable_debug; env var not set in normal test runs.
-        // Just verify the function exists and returns a bool.
-        let _ = is_debug_enabled();
-    }
-
-    #[test]
     fn test_force_enable_debug() {
         force_enable_debug();
         assert!(is_debug_enabled());

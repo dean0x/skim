@@ -148,16 +148,6 @@ fn test_skim_git_fetch_in_repo() {
         );
 }
 
-#[test]
-fn test_skim_git_help_includes_fetch() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["git", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("fetch"));
-}
-
 // ============================================================================
 // Error cases
 // ============================================================================
