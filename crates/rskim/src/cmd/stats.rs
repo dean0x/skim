@@ -151,6 +151,9 @@ fn run_json(
     if show_cost {
         let pricing = PricingModel::from_env_or_default();
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
+        // INTENTIONAL API CHANGE (stats dashboard v3 refactor): the `cost_estimate`
+        // object uses `tier` (e.g. "Standard") rather than the previous `model` key
+        // (e.g. "claude-sonnet-4-6").  Downstream consumers must update accordingly.
         root["cost_estimate"] = serde_json::json!({
             "tier": pricing.tier_name,
             "input_cost_per_mtok": pricing.input_cost_per_mtok,
@@ -356,7 +359,160 @@ fn command_label(stored: &str) -> &'static str {
 }
 
 // ============================================================================
-// Terminal dashboard
+// Terminal dashboard — section renderers
+// ============================================================================
+
+fn render_header(w: &mut dyn Write, period: &str) -> anyhow::Result<()> {
+    let border = "\u{2550}".repeat(78);
+    writeln!(w, "{}", border.bold())?;
+    writeln!(w, "{}", format!("  skim Token Analytics ({period})").bold())?;
+    writeln!(w, "{}", border.bold())?;
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_summary(w: &mut dyn Write, summary: &crate::analytics::AnalyticsSummary) -> anyhow::Result<()> {
+    writeln!(w, "{}", section_header("Summary"))?;
+    writeln!(w, "  Invocations:    {}", tokens::format_number(summary.invocations as usize))?;
+    writeln!(w, "  Raw tokens:     {}", tokens::format_number(summary.raw_tokens as usize))?;
+    writeln!(w, "  Compressed:     {}", tokens::format_number(summary.compressed_tokens as usize))?;
+    writeln!(w, "  Tokens saved:   {}", tokens::format_number(summary.tokens_saved as usize).green())?;
+    writeln!(w, "  Avg reduction:  {}", color_pct(summary.avg_savings_pct))?;
+    writeln!(w, "  {}", render_bar(summary.avg_savings_pct, 20))?;
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_daily_trend(w: &mut dyn Write, daily: &[crate::analytics::DailyStats]) -> anyhow::Result<()> {
+    if daily.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("Daily Trend (tokens saved)"))?;
+    writeln!(w)?;
+    let sparkline = render_sparkline(daily);
+    if !sparkline.is_empty() {
+        let first = daily.iter().map(|d| d.date.as_str()).min().unwrap_or("");
+        let last = daily.iter().map(|d| d.date.as_str()).max().unwrap_or("");
+        writeln!(w, "  {sparkline}")?;
+        writeln!(w, "  {} to {}", first.dimmed(), last.dimmed())?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_by_command(w: &mut dyn Write, by_command: &[crate::analytics::CommandStats]) -> anyhow::Result<()> {
+    if by_command.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("By Command"))?;
+    for cmd in by_command {
+        writeln!(
+            w,
+            "  {:<width$} {:>col_count$} calls  {:>col_saved$} saved  {}  {}",
+            command_label(&cmd.command_type),
+            tokens::format_number(cmd.invocations as usize),
+            format_tokens(cmd.tokens_saved),
+            color_pct(cmd.avg_savings_pct),
+            render_bar(cmd.avg_savings_pct, BAR_WIDTH),
+            width = COL_NAME,
+            col_count = COL_COUNT,
+            col_saved = COL_SAVED,
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_by_language(w: &mut dyn Write, by_language: &[crate::analytics::LanguageStats]) -> anyhow::Result<()> {
+    if by_language.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("By Language"))?;
+    for lang in by_language {
+        writeln!(
+            w,
+            "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
+            lang.language,
+            tokens::format_number(lang.files as usize),
+            format_tokens(lang.tokens_saved),
+            color_pct(lang.avg_savings_pct),
+            render_bar(lang.avg_savings_pct, BAR_WIDTH),
+            width = COL_NAME,
+            col_count = COL_COUNT,
+            col_saved = COL_SAVED,
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_by_mode(w: &mut dyn Write, by_mode: &[crate::analytics::ModeStats]) -> anyhow::Result<()> {
+    if by_mode.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("By Mode"))?;
+    for mode in by_mode {
+        writeln!(
+            w,
+            "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
+            mode.mode,
+            tokens::format_number(mode.files as usize),
+            format_tokens(mode.tokens_saved),
+            color_pct(mode.avg_savings_pct),
+            render_bar(mode.avg_savings_pct, BAR_WIDTH),
+            width = COL_NAME,
+            col_count = COL_COUNT,
+            col_saved = COL_SAVED,
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_parse_quality(w: &mut dyn Write, tier_dist: &crate::analytics::TierDistribution) -> anyhow::Result<()> {
+    writeln!(w, "{}", section_header("Parse Quality"))?;
+    if tier_dist.full_pct > 0.0 || tier_dist.degraded_pct > 0.0 || tier_dist.passthrough_pct > 0.0 {
+        writeln!(w, "  Full:        {:.1}%", tier_dist.full_pct)?;
+        writeln!(w, "  Degraded:    {:.1}%", tier_dist.degraded_pct)?;
+        writeln!(w, "  Passthrough: {:.1}%", tier_dist.passthrough_pct)?;
+    } else {
+        writeln!(w, "  No tier data recorded yet.")?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_cost_section(w: &mut dyn Write, tokens_saved: u64) -> anyhow::Result<()> {
+    let pricing = PricingModel::from_env_or_default();
+    writeln!(w, "{}", section_header("Cost Estimates"))?;
+    writeln!(w, "  Rate:      ${:.2}/MTok ({})", pricing.input_cost_per_mtok, pricing.tier_name)?;
+    writeln!(w)?;
+
+    for price_tier in PricingModel::all_tiers() {
+        let savings = price_tier.estimate_savings(tokens_saved);
+        writeln!(
+            w,
+            "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
+            price_tier.tier_name, price_tier.input_cost_per_mtok, savings
+        )?;
+    }
+
+    // Show custom tier row if env var was used
+    if pricing.tier_name == "Custom" {
+        let savings = pricing.estimate_savings(tokens_saved);
+        writeln!(
+            w,
+            "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
+            pricing.tier_name, pricing.input_cost_per_mtok, savings
+        )?;
+    }
+
+    writeln!(w)?;
+    Ok(())
+}
+
+// ============================================================================
+// Terminal dashboard — orchestrator
 // ============================================================================
 
 fn run_dashboard(
@@ -371,180 +527,22 @@ fn run_dashboard(
     if summary.invocations == 0 {
         writeln!(w, "{}", "No analytics data found.".dimmed())?;
         writeln!(w)?;
-        writeln!(
-            w,
-            "Run skim commands to start collecting token savings data."
-        )?;
+        writeln!(w, "Run skim commands to start collecting token savings data.")?;
         writeln!(w, "Example: skim src/main.rs")?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    // ── Header ──────────────────────────────────────────────────────────────
     let period = since_str.map_or("all time".to_string(), |s| format!("last {s}"));
-    let border = "\u{2550}".repeat(78);
-    writeln!(w, "{}", border.bold())?;
-    writeln!(
-        w,
-        "{}",
-        format!("  skim Token Analytics ({period})").bold()
-    )?;
-    writeln!(w, "{}", border.bold())?;
-    writeln!(w)?;
+    render_header(w, &period)?;
+    render_summary(w, &summary)?;
+    render_daily_trend(w, &db.query_daily(since)?)?;
+    render_by_command(w, &db.query_by_command(since)?)?;
+    render_by_language(w, &db.query_by_language(since)?)?;
+    render_by_mode(w, &db.query_by_mode(since)?)?;
+    render_parse_quality(w, &db.query_tier_distribution(since)?)?;
 
-    // ── Summary ─────────────────────────────────────────────────────────────
-    writeln!(w, "{}", section_header("Summary"))?;
-    writeln!(
-        w,
-        "  Invocations:    {}",
-        tokens::format_number(summary.invocations as usize)
-    )?;
-    writeln!(
-        w,
-        "  Raw tokens:     {}",
-        tokens::format_number(summary.raw_tokens as usize)
-    )?;
-    writeln!(
-        w,
-        "  Compressed:     {}",
-        tokens::format_number(summary.compressed_tokens as usize)
-    )?;
-    writeln!(
-        w,
-        "  Tokens saved:   {}",
-        tokens::format_number(summary.tokens_saved as usize).green()
-    )?;
-    writeln!(
-        w,
-        "  Avg reduction:  {}",
-        color_pct(summary.avg_savings_pct)
-    )?;
-
-    // Efficiency meter
-    writeln!(w, "  {}", render_bar(summary.avg_savings_pct, 20))?;
-    writeln!(w)?;
-
-    // ── Daily Trend ──────────────────────────────────────────────────────────
-    let daily = db.query_daily(since)?;
-    if !daily.is_empty() {
-        writeln!(w, "{}", section_header("Daily Trend (tokens saved)"))?;
-        writeln!(w)?;
-        let sparkline = render_sparkline(&daily);
-        if !sparkline.is_empty() {
-            let first = daily.iter().map(|d| d.date.as_str()).min().unwrap_or("");
-            let last = daily.iter().map(|d| d.date.as_str()).max().unwrap_or("");
-            writeln!(w, "  {sparkline}")?;
-            writeln!(w, "  {} to {}", first.dimmed(), last.dimmed())?;
-        }
-        writeln!(w)?;
-    }
-
-    // ── By Command ───────────────────────────────────────────────────────────
-    let by_command = db.query_by_command(since)?;
-    if !by_command.is_empty() {
-        writeln!(w, "{}", section_header("By Command"))?;
-        for cmd in &by_command {
-            writeln!(
-                w,
-                "  {:<width$} {:>col_count$} calls  {:>col_saved$} saved  {}  {}",
-                command_label(&cmd.command_type),
-                tokens::format_number(cmd.invocations as usize),
-                format_tokens(cmd.tokens_saved),
-                color_pct(cmd.avg_savings_pct),
-                render_bar(cmd.avg_savings_pct, BAR_WIDTH),
-                width = COL_NAME,
-                col_count = COL_COUNT,
-                col_saved = COL_SAVED,
-            )?;
-        }
-        writeln!(w)?;
-    }
-
-    // ── By Language ──────────────────────────────────────────────────────────
-    let by_language = db.query_by_language(since)?;
-    if !by_language.is_empty() {
-        writeln!(w, "{}", section_header("By Language"))?;
-        for lang in &by_language {
-            writeln!(
-                w,
-                "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
-                lang.language,
-                tokens::format_number(lang.files as usize),
-                format_tokens(lang.tokens_saved),
-                color_pct(lang.avg_savings_pct),
-                render_bar(lang.avg_savings_pct, BAR_WIDTH),
-                width = COL_NAME,
-                col_count = COL_COUNT,
-                col_saved = COL_SAVED,
-            )?;
-        }
-        writeln!(w)?;
-    }
-
-    // ── By Mode ───────────────────────────────────────────────────────────────
-    let by_mode = db.query_by_mode(since)?;
-    if !by_mode.is_empty() {
-        writeln!(w, "{}", section_header("By Mode"))?;
-        for mode in &by_mode {
-            writeln!(
-                w,
-                "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
-                mode.mode,
-                tokens::format_number(mode.files as usize),
-                format_tokens(mode.tokens_saved),
-                color_pct(mode.avg_savings_pct),
-                render_bar(mode.avg_savings_pct, BAR_WIDTH),
-                width = COL_NAME,
-                col_count = COL_COUNT,
-                col_saved = COL_SAVED,
-            )?;
-        }
-        writeln!(w)?;
-    }
-
-    // ── Parse Quality ─────────────────────────────────────────────────────────
-    let tier_dist = db.query_tier_distribution(since)?;
-    writeln!(w, "{}", section_header("Parse Quality"))?;
-    if tier_dist.full_pct > 0.0 || tier_dist.degraded_pct > 0.0 || tier_dist.passthrough_pct > 0.0
-    {
-        writeln!(w, "  Full:        {:.1}%", tier_dist.full_pct)?;
-        writeln!(w, "  Degraded:    {:.1}%", tier_dist.degraded_pct)?;
-        writeln!(w, "  Passthrough: {:.1}%", tier_dist.passthrough_pct)?;
-    } else {
-        writeln!(w, "  No tier data recorded yet.")?;
-    }
-    writeln!(w)?;
-
-    // ── Cost Estimates ────────────────────────────────────────────────────────
     if show_cost {
-        let pricing = PricingModel::from_env_or_default();
-        writeln!(w, "{}", section_header("Cost Estimates"))?;
-        writeln!(
-            w,
-            "  Rate:      ${:.2}/MTok ({})",
-            pricing.input_cost_per_mtok, pricing.tier_name
-        )?;
-        writeln!(w)?;
-
-        for price_tier in PricingModel::all_tiers() {
-            let savings = price_tier.estimate_savings(summary.tokens_saved);
-            let line = format!(
-                "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
-                price_tier.tier_name, price_tier.input_cost_per_mtok, savings
-            );
-            writeln!(w, "{}", line)?;
-        }
-
-        // Show custom tier row if env var was used
-        if pricing.tier_name == "Custom" {
-            let savings = pricing.estimate_savings(summary.tokens_saved);
-            let line = format!(
-                "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
-                pricing.tier_name, pricing.input_cost_per_mtok, savings
-            );
-            writeln!(w, "{}", line)?;
-        }
-
-        writeln!(w)?;
+        render_cost_section(w, summary.tokens_saved)?;
     }
 
     Ok(ExitCode::SUCCESS)

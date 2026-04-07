@@ -514,13 +514,36 @@ impl AnalyticsDb {
     /// Delete records where compressed_tokens > raw_tokens (invalid data from
     /// pre-fix versions that did not clamp at recording time).
     ///
-    /// This is a one-time self-healing operation: call it once at startup to
-    /// purge any corrupt rows so they never appear in dashboard queries.
+    /// Gated behind an `analytics_meta` sentinel key `invalid_records_cleaned`
+    /// so the DELETE only runs once, not on every `skim stats` invocation.
+    /// After cleaning, the sentinel is written so subsequent calls are no-ops.
     pub(crate) fn clean_invalid_records(&self) -> anyhow::Result<usize> {
+        // Check sentinel — if already cleaned, skip the full table scan.
+        let already_cleaned: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM analytics_meta WHERE key = 'invalid_records_cleaned'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        if already_cleaned {
+            return Ok(0);
+        }
+
         let count = self.conn.execute(
             "DELETE FROM token_savings WHERE compressed_tokens > raw_tokens",
             [],
         )?;
+
+        // Write sentinel so this never runs again.
+        let _ = self.conn.execute(
+            "INSERT OR REPLACE INTO analytics_meta (key, value) VALUES ('invalid_records_cleaned', 1)",
+            [],
+        );
+
         Ok(count)
     }
 }
