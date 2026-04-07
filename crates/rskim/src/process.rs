@@ -8,8 +8,8 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
 use rskim_core::{
-    detect_language_from_path, transform_auto_with_config, transform_with_config, Language, Mode,
-    TransformConfig,
+    detect_language_from_path, transform_auto_with_config, transform_with_config,
+    transform_with_quality, Language, Mode, TransformConfig,
 };
 
 use crate::{cache, cascade, cascade::TruncationOptions, tokens};
@@ -44,6 +44,29 @@ pub(crate) struct ProcessResult {
     pub(crate) transformed_tokens: Option<usize>,
     /// Whether the output guardrail was triggered (compressed > raw)
     pub(crate) guardrail_triggered: bool,
+    /// Parse quality tier: "full", "degraded", or "passthrough".
+    ///
+    /// - "passthrough" — Mode::Full, no transformation applied
+    /// - "degraded"    — tree-sitter reported syntax errors
+    /// - "full"        — clean parse, no errors
+    ///
+    /// `None` for cache hits (tier was not recorded at write time).
+    pub(crate) parse_tier: Option<&'static str>,
+}
+
+/// Determine the parse quality tier from the mode and whether the parser reported errors.
+///
+/// - "passthrough" — Mode::Full; no transformation was applied
+/// - "degraded"    — tree-sitter reported syntax errors
+/// - "full"        — clean parse, no syntax errors
+pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool) -> &'static str {
+    if mode == Mode::Full {
+        "passthrough"
+    } else if has_errors {
+        "degraded"
+    } else {
+        "full"
+    }
 }
 
 /// Count tokens for both original and transformed text, returning `(None, None)` on failure.
@@ -128,6 +151,7 @@ fn try_cached_result(
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered: false,
+        parse_tier: None, // tier was not recorded at cache-write time
     }))
 }
 
@@ -146,12 +170,17 @@ fn read_and_validate(path: &Path) -> anyhow::Result<String> {
 }
 
 /// Transform file contents, trying auto-detection first and falling back to
-/// `explicit_lang` when provided. Returns `(transformed_output, mode_used)`.
+/// `explicit_lang` when provided.
+///
+/// Returns `(transformed_output, mode_used, has_errors)` where `has_errors`
+/// reflects whether the parser encountered syntax errors. For cascade paths
+/// (token_budget is set) `has_errors` is always `false` because the cascade
+/// does not have access to per-mode quality signals.
 fn run_transform(
     contents: &str,
     path: &Path,
     options: &ProcessOptions,
-) -> anyhow::Result<(String, Mode)> {
+) -> anyhow::Result<(String, Mode, bool)> {
     let explicit_lang = options.explicit_lang;
     let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
         // Try auto-detection first; fall back to explicit language if provided.
@@ -177,20 +206,32 @@ fn run_transform(
                     Language::TypeScript
                 });
 
-            cascade::cascade_for_token_budget(
+            let (output, mode) = cascade::cascade_for_token_budget(
                 options.mode,
                 &options.trunc,
                 budget,
                 language,
                 transform_file,
-            )
+            )?;
+            // Cascade selects the best-fitting mode; has_errors is not tracked
+            // per-mode during cascade (mode escalation already handles degraded output).
+            Ok((output, mode, false))
         }
         None => {
+            let language = explicit_lang.or_else(|| detect_language_from_path(path));
             let config = cascade::build_config(options.mode, &options.trunc);
-            let output = transform_file(&config)?.ok_or_else(|| {
-                anyhow::anyhow!("Language detection failed and no --language specified")
-            })?;
-            Ok((output, options.mode))
+
+            // Use transform_with_quality when we can identify the language to get has_errors.
+            if let Some(lang) = language {
+                let (output, has_errors) = transform_with_quality(contents, lang, &config)?;
+                Ok((output, options.mode, has_errors))
+            } else {
+                // Language detection failed — try auto-detect via path extension.
+                let output = transform_file(&config)?.ok_or_else(|| {
+                    anyhow::anyhow!("Language detection failed and no --language specified")
+                })?;
+                Ok((output, options.mode, false))
+            }
         }
     }
 }
@@ -238,7 +279,7 @@ pub(crate) fn process_stdin(
         }
     })?;
 
-    let transformed = match options.trunc.token_budget {
+    let (transformed, stdin_has_errors) = match options.trunc.token_budget {
         Some(budget) => {
             let (output, _mode) = cascade::cascade_for_token_budget(
                 options.mode,
@@ -247,13 +288,18 @@ pub(crate) fn process_stdin(
                 language,
                 |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
             )?;
-            output
+            // Cascade path does not track per-mode has_errors (mode escalation handles it).
+            (output, false)
         }
         None => {
             let config = cascade::build_config(options.mode, &options.trunc);
-            transform_with_config(&buffer, language, &config)?
+            let (output, has_errors) = transform_with_quality(&buffer, language, &config)?;
+            (output, has_errors)
         }
     };
+
+    // Determine parse quality tier before guardrail.
+    let parse_tier = Some(parse_tier_from(options.mode, stdin_has_errors));
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Same protection as process_file; token counting happens after so stats reflect
@@ -280,6 +326,7 @@ pub(crate) fn process_stdin(
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
+        parse_tier,
     })
 }
 
@@ -290,7 +337,11 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     }
 
     let contents = read_and_validate(path)?;
-    let (result, mode_used) = run_transform(&contents, path, &options)?;
+    let (result, mode_used, has_errors) = run_transform(&contents, path, &options)?;
+
+    // Determine parse quality tier before guardrail (guardrail may swap output,
+    // but the parse tier reflects the transformation, not the final selection).
+    let parse_tier = Some(parse_tier_from(options.mode, has_errors));
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Token counting happens AFTER this decision so stats reflect the final output.
@@ -323,6 +374,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             transformed_tokens: trans_tokens,
             trunc: options.trunc,
             effective_mode,
+            parse_tier: parse_tier.map(str::to_string),
         });
     }
 
@@ -331,6 +383,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
+        parse_tier,
     })
 }
 
@@ -396,20 +449,26 @@ mod tests {
     }
 
     // ========================================================================
-    // ProcessResult #[must_use] compile-time guard
+    // parse_tier_from tests (B4-B5)
     // ========================================================================
 
     #[test]
-    fn process_result_fields_accessible() {
-        let result = ProcessResult {
-            output: "test".to_string(),
-            original_tokens: Some(10),
-            transformed_tokens: Some(5),
-            guardrail_triggered: false,
-        };
-        assert_eq!(result.output, "test");
-        assert_eq!(result.original_tokens, Some(10));
-        assert_eq!(result.transformed_tokens, Some(5));
-        assert!(!result.guardrail_triggered);
+    fn test_parse_tier_passthrough() {
+        assert_eq!(parse_tier_from(Mode::Full, false), "passthrough");
+        assert_eq!(parse_tier_from(Mode::Full, true), "passthrough");
+    }
+
+    #[test]
+    fn test_parse_tier_degraded() {
+        assert_eq!(parse_tier_from(Mode::Structure, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Signatures, true), "degraded");
+        assert_eq!(parse_tier_from(Mode::Minimal, true), "degraded");
+    }
+
+    #[test]
+    fn test_parse_tier_full() {
+        assert_eq!(parse_tier_from(Mode::Structure, false), "full");
+        assert_eq!(parse_tier_from(Mode::Signatures, false), "full");
+        assert_eq!(parse_tier_from(Mode::Types, false), "full");
     }
 }

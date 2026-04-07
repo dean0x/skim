@@ -134,18 +134,32 @@ pub(crate) struct TierDistribution {
 // Pricing
 // ============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PricingModel {
     pub(crate) input_cost_per_mtok: f64,
-    pub(crate) model_name: &'static str,
+    pub(crate) tier_name: &'static str,
 }
 
 impl PricingModel {
+    pub(crate) const ECONOMY: Self = Self {
+        input_cost_per_mtok: 1.0,
+        tier_name: "Economy",
+    };
+    pub(crate) const STANDARD: Self = Self {
+        input_cost_per_mtok: 3.0,
+        tier_name: "Standard",
+    };
+    pub(crate) const PREMIUM: Self = Self {
+        input_cost_per_mtok: 15.0,
+        tier_name: "Premium",
+    };
+
+    pub(crate) fn all_tiers() -> [Self; 3] {
+        [Self::ECONOMY, Self::STANDARD, Self::PREMIUM]
+    }
+
     pub(crate) fn default_pricing() -> Self {
-        Self {
-            input_cost_per_mtok: 3.0,
-            model_name: "claude-sonnet-4-6",
-        }
+        Self::STANDARD
     }
 
     pub(crate) fn from_env_or_default() -> Self {
@@ -154,7 +168,7 @@ impl PricingModel {
                 if cost.is_finite() && cost >= 0.0 {
                     return Self {
                         input_cost_per_mtok: cost,
-                        model_name: "custom",
+                        tier_name: "Custom",
                     };
                 }
             }
@@ -211,14 +225,42 @@ pub(crate) fn is_analytics_enabled() -> bool {
 ///
 /// `AnalyticsDb` implements this trait directly. Test code can provide a
 /// `MockStore` without requiring a real SQLite database.
+///
+/// All query methods have default implementations returning empty/zero values
+/// so test mocks only need to override the methods relevant to the behaviour
+/// under test.
 pub(crate) trait AnalyticsStore {
-    fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary>;
-    fn query_daily(&self, since: Option<i64>) -> anyhow::Result<Vec<DailyStats>>;
-    fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>>;
-    fn query_by_language(&self, since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>>;
-    fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>>;
-    fn query_tier_distribution(&self, since: Option<i64>) -> anyhow::Result<TierDistribution>;
-    fn clear(&self) -> anyhow::Result<()>;
+    fn query_summary(&self, _since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
+        Ok(AnalyticsSummary {
+            invocations: 0,
+            raw_tokens: 0,
+            compressed_tokens: 0,
+            tokens_saved: 0,
+            avg_savings_pct: 0.0,
+        })
+    }
+    fn query_daily(&self, _since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
+        Ok(vec![])
+    }
+    fn query_by_command(&self, _since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
+        Ok(vec![])
+    }
+    fn query_by_language(&self, _since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>> {
+        Ok(vec![])
+    }
+    fn query_by_mode(&self, _since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
+        Ok(vec![])
+    }
+    fn query_tier_distribution(&self, _since: Option<i64>) -> anyhow::Result<TierDistribution> {
+        Ok(TierDistribution {
+            full_pct: 0.0,
+            degraded_pct: 0.0,
+            passthrough_pct: 0.0,
+        })
+    }
+    fn clear(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -275,7 +317,13 @@ impl AnalyticsDb {
     /// before storage to bound database row size.
     pub(crate) fn record(&self, r: &TokenSavingsRecord) -> anyhow::Result<()> {
         let cmd = if r.original_cmd.len() > Self::MAX_CMD_LEN {
-            &r.original_cmd[..Self::MAX_CMD_LEN]
+            // Walk back from MAX_CMD_LEN to the nearest valid UTF-8 character
+            // boundary so we never slice through a multi-byte character.
+            let mut end = Self::MAX_CMD_LEN;
+            while !r.original_cmd.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            &r.original_cmd[..end]
         } else {
             &r.original_cmd
         };
@@ -333,7 +381,7 @@ impl AnalyticsDb {
             Ok(DailyStats {
                 date: row.get(0)?,
                 invocations: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -351,7 +399,7 @@ impl AnalyticsDb {
             Ok(CommandStats {
                 command_type: row.get(0)?,
                 invocations: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -372,7 +420,7 @@ impl AnalyticsDb {
             Ok(LanguageStats {
                 language: row.get(0)?,
                 files: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -390,7 +438,7 @@ impl AnalyticsDb {
             Ok(ModeStats {
                 mode: row.get(0)?,
                 files: row.get(1)?,
-                tokens_saved: row.get::<_, i64>(2)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
             })
         })?;
@@ -463,10 +511,40 @@ impl AnalyticsDb {
         }
     }
 
-    /// Delete all analytics data.
-    fn clear_data(&self) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM token_savings", [])?;
-        Ok(())
+    /// Delete records where compressed_tokens > raw_tokens (invalid data from
+    /// pre-fix versions that did not clamp at recording time).
+    ///
+    /// Gated behind an `analytics_meta` sentinel key `invalid_records_cleaned`
+    /// so the DELETE only runs once, not on every `skim stats` invocation.
+    /// After cleaning, the sentinel is written so subsequent calls are no-ops.
+    pub(crate) fn clean_invalid_records(&self) -> anyhow::Result<usize> {
+        // Check sentinel — if already cleaned, skip the full table scan.
+        let already_cleaned: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM analytics_meta WHERE key = 'invalid_records_cleaned'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        if already_cleaned {
+            return Ok(0);
+        }
+
+        let count = self.conn.execute(
+            "DELETE FROM token_savings WHERE compressed_tokens > raw_tokens",
+            [],
+        )?;
+
+        // Write sentinel so this never runs again.
+        let _ = self.conn.execute(
+            "INSERT OR REPLACE INTO analytics_meta (key, value) VALUES ('invalid_records_cleaned', 1)",
+            [],
+        );
+
+        Ok(count)
     }
 }
 
@@ -490,7 +568,8 @@ impl AnalyticsStore for AnalyticsDb {
         self.query_tier_distribution(since)
     }
     fn clear(&self) -> anyhow::Result<()> {
-        self.clear_data()
+        self.conn.execute("DELETE FROM token_savings", [])?;
+        Ok(())
     }
 }
 
@@ -521,9 +600,14 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 // Fire-and-forget recording functions
 // ============================================================================
 
-/// Compute token savings as a percentage (0.0 when raw_tokens is zero).
+/// Compute token savings as a percentage.
+///
+/// Returns 0.0 when:
+/// - `raw_tokens` is zero (nothing to compress), or
+/// - `compressed_tokens >= raw_tokens` (0% savings, e.g. passthrough mode or
+///   very small files — this is valid, not an error condition).
 pub(crate) fn savings_percentage(raw_tokens: usize, compressed_tokens: usize) -> f32 {
-    if raw_tokens == 0 {
+    if raw_tokens == 0 || compressed_tokens >= raw_tokens {
         0.0
     } else {
         (raw_tokens as f32 - compressed_tokens as f32) / raw_tokens as f32 * 100.0
@@ -572,7 +656,7 @@ pub(crate) fn record_fire_and_forget(
             command_type,
             original_cmd,
             raw_tokens,
-            compressed_tokens: comp_tokens,
+            compressed_tokens: comp_tokens.min(raw_tokens),
             savings_pct: savings_percentage(raw_tokens, comp_tokens),
             duration_ms: duration.as_millis() as u64,
             project_path,
@@ -629,7 +713,7 @@ pub(crate) fn try_record_command(
         command_type,
         duration,
         cwd,
-        parse_tier.map(|s| s.to_string()),
+        parse_tier.map(str::to_string),
     );
 }
 
@@ -661,13 +745,13 @@ pub(crate) fn try_record_command_with_counts(
         command_type,
         original_cmd,
         raw_tokens,
-        compressed_tokens,
+        compressed_tokens: compressed_tokens.min(raw_tokens),
         savings_pct: savings_percentage(raw_tokens, compressed_tokens),
         duration_ms: duration.as_millis() as u64,
         project_path: cwd,
         mode: None,
         language: None,
-        parse_tier: parse_tier.map(|s| s.to_string()),
+        parse_tier: parse_tier.map(str::to_string),
     });
 }
 
@@ -863,7 +947,7 @@ mod tests {
     fn test_pricing_default() {
         let p = PricingModel::default_pricing();
         assert_eq!(p.input_cost_per_mtok, 3.0);
-        assert_eq!(p.model_name, "claude-sonnet-4-6");
+        assert_eq!(p.tier_name, "Standard");
     }
 
     #[test]
@@ -897,27 +981,35 @@ mod tests {
     // is_analytics_enabled() tests
     // ========================================================================
 
-    /// Run a closure with `SKIM_DISABLE_ANALYTICS` set to the given value,
-    /// then restore the original environment. Uses a mutex to prevent
-    /// concurrent env-var mutations from interfering between tests.
-    fn with_env_var(value: Option<&str>, f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        let prev = std::env::var("SKIM_DISABLE_ANALYTICS").ok();
+    /// Temporarily set an env var to `value` (or unset it when `None`),
+    /// run `f`, then restore the original value. Panics in `f` are re-raised
+    /// after restoration so the env is always left clean.
+    ///
+    /// The caller must hold a lock on the appropriate static mutex before
+    /// calling this to prevent concurrent env-var mutations between tests.
+    fn with_env_var_locked(var: &str, value: Option<&str>, f: impl FnOnce()) {
+        let prev = std::env::var(var).ok();
         match value {
-            Some(v) => std::env::set_var("SKIM_DISABLE_ANALYTICS", v),
-            None => std::env::remove_var("SKIM_DISABLE_ANALYTICS"),
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         match prev {
-            Some(v) => std::env::set_var("SKIM_DISABLE_ANALYTICS", v),
-            None => std::env::remove_var("SKIM_DISABLE_ANALYTICS"),
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
         }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    /// Run a closure with `SKIM_DISABLE_ANALYTICS` set to the given value,
+    /// then restore the original environment.
+    fn with_env_var(value: Option<&str>, f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_env_var_locked("SKIM_DISABLE_ANALYTICS", value, f);
     }
 
     #[test]
@@ -1015,26 +1107,12 @@ mod tests {
     // ========================================================================
 
     /// Run a closure with `SKIM_INPUT_COST_PER_MTOK` set to the given value,
-    /// then restore the original environment. Uses the same mutex as
-    /// `with_env_var` to prevent concurrent env-var mutations.
+    /// then restore the original environment.
     fn with_cost_env_var(value: Option<&str>, f: impl FnOnce()) {
         use std::sync::Mutex;
         static COST_ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = COST_ENV_LOCK.lock().unwrap();
-
-        let prev = std::env::var("SKIM_INPUT_COST_PER_MTOK").ok();
-        match value {
-            Some(v) => std::env::set_var("SKIM_INPUT_COST_PER_MTOK", v),
-            None => std::env::remove_var("SKIM_INPUT_COST_PER_MTOK"),
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match prev {
-            Some(v) => std::env::set_var("SKIM_INPUT_COST_PER_MTOK", v),
-            None => std::env::remove_var("SKIM_INPUT_COST_PER_MTOK"),
-        }
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        with_env_var_locked("SKIM_INPUT_COST_PER_MTOK", value, f);
     }
 
     #[test]
@@ -1045,7 +1123,7 @@ mod tests {
                 p.input_cost_per_mtok, 3.0,
                 "negative cost should fall back to default"
             );
-            assert_eq!(p.model_name, "claude-sonnet-4-6");
+            assert_eq!(p.tier_name, "Standard");
         });
     }
 
@@ -1054,7 +1132,7 @@ mod tests {
         with_cost_env_var(Some("0"), || {
             let p = PricingModel::from_env_or_default();
             assert_eq!(p.input_cost_per_mtok, 0.0, "zero cost should be accepted");
-            assert_eq!(p.model_name, "custom");
+            assert_eq!(p.tier_name, "Custom");
         });
     }
 
@@ -1066,7 +1144,7 @@ mod tests {
                 p.input_cost_per_mtok, 3.0,
                 "infinite cost should fall back to default"
             );
-            assert_eq!(p.model_name, "claude-sonnet-4-6");
+            assert_eq!(p.tier_name, "Standard");
         });
     }
 
@@ -1078,7 +1156,7 @@ mod tests {
                 p.input_cost_per_mtok, 3.0,
                 "NaN cost should fall back to default"
             );
-            assert_eq!(p.model_name, "claude-sonnet-4-6");
+            assert_eq!(p.tier_name, "Standard");
         });
     }
 
@@ -1155,6 +1233,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_record_truncates_multibyte_utf8_original_cmd_at_char_boundary() {
+        // Build a string whose byte length exceeds MAX_CMD_LEN but where the
+        // byte at MAX_CMD_LEN falls in the middle of a multi-byte character.
+        // "é" is U+00E9, encoded as two bytes [0xC3, 0xA9] in UTF-8.
+        // Fill up to just before MAX_CMD_LEN with ASCII, then append "é"s so
+        // that a byte-index truncation at MAX_CMD_LEN would land inside one.
+        let ascii_prefix = "a".repeat(AnalyticsDb::MAX_CMD_LEN - 1);
+        // The next 'é' straddles the boundary: byte 499 is 0xC3 (first byte of
+        // the two-byte sequence), byte 500 would be 0xA9.  Slicing at 500
+        // would previously panic; the fix must walk back to 499.
+        let cmd = format!("{ascii_prefix}{}", "é".repeat(10));
+        assert!(
+            cmd.len() > AnalyticsDb::MAX_CMD_LEN,
+            "test input must exceed MAX_CMD_LEN bytes"
+        );
+        assert!(
+            !cmd.is_char_boundary(AnalyticsDb::MAX_CMD_LEN),
+            "test input must have a char boundary violation at MAX_CMD_LEN"
+        );
+
+        let (db, _tmp) = test_db();
+        let mut r = sample_record();
+        r.original_cmd = cmd;
+        // Must not panic (previously would panic with byte-index slice).
+        db.record(&r).unwrap();
+
+        let stored: String = db
+            .conn
+            .query_row("SELECT original_cmd FROM token_savings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            stored.len() < AnalyticsDb::MAX_CMD_LEN,
+            "truncation walked back to char boundary: stored {} bytes",
+            stored.len()
+        );
+        assert!(
+            stored.is_ascii() || stored.chars().all(|_| true),
+            "stored value must be valid UTF-8"
+        );
+    }
+
     // ========================================================================
     // DB file permissions test (Unix only)
     // ========================================================================
@@ -1177,6 +1299,68 @@ mod tests {
     }
 
     // ========================================================================
+    // savings_percentage underflow guard tests
+    // ========================================================================
+
+    #[test]
+    fn test_clean_invalid_records() {
+        let (db, _tmp) = test_db();
+        // Insert a valid record
+        db.record(&sample_record()).unwrap();
+        // Insert an invalid record directly (compressed > raw)
+        db.conn
+            .execute(
+                "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path)
+                 VALUES (1711300000, 'file', 'test', 10, 20, -100.0, 5, '/tmp')",
+                [],
+            )
+            .unwrap();
+        let cleaned = db.clean_invalid_records().unwrap();
+        assert_eq!(cleaned, 1, "should remove exactly the 1 invalid record");
+        let summary = db.query_summary(None).unwrap();
+        assert_eq!(
+            summary.invocations, 1,
+            "only the valid record should remain"
+        );
+    }
+
+    #[test]
+    fn test_query_negative_savings_returns_zero() {
+        let (db, _tmp) = test_db();
+        // Insert a record where compressed > raw directly (simulates pre-fix corrupt data)
+        db.conn
+            .execute(
+                "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path)
+                 VALUES (1711300000, 'file', 'test', 10, 20, -100.0, 5, '/tmp')",
+                [],
+            )
+            .unwrap();
+        let daily = db.query_daily(None).unwrap();
+        assert_eq!(
+            daily[0].tokens_saved, 0,
+            "negative savings from corrupt DB should be clamped to 0"
+        );
+        let by_cmd = db.query_by_command(None).unwrap();
+        assert_eq!(
+            by_cmd[0].tokens_saved, 0,
+            "negative savings in query_by_command should clamp to 0"
+        );
+    }
+
+    #[test]
+    fn test_negative_savings_clamped_at_recording() {
+        // savings_percentage should return 0.0 when compressed >= raw
+        assert_eq!(savings_percentage(10, 20), 0.0);
+        assert_eq!(savings_percentage(0, 5), 0.0);
+        assert_eq!(savings_percentage(10, 10), 0.0);
+        // Normal case still works
+        assert!(
+            (savings_percentage(100, 20) - 80.0).abs() < 0.01,
+            "expected ~80.0%"
+        );
+    }
+
+    // ========================================================================
     // since_clause_with_extra helper test
     // ========================================================================
 
@@ -1192,5 +1376,28 @@ mod tests {
         let (clause, params) = since_clause_with_extra(Some(12345), "mode IS NOT NULL");
         assert_eq!(clause, "WHERE timestamp >= ?1 AND mode IS NOT NULL");
         assert_eq!(params, vec![12345]);
+    }
+
+    // ========================================================================
+    // PricingModel tier tests
+    // ========================================================================
+
+    #[test]
+    fn test_pricing_tiers() {
+        let tiers = PricingModel::all_tiers();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0].tier_name, "Economy");
+        assert_eq!(tiers[0].input_cost_per_mtok, 1.0);
+        assert_eq!(tiers[1].tier_name, "Standard");
+        assert_eq!(tiers[1].input_cost_per_mtok, 3.0);
+        assert_eq!(tiers[2].tier_name, "Premium");
+        assert_eq!(tiers[2].input_cost_per_mtok, 15.0);
+    }
+
+    #[test]
+    fn test_pricing_default_is_standard() {
+        let p = PricingModel::default_pricing();
+        assert_eq!(p.tier_name, "Standard");
+        assert_eq!(p.input_cost_per_mtok, 3.0);
     }
 }

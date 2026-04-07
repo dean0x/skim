@@ -5,13 +5,14 @@
 //! JSON output (`--format json`), cost estimates (`--cost`), and data clearing
 //! (`--clear`).
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
-use colored::Colorize;
+use colored::{ColoredString, Colorize};
 
-use crate::analytics::{AnalyticsDb, AnalyticsStore, PricingModel};
+use crate::analytics::{AnalyticsDb, AnalyticsStore, DailyStats, PricingModel};
 use crate::cmd::session::types::parse_duration_ago;
 use crate::tokens;
 
@@ -36,6 +37,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     if clear {
         return run_clear(&db);
+    }
+
+    // Auto-clean: one-time self-healing for pre-fix corrupt records where
+    // compressed_tokens > raw_tokens.  Runs on concrete AnalyticsDb, reports
+    // to stderr so it never pollutes JSON stdout.
+    let cleaned = db.clean_invalid_records().unwrap_or(0);
+    if cleaned > 0 {
+        eprintln!("skim: cleaned {cleaned} invalid analytics record(s)");
     }
 
     let since_ts = if let Some(s) = &since_str {
@@ -142,15 +151,15 @@ fn run_json(
     if show_cost {
         let pricing = PricingModel::from_env_or_default();
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
-        root.as_object_mut().unwrap().insert(
-            "cost_estimate".to_string(),
-            serde_json::json!({
-                "model": pricing.model_name,
-                "input_cost_per_mtok": pricing.input_cost_per_mtok,
-                "estimated_savings_usd": (cost_savings * 100.0).round() / 100.0,
-                "tokens_saved": summary.tokens_saved,
-            }),
-        );
+        // INTENTIONAL API CHANGE (stats dashboard v3 refactor): the `cost_estimate`
+        // object uses `tier` (e.g. "Standard") rather than the previous `model` key
+        // (e.g. "claude-sonnet-4-6").  Downstream consumers must update accordingly.
+        root["cost_estimate"] = serde_json::json!({
+            "tier": pricing.tier_name,
+            "input_cost_per_mtok": pricing.input_cost_per_mtok,
+            "estimated_savings_usd": (cost_savings * 100.0).round() / 100.0,
+            "tokens_saved": summary.tokens_saved,
+        });
     }
 
     writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
@@ -158,7 +167,391 @@ fn run_json(
 }
 
 // ============================================================================
-// Terminal dashboard
+// Dashboard layout constants
+// ============================================================================
+
+const COL_NAME: usize = 14;
+const COL_COUNT: usize = 6;
+const COL_SAVED: usize = 8;
+const BAR_WIDTH: usize = 16;
+const SPARKLINE_CHAR_WIDTH: usize = 4;
+
+// ============================================================================
+// Dashboard formatting helpers
+// ============================================================================
+
+/// Format a token count in compact human-readable form: 1.5K, 2.4M, 1.2B.
+/// Values under 1000 are rendered as plain integers.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Apply the standard efficiency color to a pre-formatted string.
+///
+/// All values render green — a single unified color for a cleaner visual.
+fn apply_efficiency_color(s: String) -> ColoredString {
+    s.green()
+}
+
+/// Colorise a savings percentage with ANSI codes.
+///
+/// Clamps to [0.0, 100.0] then formats right-aligned in a 6-char field
+/// before applying color so ANSI escape sequences do not affect alignment.
+fn color_pct(pct: f64) -> ColoredString {
+    let clamped = pct.clamp(0.0, 100.0);
+    apply_efficiency_color(format!("{clamped:>5.1}%"))
+}
+
+/// Render a block-character progress bar.
+///
+/// Uses `█` for filled and `░` for empty cells, colored by efficiency tier.
+/// `pct` is clamped to [0, 100] before computing fill width.
+fn render_bar(pct: f64, width: usize) -> String {
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    let colored_fill = apply_efficiency_color("\u{2588}".repeat(filled));
+    format!("[{}{}]", colored_fill, "\u{2591}".repeat(empty))
+}
+
+/// Render a sparkline from daily stats using block chars `▁▂▃▄▅▆▇█`.
+///
+/// Takes up to the last 14 days of data.  Gaps between dates are filled
+/// with `▁` (minimum bar).  Returns an empty string when `daily` is empty.
+fn render_sparkline(daily: &[DailyStats]) -> String {
+    const BARS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    if daily.is_empty() {
+        return String::new();
+    }
+
+    // Work with data sorted ascending by date; take last 14 entries.
+    let mut sorted: Vec<&DailyStats> = daily.iter().collect();
+    sorted.sort_by(|a, b| a.date.cmp(&b.date));
+    let start = sorted.len().saturating_sub(14);
+    let window: Vec<&DailyStats> = sorted[start..].to_vec();
+
+    // Build a date-indexed map of tokens_saved.
+    let mut by_date: HashMap<&str, u64> = HashMap::new();
+    for entry in &window {
+        by_date.insert(entry.date.as_str(), entry.tokens_saved);
+    }
+
+    let first_date = window.first().map(|d| d.date.as_str()).unwrap_or("");
+    let last_date = window.last().map(|d| d.date.as_str()).unwrap_or("");
+
+    // Enumerate every calendar day between first and last inclusive.
+    let dates = calendar_dates_between(first_date, last_date);
+
+    let max_val = by_date.values().copied().max().unwrap_or(0);
+
+    dates
+        .iter()
+        .map(|date| {
+            let tokens = by_date.get(date.as_str()).copied().unwrap_or(0);
+            let idx = if max_val == 0 {
+                0
+            } else {
+                ((tokens as f64 / max_val as f64) * (BARS.len() - 1) as f64).round() as usize
+            };
+            let ch = BARS[idx.min(BARS.len() - 1)];
+            std::iter::repeat_n(ch, SPARKLINE_CHAR_WIDTH).collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Enumerate calendar dates (YYYY-MM-DD strings) from `start` to `end` inclusive.
+///
+/// Falls back to just returning the start date when date arithmetic is not
+/// possible (e.g. malformed strings), keeping output safe.
+fn calendar_dates_between(start: &str, end: &str) -> Vec<String> {
+    // Parse YYYY-MM-DD manually to avoid pulling in chrono.
+    fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+        let parts: Vec<&str> = s.splitn(3, '-').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        let y = parts[0].parse::<i32>().ok()?;
+        let m = parts[1].parse::<u32>().ok()?;
+        let d = parts[2].parse::<u32>().ok()?;
+        if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+            return None;
+        }
+        Some((y, m, d))
+    }
+
+    fn days_in_month(year: i32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 30,
+        }
+    }
+
+    fn advance_day(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
+        let max_day = days_in_month(year, month);
+        if day < max_day {
+            (year, month, day + 1)
+        } else if month < 12 {
+            (year, month + 1, 1)
+        } else {
+            (year + 1, 1, 1)
+        }
+    }
+
+    let (mut y, mut m, mut d) = match parse_ymd(start) {
+        Some(v) => v,
+        None => return vec![start.to_string()],
+    };
+    let end_parsed = match parse_ymd(end) {
+        Some(v) => v,
+        None => return vec![start.to_string()],
+    };
+
+    let mut dates = Vec::new();
+    // Safety cap: never generate more than 100 dates to prevent runaway loops.
+    while (y, m, d) <= end_parsed && dates.len() < 100 {
+        dates.push(format!("{y:04}-{m:02}-{d:02}"));
+        let next = advance_day(y, m, d);
+        (y, m, d) = next;
+    }
+    dates
+}
+
+/// Format a section header padded to 76 characters with thin horizontal lines.
+fn section_header(title: &str) -> String {
+    // "── {title} " + trailing dashes to 76 chars total
+    let prefix = format!("\u{2500}\u{2500} {title} ");
+    let remaining = 76_usize.saturating_sub(prefix.len());
+    format!("{}{}", prefix, "\u{2500}".repeat(remaining))
+}
+
+/// Map a stored command_type string to a human-readable label.
+fn command_label(stored: &str) -> &'static str {
+    match stored {
+        "file" => "Source files",
+        "test" => "Test output",
+        "build" => "Build output",
+        "git" => "Git output",
+        "lint" => "Lint output",
+        "pkg" => "Pkg output",
+        "infra" => "Infra output",
+        "fileops" => "File ops",
+        "log" => "Log output",
+        _ => "Other",
+    }
+}
+
+// ============================================================================
+// Terminal dashboard — section renderers
+// ============================================================================
+
+fn render_header(w: &mut dyn Write, period: &str) -> anyhow::Result<()> {
+    let border = "\u{2550}".repeat(78);
+    writeln!(w, "{}", border.bold())?;
+    writeln!(w, "{}", format!("  skim Token Analytics ({period})").bold())?;
+    writeln!(w, "{}", border.bold())?;
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_summary(
+    w: &mut dyn Write,
+    summary: &crate::analytics::AnalyticsSummary,
+) -> anyhow::Result<()> {
+    writeln!(w, "{}", section_header("Summary"))?;
+    writeln!(
+        w,
+        "  Invocations:    {}",
+        tokens::format_number(summary.invocations as usize)
+    )?;
+    writeln!(
+        w,
+        "  Raw tokens:     {}",
+        tokens::format_number(summary.raw_tokens as usize)
+    )?;
+    writeln!(
+        w,
+        "  Compressed:     {}",
+        tokens::format_number(summary.compressed_tokens as usize)
+    )?;
+    writeln!(
+        w,
+        "  Tokens saved:   {}",
+        tokens::format_number(summary.tokens_saved as usize).green()
+    )?;
+    writeln!(
+        w,
+        "  Avg reduction:  {}",
+        color_pct(summary.avg_savings_pct)
+    )?;
+    writeln!(w, "  {}", render_bar(summary.avg_savings_pct, 20))?;
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_daily_trend(
+    w: &mut dyn Write,
+    daily: &[crate::analytics::DailyStats],
+) -> anyhow::Result<()> {
+    if daily.is_empty() {
+        return Ok(());
+    }
+    let first = daily.iter().map(|d| d.date.as_str()).min().unwrap_or("");
+    let last = daily.iter().map(|d| d.date.as_str()).max().unwrap_or("");
+    writeln!(w, "{}", section_header("Daily Trend (tokens saved)"))?;
+    writeln!(w)?;
+    writeln!(w, "  {}", render_sparkline(daily))?;
+    writeln!(w, "  {} to {}", first.dimmed(), last.dimmed())?;
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_by_command(
+    w: &mut dyn Write,
+    by_command: &[crate::analytics::CommandStats],
+) -> anyhow::Result<()> {
+    if by_command.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("By Command"))?;
+    for cmd in by_command {
+        writeln!(
+            w,
+            "  {:<width$} {:>col_count$} calls  {:>col_saved$} saved  {}  {}",
+            command_label(&cmd.command_type),
+            tokens::format_number(cmd.invocations as usize),
+            format_tokens(cmd.tokens_saved),
+            color_pct(cmd.avg_savings_pct),
+            render_bar(cmd.avg_savings_pct, BAR_WIDTH),
+            width = COL_NAME,
+            col_count = COL_COUNT,
+            col_saved = COL_SAVED,
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_by_language(
+    w: &mut dyn Write,
+    by_language: &[crate::analytics::LanguageStats],
+) -> anyhow::Result<()> {
+    if by_language.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("By Language"))?;
+    for lang in by_language {
+        writeln!(
+            w,
+            "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
+            lang.language,
+            tokens::format_number(lang.files as usize),
+            format_tokens(lang.tokens_saved),
+            color_pct(lang.avg_savings_pct),
+            render_bar(lang.avg_savings_pct, BAR_WIDTH),
+            width = COL_NAME,
+            col_count = COL_COUNT,
+            col_saved = COL_SAVED,
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_by_mode(
+    w: &mut dyn Write,
+    by_mode: &[crate::analytics::ModeStats],
+) -> anyhow::Result<()> {
+    if by_mode.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("By Mode"))?;
+    for mode in by_mode {
+        writeln!(
+            w,
+            "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
+            mode.mode,
+            tokens::format_number(mode.files as usize),
+            format_tokens(mode.tokens_saved),
+            color_pct(mode.avg_savings_pct),
+            render_bar(mode.avg_savings_pct, BAR_WIDTH),
+            width = COL_NAME,
+            col_count = COL_COUNT,
+            col_saved = COL_SAVED,
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_parse_quality(
+    w: &mut dyn Write,
+    tier_dist: &crate::analytics::TierDistribution,
+) -> anyhow::Result<()> {
+    writeln!(w, "{}", section_header("Parse Quality"))?;
+    if tier_dist.full_pct > 0.0 || tier_dist.degraded_pct > 0.0 || tier_dist.passthrough_pct > 0.0 {
+        writeln!(w, "  Full:        {:.1}%", tier_dist.full_pct)?;
+        writeln!(w, "  Degraded:    {:.1}%", tier_dist.degraded_pct)?;
+        writeln!(w, "  Passthrough: {:.1}%", tier_dist.passthrough_pct)?;
+    } else {
+        writeln!(w, "  No tier data recorded yet.")?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_cost_section(w: &mut dyn Write, tokens_saved: u64) -> anyhow::Result<()> {
+    let pricing = PricingModel::from_env_or_default();
+    writeln!(w, "{}", section_header("Cost Estimates"))?;
+    writeln!(
+        w,
+        "  Rate:      ${:.2}/MTok ({})",
+        pricing.input_cost_per_mtok, pricing.tier_name
+    )?;
+    writeln!(w)?;
+
+    for price_tier in PricingModel::all_tiers() {
+        let savings = price_tier.estimate_savings(tokens_saved);
+        writeln!(
+            w,
+            "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
+            price_tier.tier_name, price_tier.input_cost_per_mtok, savings
+        )?;
+    }
+
+    // Show custom tier row if env var was used
+    if pricing.tier_name == "Custom" {
+        let savings = pricing.estimate_savings(tokens_saved);
+        writeln!(
+            w,
+            "  {:<10} ${:>5.2}/MTok    ${:.2} saved",
+            pricing.tier_name, pricing.input_cost_per_mtok, savings
+        )?;
+    }
+
+    writeln!(w)?;
+    Ok(())
+}
+
+// ============================================================================
+// Terminal dashboard — orchestrator
 // ============================================================================
 
 fn run_dashboard(
@@ -181,126 +574,17 @@ fn run_dashboard(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Header
     let period = since_str.map_or("all time".to_string(), |s| format!("last {s}"));
-    writeln!(w, "{}", format!("Token Analytics ({period})").bold())?;
-    writeln!(w)?;
+    render_header(w, &period)?;
+    render_summary(w, &summary)?;
+    render_daily_trend(w, &db.query_daily(since)?)?;
+    render_by_command(w, &db.query_by_command(since)?)?;
+    render_by_language(w, &db.query_by_language(since)?)?;
+    render_by_mode(w, &db.query_by_mode(since)?)?;
+    render_parse_quality(w, &db.query_tier_distribution(since)?)?;
 
-    // Summary section
-    writeln!(w, "{}", "Summary".bold().underline())?;
-    writeln!(
-        w,
-        "  Invocations:    {}",
-        tokens::format_number(summary.invocations as usize)
-    )?;
-    writeln!(
-        w,
-        "  Raw tokens:     {}",
-        tokens::format_number(summary.raw_tokens as usize)
-    )?;
-    writeln!(
-        w,
-        "  Compressed:     {}",
-        tokens::format_number(summary.compressed_tokens as usize)
-    )?;
-    writeln!(
-        w,
-        "  Tokens saved:   {}",
-        tokens::format_number(summary.tokens_saved as usize).green()
-    )?;
-    writeln!(w, "  Avg reduction:  {:.1}%", summary.avg_savings_pct)?;
-
-    // Efficiency meter
-    let pct = summary.avg_savings_pct.clamp(0.0, 100.0);
-    let filled = (pct / 5.0).round() as usize;
-    let empty = 20_usize.saturating_sub(filled);
-    let bar = format!(
-        "  [{}{}] {:.1}%",
-        "\u{2588}".repeat(filled).green(),
-        "\u{2591}".repeat(empty),
-        pct
-    );
-    writeln!(w, "{bar}")?;
-    writeln!(w)?;
-
-    // By command type
-    let by_command = db.query_by_command(since)?;
-    if !by_command.is_empty() {
-        writeln!(w, "{}", "By Command".bold().underline())?;
-        for cmd in &by_command {
-            writeln!(
-                w,
-                "  {:<8} {:>6} invocations, {} tokens saved ({:.1}%)",
-                cmd.command_type,
-                tokens::format_number(cmd.invocations as usize),
-                tokens::format_number(cmd.tokens_saved as usize),
-                cmd.avg_savings_pct,
-            )?;
-        }
-        writeln!(w)?;
-    }
-
-    // By language
-    let by_language = db.query_by_language(since)?;
-    if !by_language.is_empty() {
-        writeln!(w, "{}", "By Language".bold().underline())?;
-        for lang in &by_language {
-            writeln!(
-                w,
-                "  {:<12} {:>6} files, {} tokens saved ({:.1}%)",
-                lang.language,
-                tokens::format_number(lang.files as usize),
-                tokens::format_number(lang.tokens_saved as usize),
-                lang.avg_savings_pct,
-            )?;
-        }
-        writeln!(w)?;
-    }
-
-    // By mode
-    let by_mode = db.query_by_mode(since)?;
-    if !by_mode.is_empty() {
-        writeln!(w, "{}", "By Mode".bold().underline())?;
-        for mode in &by_mode {
-            writeln!(
-                w,
-                "  {:<12} {:>6} files, {} tokens saved ({:.1}%)",
-                mode.mode,
-                tokens::format_number(mode.files as usize),
-                tokens::format_number(mode.tokens_saved as usize),
-                mode.avg_savings_pct,
-            )?;
-        }
-        writeln!(w)?;
-    }
-
-    // Parse tier distribution
-    let tier = db.query_tier_distribution(since)?;
-    if tier.full_pct > 0.0 || tier.degraded_pct > 0.0 || tier.passthrough_pct > 0.0 {
-        writeln!(w, "{}", "Parse Quality".bold().underline())?;
-        writeln!(w, "  Full:        {:.1}%", tier.full_pct)?;
-        writeln!(w, "  Degraded:    {:.1}%", tier.degraded_pct)?;
-        writeln!(w, "  Passthrough: {:.1}%", tier.passthrough_pct)?;
-        writeln!(w)?;
-    }
-
-    // Cost estimates
     if show_cost {
-        let pricing = PricingModel::from_env_or_default();
-        let cost_savings = pricing.estimate_savings(summary.tokens_saved);
-        writeln!(w, "{}", "Cost Estimates".bold().underline())?;
-        writeln!(w, "  Model:          {}", pricing.model_name)?;
-        writeln!(
-            w,
-            "  Input cost:     ${:.2}/MTok",
-            pricing.input_cost_per_mtok
-        )?;
-        writeln!(
-            w,
-            "  Estimated savings: {}",
-            format!("${:.2}", cost_savings).green()
-        )?;
-        writeln!(w)?;
+        render_cost_section(w, summary.tokens_saved)?;
     }
 
     Ok(ExitCode::SUCCESS)
@@ -314,6 +598,113 @@ fn run_dashboard(
 mod tests {
     use super::*;
     use crate::analytics::*;
+
+    // ========================================================================
+    // format_tokens tests
+    // ========================================================================
+
+    #[test]
+    fn test_format_tokens() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1.0K");
+        assert_eq!(format_tokens(1_500), "1.5K");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(2_400_000), "2.4M");
+        assert_eq!(format_tokens(1_000_000_000), "1.0B");
+    }
+
+    // ========================================================================
+    // color_pct tests
+    // ========================================================================
+
+    #[test]
+    fn test_color_pct_clamping() {
+        // Negative clamps to 0.0
+        let s = color_pct(-5.0).to_string();
+        assert!(
+            s.contains("0.0%"),
+            "negative should clamp to 0.0%, got: {s}"
+        );
+        // Over 100 clamps to 100.0
+        let s = color_pct(150.0).to_string();
+        assert!(
+            s.contains("100.0%"),
+            "over-100 should clamp to 100.0%, got: {s}"
+        );
+    }
+
+    // ========================================================================
+    // render_sparkline tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_sparkline_empty() {
+        let result = render_sparkline(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_render_sparkline_with_gaps() {
+        let daily = vec![
+            DailyStats {
+                date: "2026-04-01".to_string(),
+                invocations: 5,
+                tokens_saved: 100,
+                avg_savings_pct: 50.0,
+            },
+            DailyStats {
+                date: "2026-04-03".to_string(),
+                invocations: 3,
+                tokens_saved: 200,
+                avg_savings_pct: 60.0,
+            },
+            DailyStats {
+                date: "2026-04-05".to_string(),
+                invocations: 7,
+                tokens_saved: 50,
+                avg_savings_pct: 40.0,
+            },
+        ];
+        let sparkline = render_sparkline(&daily);
+        // 5 days × SPARKLINE_CHAR_WIDTH chars + 4 spaces between blocks
+        let expected_len = 5 * SPARKLINE_CHAR_WIDTH + 4;
+        assert_eq!(
+            sparkline.chars().count(),
+            expected_len,
+            "Apr 1-5 = 5 days, each {} chars wide with space separators",
+            SPARKLINE_CHAR_WIDTH
+        );
+        // Split on space to get individual blocks; gaps (Apr 2, Apr 4) are min-bar blocks
+        let blocks: Vec<&str> = sparkline.split(' ').collect();
+        assert_eq!(blocks.len(), 5, "should have 5 blocks");
+        // Gap blocks (Apr 2 at index 1, Apr 4 at index 3) should be all minimum-bar chars
+        let min_bar = '▁';
+        assert!(
+            blocks[1].chars().all(|c| c == min_bar),
+            "Apr 2 gap block should be min bar"
+        );
+        assert!(
+            blocks[3].chars().all(|c| c == min_bar),
+            "Apr 4 gap block should be min bar"
+        );
+    }
+
+    // ========================================================================
+    // section_header test
+    // ========================================================================
+
+    #[test]
+    fn test_section_header_total_width() {
+        let hdr = section_header("Summary");
+        // Should be close to 76 chars (allow for unicode char width)
+        assert!(
+            hdr.len() >= 70,
+            "section header should pad to ~76 chars, got {}",
+            hdr.len()
+        );
+        assert!(hdr.contains("Summary"), "header must contain title");
+    }
 
     /// In-memory mock store for testing dashboard rendering without a real DB.
     struct MockStore {
@@ -356,12 +747,39 @@ mod tests {
                     tokens_saved: 70_000,
                     avg_savings_pct: 70.0,
                 },
-                daily: vec![DailyStats {
-                    date: "2026-03-24".to_string(),
-                    invocations: 42,
-                    tokens_saved: 70_000,
-                    avg_savings_pct: 70.0,
-                }],
+                // Multiple non-consecutive dates for sparkline coverage
+                daily: vec![
+                    DailyStats {
+                        date: "2026-03-20".to_string(),
+                        invocations: 8,
+                        tokens_saved: 10_000,
+                        avg_savings_pct: 65.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-22".to_string(),
+                        invocations: 12,
+                        tokens_saved: 20_000,
+                        avg_savings_pct: 70.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-24".to_string(),
+                        invocations: 42,
+                        tokens_saved: 70_000,
+                        avg_savings_pct: 70.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-26".to_string(),
+                        invocations: 5,
+                        tokens_saved: 8_000,
+                        avg_savings_pct: 60.0,
+                    },
+                    DailyStats {
+                        date: "2026-03-28".to_string(),
+                        invocations: 7,
+                        tokens_saved: 15_000,
+                        avg_savings_pct: 72.0,
+                    },
+                ],
                 by_command: vec![CommandStats {
                     command_type: "file".to_string(),
                     invocations: 30,
@@ -446,9 +864,9 @@ mod tests {
         assert_eq!(summary["tokens_saved"], 70_000);
         assert_eq!(summary["avg_savings_pct"], 70.0);
         // Verify breakdowns are present
-        assert!(parsed["by_command"].as_array().unwrap().len() == 1);
-        assert!(parsed["by_language"].as_array().unwrap().len() == 1);
-        assert!(parsed["by_mode"].as_array().unwrap().len() == 1);
+        assert_eq!(parsed["by_command"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["by_language"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["by_mode"].as_array().unwrap().len(), 1);
         // No cost_estimate when show_cost is false
         assert!(parsed.get("cost_estimate").is_none());
     }
@@ -558,5 +976,394 @@ mod tests {
     fn test_parse_value_flag_missing() {
         let args: Vec<String> = vec!["--cost".into()];
         assert_eq!(parse_value_flag(&args, "--format"), None);
+    }
+
+    // ========================================================================
+    // Daily Trend section integration tests
+    // ========================================================================
+
+    #[test]
+    fn test_dashboard_has_daily_trend() {
+        let store = MockStore {
+            daily: vec![
+                DailyStats {
+                    date: "2026-04-01".to_string(),
+                    invocations: 5,
+                    tokens_saved: 100,
+                    avg_savings_pct: 50.0,
+                },
+                DailyStats {
+                    date: "2026-04-03".to_string(),
+                    invocations: 3,
+                    tokens_saved: 200,
+                    avg_savings_pct: 60.0,
+                },
+            ],
+            ..MockStore::with_data()
+        };
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            output.contains("Daily Trend (tokens saved)"),
+            "dashboard should show daily trend section with subtitle"
+        );
+    }
+
+    #[test]
+    fn test_daily_trend_subtitle() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            output.contains("tokens saved"),
+            "daily trend header should include 'tokens saved' subtitle"
+        );
+    }
+
+    #[test]
+    fn test_dashboard_no_daily_trend_when_empty() {
+        let store = MockStore {
+            daily: vec![],
+            ..MockStore::with_data()
+        };
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            !output.contains("Daily Trend"),
+            "dashboard should skip daily trend section when no daily data"
+        );
+    }
+
+    // ========================================================================
+    // command_label tests
+    // ========================================================================
+
+    #[test]
+    fn test_command_label() {
+        assert_eq!(command_label("file"), "Source files");
+        assert_eq!(command_label("test"), "Test output");
+        assert_eq!(command_label("build"), "Build output");
+        assert_eq!(command_label("git"), "Git output");
+        assert_eq!(command_label("lint"), "Lint output");
+        assert_eq!(command_label("pkg"), "Pkg output");
+        assert_eq!(command_label("infra"), "Infra output");
+        assert_eq!(command_label("fileops"), "File ops");
+        assert_eq!(command_label("log"), "Log output");
+        assert_eq!(command_label("unknown_cmd"), "Other");
+    }
+
+    // ========================================================================
+    // Wider sparkline tests
+    // ========================================================================
+
+    #[test]
+    fn test_sparkline_width_with_spaces() {
+        let daily: Vec<DailyStats> = (1..=5)
+            .map(|i| DailyStats {
+                date: format!("2026-04-{:02}", i),
+                invocations: i as u64,
+                tokens_saved: i as u64 * 100,
+                avg_savings_pct: 50.0,
+            })
+            .collect();
+        let sparkline = render_sparkline(&daily);
+        // N days → N * SPARKLINE_CHAR_WIDTH + (N-1) spaces
+        let expected_len = 5 * SPARKLINE_CHAR_WIDTH + 4;
+        assert_eq!(
+            sparkline.chars().count(),
+            expected_len,
+            "5 days should produce {} chars, got {}",
+            expected_len,
+            sparkline.chars().count()
+        );
+    }
+
+    // ========================================================================
+    // render_bar tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_bar_zero_pct() {
+        let bar = render_bar(0.0, 10);
+        // All cells should be empty (░), no filled cells
+        assert!(bar.starts_with('['), "bar should start with '['");
+        assert!(bar.ends_with(']'), "bar should end with ']'");
+        // Strip ANSI for counting: just verify the empty block char count
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(empty_count, 10, "0% bar should have 10 empty cells");
+    }
+
+    #[test]
+    fn test_render_bar_full_pct() {
+        let bar = render_bar(100.0, 10);
+        let fill_count = bar.chars().filter(|&c| c == '█').count();
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(fill_count, 10, "100% bar should have 10 filled cells");
+        assert_eq!(empty_count, 0, "100% bar should have 0 empty cells");
+    }
+
+    #[test]
+    fn test_render_bar_clamps_negative() {
+        // Negative percentage should clamp to 0
+        let bar = render_bar(-20.0, 10);
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(
+            empty_count, 10,
+            "negative pct should clamp to 0% (all empty)"
+        );
+    }
+
+    #[test]
+    fn test_render_bar_clamps_over_100() {
+        // Over-100 percentage should clamp to 100
+        let bar = render_bar(150.0, 10);
+        let fill_count = bar.chars().filter(|&c| c == '█').count();
+        assert_eq!(
+            fill_count, 10,
+            "pct > 100 should clamp to 100% (all filled)"
+        );
+    }
+
+    #[test]
+    fn test_render_bar_zero_width() {
+        // Zero-width bar should still have brackets with no cells
+        let bar = render_bar(50.0, 0);
+        assert_eq!(bar, "[]", "zero-width bar should be '[]'");
+    }
+
+    #[test]
+    fn test_render_bar_half_pct() {
+        let bar = render_bar(50.0, 10);
+        let fill_count = bar.chars().filter(|&c| c == '█').count();
+        let empty_count = bar.chars().filter(|&c| c == '░').count();
+        assert_eq!(
+            fill_count, 5,
+            "50% bar (width 10) should have 5 filled cells"
+        );
+        assert_eq!(
+            empty_count, 5,
+            "50% bar (width 10) should have 5 empty cells"
+        );
+    }
+
+    // ========================================================================
+    // render_sparkline sort correctness tests
+    // ========================================================================
+
+    #[test]
+    fn test_render_sparkline_sort_order() {
+        // Provide daily data in reverse order; sparkline should sort ascending
+        let daily = vec![
+            DailyStats {
+                date: "2026-04-03".to_string(),
+                invocations: 3,
+                tokens_saved: 300,
+                avg_savings_pct: 60.0,
+            },
+            DailyStats {
+                date: "2026-04-01".to_string(),
+                invocations: 1,
+                tokens_saved: 100,
+                avg_savings_pct: 50.0,
+            },
+            DailyStats {
+                date: "2026-04-02".to_string(),
+                invocations: 2,
+                tokens_saved: 200,
+                avg_savings_pct: 55.0,
+            },
+        ];
+        // Sorted ascending and with gaps filled: Apr 1, 2, 3 — 3 blocks
+        let sparkline = render_sparkline(&daily);
+        let blocks: Vec<&str> = sparkline.split(' ').collect();
+        assert_eq!(blocks.len(), 3, "3 days should produce 3 blocks");
+        // Apr 3 has the highest tokens_saved (300), so its block should be max bar '█'
+        let max_bar = '█';
+        assert!(
+            blocks[2].chars().all(|c| c == max_bar),
+            "last block (Apr 3, highest) should be max bar"
+        );
+    }
+
+    #[test]
+    fn test_render_sparkline_takes_last_14() {
+        // Provide 20 days; sparkline should use only the last 14
+        let daily: Vec<DailyStats> = (1..=20)
+            .map(|i| DailyStats {
+                date: format!("2026-04-{:02}", i),
+                invocations: i as u64,
+                tokens_saved: i as u64 * 100,
+                avg_savings_pct: 50.0,
+            })
+            .collect();
+        let sparkline = render_sparkline(&daily);
+        let blocks: Vec<&str> = sparkline.split(' ').collect();
+        assert_eq!(
+            blocks.len(),
+            14,
+            "20 days of data should yield only last 14 blocks"
+        );
+    }
+
+    // ========================================================================
+    // calendar_dates_between tests
+    // ========================================================================
+
+    #[test]
+    fn test_calendar_same_day() {
+        let dates = calendar_dates_between("2026-04-05", "2026-04-05");
+        assert_eq!(dates, vec!["2026-04-05"]);
+    }
+
+    #[test]
+    fn test_calendar_month_boundary() {
+        // Jan 30 → Feb 2
+        let dates = calendar_dates_between("2026-01-30", "2026-02-02");
+        assert_eq!(
+            dates,
+            vec!["2026-01-30", "2026-01-31", "2026-02-01", "2026-02-02"]
+        );
+    }
+
+    #[test]
+    fn test_calendar_year_boundary() {
+        // Dec 30 → Jan 2 next year
+        let dates = calendar_dates_between("2025-12-30", "2026-01-02");
+        assert_eq!(
+            dates,
+            vec!["2025-12-30", "2025-12-31", "2026-01-01", "2026-01-02"]
+        );
+    }
+
+    #[test]
+    fn test_calendar_leap_year() {
+        // Feb 28 → Mar 1 in 2024 (leap year)
+        let dates = calendar_dates_between("2024-02-28", "2024-03-01");
+        assert_eq!(dates, vec!["2024-02-28", "2024-02-29", "2024-03-01"]);
+    }
+
+    #[test]
+    fn test_calendar_non_leap_year() {
+        // Feb 28 → Mar 1 in 2025 (non-leap year, no Feb 29)
+        let dates = calendar_dates_between("2025-02-28", "2025-03-01");
+        assert_eq!(dates, vec!["2025-02-28", "2025-03-01"]);
+    }
+
+    #[test]
+    fn test_calendar_malformed_start() {
+        // Malformed start returns vec with just the start string
+        let dates = calendar_dates_between("not-a-date", "2026-04-05");
+        assert_eq!(dates, vec!["not-a-date"]);
+    }
+
+    #[test]
+    fn test_calendar_malformed_end() {
+        // Malformed end returns vec with just the start string
+        let dates = calendar_dates_between("2026-04-01", "not-a-date");
+        assert_eq!(dates, vec!["2026-04-01"]);
+    }
+
+    #[test]
+    fn test_calendar_invalid_month() {
+        // Month 13 is invalid; parse_ymd should return None → fallback to start string
+        let dates = calendar_dates_between("2026-13-01", "2026-13-05");
+        assert_eq!(dates, vec!["2026-13-01"]);
+    }
+
+    #[test]
+    fn test_calendar_invalid_day() {
+        // Day 0 is invalid
+        let dates = calendar_dates_between("2026-04-00", "2026-04-03");
+        assert_eq!(dates, vec!["2026-04-00"]);
+    }
+
+    #[test]
+    fn test_calendar_safety_cap() {
+        // 365+ days apart should be capped at 100 entries
+        let dates = calendar_dates_between("2026-01-01", "2027-12-31");
+        assert_eq!(
+            dates.len(),
+            100,
+            "safety cap should limit output to 100 dates"
+        );
+    }
+
+    // ========================================================================
+    // JSON output value assertions
+    // ========================================================================
+
+    #[test]
+    fn test_run_json_tier_distribution_values() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_json(w, &store, None, false));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let tier = &parsed["tier_distribution"];
+        assert!(
+            tier.is_object(),
+            "tier_distribution should be a JSON object"
+        );
+        assert_eq!(
+            tier["full_pct"].as_f64().unwrap(),
+            90.0,
+            "full_pct should be 90.0"
+        );
+        assert_eq!(
+            tier["degraded_pct"].as_f64().unwrap(),
+            8.0,
+            "degraded_pct should be 8.0"
+        );
+        assert_eq!(
+            tier["passthrough_pct"].as_f64().unwrap(),
+            2.0,
+            "passthrough_pct should be 2.0"
+        );
+    }
+
+    #[test]
+    fn test_run_json_cost_tier_value() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_json(w, &store, None, true));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let cost = &parsed["cost_estimate"];
+        let tier = cost["tier"].as_str().expect("tier should be a string");
+        // Default pricing model tier should be "Standard"
+        assert_eq!(tier, "Standard", "default cost tier should be 'Standard'");
+    }
+
+    // ========================================================================
+    // Dashboard command labels test
+    // ========================================================================
+
+    #[test]
+    fn test_dashboard_shows_command_labels() {
+        let store = MockStore::with_data();
+        // MockStore::with_data() has command_type: "file"
+        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        assert!(
+            output.contains("Source files"),
+            "dashboard should show 'Source files' label for 'file' command type"
+        );
+    }
+
+    // ========================================================================
+    // Multi-tier cost table test
+    // ========================================================================
+
+    #[test]
+    fn test_dashboard_multi_tier_cost() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_dashboard(w, &store, None, true, None));
+        assert!(
+            output.contains("Economy"),
+            "cost section should show Economy tier"
+        );
+        assert!(
+            output.contains("Standard"),
+            "cost section should show Standard tier"
+        );
+        assert!(
+            output.contains("Premium"),
+            "cost section should show Premium tier"
+        );
+        assert!(output.contains("/MTok"), "cost section should show rate");
     }
 }

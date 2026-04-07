@@ -581,7 +581,7 @@ fn record_file_analytics(result: &process::ProcessResult, cmd: &str, args: &Args
             project_path: cwd,
             mode: Some(mode),
             language: lang,
-            parse_tier: None,
+            parse_tier: result.parse_tier.map(str::to_string),
         });
     }
 }
