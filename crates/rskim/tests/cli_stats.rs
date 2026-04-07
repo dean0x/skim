@@ -149,8 +149,8 @@ fn test_stats_cost_flag() {
 
     let cost = cost.unwrap();
     assert!(
-        cost.get("model").is_some(),
-        "cost_estimate should contain 'model' key"
+        cost.get("tier").is_some(),
+        "cost_estimate should contain 'tier' key"
     );
     assert!(
         cost.get("input_cost_per_mtok").is_some(),
