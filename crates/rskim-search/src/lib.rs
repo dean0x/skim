@@ -15,11 +15,12 @@
 
 pub mod fields;
 pub mod lexical;
+pub mod temporal;
 mod traits;
 mod types;
 
 pub use lexical::fxhash_bytes;
-pub use traits::{FieldClassifier, LayerBuilder, SearchIndex, SearchLayer};
+pub use traits::{FieldClassifier, LayerBuilder, SearchIndex, SearchLayer, TemporalQuery};
 pub use types::{
     FileId, FileTable, IndexStats, LineRange, MatchSpan, Result, SearchError, SearchField,
     SearchQuery, SearchResult, TemporalFlags, MAX_FILE_TABLE_ENTRIES,

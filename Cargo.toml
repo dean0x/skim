@@ -49,6 +49,7 @@ insta = "1.39"
 criterion = "0.5"
 rustc-hash = "1.1"
 memmap2 = "0.9"
+gix = { version = "0.68", default-features = false, features = ["max-performance-safe"] }
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"

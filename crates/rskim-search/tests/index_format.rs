@@ -576,8 +576,7 @@ fn validate_detects_out_of_bounds_posting_range() {
     let entry_start = INDEX_HEADER_SIZE;
     // Claim 1 million posting entries — far more than .skpost holds.
     let corrupt_length: u32 = 1_000_000;
-    bytes[entry_start + 12..entry_start + 16]
-        .copy_from_slice(&corrupt_length.to_le_bytes());
+    bytes[entry_start + 12..entry_start + 16].copy_from_slice(&corrupt_length.to_le_bytes());
     std::fs::write(&skidx_path, &bytes).expect("write corrupted skidx");
 
     // Reopen — `open()` only checks structural sizes, not per-entry bounds.

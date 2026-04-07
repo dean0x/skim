@@ -9,7 +9,9 @@
 
 use rskim_core::Language;
 use rskim_search::fields::classify_serde_fields;
-use rskim_search::fields::serde_fields::{classify_json_fields, classify_toml_fields, classify_yaml_fields};
+use rskim_search::fields::serde_fields::{
+    classify_json_fields, classify_toml_fields, classify_yaml_fields,
+};
 use rskim_search::SearchField;
 
 // ============================================================================

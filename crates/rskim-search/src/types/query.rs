@@ -1,5 +1,7 @@
 //! Search query types: `SearchQuery`, `TemporalFlags`, and `SearchField`.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Semantic field within a source file used for field-boosted search scoring.
@@ -86,11 +88,12 @@ impl SearchField {
 
 /// Temporal filter flags for query-time filtering by git activity signals.
 ///
-/// All flags default to `false` (disabled). Any combination is valid.
+/// All flags default to `false`/`None` (disabled). Any combination is valid.
 #[derive(Debug, Clone, Default)]
 pub struct TemporalFlags {
-    /// Include only files with high blast radius (many dependents).
-    pub blast_radius: bool,
+    /// Blast-radius query target file, if this is a blast-radius query.
+    /// When `Some(path)`, temporal layer returns co-change partners of `path`.
+    pub blast_radius: Option<PathBuf>,
     /// Include only files with recent commit activity ("hot" files).
     pub hot: bool,
     /// Include only files with no recent changes ("cold" files).
@@ -197,7 +200,7 @@ mod tests {
         assert_eq!(q.ast_pattern, None);
         assert_eq!(q.limit, 50);
         assert_eq!(q.offset, 0);
-        assert!(!q.temporal_flags.blast_radius);
+        assert!(q.temporal_flags.blast_radius.is_none());
         assert!(!q.temporal_flags.hot);
         assert!(!q.temporal_flags.cold);
         assert!(!q.temporal_flags.risky);
@@ -216,7 +219,7 @@ mod tests {
     #[test]
     fn temporal_flags_default_all_false() {
         let flags = TemporalFlags::default();
-        assert!(!flags.blast_radius);
+        assert!(flags.blast_radius.is_none());
         assert!(!flags.hot);
         assert!(!flags.cold);
         assert!(!flags.risky);
@@ -240,7 +243,7 @@ mod tests {
         assert_eq!(q.offset, 5);
         assert_eq!(q.ast_pattern, Some("fn _()".to_string()));
         assert!(q.temporal_flags.hot);
-        assert!(!q.temporal_flags.blast_radius);
+        assert!(q.temporal_flags.blast_radius.is_none());
     }
 
     #[test]

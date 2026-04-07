@@ -65,6 +65,8 @@ fn is_flag_with_value(flag: &str) -> bool {
             | "--format"
             | "--ast"
             | "--limit"
+            | "--blast-radius"
+            | "--lookback"
     )
 }
 
@@ -688,6 +690,8 @@ mod tests {
         "--format",
         "--ast",
         "--limit",
+        "--blast-radius",
+        "--lookback",
     ];
 
     /// Ensure every value-consuming flag (non-boolean, non-positional) in `Args`

@@ -7,8 +7,8 @@ use rustc_hash::FxHashMap;
 
 use crate::FieldClassifier;
 
-use super::{Ngram, PostingEntry};
 use super::ngram::extract_ngrams;
+use super::{Ngram, PostingEntry};
 
 // ============================================================================
 // Constants
@@ -49,10 +49,7 @@ pub(crate) struct WalkContext<'a> {
 /// pathological or adversarial ASTs.
 ///
 /// This function is `pub(crate)` so the builder can call it directly.
-pub(crate) fn walk_and_classify(
-    node: tree_sitter::Node<'_>,
-    ctx: &mut WalkContext<'_>,
-) {
+pub(crate) fn walk_and_classify(node: tree_sitter::Node<'_>, ctx: &mut WalkContext<'_>) {
     walk_and_classify_inner(node, ctx, 0);
 }
 
@@ -60,11 +57,7 @@ pub(crate) fn walk_and_classify(
 // Private recursive implementation
 // ============================================================================
 
-fn walk_and_classify_inner(
-    node: tree_sitter::Node<'_>,
-    ctx: &mut WalkContext<'_>,
-    depth: u32,
-) {
+fn walk_and_classify_inner(node: tree_sitter::Node<'_>, ctx: &mut WalkContext<'_>, depth: u32) {
     if depth >= MAX_AST_DEPTH {
         return;
     }
@@ -94,4 +87,3 @@ fn walk_and_classify_inner(
         }
     }
 }
-

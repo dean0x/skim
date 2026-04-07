@@ -220,7 +220,8 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
                 };
                 self.postings.entry(*ngram).or_default().push(entry);
             }
-            doc_len = doc_len.saturating_add(u32::try_from(fallback_ngrams.len()).unwrap_or(u32::MAX));
+            doc_len =
+                doc_len.saturating_add(u32::try_from(fallback_ngrams.len()).unwrap_or(u32::MAX));
         }
 
         self.doc_lengths.push(doc_len);
@@ -344,5 +345,4 @@ mod tests {
         assert!(builder.postings.is_empty());
         assert!(builder.parser_cache.is_empty());
     }
-
 }

@@ -74,3 +74,52 @@ pub trait FieldClassifier: Send + Sync {
     /// Returns `None` if the node is not relevant for indexing.
     fn classify_node(&self, node: &tree_sitter::Node<'_>, source: &str) -> Option<SearchField>;
 }
+
+/// Temporal filter flags re-export for the `TemporalQuery::rerank` API.
+///
+/// Defined here to avoid a circular import with `types::query::TemporalFlags`.
+/// `TemporalQuery` lives in `traits.rs` to stay alongside `SearchLayer`, but it
+/// takes `&TemporalFlags` which is defined in `types/query.rs`.
+use crate::TemporalFlags;
+
+/// Query trait for the temporal analysis layer.
+///
+/// Temporal queries are file-property queries (not text queries), so they
+/// cannot fit into [`SearchLayer::search`] which takes a [`SearchQuery`]. The
+/// trait returns owned [`PathBuf`] values because the temporal layer is
+/// decoupled from the lexical [`FileTable`]: it maintains its own internal
+/// path mapping so that deleted files and files-in-git-history-but-not-indexed
+/// are still tracked.
+///
+/// Scores are in `[0, 1]` (normalized) for all methods.
+pub trait TemporalQuery: Send + Sync {
+    /// Return files that frequently co-change with `target`.
+    ///
+    /// Scores are Jaccard similarities (higher = more coupled).
+    fn blast_radius(&self, target: &Path, limit: usize) -> Result<Vec<(PathBuf, f32)>>;
+
+    /// Return files ranked by recent commit activity (hotspots).
+    fn hotspots(&self, limit: usize) -> Result<Vec<(PathBuf, f32)>>;
+
+    /// Return files ranked by _lowest_ recent activity (coldspots).
+    ///
+    /// Only files with at least one commit in the lookback window are
+    /// considered; files never touched do NOT appear.
+    fn coldspots(&self, limit: usize) -> Result<Vec<(PathBuf, f32)>>;
+
+    /// Return files ranked by risk (fix-commit density).
+    fn risky(&self, limit: usize) -> Result<Vec<(PathBuf, f32)>>;
+
+    /// Rerank lexical results by applying temporal signals.
+    ///
+    /// Lexical and temporal ranks are both percentile-normalized internally
+    /// before blending. The `flags` parameter selects which temporal signals
+    /// to apply (hot / cold / risky). `blast_radius` in `flags` is ignored by
+    /// this method — blast-radius queries are standalone (see
+    /// [`TemporalQuery::blast_radius`]).
+    fn rerank(
+        &self,
+        lexical_results: &[(PathBuf, f32)],
+        flags: &TemporalFlags,
+    ) -> Result<Vec<(PathBuf, f32)>>;
+}

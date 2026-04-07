@@ -163,12 +163,12 @@ fn test_temporal_flags_contradictory() {
 #[test]
 fn test_temporal_flags_all_true() {
     let flags = TemporalFlags {
-        blast_radius: true,
+        blast_radius: Some(std::path::PathBuf::from("src/main.rs")),
         hot: true,
         cold: true,
         risky: true,
     };
-    assert!(flags.blast_radius);
+    assert!(flags.blast_radius.is_some());
     assert!(flags.hot);
     assert!(flags.cold);
     assert!(flags.risky);

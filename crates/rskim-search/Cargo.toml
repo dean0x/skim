@@ -18,6 +18,9 @@ serde = { workspace = true }
 rustc-hash = { workspace = true }
 memmap2 = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
+regex = { workspace = true }
+gix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

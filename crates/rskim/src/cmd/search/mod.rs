@@ -52,8 +52,16 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         eprintln!("error: --ast is not yet implemented");
         return Ok(ExitCode::FAILURE);
     }
-    if matches.get_flag("blast_radius") {
+    if matches.get_one::<String>("blast_radius").is_some() {
         eprintln!("error: --blast-radius is not yet implemented");
+        return Ok(ExitCode::FAILURE);
+    }
+    if matches.get_flag("build_temporal") {
+        eprintln!("error: --build-temporal is not yet implemented");
+        return Ok(ExitCode::FAILURE);
+    }
+    if matches.get_one::<String>("lookback").is_some() {
+        eprintln!("error: --lookback is not yet implemented");
         return Ok(ExitCode::FAILURE);
     }
     if matches.get_flag("hot") {
@@ -219,8 +227,20 @@ pub(super) fn command() -> clap::Command {
         .arg(
             clap::Arg::new("blast_radius")
                 .long("blast-radius")
+                .value_name("FILE")
+                .help("Show files that historically co-change with FILE (standalone query)"),
+        )
+        .arg(
+            clap::Arg::new("build_temporal")
+                .long("build-temporal")
                 .action(clap::ArgAction::SetTrue)
-                .help("Filter results by blast radius (high-impact changes)"),
+                .help("Build only the temporal index"),
+        )
+        .arg(
+            clap::Arg::new("lookback")
+                .long("lookback")
+                .value_name("DAYS")
+                .help("Temporal lookback window in days (default: 365)"),
         )
         .arg(
             clap::Arg::new("limit")

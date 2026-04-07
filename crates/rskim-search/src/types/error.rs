@@ -26,6 +26,18 @@ pub enum SearchError {
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
+    /// An error occurred while reading git history via gix.
+    #[error("Git error: {0}")]
+    GitError(String),
+
+    /// Temporal index not found at the given path.
+    #[error("Temporal index not found at {0}")]
+    TemporalNotFound(String),
+
+    /// Temporal query conflict (e.g., --blast-radius combined with text search).
+    #[error("Temporal query conflict: {0}")]
+    TemporalConflict(String),
+
     /// The index file is corrupted or has an incompatible format version.
     #[error("Corrupted index at {path}: {reason}")]
     CorruptedIndex {

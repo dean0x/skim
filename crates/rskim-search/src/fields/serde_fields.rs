@@ -299,4 +299,3 @@ pub fn classify_toml_fields(source: &str) -> crate::Result<Vec<(Range<usize>, Se
 
     Ok(results)
 }
-
