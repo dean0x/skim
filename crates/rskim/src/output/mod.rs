@@ -537,6 +537,31 @@ mod tests {
         crate::debug::reset_debug_for_tests();
     }
 
+    #[test]
+    fn test_emit_markers_degraded_silent_without_debug() {
+        crate::debug::reset_debug_for_tests();
+        let markers = vec!["issue one".to_string(), "issue two".to_string()];
+        let result: ParseResult<String> = ParseResult::Degraded("content".to_string(), markers);
+        let mut buf = Vec::new();
+        result.emit_markers(&mut buf).unwrap();
+        assert!(
+            buf.is_empty(),
+            "Degraded should write nothing when debug is disabled"
+        );
+    }
+
+    #[test]
+    fn test_emit_markers_passthrough_silent_without_debug() {
+        crate::debug::reset_debug_for_tests();
+        let result: ParseResult<String> = ParseResult::Passthrough("raw".to_string());
+        let mut buf = Vec::new();
+        result.emit_markers(&mut buf).unwrap();
+        assert!(
+            buf.is_empty(),
+            "Passthrough should write nothing when debug is disabled"
+        );
+    }
+
     // ========================================================================
     // PassthroughCleaner tests
     // ========================================================================
