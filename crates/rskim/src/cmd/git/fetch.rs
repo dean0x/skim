@@ -5,6 +5,7 @@
 //! and submodule fetches. Progress/noise lines (`remote: ...`, `Unpacking ...`)
 //! are stripped.
 
+use std::collections::HashMap;
 use std::process::ExitCode;
 
 use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
@@ -87,6 +88,176 @@ pub(super) fn run_fetch(
 // Parser
 // ============================================================================
 
+/// Accumulated, classified lines from a `git fetch` output pass.
+///
+/// Submodule sections use a `HashMap` for O(1) insertion (avoids O(n) linear
+/// scan per call) and a separate ordered key list to preserve encounter order.
+struct FetchCategories {
+    remote: String,
+    new_branches: Vec<String>,
+    new_tags: Vec<String>,
+    updated: Vec<String>,
+    pruned: Vec<String>,
+    forced: Vec<String>,
+    /// Ordered submodule names (insertion order).
+    submodule_order: Vec<String>,
+    /// Per-submodule entries; keyed by submodule path.
+    submodule_map: HashMap<String, Vec<String>>,
+}
+
+impl FetchCategories {
+    fn new() -> Self {
+        Self {
+            remote: String::new(),
+            new_branches: Vec::new(),
+            new_tags: Vec::new(),
+            updated: Vec::new(),
+            pruned: Vec::new(),
+            forced: Vec::new(),
+            submodule_order: Vec::new(),
+            submodule_map: HashMap::new(),
+        }
+    }
+
+    /// Add an entry to a submodule section in O(1) time.
+    fn add_submodule_entry(&mut self, sub: &str, entry: String) {
+        if !self.submodule_map.contains_key(sub) {
+            self.submodule_order.push(sub.to_string());
+            self.submodule_map.insert(sub.to_string(), Vec::new());
+        }
+        self.submodule_map.get_mut(sub).unwrap().push(entry);
+    }
+
+    /// Iterate submodule sections in the order they were first encountered.
+    fn submodule_sections(&self) -> impl Iterator<Item = (&str, &Vec<String>)> {
+        self.submodule_order
+            .iter()
+            .filter_map(|name| self.submodule_map.get(name).map(|v| (name.as_str(), v)))
+    }
+}
+
+/// Classify all lines from `git fetch` output into `FetchCategories`.
+///
+/// Uses `next_from_is_submodule` to distinguish a submodule's `From` line
+/// (which follows `Fetching submodule`) from a top-level `From` line (which
+/// resets the submodule context). This prevents top-level refs from being
+/// incorrectly attributed to the previously-active submodule.
+fn classify_lines<'a>(lines: impl Iterator<Item = &'a str>) -> FetchCategories {
+    let mut cats = FetchCategories::new();
+    let mut current_submodule: Option<String> = None;
+    // True immediately after a "Fetching submodule" line so the following
+    // "From" is recognised as that submodule's remote, not a new top-level block.
+    let mut next_from_is_submodule = false;
+
+    for trimmed in lines.map(str::trim) {
+        // Skip progress/noise lines
+        if trimmed.starts_with("remote:")
+            || trimmed.starts_with("Unpacking")
+            || trimmed.is_empty()
+        {
+            continue;
+        }
+
+        // Submodule header
+        if let Some(sub) = trimmed.strip_prefix("Fetching submodule ") {
+            current_submodule = Some(sub.to_string());
+            next_from_is_submodule = true;
+            continue;
+        }
+
+        // From line
+        if let Some(rest) = trimmed.strip_prefix("From ") {
+            if next_from_is_submodule {
+                // This "From" belongs to the submodule — preserve current_submodule.
+                next_from_is_submodule = false;
+            } else {
+                // Top-level "From" — reset submodule context.
+                current_submodule = None;
+                if cats.remote.is_empty() {
+                    cats.remote = rest.to_string();
+                }
+            }
+            continue;
+        }
+
+        // New branch
+        if trimmed.contains("[new branch]") {
+            if let Some(name) = extract_ref_name(trimmed) {
+                if let Some(ref sub) = current_submodule {
+                    cats.add_submodule_entry(sub, format!("new branch: {name}"));
+                } else {
+                    cats.new_branches.push(name);
+                }
+            }
+            continue;
+        }
+
+        // New tag
+        if trimmed.contains("[new tag]") {
+            if let Some(name) = extract_ref_name(trimmed) {
+                cats.new_tags.push(name);
+            }
+            continue;
+        }
+
+        // Deleted/pruned
+        if trimmed.contains("[deleted]") {
+            if let Some(name) = extract_pruned_ref(trimmed) {
+                cats.pruned.push(name);
+            }
+            continue;
+        }
+
+        // Forced update
+        if trimmed.contains("(forced update)") {
+            if let Some(name) = extract_updated_ref(trimmed) {
+                cats.forced.push(name);
+            }
+            continue;
+        }
+
+        // Regular update (abc..def ref -> origin/ref)
+        if trimmed.contains("->") && (trimmed.contains("..") || trimmed.contains("...")) {
+            if let Some(name) = extract_updated_ref(trimmed) {
+                if let Some(ref sub) = current_submodule {
+                    cats.add_submodule_entry(sub, format!("updated: {name}"));
+                } else {
+                    cats.updated.push(name);
+                }
+            }
+        }
+    }
+
+    cats
+}
+
+/// Build the detail lines from classified categories.
+fn build_details(cats: &FetchCategories) -> Vec<String> {
+    let mut details: Vec<String> = Vec::new();
+    for b in &cats.new_branches {
+        details.push(format!("+ {b} (new branch)"));
+    }
+    for t in &cats.new_tags {
+        details.push(format!("+ {t} (new tag)"));
+    }
+    for u in &cats.updated {
+        details.push(format!("~ {u}"));
+    }
+    for f in &cats.forced {
+        details.push(format!("! {f} (forced)"));
+    }
+    for p in &cats.pruned {
+        details.push(format!("- {p} (pruned)"));
+    }
+    for (sub_name, entries) in cats.submodule_sections() {
+        details.push(format!("[submodule {sub_name}]"));
+        for e in entries {
+            details.push(format!("  {e}"));
+        }
+    }
+    details
+}
+
 /// Parse combined stdout+stderr from `git fetch` into a compressed GitResult.
 ///
 /// Git fetch writes its output to stderr. The parser handles:
@@ -104,142 +275,40 @@ fn parse_fetch(input: &str) -> GitResult {
         return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new());
     }
 
-    let mut remote = String::new();
-    let mut new_branches: Vec<String> = Vec::new();
-    let mut new_tags: Vec<String> = Vec::new();
-    let mut updated: Vec<String> = Vec::new();
-    let mut pruned: Vec<String> = Vec::new();
-    let mut forced: Vec<String> = Vec::new();
-    let mut submodule_sections: Vec<(String, Vec<String>)> = Vec::new();
-    let mut current_submodule: Option<String> = None;
-
-    for line in &lines {
-        let trimmed = line.trim();
-
-        // Skip progress/noise lines
-        if trimmed.starts_with("remote:") || trimmed.starts_with("Unpacking") || trimmed.is_empty()
-        {
-            continue;
-        }
-
-        // Submodule header
-        if let Some(sub) = trimmed.strip_prefix("Fetching submodule ") {
-            current_submodule = Some(sub.to_string());
-            continue;
-        }
-
-        // From line — extract remote (only first one for primary remote)
-        if let Some(rest) = trimmed.strip_prefix("From ") {
-            if current_submodule.is_none() && remote.is_empty() {
-                remote = rest.to_string();
-            }
-            continue;
-        }
-
-        // New branch
-        if trimmed.contains("[new branch]") {
-            if let Some(name) = extract_ref_name(trimmed) {
-                if let Some(ref sub) = current_submodule {
-                    add_to_submodule(&mut submodule_sections, sub, &format!("new branch: {name}"));
-                } else {
-                    new_branches.push(name);
-                }
-            }
-            continue;
-        }
-
-        // New tag
-        if trimmed.contains("[new tag]") {
-            if let Some(name) = extract_ref_name(trimmed) {
-                new_tags.push(name);
-            }
-            continue;
-        }
-
-        // Deleted/pruned
-        if trimmed.contains("[deleted]") {
-            if let Some(name) = extract_pruned_ref(trimmed) {
-                pruned.push(name);
-            }
-            continue;
-        }
-
-        // Forced update
-        if trimmed.contains("(forced update)") {
-            if let Some(name) = extract_updated_ref(trimmed) {
-                forced.push(name);
-            }
-            continue;
-        }
-
-        // Regular update (abc..def ref -> origin/ref)
-        if trimmed.contains("->") && (trimmed.contains("..") || trimmed.contains("...")) {
-            if let Some(name) = extract_updated_ref(trimmed) {
-                if let Some(ref sub) = current_submodule {
-                    add_to_submodule(&mut submodule_sections, sub, &format!("updated: {name}"));
-                } else {
-                    updated.push(name);
-                }
-            }
-            continue;
-        }
-    }
+    let cats = classify_lines(lines.iter().copied());
 
     // Build summary parts
     let mut parts: Vec<String> = Vec::new();
-    if !updated.is_empty() {
-        parts.push(format!("{} updated", updated.len()));
+    if !cats.updated.is_empty() {
+        parts.push(format!("{} updated", cats.updated.len()));
     }
-    if !new_branches.is_empty() {
+    if !cats.new_branches.is_empty() {
         parts.push(format!(
             "{} new branch{}",
-            new_branches.len(),
-            if new_branches.len() == 1 { "" } else { "es" }
+            cats.new_branches.len(),
+            if cats.new_branches.len() == 1 { "" } else { "es" }
         ));
     }
-    if !new_tags.is_empty() {
+    if !cats.new_tags.is_empty() {
         parts.push(format!(
             "{} new tag{}",
-            new_tags.len(),
-            if new_tags.len() == 1 { "" } else { "s" }
+            cats.new_tags.len(),
+            if cats.new_tags.len() == 1 { "" } else { "s" }
         ));
     }
-    if !pruned.is_empty() {
-        parts.push(format!("{} pruned", pruned.len()));
+    if !cats.pruned.is_empty() {
+        parts.push(format!("{} pruned", cats.pruned.len()));
     }
-    if !forced.is_empty() {
-        parts.push(format!("{} forced", forced.len()));
+    if !cats.forced.is_empty() {
+        parts.push(format!("{} forced", cats.forced.len()));
     }
 
-    if parts.is_empty() && submodule_sections.is_empty() {
+    if parts.is_empty() && cats.submodule_map.is_empty() {
         return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new());
     }
 
-    // Build detail lines
-    let mut details: Vec<String> = Vec::new();
-    for b in &new_branches {
-        details.push(format!("+ {b} (new branch)"));
-    }
-    for t in &new_tags {
-        details.push(format!("+ {t} (new tag)"));
-    }
-    for u in &updated {
-        details.push(format!("~ {u}"));
-    }
-    for f in &forced {
-        details.push(format!("! {f} (forced)"));
-    }
-    for p in &pruned {
-        details.push(format!("- {p} (pruned)"));
-    }
-    for (sub_name, entries) in &submodule_sections {
-        details.push(format!("[submodule {sub_name}]"));
-        for e in entries {
-            details.push(format!("  {e}"));
-        }
-    }
-
-    let display_summary = build_summary(&remote, &parts);
+    let details = build_details(&cats);
+    let display_summary = build_summary(&cats.remote, &parts);
 
     GitResult::new("fetch".to_string(), display_summary, details)
 }
@@ -290,15 +359,6 @@ fn extract_pruned_ref(line: &str) -> Option<String> {
     let target = line[arrow_pos + 2..].trim();
     let name = target.strip_prefix("origin/").unwrap_or(target);
     Some(name.to_string())
-}
-
-/// Add an entry to a submodule section, creating the section if it doesn't exist.
-fn add_to_submodule(sections: &mut Vec<(String, Vec<String>)>, sub: &str, entry: &str) {
-    if let Some(section) = sections.iter_mut().find(|(name, _)| name == sub) {
-        section.1.push(entry.to_string());
-    } else {
-        sections.push((sub.to_string(), vec![entry.to_string()]));
-    }
 }
 
 // ============================================================================
@@ -491,6 +551,47 @@ From github.com:upstream/repo
         );
     }
 
+    /// Regression: refs following a submodule block must not be attributed to
+    /// the previous submodule when a top-level `From` line resets context.
+    #[test]
+    fn test_parse_fetch_submodule_then_toplevel() {
+        let input = "\
+Fetching submodule lib/core
+From github.com:user/core
+   aaa1111..bbb2222  main       -> origin/main
+From github.com:user/repo
+   ccc3333..ddd4444  release    -> origin/release
+";
+        let result = parse_fetch(input);
+        // Top-level "release" update counted in summary (submodule updates go in details only)
+        assert!(
+            result.summary.contains("1 updated"),
+            "expected '1 updated' in summary (only top-level counted), got: {}",
+            result.summary
+        );
+        // "release" must appear at the top level with "~ " prefix
+        let details_str = result.details.join("\n");
+        assert!(
+            details_str.contains("~ release"),
+            "expected top-level '~ release' in details, got: {details_str}"
+        );
+        // The top-level update must NOT be inside a submodule section
+        let mut in_submodule_core = false;
+        for line in result.details.iter() {
+            if line.contains("[submodule lib/core]") {
+                in_submodule_core = true;
+            } else if line.starts_with('[') {
+                in_submodule_core = false;
+            }
+            if in_submodule_core {
+                assert!(
+                    !line.contains("release"),
+                    "top-level 'release' ref incorrectly attributed to submodule: {line}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_extract_ref_name_new_branch() {
         let line = " * [new branch]      feature/x  -> origin/feature/x";
@@ -528,19 +629,22 @@ From github.com:upstream/repo
 
     #[test]
     fn test_add_to_submodule_creates_section() {
-        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-        add_to_submodule(&mut sections, "lib/core", "updated: main");
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].0, "lib/core");
-        assert_eq!(sections[0].1, vec!["updated: main"]);
+        let mut cats = FetchCategories::new();
+        cats.add_submodule_entry("lib/core", "updated: main".to_string());
+        assert_eq!(cats.submodule_order.len(), 1);
+        assert_eq!(cats.submodule_order[0], "lib/core");
+        assert_eq!(
+            cats.submodule_map["lib/core"],
+            vec!["updated: main".to_string()]
+        );
     }
 
     #[test]
     fn test_add_to_submodule_appends_to_existing() {
-        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-        add_to_submodule(&mut sections, "lib/core", "updated: main");
-        add_to_submodule(&mut sections, "lib/core", "new branch: feature");
-        assert_eq!(sections.len(), 1);
-        assert_eq!(sections[0].1.len(), 2);
+        let mut cats = FetchCategories::new();
+        cats.add_submodule_entry("lib/core", "updated: main".to_string());
+        cats.add_submodule_entry("lib/core", "new branch: feature".to_string());
+        assert_eq!(cats.submodule_order.len(), 1);
+        assert_eq!(cats.submodule_map["lib/core"].len(), 2);
     }
 }
