@@ -196,10 +196,7 @@ fn parse_fetch(input: &str) -> GitResult {
     // Build summary parts
     let mut parts: Vec<String> = Vec::new();
     if !updated.is_empty() {
-        parts.push(format!(
-            "{} updated",
-            updated.len()
-        ));
+        parts.push(format!("{} updated", updated.len()));
     }
     if !new_branches.is_empty() {
         parts.push(format!(
@@ -290,14 +287,9 @@ fn extract_ref_name(line: &str) -> Option<String> {
 fn extract_updated_ref(line: &str) -> Option<String> {
     let arrow_pos = line.find("->")?;
     let target = line[arrow_pos + 2..].trim();
-    // Strip trailing "(forced update)" and whitespace
-    let target = target
-        .trim_end_matches(")")
-        .trim_end();
-    let target = if let Some(pos) = target.rfind('(') {
-        target[..pos].trim()
-    } else {
-        target
+    let target = match target.rfind('(') {
+        Some(pos) => target[..pos].trim(),
+        None => target,
     };
     let name = target.strip_prefix("origin/").unwrap_or(target);
     Some(name.to_string())
@@ -474,6 +466,34 @@ mod tests {
         assert!(
             details_str.contains("lib/core") || details_str.contains("lib/utils"),
             "expected submodule names in details, got: {details_str}"
+        );
+    }
+
+    #[test]
+    fn test_parse_fetch_multiple_remotes() {
+        // git fetch --all produces multiple From blocks
+        let input = "\
+From github.com:user/repo
+   abc1234..def5678  main       -> origin/main
+From github.com:upstream/repo
+ * [new branch]      release    -> upstream/release
+";
+        let result = parse_fetch(input);
+        // First remote captured in summary
+        assert!(
+            result.summary.contains("github.com:user/repo"),
+            "expected first remote in summary, got: {}",
+            result.summary
+        );
+        // Both updates tracked
+        let details_str = result.details.join("\n");
+        assert!(
+            details_str.contains("main"),
+            "expected main in details, got: {details_str}"
+        );
+        assert!(
+            details_str.contains("release"),
+            "expected release in details, got: {details_str}"
         );
     }
 
