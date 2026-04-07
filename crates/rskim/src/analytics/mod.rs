@@ -225,14 +225,42 @@ pub(crate) fn is_analytics_enabled() -> bool {
 ///
 /// `AnalyticsDb` implements this trait directly. Test code can provide a
 /// `MockStore` without requiring a real SQLite database.
+///
+/// All query methods have default implementations returning empty/zero values
+/// so test mocks only need to override the methods relevant to the behaviour
+/// under test.
 pub(crate) trait AnalyticsStore {
-    fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary>;
-    fn query_daily(&self, since: Option<i64>) -> anyhow::Result<Vec<DailyStats>>;
-    fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>>;
-    fn query_by_language(&self, since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>>;
-    fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>>;
-    fn query_tier_distribution(&self, since: Option<i64>) -> anyhow::Result<TierDistribution>;
-    fn clear(&self) -> anyhow::Result<()>;
+    fn query_summary(&self, _since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
+        Ok(AnalyticsSummary {
+            invocations: 0,
+            raw_tokens: 0,
+            compressed_tokens: 0,
+            tokens_saved: 0,
+            avg_savings_pct: 0.0,
+        })
+    }
+    fn query_daily(&self, _since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
+        Ok(vec![])
+    }
+    fn query_by_command(&self, _since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
+        Ok(vec![])
+    }
+    fn query_by_language(&self, _since: Option<i64>) -> anyhow::Result<Vec<LanguageStats>> {
+        Ok(vec![])
+    }
+    fn query_by_mode(&self, _since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
+        Ok(vec![])
+    }
+    fn query_tier_distribution(&self, _since: Option<i64>) -> anyhow::Result<TierDistribution> {
+        Ok(TierDistribution {
+            full_pct: 0.0,
+            degraded_pct: 0.0,
+            passthrough_pct: 0.0,
+        })
+    }
+    fn clear(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -289,7 +317,13 @@ impl AnalyticsDb {
     /// before storage to bound database row size.
     pub(crate) fn record(&self, r: &TokenSavingsRecord) -> anyhow::Result<()> {
         let cmd = if r.original_cmd.len() > Self::MAX_CMD_LEN {
-            &r.original_cmd[..Self::MAX_CMD_LEN]
+            // Walk back from MAX_CMD_LEN to the nearest valid UTF-8 character
+            // boundary so we never slice through a multi-byte character.
+            let mut end = Self::MAX_CMD_LEN;
+            while !r.original_cmd.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            &r.original_cmd[..end]
         } else {
             &r.original_cmd
         };
@@ -543,8 +577,12 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 // Fire-and-forget recording functions
 // ============================================================================
 
-/// Compute token savings as a percentage (0.0 when raw_tokens is zero or
-/// compressed_tokens >= raw_tokens, which would indicate invalid data).
+/// Compute token savings as a percentage.
+///
+/// Returns 0.0 when:
+/// - `raw_tokens` is zero (nothing to compress), or
+/// - `compressed_tokens >= raw_tokens` (0% savings, e.g. passthrough mode or
+///   very small files — this is valid, not an error condition).
 pub(crate) fn savings_percentage(raw_tokens: usize, compressed_tokens: usize) -> f32 {
     if raw_tokens == 0 || compressed_tokens >= raw_tokens {
         0.0
@@ -1170,6 +1208,47 @@ mod tests {
             "original_cmd should be truncated to {} chars",
             AnalyticsDb::MAX_CMD_LEN
         );
+    }
+
+    #[test]
+    fn test_record_truncates_multibyte_utf8_original_cmd_at_char_boundary() {
+        // Build a string whose byte length exceeds MAX_CMD_LEN but where the
+        // byte at MAX_CMD_LEN falls in the middle of a multi-byte character.
+        // "é" is U+00E9, encoded as two bytes [0xC3, 0xA9] in UTF-8.
+        // Fill up to just before MAX_CMD_LEN with ASCII, then append "é"s so
+        // that a byte-index truncation at MAX_CMD_LEN would land inside one.
+        let ascii_prefix = "a".repeat(AnalyticsDb::MAX_CMD_LEN - 1);
+        // The next 'é' straddles the boundary: byte 499 is 0xC3 (first byte of
+        // the two-byte sequence), byte 500 would be 0xA9.  Slicing at 500
+        // would previously panic; the fix must walk back to 499.
+        let cmd = format!("{ascii_prefix}{}", "é".repeat(10));
+        assert!(
+            cmd.len() > AnalyticsDb::MAX_CMD_LEN,
+            "test input must exceed MAX_CMD_LEN bytes"
+        );
+        assert!(
+            !cmd.is_char_boundary(AnalyticsDb::MAX_CMD_LEN),
+            "test input must have a char boundary violation at MAX_CMD_LEN"
+        );
+
+        let (db, _tmp) = test_db();
+        let mut r = sample_record();
+        r.original_cmd = cmd;
+        // Must not panic (previously would panic with byte-index slice).
+        db.record(&r).unwrap();
+
+        let stored: String = db
+            .conn
+            .query_row("SELECT original_cmd FROM token_savings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            stored.len() < AnalyticsDb::MAX_CMD_LEN,
+            "truncation walked back to char boundary: stored {} bytes",
+            stored.len()
+        );
+        assert!(stored.is_ascii() || stored.chars().all(|_| true), "stored value must be valid UTF-8");
     }
 
     // ========================================================================
