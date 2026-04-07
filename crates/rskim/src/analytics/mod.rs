@@ -134,18 +134,32 @@ pub(crate) struct TierDistribution {
 // Pricing
 // ============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PricingModel {
     pub(crate) input_cost_per_mtok: f64,
-    pub(crate) model_name: &'static str,
+    pub(crate) tier_name: &'static str,
 }
 
 impl PricingModel {
+    pub(crate) const ECONOMY: Self = Self {
+        input_cost_per_mtok: 1.0,
+        tier_name: "Economy",
+    };
+    pub(crate) const STANDARD: Self = Self {
+        input_cost_per_mtok: 3.0,
+        tier_name: "Standard",
+    };
+    pub(crate) const PREMIUM: Self = Self {
+        input_cost_per_mtok: 15.0,
+        tier_name: "Premium",
+    };
+
+    pub(crate) fn all_tiers() -> [Self; 3] {
+        [Self::ECONOMY, Self::STANDARD, Self::PREMIUM]
+    }
+
     pub(crate) fn default_pricing() -> Self {
-        Self {
-            input_cost_per_mtok: 3.0,
-            model_name: "claude-sonnet-4-6",
-        }
+        Self::STANDARD
     }
 
     pub(crate) fn from_env_or_default() -> Self {
@@ -154,7 +168,7 @@ impl PricingModel {
                 if cost.is_finite() && cost >= 0.0 {
                     return Self {
                         input_cost_per_mtok: cost,
-                        model_name: "custom",
+                        tier_name: "Custom",
                     };
                 }
             }
@@ -476,11 +490,6 @@ impl AnalyticsDb {
         Ok(count)
     }
 
-    /// Delete all analytics data.
-    fn clear_data(&self) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM token_savings", [])?;
-        Ok(())
-    }
 }
 
 impl AnalyticsStore for AnalyticsDb {
@@ -503,7 +512,8 @@ impl AnalyticsStore for AnalyticsDb {
         self.query_tier_distribution(since)
     }
     fn clear(&self) -> anyhow::Result<()> {
-        self.clear_data()
+        self.conn.execute("DELETE FROM token_savings", [])?;
+        Ok(())
     }
 }
 
@@ -877,7 +887,7 @@ mod tests {
     fn test_pricing_default() {
         let p = PricingModel::default_pricing();
         assert_eq!(p.input_cost_per_mtok, 3.0);
-        assert_eq!(p.model_name, "claude-sonnet-4-6");
+        assert_eq!(p.tier_name, "Standard");
     }
 
     #[test]
@@ -911,27 +921,35 @@ mod tests {
     // is_analytics_enabled() tests
     // ========================================================================
 
-    /// Run a closure with `SKIM_DISABLE_ANALYTICS` set to the given value,
-    /// then restore the original environment. Uses a mutex to prevent
-    /// concurrent env-var mutations from interfering between tests.
-    fn with_env_var(value: Option<&str>, f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        let prev = std::env::var("SKIM_DISABLE_ANALYTICS").ok();
+    /// Temporarily set an env var to `value` (or unset it when `None`),
+    /// run `f`, then restore the original value. Panics in `f` are re-raised
+    /// after restoration so the env is always left clean.
+    ///
+    /// The caller must hold a lock on the appropriate static mutex before
+    /// calling this to prevent concurrent env-var mutations between tests.
+    fn with_env_var_locked(var: &str, value: Option<&str>, f: impl FnOnce()) {
+        let prev = std::env::var(var).ok();
         match value {
-            Some(v) => std::env::set_var("SKIM_DISABLE_ANALYTICS", v),
-            None => std::env::remove_var("SKIM_DISABLE_ANALYTICS"),
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         match prev {
-            Some(v) => std::env::set_var("SKIM_DISABLE_ANALYTICS", v),
-            None => std::env::remove_var("SKIM_DISABLE_ANALYTICS"),
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
         }
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }
+    }
+
+    /// Run a closure with `SKIM_DISABLE_ANALYTICS` set to the given value,
+    /// then restore the original environment.
+    fn with_env_var(value: Option<&str>, f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_env_var_locked("SKIM_DISABLE_ANALYTICS", value, f);
     }
 
     #[test]
@@ -1029,26 +1047,12 @@ mod tests {
     // ========================================================================
 
     /// Run a closure with `SKIM_INPUT_COST_PER_MTOK` set to the given value,
-    /// then restore the original environment. Uses the same mutex as
-    /// `with_env_var` to prevent concurrent env-var mutations.
+    /// then restore the original environment.
     fn with_cost_env_var(value: Option<&str>, f: impl FnOnce()) {
         use std::sync::Mutex;
         static COST_ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = COST_ENV_LOCK.lock().unwrap();
-
-        let prev = std::env::var("SKIM_INPUT_COST_PER_MTOK").ok();
-        match value {
-            Some(v) => std::env::set_var("SKIM_INPUT_COST_PER_MTOK", v),
-            None => std::env::remove_var("SKIM_INPUT_COST_PER_MTOK"),
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match prev {
-            Some(v) => std::env::set_var("SKIM_INPUT_COST_PER_MTOK", v),
-            None => std::env::remove_var("SKIM_INPUT_COST_PER_MTOK"),
-        }
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        with_env_var_locked("SKIM_INPUT_COST_PER_MTOK", value, f);
     }
 
     #[test]
@@ -1059,7 +1063,7 @@ mod tests {
                 p.input_cost_per_mtok, 3.0,
                 "negative cost should fall back to default"
             );
-            assert_eq!(p.model_name, "claude-sonnet-4-6");
+            assert_eq!(p.tier_name, "Standard");
         });
     }
 
@@ -1068,7 +1072,7 @@ mod tests {
         with_cost_env_var(Some("0"), || {
             let p = PricingModel::from_env_or_default();
             assert_eq!(p.input_cost_per_mtok, 0.0, "zero cost should be accepted");
-            assert_eq!(p.model_name, "custom");
+            assert_eq!(p.tier_name, "Custom");
         });
     }
 
@@ -1080,7 +1084,7 @@ mod tests {
                 p.input_cost_per_mtok, 3.0,
                 "infinite cost should fall back to default"
             );
-            assert_eq!(p.model_name, "claude-sonnet-4-6");
+            assert_eq!(p.tier_name, "Standard");
         });
     }
 
@@ -1092,7 +1096,7 @@ mod tests {
                 p.input_cost_per_mtok, 3.0,
                 "NaN cost should fall back to default"
             );
-            assert_eq!(p.model_name, "claude-sonnet-4-6");
+            assert_eq!(p.tier_name, "Standard");
         });
     }
 
@@ -1265,5 +1269,28 @@ mod tests {
         let (clause, params) = since_clause_with_extra(Some(12345), "mode IS NOT NULL");
         assert_eq!(clause, "WHERE timestamp >= ?1 AND mode IS NOT NULL");
         assert_eq!(params, vec![12345]);
+    }
+
+    // ========================================================================
+    // PricingModel tier tests
+    // ========================================================================
+
+    #[test]
+    fn test_pricing_tiers() {
+        let tiers = PricingModel::all_tiers();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0].tier_name, "Economy");
+        assert_eq!(tiers[0].input_cost_per_mtok, 1.0);
+        assert_eq!(tiers[1].tier_name, "Standard");
+        assert_eq!(tiers[1].input_cost_per_mtok, 3.0);
+        assert_eq!(tiers[2].tier_name, "Premium");
+        assert_eq!(tiers[2].input_cost_per_mtok, 15.0);
+    }
+
+    #[test]
+    fn test_pricing_default_is_standard() {
+        let p = PricingModel::default_pricing();
+        assert_eq!(p.tier_name, "Standard");
+        assert_eq!(p.input_cost_per_mtok, 3.0);
     }
 }
