@@ -146,7 +146,7 @@ fn try_tier2_combined(combined: &str) -> Option<ParseResult<BuildResult>> {
     let result = BuildResult::new(false, 0, error_count, None, error_messages);
     Some(ParseResult::Degraded(
         result,
-        vec!["combined stdout+stderr fallback".to_string()],
+        vec!["tsc: structured parse failed, using combined stdout+stderr".to_string()],
     ))
 }
 
