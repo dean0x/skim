@@ -183,7 +183,7 @@ pub(crate) struct ParsedCommandConfig<'a> {
 
 /// Execute an external command, parse its output, and emit the result.
 ///
-/// Convenience wrapper that auto-detects stdin piping via `is_terminal()`.
+/// Convenience wrapper that auto-detects stdin piping via [`should_use_stdin`].
 /// Use [`run_parsed_command_with_mode`] when you need explicit control
 /// over stdin vs execute behavior.
 #[allow(dead_code)]
@@ -199,7 +199,7 @@ pub(crate) fn run_parsed_command<T>(
 where
     T: AsRef<str> + serde::Serialize,
 {
-    let use_stdin = !io::stdin().is_terminal();
+    let use_stdin = should_use_stdin(args);
     let config = ParsedCommandConfig {
         program,
         args,
