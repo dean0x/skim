@@ -1,0 +1,6 @@
+Fetching submodule lib/core
+From github.com:user/core
+   aaa1111..bbb2222  main       -> origin/main
+Fetching submodule lib/utils
+From github.com:user/utils
+ * [new branch]      release    -> origin/release

@@ -154,7 +154,10 @@ fn parse(output: &str) -> ParseResult<TestResult> {
 
     // Tier 2: Regex fallback
     if let Some(result) = try_parse_regex(output) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["go test: JSON parse failed, using regex".to_string()],
+        );
     }
 
     // Tier 3: Passthrough
@@ -558,8 +561,8 @@ mod tests {
 
             // Verify marker indicates regex fallback
             assert!(
-                markers.contains(&"regex fallback".to_string()),
-                "expected 'regex fallback' marker, got: {markers:?}"
+                markers.contains(&"go test: JSON parse failed, using regex".to_string()),
+                "expected 'go test: JSON parse failed, using regex' marker, got: {markers:?}"
             );
 
             // Verify duration was extracted from summary line

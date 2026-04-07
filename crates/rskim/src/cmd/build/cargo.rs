@@ -250,7 +250,7 @@ fn try_tier2_regex(stderr: &str) -> Option<ParseResult<BuildResult>> {
 
     Some(ParseResult::Degraded(
         result,
-        vec!["regex fallback".to_string()],
+        vec!["cargo build: structured parse failed, using regex".to_string()],
     ))
 }
 
@@ -426,7 +426,9 @@ mod tests {
         if let ParseResult::Degraded(build_result, markers) = &result {
             assert_eq!(build_result.errors, 2, "expected 2 errors from regex");
             assert!(!build_result.success, "expected failure");
-            assert!(markers.contains(&"regex fallback".to_string()));
+            assert!(
+                markers.contains(&"cargo build: structured parse failed, using regex".to_string())
+            );
         }
     }
 

@@ -79,7 +79,10 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     let combined = combine_stdout_stderr(output);
 
     if let Some(result) = try_parse_regex(&combined) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["gh: JSON parse failed, using regex".to_string()],
+        );
     }
 
     ParseResult::Passthrough(combined.into_owned())

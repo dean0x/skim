@@ -105,7 +105,10 @@ fn parse_impl(output: &CommandOutput, is_nextest: bool) -> ParseResult<TestResul
     };
 
     if let Some(result) = try_parse_regex(&combined) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["cargo test: no libtest JSON events found, using regex".to_string()],
+        );
     }
 
     // Tier 3: passthrough

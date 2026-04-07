@@ -70,19 +70,28 @@ impl<T: AsRef<str>> ParseResult<T> {
     /// Write degradation markers to the given writer.
     ///
     /// - `Full`: writes nothing
-    /// - `Degraded`: writes each marker as a warning line
-    /// - `Passthrough`: writes a notice line
+    /// - `Degraded`: writes each marker as `[skim:warning]` line (only when debug enabled)
+    /// - `Passthrough`: writes a `[skim:notice]` line (only when debug enabled)
+    ///
+    /// When debug mode is disabled (the default), this is a no-op for all tiers.
+    /// Enable with `--debug` CLI flag or `SKIM_DEBUG=1` env var.
     pub(crate) fn emit_markers(&self, writer: &mut impl Write) -> io::Result<()> {
+        if !crate::debug::is_debug_enabled() {
+            return Ok(());
+        }
         match self {
             ParseResult::Full(_) => Ok(()),
             ParseResult::Degraded(_, markers) => {
                 for marker in markers {
-                    writeln!(writer, "[warning] {marker}")?;
+                    writeln!(writer, "[skim:warning] {marker}")?;
                 }
                 Ok(())
             }
             ParseResult::Passthrough(_) => {
-                writeln!(writer, "[notice] output passed through without parsing")
+                writeln!(
+                    writer,
+                    "[skim:notice] output passed through without parsing"
+                )
             }
         }
     }
@@ -495,30 +504,61 @@ mod tests {
 
     #[test]
     fn test_emit_markers_degraded_writes_warnings() {
+        crate::debug::reset_debug_for_tests();
+        crate::debug::force_enable_debug();
         let markers = vec!["issue one".to_string(), "issue two".to_string()];
         let result: ParseResult<String> = ParseResult::Degraded("content".to_string(), markers);
         let mut buf = Vec::new();
         result.emit_markers(&mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            output.contains("[warning] issue one"),
+            output.contains("[skim:warning] issue one"),
             "expected warning for first marker, got: {output}"
         );
         assert!(
-            output.contains("[warning] issue two"),
+            output.contains("[skim:warning] issue two"),
             "expected warning for second marker, got: {output}"
         );
+        crate::debug::reset_debug_for_tests();
     }
 
     #[test]
     fn test_emit_markers_passthrough_writes_notice() {
+        crate::debug::reset_debug_for_tests();
+        crate::debug::force_enable_debug();
         let result: ParseResult<String> = ParseResult::Passthrough("raw".to_string());
         let mut buf = Vec::new();
         result.emit_markers(&mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            output.contains("[notice]"),
+            output.contains("[skim:notice]"),
             "expected notice in output, got: {output}"
+        );
+        crate::debug::reset_debug_for_tests();
+    }
+
+    #[test]
+    fn test_emit_markers_degraded_silent_without_debug() {
+        crate::debug::reset_debug_for_tests();
+        let markers = vec!["issue one".to_string(), "issue two".to_string()];
+        let result: ParseResult<String> = ParseResult::Degraded("content".to_string(), markers);
+        let mut buf = Vec::new();
+        result.emit_markers(&mut buf).unwrap();
+        assert!(
+            buf.is_empty(),
+            "Degraded should write nothing when debug is disabled"
+        );
+    }
+
+    #[test]
+    fn test_emit_markers_passthrough_silent_without_debug() {
+        crate::debug::reset_debug_for_tests();
+        let result: ParseResult<String> = ParseResult::Passthrough("raw".to_string());
+        let mut buf = Vec::new();
+        result.emit_markers(&mut buf).unwrap();
+        assert!(
+            buf.is_empty(),
+            "Passthrough should write nothing when debug is disabled"
         );
     }
 

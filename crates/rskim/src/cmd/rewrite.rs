@@ -216,7 +216,20 @@ const REWRITE_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["git", "diff"],
         rewrite_to: &["skim", "git", "diff"],
-        skip_if_flag_prefix: &["--stat", "--name-only", "--name-status", "--check"],
+        skip_if_flag_prefix: &[
+            "--stat",
+            "--shortstat",
+            "--numstat",
+            "--name-only",
+            "--name-status",
+            "--check",
+        ],
+        category: RewriteCategory::Git,
+    },
+    RewriteRule {
+        prefix: &["git", "fetch"],
+        rewrite_to: &["skim", "git", "fetch"],
+        skip_if_flag_prefix: &["--dry-run", "-q", "--quiet"],
         category: RewriteCategory::Git,
     },
     RewriteRule {
@@ -2092,6 +2105,16 @@ mod tests {
     }
 
     #[test]
+    fn test_git_diff_with_shortstat_skipped() {
+        assert!(try_rewrite(&["git", "diff", "--shortstat"]).is_none());
+    }
+
+    #[test]
+    fn test_git_diff_with_numstat_skipped() {
+        assert!(try_rewrite(&["git", "diff", "--numstat"]).is_none());
+    }
+
+    #[test]
     fn test_git_log_with_format_skipped() {
         assert!(try_rewrite(&["git", "log", "--format=%H"]).is_none());
     }
@@ -2104,6 +2127,41 @@ mod tests {
     #[test]
     fn test_git_log_with_oneline_skipped() {
         assert!(try_rewrite(&["git", "log", "--oneline"]).is_none());
+    }
+
+    // ========================================================================
+    // git fetch
+    // ========================================================================
+
+    #[test]
+    fn test_git_fetch() {
+        let result = try_rewrite(&["git", "fetch"]);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.tokens, vec!["skim", "git", "fetch"]);
+    }
+
+    #[test]
+    fn test_git_fetch_with_remote_extra_args_preserved() {
+        let result = try_rewrite(&["git", "fetch", "origin", "main"]);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.tokens, vec!["skim", "git", "fetch", "origin", "main"]);
+    }
+
+    #[test]
+    fn test_git_fetch_dry_run_skipped() {
+        assert!(try_rewrite(&["git", "fetch", "--dry-run"]).is_none());
+    }
+
+    #[test]
+    fn test_git_fetch_quiet_skipped() {
+        assert!(try_rewrite(&["git", "fetch", "-q"]).is_none());
+    }
+
+    #[test]
+    fn test_git_fetch_quiet_long_skipped() {
+        assert!(try_rewrite(&["git", "fetch", "--quiet"]).is_none());
     }
 
     // ========================================================================

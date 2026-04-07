@@ -104,7 +104,10 @@ fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
     }
 
     if let Some(result) = try_parse_ls_plain(&output.stdout) {
-        return ParseResult::Degraded(result, vec!["plain ls fallback".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["ls: structured parse failed, using plain text".to_string()],
+        );
     }
 
     ParseResult::Passthrough(output.stdout.clone())
@@ -216,7 +219,10 @@ fn parse_tree(output: &CommandOutput) -> ParseResult<FileResult> {
 
     // Tier 2: text output with box-drawing lines
     if let Some(result) = try_parse_tree_text(&output.stdout) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["ls: structured parse failed, using regex".to_string()],
+        );
     }
 
     ParseResult::Passthrough(output.stdout.clone())

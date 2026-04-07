@@ -73,11 +73,11 @@ fn test_exit_code_cargo_nextest_fail_via_stdin() {
     // regex match). Exit code is 0 from synthetic stdin exit code.
     let fixture = include_str!("fixtures/cmd/test/cargo_nextest_fail.txt");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["--debug", "test", "cargo"])
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 #[test]
@@ -86,11 +86,11 @@ fn test_exit_code_cargo_passthrough_garbage() {
     // so the process exits 0.
     let fixture = include_str!("fixtures/cmd/test/cargo_passthrough.txt");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["--debug", "test", "cargo"])
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================

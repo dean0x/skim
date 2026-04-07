@@ -105,6 +105,7 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
 
     Command::cargo_bin("skim")
         .unwrap()
+        .arg("--debug")
         .arg("test")
         .arg("vitest")
         .write_stdin(input)
@@ -112,7 +113,7 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
         .failure() // fail > 0
         .stdout(predicate::str::contains("PASS: 5"))
         .stdout(predicate::str::contains("FAIL: 1"))
-        .stderr(predicate::str::contains("regex fallback"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -125,13 +126,14 @@ fn test_skim_test_vitest_stdin_passthrough() {
 
     Command::cargo_bin("skim")
         .unwrap()
+        .arg("--debug")
         .arg("test")
         .arg("vitest")
         .write_stdin(input)
         .assert()
         .failure()
         .stdout(predicate::str::contains("completely unparseable output"))
-        .stderr(predicate::str::contains("notice"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================

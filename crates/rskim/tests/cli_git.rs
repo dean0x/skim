@@ -20,6 +20,7 @@ fn test_skim_git_help() {
         .success()
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("diff"))
+        .stdout(predicate::str::contains("fetch"))
         .stdout(predicate::str::contains("log"));
 }
 
@@ -125,6 +126,23 @@ fn test_skim_git_log_oneline_passthrough() {
         .args(["git", "log", "--oneline", "-n", "3"])
         .assert()
         .success();
+}
+
+// ============================================================================
+// Fetch
+// ============================================================================
+
+/// Run `skim git fetch` against the skim repo. Since skim may have no
+/// configured remotes or may be up-to-date, we accept either "[fetch]" output
+/// or "up to date".
+#[test]
+fn test_skim_git_fetch_in_repo() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "fetch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[fetch]").or(predicate::str::contains("up to date")));
 }
 
 // ============================================================================

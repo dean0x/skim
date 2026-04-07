@@ -153,7 +153,7 @@ cargo fmt -- --check           # Format check
 - `completions` — Shell completion scripts
 - `discover` — Scan agent sessions for missed skim optimization opportunities (`--since`, `--agent`, `--json`)
 - `file` — File operations compression: find, ls, tree, grep, rg output parsing (`--json`, `--show-stats`)
-- `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log. All support `--json`.
+- `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch. All support `--json`.
 - `infra` — Infrastructure tool compression: gh, aws, curl, wget output parsing (`--json`, `--show-stats`)
 - `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode)
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`)
@@ -178,6 +178,9 @@ cargo fmt -- --check           # Format check
 - `SKIM_CURSOR_DB_PATH` — Override Cursor workspace state database path
 - `SKIM_GEMINI_DIR` — Override Gemini CLI sessions directory
 - `SKIM_OPENCODE_DIR` — Override OpenCode sessions directory
+
+**Debug:**
+- `SKIM_DEBUG` — Set to `1`/`true`/`yes` to enable debug output (warnings/notices on stderr). Also available as `--debug` CLI flag.
 
 **Cache:**
 - `SKIM_CACHE_DIR` — Override skim cache directory (default: `~/.cache/skim/`)

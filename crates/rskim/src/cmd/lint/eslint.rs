@@ -66,7 +66,10 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     let combined = combine_stdout_stderr(output);
 
     if let Some(result) = try_parse_regex(&combined) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["eslint: JSON parse failed, using regex".to_string()],
+        );
     }
 
     ParseResult::Passthrough(combined.into_owned())

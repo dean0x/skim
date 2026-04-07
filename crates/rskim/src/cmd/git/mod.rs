@@ -12,6 +12,7 @@
 
 // Private: only accessed via run() dispatch in this module
 mod diff;
+mod fetch;
 mod log;
 mod status;
 
@@ -49,12 +50,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     match subcmd.as_str() {
         "status" => status::run_status(&global_flags, subcmd_args, show_stats),
         "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats),
+        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats),
         "log" => log::run_log(&global_flags, subcmd_args, show_stats),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
                 "unknown git subcommand: '{safe_other}'\n\n\
-                 Supported: status, diff, log\n\
+                 Supported: status, diff, fetch, log\n\
                  Run 'skim git --help' for usage"
             );
         }
@@ -66,13 +68,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 // ============================================================================
 
 fn print_help() {
-    println!("skim git <status|diff|log> [args...]");
+    println!("skim git <status|diff|fetch|log> [args...]");
     println!();
     println!("  Compress git command output for LLM context windows.");
     println!();
     println!("Subcommands:");
     println!("  status    Show compressed working tree status");
     println!("  diff      AST-aware diff with full function boundaries");
+    println!("  fetch     Show compressed fetch summary (new branches, tags, pruned)");
     println!("  log       Show compressed commit log");
     println!();
     println!("Global git flags (before subcommand):");
@@ -90,6 +93,8 @@ fn print_help() {
     println!("  skim git diff --cached");
     println!("  skim git diff --mode structure");
     println!("  skim git diff main..feature --json");
+    println!("  skim git fetch");
+    println!("  skim git fetch --prune");
     println!("  skim git log -n 5");
     println!("  skim git diff --help                   Diff-specific options");
 }
@@ -220,10 +225,15 @@ fn run_passthrough(
 ///
 /// Callers are responsible for baking global flags into `subcmd_args` before
 /// calling this function.
-fn run_parsed_command<F>(
+///
+/// When `combine_stderr` is `true`, the parser receives `stderr + stdout`
+/// combined. Git fetch writes its output to stderr, so fetch uses `true`;
+/// all other subcommands use `false` (stdout only).
+pub(super) fn run_parsed_command<F>(
     subcmd_args: &[String],
     show_stats: bool,
     output_format: OutputFormat,
+    combine_stderr: bool,
     parser: F,
 ) -> anyhow::Result<ExitCode>
 where
@@ -244,7 +254,14 @@ where
         return Ok(map_exit_code(output.exit_code));
     }
 
-    let result = parser(&output.stdout);
+    // Git fetch writes to stderr; other subcommands write to stdout.
+    let raw: String = if combine_stderr {
+        format!("{}\n{}", output.stderr, output.stdout)
+    } else {
+        output.stdout
+    };
+
+    let result = parser(&raw);
     let result_str = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
@@ -260,7 +277,7 @@ where
     };
 
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&output.stdout, &result_str);
+        let (orig, comp) = crate::process::count_token_pair(&raw, &result_str);
         crate::process::report_token_stats(orig, comp, "");
     }
 
@@ -268,7 +285,7 @@ where
     // Guard to avoid allocations when analytics are disabled.
     if crate::analytics::is_analytics_enabled() {
         crate::analytics::try_record_command(
-            output.stdout,
+            raw,
             result_str,
             format!("skim git {}", subcmd_args.join(" ")),
             crate::analytics::CommandType::Git,

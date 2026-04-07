@@ -1,0 +1,11 @@
+remote: Enumerating objects: 15, done.
+remote: Counting objects: 100% (15/15), done.
+remote: Compressing objects: 100% (8/8), done.
+remote: Total 10 (delta 5), reused 7 (delta 3), pack-reused 0
+Unpacking objects: 100% (10/10), 2.50 KiB | 512.00 KiB/s, done.
+From github.com:user/repo
+   abc1234..def5678  main       -> origin/main
+   111aaaa..222bbbb  develop    -> origin/develop
+ * [new branch]      feature/x  -> origin/feature/x
+ * [new branch]      feature/y  -> origin/feature/y
+ * [new tag]         v2.3.0     -> v2.3.0

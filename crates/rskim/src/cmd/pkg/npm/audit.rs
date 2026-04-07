@@ -51,7 +51,10 @@ fn parse_audit(output: &CommandOutput) -> ParseResult<PkgResult> {
     // Tier 2: Regex
     let combined = combine_output(output);
     if let Some(result) = try_parse_audit_regex(&combined) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(
+            result,
+            vec!["npm audit: JSON parse failed, using regex".to_string()],
+        );
     }
 
     // Tier 3: Passthrough
