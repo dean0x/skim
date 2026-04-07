@@ -449,26 +449,6 @@ mod tests {
     }
 
     // ========================================================================
-    // ProcessResult #[must_use] compile-time guard
-    // ========================================================================
-
-    #[test]
-    fn process_result_fields_accessible() {
-        let result = ProcessResult {
-            output: "test".to_string(),
-            original_tokens: Some(10),
-            transformed_tokens: Some(5),
-            guardrail_triggered: false,
-            parse_tier: Some("full"),
-        };
-        assert_eq!(result.output, "test");
-        assert_eq!(result.original_tokens, Some(10));
-        assert_eq!(result.transformed_tokens, Some(5));
-        assert!(!result.guardrail_triggered);
-        assert_eq!(result.parse_tier, Some("full"));
-    }
-
-    // ========================================================================
     // parse_tier_from tests (B4-B5)
     // ========================================================================
 

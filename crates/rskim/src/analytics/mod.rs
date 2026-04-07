@@ -713,7 +713,7 @@ pub(crate) fn try_record_command(
         command_type,
         duration,
         cwd,
-        parse_tier.map(|s| s.to_string()),
+        parse_tier.map(str::to_string),
     );
 }
 
@@ -751,7 +751,7 @@ pub(crate) fn try_record_command_with_counts(
         project_path: cwd,
         mode: None,
         language: None,
-        parse_tier: parse_tier.map(|s| s.to_string()),
+        parse_tier: parse_tier.map(str::to_string),
     });
 }
 

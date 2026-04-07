@@ -387,15 +387,12 @@ fn render_daily_trend(w: &mut dyn Write, daily: &[crate::analytics::DailyStats])
     if daily.is_empty() {
         return Ok(());
     }
+    let first = daily.iter().map(|d| d.date.as_str()).min().unwrap_or("");
+    let last = daily.iter().map(|d| d.date.as_str()).max().unwrap_or("");
     writeln!(w, "{}", section_header("Daily Trend (tokens saved)"))?;
     writeln!(w)?;
-    let sparkline = render_sparkline(daily);
-    if !sparkline.is_empty() {
-        let first = daily.iter().map(|d| d.date.as_str()).min().unwrap_or("");
-        let last = daily.iter().map(|d| d.date.as_str()).max().unwrap_or("");
-        writeln!(w, "  {sparkline}")?;
-        writeln!(w, "  {} to {}", first.dimmed(), last.dimmed())?;
-    }
+    writeln!(w, "  {}", render_sparkline(daily))?;
+    writeln!(w, "  {} to {}", first.dimmed(), last.dimmed())?;
     writeln!(w)?;
     Ok(())
 }
@@ -819,9 +816,9 @@ mod tests {
         assert_eq!(summary["tokens_saved"], 70_000);
         assert_eq!(summary["avg_savings_pct"], 70.0);
         // Verify breakdowns are present
-        assert!(parsed["by_command"].as_array().unwrap().len() == 1);
-        assert!(parsed["by_language"].as_array().unwrap().len() == 1);
-        assert!(parsed["by_mode"].as_array().unwrap().len() == 1);
+        assert_eq!(parsed["by_command"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["by_language"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["by_mode"].as_array().unwrap().len(), 1);
         // No cost_estimate when show_cost is false
         assert!(parsed.get("cost_estimate").is_none());
     }
