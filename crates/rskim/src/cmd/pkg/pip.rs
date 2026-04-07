@@ -239,7 +239,7 @@ fn parse_list(output: &CommandOutput) -> ParseResult<PkgResult> {
     // Tier 2: Regex
     let combined = super::combine_output(output);
     if let Some(result) = try_parse_list_regex(&combined) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(result, vec!["pip: structured parse failed, using regex".to_string()]);
     }
 
     // Tier 3: Passthrough

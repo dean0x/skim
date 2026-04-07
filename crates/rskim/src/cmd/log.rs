@@ -223,7 +223,7 @@ fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
 
     // Try Tier 2: regex-based log formats
     if let Some(result) = try_parse_regex_logs(input, flags) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(result, vec!["log: no structured entries found, using regex".to_string()]);
     }
 
     // Tier 3: passthrough

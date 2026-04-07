@@ -171,7 +171,7 @@ fn parse(raw: &str) -> ParseResult<TestResult> {
 
     // Tier 2: Try regex fallback
     if let Some(result) = try_parse_regex(raw) {
-        return ParseResult::Degraded(result, vec!["regex fallback".to_string()]);
+        return ParseResult::Degraded(result, vec!["vitest: JSON parse failed, using regex".to_string()]);
     }
 
     // Tier 3: Passthrough
@@ -665,7 +665,7 @@ mod tests {
             assert_eq!(test_result.summary.pass, 3);
             assert_eq!(test_result.summary.fail, 0);
             assert_eq!(test_result.summary.skip, 0);
-            assert!(markers.contains(&"regex fallback".to_string()));
+            assert!(markers.contains(&"vitest: JSON parse failed, using regex".to_string()));
         }
     }
 

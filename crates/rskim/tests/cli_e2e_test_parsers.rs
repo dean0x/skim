@@ -5,8 +5,8 @@
 //!
 //! Tier behavior reference (from emit_markers in output/mod.rs):
 //! - Full: no stderr markers
-//! - Degraded: "[warning] ..." on stderr
-//! - Passthrough: "[notice] output passed through without parsing" on stderr
+//! - Degraded: "[skim:warning] ..." on stderr (only with --debug)
+//! - Passthrough: "[skim:notice] output passed through without parsing" on stderr (only with --debug)
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -59,13 +59,13 @@ fn test_cargo_nextest_pass_passthrough_via_stdin() {
     // Without "nextest" in args, nextest output hits passthrough tier
     let fixture = include_str!("fixtures/cmd/test/cargo_nextest_pass.txt");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["--debug", "test", "cargo"])
         .write_stdin(fixture)
         .assert()
         .success()
         // Content is passed through as-is
         .stdout(predicate::str::contains("PASS"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 #[test]
@@ -73,13 +73,13 @@ fn test_cargo_nextest_fail_passthrough_via_stdin() {
     // Without "nextest" in args, nextest output hits passthrough tier
     let fixture = include_str!("fixtures/cmd/test/cargo_nextest_fail.txt");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["--debug", "test", "cargo"])
         .write_stdin(fixture)
         .assert()
         // Exit code 0 from synthetic stdin exit code
         .code(0)
         .stdout(predicate::str::contains("FAIL"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================
@@ -93,12 +93,12 @@ fn test_cargo_tier2_regex_degraded() {
     // so the process exits 0 when tests pass.
     let text_input = "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured";
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["--debug", "test", "cargo"])
         .write_stdin(text_input)
         .assert()
         .success()
         .stdout(predicate::str::contains("PASS: 5"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -109,24 +109,24 @@ fn test_cargo_tier2_regex_degraded() {
 fn test_cargo_tier3_passthrough_garbage_input() {
     let fixture = include_str!("fixtures/cmd/test/cargo_passthrough.txt");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["--debug", "test", "cargo"])
         .write_stdin(fixture)
         .assert()
         // Passthrough preserves raw content on stdout
         .stdout(predicate::str::contains("This is not cargo test output"))
-        // Passthrough emits [notice] on stderr
-        .stderr(predicate::str::contains("[notice]"));
+        // Passthrough emits [skim:notice] on stderr when --debug is set
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 #[test]
 fn test_cargo_passthrough_preserves_raw_content() {
     let garbage = "completely unparseable output\nno json, no regex match\n";
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["--debug", "test", "cargo"])
         .write_stdin(garbage)
         .assert()
         .stdout(predicate::str::contains("completely unparseable output"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================
@@ -177,24 +177,24 @@ fn test_vitest_tier2_regex_pipe_format() {
     // Pipe-format summary triggers tier 2 regex
     let input = "Tests  3 passed | 0 failed | 3 total\n";
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["--debug", "test", "vitest"])
         .write_stdin(input)
         .assert()
         .success()
         .stdout(predicate::str::contains("PASS: 3"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 #[test]
 fn test_vitest_tier2_regex_fail_fixture() {
     let fixture = include_str!("fixtures/cmd/test/vitest_regex_fail.txt");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["--debug", "test", "vitest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
         .stdout(predicate::str::contains("FAIL: 1"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -204,10 +204,10 @@ fn test_vitest_tier2_regex_fail_fixture() {
 #[test]
 fn test_vitest_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["--debug", "test", "vitest"])
         .write_stdin("random garbage not vitest output\n")
         .assert()
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================
@@ -260,10 +260,10 @@ fn test_pytest_tier1_mixed() {
 #[test]
 fn test_pytest_passthrough_garbage() {
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["--debug", "test", "pytest"])
         .write_stdin("random garbage not pytest output\n")
         .assert()
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 #[test]
@@ -274,4 +274,36 @@ fn test_pytest_passthrough_preserves_raw() {
         .write_stdin(garbage)
         .assert()
         .stdout(predicate::str::contains("some unrecognized tool output"));
+}
+
+// ============================================================================
+// Silent stderr without --debug
+// ============================================================================
+
+/// Verify that degraded/passthrough output produces NO stderr markers when
+/// --debug is not set (the default). This is a subprocess-isolated test so
+/// AtomicBool state from other tests does not interfere.
+#[test]
+fn test_vitest_degraded_silent_without_debug() {
+    let input = "Tests  3 passed | 0 failed | 3 total\n";
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(input)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PASS: 3"))
+        // No --debug flag: stderr must contain no skim markers
+        .stderr(predicate::str::contains("[skim:warning]").not())
+        .stderr(predicate::str::contains("[skim:notice]").not());
+}
+
+#[test]
+fn test_vitest_passthrough_silent_without_debug() {
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin("random garbage not vitest output\n")
+        .assert()
+        // No --debug flag: no markers on stderr
+        .stderr(predicate::str::contains("[skim:notice]").not())
+        .stderr(predicate::str::contains("[skim:warning]").not());
 }

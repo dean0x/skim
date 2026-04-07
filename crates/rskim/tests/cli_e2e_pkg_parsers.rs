@@ -5,8 +5,8 @@
 //!
 //! Tier behavior reference:
 //! - Full: no stderr markers
-//! - Degraded: "[warning] ..." on stderr
-//! - Passthrough: "[notice] output passed through without parsing" on stderr
+//! - Degraded: "[skim:warning] ..." on stderr (only with --debug)
+//! - Passthrough: "[skim:notice] output passed through without parsing" on stderr (only with --debug)
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -74,13 +74,13 @@ fn test_npm_install_tier1_json() {
 fn test_npm_install_tier2_regex() {
     let fixture = include_str!("fixtures/cmd/pkg/npm_install_text.txt");
     skim_cmd()
-        .args(["pkg", "npm", "install"])
+        .args(["--debug", "pkg", "npm", "install"])
         .write_stdin(fixture)
         .assert()
         .success()
         .stdout(predicate::str::contains("PKG INSTALL | npm"))
         .stdout(predicate::str::contains("added: 127"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -90,12 +90,12 @@ fn test_npm_install_tier2_regex() {
 #[test]
 fn test_npm_install_passthrough() {
     skim_cmd()
-        .args(["pkg", "npm", "install"])
+        .args(["--debug", "pkg", "npm", "install"])
         .write_stdin("completely unparseable output")
         .assert()
         .success()
         .stdout(predicate::str::contains("completely unparseable"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================
@@ -322,12 +322,12 @@ fn test_cargo_audit_clean_json() {
 fn test_cargo_audit_tier2_regex() {
     let text = "Crate:   buffer-utils\nVersion: 0.3.1\nTitle:   Buffer overflow\nID:      RUSTSEC-2024-0001";
     skim_cmd()
-        .args(["pkg", "cargo", "audit"])
+        .args(["--debug", "pkg", "cargo", "audit"])
         .write_stdin(text)
         .assert()
         .success()
         .stdout(predicate::str::contains("PKG AUDIT | cargo"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -337,10 +337,10 @@ fn test_cargo_audit_tier2_regex() {
 #[test]
 fn test_cargo_audit_passthrough() {
     skim_cmd()
-        .args(["pkg", "cargo", "audit"])
+        .args(["--debug", "pkg", "cargo", "audit"])
         .write_stdin("completely unparseable output")
         .assert()
         .success()
         .stdout(predicate::str::contains("completely unparseable"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }

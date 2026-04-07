@@ -5,8 +5,8 @@
 //!
 //! Tier behavior reference (from emit_markers in output/mod.rs):
 //! - Full: no stderr markers
-//! - Degraded: "[warning] ..." on stderr
-//! - Passthrough: "[notice] output passed through without parsing" on stderr
+//! - Degraded: "[skim:warning] ..." on stderr (only with --debug)
+//! - Passthrough: "[skim:notice] output passed through without parsing" on stderr (only with --debug)
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -51,12 +51,12 @@ fn test_eslint_tier1_json_fail() {
 fn test_eslint_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/eslint_text.txt");
     skim_cmd()
-        .args(["lint", "eslint"])
+        .args(["--debug", "lint", "eslint"])
         .write_stdin(fixture)
         .assert()
         .success()
         .stdout(predicate::str::contains("LINT:"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -66,12 +66,12 @@ fn test_eslint_tier2_regex_degraded() {
 #[test]
 fn test_eslint_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["lint", "eslint"])
+        .args(["--debug", "lint", "eslint"])
         .write_stdin("random garbage not eslint output\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("random garbage"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================
@@ -126,12 +126,12 @@ fn test_ruff_tier1_json_fail() {
 fn test_ruff_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_text.txt");
     skim_cmd()
-        .args(["lint", "ruff"])
+        .args(["--debug", "lint", "ruff"])
         .write_stdin(fixture)
         .assert()
         .success()
         .stdout(predicate::str::contains("LINT:"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -141,12 +141,12 @@ fn test_ruff_tier2_regex_degraded() {
 #[test]
 fn test_ruff_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["lint", "ruff"])
+        .args(["--debug", "lint", "ruff"])
         .write_stdin("random garbage not ruff output\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("random garbage"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================
@@ -189,12 +189,12 @@ fn test_mypy_tier1_json_fail() {
 fn test_mypy_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/mypy_text.txt");
     skim_cmd()
-        .args(["lint", "mypy"])
+        .args(["--debug", "lint", "mypy"])
         .write_stdin(fixture)
         .assert()
         .success()
         .stdout(predicate::str::contains("LINT:"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -204,12 +204,12 @@ fn test_mypy_tier2_regex_degraded() {
 #[test]
 fn test_mypy_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["lint", "mypy"])
+        .args(["--debug", "lint", "mypy"])
         .write_stdin("random garbage not mypy output\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("random garbage"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================
@@ -253,12 +253,12 @@ fn test_golangci_tier1_json_fail() {
 fn test_golangci_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_text.txt");
     skim_cmd()
-        .args(["lint", "golangci"])
+        .args(["--debug", "lint", "golangci"])
         .write_stdin(fixture)
         .assert()
         .success()
         .stdout(predicate::str::contains("LINT:"))
-        .stderr(predicate::str::contains("[warning]"));
+        .stderr(predicate::str::contains("[skim:warning]"));
 }
 
 // ============================================================================
@@ -268,12 +268,12 @@ fn test_golangci_tier2_regex_degraded() {
 #[test]
 fn test_golangci_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["lint", "golangci"])
+        .args(["--debug", "lint", "golangci"])
         .write_stdin("random garbage not golangci output\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("random garbage"))
-        .stderr(predicate::str::contains("[notice]"));
+        .stderr(predicate::str::contains("[skim:notice]"));
 }
 
 // ============================================================================

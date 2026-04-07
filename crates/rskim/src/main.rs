@@ -13,6 +13,7 @@ mod analytics;
 mod cache;
 mod cascade;
 mod cmd;
+mod debug;
 mod multi;
 mod output;
 mod process;
@@ -296,6 +297,10 @@ struct Args {
     /// Disable analytics recording for this invocation
     #[arg(long, help = "Disable analytics recording")]
     disable_analytics: bool,
+
+    /// Enable debug output (warnings/notices on stderr)
+    #[arg(long, global = true)]
+    debug: bool,
 }
 
 /// Build the clap `Command` from `Args` for use by shell completion generation.
@@ -469,6 +474,11 @@ fn main() -> ExitCode {
     // instead of env::set_var to avoid unsoundness in multi-threaded context.
     if std::env::args().any(|a| a == "--disable-analytics") {
         analytics::force_disable_analytics();
+    }
+
+    // Extract --debug before routing so it applies to all subcommands.
+    if std::env::args().any(|a| a == "--debug") {
+        debug::force_enable_debug();
     }
 
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
@@ -709,6 +719,7 @@ mod tests {
             "--clear-cache",
             "--show-stats",
             "--disable-analytics",
+            "--debug",
         ];
 
         for flag in boolean_flags {
