@@ -194,7 +194,7 @@ fn format_tokens(n: u64) -> String {
 /// Apply the standard efficiency color to a pre-formatted string.
 ///
 /// All values render green — a single unified color for a cleaner visual.
-fn apply_efficiency_color(s: String, _pct: f64) -> ColoredString {
+fn apply_efficiency_color(s: String) -> ColoredString {
     s.green()
 }
 
@@ -204,7 +204,7 @@ fn apply_efficiency_color(s: String, _pct: f64) -> ColoredString {
 /// before applying color so ANSI escape sequences do not affect alignment.
 fn color_pct(pct: f64) -> ColoredString {
     let clamped = pct.clamp(0.0, 100.0);
-    apply_efficiency_color(format!("{clamped:>5.1}%"), clamped)
+    apply_efficiency_color(format!("{clamped:>5.1}%"))
 }
 
 /// Render a block-character progress bar.
@@ -215,7 +215,7 @@ fn render_bar(pct: f64, width: usize) -> String {
     let clamped = pct.clamp(0.0, 100.0);
     let filled = ((clamped / 100.0) * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
-    let colored_fill = apply_efficiency_color("\u{2588}".repeat(filled), clamped);
+    let colored_fill = apply_efficiency_color("\u{2588}".repeat(filled));
     format!("[{}{}]", colored_fill, "\u{2591}".repeat(empty))
 }
 
@@ -426,11 +426,8 @@ fn run_dashboard(
         writeln!(w)?;
         let sparkline = render_sparkline(&daily);
         if !sparkline.is_empty() {
-            // Sort ascending for display labels
-            let mut sorted = daily.clone();
-            sorted.sort_by(|a, b| a.date.cmp(&b.date));
-            let first = sorted.first().map(|d| d.date.as_str()).unwrap_or("");
-            let last = sorted.last().map(|d| d.date.as_str()).unwrap_or("");
+            let first = daily.iter().map(|d| d.date.as_str()).min().unwrap_or("");
+            let last = daily.iter().map(|d| d.date.as_str()).max().unwrap_or("");
             writeln!(w, "  {sparkline}")?;
             writeln!(w, "  {} to {}", first.dimmed(), last.dimmed())?;
         }

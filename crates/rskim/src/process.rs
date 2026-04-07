@@ -223,8 +223,7 @@ fn run_transform(
 
             // Use transform_with_quality when we can identify the language to get has_errors.
             if let Some(lang) = language {
-                let (output, has_errors) =
-                    transform_with_quality(contents, lang, options.mode, &config)?;
+                let (output, has_errors) = transform_with_quality(contents, lang, &config)?;
                 Ok((output, options.mode, has_errors))
             } else {
                 // Language detection failed — try auto-detect via path extension.
@@ -294,8 +293,7 @@ pub(crate) fn process_stdin(
         }
         None => {
             let config = cascade::build_config(options.mode, &options.trunc);
-            let (output, has_errors) =
-                transform_with_quality(&buffer, language, options.mode, &config)?;
+            let (output, has_errors) = transform_with_quality(&buffer, language, &config)?;
             (output, has_errors)
         }
     };

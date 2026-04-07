@@ -143,14 +143,13 @@ pub fn transform_with_config(
 /// use rskim_core::{transform_with_quality, Language, Mode, TransformConfig};
 ///
 /// let config = TransformConfig::with_mode(Mode::Structure);
-/// let (content, has_errors) = transform_with_quality("fn main() {}", Language::Rust, Mode::Structure, &config)?;
+/// let (content, has_errors) = transform_with_quality("fn main() {}", Language::Rust, &config)?;
 /// assert!(!has_errors);
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn transform_with_quality(
     source: &str,
     language: Language,
-    _mode: Mode,
     config: &TransformConfig,
 ) -> Result<(String, bool)> {
     language.transform_source(source, config)
@@ -448,7 +447,7 @@ mod tests {
         let source = "function greet(name: string): void { console.log(name); }";
         let config = TransformConfig::with_mode(Mode::Structure);
         let (content, has_errors) =
-            transform_with_quality(source, Language::TypeScript, Mode::Structure, &config)
+            transform_with_quality(source, Language::TypeScript, &config)
                 .expect("transform_with_quality should succeed for valid TypeScript");
         assert!(!has_errors, "valid source should have has_errors=false");
         assert!(content.contains("function greet"), "output should preserve signature");
@@ -459,7 +458,7 @@ mod tests {
         let source = "fn broken {{ this is not valid rust";
         let config = TransformConfig::with_mode(Mode::Structure);
         let (_content, has_errors) =
-            transform_with_quality(source, Language::Rust, Mode::Structure, &config)
+            transform_with_quality(source, Language::Rust, &config)
                 .expect("transform_with_quality should not fail outright on broken source");
         assert!(has_errors, "broken syntax should have has_errors=true");
     }
@@ -470,7 +469,7 @@ mod tests {
         let source = r#"{"key": "value", "n": 42}"#;
         let config = TransformConfig::with_mode(Mode::Structure);
         let (_content, has_errors) =
-            transform_with_quality(source, Language::Json, Mode::Structure, &config)
+            transform_with_quality(source, Language::Json, &config)
                 .expect("valid JSON should transform without failure");
         assert!(!has_errors, "serde-based JSON should always report has_errors=false");
     }
@@ -481,7 +480,7 @@ mod tests {
         let source = "fn broken {{ this is not valid rust";
         let config = TransformConfig::with_mode(Mode::Full);
         let (content, has_errors) =
-            transform_with_quality(source, Language::Rust, Mode::Full, &config)
+            transform_with_quality(source, Language::Rust, &config)
                 .expect("Full mode passthrough should always succeed");
         assert!(!has_errors, "Full mode (passthrough) should always report has_errors=false");
         assert_eq!(content, source, "Full mode should return source unchanged");
