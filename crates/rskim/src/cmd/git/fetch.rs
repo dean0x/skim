@@ -74,18 +74,18 @@ impl FetchCategories {
 
     /// Add an entry to a submodule section in O(1) time.
     fn add_submodule_entry(&mut self, sub: &str, entry: String) {
-        if !self.submodule_map.contains_key(sub) {
+        let entries = self.submodule_map.entry(sub.to_string()).or_insert_with(|| {
             self.submodule_order.push(sub.to_string());
-            self.submodule_map.insert(sub.to_string(), Vec::new());
-        }
-        self.submodule_map.get_mut(sub).unwrap().push(entry);
+            Vec::new()
+        });
+        entries.push(entry);
     }
 
     /// Iterate submodule sections in the order they were first encountered.
-    fn submodule_sections(&self) -> impl Iterator<Item = (&str, &Vec<String>)> {
+    fn submodule_sections(&self) -> impl Iterator<Item = (&str, &[String])> {
         self.submodule_order
             .iter()
-            .filter_map(|name| self.submodule_map.get(name).map(|v| (name.as_str(), v)))
+            .filter_map(|name| self.submodule_map.get(name).map(|v| (name.as_str(), v.as_slice())))
     }
 }
 
