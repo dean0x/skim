@@ -157,33 +157,3 @@ pub(super) fn command() -> clap::Command {
         )
 }
 
-// ============================================================================
-// Unit tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    // sanitize_for_display is now in crate::cmd; tests remain here as
-    // a usage-site smoke-check to catch regressions at the call site.
-    #[test]
-    fn test_sanitize_for_display_clean_input() {
-        assert_eq!(
-            super::super::sanitize_for_display("hello-world"),
-            "hello-world"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_for_display_rejects_non_ascii() {
-        let input = "tool\x1b[31mred\x1b[0m";
-        let sanitized = super::super::sanitize_for_display(input);
-        assert!(!sanitized.contains('\x1b'));
-    }
-
-    #[test]
-    fn test_sanitize_for_display_truncates_at_64() {
-        let long_input = "a".repeat(100);
-        let sanitized = super::super::sanitize_for_display(&long_input);
-        assert_eq!(sanitized.len(), 64);
-    }
-}

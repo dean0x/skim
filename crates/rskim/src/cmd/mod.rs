@@ -446,29 +446,25 @@ mod tests {
         let sanitized = sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
     }
-}
-
-#[cfg(test)]
-mod stdin_detection_tests {
-    use super::should_use_stdin;
 
     #[test]
-    fn with_args_never_reads_stdin() {
+    fn should_use_stdin_with_args_never_reads_stdin() {
         let args = vec!["run".to_string(), "test.ts".to_string()];
         assert!(!should_use_stdin(&args), "args present → run command, never stdin");
     }
 
     #[test]
-    fn with_single_arg_never_reads_stdin() {
+    fn should_use_stdin_with_single_arg_never_reads_stdin() {
         let args = vec!["--help".to_string()];
         assert!(!should_use_stdin(&args), "single arg → run command");
     }
 
     #[test]
-    fn empty_args_in_pipe_reads_stdin() {
-        // When running under `cargo test`, stdin is a pipe (not a terminal),
-        // so empty args triggers the stdin path — this is the correct behavior.
+    fn should_use_stdin_empty_args_in_pipe_reads_stdin() {
+        // cargo test runs with a non-terminal stdin, so empty args here triggers
+        // the stdin path — verifying the helper's AND condition fires correctly.
         let args: Vec<String> = vec![];
         assert!(should_use_stdin(&args), "no args + pipe → read stdin");
     }
 }
+

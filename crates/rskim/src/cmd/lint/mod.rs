@@ -32,8 +32,6 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     }
 
     let (filtered_args, show_stats) = extract_show_stats(args);
-
-    // Extract --json flag
     let (filtered_args, json_output) = super::extract_json_flag(&filtered_args);
 
     let Some((linter_name, linter_args)) = filtered_args.split_first() else {

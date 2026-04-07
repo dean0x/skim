@@ -56,12 +56,6 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
         inject_flag_before_separator(&mut cmd_args, "--message-format=json");
     }
 
-    // Determine whether to read from stdin or execute the command.
-    // Only use stdin when:
-    // 1. stdin is not a terminal (i.e., data is being piped), AND
-    // 2. no user args were provided (bare `skim test cargo` with piped data)
-    // This prevents empty-stdin issues when test frameworks (e.g., assert_cmd)
-    // pipe stdin without providing data.
     let use_stdin = crate::cmd::should_use_stdin(args);
 
     run_parsed_command_with_mode(
