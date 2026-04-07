@@ -1271,7 +1271,10 @@ mod tests {
             "truncation walked back to char boundary: stored {} bytes",
             stored.len()
         );
-        assert!(stored.is_ascii() || stored.chars().all(|_| true), "stored value must be valid UTF-8");
+        assert!(
+            stored.is_ascii() || stored.chars().all(|_| true),
+            "stored value must be valid UTF-8"
+        );
     }
 
     // ========================================================================
@@ -1315,7 +1318,10 @@ mod tests {
         let cleaned = db.clean_invalid_records().unwrap();
         assert_eq!(cleaned, 1, "should remove exactly the 1 invalid record");
         let summary = db.query_summary(None).unwrap();
-        assert_eq!(summary.invocations, 1, "only the valid record should remain");
+        assert_eq!(
+            summary.invocations, 1,
+            "only the valid record should remain"
+        );
     }
 
     #[test]

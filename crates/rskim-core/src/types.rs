@@ -200,9 +200,21 @@ impl Language {
             // Serde-based languages use their own parsers; tree-sitter languages
             // handle truncation inside transform_tree.
             match self {
-                Self::Json => (crate::transform::json::transform_json(source)?, false, false),
-                Self::Yaml => (crate::transform::yaml::transform_yaml(source)?, false, false),
-                Self::Toml => (crate::transform::toml::transform_toml(source)?, false, false),
+                Self::Json => (
+                    crate::transform::json::transform_json(source)?,
+                    false,
+                    false,
+                ),
+                Self::Yaml => (
+                    crate::transform::yaml::transform_yaml(source)?,
+                    false,
+                    false,
+                ),
+                Self::Toml => (
+                    crate::transform::toml::transform_toml(source)?,
+                    false,
+                    false,
+                ),
                 _ => {
                     let mut parser = Parser::new(self)?;
                     let tree = parser.parse(source)?;

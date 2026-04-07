@@ -371,19 +371,45 @@ fn render_header(w: &mut dyn Write, period: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render_summary(w: &mut dyn Write, summary: &crate::analytics::AnalyticsSummary) -> anyhow::Result<()> {
+fn render_summary(
+    w: &mut dyn Write,
+    summary: &crate::analytics::AnalyticsSummary,
+) -> anyhow::Result<()> {
     writeln!(w, "{}", section_header("Summary"))?;
-    writeln!(w, "  Invocations:    {}", tokens::format_number(summary.invocations as usize))?;
-    writeln!(w, "  Raw tokens:     {}", tokens::format_number(summary.raw_tokens as usize))?;
-    writeln!(w, "  Compressed:     {}", tokens::format_number(summary.compressed_tokens as usize))?;
-    writeln!(w, "  Tokens saved:   {}", tokens::format_number(summary.tokens_saved as usize).green())?;
-    writeln!(w, "  Avg reduction:  {}", color_pct(summary.avg_savings_pct))?;
+    writeln!(
+        w,
+        "  Invocations:    {}",
+        tokens::format_number(summary.invocations as usize)
+    )?;
+    writeln!(
+        w,
+        "  Raw tokens:     {}",
+        tokens::format_number(summary.raw_tokens as usize)
+    )?;
+    writeln!(
+        w,
+        "  Compressed:     {}",
+        tokens::format_number(summary.compressed_tokens as usize)
+    )?;
+    writeln!(
+        w,
+        "  Tokens saved:   {}",
+        tokens::format_number(summary.tokens_saved as usize).green()
+    )?;
+    writeln!(
+        w,
+        "  Avg reduction:  {}",
+        color_pct(summary.avg_savings_pct)
+    )?;
     writeln!(w, "  {}", render_bar(summary.avg_savings_pct, 20))?;
     writeln!(w)?;
     Ok(())
 }
 
-fn render_daily_trend(w: &mut dyn Write, daily: &[crate::analytics::DailyStats]) -> anyhow::Result<()> {
+fn render_daily_trend(
+    w: &mut dyn Write,
+    daily: &[crate::analytics::DailyStats],
+) -> anyhow::Result<()> {
     if daily.is_empty() {
         return Ok(());
     }
@@ -397,7 +423,10 @@ fn render_daily_trend(w: &mut dyn Write, daily: &[crate::analytics::DailyStats])
     Ok(())
 }
 
-fn render_by_command(w: &mut dyn Write, by_command: &[crate::analytics::CommandStats]) -> anyhow::Result<()> {
+fn render_by_command(
+    w: &mut dyn Write,
+    by_command: &[crate::analytics::CommandStats],
+) -> anyhow::Result<()> {
     if by_command.is_empty() {
         return Ok(());
     }
@@ -420,7 +449,10 @@ fn render_by_command(w: &mut dyn Write, by_command: &[crate::analytics::CommandS
     Ok(())
 }
 
-fn render_by_language(w: &mut dyn Write, by_language: &[crate::analytics::LanguageStats]) -> anyhow::Result<()> {
+fn render_by_language(
+    w: &mut dyn Write,
+    by_language: &[crate::analytics::LanguageStats],
+) -> anyhow::Result<()> {
     if by_language.is_empty() {
         return Ok(());
     }
@@ -443,7 +475,10 @@ fn render_by_language(w: &mut dyn Write, by_language: &[crate::analytics::Langua
     Ok(())
 }
 
-fn render_by_mode(w: &mut dyn Write, by_mode: &[crate::analytics::ModeStats]) -> anyhow::Result<()> {
+fn render_by_mode(
+    w: &mut dyn Write,
+    by_mode: &[crate::analytics::ModeStats],
+) -> anyhow::Result<()> {
     if by_mode.is_empty() {
         return Ok(());
     }
@@ -466,7 +501,10 @@ fn render_by_mode(w: &mut dyn Write, by_mode: &[crate::analytics::ModeStats]) ->
     Ok(())
 }
 
-fn render_parse_quality(w: &mut dyn Write, tier_dist: &crate::analytics::TierDistribution) -> anyhow::Result<()> {
+fn render_parse_quality(
+    w: &mut dyn Write,
+    tier_dist: &crate::analytics::TierDistribution,
+) -> anyhow::Result<()> {
     writeln!(w, "{}", section_header("Parse Quality"))?;
     if tier_dist.full_pct > 0.0 || tier_dist.degraded_pct > 0.0 || tier_dist.passthrough_pct > 0.0 {
         writeln!(w, "  Full:        {:.1}%", tier_dist.full_pct)?;
@@ -482,7 +520,11 @@ fn render_parse_quality(w: &mut dyn Write, tier_dist: &crate::analytics::TierDis
 fn render_cost_section(w: &mut dyn Write, tokens_saved: u64) -> anyhow::Result<()> {
     let pricing = PricingModel::from_env_or_default();
     writeln!(w, "{}", section_header("Cost Estimates"))?;
-    writeln!(w, "  Rate:      ${:.2}/MTok ({})", pricing.input_cost_per_mtok, pricing.tier_name)?;
+    writeln!(
+        w,
+        "  Rate:      ${:.2}/MTok ({})",
+        pricing.input_cost_per_mtok, pricing.tier_name
+    )?;
     writeln!(w)?;
 
     for price_tier in PricingModel::all_tiers() {
@@ -524,7 +566,10 @@ fn run_dashboard(
     if summary.invocations == 0 {
         writeln!(w, "{}", "No analytics data found.".dimmed())?;
         writeln!(w)?;
-        writeln!(w, "Run skim commands to start collecting token savings data.")?;
+        writeln!(
+            w,
+            "Run skim commands to start collecting token savings data."
+        )?;
         writeln!(w, "Example: skim src/main.rs")?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -577,7 +622,10 @@ mod tests {
     fn test_color_pct_clamping() {
         // Negative clamps to 0.0
         let s = color_pct(-5.0).to_string();
-        assert!(s.contains("0.0%"), "negative should clamp to 0.0%, got: {s}");
+        assert!(
+            s.contains("0.0%"),
+            "negative should clamp to 0.0%, got: {s}"
+        );
         // Over 100 clamps to 100.0
         let s = color_pct(150.0).to_string();
         assert!(
@@ -1056,7 +1104,10 @@ mod tests {
         // Negative percentage should clamp to 0
         let bar = render_bar(-20.0, 10);
         let empty_count = bar.chars().filter(|&c| c == '░').count();
-        assert_eq!(empty_count, 10, "negative pct should clamp to 0% (all empty)");
+        assert_eq!(
+            empty_count, 10,
+            "negative pct should clamp to 0% (all empty)"
+        );
     }
 
     #[test]
@@ -1065,8 +1116,7 @@ mod tests {
         let bar = render_bar(150.0, 10);
         let fill_count = bar.chars().filter(|&c| c == '█').count();
         assert_eq!(
-            fill_count,
-            10,
+            fill_count, 10,
             "pct > 100 should clamp to 100% (all filled)"
         );
     }
@@ -1083,8 +1133,14 @@ mod tests {
         let bar = render_bar(50.0, 10);
         let fill_count = bar.chars().filter(|&c| c == '█').count();
         let empty_count = bar.chars().filter(|&c| c == '░').count();
-        assert_eq!(fill_count, 5, "50% bar (width 10) should have 5 filled cells");
-        assert_eq!(empty_count, 5, "50% bar (width 10) should have 5 empty cells");
+        assert_eq!(
+            fill_count, 5,
+            "50% bar (width 10) should have 5 filled cells"
+        );
+        assert_eq!(
+            empty_count, 5,
+            "50% bar (width 10) should have 5 empty cells"
+        );
     }
 
     // ========================================================================
@@ -1180,10 +1236,7 @@ mod tests {
     fn test_calendar_leap_year() {
         // Feb 28 → Mar 1 in 2024 (leap year)
         let dates = calendar_dates_between("2024-02-28", "2024-03-01");
-        assert_eq!(
-            dates,
-            vec!["2024-02-28", "2024-02-29", "2024-03-01"]
-        );
+        assert_eq!(dates, vec!["2024-02-28", "2024-02-29", "2024-03-01"]);
     }
 
     #[test]
@@ -1225,7 +1278,11 @@ mod tests {
     fn test_calendar_safety_cap() {
         // 365+ days apart should be capped at 100 entries
         let dates = calendar_dates_between("2026-01-01", "2027-12-31");
-        assert_eq!(dates.len(), 100, "safety cap should limit output to 100 dates");
+        assert_eq!(
+            dates.len(),
+            100,
+            "safety cap should limit output to 100 dates"
+        );
     }
 
     // ========================================================================
