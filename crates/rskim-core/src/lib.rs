@@ -125,6 +125,34 @@ pub fn transform_with_config(
 ) -> Result<String> {
     // ARCHITECTURE: Language encapsulates parsing strategy (tree-sitter vs serde_json)
     // This eliminates special-case conditionals - each language handles its own parsing
+    let (content, _has_errors) = language.transform_source(source, config)?;
+    Ok(content)
+}
+
+/// Transform source code and return both content and parse quality flag
+///
+/// Like `transform_with_config` but also returns whether the parser encountered
+/// syntax errors. Callers can use this to determine the `parse_tier`:
+/// - `Mode::Full` → "passthrough" (no transformation applied)
+/// - `has_errors == true` → "degraded" (syntax errors present)
+/// - `has_errors == false` → "full" (clean parse)
+///
+/// # Examples
+///
+/// ```no_run
+/// use rskim_core::{transform_with_quality, Language, Mode, TransformConfig};
+///
+/// let config = TransformConfig::with_mode(Mode::Structure);
+/// let (content, has_errors) = transform_with_quality("fn main() {}", Language::Rust, Mode::Structure, &config)?;
+/// assert!(!has_errors);
+/// # Ok::<(), rskim_core::SkimError>(())
+/// ```
+pub fn transform_with_quality(
+    source: &str,
+    language: Language,
+    _mode: Mode,
+    config: &TransformConfig,
+) -> Result<(String, bool)> {
     language.transform_source(source, config)
 }
 
@@ -388,6 +416,74 @@ mod tests {
         assert_eq!(detect_language("unknown"), None);
     }
 
-    // NOTE: Actual transformation tests require implementation
-    // These are placeholders for schema validation
+    // ========================================================================
+    // transform_with_quality tests (B3)
+    // ========================================================================
+
+    #[test]
+    fn test_transform_source_has_errors_false() {
+        // Valid TypeScript source should parse without errors
+        let source = "function add(a: number, b: number): number { return a + b; }";
+        let config = TransformConfig::with_mode(Mode::Structure);
+        let (content, has_errors) = Language::TypeScript
+            .transform_source(source, &config)
+            .expect("valid TypeScript should transform without failure");
+        assert!(!has_errors, "valid TypeScript source should have has_errors=false");
+        assert!(content.contains("function add"), "output should preserve signature");
+    }
+
+    #[test]
+    fn test_transform_source_has_errors_true() {
+        // Broken Rust syntax should trigger has_errors=true
+        let source = "fn broken {{ this is not valid rust";
+        let config = TransformConfig::with_mode(Mode::Structure);
+        let (_, has_errors) = Language::Rust
+            .transform_source(source, &config)
+            .expect("tree-sitter is error-tolerant and should not fail outright");
+        assert!(has_errors, "broken Rust syntax should have has_errors=true");
+    }
+
+    #[test]
+    fn test_transform_with_quality_valid_source() {
+        let source = "function greet(name: string): void { console.log(name); }";
+        let config = TransformConfig::with_mode(Mode::Structure);
+        let (content, has_errors) =
+            transform_with_quality(source, Language::TypeScript, Mode::Structure, &config)
+                .expect("transform_with_quality should succeed for valid TypeScript");
+        assert!(!has_errors, "valid source should have has_errors=false");
+        assert!(content.contains("function greet"), "output should preserve signature");
+    }
+
+    #[test]
+    fn test_transform_with_quality_broken_source() {
+        let source = "fn broken {{ this is not valid rust";
+        let config = TransformConfig::with_mode(Mode::Structure);
+        let (_content, has_errors) =
+            transform_with_quality(source, Language::Rust, Mode::Structure, &config)
+                .expect("transform_with_quality should not fail outright on broken source");
+        assert!(has_errors, "broken syntax should have has_errors=true");
+    }
+
+    #[test]
+    fn test_transform_with_quality_json_no_errors() {
+        // JSON uses serde parser — always reports no parse errors on success
+        let source = r#"{"key": "value", "n": 42}"#;
+        let config = TransformConfig::with_mode(Mode::Structure);
+        let (_content, has_errors) =
+            transform_with_quality(source, Language::Json, Mode::Structure, &config)
+                .expect("valid JSON should transform without failure");
+        assert!(!has_errors, "serde-based JSON should always report has_errors=false");
+    }
+
+    #[test]
+    fn test_transform_with_quality_full_mode_no_errors() {
+        // Full mode is passthrough for all languages — always no errors
+        let source = "fn broken {{ this is not valid rust";
+        let config = TransformConfig::with_mode(Mode::Full);
+        let (content, has_errors) =
+            transform_with_quality(source, Language::Rust, Mode::Full, &config)
+                .expect("Full mode passthrough should always succeed");
+        assert!(!has_errors, "Full mode (passthrough) should always report has_errors=false");
+        assert_eq!(content, source, "Full mode should return source unchanged");
+    }
 }

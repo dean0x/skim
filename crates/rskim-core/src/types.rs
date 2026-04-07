@@ -174,7 +174,16 @@ impl Language {
     ///
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
-    pub(crate) fn transform_source(self, source: &str, config: &TransformConfig) -> Result<String> {
+    /// Transform source code, returning `(content, has_errors)`.
+    ///
+    /// `has_errors` is `true` when the tree-sitter parser encountered syntax
+    /// errors in the source. For serde-based languages and passthrough paths
+    /// (Mode::Full) it is always `false` on success.
+    pub(crate) fn transform_source(
+        self,
+        source: &str,
+        config: &TransformConfig,
+    ) -> Result<(String, bool)> {
         debug_assert!(
             !(config.max_lines.is_some() && config.last_lines.is_some()),
             "max_lines and last_lines are mutually exclusive"
@@ -186,20 +195,21 @@ impl Language {
             || (matches!(config.mode, Mode::Minimal | Mode::Pseudo)
                 && (self.is_serde_based() || self == Self::Markdown));
 
-        let (result, tree_sitter_handled) = if is_passthrough {
-            (source.to_string(), false)
+        let (result, tree_sitter_handled, has_errors) = if is_passthrough {
+            (source.to_string(), false, false)
         } else {
             // Serde-based languages use their own parsers; tree-sitter languages
             // handle truncation inside transform_tree.
             match self {
-                Self::Json => (crate::transform::json::transform_json(source)?, false),
-                Self::Yaml => (crate::transform::yaml::transform_yaml(source)?, false),
-                Self::Toml => (crate::transform::toml::transform_toml(source)?, false),
+                Self::Json => (crate::transform::json::transform_json(source)?, false, false),
+                Self::Yaml => (crate::transform::yaml::transform_yaml(source)?, false, false),
+                Self::Toml => (crate::transform::toml::transform_toml(source)?, false, false),
                 _ => {
                     let mut parser = Parser::new(self)?;
                     let tree = parser.parse(source)?;
+                    let parse_errors = tree.root_node().has_error();
                     let r = crate::transform::transform_tree(source, &tree, self, config)?;
-                    (r, true)
+                    (r, true, parse_errors)
                 }
             }
         };
@@ -218,11 +228,13 @@ impl Language {
         };
 
         // Apply last_lines truncation as a post-processing step
-        if let Some(n) = config.last_lines {
-            crate::transform::truncate::simple_last_line_truncate(&result, self, n)
+        let result = if let Some(n) = config.last_lines {
+            crate::transform::truncate::simple_last_line_truncate(&result, self, n)?
         } else {
-            Ok(result)
-        }
+            result
+        };
+
+        Ok((result, has_errors))
     }
 }
 

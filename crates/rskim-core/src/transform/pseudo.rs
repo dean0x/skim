@@ -938,13 +938,14 @@ mod tests {
         // happens in Language::transform_source, not in transform_pseudo)
         let source = "# Heading\n\nSome **bold** text.\n";
         let config = TransformConfig::with_mode(Mode::Pseudo);
-        let result = Language::Markdown
+        let (result, has_errors) = Language::Markdown
             .transform_source(source, &config)
             .unwrap();
         assert_eq!(
             result, source,
             "Markdown should pass through unchanged in pseudo mode"
         );
+        assert!(!has_errors, "passthrough should not report parse errors");
     }
 
     // ========================================================================
