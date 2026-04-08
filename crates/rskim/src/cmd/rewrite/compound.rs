@@ -284,7 +284,6 @@ fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResul
         }
     }
 
-    let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
     let rewrite = try_rewrite(&token_refs)?;
 
     // Reconstruct: rewritten first segment | rest unchanged

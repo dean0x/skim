@@ -4,7 +4,7 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum RewriteCategory {
+pub(super) enum RewriteCategory {
     Test,
     Build,
     Git,
@@ -15,24 +15,24 @@ pub(crate) enum RewriteCategory {
     FileOps,
 }
 
-pub(crate) struct RewriteRule {
-    pub(crate) prefix: &'static [&'static str],
-    pub(crate) rewrite_to: &'static [&'static str],
-    pub(crate) skip_if_flag_prefix: &'static [&'static str],
-    pub(crate) category: RewriteCategory,
+pub(super) struct RewriteRule {
+    pub(super) prefix: &'static [&'static str],
+    pub(super) rewrite_to: &'static [&'static str],
+    pub(super) skip_if_flag_prefix: &'static [&'static str],
+    pub(super) category: RewriteCategory,
 }
 
 #[derive(Debug)]
-pub(crate) struct RewriteResult {
-    pub(crate) tokens: Vec<String>,
-    pub(crate) category: RewriteCategory,
+pub(super) struct RewriteResult {
+    pub(super) tokens: Vec<String>,
+    pub(super) category: RewriteCategory,
 }
 
 // ---- Compound command types (#45) ----
 
 /// Result of splitting a shell command string at compound operators.
 #[derive(Debug)]
-pub(crate) enum CompoundSplitResult {
+pub(super) enum CompoundSplitResult {
     /// No compound operators found — treat as a simple command.
     Simple(Vec<String>),
     /// Found compound operators — segments separated by `&&`, `||`, `;`, `|`.
@@ -43,14 +43,14 @@ pub(crate) enum CompoundSplitResult {
 
 /// A single command within a compound expression.
 #[derive(Debug)]
-pub(crate) struct CommandSegment {
-    pub(crate) tokens: Vec<String>,
-    pub(crate) trailing_operator: Option<CompoundOp>,
+pub(super) struct CommandSegment {
+    pub(super) tokens: Vec<String>,
+    pub(super) trailing_operator: Option<CompoundOp>,
 }
 
 /// Shell compound operators.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum CompoundOp {
+pub(super) enum CompoundOp {
     And,       // &&
     Or,        // ||
     Semicolon, // ;
@@ -58,7 +58,7 @@ pub(crate) enum CompoundOp {
 }
 
 impl CompoundOp {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             CompoundOp::And => "&&",
             CompoundOp::Or => "||",
@@ -70,27 +70,27 @@ impl CompoundOp {
 
 /// Quote-tracking state for the compound splitter.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum QuoteState {
+pub(super) enum QuoteState {
     None,
     SingleQuote,
     DoubleQuote,
 }
 
 #[derive(Serialize)]
-pub(crate) struct SuggestOutput<'a> {
-    pub(crate) version: u8,
+pub(super) struct SuggestOutput<'a> {
+    pub(super) version: u8,
     #[serde(rename = "match")]
-    pub(crate) is_match: bool,
-    pub(crate) original: &'a str,
-    pub(crate) rewritten: &'a str,
+    pub(super) is_match: bool,
+    pub(super) original: &'a str,
+    pub(super) rewritten: &'a str,
     #[serde(serialize_with = "serialize_category")]
-    pub(crate) category: Option<RewriteCategory>,
-    pub(crate) confidence: &'a str,
-    pub(crate) compound: bool,
-    pub(crate) skim_hook_version: &'a str,
+    pub(super) category: Option<RewriteCategory>,
+    pub(super) confidence: &'a str,
+    pub(super) compound: bool,
+    pub(super) skim_hook_version: &'a str,
 }
 
-pub(crate) fn serialize_category<S: serde::Serializer>(
+pub(super) fn serialize_category<S: serde::Serializer>(
     cat: &Option<RewriteCategory>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {

@@ -176,7 +176,7 @@ fn analyze_invocations(
                     .result
                     .as_ref()
                     .map(|r| r.content.as_str())
-                    .unwrap_or("");
+                    .unwrap_or_default();
                 let result_bytes = result_content.len();
                 let result_tokens = estimate_tokens(result_content);
                 total_read_tokens += result_tokens;
@@ -536,8 +536,8 @@ pub(super) fn command() -> clap::Command {
 
 #[cfg(test)]
 mod tests {
-    use super::super::rewrite::would_rewrite;
     use super::*;
+    use crate::cmd::rewrite::would_rewrite;
 
     #[test]
     fn test_parse_duration_ago_days() {
