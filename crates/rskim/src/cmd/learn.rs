@@ -286,8 +286,8 @@ fn find_correction(
         };
 
         // Pre-filter: base command must match (or be a typo with edit distance ≤1)
-        let failed_base = failed_cmd.split_whitespace().next().unwrap_or("");
-        let candidate_base = candidate_cmd.split_whitespace().next().unwrap_or("");
+        let failed_base = failed_cmd.split_whitespace().next().unwrap_or_default();
+        let candidate_base = candidate_cmd.split_whitespace().next().unwrap_or_default();
         if failed_base != candidate_base && levenshtein(failed_base, candidate_base) > 1 {
             continue;
         }
@@ -776,7 +776,7 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
         println!("   Correct: {}", pair.successful_command);
         if !pair.error_output.is_empty() {
             // Show first line of error output
-            let first_line = pair.error_output.lines().next().unwrap_or("");
+            let first_line = pair.error_output.lines().next().unwrap_or_default();
             if !first_line.is_empty() {
                 println!("   Error:   {first_line}");
             }

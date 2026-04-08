@@ -242,9 +242,9 @@ fn test_skim_git_log_contains_hashes() {
     );
     // Verify at least one line looks like a commit (7-char hex prefix)
     let has_hash = stdout.lines().filter(|l| !l.starts_with('[')).any(|l| {
-        l.split_whitespace().next().map_or(false, |w| {
-            w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit())
-        })
+        l.split_whitespace()
+            .next()
+            .is_some_and(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
     });
     assert!(
         has_hash,
