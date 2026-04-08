@@ -12,52 +12,7 @@ use rskim_search::temporal::{ScoreKind, TemporalDb};
 use rskim_search::SearchError;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use temporal_test_helpers::{build_fixture_repo, FixtureCommit};
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Unix epoch seconds for recent timestamps (avoids 90-day exclusion window).
-fn recent_ts(days_ago: i64) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_secs() as i64;
-    now - days_ago * 86_400
-}
-
-/// Build a 4-commit fixture repo where a.rs and b.rs always change together.
-///
-/// Commits 1-4: a.rs + b.rs change together.
-/// Commit 3 has "fix:" prefix to populate the risk table.
-fn build_cochange_fixture(dir: &std::path::Path) {
-    build_fixture_repo(
-        dir,
-        &[
-            FixtureCommit {
-                message: "feat: add a and b",
-                changes: vec![("a.rs", "fn a() {}"), ("b.rs", "fn b() {}")],
-                timestamp_override: Some(recent_ts(20)),
-            },
-            FixtureCommit {
-                message: "refactor: update a and b",
-                changes: vec![("a.rs", "fn a() { 1 }"), ("b.rs", "fn b() { 2 }")],
-                timestamp_override: Some(recent_ts(15)),
-            },
-            FixtureCommit {
-                message: "fix: bug in a and b",
-                changes: vec![("a.rs", "fn a() { 2 }"), ("b.rs", "fn b() { 3 }")],
-                timestamp_override: Some(recent_ts(10)),
-            },
-            FixtureCommit {
-                message: "chore: cleanup a and b",
-                changes: vec![("a.rs", "fn a() { 3 }"), ("b.rs", "fn b() { 4 }")],
-                timestamp_override: Some(recent_ts(5)),
-            },
-        ],
-    );
-}
+use temporal_test_helpers::{build_cochange_fixture, build_fixture_repo};
 
 // ============================================================================
 // 1. Schema creation

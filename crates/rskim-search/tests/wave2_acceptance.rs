@@ -11,50 +11,7 @@ use rskim_search::temporal::{TemporalDb, TemporalIndex};
 use rskim_search::{TemporalFlags, TemporalQuery};
 use std::path::PathBuf;
 use tempfile::TempDir;
-use temporal_test_helpers::{build_fixture_repo, FixtureCommit};
-
-// ============================================================================
-// Shared fixture builders
-// ============================================================================
-
-/// Recent Unix timestamp helper: `n` days ago.
-fn recent_ts(days_ago: i64) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time")
-        .as_secs() as i64;
-    now - days_ago * 86_400
-}
-
-/// Build a fixture repo where `a.rs` and `b.rs` always co-change.
-/// One commit has a "fix:" prefix so `b.rs` gets risk data.
-fn build_cochange_repo(dir: &std::path::Path) {
-    build_fixture_repo(
-        dir,
-        &[
-            FixtureCommit {
-                message: "feat: add a and b",
-                changes: vec![("a.rs", "fn a() {}"), ("b.rs", "fn b() {}")],
-                timestamp_override: Some(recent_ts(20)),
-            },
-            FixtureCommit {
-                message: "refactor: update a and b",
-                changes: vec![("a.rs", "fn a() { 1 }"), ("b.rs", "fn b() { 2 }")],
-                timestamp_override: Some(recent_ts(15)),
-            },
-            FixtureCommit {
-                message: "fix: bug in a and b",
-                changes: vec![("a.rs", "fn a() { 2 }"), ("b.rs", "fn b() { 3 }")],
-                timestamp_override: Some(recent_ts(10)),
-            },
-            FixtureCommit {
-                message: "chore: cleanup a and b",
-                changes: vec![("a.rs", "fn a() { 3 }"), ("b.rs", "fn b() { 4 }")],
-                timestamp_override: Some(recent_ts(5)),
-            },
-        ],
-    );
-}
+use temporal_test_helpers::{build_cochange_fixture, build_fixture_repo, recent_ts, FixtureCommit};
 
 /// Build a fixture repo with distinct hotspot/coldspot/risky pattern:
 /// - `hot.rs` — touched frequently in all recent commits (within 90 days)
@@ -134,7 +91,7 @@ fn build_temporal_index(repo_dir: &std::path::Path) -> (TempDir, TemporalIndex) 
 #[test]
 fn wave2_blast_radius_end_to_end() {
     let repo = TempDir::new().expect("repo tempdir");
-    build_cochange_repo(repo.path());
+    build_cochange_fixture(repo.path());
 
     let (_idx, temporal) = build_temporal_index(repo.path());
 
@@ -243,7 +200,7 @@ fn wave2_risky_end_to_end() {
 #[test]
 fn wave2_rerank_empty_lexical() {
     let repo = TempDir::new().expect("repo tempdir");
-    build_cochange_repo(repo.path());
+    build_cochange_fixture(repo.path());
 
     let (_idx, temporal) = build_temporal_index(repo.path());
 
@@ -333,7 +290,7 @@ fn wave2_rerank_with_hot_flag() {
 #[test]
 fn wave2_rerank_no_flags_passthrough() {
     let repo = TempDir::new().expect("repo tempdir");
-    build_cochange_repo(repo.path());
+    build_cochange_fixture(repo.path());
 
     let (_idx, temporal) = build_temporal_index(repo.path());
 

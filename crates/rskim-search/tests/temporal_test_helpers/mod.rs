@@ -3,10 +3,64 @@
 //! Creates deterministic git repos for testing git_parser, cochange, scoring.
 //! Uses `std::process::Command` + git CLI (test-only dependency).
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, dead_code)]
 
 use std::path::Path;
 use std::process::Command;
+
+// ============================================================================
+// Time helpers
+// ============================================================================
+
+/// Return a Unix epoch timestamp `days_ago` days before now (as seconds).
+///
+/// Used to seed `FixtureCommit::timestamp_override` so tests exercise
+/// temporal windows (30d / 90d hotspot, lookback filter) deterministically.
+pub fn recent_ts(days_ago: i64) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_secs() as i64;
+    now - days_ago * 86_400
+}
+
+// ============================================================================
+// Standard fixture repos
+// ============================================================================
+
+/// Build a 4-commit fixture repo where `a.rs` and `b.rs` always change together.
+///
+/// Commits are dated 20, 15, 10, and 5 days ago (all within the 90-day
+/// hotspot window). Commit 3 has a `fix:` prefix so both files accumulate
+/// risk data. This is the canonical co-change scenario used across storage
+/// and acceptance tests.
+pub fn build_cochange_fixture(dir: &Path) {
+    build_fixture_repo(
+        dir,
+        &[
+            FixtureCommit {
+                message: "feat: add a and b",
+                changes: vec![("a.rs", "fn a() {}"), ("b.rs", "fn b() {}")],
+                timestamp_override: Some(recent_ts(20)),
+            },
+            FixtureCommit {
+                message: "refactor: update a and b",
+                changes: vec![("a.rs", "fn a() { 1 }"), ("b.rs", "fn b() { 2 }")],
+                timestamp_override: Some(recent_ts(15)),
+            },
+            FixtureCommit {
+                message: "fix: bug in a and b",
+                changes: vec![("a.rs", "fn a() { 2 }"), ("b.rs", "fn b() { 3 }")],
+                timestamp_override: Some(recent_ts(10)),
+            },
+            FixtureCommit {
+                message: "chore: cleanup a and b",
+                changes: vec![("a.rs", "fn a() { 3 }"), ("b.rs", "fn b() { 4 }")],
+                timestamp_override: Some(recent_ts(5)),
+            },
+        ],
+    );
+}
 
 /// A commit to apply when building a fixture git repo.
 pub struct FixtureCommit<'a> {

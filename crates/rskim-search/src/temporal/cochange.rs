@@ -105,13 +105,11 @@ fn compute_pair_counts(commits: &[CommitInfo]) -> FxHashMap<(PathBuf, PathBuf), 
 
         for i in 0..unique.len() {
             for j in (i + 1)..unique.len() {
-                // Canonical ordering: smaller path first.
-                let (a, b) = if unique[i] <= unique[j] {
-                    (unique[i].clone(), unique[j].clone())
-                } else {
-                    (unique[j].clone(), unique[i].clone())
-                };
-                *counts.entry((a, b)).or_default() += 1;
+                // unique is sorted, so unique[i] <= unique[j] always holds —
+                // canonical ordering (smaller path first) is preserved by construction.
+                *counts
+                    .entry((unique[i].clone(), unique[j].clone()))
+                    .or_default() += 1;
             }
         }
     }
