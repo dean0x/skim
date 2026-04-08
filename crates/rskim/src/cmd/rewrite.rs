@@ -556,6 +556,48 @@ const REWRITE_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
+// Public API for other modules
+// ============================================================================
+
+/// Check if a command would be rewritten, returning the rewritten form.
+///
+/// Used by `discover` to avoid maintaining a separate heuristic that mirrors
+/// the rewrite engine's declarative rule table.
+///
+/// Returns `Some(rewritten_command)` if the command matches a rewrite rule,
+/// `None` if no rewrite applies (including skim commands, empty input, and
+/// unsupported shell syntax).
+pub(crate) fn would_rewrite(command: &str) -> Option<String> {
+    let command = command.trim();
+    if command.is_empty() || command.starts_with("skim ") {
+        return None;
+    }
+
+    // Fast path: no compound operators — skip split_compound entirely.
+    let has_operator_chars = command.contains("&&")
+        || command.contains("||")
+        || command.contains(';')
+        || command.contains('|');
+
+    if !has_operator_chars {
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        return try_rewrite(&tokens).map(|r| r.tokens.join(" "));
+    }
+
+    // Compound command handling
+    match split_compound(command) {
+        CompoundSplitResult::Bail => None,
+        CompoundSplitResult::Simple(tokens) => {
+            let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+            try_rewrite(&refs).map(|r| r.tokens.join(" "))
+        }
+        CompoundSplitResult::Compound(segments) => {
+            try_rewrite_compound(&segments).map(|r| r.tokens.join(" "))
+        }
+    }
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
