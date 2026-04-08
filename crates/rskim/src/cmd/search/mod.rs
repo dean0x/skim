@@ -7,20 +7,19 @@
 //!
 //! # Module layout
 //!
-//! - [`index`] — Repo root discovery, cache directory management, index build
-//! - [`output`] — Text and JSON result formatting, stats display
+//! - [`dispatch`] — three query dispatch paths (blast-radius, temporal, lexical+composite)
+//!   plus helper functions (temporal_db_path, build_temporal_layer, ensure_temporal_built,
+//!   resolve_blast_target, lexical_to_paths)
+//! - [`index`] — repo root discovery, cache directory management, index build
+//! - [`output`] — text and JSON result formatting, stats display
 
+mod dispatch;
 mod index;
 mod output;
 
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rskim_search::{
-    lexical::query::LexicalSearchLayer,
-    temporal::{TemporalDb, TemporalIndex, DEFAULT_LOOKBACK_DAYS},
-    FileId, SearchIndex, SearchLayer, SearchQuery, TemporalFlags, TemporalQuery,
-};
+use rskim_search::temporal::{TemporalIndex, DEFAULT_LOOKBACK_DAYS};
 
 /// Run the search subcommand.
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
@@ -122,17 +121,20 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
             eprintln!("No search index found. Run 'skim search --build' first.");
             return Ok(ExitCode::FAILURE);
         }
-        let layer = match LexicalSearchLayer::open(&index_dir) {
+        let layer = match rskim_search::lexical::query::LexicalSearchLayer::open(&index_dir) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("error: failed to open search index: {e}");
                 return Ok(ExitCode::FAILURE);
             }
         };
-        let temporal_opt = if temporal_db_path(&index_dir).exists() {
-            TemporalIndex::open(&temporal_db_path(&index_dir)).ok()
-        } else {
-            None
+        let temporal_opt = {
+            let db_path = dispatch::temporal_db_path(&index_dir);
+            if db_path.exists() {
+                TemporalIndex::open(&db_path).ok()
+            } else {
+                None
+            }
         };
         return output::show_stats(&layer, temporal_opt.as_ref(), json_output);
     }
@@ -152,7 +154,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
             index::build_index(&repo_root, &index_dir)?;
         }
         // All three flags trigger a temporal build.
-        build_temporal_layer(&repo_root, &index_dir, lookback)?;
+        dispatch::build_temporal_layer(&repo_root, &index_dir, lookback)?;
 
         // If no query/temporal query was also requested, we're done after building.
         if !has_text && !is_blast_radius && !has_temporal_scoring_flag {
@@ -160,69 +162,29 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         }
     }
 
-    // ── STANDALONE TEMPORAL QUERIES ──────────────────────────────────────────
+    let temporal_params = dispatch::TemporalParams {
+        hot,
+        cold,
+        risky,
+        limit,
+        lookback,
+        json_output,
+    };
 
+    // ── STANDALONE BLAST-RADIUS QUERY ────────────────────────────────────────
     if is_blast_radius {
-        let db_path = temporal_db_path(&index_dir);
-        ensure_temporal_built(&repo_root, &index_dir, &db_path, lookback)?;
-        let temporal = TemporalIndex::open(&db_path)?;
-
         let arg = blast_radius_arg.as_deref().unwrap_or("");
-        let target = resolve_blast_target(arg, &repo_root)?;
-        let results = temporal.blast_radius(&target, limit)?;
-
-        if results.is_empty() {
-            if json_output {
-                println!("[]");
-            } else {
-                eprintln!("No co-change partners found for {}", target.display());
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
-        output::print_temporal_results(&results, &repo_root, json_output)?;
-        return Ok(ExitCode::SUCCESS);
+        return dispatch::run_standalone_blast_radius(
+            arg,
+            &index_dir,
+            &repo_root,
+            &temporal_params,
+        );
     }
 
+    // ── STANDALONE TEMPORAL QUERY ─────────────────────────────────────────────
     if has_temporal_scoring_flag && !has_text {
-        // Standalone temporal: hot / cold / risky without text.
-        let db_path = temporal_db_path(&index_dir);
-        ensure_temporal_built(&repo_root, &index_dir, &db_path, lookback)?;
-        let temporal = TemporalIndex::open(&db_path)?;
-
-        let results = if (hot as u8) + (cold as u8) + (risky as u8) > 1 {
-            // Multiple signals: fetch candidates from the primary signal and rerank.
-            let candidates = if hot {
-                temporal.hotspots(limit * 5)?
-            } else if cold {
-                temporal.coldspots(limit * 5)?
-            } else {
-                temporal.risky(limit * 5)?
-            };
-            let flags = TemporalFlags {
-                blast_radius: None,
-                hot,
-                cold,
-                risky,
-            };
-            let mut reranked = temporal.rerank(&candidates, &flags)?;
-            reranked.truncate(limit);
-            reranked
-        } else if hot {
-            temporal.hotspots(limit)?
-        } else if cold {
-            temporal.coldspots(limit)?
-        } else {
-            temporal.risky(limit)?
-        };
-
-        if results.is_empty() {
-            if json_output {
-                println!("[]");
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
-        output::print_temporal_results(&results, &repo_root, json_output)?;
-        return Ok(ExitCode::SUCCESS);
+        return dispatch::run_standalone_temporal(&index_dir, &repo_root, &temporal_params);
     }
 
     // ── LEXICAL / COMPOSITE QUERIES ──────────────────────────────────────────
@@ -240,142 +202,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         }
     };
 
-    // Auto-build lexical index if missing.
-    if !index_dir.join("metadata.json").exists() {
-        eprintln!("Building search index...");
-        index::build_index(&repo_root, &index_dir)?;
-    }
-
-    let layer = match LexicalSearchLayer::open(&index_dir) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("error: failed to open search index: {e}");
-            eprintln!("hint: run 'skim search --rebuild' to recreate the index");
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-
-    // For composite queries, fetch more candidates so temporal rerank has a
-    // sufficient working set.
-    let internal_limit = if has_temporal_scoring_flag {
-        (limit * 3).max(150)
-    } else {
-        limit
-    };
-    let search_query = SearchQuery::text(query_str).with_limit(internal_limit);
-    let lex_results = layer.search(&search_query)?;
-
-    if has_temporal_scoring_flag {
-        // Composite: temporal rerank on top of lexical results.
-        let db_path = temporal_db_path(&index_dir);
-        ensure_temporal_built(&repo_root, &index_dir, &db_path, lookback)?;
-        let temporal = TemporalIndex::open(&db_path)?;
-
-        let lex_paths = lexical_to_paths(&lex_results, &layer);
-        let flags = TemporalFlags {
-            blast_radius: None,
-            hot,
-            cold,
-            risky,
-        };
-        let mut reranked = temporal.rerank(&lex_paths, &flags)?;
-        reranked.truncate(limit);
-
-        if reranked.is_empty() {
-            if json_output {
-                println!("[]");
-            }
-            return Ok(ExitCode::SUCCESS);
-        }
-        output::print_temporal_results(&reranked, &repo_root, json_output)?;
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // Pure lexical query.
-    if lex_results.is_empty() {
-        if json_output {
-            println!("[]");
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    if json_output {
-        output::print_json_results(&layer, &lex_results, query_str, &repo_root)?;
-    } else {
-        output::print_text_results(&layer, &lex_results, query_str, &repo_root)?;
-    }
-
-    Ok(ExitCode::SUCCESS)
-}
-
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-/// Return the path to the temporal DB file within the per-repo index dir.
-fn temporal_db_path(index_dir: &Path) -> PathBuf {
-    index_dir.join("temporal.db")
-}
-
-/// Build the temporal index at `db_path` for `repo_root` with the given lookback.
-///
-/// Prints progress messages to stderr.
-fn build_temporal_layer(repo_root: &Path, index_dir: &Path, lookback: u32) -> anyhow::Result<()> {
-    std::fs::create_dir_all(index_dir)?;
-    let db_path = temporal_db_path(index_dir);
-    eprintln!("Building temporal index, this may take a while...");
-    let _db = TemporalDb::build(repo_root, &db_path, lookback)?;
-    eprintln!("Temporal index built.");
-    Ok(())
-}
-
-/// Auto-build temporal index if it does not yet exist at `db_path`.
-fn ensure_temporal_built(
-    repo_root: &Path,
-    index_dir: &Path,
-    db_path: &Path,
-    lookback: u32,
-) -> anyhow::Result<()> {
-    if !db_path.exists() {
-        build_temporal_layer(repo_root, index_dir, lookback)?;
-    }
-    Ok(())
-}
-
-/// Resolve a user-provided blast-radius target to a canonical repo-relative path.
-///
-/// Accepts both cwd-relative and repo-relative paths. Returns the repo-relative
-/// form in forward-slash format (matching temporal storage convention).
-/// If neither resolves to an existing file, the argument is returned as-is so
-/// that the temporal layer can return an empty result gracefully.
-fn resolve_blast_target(arg: &str, repo_root: &Path) -> anyhow::Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    let abs_candidate = cwd.join(arg);
-    if abs_candidate.exists() {
-        let rel = abs_candidate
-            .strip_prefix(repo_root)
-            .unwrap_or(&abs_candidate);
-        return Ok(PathBuf::from(rel.to_string_lossy().replace('\\', "/")));
-    }
-    let abs_from_root = repo_root.join(arg);
-    if abs_from_root.exists() {
-        return Ok(PathBuf::from(arg.replace('\\', "/")));
-    }
-    // Last resort: accept arg as-is; temporal returns empty if not found.
-    Ok(PathBuf::from(arg.replace('\\', "/")))
-}
-
-/// Convert lexical `(FileId, score)` results to `(PathBuf, score)` for temporal rerank.
-fn lexical_to_paths(results: &[(FileId, f32)], layer: &dyn SearchIndex) -> Vec<(PathBuf, f32)> {
-    results
-        .iter()
-        .filter_map(|(id, s)| {
-            layer
-                .file_table()
-                .lookup(*id)
-                .map(|p| (p.to_path_buf(), *s))
-        })
-        .collect()
+    dispatch::run_lexical_or_composite(query_str, &index_dir, &repo_root, &temporal_params)
 }
 
 // ============================================================================

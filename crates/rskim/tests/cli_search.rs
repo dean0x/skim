@@ -410,3 +410,101 @@ fn test_search_completions_registered() {
         .success()
         .stdout(predicate::str::contains("search"));
 }
+
+// ============================================================================
+// Temporal flag integration tests (Wave 2 must-fix #5)
+// ============================================================================
+
+/// Create a temporary git repo with two committed files for temporal tests.
+///
+/// Two commits ensure git history is non-trivial so the temporal builder has
+/// something to index.
+fn init_temp_git_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git command");
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "Test"]);
+    run_git(&["config", "user.email", "test@example.com"]);
+    std::fs::write(dir.join("a.rs"), "fn alpha() {}\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "fn beta() {}\n").unwrap();
+    run_git(&["add", "a.rs", "b.rs"]);
+    run_git(&["commit", "-q", "-m", "initial"]);
+    std::fs::write(dir.join("a.rs"), "fn alpha() { 1 }\n").unwrap();
+    std::fs::write(dir.join("b.rs"), "fn beta() { 1 }\n").unwrap();
+    run_git(&["add", "a.rs", "b.rs"]);
+    run_git(&["commit", "-q", "-m", "fix: update"]);
+    tmp
+}
+
+#[test]
+fn test_search_build_temporal_flag() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--build-temporal"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Temporal index built"));
+}
+
+#[test]
+fn test_search_hot_standalone() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--hot", "--limit", "5"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_search_blast_radius_with_text_rejected() {
+    let cache = tempfile::tempdir().unwrap();
+    skim_cmd()
+        .args(["search", "hello", "--blast-radius", "foo.rs"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot be combined with text search",
+        ));
+}
+
+#[test]
+fn test_search_blast_radius_with_hot_rejected() {
+    let cache = tempfile::tempdir().unwrap();
+    skim_cmd()
+        .args(["search", "--blast-radius", "foo.rs", "--hot"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be combined with --hot"));
+}
+
+#[test]
+fn test_search_hot_cold_conflict_warns() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--hot", "--cold"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("mutually exclusive"));
+}

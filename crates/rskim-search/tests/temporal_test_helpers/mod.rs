@@ -3,7 +3,7 @@
 //! Creates deterministic git repos for testing git_parser, cochange, scoring.
 //! Uses `std::process::Command` + git CLI (test-only dependency).
 
-#![allow(clippy::expect_used, clippy::unwrap_used, dead_code)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, dead_code)]
 
 use std::path::Path;
 use std::process::Command;
