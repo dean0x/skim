@@ -362,7 +362,7 @@ fn render_unchanged_node(
         }
         DiffMode::Structure => {
             // Show unchanged nodes as structure (signatures)
-            let node_text = node.utf8_text(source.as_bytes()).unwrap_or("");
+            let node_text = node.utf8_text(source.as_bytes()).unwrap_or_default();
 
             // Transform using the reused parser (avoids per-node parser creation)
             let config = rskim_core::TransformConfig::with_mode(rskim_core::Mode::Structure);

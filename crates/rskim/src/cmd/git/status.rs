@@ -65,7 +65,8 @@ impl StatusCategories {
 
         if line.starts_with('?') {
             // Untracked: "? <path>"
-            self.untracked.push(line.get(2..).unwrap_or("").to_string());
+            self.untracked
+                .push(line.get(2..).unwrap_or_default().to_string());
             return;
         }
 
@@ -198,12 +199,12 @@ fn extract_renamed_path(line: &str) -> String {
     // "2 XY sub mH mI mW hH hI X_score <path>\t<origPath>"
     let Some(tab_pos) = line.find('\t') else {
         // Malformed input: no tab found; fall back to the path portion after the prefix
-        return line.get(2..).unwrap_or("").to_string();
+        return line.get(2..).unwrap_or_default().to_string();
     };
     let before_tab = &line[..tab_pos];
     let after_tab = &line[tab_pos + 1..];
     // Field 10 (0-indexed 9) is the new path; use splitn to preserve spaces in path
-    let new_path = before_tab.splitn(10, ' ').last().unwrap_or("");
+    let new_path = before_tab.splitn(10, ' ').last().unwrap_or_default();
     format!("{after_tab} -> {new_path}")
 }
 
@@ -517,7 +518,14 @@ mod tests {
     #[test]
     fn test_flag_stripping_mixed_input() {
         // Conflicting flags are stripped; non-conflicting flags are preserved.
-        let input = ["-s", "--branch", "--short", "--", "--porcelain=v1", "path/to/file"];
+        let input = [
+            "-s",
+            "--branch",
+            "--short",
+            "--",
+            "--porcelain=v1",
+            "path/to/file",
+        ];
         let result = strip_conflicting_flags(&input);
         assert_eq!(
             result,
