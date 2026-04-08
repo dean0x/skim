@@ -12,7 +12,7 @@
 //! Wave-1 and later tests omit the `test_` prefix — `#[test]` already marks
 //! test functions, making the prefix redundant (idiomatic Rust style). Existing
 //! wave-0 tests retain the `test_` prefix to avoid a noisy rename-only commit.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 

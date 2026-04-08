@@ -314,13 +314,19 @@ fn test_search_stats_json_after_build() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("--stats --json must produce valid JSON: {e}\ngot: {stdout}"));
+
+    // Wave 2: --build builds both lexical and temporal, so stats JSON is
+    // the combined `{"lexical": {...}, "temporal": {...}}` object. When only
+    // lexical is present, the JSON is a plain `IndexStats` object (backward
+    // compatible with pre-Wave-2 callers).
+    let lexical = parsed.get("lexical").unwrap_or(&parsed);
     assert!(
-        parsed.get("file_count").is_some(),
-        "stats JSON missing file_count"
+        lexical.get("file_count").is_some(),
+        "stats JSON missing lexical.file_count: {parsed}"
     );
     assert!(
-        parsed.get("total_ngrams").is_some(),
-        "stats JSON missing total_ngrams"
+        lexical.get("total_ngrams").is_some(),
+        "stats JSON missing lexical.total_ngrams: {parsed}"
     );
 }
 

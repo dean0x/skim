@@ -2,7 +2,7 @@
 //!
 //! Each test exercises behaviour at the I/O boundary. No implementation details
 //! are probed; only externally observable results are asserted.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use rskim_search::lexical::{
     index_format::{DeltaReader, DeltaWriter, IndexReader, Tombstones},

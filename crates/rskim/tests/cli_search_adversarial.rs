@@ -156,14 +156,17 @@ fn stats_json_is_valid_json() {
 
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("--stats --json output must be valid JSON: {e}\ngot: {stdout}"));
-    // Sanity-check expected keys.
+    // Wave 2: when both lexical and temporal indexes exist, stats JSON is
+    // nested as `{"lexical": {...}, "temporal": {...}}`. Fall back to
+    // top-level keys for the pre-Wave-2 shape (lexical-only).
+    let lexical = parsed.get("lexical").unwrap_or(&parsed);
     assert!(
-        parsed.get("file_count").is_some(),
-        "stats JSON must contain file_count, got: {parsed}"
+        lexical.get("file_count").is_some(),
+        "stats JSON must contain lexical.file_count, got: {parsed}"
     );
     assert!(
-        parsed.get("total_ngrams").is_some(),
-        "stats JSON must contain total_ngrams, got: {parsed}"
+        lexical.get("total_ngrams").is_some(),
+        "stats JSON must contain lexical.total_ngrams, got: {parsed}"
     );
 }
 

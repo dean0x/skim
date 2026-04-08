@@ -23,12 +23,14 @@
 
 pub mod cochange;
 pub mod git_parser;
+pub mod query;
 pub mod scoring;
 pub mod storage;
 pub mod types;
 
 pub use cochange::build_cochange_matrix;
 pub use git_parser::parse_history;
+pub use query::TemporalIndex;
 pub use scoring::{hotspot_scores, risk_scores};
 pub use storage::{ScoreKind, TemporalDb, DEFAULT_LOOKBACK_DAYS};
 pub use types::{CochangeEntry, CommitInfo, HotspotScore, RiskScore, TemporalFileId};
