@@ -424,6 +424,45 @@ mod tests {
     }
 
     // ========================================================================
+    // Fallback guarantee: parse_status must not panic on unexpected input
+    // (Step 7e)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_status_garbage_input_no_panic() {
+        // Feed unexpected garbage — must produce a valid result, never panic.
+        // The parser may interpret "unexpected garbage input" as an unmerged line
+        // (because the line starts with 'u'). The key contract is: no panic, valid result.
+        let result = parse_status("unexpected garbage input");
+        // Must return a well-formed GitResult (non-empty summary, valid details vec).
+        assert!(!result.summary.is_empty(), "Summary must not be empty");
+        // Details may or may not be populated depending on how the line is classified.
+        // We just verify the result is structurally valid (no panic, fields accessible).
+        let _ = result.details.len();
+    }
+
+    #[test]
+    fn test_parse_status_null_bytes_no_panic() {
+        // Feed null bytes and other control characters.
+        let result = parse_status("\x00\x01\x02\x03 binary garbage");
+        // Must not panic and must return a valid GitResult.
+        let _ = result.summary;
+        let _ = result.details;
+    }
+
+    #[test]
+    fn test_parse_status_partial_v2_line_no_panic() {
+        // Truncated porcelain v2 lines — handler must degrade gracefully.
+        let output = "# branch.head main\n1\n1 M\n1 M. \n";
+        let result = parse_status(output);
+        assert!(
+            result.details.iter().any(|d| d.contains("branch: main")),
+            "branch line should still be parsed"
+        );
+        // Truncated type-1 lines should produce no panics, possibly no detail entries.
+    }
+
+    // ========================================================================
     // Binary files in diff stat
     // ========================================================================
 

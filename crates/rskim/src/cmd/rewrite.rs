@@ -3589,4 +3589,187 @@ mod tests {
             "Should not rewrite rg when --files flag is present"
         );
     }
+
+    // ========================================================================
+    // jest rewrite rules (Step 6 — new rules)
+    // ========================================================================
+
+    #[test]
+    fn test_rewrite_jest_bare() {
+        let result = try_rewrite(&["jest"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "test".to_string(),
+                "jest".to_string(),
+            ]),
+            "Expected tokens to start with 'skim test jest', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_jest_with_args() {
+        let result = try_rewrite(&["jest", "src/", "--watch"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "test", "jest", "src/", "--watch"],
+            "Expected jest args to be preserved"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_npx_jest() {
+        let result = try_rewrite(&["npx", "jest"]).unwrap();
+        assert!(
+            result.tokens.starts_with(&[
+                "skim".to_string(),
+                "test".to_string(),
+                "jest".to_string(),
+            ]),
+            "Expected tokens to start with 'skim test jest', got {:?}",
+            result.tokens
+        );
+    }
+
+    #[test]
+    fn test_rewrite_npx_jest_with_args() {
+        let result = try_rewrite(&["npx", "jest", "src/", "--coverage"]).unwrap();
+        assert_eq!(
+            result.tokens,
+            vec!["skim", "test", "jest", "src/", "--coverage"],
+            "Expected npx jest args to be preserved"
+        );
+    }
+
+    // ========================================================================
+    // gh list subcommands with --json flag (Step 6 — previously skip-flagged)
+    // ========================================================================
+
+    // --json is no longer a skip flag for any gh list subcommand.
+    // The gh handler natively parses JSON output.
+
+    #[test]
+    fn test_rewrite_gh_issue_list_with_json_rewrites() {
+        let result = try_rewrite(&["gh", "issue", "list", "--json", "number,title"]);
+        assert!(
+            result.is_some(),
+            "Expected rewrite for 'gh issue list --json' — handler supports --json output"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_run_list_with_json_rewrites() {
+        let result = try_rewrite(&["gh", "run", "list", "--json", "name"]);
+        assert!(
+            result.is_some(),
+            "Expected rewrite for 'gh run list --json' — handler supports --json output"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_gh_release_list_with_json_rewrites() {
+        let result = try_rewrite(&["gh", "release", "list", "--json", "tagName"]);
+        assert!(
+            result.is_some(),
+            "Expected rewrite for 'gh release list --json' — handler supports --json output"
+        );
+    }
+
+    // ========================================================================
+    // would_rewrite() API tests (Step 7d)
+    // ========================================================================
+
+    #[test]
+    fn test_would_rewrite_git_status_with_s() {
+        assert_eq!(
+            would_rewrite("git status -s"),
+            Some("skim git status -s".to_string()),
+            "git status -s should rewrite (handler strips -s)"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_git_log_oneline() {
+        // --oneline is passed through in the rewrite tokens; handler strips it
+        let result = would_rewrite("git log --oneline -5");
+        assert!(
+            result.is_some(),
+            "git log --oneline -5 should rewrite (handler strips --oneline)"
+        );
+        let rewritten = result.unwrap();
+        assert!(
+            rewritten.starts_with("skim git log"),
+            "Expected 'skim git log ...' prefix, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_already_skim_returns_none() {
+        assert_eq!(
+            would_rewrite("skim git status"),
+            None,
+            "Already-skim commands must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_empty_returns_none() {
+        assert_eq!(would_rewrite(""), None, "Empty input must return None");
+        assert_eq!(
+            would_rewrite("   "),
+            None,
+            "Whitespace-only input must return None"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_non_rewritable_returns_none() {
+        assert_eq!(
+            would_rewrite("python3 -c 'print(1)'"),
+            None,
+            "python3 -c is not a rewritable pattern"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_justified_skip_returns_none() {
+        assert_eq!(
+            would_rewrite("git diff --stat"),
+            None,
+            "git diff --stat is a justified skip"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_gh_pr_list_json_rewrites() {
+        let result = would_rewrite("gh pr list --json number");
+        assert!(
+            result.is_some(),
+            "gh pr list --json should now rewrite"
+        );
+        let rewritten = result.unwrap();
+        assert!(
+            rewritten.contains("skim infra gh pr list"),
+            "Expected 'skim infra gh pr list' in output, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_jest_rewrites() {
+        assert_eq!(
+            would_rewrite("jest src/"),
+            Some("skim test jest src/".to_string()),
+            "jest should rewrite to skim test jest"
+        );
+    }
+
+    #[test]
+    fn test_would_rewrite_npx_jest_rewrites() {
+        assert_eq!(
+            would_rewrite("npx jest src/"),
+            Some("skim test jest src/".to_string()),
+            "npx jest should rewrite to skim test jest"
+        );
+    }
 }
