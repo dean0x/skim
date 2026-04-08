@@ -38,12 +38,12 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     }
 
     // Classify and analyze
-    let analysis = analyze_invocations(&all_invocations, config.debug);
+    let analysis = analyze_invocations(&all_invocations, &config);
 
     if config.json_output {
-        print_json_report(&analysis, config.debug)?;
+        print_json_report(&analysis, &config)?;
     } else {
-        print_text_report(&analysis, config.debug);
+        print_text_report(&analysis, &config);
     }
 
     Ok(ExitCode::SUCCESS)
@@ -148,14 +148,15 @@ struct BashCommandInfo {
     rewrite_target: Option<String>,
 }
 
-fn analyze_invocations(invocations: &[ToolInvocation], debug: bool) -> DiscoverAnalysis {
+fn analyze_invocations(invocations: &[ToolInvocation], config: &DiscoverConfig) -> DiscoverAnalysis {
     let mut code_reads = Vec::new();
     let mut bash_commands = Vec::new();
     let mut total_read_tokens = 0usize;
     let mut potential_savings = 0usize;
-    // Accumulate non-rewritable command prefix counts (only when debug enabled)
-    let mut non_rewritable_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
+    // Only allocate the HashMap when debug mode is enabled; it is unused on the
+    // common (non-debug) path and would otherwise impose an unconditional allocation.
+    let mut non_rewritable_counts: Option<std::collections::HashMap<String, usize>> =
+        if config.debug { Some(std::collections::HashMap::new()) } else { None };
 
     for inv in invocations {
         match &inv.input {
@@ -185,40 +186,18 @@ fn analyze_invocations(invocations: &[ToolInvocation], debug: bool) -> DiscoverA
                 });
             }
             ToolInput::Bash { command } => {
-                // Skip commands already rewritten by the hook (start with "skim ")
-                if command.starts_with("skim ") {
-                    continue;
+                if let Some(info) = classify_bash_command(command, &mut non_rewritable_counts) {
+                    bash_commands.push(info);
                 }
-
-                // Use the rewrite engine directly to check for a rewrite
-                let rewrite_target = super::rewrite::would_rewrite(command);
-                let has_rewrite = rewrite_target.is_some();
-
-                // Collect non-rewritable commands when debug is enabled
-                if debug && !has_rewrite {
-                    let prefix: String = command
-                        .split_whitespace()
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !prefix.is_empty() {
-                        *non_rewritable_counts.entry(prefix).or_insert(0) += 1;
-                    }
-                }
-
-                bash_commands.push(BashCommandInfo {
-                    command: command.clone(),
-                    has_rewrite,
-                    rewrite_target,
-                });
             }
             _ => {}
         }
     }
 
     // Sort non-rewritable by frequency descending, then alphabetically for stability
-    let mut non_rewritable_commands: Vec<(String, usize)> =
-        non_rewritable_counts.into_iter().collect();
+    let mut non_rewritable_commands: Vec<(String, usize)> = non_rewritable_counts
+        .map(|m| m.into_iter().collect())
+        .unwrap_or_default();
     non_rewritable_commands.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     DiscoverAnalysis {
@@ -229,6 +208,49 @@ fn analyze_invocations(invocations: &[ToolInvocation], debug: bool) -> DiscoverA
         potential_savings_tokens: potential_savings,
         non_rewritable_commands,
     }
+}
+
+/// Classify a single Bash invocation.
+///
+/// Returns `None` when the command should be skipped entirely (already a `skim`
+/// invocation), otherwise returns the classified [`BashCommandInfo`].
+///
+/// `non_rewritable_counts` accumulates prefix frequencies for the debug report.
+/// It is `None` when debug mode is disabled, avoiding an unconditional allocation.
+fn classify_bash_command(
+    command: &str,
+    non_rewritable_counts: &mut Option<std::collections::HashMap<String, usize>>,
+) -> Option<BashCommandInfo> {
+    // Skip commands already rewritten by the hook (start with "skim ")
+    if command.starts_with("skim ") {
+        return None;
+    }
+
+    // `would_rewrite` is the single source of truth for rewrite eligibility.
+    // It is heavier than a simple prefix heuristic but eliminates rule
+    // duplication and guarantees correctness — correctness over micro-performance.
+    let rewrite_target = super::rewrite::would_rewrite(command);
+    let has_rewrite = rewrite_target.is_some();
+
+    // Collect non-rewritable command prefix counts when debug is enabled
+    if let Some(ref mut counts) = non_rewritable_counts {
+        if !has_rewrite {
+            let prefix: String = command
+                .split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !prefix.is_empty() {
+                *counts.entry(prefix).or_insert(0) += 1;
+            }
+        }
+    }
+
+    Some(BashCommandInfo {
+        command: command.to_string(),
+        has_rewrite,
+        rewrite_target,
+    })
 }
 
 /// Token estimation using the real tiktoken tokenizer.
@@ -252,16 +274,22 @@ fn is_skimmable_file(path: &str) -> bool {
 // Output
 // ============================================================================
 
-fn print_text_report(analysis: &DiscoverAnalysis, debug: bool) {
+fn print_text_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
     println!("skim discover -- optimization opportunities\n");
-
     println!(
         "Sessions scanned: found {} tool invocations",
         analysis.total_invocations
     );
     println!();
 
-    // Code reads summary
+    print_code_reads_section(analysis);
+    print_commands_section(analysis, config.debug);
+
+    println!();
+    println!("hint: run `skim init` to install the PreToolUse hook for automatic optimization");
+}
+
+fn print_code_reads_section(analysis: &DiscoverAnalysis) {
     let skimmable_count = analysis.code_reads.iter().filter(|r| r.could_skim).count();
     let non_skimmable_count = analysis.code_reads.iter().filter(|r| !r.could_skim).count();
 
@@ -286,7 +314,6 @@ fn print_text_report(analysis: &DiscoverAnalysis, debug: bool) {
         );
         println!();
 
-        // Top files by token count
         let mut sorted_reads: Vec<_> = analysis
             .code_reads
             .iter()
@@ -299,8 +326,9 @@ fn print_text_report(analysis: &DiscoverAnalysis, debug: bool) {
         }
     }
     println!();
+}
 
-    // Bash commands summary
+fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
     let rewritable_count = analysis
         .bash_commands
         .iter()
@@ -334,7 +362,10 @@ fn print_text_report(analysis: &DiscoverAnalysis, debug: bool) {
         }
     }
 
-    // Debug: show non-rewritable commands
+    print_debug_section(analysis, debug);
+}
+
+fn print_debug_section(analysis: &DiscoverAnalysis, debug: bool) {
     if debug && !analysis.non_rewritable_commands.is_empty() {
         println!();
         println!(
@@ -350,12 +381,10 @@ fn print_text_report(analysis: &DiscoverAnalysis, debug: bool) {
             );
         }
     }
-
-    println!();
-    println!("hint: run `skim init` to install the PreToolUse hook for automatic optimization");
 }
 
-fn print_json_report(analysis: &DiscoverAnalysis, debug: bool) -> anyhow::Result<()> {
+fn print_json_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) -> anyhow::Result<()> {
+    let debug = config.debug;
     let skimmable_reads: Vec<_> = analysis
         .code_reads
         .iter()
@@ -682,7 +711,8 @@ mod tests {
         let inv3 = make_bash_invocation("cargo test"); // this one IS rewritable
         let invocations = vec![inv1, inv2, inv3];
 
-        let analysis = analyze_invocations(&invocations, false);
+        let config = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: false };
+        let analysis = analyze_invocations(&invocations, &config);
 
         // Only "cargo test" should be in bash_commands, not the skim commands
         assert_eq!(analysis.bash_commands.len(), 1);
@@ -696,7 +726,8 @@ mod tests {
         let inv2 = make_bash_invocation("cargo test");
         let invocations = vec![inv1, inv2];
 
-        let analysis = analyze_invocations(&invocations, false);
+        let config = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: false };
+        let analysis = analyze_invocations(&invocations, &config);
 
         assert_eq!(analysis.bash_commands.len(), 2);
     }
@@ -711,11 +742,13 @@ mod tests {
         let invocations = vec![inv1, inv2, inv3];
 
         // debug=false: non_rewritable_commands should be empty
-        let analysis = analyze_invocations(&invocations, false);
+        let config_no_debug = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: false };
+        let analysis = analyze_invocations(&invocations, &config_no_debug);
         assert!(analysis.non_rewritable_commands.is_empty());
 
         // debug=true: non_rewritable_commands should be populated
-        let analysis = analyze_invocations(&invocations, true);
+        let config_debug = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: true };
+        let analysis = analyze_invocations(&invocations, &config_debug);
         assert!(!analysis.non_rewritable_commands.is_empty());
         // "node server.js --port 3000" and "node server.js --port 4000" share
         // prefix "node server.js --port" (first 3 tokens)

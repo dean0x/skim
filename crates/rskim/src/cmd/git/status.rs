@@ -463,6 +463,70 @@ mod tests {
     }
 
     // ========================================================================
+    // Flag-stripping predicate
+    // ========================================================================
+
+    /// Replicate the filter predicate from `run_status` so it can be tested
+    /// independently of the process boundary.
+    fn strip_conflicting_flags(args: &[&str]) -> Vec<String> {
+        args.iter()
+            .filter(|a| {
+                let s = **a;
+                s != "-s" && s != "--short" && s != "--porcelain" && !s.starts_with("--porcelain=")
+            })
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_flag_stripping_removes_conflicting_flags() {
+        // Each of these must be stripped individually.
+        assert!(
+            strip_conflicting_flags(&["-s"]).is_empty(),
+            "-s must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--short"]).is_empty(),
+            "--short must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--porcelain"]).is_empty(),
+            "--porcelain must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--porcelain=v1"]).is_empty(),
+            "--porcelain=v1 must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--porcelain=v2"]).is_empty(),
+            "--porcelain=v2 must be stripped"
+        );
+    }
+
+    #[test]
+    fn test_flag_stripping_preserves_non_conflicting_flags() {
+        let input = ["--branch", "--", "path/to/file"];
+        let result = strip_conflicting_flags(&input);
+        assert_eq!(
+            result,
+            vec!["--branch", "--", "path/to/file"],
+            "non-conflicting flags must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_flag_stripping_mixed_input() {
+        // Conflicting flags are stripped; non-conflicting flags are preserved.
+        let input = ["-s", "--branch", "--short", "--", "--porcelain=v1", "path/to/file"];
+        let result = strip_conflicting_flags(&input);
+        assert_eq!(
+            result,
+            vec!["--branch", "--", "path/to/file"],
+            "only conflicting flags must be stripped from mixed input"
+        );
+    }
+
+    // ========================================================================
     // Binary files in diff stat
     // ========================================================================
 
