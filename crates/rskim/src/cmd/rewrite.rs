@@ -126,7 +126,7 @@ fn serialize_category<S: serde::Serializer>(
 }
 
 // ============================================================================
-// Rule table (44 rules, ordered longest-prefix-first within same leading token)
+// Rule table (64 rules, ordered longest-prefix-first within same leading token)
 // ============================================================================
 
 const REWRITE_RULES: &[RewriteRule] = &[
@@ -182,6 +182,12 @@ const REWRITE_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
     },
     RewriteRule {
+        prefix: &["npx", "jest"],
+        rewrite_to: &["skim", "test", "jest"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
         prefix: &["npx", "tsc"],
         rewrite_to: &["skim", "build", "tsc"],
         skip_if_flag_prefix: &[],
@@ -201,6 +207,12 @@ const REWRITE_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
     },
     RewriteRule {
+        prefix: &["jest"],
+        rewrite_to: &["skim", "test", "jest"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+    },
+    RewriteRule {
         prefix: &["go", "test"],
         rewrite_to: &["skim", "test", "go"],
         skip_if_flag_prefix: &[],
@@ -210,7 +222,7 @@ const REWRITE_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["git", "status"],
         rewrite_to: &["skim", "git", "status"],
-        skip_if_flag_prefix: &["--porcelain", "--short", "-s"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
     RewriteRule {
@@ -235,7 +247,7 @@ const REWRITE_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["git", "log"],
         rewrite_to: &["skim", "git", "log"],
-        skip_if_flag_prefix: &["--format", "--pretty", "--oneline"],
+        skip_if_flag_prefix: &["--format", "--pretty"],
         category: RewriteCategory::Git,
     },
     // tsc bare
@@ -444,25 +456,25 @@ const REWRITE_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "pr", "list"],
         rewrite_to: &["skim", "infra", "gh", "pr", "list"],
-        skip_if_flag_prefix: &["--json"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Infra,
     },
     RewriteRule {
         prefix: &["gh", "issue", "list"],
         rewrite_to: &["skim", "infra", "gh", "issue", "list"],
-        skip_if_flag_prefix: &["--json"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Infra,
     },
     RewriteRule {
         prefix: &["gh", "run", "list"],
         rewrite_to: &["skim", "infra", "gh", "run", "list"],
-        skip_if_flag_prefix: &["--json"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Infra,
     },
     RewriteRule {
         prefix: &["gh", "release", "list"],
         rewrite_to: &["skim", "infra", "gh", "release", "list"],
-        skip_if_flag_prefix: &["--json"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Infra,
     },
     // infra — aws
@@ -2069,19 +2081,34 @@ mod tests {
     // Skip-flag behavior (git rules)
     // ========================================================================
 
+    // --porcelain, --short, and -s are no longer skip flags for `git status`.
+    // The rewrite proceeds; the handler strips conflicting format flags itself.
     #[test]
-    fn test_git_status_with_porcelain_skipped() {
-        assert!(try_rewrite(&["git", "status", "--porcelain"]).is_none());
+    fn test_git_status_with_porcelain_rewrites() {
+        let result = try_rewrite(&["git", "status", "--porcelain"]);
+        assert!(
+            result.is_some(),
+            "Expected rewrite for 'git status --porcelain' — flag is now stripped by handler"
+        );
+        assert_eq!(result.unwrap().tokens, vec!["skim", "git", "status", "--porcelain"]);
     }
 
     #[test]
-    fn test_git_status_with_short_skipped() {
-        assert!(try_rewrite(&["git", "status", "--short"]).is_none());
+    fn test_git_status_with_short_rewrites() {
+        let result = try_rewrite(&["git", "status", "--short"]);
+        assert!(
+            result.is_some(),
+            "Expected rewrite for 'git status --short' — flag is now stripped by handler"
+        );
     }
 
     #[test]
-    fn test_git_status_with_s_skipped() {
-        assert!(try_rewrite(&["git", "status", "-s"]).is_none());
+    fn test_git_status_with_s_rewrites() {
+        let result = try_rewrite(&["git", "status", "-s"]);
+        assert!(
+            result.is_some(),
+            "Expected rewrite for 'git status -s' — flag is now stripped by handler"
+        );
     }
 
     #[test]
@@ -2124,9 +2151,16 @@ mod tests {
         assert!(try_rewrite(&["git", "log", "--pretty=oneline"]).is_none());
     }
 
+    // --oneline is no longer a skip flag for `git log`. The rewrite proceeds;
+    // the handler strips --oneline and injects its own --format flag.
     #[test]
-    fn test_git_log_with_oneline_skipped() {
-        assert!(try_rewrite(&["git", "log", "--oneline"]).is_none());
+    fn test_git_log_with_oneline_rewrites() {
+        let result = try_rewrite(&["git", "log", "--oneline"]);
+        assert!(
+            result.is_some(),
+            "Expected rewrite for 'git log --oneline' — flag is now stripped by handler"
+        );
+        assert_eq!(result.unwrap().tokens, vec!["skim", "git", "log", "--oneline"]);
     }
 
     // ========================================================================
@@ -3269,11 +3303,14 @@ mod tests {
         );
     }
 
+    // --json is no longer a skip flag for gh list commands — the gh handler
+    // already parses --json output correctly.
     #[test]
-    fn test_rewrite_gh_pr_list_skip_json() {
+    fn test_rewrite_gh_pr_list_with_json_rewrites() {
+        let result = try_rewrite(&["gh", "pr", "list", "--json", "number"]);
         assert!(
-            try_rewrite(&["gh", "pr", "list", "--json", "number"]).is_none(),
-            "Expected no rewrite when --json flag is present"
+            result.is_some(),
+            "Expected rewrite for 'gh pr list --json' — handler supports --json output"
         );
     }
 

@@ -2,25 +2,32 @@
 
 use std::process::ExitCode;
 
-use crate::cmd::{extract_output_format, user_has_flag};
+use crate::cmd::extract_output_format;
 use crate::output::canonical::GitResult;
 
-use super::{run_parsed_command, run_passthrough};
+use super::run_parsed_command;
 
 /// Run `git status` with compression.
 ///
-/// Flag-aware passthrough: if user has `--porcelain`, `--short`, or `-s`,
-/// output is already compact — pass through unmodified.
+/// Strips user-supplied format flags (`-s`, `--short`, `--porcelain`,
+/// `--porcelain=*`) before forwarding to git so they cannot conflict with the
+/// `--porcelain=v2` flag that the handler injects for structured parsing.
 pub(super) fn run_status(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
-    if user_has_flag(args, &["--porcelain", "--short", "-s"]) {
-        return run_passthrough(global_flags, "status", args, show_stats);
-    }
+    // Strip conflicting format flags — handler injects --porcelain=v2 itself.
+    let stripped_args: Vec<String> = args
+        .iter()
+        .filter(|a| {
+            let s = a.as_str();
+            s != "-s" && s != "--short" && s != "--porcelain" && !s.starts_with("--porcelain=")
+        })
+        .cloned()
+        .collect();
 
-    let (filtered_args, output_format) = extract_output_format(args);
+    let (filtered_args, output_format) = extract_output_format(&stripped_args);
 
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend([

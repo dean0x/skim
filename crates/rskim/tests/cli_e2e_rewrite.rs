@@ -1042,10 +1042,11 @@ fn test_rewrite_rg_json_skipped() {
 }
 
 #[test]
-fn test_rewrite_gh_json_skipped() {
-    // --json is in skip_if_flag_prefix for gh pr list: no match = exit 1
+fn test_rewrite_gh_json_rewrites() {
+    // --json is no longer a skip flag for gh list commands — handler supports
+    // --json output natively, so the rewrite should succeed (exit 0).
     skim_cmd()
         .args(["rewrite", "gh", "pr", "list", "--json", "title"])
         .assert()
-        .failure();
+        .success();
 }
