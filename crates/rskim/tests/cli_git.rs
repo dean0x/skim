@@ -241,12 +241,11 @@ fn test_skim_git_log_contains_hashes() {
         "Expected [log] prefix in output, got: {stdout}"
     );
     // Verify at least one line looks like a commit (7-char hex prefix)
-    let has_hash = stdout
-        .lines()
-        .filter(|l| !l.starts_with('['))
-        .any(|l| l.split_whitespace().next().map_or(false, |w| {
+    let has_hash = stdout.lines().filter(|l| !l.starts_with('[')).any(|l| {
+        l.split_whitespace().next().map_or(false, |w| {
             w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit())
-        }));
+        })
+    });
     assert!(
         has_hash,
         "Expected a line with a hex commit hash in output, got: {stdout}"

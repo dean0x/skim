@@ -1103,7 +1103,9 @@ fn test_rewrite_gh_pr_list_json_roundtrip() {
         .args(["rewrite", "gh", "pr", "list", "--json", "number"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra gh pr list --json number"));
+        .stdout(predicate::str::contains(
+            "skim infra gh pr list --json number",
+        ));
 }
 
 #[test]
