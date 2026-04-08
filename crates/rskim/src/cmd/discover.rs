@@ -62,6 +62,10 @@ struct DiscoverConfig {
     debug: bool,
 }
 
+/// Parse CLI arguments into a [`DiscoverConfig`].
+///
+/// SYNC NOTE: This function must remain in sync with [`command()`] — any flag
+/// added here must also be added there (for shell completions), and vice versa.
 fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
     let mut config = DiscoverConfig {
         since: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600)),
@@ -148,7 +152,10 @@ struct BashCommandInfo {
     rewrite_target: Option<String>,
 }
 
-fn analyze_invocations(invocations: &[ToolInvocation], config: &DiscoverConfig) -> DiscoverAnalysis {
+fn analyze_invocations(
+    invocations: &[ToolInvocation],
+    config: &DiscoverConfig,
+) -> DiscoverAnalysis {
     let mut code_reads = Vec::new();
     let mut bash_commands = Vec::new();
     let mut total_read_tokens = 0usize;
@@ -156,7 +163,11 @@ fn analyze_invocations(invocations: &[ToolInvocation], config: &DiscoverConfig) 
     // Only allocate the HashMap when debug mode is enabled; it is unused on the
     // common (non-debug) path and would otherwise impose an unconditional allocation.
     let mut non_rewritable_counts: Option<std::collections::HashMap<String, usize>> =
-        if config.debug { Some(std::collections::HashMap::new()) } else { None };
+        if config.debug {
+            Some(std::collections::HashMap::new())
+        } else {
+            None
+        };
 
     for inv in invocations {
         match &inv.input {
@@ -384,7 +395,6 @@ fn print_debug_section(analysis: &DiscoverAnalysis, debug: bool) {
 }
 
 fn print_json_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) -> anyhow::Result<()> {
-    let debug = config.debug;
     let skimmable_reads: Vec<_> = analysis
         .code_reads
         .iter()
@@ -410,7 +420,7 @@ fn print_json_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) -> an
     });
 
     // Include non-rewritable commands array when debug is enabled
-    if debug && !analysis.non_rewritable_commands.is_empty() {
+    if config.debug && !analysis.non_rewritable_commands.is_empty() {
         let non_rewritable: Vec<_> = analysis
             .non_rewritable_commands
             .iter()
@@ -485,6 +495,10 @@ fn print_help() {
 // Clap command for completions
 // ============================================================================
 
+/// Build the clap [`Command`] for `skim discover` (used for shell completions).
+///
+/// SYNC NOTE: This must remain in sync with [`parse_args()`] — any flag added
+/// here must also be handled in `parse_args`, and vice versa.
 pub(super) fn command() -> clap::Command {
     clap::Command::new("discover")
         .about("Identify missed optimization opportunities in AI agent sessions")
@@ -522,6 +536,7 @@ pub(super) fn command() -> clap::Command {
 
 #[cfg(test)]
 mod tests {
+    use super::super::rewrite::would_rewrite;
     use super::*;
 
     #[test]
@@ -567,75 +582,75 @@ mod tests {
     #[test]
     fn test_would_rewrite_basic() {
         // Rewritable commands
-        assert!(super::super::rewrite::would_rewrite("cargo test").is_some());
-        assert!(super::super::rewrite::would_rewrite("cargo clippy").is_some());
-        assert!(super::super::rewrite::would_rewrite("cargo build").is_some());
-        assert!(super::super::rewrite::would_rewrite("pytest").is_some());
-        assert!(super::super::rewrite::would_rewrite("go test ./...").is_some());
-        assert!(super::super::rewrite::would_rewrite("git status").is_some());
-        assert!(super::super::rewrite::would_rewrite("git diff").is_some());
-        assert!(super::super::rewrite::would_rewrite("tsc").is_some());
-        assert!(super::super::rewrite::would_rewrite("cat file.rs").is_some());
+        assert!(would_rewrite("cargo test").is_some());
+        assert!(would_rewrite("cargo clippy").is_some());
+        assert!(would_rewrite("cargo build").is_some());
+        assert!(would_rewrite("pytest").is_some());
+        assert!(would_rewrite("go test ./...").is_some());
+        assert!(would_rewrite("git status").is_some());
+        assert!(would_rewrite("git diff").is_some());
+        assert!(would_rewrite("tsc").is_some());
+        assert!(would_rewrite("cat file.rs").is_some());
         // Non-rewritable commands
-        assert!(super::super::rewrite::would_rewrite("cat file.txt").is_none());
-        assert!(super::super::rewrite::would_rewrite("ls").is_none());
-        assert!(super::super::rewrite::would_rewrite("echo hello").is_none());
-        assert!(super::super::rewrite::would_rewrite("cargo run").is_none());
+        assert!(would_rewrite("cat file.txt").is_none());
+        assert!(would_rewrite("ls").is_none());
+        assert!(would_rewrite("echo hello").is_none());
+        assert!(would_rewrite("cargo run").is_none());
         // Already a skim command
-        assert!(super::super::rewrite::would_rewrite("skim test cargo").is_none());
+        assert!(would_rewrite("skim test cargo").is_none());
     }
 
     #[test]
     fn test_would_rewrite_lint_and_infra_tools() {
         // lint tools
-        assert!(super::super::rewrite::would_rewrite("prettier --check .").is_some());
-        assert!(super::super::rewrite::would_rewrite("rustfmt --check src/main.rs").is_some());
-        assert!(super::super::rewrite::would_rewrite("npx prettier --check .").is_some());
+        assert!(would_rewrite("prettier --check .").is_some());
+        assert!(would_rewrite("rustfmt --check src/main.rs").is_some());
+        assert!(would_rewrite("npx prettier --check .").is_some());
         // infra tools
-        assert!(super::super::rewrite::would_rewrite("gh pr list").is_some());
-        assert!(super::super::rewrite::would_rewrite("gh issue list").is_some());
-        assert!(super::super::rewrite::would_rewrite("gh run list").is_some());
-        assert!(super::super::rewrite::would_rewrite("gh release list").is_some());
-        assert!(super::super::rewrite::would_rewrite("aws s3 ls").is_some());
-        assert!(super::super::rewrite::would_rewrite("curl https://api.example.com").is_some());
-        assert!(super::super::rewrite::would_rewrite("wget https://example.com/file").is_some());
+        assert!(would_rewrite("gh pr list").is_some());
+        assert!(would_rewrite("gh issue list").is_some());
+        assert!(would_rewrite("gh run list").is_some());
+        assert!(would_rewrite("gh release list").is_some());
+        assert!(would_rewrite("aws s3 ls").is_some());
+        assert!(would_rewrite("curl https://api.example.com").is_some());
+        assert!(would_rewrite("wget https://example.com/file").is_some());
         // gh without a recognized subcommand should not match
-        assert!(super::super::rewrite::would_rewrite("gh auth login").is_none());
+        assert!(would_rewrite("gh auth login").is_none());
     }
 
     #[test]
     fn test_would_rewrite_targets() {
         assert_eq!(
-            super::super::rewrite::would_rewrite("cargo test"),
+            would_rewrite("cargo test"),
             Some("skim test cargo".to_string())
         );
         assert_eq!(
-            super::super::rewrite::would_rewrite("git status"),
+            would_rewrite("git status"),
             Some("skim git status".to_string())
         );
         assert_eq!(
-            super::super::rewrite::would_rewrite("cat file.rs"),
+            would_rewrite("cat file.rs"),
             Some("skim file.rs --mode=pseudo".to_string())
         );
-        assert_eq!(super::super::rewrite::would_rewrite("ls"), None);
+        assert_eq!(would_rewrite("ls"), None);
     }
 
     #[test]
     fn test_would_rewrite_file_ops() {
         // find always matches
-        assert!(super::super::rewrite::would_rewrite("find . -name '*.rs'").is_some());
+        assert!(would_rewrite("find . -name '*.rs'").is_some());
         // tree always matches
-        assert!(super::super::rewrite::would_rewrite("tree src/").is_some());
+        assert!(would_rewrite("tree src/").is_some());
         // rg always matches
-        assert!(super::super::rewrite::would_rewrite("rg fn main src/").is_some());
+        assert!(would_rewrite("rg fn main src/").is_some());
         // grep -r/-rn matches; bare grep does not
-        assert!(super::super::rewrite::would_rewrite("grep -r TODO src/").is_some());
-        assert!(super::super::rewrite::would_rewrite("grep -rn TODO src/").is_some());
-        assert!(super::super::rewrite::would_rewrite("grep TODO file.rs").is_none());
+        assert!(would_rewrite("grep -r TODO src/").is_some());
+        assert!(would_rewrite("grep -rn TODO src/").is_some());
+        assert!(would_rewrite("grep TODO file.rs").is_none());
         // ls -la/-R matches; bare ls does not
-        assert!(super::super::rewrite::would_rewrite("ls -la").is_some());
-        assert!(super::super::rewrite::would_rewrite("ls -R src/").is_some());
-        assert!(super::super::rewrite::would_rewrite("ls").is_none());
+        assert!(would_rewrite("ls -la").is_some());
+        assert!(would_rewrite("ls -R src/").is_some());
+        assert!(would_rewrite("ls").is_none());
     }
 
     #[test]
@@ -711,7 +726,13 @@ mod tests {
         let inv3 = make_bash_invocation("cargo test"); // this one IS rewritable
         let invocations = vec![inv1, inv2, inv3];
 
-        let config = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: false };
+        let config = DiscoverConfig {
+            since: None,
+            session_latest: false,
+            agent_filter: None,
+            json_output: false,
+            debug: false,
+        };
         let analysis = analyze_invocations(&invocations, &config);
 
         // Only "cargo test" should be in bash_commands, not the skim commands
@@ -726,7 +747,13 @@ mod tests {
         let inv2 = make_bash_invocation("cargo test");
         let invocations = vec![inv1, inv2];
 
-        let config = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: false };
+        let config = DiscoverConfig {
+            since: None,
+            session_latest: false,
+            agent_filter: None,
+            json_output: false,
+            debug: false,
+        };
         let analysis = analyze_invocations(&invocations, &config);
 
         assert_eq!(analysis.bash_commands.len(), 2);
@@ -742,12 +769,24 @@ mod tests {
         let invocations = vec![inv1, inv2, inv3];
 
         // debug=false: non_rewritable_commands should be empty
-        let config_no_debug = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: false };
+        let config_no_debug = DiscoverConfig {
+            since: None,
+            session_latest: false,
+            agent_filter: None,
+            json_output: false,
+            debug: false,
+        };
         let analysis = analyze_invocations(&invocations, &config_no_debug);
         assert!(analysis.non_rewritable_commands.is_empty());
 
         // debug=true: non_rewritable_commands should be populated
-        let config_debug = DiscoverConfig { since: None, session_latest: false, agent_filter: None, json_output: false, debug: true };
+        let config_debug = DiscoverConfig {
+            since: None,
+            session_latest: false,
+            agent_filter: None,
+            json_output: false,
+            debug: true,
+        };
         let analysis = analyze_invocations(&invocations, &config_debug);
         assert!(!analysis.non_rewritable_commands.is_empty());
         // "node server.js --port 3000" and "node server.js --port 4000" share
@@ -766,6 +805,73 @@ mod tests {
         let config = parse_args(&["--debug".to_string()]).unwrap();
         assert!(config.debug);
         // Clean up process-wide debug state set by parse_args
+        crate::debug::reset_debug_for_tests();
+    }
+
+    /// Sync test: verifies that `parse_args` and `command()` accept the same flags.
+    ///
+    /// If this test fails, a flag was added to one but not the other. Update both
+    /// `parse_args` and `command` together.
+    #[test]
+    fn test_parse_args_and_command_are_in_sync() {
+        // Build the clap command for validation
+        let cmd = command();
+
+        // Flags exercised: --since, --agent, --json, --debug, --session
+        let all_args = [
+            "--since",
+            "7d",
+            "--agent",
+            "claude-code",
+            "--json",
+            "--debug",
+            "--session",
+            "latest",
+        ];
+
+        // clap must accept these flags without error
+        cmd.clone()
+            .try_get_matches_from(std::iter::once("discover").chain(all_args.iter().copied()))
+            .expect("clap rejected flags that parse_args accepts — sync is broken");
+
+        // parse_args must also accept these flags without error
+        let string_args: Vec<String> = all_args.iter().map(|s| s.to_string()).collect();
+        parse_args(&string_args)
+            .expect("parse_args rejected flags that clap accepts — sync is broken");
+
+        // Verify individual flag values agree between parse_args and clap
+        let matches = cmd
+            .try_get_matches_from(std::iter::once("discover").chain(all_args.iter().copied()))
+            .unwrap();
+
+        // --json: both must agree it is set
+        assert!(matches.get_flag("json"), "clap should see --json as true");
+
+        // --debug: both must agree it is set
+        assert!(matches.get_flag("debug"), "clap should see --debug as true");
+
+        // --since: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("since").map(|s| s.as_str()),
+            Some("7d"),
+            "clap --since value should be '7d'"
+        );
+
+        // --agent: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("agent").map(|s| s.as_str()),
+            Some("claude-code"),
+            "clap --agent value should be 'claude-code'"
+        );
+
+        // --session: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("session").map(|s| s.as_str()),
+            Some("latest"),
+            "clap --session value should be 'latest'"
+        );
+
+        // Clean up process-wide debug state set by parse_args (via --debug)
         crate::debug::reset_debug_for_tests();
     }
 }
