@@ -212,14 +212,18 @@ fn color_pct(pct: f64) -> ColoredString {
 
 /// Render a block-character progress bar.
 ///
-/// Uses `█` for filled and `░` for empty cells, colored by efficiency tier.
-/// `pct` is clamped to [0, 100] before computing fill width.
+/// Uses `█` for filled and `░` for empty cells. Filled cells are colored green;
+/// empty cells are uncolored. `pct` is clamped to [0, 100] before computing fill width.
 fn render_bar(pct: f64, width: usize) -> String {
     let clamped = pct.clamp(0.0, 100.0);
     let filled = ((clamped / 100.0) * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
-    let colored_fill = apply_efficiency_color("\u{2588}".repeat(filled));
-    format!("[{}{}]", colored_fill, "\u{2591}".repeat(empty))
+    if filled == 0 {
+        format!("[{}]", "\u{2591}".repeat(empty))
+    } else {
+        let colored_fill = apply_efficiency_color("\u{2588}".repeat(filled));
+        format!("[{}{}]", colored_fill, "\u{2591}".repeat(empty))
+    }
 }
 
 /// Render a sparkline from daily stats using block chars `▁▂▃▄▅▆▇█`.
