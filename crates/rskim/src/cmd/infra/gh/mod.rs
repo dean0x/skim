@@ -33,13 +33,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::output::canonical::{InfraItem, InfraResult};
+use crate::output::canonical::InfraResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
-
-pub(super) use super::combine_stdout_stderr as combine_stdout_stderr_gh;
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "gh",
@@ -174,7 +172,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
-            |cmd| issue_view::prepare_args(cmd),
+            issue_view::prepare_args,
             issue_view::parse_impl,
         ),
         ("pr", "view") => run_infra_tool(
@@ -182,7 +180,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
-            |cmd| pr_view::prepare_args(cmd),
+            pr_view::prepare_args,
             pr_view::parse_impl,
         ),
         ("pr", "checks") => run_infra_tool(
@@ -190,7 +188,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
-            |cmd| pr_checks::prepare_args(cmd),
+            pr_checks::prepare_args,
             pr_checks::parse_impl,
         ),
         ("run", "view") => run_infra_tool(
@@ -198,7 +196,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
-            |cmd| run_view::prepare_args(cmd),
+            run_view::prepare_args,
             run_view::parse_impl,
         ),
         _ => run_infra_tool(
@@ -206,7 +204,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
-            |cmd| list::prepare_args(cmd),
+            list::prepare_args,
             parse_impl_with_auto_detect,
         ),
     }
@@ -251,23 +249,19 @@ pub(crate) fn parse_impl_with_auto_detect(output: &CommandOutput) -> ParseResult
         if let Some(result) = pr_checks::try_parse_checks_json(&output.stdout) {
             return ParseResult::Full(result);
         }
+        // Unknown JSON array (e.g., gh api) → passthrough
+        let combined = combine_stdout_stderr(output);
+        return ParseResult::Passthrough(combined.into_owned());
     }
 
-    // Text — try checks text format first, then list regex
-    let combined = combine_stdout_stderr(output);
-
-    if let Some(result) = pr_checks::try_parse_checks_text(&combined) {
+    // Text — try checks text format first, then list three-tier fallback.
+    // Delegate to list::parse_impl so text passthrough follows the same path as
+    // direct list commands (regex Tier 2 → Passthrough Tier 3).
+    if let Some(result) = pr_checks::try_parse_checks_text(&output.stdout) {
         return ParseResult::Full(result);
     }
 
-    if let Some(result) = list::try_parse_regex(&combined) {
-        return ParseResult::Degraded(
-            result,
-            vec!["gh: JSON parse failed, using regex".to_string()],
-        );
-    }
-
-    ParseResult::Passthrough(combined.into_owned())
+    list::parse_impl(output)
 }
 
 /// Discriminate a JSON object by its fields to select the correct view parser.
@@ -301,12 +295,6 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
 
     None
 }
-
-// ============================================================================
-// Re-export combine_stdout_stderr for sub-modules
-// ============================================================================
-
-pub(super) use super::combine_stdout_stderr as combine_stdout_stderr_inner;
 
 // ============================================================================
 // Unit tests

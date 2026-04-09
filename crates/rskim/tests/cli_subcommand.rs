@@ -10,6 +10,14 @@ use tempfile::TempDir;
 
 const FIND_FIXTURE: &str = include_str!("fixtures/cmd/file/find_small.txt");
 const GH_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_pr_list.json");
+const GH_ISSUE_VIEW_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_issue_view.json");
+const GH_PR_VIEW_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_pr_view.json");
+// Symbol format used for piped stdin tests because strip_ansi (applied to
+// stdin content before parsing) removes tab characters, breaking the
+// tab-format fixture. Symbol format uses Unicode (✓/X/-) which survives
+// strip_ansi. Tab format is covered by unit tests in pr_checks.rs.
+const GH_PR_CHECKS_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_pr_checks_symbol.txt");
+const GH_RUN_VIEW_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_run_view.json");
 const LOG_FIXTURE: &str = include_str!("fixtures/cmd/log/plaintext_mixed.txt");
 
 fn skim_cmd() -> Command {
@@ -502,5 +510,129 @@ fn test_subcommand_log_show_stats() {
     assert!(
         stderr.to_lowercase().contains("token"),
         "stderr should contain token stats, got: {stderr}"
+    );
+}
+
+// ============================================================================
+// gh view/checks integration tests (#131)
+// ============================================================================
+
+#[test]
+fn test_subcommand_infra_gh_issue_view() {
+    // Pipe issue JSON fixture via stdin — auto-detect should produce compressed output
+    let output = skim_cmd()
+        .args(["infra", "gh"])
+        .write_stdin(GH_ISSUE_VIEW_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("issue view"),
+        "Expected 'issue view' in output, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("#42"),
+        "Expected issue number in output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_pr_view() {
+    let output = skim_cmd()
+        .args(["infra", "gh"])
+        .write_stdin(GH_PR_VIEW_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("pr view"),
+        "Expected 'pr view' in output, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("#15"),
+        "Expected PR number in output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_pr_checks() {
+    let output = skim_cmd()
+        .args(["infra", "gh"])
+        .write_stdin(GH_PR_CHECKS_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("checks") || stdout.contains("check"),
+        "Expected check summary in output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_run_view() {
+    let output = skim_cmd()
+        .args(["infra", "gh"])
+        .write_stdin(GH_RUN_VIEW_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("run view"),
+        "Expected 'run view' in output, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("#12345"),
+        "Expected run ID in output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_issue_view_json_output() {
+    let output = skim_cmd()
+        .args(["infra", "gh", "--json"])
+        .write_stdin(GH_ISSUE_VIEW_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(json.get("tool").is_some(), "JSON output should have 'tool' field");
+    assert_eq!(
+        json.get("tool").and_then(|v| v.as_str()),
+        Some("gh"),
+        "tool field should be 'gh'"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_run_view_json_output() {
+    let output = skim_cmd()
+        .args(["infra", "gh", "--json"])
+        .write_stdin(GH_RUN_VIEW_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(json.get("tool").is_some(), "JSON output should have 'tool' field");
+}
+
+#[test]
+fn test_subcommand_infra_gh_existing_list_unchanged() {
+    // Regression guard: existing list fixture must still work correctly
+    let output = skim_cmd()
+        .args(["infra", "gh"])
+        .write_stdin(GH_FIXTURE)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("gh list"),
+        "Regression: existing list fixture should produce 'gh list', got: {stdout}"
     );
 }

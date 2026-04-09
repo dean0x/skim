@@ -57,6 +57,9 @@ pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
 }
 
 /// Three-tier parse function for gh list output.
+///
+/// Called by `parse_impl_with_auto_detect` in `gh/mod.rs` as the final text
+/// fallback after JSON auto-detection fails. Also exercised by unit tests.
 pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     if let Some(result) = try_parse_json_list(&output.stdout) {
         return ParseResult::Full(result);
