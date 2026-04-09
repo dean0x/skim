@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-04-09
+
+Patch release: discover/rewrite alignment, rewritable gap closures, stats bar fix.
+
+### Fixed
+- `render_bar` zero-width ANSI color leak in stats dashboard
+- Removed unjustified skip flags from rewrite rules (git status, git log, gh list)
+
+### Added
+- Jest / npx jest rewrite rules for test output compression
+- `pub(crate) would_rewrite()` API for discover/rewrite alignment
+- `--debug` flag for `skim discover` command
+
+### Testing
+- **2,223 tests passing** (consolidated from 2,306 in v2.3.0 via PR #130 alignment work)
+
 ## [2.3.0] - 2026-04-08
 
 Minor release: Stats dashboard v3, debug-gated warnings, git fetch compression.
