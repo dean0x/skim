@@ -2,25 +2,36 @@
 
 use std::process::ExitCode;
 
-use crate::cmd::{extract_output_format, user_has_flag};
+use crate::cmd::extract_output_format;
 use crate::output::canonical::GitResult;
 
-use super::{run_parsed_command, run_passthrough};
+use super::run_parsed_command;
+
+/// Returns `true` for flags that conflict with the `--porcelain=v2` flag the
+/// handler injects.  These are `-s`, `--short`, `--porcelain`, and any
+/// `--porcelain=*` variant.
+fn is_conflicting_status_flag(s: &str) -> bool {
+    s == "-s" || s == "--short" || s == "--porcelain" || s.starts_with("--porcelain=")
+}
 
 /// Run `git status` with compression.
 ///
-/// Flag-aware passthrough: if user has `--porcelain`, `--short`, or `-s`,
-/// output is already compact — pass through unmodified.
+/// Strips user-supplied format flags (`-s`, `--short`, `--porcelain`,
+/// `--porcelain=*`) before forwarding to git so they cannot conflict with the
+/// `--porcelain=v2` flag that the handler injects for structured parsing.
 pub(super) fn run_status(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
-    if user_has_flag(args, &["--porcelain", "--short", "-s"]) {
-        return run_passthrough(global_flags, "status", args, show_stats);
-    }
+    // Strip conflicting format flags — handler injects --porcelain=v2 itself.
+    let stripped_args: Vec<String> = args
+        .iter()
+        .filter(|a| !is_conflicting_status_flag(a.as_str()))
+        .cloned()
+        .collect();
 
-    let (filtered_args, output_format) = extract_output_format(args);
+    let (filtered_args, output_format) = extract_output_format(&stripped_args);
 
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend([
@@ -58,7 +69,8 @@ impl StatusCategories {
 
         if line.starts_with('?') {
             // Untracked: "? <path>"
-            self.untracked.push(line.get(2..).unwrap_or("").to_string());
+            self.untracked
+                .push(line.get(2..).unwrap_or_default().to_string());
             return;
         }
 
@@ -191,12 +203,12 @@ fn extract_renamed_path(line: &str) -> String {
     // "2 XY sub mH mI mW hH hI X_score <path>\t<origPath>"
     let Some(tab_pos) = line.find('\t') else {
         // Malformed input: no tab found; fall back to the path portion after the prefix
-        return line.get(2..).unwrap_or("").to_string();
+        return line.get(2..).unwrap_or_default().to_string();
     };
     let before_tab = &line[..tab_pos];
     let after_tab = &line[tab_pos + 1..];
     // Field 10 (0-indexed 9) is the new path; use splitn to preserve spaces in path
-    let new_path = before_tab.splitn(10, ' ').last().unwrap_or("");
+    let new_path = before_tab.splitn(10, ' ').last().unwrap_or_default();
     format!("{after_tab} -> {new_path}")
 }
 
@@ -413,6 +425,110 @@ mod tests {
                 .any(|d| d.contains("unmerged:") && d.contains("conflict.rs")),
             "expected unmerged detail for conflict.rs, got: {:?}",
             result.details
+        );
+    }
+
+    // ========================================================================
+    // Fallback guarantee: parse_status must not panic on unexpected input
+    // (Step 7e)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_status_garbage_input_no_panic() {
+        // Feed unexpected garbage — must produce a valid result, never panic.
+        // The parser may interpret "unexpected garbage input" as an unmerged line
+        // (because the line starts with 'u'). The key contract is: no panic, valid result.
+        let result = parse_status("unexpected garbage input");
+        // Must return a well-formed GitResult (non-empty summary, valid details vec).
+        assert!(!result.summary.is_empty(), "Summary must not be empty");
+        // Details may or may not be populated depending on how the line is classified.
+        // We just verify the result is structurally valid (no panic, fields accessible).
+        let _ = result.details.len();
+    }
+
+    #[test]
+    fn test_parse_status_null_bytes_no_panic() {
+        // Feed null bytes and other control characters — must not panic.
+        let result = parse_status("\x00\x01\x02\x03 binary garbage");
+        assert!(!result.summary.is_empty(), "summary must be non-empty");
+    }
+
+    #[test]
+    fn test_parse_status_partial_v2_line_no_panic() {
+        // Truncated porcelain v2 lines — handler must degrade gracefully.
+        let output = "# branch.head main\n1\n1 M\n1 M. \n";
+        let result = parse_status(output);
+        assert!(
+            result.details.iter().any(|d| d.contains("branch: main")),
+            "branch line should still be parsed"
+        );
+        // Truncated type-1 lines should produce no panics, possibly no detail entries.
+    }
+
+    // ========================================================================
+    // Flag-stripping predicate
+    // ========================================================================
+
+    /// Thin test wrapper around the module-scope predicate.
+    fn strip_conflicting_flags(args: &[&str]) -> Vec<String> {
+        args.iter()
+            .filter(|a| !is_conflicting_status_flag(a))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_flag_stripping_removes_conflicting_flags() {
+        // Each of these must be stripped individually.
+        assert!(
+            strip_conflicting_flags(&["-s"]).is_empty(),
+            "-s must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--short"]).is_empty(),
+            "--short must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--porcelain"]).is_empty(),
+            "--porcelain must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--porcelain=v1"]).is_empty(),
+            "--porcelain=v1 must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["--porcelain=v2"]).is_empty(),
+            "--porcelain=v2 must be stripped"
+        );
+    }
+
+    #[test]
+    fn test_flag_stripping_preserves_non_conflicting_flags() {
+        let input = ["--branch", "--", "path/to/file"];
+        let result = strip_conflicting_flags(&input);
+        assert_eq!(
+            result,
+            vec!["--branch", "--", "path/to/file"],
+            "non-conflicting flags must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_flag_stripping_mixed_input() {
+        // Conflicting flags are stripped; non-conflicting flags are preserved.
+        let input = [
+            "-s",
+            "--branch",
+            "--short",
+            "--",
+            "--porcelain=v1",
+            "path/to/file",
+        ];
+        let result = strip_conflicting_flags(&input);
+        assert_eq!(
+            result,
+            vec!["--branch", "--", "path/to/file"],
+            "only conflicting flags must be stripped from mixed input"
         );
     }
 

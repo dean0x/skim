@@ -419,3 +419,80 @@ fn test_discover_only_skim_commands_shows_zero() {
         "Sessions with only skim commands should show 0 commands, got {commands_total}"
     );
 }
+
+// ============================================================================
+// Step 6e: --debug flag E2E tests
+// ============================================================================
+
+#[test]
+fn test_discover_debug_flag_accepted() {
+    // --debug should not cause an error; exit 0.
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("nonexistent");
+    skim_cmd_neutralized(&nonexistent)
+        .args(["discover", "--debug"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_discover_debug_shows_non_rewritable_commands() {
+    // --debug mode should include a section for non-rewritable commands when
+    // there are bash commands that have no rewrite rule.
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("nonexistent");
+    let claude_dir = dir.path().join("claude-projects");
+    let project_dir = claude_dir.join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Session with a non-rewritable command (node is not rewritable)
+    let session = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t01","name":"Bash","input":{"command":"node server.js"}}]},"timestamp":"2024-01-01T00:00:00Z","sessionId":"sess1"}
+{"type":"user","message":{"content":[{"tool_use_id":"t01","type":"tool_result","content":"running"}]}}
+"#;
+    std::fs::write(project_dir.join("node-session.jsonl"), session).unwrap();
+
+    let output = skim_cmd_neutralized(&nonexistent)
+        .args(["discover", "--debug", "--since", "7d"])
+        .env("SKIM_PROJECTS_DIR", claude_dir.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Debug mode should show non-rewritable commands section
+    assert!(
+        stdout.contains("Non-rewritable") || stdout.contains("non_rewritable"),
+        "Expected non-rewritable commands section in --debug output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_discover_debug_json_includes_non_rewritable() {
+    // --debug --json should include non_rewritable_commands in the JSON output.
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("nonexistent");
+    let claude_dir = dir.path().join("claude-projects");
+    let project_dir = claude_dir.join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    // Session with a non-rewritable command
+    let session = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t01","name":"Bash","input":{"command":"node server.js"}}]},"timestamp":"2024-01-01T00:00:00Z","sessionId":"sess1"}
+{"type":"user","message":{"content":[{"tool_use_id":"t01","type":"tool_result","content":"running"}]}}
+"#;
+    std::fs::write(project_dir.join("node-session.jsonl"), session).unwrap();
+
+    let output = skim_cmd_neutralized(&nonexistent)
+        .args(["discover", "--debug", "--json", "--since", "7d"])
+        .env("SKIM_PROJECTS_DIR", claude_dir.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // JSON output should include non_rewritable_commands key inside commands object
+    // when debug is enabled and there are non-rewritable commands.
+    assert!(
+        json["commands"].get("non_rewritable_commands").is_some(),
+        "Expected 'non_rewritable_commands' key under commands in debug JSON output, got: {json}"
+    );
+}

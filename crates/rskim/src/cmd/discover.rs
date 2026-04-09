@@ -38,12 +38,12 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     }
 
     // Classify and analyze
-    let analysis = analyze_invocations(&all_invocations);
+    let analysis = analyze_invocations(&all_invocations, &config);
 
     if config.json_output {
-        print_json_report(&analysis)?;
+        print_json_report(&analysis, &config)?;
     } else {
-        print_text_report(&analysis);
+        print_text_report(&analysis, &config);
     }
 
     Ok(ExitCode::SUCCESS)
@@ -59,14 +59,21 @@ struct DiscoverConfig {
     session_latest: bool,
     agent_filter: Option<AgentKind>,
     json_output: bool,
+    debug: bool,
 }
 
+/// Parse CLI arguments into a [`DiscoverConfig`].
+///
+/// SYNC NOTE: This function must remain in sync with [`command()`] — any flag
+/// added here must also be added there (for shell completions), and vice versa.
 fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
     let mut config = DiscoverConfig {
         since: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600)),
         session_latest: false,
         agent_filter: None,
         json_output: false,
+        // Honor SKIM_DEBUG env var as well as the --debug flag
+        debug: crate::debug::is_debug_enabled(),
     };
 
     let mut i = 0;
@@ -100,9 +107,13 @@ fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
             "--json" => {
                 config.json_output = true;
             }
+            "--debug" => {
+                config.debug = true;
+                crate::debug::force_enable_debug();
+            }
             other => {
                 anyhow::bail!(
-                    "unknown flag: '{other}'\n\nUsage: skim discover [--since <duration>] [--session latest] [--agent <name>] [--json]"
+                    "unknown flag: '{other}'\n\nUsage: skim discover [--since <duration>] [--session latest] [--agent <name>] [--json] [--debug]"
                 );
             }
         }
@@ -122,6 +133,9 @@ struct DiscoverAnalysis {
     bash_commands: Vec<BashCommandInfo>,
     total_read_tokens: usize,
     potential_savings_tokens: usize,
+    /// Non-rewritable command prefixes (first 3 tokens), with occurrence counts.
+    /// Only populated when debug mode is enabled.
+    non_rewritable_commands: Vec<(String, usize)>,
 }
 
 struct CodeReadInfo {
@@ -138,11 +152,22 @@ struct BashCommandInfo {
     rewrite_target: Option<String>,
 }
 
-fn analyze_invocations(invocations: &[ToolInvocation]) -> DiscoverAnalysis {
+fn analyze_invocations(
+    invocations: &[ToolInvocation],
+    config: &DiscoverConfig,
+) -> DiscoverAnalysis {
     let mut code_reads = Vec::new();
     let mut bash_commands = Vec::new();
     let mut total_read_tokens = 0usize;
     let mut potential_savings = 0usize;
+    // Only allocate the HashMap when debug mode is enabled; it is unused on the
+    // common (non-debug) path and would otherwise impose an unconditional allocation.
+    let mut non_rewritable_counts: Option<std::collections::HashMap<String, usize>> =
+        if config.debug {
+            Some(std::collections::HashMap::new())
+        } else {
+            None
+        };
 
     for inv in invocations {
         match &inv.input {
@@ -151,7 +176,7 @@ fn analyze_invocations(invocations: &[ToolInvocation]) -> DiscoverAnalysis {
                     .result
                     .as_ref()
                     .map(|r| r.content.as_str())
-                    .unwrap_or("");
+                    .unwrap_or_default();
                 let result_bytes = result_content.len();
                 let result_tokens = estimate_tokens(result_content);
                 total_read_tokens += result_tokens;
@@ -172,29 +197,34 @@ fn analyze_invocations(invocations: &[ToolInvocation]) -> DiscoverAnalysis {
                 });
             }
             ToolInput::Bash { command } => {
-                // Skip commands already rewritten by the hook (start with "skim ")
-                if command.starts_with("skim ") {
-                    continue;
+                if let Some(info) = classify_bash_command(command) {
+                    // Accumulate non-rewritable prefix counts when debug is enabled.
+                    // Responsibility lives in the caller, not classify_bash_command,
+                    // so the classification function stays pure and easily testable.
+                    if let Some(ref mut counts) = non_rewritable_counts {
+                        if !info.has_rewrite {
+                            let prefix: String = command
+                                .split_whitespace()
+                                .take(3)
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !prefix.is_empty() {
+                                *counts.entry(prefix).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    bash_commands.push(info);
                 }
-
-                // Check if this command has a skim rewrite
-                let tokens: Vec<&str> = command.split_whitespace().collect();
-                let has_rewrite = check_has_rewrite(&tokens);
-                let rewrite_target = if has_rewrite {
-                    get_rewrite_target(&tokens)
-                } else {
-                    None
-                };
-
-                bash_commands.push(BashCommandInfo {
-                    command: command.clone(),
-                    has_rewrite,
-                    rewrite_target,
-                });
             }
             _ => {}
         }
     }
+
+    // Sort non-rewritable by frequency descending, then alphabetically for stability
+    let mut non_rewritable_commands: Vec<(String, usize)> = non_rewritable_counts
+        .map(|m| m.into_iter().collect())
+        .unwrap_or_default();
+    non_rewritable_commands.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     DiscoverAnalysis {
         total_invocations: invocations.len(),
@@ -202,7 +232,34 @@ fn analyze_invocations(invocations: &[ToolInvocation]) -> DiscoverAnalysis {
         bash_commands,
         total_read_tokens,
         potential_savings_tokens: potential_savings,
+        non_rewritable_commands,
     }
+}
+
+/// Classify a single Bash invocation.
+///
+/// Returns `None` when the command should be skipped entirely (already a `skim`
+/// invocation), otherwise returns the classified [`BashCommandInfo`].
+///
+/// The caller is responsible for any debug-mode accumulation (e.g. collecting
+/// non-rewritable prefix counts); this function only classifies.
+fn classify_bash_command(command: &str) -> Option<BashCommandInfo> {
+    // Skip commands already rewritten by the hook (start with "skim ")
+    if command.starts_with("skim ") {
+        return None;
+    }
+
+    // `would_rewrite` is the single source of truth for rewrite eligibility.
+    // It is heavier than a simple prefix heuristic but eliminates rule
+    // duplication and guarantees correctness — correctness over micro-performance.
+    let rewrite_target = super::rewrite::would_rewrite(command);
+    let has_rewrite = rewrite_target.is_some();
+
+    Some(BashCommandInfo {
+        command: command.to_string(),
+        has_rewrite,
+        rewrite_target,
+    })
 }
 
 /// Token estimation using the real tiktoken tokenizer.
@@ -222,108 +279,26 @@ fn is_skimmable_file(path: &str) -> bool {
         .is_some()
 }
 
-/// Check if a command would be rewritten by skim rewrite.
-///
-/// Simple prefix-based heuristic matching the same command families as
-/// the rewrite engine's declarative rules. We use a heuristic rather
-/// than importing `try_rewrite` directly to avoid tight coupling with
-/// the rewrite module's internal types.
-fn check_has_rewrite(tokens: &[&str]) -> bool {
-    let cmd = tokens.first().copied().unwrap_or("");
-    match cmd {
-        "cargo" => matches!(
-            tokens.get(1).copied(),
-            Some("test" | "nextest" | "clippy" | "build")
-        ),
-        "pytest" | "python" | "python3" => true,
-        "npx" => matches!(
-            tokens.get(1).copied(),
-            Some("vitest" | "jest" | "tsc" | "prettier")
-        ),
-        "vitest" | "jest" => true,
-        "go" => tokens.get(1) == Some(&"test"),
-        "git" => matches!(tokens.get(1).copied(), Some("status" | "diff" | "log")),
-        "tsc" => true,
-        "prettier" => true,
-        "rustfmt" => true,
-        "gh" => matches!(
-            tokens.get(1).copied(),
-            Some("pr" | "issue" | "run" | "release")
-        ),
-        "aws" => true,
-        "curl" => true,
-        "wget" => true,
-        "find" => true,
-        "tree" => true,
-        "rg" => true,
-        "ls" => matches!(tokens.get(1).copied(), Some("-la" | "-R")),
-        "grep" => matches!(tokens.get(1).copied(), Some("-r" | "-rn")),
-        "cat" | "head" | "tail" => {
-            // Only rewritable if operating on code files
-            tokens
-                .iter()
-                .skip(1)
-                .any(|t| !t.starts_with('-') && is_skimmable_file(t))
-        }
-        _ => false,
-    }
-}
-
-/// Get the skim rewrite target description for a command.
-fn get_rewrite_target(tokens: &[&str]) -> Option<String> {
-    if tokens.is_empty() {
-        return None;
-    }
-    match tokens[0] {
-        "cargo" if matches!(tokens.get(1), Some(&"test") | Some(&"nextest")) => {
-            Some("skim test cargo".to_string())
-        }
-        "cargo" if tokens.get(1) == Some(&"clippy") => Some("skim build clippy".to_string()),
-        "cargo" if tokens.get(1) == Some(&"build") => Some("skim build cargo".to_string()),
-        "pytest" | "python" | "python3" => Some("skim test pytest".to_string()),
-        "vitest" | "jest" => Some("skim test vitest".to_string()),
-        "npx" if tokens.get(1) == Some(&"vitest") || tokens.get(1) == Some(&"jest") => {
-            Some("skim test vitest".to_string())
-        }
-        "npx" if tokens.get(1) == Some(&"tsc") => Some("skim build tsc".to_string()),
-        "npx" if tokens.get(1) == Some(&"prettier") => Some("skim lint prettier".to_string()),
-        "go" if tokens.get(1) == Some(&"test") => Some("skim test go".to_string()),
-        "git" => Some(format!("skim git {}", tokens.get(1).unwrap_or(&""))),
-        "tsc" => Some("skim build tsc".to_string()),
-        "prettier" => Some("skim lint prettier".to_string()),
-        "rustfmt" => Some("skim lint rustfmt".to_string()),
-        "gh" => Some(format!("skim infra gh {}", tokens.get(1).unwrap_or(&""))),
-        "aws" => Some("skim infra aws".to_string()),
-        "curl" => Some("skim infra curl".to_string()),
-        "wget" => Some("skim infra wget".to_string()),
-        "find" => Some("skim file find".to_string()),
-        "tree" => Some("skim file tree".to_string()),
-        "rg" => Some("skim file rg".to_string()),
-        "ls" if matches!(tokens.get(1).copied(), Some("-la" | "-R")) => {
-            Some("skim file ls".to_string())
-        }
-        "grep" if matches!(tokens.get(1).copied(), Some("-r" | "-rn")) => {
-            Some("skim file grep".to_string())
-        }
-        "cat" | "head" | "tail" => Some("skim <file> --mode=pseudo".to_string()),
-        _ => None,
-    }
-}
-
 // ============================================================================
 // Output
 // ============================================================================
 
-fn print_text_report(analysis: &DiscoverAnalysis) {
+fn print_text_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
     println!("skim discover -- optimization opportunities\n");
-
     println!(
         "Sessions scanned: found {} tool invocations",
         analysis.total_invocations
     );
     println!();
 
-    // Code reads summary
+    print_code_reads_section(analysis);
+    print_commands_section(analysis, config.debug);
+
+    println!();
+    println!("hint: run `skim init` to install the PreToolUse hook for automatic optimization");
+}
+
+fn print_code_reads_section(analysis: &DiscoverAnalysis) {
     let skimmable_count = analysis.code_reads.iter().filter(|r| r.could_skim).count();
     let non_skimmable_count = analysis.code_reads.iter().filter(|r| !r.could_skim).count();
 
@@ -348,7 +323,6 @@ fn print_text_report(analysis: &DiscoverAnalysis) {
         );
         println!();
 
-        // Top files by token count
         let mut sorted_reads: Vec<_> = analysis
             .code_reads
             .iter()
@@ -361,8 +335,9 @@ fn print_text_report(analysis: &DiscoverAnalysis) {
         }
     }
     println!();
+}
 
-    // Bash commands summary
+fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
     let rewritable_count = analysis
         .bash_commands
         .iter()
@@ -396,11 +371,28 @@ fn print_text_report(analysis: &DiscoverAnalysis) {
         }
     }
 
-    println!();
-    println!("hint: run `skim init` to install the PreToolUse hook for automatic optimization");
+    print_debug_section(analysis, debug);
 }
 
-fn print_json_report(analysis: &DiscoverAnalysis) -> anyhow::Result<()> {
+fn print_debug_section(analysis: &DiscoverAnalysis, debug: bool) {
+    if debug && !analysis.non_rewritable_commands.is_empty() {
+        println!();
+        println!(
+            "  Non-rewritable commands ({}):",
+            analysis.non_rewritable_commands.len()
+        );
+        for (prefix, count) in &analysis.non_rewritable_commands {
+            println!(
+                "    {} ({} occurrence{})",
+                prefix,
+                count,
+                if *count == 1 { "" } else { "s" }
+            );
+        }
+    }
+}
+
+fn print_json_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) -> anyhow::Result<()> {
     let skimmable_reads: Vec<_> = analysis
         .code_reads
         .iter()
@@ -411,6 +403,34 @@ fn print_json_report(analysis: &DiscoverAnalysis) -> anyhow::Result<()> {
         .iter()
         .filter(|c| c.has_rewrite)
         .collect();
+
+    let mut commands_obj = serde_json::json!({
+        "total": analysis.bash_commands.len(),
+        "rewritable": rewritable.len(),
+        "rewrites": rewritable.iter().filter_map(|c| {
+            c.rewrite_target.as_ref().map(|t| {
+                serde_json::json!({
+                    "original": c.command,
+                    "target": t,
+                })
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    // Include non-rewritable commands array when debug is enabled
+    if config.debug && !analysis.non_rewritable_commands.is_empty() {
+        let non_rewritable: Vec<_> = analysis
+            .non_rewritable_commands
+            .iter()
+            .map(|(prefix, count)| {
+                serde_json::json!({
+                    "prefix": prefix,
+                    "count": count,
+                })
+            })
+            .collect();
+        commands_obj["non_rewritable_commands"] = serde_json::json!(non_rewritable);
+    }
 
     let report = serde_json::json!({
         "version": 1,
@@ -427,18 +447,7 @@ fn print_json_report(analysis: &DiscoverAnalysis) -> anyhow::Result<()> {
                 })
             }).collect::<Vec<_>>(),
         },
-        "commands": {
-            "total": analysis.bash_commands.len(),
-            "rewritable": rewritable.len(),
-            "rewrites": rewritable.iter().filter_map(|c| {
-                c.rewrite_target.as_ref().map(|t| {
-                    serde_json::json!({
-                        "original": c.command,
-                        "target": t,
-                    })
-                })
-            }).collect::<Vec<_>>(),
-        },
+        "commands": commands_obj,
     });
 
     let stdout = io::stdout();
@@ -466,6 +475,7 @@ fn print_help() {
     println!("  --session latest     Only scan the most recent session");
     println!("  --agent <name>       Only scan sessions from a specific agent");
     println!("  --json               Output machine-readable JSON");
+    println!("  --debug              Show non-rewritable commands (also: SKIM_DEBUG=1)");
     println!("  --help, -h           Print help information");
     println!();
     println!("Supported agents:");
@@ -483,6 +493,10 @@ fn print_help() {
 // Clap command for completions
 // ============================================================================
 
+/// Build the clap [`Command`] for `skim discover` (used for shell completions).
+///
+/// SYNC NOTE: This must remain in sync with [`parse_args()`] — any flag added
+/// here must also be handled in `parse_args`, and vice versa.
 pub(super) fn command() -> clap::Command {
     clap::Command::new("discover")
         .about("Identify missed optimization opportunities in AI agent sessions")
@@ -510,11 +524,18 @@ pub(super) fn command() -> clap::Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Output machine-readable JSON"),
         )
+        .arg(
+            clap::Arg::new("debug")
+                .long("debug")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show non-rewritable commands (also: SKIM_DEBUG=1)"),
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::rewrite::would_rewrite;
 
     #[test]
     fn test_parse_duration_ago_days() {
@@ -554,132 +575,80 @@ mod tests {
         assert!(!is_skimmable_file("/tmp/.env"));
     }
 
+    /// Verify that `would_rewrite` (from the rewrite engine) correctly identifies
+    /// rewritable commands — replaces the deleted `check_has_rewrite` heuristic.
     #[test]
-    fn test_check_has_rewrite() {
-        assert!(check_has_rewrite(&["cargo", "test"]));
-        assert!(check_has_rewrite(&["cargo", "clippy"]));
-        assert!(check_has_rewrite(&["cargo", "build"]));
-        assert!(check_has_rewrite(&["pytest"]));
-        assert!(check_has_rewrite(&["go", "test", "./..."]));
-        assert!(check_has_rewrite(&["git", "status"]));
-        assert!(check_has_rewrite(&["git", "diff"]));
-        assert!(check_has_rewrite(&["tsc"]));
-        assert!(check_has_rewrite(&["cat", "file.rs"]));
-        assert!(!check_has_rewrite(&["cat", "file.txt"]));
-        assert!(!check_has_rewrite(&["ls"]));
-        assert!(!check_has_rewrite(&["echo", "hello"]));
-        assert!(!check_has_rewrite(&["cargo", "run"]));
+    fn test_would_rewrite_basic() {
+        // Rewritable commands
+        assert!(would_rewrite("cargo test").is_some());
+        assert!(would_rewrite("cargo clippy").is_some());
+        assert!(would_rewrite("cargo build").is_some());
+        assert!(would_rewrite("pytest").is_some());
+        assert!(would_rewrite("go test ./...").is_some());
+        assert!(would_rewrite("git status").is_some());
+        assert!(would_rewrite("git diff").is_some());
+        assert!(would_rewrite("tsc").is_some());
+        assert!(would_rewrite("cat file.rs").is_some());
+        // Non-rewritable commands
+        assert!(would_rewrite("cat file.txt").is_none());
+        assert!(would_rewrite("ls").is_none());
+        assert!(would_rewrite("echo hello").is_none());
+        assert!(would_rewrite("cargo run").is_none());
+        // Already a skim command
+        assert!(would_rewrite("skim test cargo").is_none());
     }
 
     #[test]
-    fn test_check_has_rewrite_lint_and_infra_tools() {
+    fn test_would_rewrite_lint_and_infra_tools() {
         // lint tools
-        assert!(check_has_rewrite(&["prettier", "--check", "."]));
-        assert!(check_has_rewrite(&["rustfmt", "--check", "src/main.rs"]));
-        assert!(check_has_rewrite(&["npx", "prettier", "--check", "."]));
+        assert!(would_rewrite("prettier --check .").is_some());
+        assert!(would_rewrite("rustfmt --check src/main.rs").is_some());
+        assert!(would_rewrite("npx prettier --check .").is_some());
         // infra tools
-        assert!(check_has_rewrite(&["gh", "pr", "list"]));
-        assert!(check_has_rewrite(&["gh", "issue", "list"]));
-        assert!(check_has_rewrite(&["gh", "run", "list"]));
-        assert!(check_has_rewrite(&["gh", "release", "list"]));
-        assert!(check_has_rewrite(&["aws", "s3", "ls"]));
-        assert!(check_has_rewrite(&["curl", "https://api.example.com"]));
-        assert!(check_has_rewrite(&["wget", "https://example.com/file"]));
+        assert!(would_rewrite("gh pr list").is_some());
+        assert!(would_rewrite("gh issue list").is_some());
+        assert!(would_rewrite("gh run list").is_some());
+        assert!(would_rewrite("gh release list").is_some());
+        assert!(would_rewrite("aws s3 ls").is_some());
+        assert!(would_rewrite("curl https://api.example.com").is_some());
+        assert!(would_rewrite("wget https://example.com/file").is_some());
         // gh without a recognized subcommand should not match
-        assert!(!check_has_rewrite(&["gh", "auth", "login"]));
+        assert!(would_rewrite("gh auth login").is_none());
     }
 
     #[test]
-    fn test_get_rewrite_target() {
+    fn test_would_rewrite_targets() {
         assert_eq!(
-            get_rewrite_target(&["cargo", "test"]),
+            would_rewrite("cargo test"),
             Some("skim test cargo".to_string())
         );
         assert_eq!(
-            get_rewrite_target(&["git", "status"]),
+            would_rewrite("git status"),
             Some("skim git status".to_string())
         );
         assert_eq!(
-            get_rewrite_target(&["cat", "file.rs"]),
-            Some("skim <file> --mode=pseudo".to_string())
+            would_rewrite("cat file.rs"),
+            Some("skim file.rs --mode=pseudo".to_string())
         );
-        assert_eq!(get_rewrite_target(&["ls"]), None);
+        assert_eq!(would_rewrite("ls"), None);
     }
 
     #[test]
-    fn test_get_rewrite_target_lint_and_infra_tools() {
-        assert_eq!(
-            get_rewrite_target(&["prettier"]),
-            Some("skim lint prettier".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["rustfmt"]),
-            Some("skim lint rustfmt".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["npx", "prettier"]),
-            Some("skim lint prettier".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["gh", "pr"]),
-            Some("skim infra gh pr".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["aws"]),
-            Some("skim infra aws".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["curl"]),
-            Some("skim infra curl".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["wget"]),
-            Some("skim infra wget".to_string())
-        );
-    }
-
-    #[test]
-    fn test_check_has_rewrite_file_ops() {
+    fn test_would_rewrite_file_ops() {
         // find always matches
-        assert!(check_has_rewrite(&["find", ".", "-name", "*.rs"]));
+        assert!(would_rewrite("find . -name '*.rs'").is_some());
         // tree always matches
-        assert!(check_has_rewrite(&["tree", "src/"]));
+        assert!(would_rewrite("tree src/").is_some());
         // rg always matches
-        assert!(check_has_rewrite(&["rg", "fn main", "src/"]));
+        assert!(would_rewrite("rg fn main src/").is_some());
         // grep -r/-rn matches; bare grep does not
-        assert!(check_has_rewrite(&["grep", "-r", "TODO", "src/"]));
-        assert!(check_has_rewrite(&["grep", "-rn", "TODO", "src/"]));
-        assert!(!check_has_rewrite(&["grep", "TODO", "file.rs"]));
+        assert!(would_rewrite("grep -r TODO src/").is_some());
+        assert!(would_rewrite("grep -rn TODO src/").is_some());
+        assert!(would_rewrite("grep TODO file.rs").is_none());
         // ls -la/-R matches; bare ls does not
-        assert!(check_has_rewrite(&["ls", "-la"]));
-        assert!(check_has_rewrite(&["ls", "-R", "src/"]));
-        assert!(!check_has_rewrite(&["ls"]));
-    }
-
-    #[test]
-    fn test_get_rewrite_target_file_ops() {
-        assert_eq!(
-            get_rewrite_target(&["find", "."]),
-            Some("skim file find".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["tree", "src/"]),
-            Some("skim file tree".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["rg", "pattern"]),
-            Some("skim file rg".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["grep", "-r", "pattern"]),
-            Some("skim file grep".to_string())
-        );
-        assert_eq!(
-            get_rewrite_target(&["ls", "-la"]),
-            Some("skim file ls".to_string())
-        );
-        // bare ls returns None
-        assert_eq!(get_rewrite_target(&["ls"]), None);
+        assert!(would_rewrite("ls -la").is_some());
+        assert!(would_rewrite("ls -R src/").is_some());
+        assert!(would_rewrite("ls").is_none());
     }
 
     #[test]
@@ -729,7 +698,62 @@ mod tests {
         assert!(config.since.is_some());
     }
 
+    // ---- classify_bash_command: unit tests ----
+
+    #[test]
+    fn test_classify_bash_skips_skim_commands() {
+        // Commands that start with "skim " are already rewritten — skip entirely.
+        assert!(classify_bash_command("skim test cargo").is_none());
+        assert!(classify_bash_command("skim build clippy").is_none());
+        assert!(classify_bash_command("skim git status").is_none());
+        assert!(classify_bash_command("skim file.rs").is_none());
+    }
+
+    #[test]
+    fn test_classify_bash_rewritable_commands() {
+        // Rewritable commands return Some with has_rewrite=true and a target.
+        let info = classify_bash_command("cargo test").unwrap();
+        assert!(info.has_rewrite);
+        assert!(info.rewrite_target.is_some());
+        assert_eq!(info.command, "cargo test");
+
+        let info = classify_bash_command("git status").unwrap();
+        assert!(info.has_rewrite);
+        assert!(info.rewrite_target.is_some());
+
+        let info = classify_bash_command("cat file.rs").unwrap();
+        assert!(info.has_rewrite);
+        assert!(info.rewrite_target.is_some());
+    }
+
+    #[test]
+    fn test_classify_bash_non_rewritable_commands() {
+        // Non-rewritable commands return Some with has_rewrite=false and no target.
+        let info = classify_bash_command("ls").unwrap();
+        assert!(!info.has_rewrite);
+        assert!(info.rewrite_target.is_none());
+        assert_eq!(info.command, "ls");
+
+        let info = classify_bash_command("echo hello").unwrap();
+        assert!(!info.has_rewrite);
+        assert!(info.rewrite_target.is_none());
+
+        let info = classify_bash_command("node server.js").unwrap();
+        assert!(!info.has_rewrite);
+        assert!(info.rewrite_target.is_none());
+    }
+
     // ---- analyze_invocations: skim command exclusion ----
+
+    fn default_config() -> DiscoverConfig {
+        DiscoverConfig {
+            since: None,
+            session_latest: false,
+            agent_filter: None,
+            json_output: false,
+            debug: false,
+        }
+    }
 
     fn make_bash_invocation(command: &str) -> ToolInvocation {
         ToolInvocation {
@@ -755,7 +779,8 @@ mod tests {
         let inv3 = make_bash_invocation("cargo test"); // this one IS rewritable
         let invocations = vec![inv1, inv2, inv3];
 
-        let analysis = analyze_invocations(&invocations);
+        let config = default_config();
+        let analysis = analyze_invocations(&invocations, &config);
 
         // Only "cargo test" should be in bash_commands, not the skim commands
         assert_eq!(analysis.bash_commands.len(), 1);
@@ -769,8 +794,115 @@ mod tests {
         let inv2 = make_bash_invocation("cargo test");
         let invocations = vec![inv1, inv2];
 
-        let analysis = analyze_invocations(&invocations);
+        let config = default_config();
+        let analysis = analyze_invocations(&invocations, &config);
 
         assert_eq!(analysis.bash_commands.len(), 2);
+    }
+
+    #[test]
+    fn test_analyze_collects_non_rewritable_when_debug() {
+        // Use commands whose first 3 tokens are identical so they collapse into
+        // a single deduplicated entry with count=2.
+        let inv1 = make_bash_invocation("node server.js --port 3000");
+        let inv2 = make_bash_invocation("node server.js --port 4000");
+        let inv3 = make_bash_invocation("cargo run --bin myapp");
+        let invocations = vec![inv1, inv2, inv3];
+
+        // debug=false: non_rewritable_commands should be empty
+        let analysis = analyze_invocations(&invocations, &default_config());
+        assert!(analysis.non_rewritable_commands.is_empty());
+
+        // debug=true: non_rewritable_commands should be populated
+        let config_debug = DiscoverConfig {
+            debug: true,
+            ..default_config()
+        };
+        let analysis = analyze_invocations(&invocations, &config_debug);
+        assert!(!analysis.non_rewritable_commands.is_empty());
+        // "node server.js --port 3000" and "node server.js --port 4000" share
+        // prefix "node server.js --port" (first 3 tokens)
+        let node_entry = analysis
+            .non_rewritable_commands
+            .iter()
+            .find(|(p, _)| p.starts_with("node server.js"));
+        assert!(node_entry.is_some());
+        assert_eq!(node_entry.unwrap().1, 2);
+    }
+
+    #[test]
+    fn test_parse_args_debug() {
+        // --debug flag sets debug=true
+        let config = parse_args(&["--debug".to_string()]).unwrap();
+        assert!(config.debug);
+        // Clean up process-wide debug state set by parse_args
+        crate::debug::reset_debug_for_tests();
+    }
+
+    /// Sync test: verifies that `parse_args` and `command()` accept the same flags.
+    ///
+    /// If this test fails, a flag was added to one but not the other. Update both
+    /// `parse_args` and `command` together.
+    #[test]
+    fn test_parse_args_and_command_are_in_sync() {
+        // Build the clap command for validation
+        let cmd = command();
+
+        // Flags exercised: --since, --agent, --json, --debug, --session
+        let all_args = [
+            "--since",
+            "7d",
+            "--agent",
+            "claude-code",
+            "--json",
+            "--debug",
+            "--session",
+            "latest",
+        ];
+
+        // clap must accept these flags without error
+        cmd.clone()
+            .try_get_matches_from(std::iter::once("discover").chain(all_args.iter().copied()))
+            .expect("clap rejected flags that parse_args accepts — sync is broken");
+
+        // parse_args must also accept these flags without error
+        let string_args: Vec<String> = all_args.iter().map(|s| s.to_string()).collect();
+        parse_args(&string_args)
+            .expect("parse_args rejected flags that clap accepts — sync is broken");
+
+        // Verify individual flag values agree between parse_args and clap
+        let matches = cmd
+            .try_get_matches_from(std::iter::once("discover").chain(all_args.iter().copied()))
+            .unwrap();
+
+        // --json: both must agree it is set
+        assert!(matches.get_flag("json"), "clap should see --json as true");
+
+        // --debug: both must agree it is set
+        assert!(matches.get_flag("debug"), "clap should see --debug as true");
+
+        // --since: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("since").map(|s| s.as_str()),
+            Some("7d"),
+            "clap --since value should be '7d'"
+        );
+
+        // --agent: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("agent").map(|s| s.as_str()),
+            Some("claude-code"),
+            "clap --agent value should be 'claude-code'"
+        );
+
+        // --session: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("session").map(|s| s.as_str()),
+            Some("latest"),
+            "clap --session value should be 'latest'"
+        );
+
+        // Clean up process-wide debug state set by parse_args (via --debug)
+        crate::debug::reset_debug_for_tests();
     }
 }

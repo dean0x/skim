@@ -1042,10 +1042,88 @@ fn test_rewrite_rg_json_skipped() {
 }
 
 #[test]
-fn test_rewrite_gh_json_skipped() {
-    // --json is in skip_if_flag_prefix for gh pr list: no match = exit 1
+fn test_rewrite_gh_json_rewrites() {
+    // --json is no longer a skip flag for gh list commands — handler supports
+    // --json output natively, so the rewrite should succeed (exit 0).
     skim_cmd()
         .args(["rewrite", "gh", "pr", "list", "--json", "title"])
         .assert()
-        .failure();
+        .success();
+}
+
+// ============================================================================
+// Step 7c: Rewrite + handler round-trip validation
+// These tests verify the full CLI path: `skim rewrite <tokens>` → correct output
+// ============================================================================
+
+#[test]
+fn test_rewrite_git_status_s_roundtrip() {
+    // `git status -s` should rewrite to `skim git status -s`
+    skim_cmd()
+        .args(["rewrite", "git", "status", "-s"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git status -s"));
+}
+
+#[test]
+fn test_rewrite_git_status_short_roundtrip() {
+    // `git status --short` should rewrite to `skim git status --short`
+    skim_cmd()
+        .args(["rewrite", "git", "status", "--short"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git status --short"));
+}
+
+#[test]
+fn test_rewrite_git_status_porcelain_roundtrip() {
+    // `git status --porcelain` should rewrite to `skim git status --porcelain`
+    skim_cmd()
+        .args(["rewrite", "git", "status", "--porcelain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git status --porcelain"));
+}
+
+#[test]
+fn test_rewrite_git_log_oneline_roundtrip() {
+    // `git log --oneline -5` should rewrite to `skim git log --oneline -5`
+    skim_cmd()
+        .args(["rewrite", "git", "log", "--oneline", "-5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git log"));
+}
+
+#[test]
+fn test_rewrite_gh_pr_list_json_roundtrip() {
+    // `gh pr list --json number` should rewrite to `skim infra gh pr list --json number`
+    skim_cmd()
+        .args(["rewrite", "gh", "pr", "list", "--json", "number"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "skim infra gh pr list --json number",
+        ));
+}
+
+#[test]
+fn test_rewrite_jest_roundtrip() {
+    // `jest src/` should rewrite to `skim test jest src/`
+    skim_cmd()
+        .args(["rewrite", "jest", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test jest src/"));
+}
+
+#[test]
+fn test_rewrite_npx_jest_roundtrip() {
+    // `npx jest src/` should rewrite to `skim test jest src/`
+    skim_cmd()
+        .args(["rewrite", "npx", "jest", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim test jest src/"));
 }

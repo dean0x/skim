@@ -89,6 +89,10 @@ struct LearnConfig {
     min_occurrences: usize,
 }
 
+/// Parse CLI arguments into a [`LearnConfig`].
+///
+/// SYNC NOTE: This function must remain in sync with [`command()`] — any flag
+/// added here must also be added there (for shell completions), and vice versa.
 fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
     let mut config = LearnConfig {
         since: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86400)),
@@ -282,8 +286,8 @@ fn find_correction(
         };
 
         // Pre-filter: base command must match (or be a typo with edit distance ≤1)
-        let failed_base = failed_cmd.split_whitespace().next().unwrap_or("");
-        let candidate_base = candidate_cmd.split_whitespace().next().unwrap_or("");
+        let failed_base = failed_cmd.split_whitespace().next().unwrap_or_default();
+        let candidate_base = candidate_cmd.split_whitespace().next().unwrap_or_default();
         if failed_base != candidate_base && levenshtein(failed_base, candidate_base) > 1 {
             continue;
         }
@@ -772,7 +776,7 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
         println!("   Correct: {}", pair.successful_command);
         if !pair.error_output.is_empty() {
             // Show first line of error output
-            let first_line = pair.error_output.lines().next().unwrap_or("");
+            let first_line = pair.error_output.lines().next().unwrap_or_default();
             if !first_line.is_empty() {
                 println!("   Error:   {first_line}");
             }
@@ -845,6 +849,10 @@ fn print_help() {
 // Clap command (for completions)
 // ============================================================================
 
+/// Build the clap [`Command`] for `skim learn` (used for shell completions).
+///
+/// SYNC NOTE: This must remain in sync with [`parse_args()`] — any flag added
+/// here must also be handled in `parse_args`, and vice versa.
 pub(super) fn command() -> clap::Command {
     clap::Command::new("learn")
         .about("Detect CLI error patterns and generate correction rules")
@@ -1793,5 +1801,81 @@ mod tests {
         let content = generate_rules_content(&corrections, AgentKind::CodexCli);
         assert!(!content.starts_with("---"));
         assert!(content.starts_with("# CLI Corrections"));
+    }
+
+    /// Sync test: verifies that `parse_args` and `command()` accept the same flags.
+    ///
+    /// If this test fails, a flag was added to one but not the other. Update both
+    /// `parse_args` and `command` together.
+    #[test]
+    fn test_parse_args_and_command_are_in_sync() {
+        // Build the clap command for validation
+        let cmd = command();
+
+        // Flags exercised: --since, --generate, --dry-run, --json, --agent, --min-occurrences
+        let all_args = [
+            "--since",
+            "7d",
+            "--generate",
+            "--dry-run",
+            "--json",
+            "--agent",
+            "claude-code",
+            "--min-occurrences",
+            "3",
+        ];
+
+        // clap must accept these flags without error
+        cmd.clone()
+            .try_get_matches_from(std::iter::once("learn").chain(all_args.iter().copied()))
+            .expect("clap rejected flags that parse_args accepts — sync is broken");
+
+        // parse_args must also accept these flags without error
+        let string_args: Vec<String> = all_args.iter().map(|s| s.to_string()).collect();
+        parse_args(&string_args)
+            .expect("parse_args rejected flags that clap accepts — sync is broken");
+
+        // Verify individual flag values agree between parse_args and clap
+        let matches = cmd
+            .try_get_matches_from(std::iter::once("learn").chain(all_args.iter().copied()))
+            .unwrap();
+
+        // --generate: both must agree it is set
+        assert!(
+            matches.get_flag("generate"),
+            "clap should see --generate as true"
+        );
+
+        // --dry-run: both must agree it is set
+        assert!(
+            matches.get_flag("dry-run"),
+            "clap should see --dry-run as true"
+        );
+
+        // --json: both must agree it is set
+        assert!(matches.get_flag("json"), "clap should see --json as true");
+
+        // --since: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("since").map(|s| s.as_str()),
+            Some("7d"),
+            "clap --since value should be '7d'"
+        );
+
+        // --agent: clap must surface the value
+        assert_eq!(
+            matches.get_one::<String>("agent").map(|s| s.as_str()),
+            Some("claude-code"),
+            "clap --agent value should be 'claude-code'"
+        );
+
+        // --min-occurrences: clap must surface the value
+        assert_eq!(
+            matches
+                .get_one::<String>("min-occurrences")
+                .map(|s| s.as_str()),
+            Some("3"),
+            "clap --min-occurrences value should be '3'"
+        );
     }
 }

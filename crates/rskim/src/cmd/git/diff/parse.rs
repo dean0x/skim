@@ -45,7 +45,10 @@ pub(super) fn scan_extended_headers(lines: &[&str], start: usize) -> (FileMetada
         } else if line.starts_with("deleted file mode") {
             meta.change = FileChange::Deleted;
         } else if line.starts_with("rename from ") {
-            let from = line.strip_prefix("rename from ").unwrap_or("").to_string();
+            let from = line
+                .strip_prefix("rename from ")
+                .unwrap_or_default()
+                .to_string();
             meta.change = FileChange::Renamed { from: Some(from) };
         } else if line.starts_with("rename to ") {
             // Only update if not already set to Renamed (rename from comes first)
@@ -55,9 +58,9 @@ pub(super) fn scan_extended_headers(lines: &[&str], start: usize) -> (FileMetada
         } else if line.starts_with("Binary files") && line.contains("differ") {
             meta.change = FileChange::Binary;
         } else if line.starts_with("--- ") {
-            meta.file_minus = line.strip_prefix("--- ").unwrap_or("").to_string();
+            meta.file_minus = line.strip_prefix("--- ").unwrap_or_default().to_string();
         } else if line.starts_with("+++ ") {
-            meta.file_plus = line.strip_prefix("+++ ").unwrap_or("").to_string();
+            meta.file_plus = line.strip_prefix("+++ ").unwrap_or_default().to_string();
         } else if line.starts_with("@@") {
             // Hunk header — extended headers are done, stop before consuming it
             break;

@@ -9,18 +9,27 @@ use super::{has_limit_flag, run_parsed_command, run_passthrough};
 
 /// Run `git log` with compression.
 ///
-/// Flag-aware passthrough: if user has `--format`, `--pretty`, or `--oneline`,
-/// output is already compact — pass through unmodified.
+/// Flag-aware passthrough: if user has `--format` or `--pretty` (custom
+/// format strings that cannot be parsed generically), pass through unmodified.
+/// `--oneline` is handled by stripping it and injecting the handler's own
+/// `--format` flag instead.
 pub(super) fn run_log(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
-    if user_has_flag(args, &["--format", "--pretty", "--oneline"]) {
+    if user_has_flag(args, &["--format", "--pretty"]) {
         return run_passthrough(global_flags, "log", args, show_stats);
     }
 
-    let (filtered_args, output_format) = extract_output_format(args);
+    // Strip --oneline — handler injects its own --format flag.
+    let stripped_args: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--oneline")
+        .cloned()
+        .collect();
+
+    let (filtered_args, output_format) = extract_output_format(&stripped_args);
 
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["log".to_string(), "--format=%h %s (%cr) <%an>".to_string()]);
