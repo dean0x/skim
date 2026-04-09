@@ -9,6 +9,13 @@ use rskim_search::{fxhash_bytes, lexical::builder::LexicalLayerBuilder, LayerBui
 // Directory helpers
 // ============================================================================
 
+/// Return `true` if `path` is the root of a git repository (has a `.git` entry).
+///
+/// Lightweight predicate: does not invoke `gix` and does not walk up the tree.
+pub(super) fn is_repo(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
 /// Walk up directory tree to find a `.git` directory (repo root).
 ///
 /// Falls back to CWD if no `.git` ancestor is found.

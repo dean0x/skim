@@ -153,8 +153,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         if build_flag || rebuild_flag {
             index::build_index(&repo_root, &index_dir)?;
         }
-        // All three flags trigger a temporal build.
-        dispatch::build_temporal_layer(&repo_root, &index_dir, lookback)?;
+        // Temporal build: --build-temporal is explicit so it hard-fails when
+        // there is no git repository. --build/--rebuild are "do the right thing"
+        // entry points: skip temporal with a warning when not in a git repo.
+        if build_temporal_flag || index::is_repo(&repo_root) {
+            dispatch::build_temporal_layer(&repo_root, &index_dir, lookback)?;
+        } else {
+            eprintln!("warning: skipping temporal index build: not a git repository");
+        }
 
         // If no query/temporal query was also requested, we're done after building.
         if !has_text && !is_blast_radius && !has_temporal_scoring_flag {

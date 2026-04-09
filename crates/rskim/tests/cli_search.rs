@@ -7,6 +7,24 @@ fn skim_cmd() -> Command {
     Command::cargo_bin("skim").unwrap()
 }
 
+/// Recursively search `root` for a file named `name`.
+fn dir_contains_file(root: &std::path::Path, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_contains_file(&path, name) {
+                return true;
+            }
+        } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return true;
+        }
+    }
+    false
+}
+
 // ============================================================================
 // Help flag tests (unchanged behaviour)
 // ============================================================================
@@ -275,18 +293,20 @@ fn test_search_json_output() {
 
 #[test]
 fn test_search_stats_after_build() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cache_dir = tmp.path().to_str().unwrap().to_string();
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
 
     skim_cmd()
+        .current_dir(repo.path())
         .args(["search", "--build"])
-        .env("SKIM_CACHE_DIR", &cache_dir)
+        .env("SKIM_CACHE_DIR", cache.path())
         .assert()
         .success();
 
     skim_cmd()
+        .current_dir(repo.path())
         .args(["search", "--stats"])
-        .env("SKIM_CACHE_DIR", &cache_dir)
+        .env("SKIM_CACHE_DIR", cache.path())
         .assert()
         .success()
         .stderr(predicate::str::contains("Files indexed"))
@@ -295,18 +315,20 @@ fn test_search_stats_after_build() {
 
 #[test]
 fn test_search_stats_json_after_build() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cache_dir = tmp.path().to_str().unwrap().to_string();
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
 
     skim_cmd()
+        .current_dir(repo.path())
         .args(["search", "--build"])
-        .env("SKIM_CACHE_DIR", &cache_dir)
+        .env("SKIM_CACHE_DIR", cache.path())
         .assert()
         .success();
 
     let output = skim_cmd()
+        .current_dir(repo.path())
         .args(["search", "--stats", "--json"])
-        .env("SKIM_CACHE_DIR", &cache_dir)
+        .env("SKIM_CACHE_DIR", cache.path())
         .output()
         .unwrap();
 
@@ -507,4 +529,85 @@ fn test_search_hot_cold_conflict_warns() {
         .assert()
         .success()
         .stderr(predicate::str::contains("mutually exclusive"));
+}
+
+// ============================================================================
+// Non-git directory regression tests (wave-2 critical fix)
+// ============================================================================
+
+/// `skim search --build` in a directory with no `.git` ancestor must exit 0,
+/// build the lexical index, print a warning about temporal being skipped, and
+/// NOT create a temporal.db.
+#[test]
+fn test_search_build_succeeds_in_non_git_dir() {
+    // A bare tempdir has no .git — simulates tarball extract / scratch dir.
+    let non_git_dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let output = skim_cmd()
+        .current_dir(non_git_dir.path())
+        .args(["search", "--build"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "--build in non-git dir must exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("warning: skipping temporal index build: not a git repository"),
+        "--build in non-git dir must warn about temporal skip; stderr: {stderr}"
+    );
+
+    // The temporal database must NOT have been created.
+    // Recursively scan the cache dir looking for any temporal.db.
+    assert!(
+        !dir_contains_file(cache.path(), "temporal.db"),
+        "temporal.db must not exist after --build in non-git dir"
+    );
+}
+
+/// `skim search --build-temporal` in a directory with no `.git` ancestor must
+/// hard-fail (exit 1) with an error mentioning git.
+#[test]
+fn test_search_build_temporal_hard_fails_in_non_git_dir() {
+    let non_git_dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let output = skim_cmd()
+        .current_dir(non_git_dir.path())
+        .args(["search", "--build-temporal"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "--build-temporal in non-git dir must exit non-zero; stderr: {stderr}"
+    );
+}
+
+/// `skim search --build` inside a git repository must build both lexical and
+/// temporal indexes successfully.
+#[test]
+fn test_search_build_in_git_dir_builds_temporal() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--build"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Temporal index built"));
+
+    // Confirm temporal.db was actually created somewhere under the cache.
+    assert!(
+        dir_contains_file(cache.path(), "temporal.db"),
+        "temporal.db must exist after --build in a git repo"
+    );
 }
