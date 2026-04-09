@@ -107,7 +107,10 @@ mod tests {
     fn command_has_suggest_flag() {
         let cmd = command();
         let arg = cmd.get_arguments().find(|a| a.get_id() == "suggest");
-        assert!(arg.is_some(), "Expected --suggest flag in command definition");
+        assert!(
+            arg.is_some(),
+            "Expected --suggest flag in command definition"
+        );
     }
 
     #[test]
@@ -121,7 +124,10 @@ mod tests {
     fn command_has_agent_option() {
         let cmd = command();
         let arg = cmd.get_arguments().find(|a| a.get_id() == "agent");
-        assert!(arg.is_some(), "Expected --agent option in command definition");
+        assert!(
+            arg.is_some(),
+            "Expected --agent option in command definition"
+        );
     }
 
     #[test]
@@ -171,7 +177,8 @@ mod tests {
             compound: false,
             skim_hook_version: "0.0.0",
         };
-        let json = serde_json::to_string(&output).expect("serialization must not fail for no-match");
+        let json =
+            serde_json::to_string(&output).expect("serialization must not fail for no-match");
         assert!(json.contains("\"match\":false"));
         // None category serializes as empty string via serialize_category
         assert!(json.contains("\"category\":\"\""));

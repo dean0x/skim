@@ -176,7 +176,14 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
         // Only recognise operators at the top-level (paren depth 0).
         if paren_depth == 0 {
             if let Some((op, advance)) = scan_operator(&chars, i, len) {
-                push_segment(input, &byte_offsets, i, current_start, &mut segments, Some(op));
+                push_segment(
+                    input,
+                    &byte_offsets,
+                    i,
+                    current_start,
+                    &mut segments,
+                    Some(op),
+                );
                 found_operator = true;
                 i += advance;
                 current_start = byte_offsets[i.min(len)];
