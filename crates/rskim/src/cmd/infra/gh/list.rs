@@ -81,6 +81,41 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // Tier 1: JSON array parsing
 // ============================================================================
 
+/// Convert a single JSON entry from a `gh` list response into an [`InfraItem`].
+///
+/// Handles field name alternatives used by different `gh` subcommands:
+/// - Label: `number` (issues/PRs) or `databaseId` (runs)
+/// - Title: `title` (issues/PRs) or `displayTitle` (runs)
+/// - State: `state` (issues/PRs) or `status` (runs)
+///
+/// Returns `None` if neither label alternative is present.
+fn json_entry_to_infra_item(entry: &serde_json::Value) -> Option<InfraItem> {
+    let label = entry
+        .get("number")
+        .and_then(|v| v.as_u64())
+        .or_else(|| entry.get("databaseId").and_then(|v| v.as_u64()))
+        .map(|n| format!("#{n}"))
+        .unwrap_or_else(|| "item".to_string());
+
+    let title = entry
+        .get("title")
+        .and_then(|v| v.as_str())
+        .or_else(|| entry.get("displayTitle").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    let state = entry
+        .get("state")
+        .and_then(|v| v.as_str())
+        .or_else(|| entry.get("status").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_lowercase();
+
+    let value = if state.is_empty() { title } else { format!("{title} ({state})") };
+
+    Some(InfraItem { label, value })
+}
+
 /// Parse gh JSON array output.
 ///
 /// Returns `None` if the input is not a JSON array, is larger than
@@ -101,36 +136,7 @@ pub(super) fn try_parse_json_list(stdout: &str) -> Option<InfraResult> {
     let items: Vec<InfraItem> = arr
         .into_iter()
         .take(MAX_ITEMS)
-        .map(|entry| {
-            let label = entry
-                .get("number")
-                .and_then(|v| v.as_u64())
-                .or_else(|| entry.get("databaseId").and_then(|v| v.as_u64()))
-                .map(|n| format!("#{n}"))
-                .unwrap_or_else(|| "item".to_string());
-
-            let title = entry
-                .get("title")
-                .and_then(|v| v.as_str())
-                .or_else(|| entry.get("displayTitle").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_string();
-
-            let state = entry
-                .get("state")
-                .and_then(|v| v.as_str())
-                .or_else(|| entry.get("status").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_lowercase();
-
-            let value = if state.is_empty() {
-                title
-            } else {
-                format!("{title} ({state})")
-            };
-
-            InfraItem { label, value }
-        })
+        .filter_map(|entry| json_entry_to_infra_item(&entry))
         .collect();
 
     let count = items.len();

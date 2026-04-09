@@ -59,17 +59,15 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
     // Get the common issue items via issue_view parser
     let issue_result = issue_view::try_parse_json(obj)?;
 
-    // Build PR-specific summary
+    // NOTE: number/title/state are re-extracted here because issue_view returns
+    // a rendered InfraResult with its summary already baked in as "issue view".
+    // We need the raw fields to re-render the summary as "pr view". The three
+    // field lookups are cheap (no allocation on the hot path) and avoidable only
+    // by threading raw fields back through issue_view's return type — not worth
+    // the added coupling for three string reads.
     let number = obj.get("number").and_then(|v| v.as_u64())?;
-    let title = obj
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(no title)");
-    let state = obj
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
+    let state = obj.get("state").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
     let summary = format!("#{number}: {title} ({state})");
 
     // Start with the issue items

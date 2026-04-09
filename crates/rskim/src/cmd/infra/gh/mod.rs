@@ -434,4 +434,19 @@ mod tests {
             result.tier_name()
         );
     }
+
+    #[test]
+    fn test_freeform_release_text_passthrough() {
+        // Freeform text that is neither checks format nor list format should
+        // pass through unchanged via auto-detect. This text matches no tab
+        // pattern (no `<number>\t<rest>`) and no checks regex.
+        let input = "Release v2.0.0\nPublished by @dean\nSee CHANGELOG.md for details.";
+        let output = make_output(input);
+        let result = parse_impl_with_auto_detect(&output);
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough for freeform release text, got {}",
+            result.tier_name()
+        );
+    }
 }

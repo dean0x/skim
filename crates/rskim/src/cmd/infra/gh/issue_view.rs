@@ -30,6 +30,40 @@ use super::{
 const ISSUE_VIEW_FIELDS: &str =
     "number,title,state,body,labels,assignees,author,milestone,comments";
 
+// ============================================================================
+// Field extraction helpers
+// ============================================================================
+
+/// Push an array field by joining extracted sub-field strings with `", "`.
+///
+/// Each array element has `sub_key` extracted as a string and the results are
+/// joined. If the result is empty, `empty_fallback` is used.
+fn push_array_field(
+    items: &mut Vec<InfraItem>,
+    label: &str,
+    obj: &serde_json::Value,
+    key: &str,
+    sub_key: &str,
+    empty_fallback: &str,
+) {
+    let joined = obj
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|el| el.get(sub_key).and_then(|n| n.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let value = if joined.is_empty() {
+        empty_fallback.to_string()
+    } else {
+        joined
+    };
+    items.push(InfraItem { label: label.to_string(), value });
+}
+
 /// Inject `--json` for issue view if not already present.
 pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
     inject_json_fields(cmd_args, ISSUE_VIEW_FIELDS);
@@ -75,105 +109,46 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
 
     let mut items: Vec<InfraItem> = Vec::new();
 
-    // Author
+    // Author — nested object: author.login
     let author = obj
         .get("author")
         .and_then(|a| a.get("login"))
         .and_then(|l| l.as_str())
         .unwrap_or("unknown");
-    items.push(InfraItem {
-        label: "author".to_string(),
-        value: author.to_string(),
-    });
+    items.push(InfraItem { label: "author".to_string(), value: author.to_string() });
 
-    // Labels
-    let labels = obj
-        .get("labels")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    items.push(InfraItem {
-        label: "labels".to_string(),
-        value: if labels.is_empty() {
-            "(none)".to_string()
-        } else {
-            labels
-        },
-    });
+    // Labels — array of {name: string}
+    push_array_field(&mut items, "labels", obj, "labels", "name", "(none)");
 
-    // Assignees
-    let assignees = obj
-        .get("assignees")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|a| a.get("login").and_then(|l| l.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    items.push(InfraItem {
-        label: "assignees".to_string(),
-        value: if assignees.is_empty() {
-            "(none)".to_string()
-        } else {
-            assignees
-        },
-    });
+    // Assignees — array of {login: string}
+    push_array_field(&mut items, "assignees", obj, "assignees", "login", "(none)");
 
-    // Milestone
+    // Milestone — optional nested object: milestone.title
     let milestone = obj
         .get("milestone")
-        .and_then(|m| {
-            if m.is_null() {
-                None
-            } else {
-                m.get("title").and_then(|t| t.as_str())
-            }
-        })
+        .and_then(|m| if m.is_null() { None } else { m.get("title").and_then(|t| t.as_str()) })
         .unwrap_or("(none)");
-    items.push(InfraItem {
-        label: "milestone".to_string(),
-        value: milestone.to_string(),
-    });
+    items.push(InfraItem { label: "milestone".to_string(), value: milestone.to_string() });
 
-    // Body
-    let body = obj
-        .get("body")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
+    // Body — truncated to MAX_BODY_LINES
+    let body = obj.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
     let body_value = if body.is_empty() {
         "(empty)".to_string()
     } else {
         truncate_body(body, MAX_BODY_LINES)
     };
-    items.push(InfraItem {
-        label: "body".to_string(),
-        value: body_value,
-    });
+    items.push(InfraItem { label: "body".to_string(), value: body_value });
 
-    // Comments
+    // Comments count + last MAX_COMMENTS previews
     let comments_arr = obj
         .get("comments")
         .and_then(|v| v.as_array())
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     let count = comments_arr.len();
-    items.push(InfraItem {
-        label: "comments".to_string(),
-        value: format!("{count} total"),
-    });
+    items.push(InfraItem { label: "comments".to_string(), value: format!("{count} total") });
     for c in extract_comments(comments_arr, MAX_COMMENTS) {
-        items.push(InfraItem {
-            label: "comment".to_string(),
-            value: c,
-        });
+        items.push(InfraItem { label: "comment".to_string(), value: c });
     }
 
     Some(InfraResult::new(
@@ -279,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tier1_user_json_fields_passthrough() {
+    fn test_tier1_user_json_fields_not_overridden() {
         // When user already passed --json, we should not inject again
         let mut args = vec![
             "issue".to_string(),
@@ -322,6 +297,26 @@ mod tests {
             result.is_full(),
             "Expected Full parse result, got {}",
             result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_oversized_json_does_not_parse_as_full() {
+        // Input larger than MAX_JSON_BYTES must skip Tier 1 and not return Full
+        // from the JSON path. It should fall through to Tier 2 (Degraded) or
+        // Tier 3 (Passthrough) — either is acceptable; Full from JSON is not.
+        use super::super::MAX_JSON_BYTES;
+        // Build a valid-looking JSON object prefix padded to exceed the limit.
+        // We use a large string field so serde_json would succeed if the gate
+        // weren't there — confirming the gate rejects it before deserialization.
+        let padding = "x".repeat(MAX_JSON_BYTES + 1);
+        let oversized = format!(r#"{{"number":1,"title":"T","state":"open","_pad":"{padding}"}}"#);
+        assert!(oversized.len() > MAX_JSON_BYTES);
+        let output = make_output(&oversized);
+        let result = parse_impl(&output);
+        assert!(
+            !result.is_full(),
+            "Expected non-Full for oversized JSON input (got Full — MAX_JSON_BYTES gate not applied)"
         );
     }
 }

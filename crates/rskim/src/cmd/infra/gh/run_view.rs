@@ -47,6 +47,54 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // Tier 1: JSON parsing
 // ============================================================================
 
+/// Append one [`InfraItem`] per job to `items`, plus step details for failed jobs.
+///
+/// Separated from [`try_parse_json`] so that run metadata extraction and job
+/// iteration each have a single responsibility.
+fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
+    for job in jobs {
+        let job_name = job.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let job_conclusion = job
+            .get("conclusion")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| job.get("status").and_then(|v| v.as_str()).unwrap_or("?"))
+            .to_lowercase();
+
+        items.push(InfraItem { label: format!("job:{job_name}"), value: job_conclusion.clone() });
+
+        // For failed jobs, show step details (up to MAX_STEP_DETAIL non-passing steps)
+        if job_conclusion == "failure" || job_conclusion == "failed" {
+            let steps = job
+                .get("steps")
+                .and_then(|v| v.as_array())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
+            let mut shown = 0;
+            for step in steps {
+                if shown >= MAX_STEP_DETAIL {
+                    break;
+                }
+                let step_name = step.get("name").and_then(|v| v.as_str()).unwrap_or("step");
+                let step_conclusion = step
+                    .get("conclusion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_lowercase();
+
+                // Only show non-passing steps
+                if step_conclusion != "success" && step_conclusion != "skipped" {
+                    items.push(InfraItem {
+                        label: format!("  step:{step_name}"),
+                        value: step_conclusion,
+                    });
+                    shown += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Parse a `gh run view --json` object into an [`InfraResult`].
 ///
 /// Shows one item per job with status. For failed jobs, adds indented step
@@ -89,56 +137,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
-    for job in jobs {
-        let job_name = job
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let job_conclusion = job
-            .get("conclusion")
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| job.get("status").and_then(|v| v.as_str()).unwrap_or("?"))
-            .to_lowercase();
-
-        items.push(InfraItem {
-            label: format!("job:{job_name}"),
-            value: job_conclusion.clone(),
-        });
-
-        // For failed jobs, show step details
-        if job_conclusion == "failure" || job_conclusion == "failed" {
-            let steps = job
-                .get("steps")
-                .and_then(|v| v.as_array())
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-
-            let mut shown = 0;
-            for step in steps {
-                if shown >= MAX_STEP_DETAIL {
-                    break;
-                }
-                let step_name = step
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("step");
-                let step_conclusion = step
-                    .get("conclusion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_lowercase();
-
-                // Only show non-passing steps
-                if step_conclusion != "success" && step_conclusion != "skipped" {
-                    items.push(InfraItem {
-                        label: format!("  step:{step_name}"),
-                        value: step_conclusion,
-                    });
-                    shown += 1;
-                }
-            }
-        }
-    }
+    extract_job_items(jobs, &mut items);
 
     Some(InfraResult::new(
         "gh".to_string(),
@@ -332,7 +331,29 @@ mod tests {
     }
 
     #[test]
-    fn test_user_json_fields_not_overridden() {
+    fn test_tier1_empty_jobs_array() {
+        // A run view JSON with an empty jobs array should produce a result with
+        // run-level summary but no job items.
+        let json = r#"{
+            "databaseId": 99,
+            "name": "Empty Run",
+            "status": "completed",
+            "conclusion": "success",
+            "event": "push",
+            "jobs": []
+        }"#;
+        let obj: serde_json::Value = serde_json::from_str(json).unwrap();
+        let result = try_parse_json(&obj);
+        assert!(result.is_some(), "Expected parse to succeed for empty jobs array");
+        let result = result.unwrap();
+        assert!(result.as_ref().contains("#99"), "got: {}", result.as_ref());
+        assert!(result.as_ref().contains("Empty Run"), "got: {}", result.as_ref());
+        let job_items: Vec<_> = result.items.iter().filter(|i| i.label.starts_with("job:")).collect();
+        assert!(job_items.is_empty(), "Expected no job items for empty jobs array");
+    }
+
+    #[test]
+    fn test_tier1_user_json_fields_not_overridden() {
         let mut args = vec![
             "run".to_string(),
             "view".to_string(),

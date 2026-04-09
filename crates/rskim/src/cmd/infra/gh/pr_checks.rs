@@ -180,16 +180,25 @@ fn build_checks_result(checks: Vec<(String, String, Option<String>)>) -> Option<
 
     let total = checks.len();
     let pass = checks.iter().filter(|(_, s, _)| s == "pass" || s == "success").count();
-    let fail = checks
+    let fail = checks.iter().filter(|(_, s, _)| s == "fail" || s == "failure").count();
+    let pending = checks
         .iter()
-        .filter(|(_, s, _)| s == "fail" || s == "failure")
+        .filter(|(_, s, _)| s == "pending" || s == "in_progress")
         .count();
-    let pending = total - pass - fail;
+    // Catch-all for cancelled, neutral, skipped, timed_out, and any future states
+    let other = total - pass - fail - pending;
 
-    let summary = format!(
-        "{total} check{}: {pass} pass, {fail} fail, {pending} pending",
-        if total == 1 { "" } else { "s" }
-    );
+    let summary = if other > 0 {
+        format!(
+            "{total} check{}: {pass} pass, {fail} fail, {pending} pending, {other} other",
+            if total == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{total} check{}: {pass} pass, {fail} fail, {pending} pending",
+            if total == 1 { "" } else { "s" }
+        )
+    };
 
     let items: Vec<InfraItem> = checks
         .into_iter()
@@ -296,6 +305,41 @@ mod tests {
             result.is_passthrough(),
             "Expected Passthrough for garbage, got {}",
             result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_tier1_json_object_wrapper_check_runs() {
+        // Some gh versions wrap results in {"checkRuns": [...]} instead of a
+        // bare array. Verify try_parse_checks_json handles this shape.
+        let json = r#"{"checkRuns": [{"name": "CI", "state": "SUCCESS"}]}"#;
+        let result = try_parse_checks_json(json);
+        assert!(
+            result.is_some(),
+            "Expected JSON parse to succeed for checkRuns wrapper, got None"
+        );
+        let result = result.unwrap();
+        assert!(result.as_ref().contains("1 check"), "got: {}", result.as_ref());
+    }
+
+    #[test]
+    fn test_other_states_appear_in_summary() {
+        // cancelled/skipped/neutral states must not be lumped into "pending"
+        let checks = vec![
+            ("CI / build".to_string(), "pass".to_string(), None),
+            ("CI / cancel".to_string(), "cancelled".to_string(), None),
+            ("CI / skip".to_string(), "skipped".to_string(), None),
+        ];
+        let result = build_checks_result(checks).unwrap();
+        assert!(
+            result.summary.contains("other"),
+            "Expected 'other' in summary for cancelled/skipped states, got: {}",
+            result.summary
+        );
+        assert!(
+            !result.summary.contains("2 pending"),
+            "Should not label cancelled/skipped as pending, got: {}",
+            result.summary
         );
     }
 }
