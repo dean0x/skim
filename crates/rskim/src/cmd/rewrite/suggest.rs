@@ -57,6 +57,114 @@ pub(crate) fn command() -> clap::Command {
         )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::types::{RewriteCategory, SuggestOutput};
+    use super::command;
+
+    // ========================================================================
+    // command() — clap Command definition
+    // ========================================================================
+
+    #[test]
+    fn command_name_is_rewrite() {
+        let cmd = command();
+        assert_eq!(cmd.get_name(), "rewrite");
+    }
+
+    #[test]
+    fn command_has_suggest_flag() {
+        let cmd = command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "suggest");
+        assert!(arg.is_some(), "Expected --suggest flag in command definition");
+    }
+
+    #[test]
+    fn command_has_hook_flag() {
+        let cmd = command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "hook");
+        assert!(arg.is_some(), "Expected --hook flag in command definition");
+    }
+
+    #[test]
+    fn command_has_agent_option() {
+        let cmd = command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "agent");
+        assert!(arg.is_some(), "Expected --agent option in command definition");
+    }
+
+    #[test]
+    fn command_has_command_positional() {
+        let cmd = command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "command");
+        assert!(
+            arg.is_some(),
+            "Expected COMMAND positional arg in command definition"
+        );
+    }
+
+    // ========================================================================
+    // SuggestOutput JSON serialization — must never panic
+    // ========================================================================
+
+    #[test]
+    fn suggest_output_serialization_match() {
+        let output = SuggestOutput {
+            version: 1,
+            is_match: true,
+            original: "cargo test",
+            rewritten: "skim test cargo",
+            category: Some(RewriteCategory::Test),
+            confidence: "exact",
+            compound: false,
+            skim_hook_version: "0.0.0",
+        };
+        let json = serde_json::to_string(&output).expect("serialization must not fail");
+        assert!(json.contains("\"match\":true"));
+        assert!(json.contains("\"original\":\"cargo test\""));
+        assert!(json.contains("\"rewritten\":\"skim test cargo\""));
+        assert!(json.contains("\"category\":\"test\""));
+        assert!(json.contains("\"confidence\":\"exact\""));
+        assert!(json.contains("\"compound\":false"));
+    }
+
+    #[test]
+    fn suggest_output_serialization_no_match() {
+        let output = SuggestOutput {
+            version: 1,
+            is_match: false,
+            original: "python3 -c 'print(1)'",
+            rewritten: "",
+            category: None,
+            confidence: "",
+            compound: false,
+            skim_hook_version: "0.0.0",
+        };
+        let json = serde_json::to_string(&output).expect("serialization must not fail for no-match");
+        assert!(json.contains("\"match\":false"));
+        // None category serializes as empty string via serialize_category
+        assert!(json.contains("\"category\":\"\""));
+        assert!(json.contains("\"confidence\":\"\""));
+    }
+
+    #[test]
+    fn suggest_output_serialization_compound() {
+        let output = SuggestOutput {
+            version: 1,
+            is_match: true,
+            original: "cargo test && cargo build",
+            rewritten: "skim test cargo && skim build cargo",
+            category: Some(RewriteCategory::Test),
+            confidence: "exact",
+            compound: true,
+            skim_hook_version: "0.0.0",
+        };
+        let json =
+            serde_json::to_string(&output).expect("serialization must not fail for compound");
+        assert!(json.contains("\"compound\":true"));
+    }
+}
+
 /// Print the help text for the rewrite subcommand.
 pub(super) fn print_help() {
     println!("skim rewrite");

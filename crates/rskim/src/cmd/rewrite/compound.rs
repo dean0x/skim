@@ -8,6 +8,86 @@ use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
 
+// ---- State machine helpers ----
+
+/// Check whether position `i` is the start of a bail-triggering construct.
+///
+/// Bail triggers (evaluated only in `QuoteState::None`):
+/// - backtick `` ` ``
+/// - heredoc `<<`
+/// - subshell `$(` or variable expansion `${`
+///
+/// Returns `true` when the caller should immediately return `Bail`.
+fn check_bail(ch: char, chars: &[char], i: usize, len: usize) -> bool {
+    if ch == '`' {
+        return true;
+    }
+    if ch == '<' && i + 1 < len && chars[i + 1] == '<' {
+        return true;
+    }
+    if ch == '$' && i + 1 < len && (chars[i + 1] == '(' || chars[i + 1] == '{') {
+        return true;
+    }
+    false
+}
+
+/// Scan for a compound operator starting at position `i` (paren depth 0, unquoted).
+///
+/// Returns `Some((op, advance))` where `advance` is the number of char positions
+/// to move past the operator, or `None` if no operator starts here.
+///
+/// The `&&` check includes a redirect guard: `>&1` patterns must not be mistaken
+/// for `&&`.
+fn scan_operator(chars: &[char], i: usize, len: usize) -> Option<(CompoundOp, usize)> {
+    let ch = chars[i];
+
+    if ch == '&' && i + 1 < len && chars[i + 1] == '&' {
+        // Guard against >&N redirect patterns (e.g., 2>&1).
+        if i > 0 && chars[i - 1] == '>' {
+            return None;
+        }
+        return Some((CompoundOp::And, 2));
+    }
+
+    if ch == '|' && i + 1 < len && chars[i + 1] == '|' {
+        return Some((CompoundOp::Or, 2));
+    }
+
+    // Single | must be checked after || to avoid misidentifying the first char.
+    if ch == '|' {
+        return Some((CompoundOp::Pipe, 1));
+    }
+
+    if ch == ';' {
+        return Some((CompoundOp::Semicolon, 1));
+    }
+
+    None
+}
+
+/// Slice the current segment text from `input`, tokenise it, and push a
+/// `CommandSegment` onto `segments`.  Does nothing when the slice is
+/// all-whitespace (empty token list).
+fn push_segment(
+    input: &str,
+    byte_offsets: &[usize],
+    seg_end_char_idx: usize,
+    current_start: usize,
+    segments: &mut Vec<CommandSegment>,
+    op: Option<CompoundOp>,
+) {
+    let seg_text = &input[current_start..byte_offsets[seg_end_char_idx]];
+    let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
+    if !tokens.is_empty() {
+        segments.push(CommandSegment {
+            tokens,
+            trailing_operator: op,
+        });
+    }
+}
+
+// ---- Public entry point ----
+
 /// Split a shell command string at compound operators (`&&`, `||`, `;`, `|`).
 ///
 /// Uses a character-by-character state machine tracking quotes and paren depth.
@@ -25,7 +105,8 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
     let mut paren_depth: usize = 0;
     let mut found_operator = false;
     let mut i: usize = 0;
-    // Precompute byte offsets for each char index
+
+    // Precompute byte offsets for each char index.
     let byte_offsets: Vec<usize> = {
         let mut offsets = Vec::with_capacity(len + 1);
         let mut bo = 0;
@@ -40,7 +121,7 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
     while i < len {
         let ch = chars[i];
 
-        // Handle quote state transitions
+        // Handle quote state transitions (consume char and continue).
         match quote_state {
             QuoteState::SingleQuote => {
                 if ch == '\'' {
@@ -63,12 +144,12 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
             QuoteState::None => {}
         }
 
-        // Bail on backticks
-        if ch == '`' {
+        // Bail on heredocs, subshells, and backticks.
+        if check_bail(ch, &chars, i, len) {
             return CompoundSplitResult::Bail;
         }
 
-        // Enter quotes
+        // Enter quote mode.
         if ch == '\'' {
             quote_state = QuoteState::SingleQuote;
             i += 1;
@@ -80,7 +161,7 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
             continue;
         }
 
-        // Track parens
+        // Track parenthesis depth.
         if ch == '(' {
             paren_depth += 1;
             i += 1;
@@ -92,85 +173,12 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
             continue;
         }
 
-        // Bail on heredoc: << (but not <<< which is a here-string — still bail)
-        if ch == '<' && i + 1 < len && chars[i + 1] == '<' {
-            return CompoundSplitResult::Bail;
-        }
-
-        // Bail on subshell $( and variable expansion ${
-        if ch == '$' && i + 1 < len && (chars[i + 1] == '(' || chars[i + 1] == '{') {
-            return CompoundSplitResult::Bail;
-        }
-
-        // Only check operators at paren_depth == 0
+        // Only recognise operators at the top-level (paren depth 0).
         if paren_depth == 0 {
-            // Check for &&
-            if ch == '&' && i + 1 < len && chars[i + 1] == '&' {
-                // Guard against >&N redirect patterns (e.g., 2>&1).
-                // When '>' immediately precedes '&', this is a file descriptor
-                // redirect, not the start of '&&'.
-                if i > 0 && chars[i - 1] == '>' {
-                    i += 1;
-                    continue;
-                }
-                let seg_text = &input[current_start..byte_offsets[i]];
-                let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
-                if !tokens.is_empty() {
-                    segments.push(CommandSegment {
-                        tokens,
-                        trailing_operator: Some(CompoundOp::And),
-                    });
-                }
+            if let Some((op, advance)) = scan_operator(&chars, i, len) {
+                push_segment(input, &byte_offsets, i, current_start, &mut segments, Some(op));
                 found_operator = true;
-                i += 2; // skip both &
-                current_start = byte_offsets[i.min(len)];
-                continue;
-            }
-
-            // Check for ||
-            if ch == '|' && i + 1 < len && chars[i + 1] == '|' {
-                let seg_text = &input[current_start..byte_offsets[i]];
-                let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
-                if !tokens.is_empty() {
-                    segments.push(CommandSegment {
-                        tokens,
-                        trailing_operator: Some(CompoundOp::Or),
-                    });
-                }
-                found_operator = true;
-                i += 2;
-                current_start = byte_offsets[i.min(len)];
-                continue;
-            }
-
-            // Check for single | (pipe, not ||)
-            if ch == '|' {
-                let seg_text = &input[current_start..byte_offsets[i]];
-                let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
-                if !tokens.is_empty() {
-                    segments.push(CommandSegment {
-                        tokens,
-                        trailing_operator: Some(CompoundOp::Pipe),
-                    });
-                }
-                found_operator = true;
-                i += 1;
-                current_start = byte_offsets[i.min(len)];
-                continue;
-            }
-
-            // Check for ;
-            if ch == ';' {
-                let seg_text = &input[current_start..byte_offsets[i]];
-                let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
-                if !tokens.is_empty() {
-                    segments.push(CommandSegment {
-                        tokens,
-                        trailing_operator: Some(CompoundOp::Semicolon),
-                    });
-                }
-                found_operator = true;
-                i += 1;
+                i += advance;
                 current_start = byte_offsets[i.min(len)];
                 continue;
             }
@@ -179,18 +187,18 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
         i += 1;
     }
 
-    // Bail on unmatched quotes
+    // Bail on unmatched quotes.
     if quote_state != QuoteState::None {
         return CompoundSplitResult::Bail;
     }
 
     if !found_operator {
-        // No compound operators found — return as simple
+        // No compound operators found — return as simple.
         let tokens: Vec<String> = input.split_whitespace().map(String::from).collect();
         return CompoundSplitResult::Simple(tokens);
     }
 
-    // Push the final segment (after the last operator)
+    // Push the final segment (after the last operator).
     let seg_text = &input[current_start..];
     let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
     if !tokens.is_empty() {

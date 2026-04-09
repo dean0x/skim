@@ -197,7 +197,22 @@ fn analyze_invocations(
                 });
             }
             ToolInput::Bash { command } => {
-                if let Some(info) = classify_bash_command(command, &mut non_rewritable_counts) {
+                if let Some(info) = classify_bash_command(command) {
+                    // Accumulate non-rewritable prefix counts when debug is enabled.
+                    // Responsibility lives in the caller, not classify_bash_command,
+                    // so the classification function stays pure and easily testable.
+                    if let Some(ref mut counts) = non_rewritable_counts {
+                        if !info.has_rewrite {
+                            let prefix: String = command
+                                .split_whitespace()
+                                .take(3)
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !prefix.is_empty() {
+                                *counts.entry(prefix).or_insert(0) += 1;
+                            }
+                        }
+                    }
                     bash_commands.push(info);
                 }
             }
@@ -226,12 +241,9 @@ fn analyze_invocations(
 /// Returns `None` when the command should be skipped entirely (already a `skim`
 /// invocation), otherwise returns the classified [`BashCommandInfo`].
 ///
-/// `non_rewritable_counts` accumulates prefix frequencies for the debug report.
-/// It is `None` when debug mode is disabled, avoiding an unconditional allocation.
-fn classify_bash_command(
-    command: &str,
-    non_rewritable_counts: &mut Option<std::collections::HashMap<String, usize>>,
-) -> Option<BashCommandInfo> {
+/// The caller is responsible for any debug-mode accumulation (e.g. collecting
+/// non-rewritable prefix counts); this function only classifies.
+fn classify_bash_command(command: &str) -> Option<BashCommandInfo> {
     // Skip commands already rewritten by the hook (start with "skim ")
     if command.starts_with("skim ") {
         return None;
@@ -242,20 +254,6 @@ fn classify_bash_command(
     // duplication and guarantees correctness — correctness over micro-performance.
     let rewrite_target = super::rewrite::would_rewrite(command);
     let has_rewrite = rewrite_target.is_some();
-
-    // Collect non-rewritable command prefix counts when debug is enabled
-    if let Some(ref mut counts) = non_rewritable_counts {
-        if !has_rewrite {
-            let prefix: String = command
-                .split_whitespace()
-                .take(3)
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !prefix.is_empty() {
-                *counts.entry(prefix).or_insert(0) += 1;
-            }
-        }
-    }
 
     Some(BashCommandInfo {
         command: command.to_string(),
@@ -698,6 +696,51 @@ mod tests {
     fn test_parse_args_since() {
         let config = parse_args(&["--since".to_string(), "7d".to_string()]).unwrap();
         assert!(config.since.is_some());
+    }
+
+    // ---- classify_bash_command: unit tests ----
+
+    #[test]
+    fn test_classify_bash_skips_skim_commands() {
+        // Commands that start with "skim " are already rewritten — skip entirely.
+        assert!(classify_bash_command("skim test cargo").is_none());
+        assert!(classify_bash_command("skim build clippy").is_none());
+        assert!(classify_bash_command("skim git status").is_none());
+        assert!(classify_bash_command("skim file.rs").is_none());
+    }
+
+    #[test]
+    fn test_classify_bash_rewritable_commands() {
+        // Rewritable commands return Some with has_rewrite=true and a target.
+        let info = classify_bash_command("cargo test").unwrap();
+        assert!(info.has_rewrite);
+        assert!(info.rewrite_target.is_some());
+        assert_eq!(info.command, "cargo test");
+
+        let info = classify_bash_command("git status").unwrap();
+        assert!(info.has_rewrite);
+        assert!(info.rewrite_target.is_some());
+
+        let info = classify_bash_command("cat file.rs").unwrap();
+        assert!(info.has_rewrite);
+        assert!(info.rewrite_target.is_some());
+    }
+
+    #[test]
+    fn test_classify_bash_non_rewritable_commands() {
+        // Non-rewritable commands return Some with has_rewrite=false and no target.
+        let info = classify_bash_command("ls").unwrap();
+        assert!(!info.has_rewrite);
+        assert!(info.rewrite_target.is_none());
+        assert_eq!(info.command, "ls");
+
+        let info = classify_bash_command("echo hello").unwrap();
+        assert!(!info.has_rewrite);
+        assert!(info.rewrite_target.is_none());
+
+        let info = classify_bash_command("node server.js").unwrap();
+        assert!(!info.has_rewrite);
+        assert!(info.rewrite_target.is_none());
     }
 
     // ---- analyze_invocations: skim command exclusion ----
