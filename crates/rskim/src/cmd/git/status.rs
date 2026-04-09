@@ -7,6 +7,13 @@ use crate::output::canonical::GitResult;
 
 use super::run_parsed_command;
 
+/// Returns `true` for flags that conflict with the `--porcelain=v2` flag the
+/// handler injects.  These are `-s`, `--short`, `--porcelain`, and any
+/// `--porcelain=*` variant.
+fn is_conflicting_status_flag(s: &str) -> bool {
+    s == "-s" || s == "--short" || s == "--porcelain" || s.starts_with("--porcelain=")
+}
+
 /// Run `git status` with compression.
 ///
 /// Strips user-supplied format flags (`-s`, `--short`, `--porcelain`,
@@ -20,10 +27,7 @@ pub(super) fn run_status(
     // Strip conflicting format flags — handler injects --porcelain=v2 itself.
     let stripped_args: Vec<String> = args
         .iter()
-        .filter(|a| {
-            let s = a.as_str();
-            s != "-s" && s != "--short" && s != "--porcelain" && !s.starts_with("--porcelain=")
-        })
+        .filter(|a| !is_conflicting_status_flag(a.as_str()))
         .cloned()
         .collect();
 
@@ -467,14 +471,10 @@ mod tests {
     // Flag-stripping predicate
     // ========================================================================
 
-    /// Replicate the filter predicate from `run_status` so it can be tested
-    /// independently of the process boundary.
+    /// Thin test wrapper around the module-scope predicate.
     fn strip_conflicting_flags(args: &[&str]) -> Vec<String> {
         args.iter()
-            .filter(|a| {
-                let s = **a;
-                s != "-s" && s != "--short" && s != "--porcelain" && !s.starts_with("--porcelain=")
-            })
+            .filter(|a| !is_conflicting_status_flag(a))
             .map(|s| s.to_string())
             .collect()
     }
