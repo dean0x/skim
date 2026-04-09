@@ -1,0 +1,39 @@
+{
+  "number": 42,
+  "title": "Fix login bug with OAuth provider",
+  "state": "OPEN",
+  "author": {"login": "alice"},
+  "body": "## Problem\n\nUsers are unable to log in when using OAuth with Google.\n\nSteps to reproduce:\n1. Go to /login\n2. Click \"Sign in with Google\"\n3. Observe the 500 error\n\n## Expected\n\nSuccessful redirect to dashboard after OAuth flow.\n\n## Notes\n\nThis appears to be related to the token expiry logic introduced in #39.\nThe `refresh_token` handler is not properly checking the `exp` claim.\n\nSee also: https://github.com/example/repo/issues/39",
+  "labels": [
+    {"name": "bug"},
+    {"name": "auth"},
+    {"name": "priority:high"}
+  ],
+  "assignees": [
+    {"login": "bob"},
+    {"login": "carol"}
+  ],
+  "milestone": {"title": "v2.0.0"},
+  "comments": [
+    {
+      "author": {"login": "bob"},
+      "body": "> Fix login bug with OAuth provider\n\nI can reproduce this. The issue is in `token_refresh.rs` line 47."
+    },
+    {
+      "author": {"login": "carol"},
+      "body": "I looked into this. The `exp` claim check is off by one — we're comparing against `now` instead of `now + buffer`."
+    },
+    {
+      "author": {"login": "dave"},
+      "body": "> I looked into this.\n\nAgree with carol's analysis. Here's a patch: `if exp > now + 60 { ... }`"
+    },
+    {
+      "author": {"login": "alice"},
+      "body": "PR is up at #45. Please review."
+    },
+    {
+      "author": {"login": "eve"},
+      "body": "LGTM. Approving after CI passes."
+    }
+  ]
+}

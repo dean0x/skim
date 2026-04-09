@@ -1,10 +1,12 @@
-//! GitHub CLI (`gh`) parser with three-tier degradation (#116).
+//! `gh` list command parser (pr list, issue list, run list).
 //!
-//! Executes `gh` and parses the output into structured `InfraResult`.
+//! Handles `gh pr list`, `gh issue list`, `gh run list` by injecting `--json`
+//! fields when the user has not already supplied them, then parsing the JSON
+//! array response.
 //!
 //! Three tiers:
-//! - **Tier 1 (Full)**: JSON parsing (inject `--json` for list commands)
-//! - **Tier 2 (Degraded)**: Regex on tabular text output
+//! - **Tier 1 (Full)**: JSON array (`[...]`) → structured items
+//! - **Tier 2 (Degraded)**: Tab-separated text (`#N\t...`) → label/value pairs
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 
 use std::sync::LazyLock;
@@ -16,39 +18,23 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
+use super::combine_stdout_stderr;
+use super::{MAX_ITEMS, MAX_JSON_BYTES};
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
-    program: "gh",
-    env_overrides: &[],
-    install_hint: "Install gh: https://cli.github.com/",
-};
-
-static RE_GH_TAB_ROW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)\t(.+)").unwrap());
-
-/// Run `skim infra gh [args...]`.
-pub(crate) fn run(
-    args: &[String],
-    show_stats: bool,
-    json_output: bool,
-) -> anyhow::Result<std::process::ExitCode> {
-    run_infra_tool(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        prepare_args,
-        parse_impl,
-    )
-}
+/// Matches tab-separated gh text output: `<number>\t<rest>`.
+pub(super) static RE_GH_TAB_ROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+)\t(.+)").unwrap());
 
 /// Inject `--json` fields for list commands if not already present.
-fn prepare_args(cmd_args: &mut Vec<String>) {
+///
+/// Only injects for known list subcommands (`pr list`, `issue list`, `run list`).
+/// All other commands are left unchanged so that arbitrary `gh` subcommands
+/// (e.g., `gh release upload`) are not broken by unexpected flags.
+pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
     if user_has_flag(cmd_args, &["--json"]) {
         return;
     }
 
-    // Detect subcommand pattern: gh pr list, gh issue list, gh run list
     let subcmd = cmd_args.first().map(|s| s.as_str()).unwrap_or("");
     let action = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
 
@@ -70,9 +56,9 @@ fn prepare_args(cmd_args: &mut Vec<String>) {
     }
 }
 
-/// Three-tier parse function for gh output.
-fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
-    if let Some(result) = try_parse_json(&output.stdout) {
+/// Three-tier parse function for gh list output.
+pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
+    if let Some(result) = try_parse_json_list(&output.stdout) {
         return ParseResult::Full(result);
     }
 
@@ -89,23 +75,14 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 }
 
 // ============================================================================
-// Tier 1: JSON parsing
+// Tier 1: JSON array parsing
 // ============================================================================
 
-/// Maximum number of items to include in a parsed result.
-///
-/// Prevents unbounded memory growth when `gh` returns very large JSON arrays
-/// (e.g., repositories with thousands of open issues or PRs).
-const MAX_ITEMS: usize = 100;
-
-/// Maximum byte length of JSON input accepted for Tier 1 parsing.
-///
-/// Inputs larger than this are skipped and fall through to the regex tier,
-/// preventing unbounded allocation on pathological or adversarial responses.
-const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
-
 /// Parse gh JSON array output.
-fn try_parse_json(stdout: &str) -> Option<InfraResult> {
+///
+/// Returns `None` if the input is not a JSON array, is larger than
+/// [`MAX_JSON_BYTES`], or fails to deserialize.
+pub(super) fn try_parse_json_list(stdout: &str) -> Option<InfraResult> {
     let trimmed = stdout.trim();
     if !trimmed.starts_with('[') {
         return None;
@@ -168,11 +145,14 @@ fn try_parse_json(stdout: &str) -> Option<InfraResult> {
 }
 
 // ============================================================================
-// Tier 2: regex fallback
+// Tier 2: Tab-separated text fallback
 // ============================================================================
 
 /// Parse tab-separated gh text output.
-fn try_parse_regex(text: &str) -> Option<InfraResult> {
+///
+/// Falls back to regex matching `<number>\t<rest>` lines when JSON is not
+/// available. Returns `None` if no such lines are found.
+pub(super) fn try_parse_regex(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
 
     for line in text.lines() {
@@ -222,7 +202,7 @@ mod tests {
     #[test]
     fn test_tier1_gh_pass() {
         let input = load_fixture("gh_pr_list.json");
-        let result = try_parse_json(&input);
+        let result = try_parse_json_list(&input);
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
         assert!(result.as_ref().contains("INFRA: gh list"));
@@ -231,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_tier1_gh_fail_non_json() {
-        let result = try_parse_json("not json");
+        let result = try_parse_json_list("not json");
         assert!(result.is_none());
     }
 

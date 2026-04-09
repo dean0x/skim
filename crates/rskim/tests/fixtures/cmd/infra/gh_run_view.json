@@ -1,0 +1,48 @@
+{
+  "databaseId": 12345,
+  "name": "CI Pipeline",
+  "status": "completed",
+  "conclusion": "failure",
+  "event": "push",
+  "createdAt": "2026-04-09T10:00:00Z",
+  "updatedAt": "2026-04-09T10:08:30Z",
+  "jobs": [
+    {
+      "name": "build",
+      "status": "completed",
+      "conclusion": "success",
+      "steps": [
+        {"name": "Set up job", "conclusion": "success"},
+        {"name": "Checkout", "conclusion": "success"},
+        {"name": "Build", "conclusion": "success"}
+      ]
+    },
+    {
+      "name": "test",
+      "status": "completed",
+      "conclusion": "failure",
+      "steps": [
+        {"name": "Set up job", "conclusion": "success"},
+        {"name": "Checkout", "conclusion": "success"},
+        {"name": "Run tests", "conclusion": "failure"},
+        {"name": "Upload coverage", "conclusion": "skipped"},
+        {"name": "Post job", "conclusion": "success"}
+      ]
+    },
+    {
+      "name": "lint",
+      "status": "completed",
+      "conclusion": "success",
+      "steps": [
+        {"name": "Set up job", "conclusion": "success"},
+        {"name": "Lint check", "conclusion": "success"}
+      ]
+    },
+    {
+      "name": "deploy",
+      "status": "completed",
+      "conclusion": "skipped",
+      "steps": []
+    }
+  ]
+}

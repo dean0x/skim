@@ -1,0 +1,280 @@
+//! `gh pr view` parser with three-tier degradation.
+//!
+//! Extends the issue view parser with PR-specific overlay fields:
+//! branch information (`headRefName → baseRefName`) and diff statistics
+//! (`additions`, `deletions`, `changedFiles`).
+//!
+//! # Design Decision: Reuse issue_view core
+//!
+//! PR view shares all issue fields (`number`, `title`, `state`, `body`,
+//! `labels`, `assignees`, `author`, `milestone`, `comments`) and adds
+//! PR-only fields. We call [`issue_view::try_parse_json`] for the common
+//! items, then overlay the PR-specific items rather than duplicating code.
+
+use crate::cmd::user_has_flag;
+use crate::output::canonical::{InfraItem, InfraResult};
+use crate::output::ParseResult;
+use crate::runner::CommandOutput;
+
+use super::{
+    combine_stdout_stderr, issue_view, MAX_JSON_BYTES, RE_GH_VIEW_FIELD, RE_GH_VIEW_HEADER,
+};
+
+/// JSON fields to inject for `gh pr view`.
+///
+/// Superset of issue view fields with PR-specific additions.
+const PR_VIEW_FIELDS: &str =
+    "number,title,state,body,labels,assignees,author,headRefName,baseRefName,additions,deletions,changedFiles,comments";
+
+/// Inject `--json` for PR view if not already present.
+pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
+    if user_has_flag(cmd_args, &["--json"]) {
+        return;
+    }
+    cmd_args.push("--json".to_string());
+    cmd_args.push(PR_VIEW_FIELDS.to_string());
+}
+
+/// Three-tier parse function for `gh pr view` output.
+pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
+    let trimmed = output.stdout.trim();
+
+    // Tier 1: JSON object
+    if trimmed.starts_with('{') && trimmed.len() <= MAX_JSON_BYTES {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(result) = try_parse_json(&obj) {
+                return ParseResult::Full(result);
+            }
+        }
+    }
+
+    let combined = combine_stdout_stderr(output);
+
+    // Tier 2: text regex
+    if let Some(result) = try_parse_text(&combined) {
+        return ParseResult::Degraded(
+            result,
+            vec!["gh pr view: JSON parse failed, using text regex".to_string()],
+        );
+    }
+
+    ParseResult::Passthrough(combined.into_owned())
+}
+
+// ============================================================================
+// Tier 1: JSON parsing
+// ============================================================================
+
+/// Parse a `gh pr view --json` object into an [`InfraResult`].
+///
+/// Delegates to [`issue_view::try_parse_json`] for common fields, then
+/// re-applies PR-specific fields and re-renders as "pr view" operation.
+///
+/// Accepts a pre-parsed JSON `Value` so this function can also be called
+/// from the auto-detect dispatcher.
+pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
+    // Get the common issue items via issue_view parser
+    let issue_result = issue_view::try_parse_json(obj)?;
+
+    // Build PR-specific summary
+    let number = obj.get("number").and_then(|v| v.as_u64())?;
+    let title = obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no title)");
+    let state = obj
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let summary = format!("#{number}: {title} ({state})");
+
+    // Start with the issue items
+    let mut items: Vec<InfraItem> = issue_result.items;
+
+    // PR-specific overlay: branch
+    let head = obj
+        .get("headRefName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let base = obj
+        .get("baseRefName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    items.push(InfraItem {
+        label: "branch".to_string(),
+        value: format!("{head} → {base}"),
+    });
+
+    // PR-specific overlay: diff stats
+    let additions = obj
+        .get("additions")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let deletions = obj
+        .get("deletions")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let changed_files = obj
+        .get("changedFiles")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    items.push(InfraItem {
+        label: "changes".to_string(),
+        value: format!("+{additions} -{deletions} ({changed_files} files)"),
+    });
+
+    Some(InfraResult::new(
+        "gh".to_string(),
+        "pr view".to_string(),
+        summary,
+        items,
+    ))
+}
+
+// ============================================================================
+// Tier 2: text regex fallback
+// ============================================================================
+
+/// Parse `gh pr view` text output using regex.
+fn try_parse_text(text: &str) -> Option<InfraResult> {
+    let mut items: Vec<InfraItem> = Vec::new();
+    let mut summary = String::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if summary.is_empty() {
+            if let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
+                summary = format!("#{}: {}", &caps[2], &caps[1]);
+                continue;
+            }
+        }
+        if let Some(caps) = RE_GH_VIEW_FIELD.captures(line) {
+            items.push(InfraItem {
+                label: caps[1].to_lowercase(),
+                value: caps[2].to_string(),
+            });
+        }
+    }
+
+    if summary.is_empty() && items.is_empty() {
+        return None;
+    }
+
+    if summary.is_empty() {
+        summary = "pr view".to_string();
+    }
+
+    Some(InfraResult::new(
+        "gh".to_string(),
+        "pr view".to_string(),
+        summary,
+        items,
+    ))
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_fixture(name: &str) -> String {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/cmd/infra");
+        path.push(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+    }
+
+    fn make_output(stdout: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_tier1_json() {
+        let input = load_fixture("gh_pr_view.json");
+        let obj: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let result = try_parse_json(&obj);
+        assert!(result.is_some(), "Expected JSON parse to succeed");
+        let result = result.unwrap();
+        assert!(
+            result.as_ref().contains("INFRA: gh pr view"),
+            "got: {}",
+            result.as_ref()
+        );
+        assert!(result.as_ref().contains("#15"), "got: {}", result.as_ref());
+        // Should have branch info
+        let branch_item = result.items.iter().find(|i| i.label == "branch");
+        assert!(branch_item.is_some(), "Expected branch item");
+        assert!(
+            branch_item.unwrap().value.contains("→"),
+            "got: {}",
+            branch_item.unwrap().value
+        );
+        // Should have changes
+        let changes_item = result.items.iter().find(|i| i.label == "changes");
+        assert!(changes_item.is_some(), "Expected changes item");
+        assert!(
+            changes_item.unwrap().value.contains("+150"),
+            "got: {}",
+            changes_item.unwrap().value
+        );
+    }
+
+    #[test]
+    fn test_tier1_user_json_fields_not_overridden() {
+        let mut args = vec![
+            "pr".to_string(),
+            "view".to_string(),
+            "15".to_string(),
+            "--json".to_string(),
+            "title".to_string(),
+        ];
+        let original_len = args.len();
+        prepare_args(&mut args);
+        assert_eq!(args.len(), original_len, "Should not inject when --json present");
+    }
+
+    #[test]
+    fn test_tier2_text() {
+        let text = "Add dark mode #15\nState: open\nAuthor: feature-dev\nBase: main\n";
+        let result = try_parse_text(text);
+        assert!(result.is_some(), "Expected Tier 2 text parse to succeed");
+        let result = result.unwrap();
+        assert!(result.as_ref().contains("gh pr view"));
+    }
+
+    #[test]
+    fn test_passthrough_garbage() {
+        let output = make_output("not a PR response at all");
+        let result = parse_impl(&output);
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough for garbage, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_json_produces_full() {
+        let input = load_fixture("gh_pr_view.json");
+        let output = make_output(&input);
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "Expected Full parse result, got {}",
+            result.tier_name()
+        );
+    }
+}

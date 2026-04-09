@@ -1,0 +1,5 @@
+✓  CI / build  2m30s  https://github.com/example/repo/actions/runs/12345/jobs/67890
+✓  CI / test   4m15s  https://github.com/example/repo/actions/runs/12345/jobs/67891
+X  CI / lint   1m5s   https://github.com/example/repo/actions/runs/12345/jobs/67892
+✓  CI / security  3m0s  https://github.com/example/repo/actions/runs/12345/jobs/67893
+-  Deploy / staging  0s  https://github.com/example/repo/actions/runs/12345/jobs/67894

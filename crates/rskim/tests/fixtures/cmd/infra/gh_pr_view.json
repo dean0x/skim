@@ -1,0 +1,34 @@
+{
+  "number": 15,
+  "title": "feat: add dark mode support",
+  "state": "OPEN",
+  "author": {"login": "feature-dev"},
+  "body": "## Summary\n\nThis PR adds dark mode support to the dashboard.\n\n### Changes\n- Added `theme.rs` module with light/dark palette\n- Updated CSS variables in `styles/global.css`\n- Added toggle button in header\n- Persists preference in localStorage\n\n### Testing\nManually tested on Chrome 120, Firefox 121, Safari 17.\nAll existing visual regression tests pass.",
+  "labels": [
+    {"name": "feature"},
+    {"name": "ui"}
+  ],
+  "assignees": [
+    {"login": "feature-dev"}
+  ],
+  "milestone": {"title": "v2.1.0"},
+  "headRefName": "feature/dark-mode",
+  "baseRefName": "main",
+  "additions": 150,
+  "deletions": 30,
+  "changedFiles": 5,
+  "comments": [
+    {
+      "author": {"login": "reviewer1"},
+      "body": "The toggle button accessibility looks good. Could you add an `aria-label`?"
+    },
+    {
+      "author": {"login": "feature-dev"},
+      "body": "Good catch — added `aria-label=\"Toggle dark mode\"` in the latest commit."
+    },
+    {
+      "author": {"login": "reviewer2"},
+      "body": "LGTM overall. Minor: the CSS variable names could follow our existing convention (`--color-bg` → `--bg-color`)."
+    }
+  ]
+}

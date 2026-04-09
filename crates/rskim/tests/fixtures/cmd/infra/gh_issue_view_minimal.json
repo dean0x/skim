@@ -1,0 +1,11 @@
+{
+  "number": 99,
+  "title": "Minimal issue",
+  "state": "CLOSED",
+  "author": {"login": "testuser"},
+  "body": "",
+  "labels": [],
+  "assignees": [],
+  "milestone": null,
+  "comments": []
+}

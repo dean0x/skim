@@ -1,0 +1,5 @@
+CI / build	pass	2m30s	https://github.com/example/repo/actions/runs/12345/jobs/67890
+CI / test	pass	4m15s	https://github.com/example/repo/actions/runs/12345/jobs/67891
+CI / lint	fail	1m5s	https://github.com/example/repo/actions/runs/12345/jobs/67892
+CI / security	pass	3m0s	https://github.com/example/repo/actions/runs/12345/jobs/67893
+Deploy / staging	pending	0s	https://github.com/example/repo/actions/runs/12345/jobs/67894
