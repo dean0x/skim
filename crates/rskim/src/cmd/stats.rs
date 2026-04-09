@@ -212,8 +212,8 @@ fn color_pct(pct: f64) -> ColoredString {
 
 /// Render a block-character progress bar.
 ///
-/// Uses `█` for filled and `░` for empty cells, colored by efficiency tier.
-/// `pct` is clamped to [0, 100] before computing fill width.
+/// Uses `█` for filled and `░` for empty cells. Filled cells are colored green;
+/// empty cells are uncolored. `pct` is clamped to [0, 100] before computing fill width.
 fn render_bar(pct: f64, width: usize) -> String {
     let clamped = pct.clamp(0.0, 100.0);
     let filled = ((clamped / 100.0) * width as f64).round() as usize;
