@@ -17,14 +17,13 @@
 //! Falls back to regex-based parsing of `gh issue view` text output when JSON
 //! is unavailable. Extracts title, state, and visible fields.
 
-use crate::cmd::user_has_flag;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::{
-    combine_stdout_stderr, extract_comments, truncate_body, MAX_BODY_LINES, MAX_COMMENTS,
-    MAX_JSON_BYTES, RE_GH_VIEW_FIELD, RE_GH_VIEW_HEADER,
+    combine_stdout_stderr, extract_comments, inject_json_fields, parse_view_text, truncate_body,
+    MAX_BODY_LINES, MAX_COMMENTS, MAX_JSON_BYTES,
 };
 
 /// JSON fields to inject for `gh issue view`.
@@ -33,11 +32,7 @@ const ISSUE_VIEW_FIELDS: &str =
 
 /// Inject `--json` for issue view if not already present.
 pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
-    if user_has_flag(cmd_args, &["--json"]) {
-        return;
-    }
-    cmd_args.push("--json".to_string());
-    cmd_args.push(ISSUE_VIEW_FIELDS.to_string());
+    inject_json_fields(cmd_args, ISSUE_VIEW_FIELDS);
 }
 
 /// Three-tier parse function for `gh issue view` output.
@@ -204,48 +199,8 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
 // ============================================================================
 
 /// Parse `gh issue view` text output using regex.
-///
-/// Extracts title and structured key-value fields from the human-readable
-/// text output emitted when `--json` is not used.
 fn try_parse_text(text: &str) -> Option<InfraResult> {
-    let mut items: Vec<InfraItem> = Vec::new();
-    let mut summary = String::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // Try header: "Title #42"
-        if summary.is_empty() {
-            if let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
-                summary = format!("#{}: {}", &caps[2], &caps[1]);
-                continue;
-            }
-        }
-        // Try field: "Key: value"
-        if let Some(caps) = RE_GH_VIEW_FIELD.captures(line) {
-            items.push(InfraItem {
-                label: caps[1].to_lowercase(),
-                value: caps[2].to_string(),
-            });
-        }
-    }
-
-    if summary.is_empty() && items.is_empty() {
-        return None;
-    }
-
-    if summary.is_empty() {
-        summary = "issue view".to_string();
-    }
-
-    Some(InfraResult::new(
-        "gh".to_string(),
-        "issue view".to_string(),
-        summary,
-        items,
-    ))
+    parse_view_text(text, "issue view")
 }
 
 // ============================================================================
@@ -255,23 +210,7 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
+    use super::super::test_helpers::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_json() {

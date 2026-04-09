@@ -11,13 +11,12 @@
 //! PR-only fields. We call [`issue_view::try_parse_json`] for the common
 //! items, then overlay the PR-specific items rather than duplicating code.
 
-use crate::cmd::user_has_flag;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::{
-    combine_stdout_stderr, issue_view, MAX_JSON_BYTES, RE_GH_VIEW_FIELD, RE_GH_VIEW_HEADER,
+    combine_stdout_stderr, inject_json_fields, issue_view, parse_view_text, MAX_JSON_BYTES,
 };
 
 /// JSON fields to inject for `gh pr view`.
@@ -28,11 +27,7 @@ const PR_VIEW_FIELDS: &str =
 
 /// Inject `--json` for PR view if not already present.
 pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
-    if user_has_flag(cmd_args, &["--json"]) {
-        return;
-    }
-    cmd_args.push("--json".to_string());
-    cmd_args.push(PR_VIEW_FIELDS.to_string());
+    inject_json_fields(cmd_args, PR_VIEW_FIELDS);
 }
 
 /// Three-tier parse function for `gh pr view` output.
@@ -138,42 +133,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
 
 /// Parse `gh pr view` text output using regex.
 fn try_parse_text(text: &str) -> Option<InfraResult> {
-    let mut items: Vec<InfraItem> = Vec::new();
-    let mut summary = String::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if summary.is_empty() {
-            if let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
-                summary = format!("#{}: {}", &caps[2], &caps[1]);
-                continue;
-            }
-        }
-        if let Some(caps) = RE_GH_VIEW_FIELD.captures(line) {
-            items.push(InfraItem {
-                label: caps[1].to_lowercase(),
-                value: caps[2].to_string(),
-            });
-        }
-    }
-
-    if summary.is_empty() && items.is_empty() {
-        return None;
-    }
-
-    if summary.is_empty() {
-        summary = "pr view".to_string();
-    }
-
-    Some(InfraResult::new(
-        "gh".to_string(),
-        "pr view".to_string(),
-        summary,
-        items,
-    ))
+    parse_view_text(text, "pr view")
 }
 
 // ============================================================================
@@ -183,23 +143,7 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
+    use super::super::test_helpers::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_json() {

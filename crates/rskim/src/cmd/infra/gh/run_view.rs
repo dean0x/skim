@@ -10,14 +10,13 @@
 //! [`MAX_STEP_DETAIL`] steps per failed job, filtered to only show non-passing
 //! steps. Successful jobs show only a one-line summary to minimize context.
 
-use crate::cmd::user_has_flag;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::{
-    combine_stdout_stderr, MAX_JSON_BYTES, MAX_STEP_DETAIL, RE_GH_RUN_HEADER, RE_GH_RUN_JOB,
-    RE_GH_VIEW_FIELD,
+    combine_stdout_stderr, inject_json_fields, MAX_JSON_BYTES, MAX_STEP_DETAIL, RE_GH_RUN_HEADER,
+    RE_GH_RUN_JOB, RE_GH_VIEW_FIELD,
 };
 
 /// JSON fields to inject for `gh run view`.
@@ -25,11 +24,7 @@ const RUN_VIEW_FIELDS: &str = "name,status,conclusion,event,jobs,databaseId,crea
 
 /// Inject `--json` for run view if not already present.
 pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
-    if user_has_flag(cmd_args, &["--json"]) {
-        return;
-    }
-    cmd_args.push("--json".to_string());
-    cmd_args.push(RUN_VIEW_FIELDS.to_string());
+    inject_json_fields(cmd_args, RUN_VIEW_FIELDS);
 }
 
 /// Three-tier parse function for `gh run view` output.
@@ -121,8 +116,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         });
 
         // For failed jobs, show step details
-        let is_failed = job_conclusion == "failure" || job_conclusion == "failed";
-        if is_failed {
+        if job_conclusion == "failure" || job_conclusion == "failed" {
             let steps = job
                 .get("steps")
                 .and_then(|v| v.as_array())
@@ -228,23 +222,7 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
+    use super::super::test_helpers::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_json() {
@@ -315,11 +293,29 @@ mod tests {
     fn test_tier2_text() {
         let input = load_fixture("gh_run_view_text.txt");
         let result = try_parse_text(&input);
-        // Text fixture may or may not match — if it does, verify result type
-        if let Some(result) = result {
-            assert!(result.as_ref().contains("gh run view"));
-        }
-        // Not asserting must succeed since the text fixture may not match the header regex
+        assert!(result.is_some(), "Expected Tier 2 text parse to succeed");
+        let result = result.unwrap();
+        assert!(
+            result.as_ref().contains("gh run view"),
+            "got: {}",
+            result.as_ref()
+        );
+        assert!(
+            result.as_ref().contains("#12345"),
+            "Expected run ID in text output, got: {}",
+            result.as_ref()
+        );
+        // Should have parsed job lines
+        let job_items: Vec<_> = result
+            .items
+            .iter()
+            .filter(|i| i.label.starts_with("job:"))
+            .collect();
+        assert!(
+            !job_items.is_empty(),
+            "Expected job items from text parsing, got items: {:?}",
+            result.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
     }
 
     #[test]

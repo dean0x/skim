@@ -193,14 +193,7 @@ pub(super) fn try_parse_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use super::super::test_helpers::{load_fixture, make_output};
 
     #[test]
     fn test_tier1_gh_pass() {
@@ -231,12 +224,7 @@ mod tests {
     #[test]
     fn test_parse_impl_produces_full() {
         let input = load_fixture("gh_pr_list.json");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -247,12 +235,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        let output = CommandOutput {
-            stdout: "completely unparseable output\nno json, no regex match".to_string(),
-            stderr: String::new(),
-            exit_code: Some(1),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("completely unparseable output\nno json, no regex match");
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -265,12 +248,7 @@ mod tests {
     fn test_parse_impl_text_produces_degraded() {
         // Tier 2 input: tab-separated tabular text output (not JSON) that matches
         // the `^\d+\t.+` regex. This is what `gh pr list` emits without `--json`.
-        let output = CommandOutput {
-            stdout: "42\tFix login bug\tOPEN\n57\tAdd dark mode\tOPEN\n".to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("42\tFix login bug\tOPEN\n57\tAdd dark mode\tOPEN\n");
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),

@@ -33,7 +33,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::output::canonical::InfraResult;
+use crate::cmd::user_has_flag;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
@@ -103,12 +104,29 @@ pub(super) static RE_GH_RUN_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+)\s+run\s+#(\d+)").unwrap());
 
 /// Matches job lines in gh run view text output.
+///
+/// Format: `✓  name    status  duration`
+/// Uses `\s{2,}` as a column delimiter to separate name from status word,
+/// since names may contain embedded single spaces (e.g., `CI / build`).
 pub(super) static RE_GH_RUN_JOB: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[✓✗X\-*]\s+(.+)\s+(\w+)\s*$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[✓✗X\-*]\s+(.+?)\s{2,}(\w+)\s+\S+\s*$").unwrap());
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
+
+/// Inject `--json <fields>` into a command argument list if the user has not
+/// already supplied `--json`.
+///
+/// Called by `prepare_args` in each view sub-parser. Callers that have version
+/// compatibility constraints (e.g., `pr_checks`) should not call this and
+/// should instead implement their own `prepare_args`.
+pub(super) fn inject_json_fields(cmd_args: &mut Vec<String>, fields: &str) {
+    if !user_has_flag(cmd_args, &["--json"]) {
+        cmd_args.push("--json".to_string());
+        cmd_args.push(fields.to_string());
+    }
+}
 
 /// Truncate a body string to at most `max_lines` lines.
 ///
@@ -124,6 +142,51 @@ pub(super) fn truncate_body(body: &str, max_lines: usize) -> String {
     let mut result = lines[..max_lines].join("\n");
     result.push_str(&format!("\n... ({more} more lines)"));
     result
+}
+
+/// Parse `gh issue view` / `gh pr view` text output using regex.
+///
+/// Both commands emit the same human-readable header + key-value format. The
+/// caller passes `operation` (`"issue view"` or `"pr view"`) to label the result.
+///
+/// Returns `None` if the text contains no recognizable header or fields.
+pub(super) fn parse_view_text(text: &str, operation: &str) -> Option<InfraResult> {
+    let mut items: Vec<InfraItem> = Vec::new();
+    let mut summary = String::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if summary.is_empty() {
+            if let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
+                summary = format!("#{}: {}", &caps[2], &caps[1]);
+                continue;
+            }
+        }
+        if let Some(caps) = RE_GH_VIEW_FIELD.captures(line) {
+            items.push(InfraItem {
+                label: caps[1].to_lowercase(),
+                value: caps[2].to_string(),
+            });
+        }
+    }
+
+    if summary.is_empty() && items.is_empty() {
+        return None;
+    }
+
+    if summary.is_empty() {
+        summary = operation.to_string();
+    }
+
+    Some(InfraResult::new(
+        "gh".to_string(),
+        operation.to_string(),
+        summary,
+        items,
+    ))
 }
 
 /// Extract the last `max` comments, stripping quoted-reply (`>`) lines.
@@ -297,14 +360,14 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
 }
 
 // ============================================================================
-// Unit tests
+// Shared test helpers
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(super) mod test_helpers {
+    use crate::runner::CommandOutput;
 
-    fn make_output(stdout: &str) -> CommandOutput {
+    pub(super) fn make_output(stdout: &str) -> CommandOutput {
         CommandOutput {
             stdout: stdout.to_string(),
             stderr: String::new(),
@@ -313,13 +376,23 @@ mod tests {
         }
     }
 
-    fn load_fixture(name: &str) -> String {
+    pub(super) fn load_fixture(name: &str) -> String {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("tests/fixtures/cmd/infra");
         path.push(name);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
     }
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_helpers::{load_fixture, make_output};
 
     // --- truncate_body ---
 
