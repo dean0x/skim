@@ -22,8 +22,8 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::{
-    combine_stdout_stderr, extract_comments, inject_json_fields, parse_view_text, truncate_body,
-    MAX_BODY_LINES, MAX_COMMENTS, MAX_JSON_BYTES,
+    extract_comments, inject_json_fields, parse_view_text, three_tier_parse, truncate_body,
+    MAX_BODY_LINES, MAX_COMMENTS,
 };
 
 /// JSON fields to inject for `gh issue view`.
@@ -37,28 +37,18 @@ pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
 
 /// Three-tier parse function for `gh issue view` output.
 pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
-    let trimmed = output.stdout.trim();
-
-    // Tier 1: JSON object
-    if trimmed.starts_with('{') && trimmed.len() <= MAX_JSON_BYTES {
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(result) = try_parse_json(&obj) {
-                return ParseResult::Full(result);
-            }
-        }
-    }
-
-    let combined = combine_stdout_stderr(output);
-
-    // Tier 2: text regex
-    if let Some(result) = try_parse_text(&combined) {
-        return ParseResult::Degraded(
-            result,
-            vec!["gh issue view: JSON parse failed, using text regex".to_string()],
-        );
-    }
-
-    ParseResult::Passthrough(combined.into_owned())
+    three_tier_parse(
+        output,
+        |trimmed| {
+            serde_json::from_str::<serde_json::Value>(trimmed)
+                .ok()
+                .and_then(|obj| try_parse_json(&obj))
+        },
+        |t| t.starts_with('{'),
+        try_parse_text,
+        false,
+        "gh issue view: JSON parse failed, using text regex",
+    )
 }
 
 // ============================================================================

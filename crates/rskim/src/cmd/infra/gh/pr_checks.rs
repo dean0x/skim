@@ -30,7 +30,7 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, MAX_ITEMS, MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB};
+use super::{three_tier_parse, MAX_ITEMS, MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB};
 
 /// No-op `prepare_args`: `gh pr checks` has no stable `--json` flag to inject.
 ///
@@ -40,24 +40,22 @@ pub(super) fn prepare_args(_cmd_args: &mut Vec<String>) {
 }
 
 /// Three-tier parse function for `gh pr checks` output.
+///
+/// Unlike the view parsers, text is the primary format here (`text_is_full: true`)
+/// and JSON is only attempted when the user explicitly passes `--json` (the flag is
+/// not injected by `prepare_args`). Both `[` and `{` prefixes are accepted for
+/// JSON because some gh versions wrap the result in a `{checkRuns: [...]}` object.
 pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
-    let trimmed = output.stdout.trim();
-
-    // Tier 1a: user-provided --json (array or object)
-    if (trimmed.starts_with('[') || trimmed.starts_with('{')) && trimmed.len() <= MAX_JSON_BYTES {
-        if let Some(result) = try_parse_checks_json(&output.stdout) {
-            return ParseResult::Full(result);
-        }
-    }
-
-    let combined = combine_stdout_stderr(output);
-
-    // Tier 1b: text parsing (tab or symbol format) — text IS primary for this command
-    if let Some(result) = try_parse_checks_text(&combined) {
-        return ParseResult::Full(result);
-    }
-
-    ParseResult::Passthrough(combined.into_owned())
+    three_tier_parse(
+        output,
+        // `try_parse_checks_json` does its own internal trim, so passing the
+        // already-trimmed slice from the gate is equivalent to the original.
+        try_parse_checks_json,
+        |t| t.starts_with('[') || t.starts_with('{'),
+        try_parse_checks_text,
+        true,
+        "",
+    )
 }
 
 // ============================================================================

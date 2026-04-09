@@ -28,13 +28,17 @@ pub(crate) mod list;
 pub(crate) mod pr_checks;
 pub(crate) mod pr_view;
 pub(crate) mod run_view;
+pub(super) mod shared;
 
-use std::sync::LazyLock;
+// Re-export everything from `shared` so that submodule `use super::…` imports
+// continue to resolve without any changes to the sub-parser files.
+pub(super) use shared::{
+    extract_comments, inject_json_fields, parse_view_text, three_tier_parse, truncate_body,
+    MAX_BODY_LINES, MAX_COMMENTS, MAX_ITEMS, MAX_JSON_BYTES, MAX_STEP_DETAIL, RE_GH_CHECK_SYMBOL,
+    RE_GH_CHECK_TAB, RE_GH_RUN_HEADER, RE_GH_RUN_JOB, RE_GH_VIEW_FIELD,
+};
 
-use regex::Regex;
-
-use crate::cmd::user_has_flag;
-use crate::output::canonical::{InfraItem, InfraResult};
+use crate::output::canonical::InfraResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
@@ -45,176 +49,6 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     env_overrides: &[],
     install_hint: "Install gh: https://cli.github.com/",
 };
-
-// ============================================================================
-// Shared constants
-// ============================================================================
-
-/// Maximum body lines included in issue/PR view output.
-///
-/// Bodies are truncated to this many lines to prevent excessive context
-/// consumption when an issue has a multi-page description.
-pub(super) const MAX_BODY_LINES: usize = 10;
-
-/// Maximum number of comments to include in issue/PR view output.
-///
-/// Only the most recent N comments are shown to surface actionable context.
-pub(super) const MAX_COMMENTS: usize = 3;
-
-/// Maximum step details shown per failed job in run view.
-pub(super) const MAX_STEP_DETAIL: usize = 5;
-
-/// Maximum items in list output.
-pub(super) const MAX_ITEMS: usize = 100;
-
-/// Maximum byte length of JSON input accepted for Tier 1 parsing.
-///
-/// Inputs larger than this are skipped and fall through to the regex tier,
-/// preventing unbounded allocation on pathological or adversarial responses.
-pub(super) const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
-
-// ============================================================================
-// Shared regexes
-// ============================================================================
-
-/// Matches tab-separated pr checks output: `name\tstatus\tduration\turl`.
-pub(super) static RE_GH_CHECK_TAB: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(.+)\t(pass|fail|pending|skipped|cancelled|neutral)\t([^\t]*)\t(.*)$").unwrap()
-});
-
-/// Matches symbol-format pr checks output: `✓  name  duration  url`.
-///
-/// Newer `gh` versions prefix each line with `✓` (pass), `X` (fail), or
-/// `-` (pending/skipped). We match the first non-whitespace token and treat
-/// the rest as name.
-pub(super) static RE_GH_CHECK_SYMBOL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^([✓✗X\-*])\s{1,3}(.+?)\s{2,}(\d+[ms][^\s]*|\d+:\d+)\s+(\S+)\s*$").unwrap()
-});
-
-/// Matches gh issue/pr view text header: `<title> #<number>`.
-pub(super) static RE_GH_VIEW_HEADER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+)\s+#(\d+)$").unwrap());
-
-/// Matches `key:\tvalue` fields in gh issue/pr view text output.
-pub(super) static RE_GH_VIEW_FIELD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\w[\w ]*?):\s+(.+)$").unwrap());
-
-/// Matches gh run view text header line.
-pub(super) static RE_GH_RUN_HEADER: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+)\s+run\s+#(\d+)").unwrap());
-
-/// Matches job lines in gh run view text output.
-///
-/// Format: `✓  name    status  duration`
-/// Uses `\s{2,}` as a column delimiter to separate name from status word,
-/// since names may contain embedded single spaces (e.g., `CI / build`).
-pub(super) static RE_GH_RUN_JOB: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[✓✗X\-*]\s+(.+?)\s{2,}(\w+)\s+\S+\s*$").unwrap());
-
-// ============================================================================
-// Shared helpers
-// ============================================================================
-
-/// Inject `--json <fields>` into a command argument list if the user has not
-/// already supplied `--json`.
-///
-/// Called by `prepare_args` in each view sub-parser. Callers that have version
-/// compatibility constraints (e.g., `pr_checks`) should not call this and
-/// should instead implement their own `prepare_args`.
-pub(super) fn inject_json_fields(cmd_args: &mut Vec<String>, fields: &str) {
-    if !user_has_flag(cmd_args, &["--json"]) {
-        cmd_args.push("--json".to_string());
-        cmd_args.push(fields.to_string());
-    }
-}
-
-/// Truncate a body string to at most `max_lines` lines.
-///
-/// If the body fits within the limit it is returned as-is.
-/// Otherwise the first `max_lines` lines are kept and a suffix of the form
-/// `... (M more lines)` is appended.
-pub(super) fn truncate_body(body: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = body.lines().collect();
-    if lines.len() <= max_lines {
-        return body.to_string();
-    }
-    let more = lines.len() - max_lines;
-    let mut result = lines[..max_lines].join("\n");
-    result.push_str(&format!("\n... ({more} more lines)"));
-    result
-}
-
-/// Parse `gh issue view` / `gh pr view` text output using regex.
-///
-/// Both commands emit the same human-readable header + key-value format. The
-/// caller passes `operation` (`"issue view"` or `"pr view"`) to label the result.
-///
-/// Returns `None` if the text contains no recognizable header or fields.
-pub(super) fn parse_view_text(text: &str, operation: &str) -> Option<InfraResult> {
-    let mut items: Vec<InfraItem> = Vec::new();
-    let mut summary = String::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if summary.is_empty() {
-            if let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
-                summary = format!("#{}: {}", &caps[2], &caps[1]);
-                continue;
-            }
-        }
-        if let Some(caps) = RE_GH_VIEW_FIELD.captures(line) {
-            items.push(InfraItem {
-                label: caps[1].to_lowercase(),
-                value: caps[2].to_string(),
-            });
-        }
-    }
-
-    if summary.is_empty() && items.is_empty() {
-        return None;
-    }
-
-    if summary.is_empty() {
-        summary = operation.to_string();
-    }
-
-    Some(InfraResult::new(
-        "gh".to_string(),
-        operation.to_string(),
-        summary,
-        items,
-    ))
-}
-
-/// Extract the last `max` comments, stripping quoted-reply (`>`) lines.
-///
-/// Returns one entry per comment in the format `"@author: first_line..."`.
-/// Leading `>` lines (quoted replies in Markdown) are removed before
-/// extracting the first meaningful line so that only the new text is shown.
-pub(super) fn extract_comments(comments: &[serde_json::Value], max: usize) -> Vec<String> {
-    let start = comments.len().saturating_sub(max);
-    comments[start..]
-        .iter()
-        .filter_map(|c| {
-            let author = c
-                .get("author")
-                .and_then(|a| a.get("login"))
-                .and_then(|l| l.as_str())
-                .or_else(|| c.get("login").and_then(|l| l.as_str()))
-                .unwrap_or("unknown");
-            let body = c.get("body").and_then(|b| b.as_str()).unwrap_or("");
-            // Strip quoted lines (starting with `>`)
-            let first_line = body
-                .lines()
-                .find(|l| !l.trim_start().starts_with('>') && !l.trim().is_empty())?;
-            let preview: String = first_line.chars().take(120).collect();
-            Some(format!("@{author}: {preview}"))
-        })
-        .collect()
-}
 
 // ============================================================================
 // Run entry point
