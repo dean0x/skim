@@ -448,11 +448,9 @@ mod tests {
 
     #[test]
     fn test_parse_status_null_bytes_no_panic() {
-        // Feed null bytes and other control characters.
+        // Feed null bytes and other control characters — must not panic.
         let result = parse_status("\x00\x01\x02\x03 binary garbage");
-        // Must not panic and must return a valid GitResult.
-        let _ = result.summary;
-        let _ = result.details;
+        assert!(!result.summary.is_empty(), "summary must be non-empty");
     }
 
     #[test]

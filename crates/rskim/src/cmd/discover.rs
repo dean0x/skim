@@ -745,6 +745,16 @@ mod tests {
 
     // ---- analyze_invocations: skim command exclusion ----
 
+    fn default_config() -> DiscoverConfig {
+        DiscoverConfig {
+            since: None,
+            session_latest: false,
+            agent_filter: None,
+            json_output: false,
+            debug: false,
+        }
+    }
+
     fn make_bash_invocation(command: &str) -> ToolInvocation {
         ToolInvocation {
             tool_name: "Bash".to_string(),
@@ -769,13 +779,7 @@ mod tests {
         let inv3 = make_bash_invocation("cargo test"); // this one IS rewritable
         let invocations = vec![inv1, inv2, inv3];
 
-        let config = DiscoverConfig {
-            since: None,
-            session_latest: false,
-            agent_filter: None,
-            json_output: false,
-            debug: false,
-        };
+        let config = default_config();
         let analysis = analyze_invocations(&invocations, &config);
 
         // Only "cargo test" should be in bash_commands, not the skim commands
@@ -790,13 +794,7 @@ mod tests {
         let inv2 = make_bash_invocation("cargo test");
         let invocations = vec![inv1, inv2];
 
-        let config = DiscoverConfig {
-            since: None,
-            session_latest: false,
-            agent_filter: None,
-            json_output: false,
-            debug: false,
-        };
+        let config = default_config();
         let analysis = analyze_invocations(&invocations, &config);
 
         assert_eq!(analysis.bash_commands.len(), 2);
@@ -812,23 +810,13 @@ mod tests {
         let invocations = vec![inv1, inv2, inv3];
 
         // debug=false: non_rewritable_commands should be empty
-        let config_no_debug = DiscoverConfig {
-            since: None,
-            session_latest: false,
-            agent_filter: None,
-            json_output: false,
-            debug: false,
-        };
-        let analysis = analyze_invocations(&invocations, &config_no_debug);
+        let analysis = analyze_invocations(&invocations, &default_config());
         assert!(analysis.non_rewritable_commands.is_empty());
 
         // debug=true: non_rewritable_commands should be populated
         let config_debug = DiscoverConfig {
-            since: None,
-            session_latest: false,
-            agent_filter: None,
-            json_output: false,
             debug: true,
+            ..default_config()
         };
         let analysis = analyze_invocations(&invocations, &config_debug);
         assert!(!analysis.non_rewritable_commands.is_empty());

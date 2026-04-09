@@ -57,6 +57,37 @@ pub(crate) fn command() -> clap::Command {
         )
 }
 
+/// Print the help text for the rewrite subcommand.
+pub(super) fn print_help() {
+    println!("skim rewrite");
+    println!();
+    println!("  Rewrite common developer commands into skim equivalents");
+    println!();
+    println!("Usage: skim rewrite [--suggest] <COMMAND>...");
+    println!("       echo \"cargo test\" | skim rewrite [--suggest]");
+    println!("       skim rewrite --hook  (agent PreToolUse hook mode)");
+    println!();
+    println!("Options:");
+    println!("  --suggest         Output JSON suggestion instead of plain text");
+    println!("  --hook            Run as agent PreToolUse hook (reads JSON from stdin)");
+    println!("  --agent <name>    Agent type for hook mode (default: claude-code)");
+    println!("  --help, -h        Print help information");
+    println!();
+    println!("Examples:");
+    println!("  skim rewrite cargo test -- --nocapture");
+    println!("  skim rewrite git status");
+    println!("  skim rewrite cat src/main.rs");
+    println!("  echo \"pytest -v\" | skim rewrite --suggest");
+    println!();
+    println!("Hook mode:");
+    println!("  Reads agent PreToolUse JSON from stdin, rewrites command if matched,");
+    println!("  and emits agent-specific hook-protocol JSON (see --agent flag).");
+    println!();
+    println!("Exit codes:");
+    println!("  0  Rewrite found (or --suggest/--hook mode)");
+    println!("  1  No rewrite match");
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::{RewriteCategory, SuggestOutput};
@@ -163,35 +194,4 @@ mod tests {
             serde_json::to_string(&output).expect("serialization must not fail for compound");
         assert!(json.contains("\"compound\":true"));
     }
-}
-
-/// Print the help text for the rewrite subcommand.
-pub(super) fn print_help() {
-    println!("skim rewrite");
-    println!();
-    println!("  Rewrite common developer commands into skim equivalents");
-    println!();
-    println!("Usage: skim rewrite [--suggest] <COMMAND>...");
-    println!("       echo \"cargo test\" | skim rewrite [--suggest]");
-    println!("       skim rewrite --hook  (agent PreToolUse hook mode)");
-    println!();
-    println!("Options:");
-    println!("  --suggest         Output JSON suggestion instead of plain text");
-    println!("  --hook            Run as agent PreToolUse hook (reads JSON from stdin)");
-    println!("  --agent <name>    Agent type for hook mode (default: claude-code)");
-    println!("  --help, -h        Print help information");
-    println!();
-    println!("Examples:");
-    println!("  skim rewrite cargo test -- --nocapture");
-    println!("  skim rewrite git status");
-    println!("  skim rewrite cat src/main.rs");
-    println!("  echo \"pytest -v\" | skim rewrite --suggest");
-    println!();
-    println!("Hook mode:");
-    println!("  Reads agent PreToolUse JSON from stdin, rewrites command if matched,");
-    println!("  and emits agent-specific hook-protocol JSON (see --agent flag).");
-    println!();
-    println!("Exit codes:");
-    println!("  0  Rewrite found (or --suggest/--hook mode)");
-    println!("  1  No rewrite match");
 }
