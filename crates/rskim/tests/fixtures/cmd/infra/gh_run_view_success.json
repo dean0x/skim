@@ -1,0 +1,29 @@
+{
+  "databaseId": 99999,
+  "name": "Release Pipeline",
+  "status": "completed",
+  "conclusion": "success",
+  "event": "release",
+  "createdAt": "2026-04-09T09:00:00Z",
+  "updatedAt": "2026-04-09T09:05:00Z",
+  "jobs": [
+    {
+      "name": "build",
+      "status": "completed",
+      "conclusion": "success",
+      "steps": [
+        {"name": "Set up job", "conclusion": "success"},
+        {"name": "Build release", "conclusion": "success"}
+      ]
+    },
+    {
+      "name": "publish",
+      "status": "completed",
+      "conclusion": "success",
+      "steps": [
+        {"name": "Publish to crates.io", "conclusion": "success"},
+        {"name": "Publish to npm", "conclusion": "success"}
+      ]
+    }
+  ]
+}

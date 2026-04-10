@@ -1,6 +1,6 @@
 //! Declarative rewrite rule table.
 //!
-//! 64 rules, ordered longest-prefix-first within the same leading token.
+//! 68 rules, ordered longest-prefix-first within the same leading token.
 //! Only `engine.rs` consumes `REWRITE_RULES`.
 
 use super::types::{RewriteCategory, RewriteRule};
@@ -329,6 +329,26 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
     },
     // infra — gh (longest prefix first)
+    //
+    // DESIGN DECISION: --jq and --template skip because they apply custom
+    // transformations to gh JSON output. Injecting --json fields would change
+    // what the filter operates on, breaking user-defined projections.
+    // --log and --log-failed skip for gh run view because they output raw CI
+    // step logs — a completely different format from structured run metadata.
+    // --web skips because it opens a browser tab, not stdout.
+    // --watch skips because it produces a streaming TUI, not parseable output.
+    RewriteRule {
+        prefix: &["gh", "pr", "checks"],
+        rewrite_to: &["skim", "infra", "gh", "pr", "checks"],
+        skip_if_flag_prefix: &["--web", "--watch", "--jq", "--template"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "pr", "view"],
+        rewrite_to: &["skim", "infra", "gh", "pr", "view"],
+        skip_if_flag_prefix: &["--web", "--jq", "--template"],
+        category: RewriteCategory::Infra,
+    },
     RewriteRule {
         prefix: &["gh", "pr", "list"],
         rewrite_to: &["skim", "infra", "gh", "pr", "list"],
@@ -336,9 +356,21 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
     },
     RewriteRule {
+        prefix: &["gh", "issue", "view"],
+        rewrite_to: &["skim", "infra", "gh", "issue", "view"],
+        skip_if_flag_prefix: &["--web", "--jq", "--template"],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
         prefix: &["gh", "issue", "list"],
         rewrite_to: &["skim", "infra", "gh", "issue", "list"],
         skip_if_flag_prefix: &[],
+        category: RewriteCategory::Infra,
+    },
+    RewriteRule {
+        prefix: &["gh", "run", "view"],
+        rewrite_to: &["skim", "infra", "gh", "run", "view"],
+        skip_if_flag_prefix: &["--web", "--log", "--log-failed", "--jq", "--template"],
         category: RewriteCategory::Infra,
     },
     RewriteRule {
@@ -436,7 +468,7 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with REWRITE_RULES.
-    const EXPECTED_RULE_COUNT: usize = 64;
+    const EXPECTED_RULE_COUNT: usize = 68;
 
     #[test]
     fn test_rule_count_matches_expected() {

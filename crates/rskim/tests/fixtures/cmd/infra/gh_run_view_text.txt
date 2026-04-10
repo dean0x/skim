@@ -1,0 +1,6 @@
+CI Pipeline run #12345
+
+✓  build    completed  2m10s
+X  test     failure    3m45s
+✓  lint     completed  1m05s
+-  deploy   skipped    0s

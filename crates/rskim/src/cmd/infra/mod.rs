@@ -1,7 +1,10 @@
-//! Infrastructure tool subcommand dispatcher (#116)
+//! Infrastructure tool subcommand dispatcher (#116, #131)
 //!
 //! Routes `skim infra <tool> [args...]` to the appropriate infra tool parser.
 //! Currently supported tools: `aws`, `curl`, `gh`, `wget`.
+//!
+//! The `gh` handler supports list commands (`pr list`, `issue list`, `run list`)
+//! and view commands (`issue view`, `pr view`, `pr checks`, `run view`).
 
 pub(crate) mod aws;
 pub(crate) mod curl;
@@ -71,6 +74,12 @@ fn print_help() {
     println!();
     println!("Examples:");
     println!("  skim infra gh pr list              List GitHub pull requests");
+    println!("  skim infra gh issue list           List GitHub issues");
+    println!("  skim infra gh run list             List workflow runs");
+    println!("  skim infra gh issue view 42        View GitHub issue details");
+    println!("  skim infra gh pr view 15           View PR details");
+    println!("  skim infra gh pr checks 15         View PR check status");
+    println!("  skim infra gh run view 12345       View workflow run details");
     println!("  skim infra aws s3 ls               List S3 buckets");
     println!("  skim infra curl https://api.example.com/data  Make HTTP request");
     println!("  skim infra wget https://example.com/file.txt  Download a file");
