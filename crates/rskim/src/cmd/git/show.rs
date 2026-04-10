@@ -379,10 +379,11 @@ fn run_show_file_content(
 ) -> anyhow::Result<ExitCode> {
     // --json is not meaningful for file-content mode.
     if user_has_flag(args, &["--json"]) {
-        anyhow::bail!(
-            "--json is not supported for `git show <ref>:<path>` (file-content mode);\n\
-             the output is already the compressed artifact (exit code 2)"
+        eprintln!(
+            "Error: --json is not supported for `git show <ref>:<path>` (file-content mode); \
+             the output is already the compressed artifact"
         );
+        return Ok(ExitCode::from(2));
     }
 
     // Extract the path component from `<ref>:<path>` (everything after the last `:`).
@@ -749,6 +750,31 @@ mod tests {
     fn test_no_passthrough_flags_does_not_trigger() {
         let args: Vec<String> = vec!["HEAD".into()];
         assert!(!user_has_flag(&args, PASSTHROUGH_FLAGS));
+    }
+
+    // ========================================================================
+    // --json rejection in file-content mode
+    // ========================================================================
+
+    /// `--json` in file-content mode must be detected and rejected.
+    ///
+    /// The actual exit code (2) is verified by the E2E integration test
+    /// `test_skim_git_show_file_content_json_rejected` in `tests/cli_git.rs`.
+    #[test]
+    fn test_file_content_mode_json_rejected() {
+        // run_show_file_content checks user_has_flag first before spawning git.
+        // Confirm the guard fires so the exit-2 path is taken.
+        let args_with_json: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
+        assert!(
+            user_has_flag(&args_with_json, &["--json"]),
+            "--json must be detected in file-content args"
+        );
+
+        let args_without_json: Vec<String> = vec!["HEAD:src/main.rs".into()];
+        assert!(
+            !user_has_flag(&args_without_json, &["--json"]),
+            "flag must not fire when --json is absent"
+        );
     }
 
     // ========================================================================

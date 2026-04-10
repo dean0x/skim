@@ -319,3 +319,31 @@ fn test_skim_git_show_unknown_subcommand_message() {
         .failure()
         .stderr(predicate::str::contains("show"));
 }
+
+#[test]
+fn test_skim_git_show_file_content_json_rejected() {
+    // --json in file-content mode (git show <ref>:<path>) must exit with
+    // code 2 (argument error) and print a clear error to stderr.
+    // The error message must NOT embed the literal text "(exit code 2)"
+    // since that would be self-contradictory if the code were ever changed.
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "show", "HEAD:Cargo.toml", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "file-content --json must exit 2 (argument error), got: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--json is not supported"),
+        "stderr must explain the rejection, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("(exit code 2)"),
+        "stderr must not embed '(exit code 2)' — self-contradictory prose, got: {stderr}"
+    );
+}
