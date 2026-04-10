@@ -26,7 +26,7 @@ use std::process::ExitCode;
 use rskim_core::{Language, TransformConfig};
 
 use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
-use crate::output::canonical::{ShowCommitResult, ShowDiffFileEntry};
+use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
 
 use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
@@ -312,7 +312,7 @@ fn run_show_commit(
     // Render the diff body using the AST-aware pipeline.
     let file_diffs = parse_unified_diff(diff_body);
     let mut rendered_diff = String::new();
-    let mut diff_file_entries: Vec<ShowDiffFileEntry> = Vec::new();
+    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
 
     for (i, file_diff) in file_diffs.iter().enumerate() {
         let skip_ast = i >= super::diff::MAX_AST_FILE_COUNT;
@@ -325,7 +325,7 @@ fn run_show_commit(
         );
         rendered_diff.push_str(&rendered);
 
-        diff_file_entries.push(ShowDiffFileEntry {
+        diff_file_entries.push(DiffFileEntry {
             path: file_diff.path.clone(),
             status: file_diff.status.clone(),
             changed_regions: file_diff.hunks.len(),
