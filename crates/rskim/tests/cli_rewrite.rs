@@ -412,6 +412,41 @@ fn test_rewrite_git_show_file_content_rewrites() {
         .stdout(predicate::str::contains("skim git show HEAD:src/main.rs"));
 }
 
+/// `git worktree list` is AlreadyCompact (AD-2/AD-3): exits 0 and prints original.
+#[test]
+fn test_rewrite_git_worktree_list_already_compact() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "worktree", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("git worktree list"));
+}
+
+/// `git worktree list --porcelain` is also AlreadyCompact (prefix match).
+#[test]
+fn test_rewrite_git_worktree_list_porcelain_already_compact() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "worktree", "list", "--porcelain"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("git worktree list --porcelain"));
+}
+
+/// Compound: `git worktree list && git show HEAD` → ack segment passes through,
+/// show segment is rewritten (AD-2 compound behavior uses original try_rewrite_compound).
+#[test]
+fn test_rewrite_compound_worktree_list_and_git_show() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("git worktree list && git show HEAD\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git show HEAD"));
+}
+
 // ============================================================================
 // Suggest mode
 // ============================================================================
