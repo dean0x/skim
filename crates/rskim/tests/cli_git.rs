@@ -251,3 +251,71 @@ fn test_skim_git_log_contains_hashes() {
         "Expected a line with a hex commit hash in output, got: {stdout}"
     );
 }
+
+// ============================================================================
+// Show — new subcommand (#132)
+// ============================================================================
+
+#[test]
+fn test_skim_git_show_help_listed_in_git_help() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("show"));
+}
+
+#[test]
+fn test_skim_git_show_help_subcommand() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "show", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("commit").and(predicate::str::contains("USAGE")));
+}
+
+#[test]
+fn test_skim_git_show_head_commit_mode() {
+    // Run `skim git show HEAD` against the real skim repo — must succeed and
+    // produce a compressed commit header.
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "show", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "skim git show HEAD should succeed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Output should contain a short hash (7 hex chars) from the commit header.
+    let has_hash = stdout.lines().any(|l| {
+        l.split_whitespace()
+            .next()
+            .is_some_and(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
+    });
+    assert!(
+        has_hash,
+        "Expected a commit hash in show output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_skim_git_show_stat_passthrough() {
+    // --stat triggers passthrough — git standard output format with no skim wrapping.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "show", "--stat", "HEAD"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_skim_git_show_unknown_subcommand_message() {
+    // The "unknown git subcommand" error should now list "show" in the supported list.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "totally_unknown_cmd_xyz"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("show"));
+}

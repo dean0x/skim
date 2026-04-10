@@ -1,0 +1,50 @@
+commit abc1234def5678901234567890abcdef01234567
+Author: Jane Dev <jane@example.com>
+Date:   Thu Apr 10 12:00:00 2025 +0000
+
+    feat: add user authentication handler
+
+    Implements JWT-based login endpoint with bcrypt password hashing.
+
+diff --git a/src/auth/handler.rs b/src/auth/handler.rs
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/src/auth/handler.rs
+@@ -0,0 +1,25 @@
++use serde::{Deserialize, Serialize};
++use anyhow::Result;
++
++#[derive(Debug, Deserialize)]
++pub struct LoginRequest {
++    pub username: String,
++    pub password: String,
++}
++
++#[derive(Debug, Serialize)]
++pub struct LoginResponse {
++    pub token: String,
++    pub expires_in: u64,
++}
++
++/// Handle user login.
++///
++/// Validates credentials and returns a signed JWT token on success.
++pub async fn handle_login(req: LoginRequest) -> Result<LoginResponse> {
++    let token = generate_jwt(&req.username)?;
++    Ok(LoginResponse {
++        token,
++        expires_in: 3600,
++    })
++}
++
+diff --git a/src/config.rs b/src/config.rs
+index 111aaa..222bbb 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -10,6 +10,9 @@ pub struct Config {
+     pub database_url: String,
+     pub port: u16,
++    /// Secret key for JWT signing.
++    pub jwt_secret: String,
+ }

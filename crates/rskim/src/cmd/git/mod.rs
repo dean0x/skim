@@ -14,6 +14,7 @@
 mod diff;
 mod fetch;
 mod log;
+mod show;
 mod status;
 
 use std::process::ExitCode;
@@ -28,10 +29,16 @@ use crate::runner::CommandRunner;
 
 /// Run the `git` subcommand.
 ///
-/// Dispatches to `status`, `diff`, or `log` parsers, or prints help.
+/// Dispatches to `status`, `diff`, `log`, `show`, etc., or prints help.
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
-    // Handle --help / -h at the git level
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    // Handle --help / -h at the `skim git` level: only when the first
+    // non-global-flag token is the help flag (e.g., `skim git --help`),
+    // not when it appears deeper inside a subcommand (`skim git show --help`).
+    if args.is_empty()
+        || args
+            .first()
+            .is_some_and(|a| matches!(a.as_str(), "--help" | "-h"))
+    {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
@@ -52,11 +59,12 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats),
         "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats),
         "log" => log::run_log(&global_flags, subcmd_args, show_stats),
+        "show" => show::run_show(&global_flags, subcmd_args, show_stats),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
                 "unknown git subcommand: '{safe_other}'\n\n\
-                 Supported: status, diff, fetch, log\n\
+                 Supported: status, diff, fetch, log, show\n\
                  Run 'skim git --help' for usage"
             );
         }
@@ -68,7 +76,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 // ============================================================================
 
 fn print_help() {
-    println!("skim git <status|diff|fetch|log> [args...]");
+    println!("skim git <status|diff|fetch|log|show> [args...]");
     println!();
     println!("  Compress git command output for LLM context windows.");
     println!();
@@ -77,6 +85,7 @@ fn print_help() {
     println!("  diff      AST-aware diff with full function boundaries");
     println!("  fetch     Show compressed fetch summary (new branches, tags, pruned)");
     println!("  log       Show compressed commit log");
+    println!("  show      Show compressed commit or file content at a ref");
     println!();
     println!("Global git flags (before subcommand):");
     println!("  -C <path>    Run as if git was started in <path>");
@@ -96,7 +105,10 @@ fn print_help() {
     println!("  skim git fetch");
     println!("  skim git fetch --prune");
     println!("  skim git log -n 5");
+    println!("  skim git show HEAD");
+    println!("  skim git show HEAD:src/main.rs");
     println!("  skim git diff --help                   Diff-specific options");
+    println!("  skim git show --help                   Show-specific options");
 }
 
 // ============================================================================
