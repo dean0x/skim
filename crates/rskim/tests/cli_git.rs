@@ -258,12 +258,16 @@ fn test_skim_git_log_contains_hashes() {
 
 #[test]
 fn test_skim_git_show_help_listed_in_git_help() {
+    // Match the exact subcommand row from print_help() in cmd/git/mod.rs so that
+    // removing or renaming the "show" line causes this test to fail.
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("show"));
+        .stdout(predicate::str::contains(
+            "  show      Show compressed commit or file content at a ref",
+        ));
 }
 
 #[test]

@@ -19,6 +19,18 @@
 //!   Tier 1: language supported → transform via rskim-core.
 //!   Tier 2: unsupported language → passthrough.
 //!   Tier 3: guardrail fallback (transform inflated output) → raw.
+//!
+//! # Design decisions
+//!
+//! **AD-5** — Dispatch-on-arg-shape.
+//!
+//! The single entry point [`run_show`] inspects the first non-flag argument to
+//! determine which of the three modes to enter (file-content, commit, multi-ref
+//! passthrough). This avoids a separate subcommand (`show-file` / `show-commit`)
+//! and mirrors `git show`'s own ambiguity resolution: the presence of `:` in a
+//! token unambiguously signals a tree-object ref, while its absence means a
+//! commit-ish. All other dispatch logic (passthrough flags, `--json` rejection,
+//! annotated-tag detection) is layered on top of this primary shape test.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -45,6 +57,27 @@ use super::{finalize_git_output, map_exit_code, run_passthrough};
 #[inline]
 fn as_str_slice(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
+}
+
+/// Extract the path portion from a `<ref>:<path>` token.
+///
+/// Git disallows `:` in ref names, so any `:` is a ref/path separator and
+/// the path is everything after the last `:`.
+///
+/// - `HEAD:foo.rs`                 → `foo.rs`
+/// - `:foo.rs`                     → `foo.rs` (empty ref = index)
+/// - `refs/heads/main:src/lib.rs`  → `src/lib.rs`
+/// - `abc:path/with:colon.rs`      → `colon.rs` (splits at last `:`)
+///
+/// If no `:` is present the whole token is returned unchanged (defensive
+/// fallback — `run_show_file_content` is only reached when `detect_show_mode`
+/// already confirmed a `:` exists).
+#[inline]
+fn split_refpath(refpath: &str) -> &str {
+    refpath
+        .rfind(':')
+        .map(|pos| &refpath[pos + 1..])
+        .unwrap_or(refpath)
 }
 
 // ============================================================================
@@ -475,10 +508,7 @@ fn run_show_file_content(
 
     // Extract the path component from `<ref>:<path>` (everything after the last `:`).
     // Git disallows `:` inside ref names, so any `:` in the token is a ref/path separator.
-    let path_str = refpath
-        .rfind(':')
-        .map(|pos| &refpath[pos + 1..])
-        .unwrap_or(refpath);
+    let path_str = split_refpath(refpath);
 
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.push("show".to_string());
@@ -572,9 +602,14 @@ fn print_show_help() {
     println!("    --stat, --shortstat, --numstat, --name-only, --name-status");
     println!("    --raw, --check, --format, --pretty");
     println!();
+    println!("NOTES:");
+    println!("    --json is not supported in file-content mode (<ref>:<path>).");
+    println!("    Passing --json with a file-content ref exits with code 2.");
+    println!();
     println!("EXAMPLES:");
     println!("    skim git show HEAD");
     println!("    skim git show HEAD:src/main.rs");
+    println!("    skim git show HEAD:README.md      # unsupported ext → raw passthrough");
     println!("    skim git show abc123 --json");
     println!("    skim git show v1.0.0              # annotated tag → passthrough");
     println!("    skim git show --stat HEAD         # passthrough to git");
@@ -671,16 +706,24 @@ mod tests {
     fn test_parse_commit_header_basic() {
         let fixture = include_str!("../../../tests/fixtures/cmd/git/show_commit.txt");
         let (header, diff_body) = parse_commit_header(fixture).expect("should parse commit");
-        assert_eq!(&header.hash[..7], "abc1234");
-        assert!(
-            header.author.contains("Jane Dev"),
-            "expected author to contain 'Jane Dev', got: {}",
-            header.author
+        assert_eq!(
+            &header.hash[..7],
+            "abc1234",
+            "hash prefix must be 'abc1234', got: {}",
+            header.hash
         );
-        assert_eq!(header.subject, "feat: add user authentication handler");
+        assert_eq!(
+            header.author, "Jane Dev <jane@example.com>",
+            "author must match exactly"
+        );
+        assert_eq!(
+            header.subject, "feat: add user authentication handler",
+            "subject must match exactly"
+        );
         assert!(
-            diff_body.contains("diff --git"),
-            "diff body should start with diff --git"
+            diff_body.starts_with("diff --git "),
+            "diff body must start with 'diff --git ', got: {:?}",
+            &diff_body[..diff_body.len().min(40)]
         );
     }
 
@@ -813,17 +856,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_file_content_mode_passthrough_for_unknown_extension() {
-        // `.lock` has no language → passthrough (no transform).
-        let path = Path::new("Cargo.lock");
-        let lang = Language::from_path(path).filter(|l| !l.is_serde_based());
-        assert!(
-            lang.is_none(),
-            "Cargo.lock must not have a tree-sitter language"
-        );
-    }
-
     // ========================================================================
     // Passthrough flags
     // ========================================================================
@@ -856,47 +888,80 @@ mod tests {
     // --json rejection in file-content mode
     // ========================================================================
 
-    /// `--json` in file-content mode must be detected and rejected.
+    /// `--json` in file-content mode must exit 2.
     ///
-    /// The actual exit code (2) is verified by the E2E integration test
+    /// Tests the actual `run_show_file_content` entry path: the function must
+    /// return `ExitCode::from(2)` immediately when `--json` is present, without
+    /// spawning a git process (no real git invocation needed here).
+    ///
+    /// The full E2E path (real binary + stderr message) is covered by
     /// `test_skim_git_show_file_content_json_rejected` in `tests/cli_git.rs`.
     #[test]
     fn test_file_content_mode_json_rejected() {
-        // run_show_file_content checks user_has_flag first before spawning git.
-        // Confirm the guard fires so the exit-2 path is taken.
-        let args_with_json: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
-        assert!(
-            user_has_flag(&args_with_json, &["--json"]),
-            "--json must be detected in file-content args"
-        );
-
-        let args_without_json: Vec<String> = vec!["HEAD:src/main.rs".into()];
-        assert!(
-            !user_has_flag(&args_without_json, &["--json"]),
-            "flag must not fire when --json is absent"
+        let global_flags: Vec<String> = vec![];
+        let args: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
+        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false)
+            .expect("run_show_file_content must not return an anyhow error for --json rejection");
+        assert_eq!(
+            result,
+            ExitCode::from(2),
+            "--json in file-content mode must return exit code 2"
         );
     }
 
     // ========================================================================
-    // Guardrail: verify the call chain compiles and functions are visible
+    // render_show_diff: unit tests for the pure rendering helper
     // ========================================================================
 
-    /// Documents the guardrail path: if transform produces a larger output,
-    /// the guardrail emits the raw string. We verify this with synthetic data.
+    /// `render_show_diff` with a well-formed header + no diff body returns Some
+    /// with a result that carries the expected header fields.
+    ///
+    /// This is the Tier-2 path (header parsed, zero AST files) and confirms
+    /// the result is reachable and contains correct metadata.
     #[test]
-    fn test_guardrail_fallback_when_transform_inflates() {
-        // Raw must be >= MIN_RAW_SIZE_FOR_GUARDRAIL (256 bytes) to activate the guardrail.
-        // Use 300 bytes of raw, then an inflated output with substantially more tokens.
-        let raw = "x".repeat(300);
-        let inflated = "this is a much longer string with many more tokens ".repeat(20);
-        let mut buf = Vec::new();
-        let outcome = crate::output::guardrail::apply(raw.clone(), inflated, &mut buf).unwrap();
-        // Guardrail should have triggered and returned the raw content.
+    fn test_render_show_diff_header_only_commit() {
+        let raw = "commit abc1234\nAuthor: Jane Dev <jane@example.com>\nDate: Thu Apr 10 2025\n\n    feat: header only\n";
+        let result = render_show_diff(raw, &[], &[]);
+        let result = result.expect("well-formed commit without diff must produce Some");
+        let rendered = result.to_string();
         assert!(
-            outcome.was_triggered(),
-            "guardrail must trigger when output inflates"
+            rendered.contains("abc1234"),
+            "rendered output must include the commit hash"
         );
-        assert_eq!(outcome.into_output(), raw);
+        assert!(
+            rendered.contains("feat: header only"),
+            "rendered output must include the commit subject"
+        );
+    }
+
+    /// `render_show_diff` with input that does not start with `commit ` returns None,
+    /// verifying the annotated-tag / blob passthrough path is reachable.
+    #[test]
+    fn test_render_show_diff_non_commit_returns_none() {
+        let raw = "tag v1.0.0\nTagger: Someone\nDate: ...\n\n    Release notes\n";
+        assert!(
+            render_show_diff(raw, &[], &[]).is_none(),
+            "non-commit raw output must return None (passthrough path)"
+        );
+    }
+
+    /// `render_show_diff` with the full fixture produces a result containing
+    /// the file path from the diff — verifying the Tier-1 (AST) path is
+    /// exercised end-to-end through the pure helper.
+    #[test]
+    fn test_render_show_diff_full_fixture_tier1() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_commit.txt");
+        let result =
+            render_show_diff(fixture, &[], &[]).expect("fixture commit must render successfully");
+        let rendered = result.to_string();
+        assert!(
+            rendered.contains("abc1234"),
+            "hash must appear in Tier-1 rendered output"
+        );
+        assert!(
+            rendered.contains("feat: add user authentication handler"),
+            "subject must appear in Tier-1 rendered output"
+        );
     }
 
     // ========================================================================
@@ -905,23 +970,34 @@ mod tests {
 
     #[test]
     fn test_show_no_panic_on_malformed_commit_header() {
-        // Garbage input should either return None or a partially-filled header.
+        // Input that does not start with "commit " must return None.
+        // parse_commit_header returns None for anything that isn't a regular commit
+        // preamble, including garbage bytes, annotated-tag output, etc.
         let garbage = "\x00\x01\x02\x03 garbage bytes here";
         let result = parse_commit_header(garbage);
-        // Should not panic — either None (doesn't start with "commit ") or Some.
-        let _ = result;
+        assert!(
+            result.is_none(),
+            "malformed input must return None, not panic or produce a header"
+        );
     }
 
     #[test]
     fn test_show_no_panic_on_empty_diff_body() {
-        // A commit with no diff body should produce an empty file list.
+        // A commit with no diff body should parse successfully and produce an
+        // empty file list.  The conditional `if let` was silently passing when
+        // parse_commit_header returned None — now we assert the expected shape.
         let raw = "commit abc1234\nAuthor: Test <t@t.com>\nDate: Thu\n\n    subject\n";
-        let result = parse_commit_header(raw);
-        if let Some((header, diff_body)) = result {
-            assert_eq!(header.subject, "subject");
-            let files = parse_unified_diff(diff_body);
-            assert!(files.is_empty());
-        }
+        let (header, diff_body) =
+            parse_commit_header(raw).expect("well-formed header-only commit must parse");
+        assert_eq!(
+            header.subject, "subject",
+            "subject must be parsed from indented commit message line"
+        );
+        let files = parse_unified_diff(diff_body);
+        assert!(
+            files.is_empty(),
+            "header-only commit (no diff --git lines) must produce zero FileDiff entries"
+        );
     }
 
     // ========================================================================
@@ -966,5 +1042,82 @@ mod tests {
                 "flag '{flag_key}' (arg '{arg_value}') must trigger passthrough via user_has_flag"
             );
         }
+    }
+
+    // ========================================================================
+    // split_refpath — ref/path extraction
+    // ========================================================================
+
+    /// `split_refpath` must extract the path component from every `<ref>:<path>`
+    /// shape that `git show` accepts, including edge cases that the inline `rfind`
+    /// previously handled without test coverage.
+    #[test]
+    fn test_split_refpath_simple() {
+        assert_eq!(split_refpath("HEAD:foo.rs"), "foo.rs");
+    }
+
+    #[test]
+    fn test_split_refpath_empty_ref() {
+        // `:foo.rs` — empty ref means the index (staging area).
+        assert_eq!(split_refpath(":foo.rs"), "foo.rs");
+    }
+
+    #[test]
+    fn test_split_refpath_slashes_in_ref() {
+        assert_eq!(split_refpath("refs/heads/main:src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn test_split_refpath_colon_in_path() {
+        // `abc:path/with:colon.rs` — splits at the LAST `:`, yielding `colon.rs`.
+        // Git ref names cannot contain `:`, so the first colon is unambiguously the
+        // ref/path separator.  Colons in file paths are uncommon on most OSes and
+        // rfind still gives a safe result (the shortest unambiguous path suffix).
+        assert_eq!(split_refpath("abc:path/with:colon.rs"), "colon.rs");
+    }
+
+    #[test]
+    fn test_split_refpath_no_colon_returns_whole_token() {
+        // Defensive fallback: no `:` → whole token returned.
+        assert_eq!(split_refpath("HEAD"), "HEAD");
+    }
+
+    // ========================================================================
+    // Tier-2 render_show_diff: unsupported extension falls back to raw hunks
+    // ========================================================================
+
+    /// When `render_show_diff` encounters a diff that contains only files with
+    /// extensions that have no tree-sitter support, the rendered output still
+    /// returns Some (the diff pipeline falls back to raw-hunk passthrough for
+    /// those files) — confirming the Tier-2 path is reachable.
+    #[test]
+    fn test_render_show_diff_unsupported_extension_yields_some() {
+        // Synthetic commit with a `.lock` file diff — no tree-sitter language.
+        let raw = "commit deadbeef\n\
+                   Author: Test <t@t.com>\n\
+                   Date:   Thu Apr 10 2025\n\
+                   \n\
+                       chore: update lockfile\n\
+                   \n\
+                   diff --git a/Cargo.lock b/Cargo.lock\n\
+                   index aaa..bbb 100644\n\
+                   --- a/Cargo.lock\n\
+                   +++ b/Cargo.lock\n\
+                   @@ -1,2 +1,3 @@\n\
+                    unchanged\n\
+                   +added line\n\
+                    unchanged\n";
+        let result = render_show_diff(raw, &[], &[]);
+        let result = result.expect("valid commit with unsupported-language diff must return Some");
+        let rendered = result.to_string();
+        // ShowCommitResult::render uses only the first 7 chars of the hash.
+        assert!(
+            rendered.contains("deadbee"),
+            "commit hash (short) must appear in Tier-2 rendered output, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("chore: update lockfile"),
+            "subject must appear in Tier-2 rendered output, got: {rendered}"
+        );
     }
 }

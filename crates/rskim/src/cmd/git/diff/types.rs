@@ -4,6 +4,10 @@ use super::DiffMode;
 use crate::output::canonical::DiffFileStatus;
 
 /// A single hunk from a unified diff.
+///
+/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` so that
+/// `show.rs` can pass `DiffHunk` slices into `render_diff_file` directly, reusing
+/// the diff pipeline without duplicating parsing logic.
 #[derive(Debug, Clone)]
 pub(in crate::cmd::git) struct DiffHunk<'a> {
     /// Start line in the old file (1-indexed).
@@ -24,6 +28,10 @@ pub(in crate::cmd::git) struct DiffHunk<'a> {
 }
 
 /// Parsed representation of a single file in a unified diff.
+///
+/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` so that
+/// `show.rs` can iterate over `FileDiff` entries returned by `parse_unified_diff`
+/// without requiring a parallel data model in the show handler.
 #[derive(Debug, Clone)]
 pub(in crate::cmd::git) struct FileDiff<'a> {
     /// File path (new path for renames/adds, old path for deletes)

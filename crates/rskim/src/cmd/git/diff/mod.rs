@@ -44,6 +44,9 @@ const PARALLEL_THRESHOLD: usize = 5;
 /// - `Default`: Only changed nodes are shown (no unchanged context).
 /// - `Structure`: Unchanged nodes are shown as signatures (`{ /* ... */ }`).
 /// - `Full`: Unchanged nodes are shown in full.
+///
+/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` so that
+/// `show.rs` can specify the render mode when reusing `render_diff_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::cmd::git) enum DiffMode {
     /// Only changed AST nodes with `+`/`-` markers.
