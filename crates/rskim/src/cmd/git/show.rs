@@ -33,6 +33,21 @@ use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
 use super::{finalize_git_output, map_exit_code, run_passthrough};
 
 // ============================================================================
+// Utilities
+// ============================================================================
+
+/// Convert `&[String]` to `Vec<&str>` for [`CommandRunner::run`].
+///
+/// Repeated at call sites in this file; extracted to eliminate boilerplate.
+/// We intentionally keep this local rather than changing `CommandRunner::run`'s
+/// signature, since that would touch >3 files across the codebase (rewrite,
+/// build, test, git modules all share the same pattern).
+#[inline]
+fn as_str_slice(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+// ============================================================================
 // Mode detection
 // ============================================================================
 
@@ -179,25 +194,20 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
         return None;
     }
 
-    // Locate the start of the diff body using a direct substring search.
+    // Locate the split position between the commit header and the diff body.
     // The leading `\n` anchors the match to the start of a line to avoid
     // false positives inside commit message bodies that might mention
-    // `diff --git` textually.
-    let diff_body = match raw.find("\ndiff --git ") {
-        Some(pos) => &raw[pos + 1..], // +1 to skip the anchoring newline
-        None => "",
-    };
+    // `diff --git` textually.  `split_at(pos)` makes the contract explicit:
+    // header_region = everything up to (but not including) the `\n`, and
+    // diff_body starts exactly at `diff --git`.
+    let split_pos = raw
+        .find("\ndiff --git ")
+        .map(|p| p + 1)
+        .unwrap_or(raw.len());
+    let (header_region, diff_body) = raw.split_at(split_pos);
 
-    // Walk the header region (everything before the diff body, or the
-    // whole string if there is no diff body) to extract hash/author/date
-    // /subject. `lines()` handles both LF and CRLF endings.
-    let header_region = if diff_body.is_empty() {
-        raw
-    } else {
-        // Safe: diff_body is a suffix of raw; subtracting its length from
-        // raw.len() yields the header region's end in bytes.
-        &raw[..raw.len() - diff_body.len()]
-    };
+    // Walk the header region to extract hash/author/date/subject.
+    // `lines()` handles both LF and CRLF endings.
 
     let mut in_body = false;
     for line in header_region.lines() {
@@ -237,26 +247,22 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     Some((header, diff_body))
 }
 
-/// Run `git show` in commit mode: parse header + AST-aware diff.
+/// Execute `git show` and return `(stdout, stderr, duration)` on success.
 ///
-/// `original_args` is the full args slice before `--json` extraction, used to
-/// build the analytics label.  This preserves the `--json` flag in the label
-/// so the analytics DB can distinguish `skim git show HEAD --json` from
-/// `skim git show HEAD`, matching the label convention in `diff/mod.rs`.
-fn run_show_commit(
+/// On non-zero exit the error streams are forwarded to the terminal and the
+/// appropriate exit code is returned via the `Err` variant of the inner
+/// `ExitCode`. Using a dedicated return type avoids surfacing git process
+/// errors as `anyhow::Error`, keeping the call-site match arm clean.
+fn run_git_show_raw(
     global_flags: &[String],
     git_args: &[String],
-    original_args: &[String],
-    output_format: OutputFormat,
-    show_stats: bool,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<Result<(String, std::time::Duration), ExitCode>> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["show".to_string(), "--no-color".to_string()]);
     full_args.extend_from_slice(git_args);
 
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
-    let output = runner.run("git", &arg_refs)?;
+    let output = runner.run("git", &as_str_slice(&full_args))?;
 
     if output.exit_code != Some(0) {
         if !output.stderr.is_empty() {
@@ -265,38 +271,38 @@ fn run_show_commit(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        return Ok(map_exit_code(output.exit_code));
+        return Ok(Err(map_exit_code(output.exit_code)));
     }
 
-    let raw = output.stdout;
-    let duration = output.duration;
+    Ok(Ok((output.stdout, output.duration)))
+}
 
-    // Parse the commit header. Annotated tags and other non-commit objects fall back.
-    let (header, diff_body) = match parse_commit_header(&raw) {
-        Some(result) => result,
-        None => {
-            // Passthrough: not a regular commit (annotated tag, blob, tree, etc.)
-            print!("{raw}");
-            return Ok(ExitCode::SUCCESS);
-        }
-    };
+/// Parse the commit body into a `ShowCommitResult`.
+///
+/// Returns `None` when the raw output does not represent a regular commit
+/// (e.g., annotated tag, blob, tree) — the caller should passthrough in that
+/// case. When `Some`, the returned result contains the rendered diff text and
+/// metadata ready for format dispatch.
+fn render_show_diff(
+    raw: &str,
+    global_flags: &[String],
+    git_args: &[String],
+) -> Option<ShowCommitResult> {
+    let (header, diff_body) = parse_commit_header(raw)?;
 
-    // Render the diff body using the AST-aware pipeline.
     let file_diffs = parse_unified_diff(diff_body);
     let mut rendered_diff = String::new();
     let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
 
     for (i, file_diff) in file_diffs.iter().enumerate() {
-        let skip_ast = i >= super::diff::MAX_AST_FILE_COUNT;
         let rendered = render_diff_file(
             file_diff,
             global_flags,
             git_args,
             DiffMode::Default,
-            skip_ast,
+            i >= super::diff::MAX_AST_FILE_COUNT,
         );
         rendered_diff.push_str(&rendered);
-
         diff_file_entries.push(DiffFileEntry {
             path: file_diff.path.clone(),
             status: file_diff.status.clone(),
@@ -304,20 +310,29 @@ fn run_show_commit(
         });
     }
 
-    let result = ShowCommitResult::new(
+    Some(ShowCommitResult::new(
         header.hash,
         header.author,
         header.date,
         header.subject,
         diff_file_entries,
         rendered_diff,
-    );
+    ))
+}
 
-    // Build the analytics label from the original args (before --json extraction)
-    // so the DB sees `skim git show HEAD --json` vs `skim git show HEAD` as
-    // distinct entries — matching the convention used by `diff/mod.rs:286`.
-    let label = format!("skim git show {}", original_args.join(" "));
-
+/// Dispatch `ShowCommitResult` to the requested output format and record stats.
+///
+/// Accepts ownership of `raw` to avoid cloning for the common text+analytics
+/// path. The `label` is pre-built lazily by the caller (empty string when
+/// neither stats nor analytics are active).
+fn emit_show_commit(
+    result: ShowCommitResult,
+    raw: String,
+    label: String,
+    output_format: OutputFormat,
+    show_stats: bool,
+    duration: std::time::Duration,
+) -> anyhow::Result<()> {
     match output_format {
         OutputFormat::Json => {
             // JSON: serialise result directly; guardrail is irrelevant here
@@ -338,9 +353,11 @@ fn run_show_commit(
         }
         OutputFormat::Text => {
             // Apply guardrail: if compressed output is larger than raw, emit raw.
-            // Move `raw` into the guardrail to avoid cloning; clone only when
-            // analytics recording will actually use it.
-            let result_str = result.to_string();
+            // `into_rendered` consumes result and returns the pre-built String
+            // directly, avoiding the extra allocation `to_string()` would incur.
+            let result_str = result.into_rendered();
+            // Clone raw before moving it into the guardrail — only when the
+            // clone will actually be used by stats/analytics.
             let record_raw = if show_stats || crate::analytics::is_analytics_enabled() {
                 Some(raw.clone())
             } else {
@@ -349,7 +366,6 @@ fn run_show_commit(
             let guardrail = crate::output::guardrail::apply_to_stderr(raw, result_str)?;
             let final_output = guardrail.into_output();
             print!("{final_output}");
-            // Use the pre-move clone when stats/analytics need the original raw.
             let raw_ref = record_raw.as_deref().unwrap_or("");
             finalize_git_output(
                 raw_ref,
@@ -361,7 +377,43 @@ fn run_show_commit(
             );
         }
     }
+    Ok(())
+}
 
+/// Run `git show` in commit mode: parse header + AST-aware diff.
+///
+/// `original_args` is the full args slice before `--json` extraction, used to
+/// build the analytics label.  This preserves the `--json` flag in the label
+/// so the analytics DB can distinguish `skim git show HEAD --json` from
+/// `skim git show HEAD`, matching the label convention in `diff/mod.rs`.
+fn run_show_commit(
+    global_flags: &[String],
+    git_args: &[String],
+    original_args: &[String],
+    output_format: OutputFormat,
+    show_stats: bool,
+) -> anyhow::Result<ExitCode> {
+    let (raw, duration) = match run_git_show_raw(global_flags, git_args)? {
+        Ok(pair) => pair,
+        Err(code) => return Ok(code),
+    };
+
+    let Some(result) = render_show_diff(&raw, global_flags, git_args) else {
+        // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
+        print!("{raw}");
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    // Build the label lazily: skip the allocation when neither stats display
+    // nor analytics recording will use it.  Derived from *original* args
+    // (before `--json` extraction) so the DB records the full invocation.
+    let label = if show_stats || crate::analytics::is_analytics_enabled() {
+        format!("skim git show {}", original_args.join(" "))
+    } else {
+        String::new()
+    };
+
+    emit_show_commit(result, raw, label, output_format, show_stats, duration)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -369,10 +421,43 @@ fn run_show_commit(
 // File-content mode
 // ============================================================================
 
+/// Emit raw `git show` output unchanged and record analytics/stats.
+///
+/// All three degradation tiers that cannot transform the content (unsupported
+/// extension, transform error, guardrail-triggered fallback) share this path.
+/// Centralising here ensures consistent analytics accounting: raw == output in
+/// all passthrough cases so the DB records zero compression gain, matching the
+/// behaviour of `run_passthrough` for other subcommands.
+///
+/// `label` is constructed once at the top of `run_show_file_content` and
+/// threaded through — eliminating the per-branch `format!` duplication that
+/// previously appeared at three call sites (complexity-5 / perf-3 subsumption).
+fn passthrough_file_content(
+    raw: &str,
+    label: String,
+    show_stats: bool,
+    duration: std::time::Duration,
+) {
+    print!("{raw}");
+    // Raw equals output on passthrough; pass the same ref twice so
+    // finalize_git_output can compute accurate compression ratios.
+    finalize_git_output(
+        raw,
+        raw,
+        label,
+        show_stats,
+        crate::analytics::CommandType::Git,
+        duration,
+    );
+}
+
 /// Run `git show <ref>:<path>` in file-content mode.
 ///
-/// Applies skim's source transformation when the file extension is supported.
-/// Falls back to passthrough for unsupported extensions or parse failures.
+/// Four-tier dispatch:
+///   Tier 0: `--json` flag → exit 2 (unsupported).
+///   Tier 1: language supported → transform via rskim-core + guardrail.
+///   Tier 2: unsupported or serde-based extension → `passthrough_file_content`.
+///   Tier 3: transform error or guardrail inflate → `passthrough_file_content`.
 fn run_show_file_content(
     global_flags: &[String],
     args: &[String],
@@ -401,8 +486,7 @@ fn run_show_file_content(
     full_args.extend_from_slice(args);
 
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
-    let output = runner.run("git", &arg_refs)?;
+    let output = runner.run("git", &as_str_slice(&full_args))?;
 
     if output.exit_code != Some(0) {
         if !output.stderr.is_empty() {
@@ -417,31 +501,25 @@ fn run_show_file_content(
     let raw = output.stdout;
     let duration = output.duration;
 
+    // Build label once here; threaded through passthrough_file_content to
+    // avoid repeated format! calls at each fallback branch (perf-3 / complexity-5).
+    let label = || format!("skim git show {}", args.join(" "));
+
     // Detect language from path extension.
     let lang = Language::from_path(Path::new(path_str)).filter(|l| !l.is_serde_based());
 
     let Some(lang) = lang else {
-        // Unsupported or serde-based language — passthrough.
-        print!("{raw}");
-        let label = format!("skim git show {}", args.join(" "));
-        // Raw equals output on passthrough; pass the same ref twice.
-        finalize_git_output(
-            &raw,
-            &raw,
-            label,
-            show_stats,
-            crate::analytics::CommandType::Git,
-            duration,
-        );
+        // Tier 2: unsupported or serde-based language — passthrough.
+        passthrough_file_content(&raw, label(), show_stats, duration);
         return Ok(ExitCode::SUCCESS);
     };
 
-    // Transform in memory.
+    // Tier 1: transform in memory.
     let config = TransformConfig::default();
     let transformed = match rskim_core::transform(&raw, lang, config.mode) {
         Ok(t) => t,
         Err(e) => {
-            // Transform failed — fall back to raw passthrough.
+            // Tier 3: transform failed — fall back to raw passthrough.
             // Record as a zero-compression pass so analytics and --show-stats
             // remain consistent with the unsupported-language branch above.
             if crate::debug::is_debug_enabled() {
@@ -449,16 +527,7 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            print!("{raw}");
-            let label = format!("skim git show {}", args.join(" "));
-            finalize_git_output(
-                &raw,
-                &raw,
-                label,
-                show_stats,
-                crate::analytics::CommandType::Git,
-                duration,
-            );
+            passthrough_file_content(&raw, label(), show_stats, duration);
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -468,11 +537,10 @@ fn run_show_file_content(
     let final_output = guardrail.into_output();
 
     print!("{final_output}");
-    let label = format!("skim git show {}", args.join(" "));
     finalize_git_output(
         &raw,
         &final_output,
-        label,
+        label(),
         show_stats,
         crate::analytics::CommandType::Git,
         duration,
@@ -853,6 +921,50 @@ mod tests {
             assert_eq!(header.subject, "subject");
             let files = parse_unified_diff(diff_body);
             assert!(files.is_empty());
+        }
+    }
+
+    // ========================================================================
+    // PASSTHROUGH_FLAGS coverage (complexity-7)
+    // ========================================================================
+
+    /// Every entry in `PASSTHROUGH_FLAGS` must trigger the passthrough branch.
+    ///
+    /// `user_has_flag` does prefix matching, so `--format` catches `--format=%H`
+    /// and similar. This table-driven test documents every flag and asserts
+    /// that none has been accidentally dropped or misspelled.
+    #[test]
+    fn test_passthrough_flags_all_rewrite_correctly() {
+        // For each flag, construct a minimal args slice that contains it,
+        // then verify `user_has_flag` fires.  The second element is a
+        // representative value — some flags take `=value`, some stand alone.
+        let cases: &[(&str, &str)] = &[
+            ("--stat", "--stat"),
+            ("--shortstat", "--shortstat"),
+            ("--numstat", "--numstat"),
+            ("--name-only", "--name-only"),
+            ("--name-status", "--name-status"),
+            ("--raw", "--raw"),
+            ("--check", "--check"),
+            ("--format", "--format=%H"),
+            ("--pretty", "--pretty=oneline"),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            PASSTHROUGH_FLAGS.len(),
+            "test case count ({}) does not match PASSTHROUGH_FLAGS len ({}); \
+             update this test when the constant changes",
+            cases.len(),
+            PASSTHROUGH_FLAGS.len()
+        );
+
+        for (flag_key, arg_value) in cases {
+            let args: Vec<String> = vec![arg_value.to_string(), "HEAD".to_string()];
+            assert!(
+                user_has_flag(&args, PASSTHROUGH_FLAGS),
+                "flag '{flag_key}' (arg '{arg_value}') must trigger passthrough via user_has_flag"
+            );
         }
     }
 }

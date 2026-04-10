@@ -1894,6 +1894,15 @@ impl ShowCommitResult {
         output
     }
 
+    /// Consume `self` and return the pre-rendered text, avoiding a clone.
+    ///
+    /// Prefer this over `to_string()` at call sites that own the result and do
+    /// not need the other fields afterwards.  The `Display` impl re-runs a
+    /// `write!` through the formatter, which allocates; this method is zero-copy.
+    pub(crate) fn into_rendered(self) -> String {
+        self.rendered
+    }
+
     /// Recompute `rendered` if empty (e.g. after JSON deserialization that
     /// stripped the field).  Produces a lossy summary — file paths, statuses,
     /// and region counts — because the original diff body is not stored.
