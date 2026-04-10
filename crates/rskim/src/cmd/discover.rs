@@ -249,11 +249,16 @@ fn classify_bash_command(command: &str) -> Option<BashCommandInfo> {
         return None;
     }
 
-    // `would_rewrite` is the single source of truth for rewrite eligibility.
-    // It is heavier than a simple prefix heuristic but eliminates rule
-    // duplication and guarantees correctness — correctness over micro-performance.
-    let rewrite_target = super::rewrite::would_rewrite(command);
-    let has_rewrite = rewrite_target.is_some();
+    // `classify_command` is the single source of truth for rewrite eligibility.
+    // Using the tri-state API (AD-2) means AlreadyCompact commands (e.g.,
+    // `git worktree list`) are treated as "has_rewrite = true" — discover stops
+    // flagging them as gaps even though no handler rewrites them.
+    let classification = super::rewrite::classify_command(command);
+    let has_rewrite = !matches!(classification, super::rewrite::CommandClassification::Unhandled);
+    let rewrite_target = match classification {
+        super::rewrite::CommandClassification::Rewritten(s) => Some(s),
+        _ => None,
+    };
 
     Some(BashCommandInfo {
         command: command.to_string(),

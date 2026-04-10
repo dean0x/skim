@@ -103,11 +103,13 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
 /// Check if a command would be rewritten, returning the rewritten form.
 ///
 /// Thin wrapper around `classify_command` that preserves the existing
-/// `Option<String>` API for backwards compatibility.
+/// `Option<String>` API for backwards compatibility with discover tests.
 ///
 /// Returns `Some(rewritten_command)` if the command matches a rewrite rule,
 /// `None` if no rewrite applies (including skim commands, empty input,
 /// unsupported shell syntax, and acknowledged-compact commands).
+// Kept for backward-compatibility; primary callers are tests in discover.rs.
+#[allow(dead_code)]
 pub(crate) fn would_rewrite(command: &str) -> Option<String> {
     match classify_command(command) {
         CommandClassification::Rewritten(s) => Some(s),
