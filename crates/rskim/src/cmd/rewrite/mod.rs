@@ -79,12 +79,7 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
     }
 
     // Fast path: no compound operators — classify single segment directly.
-    let has_operator_chars = command.contains("&&")
-        || command.contains("||")
-        || command.contains(';')
-        || command.contains('|');
-
-    if !has_operator_chars {
+    if !has_compound_operators(command) {
         let tokens: Vec<&str> = command.split_whitespace().collect();
         return classify_segment(&tokens);
     }
@@ -120,6 +115,13 @@ pub(crate) fn would_rewrite(command: &str) -> Option<String> {
 // ============================================================================
 // classify_command internals
 // ============================================================================
+
+/// Return `true` when `s` contains a shell compound operator (`&&`, `||`, `;`, `|`).
+///
+/// Used as a fast-path gate before invoking the full compound-split state machine.
+fn has_compound_operators(s: &str) -> bool {
+    s.contains("&&") || s.contains("||") || s.contains(';') || s.contains('|')
+}
 
 /// Classification result for a single command segment (not a full command string).
 #[derive(Debug, Clone)]
@@ -338,12 +340,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     // Fast path: if no compound operator chars are present, use classify_command
     // which also handles the AlreadyCompact case (AD-3).
-    let has_operator_chars = original.contains("&&")
-        || original.contains("||")
-        || original.contains(';')
-        || original.contains('|');
-
-    if !has_operator_chars {
+    if !has_compound_operators(&original) {
         let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
 
         // Check AlreadyCompact first (acknowledged-compact commands, AD-2/AD-3).

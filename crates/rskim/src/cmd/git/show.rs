@@ -58,7 +58,7 @@ enum ShowMode {
 /// - Zero non-flag tokens → `Commit` (defaults to HEAD).
 /// - Two or more non-flag tokens without `:` → `MultiRef`.
 fn detect_show_mode(args: &[String]) -> ShowMode {
-    let mut non_flag_tokens: Vec<&str> = Vec::new();
+    let mut non_flag_count: usize = 0;
     let mut past_separator = false;
 
     for arg in args {
@@ -80,10 +80,10 @@ fn detect_show_mode(args: &[String]) -> ShowMode {
                 refpath: arg.clone(),
             };
         }
-        non_flag_tokens.push(arg.as_str());
+        non_flag_count += 1;
     }
 
-    match non_flag_tokens.len() {
+    match non_flag_count {
         0 | 1 => ShowMode::Commit,
         _ => ShowMode::MultiRef,
     }
@@ -108,6 +108,36 @@ const PASSTHROUGH_FLAGS: &[&str] = &[
     "--format",
     "--pretty",
 ];
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Record token stats to stderr and fire-and-forget analytics for a `git show` operation.
+///
+/// `command_label` is the human-readable command string (e.g. `"skim git show HEAD"`).
+fn record_show_result(
+    raw: String,
+    output: String,
+    command_label: String,
+    show_stats: bool,
+    duration: std::time::Duration,
+) {
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw, &output);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            raw,
+            output,
+            command_label,
+            crate::analytics::CommandType::Git,
+            duration,
+            None,
+        );
+    }
+}
 
 // ============================================================================
 // Entry point
@@ -308,46 +338,17 @@ fn run_show_commit(
     let guardrail = crate::output::guardrail::apply_to_stderr(raw.clone(), result_str)?;
     let final_output = guardrail.into_output();
 
+    let label = format!("skim git show {}", git_args.join(" "));
     match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
             println!("{json}");
-
-            if show_stats {
-                let (orig, comp) = crate::process::count_token_pair(&raw, &json);
-                crate::process::report_token_stats(orig, comp, "");
-            }
-
-            if crate::analytics::is_analytics_enabled() {
-                crate::analytics::try_record_command(
-                    raw,
-                    json,
-                    format!("skim git show {}", git_args.join(" ")),
-                    crate::analytics::CommandType::Git,
-                    duration,
-                    None,
-                );
-            }
+            record_show_result(raw, json, label, show_stats, duration);
         }
         OutputFormat::Text => {
             print!("{final_output}");
-
-            if show_stats {
-                let (orig, comp) = crate::process::count_token_pair(&raw, &final_output);
-                crate::process::report_token_stats(orig, comp, "");
-            }
-
-            if crate::analytics::is_analytics_enabled() {
-                crate::analytics::try_record_command(
-                    raw,
-                    final_output,
-                    format!("skim git show {}", git_args.join(" ")),
-                    crate::analytics::CommandType::Git,
-                    duration,
-                    None,
-                );
-            }
+            record_show_result(raw, final_output, label, show_stats, duration);
         }
     }
 
@@ -411,20 +412,8 @@ fn run_show_file_content(
     let Some(lang) = lang else {
         // Unsupported or serde-based language — passthrough.
         print!("{raw}");
-        if show_stats {
-            let (orig, comp) = crate::process::count_token_pair(&raw, &raw);
-            crate::process::report_token_stats(orig, comp, "");
-        }
-        if crate::analytics::is_analytics_enabled() {
-            crate::analytics::try_record_command(
-                raw.clone(),
-                raw,
-                format!("skim git show {}", args.join(" ")),
-                crate::analytics::CommandType::Git,
-                duration,
-                None,
-            );
-        }
+        let label = format!("skim git show {}", args.join(" "));
+        record_show_result(raw.clone(), raw, label, show_stats, duration);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -444,22 +433,8 @@ fn run_show_file_content(
     let final_output = guardrail.into_output();
 
     print!("{final_output}");
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw, &final_output);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw,
-            final_output,
-            format!("skim git show {}", args.join(" ")),
-            crate::analytics::CommandType::Git,
-            duration,
-            None,
-        );
-    }
+    let label = format!("skim git show {}", args.join(" "));
+    record_show_result(raw, final_output, label, show_stats, duration);
 
     Ok(ExitCode::SUCCESS)
 }
@@ -653,17 +628,6 @@ mod tests {
     // ========================================================================
     // File-content mode language detection
     // ========================================================================
-
-    #[test]
-    fn test_file_content_mode_path_extraction() {
-        // Verify the path extraction logic used by run_show_file_content.
-        let refpath = "HEAD:src/auth/handler.rs";
-        let path_str = refpath
-            .rfind(':')
-            .map(|pos| &refpath[pos + 1..])
-            .unwrap_or(refpath);
-        assert_eq!(path_str, "src/auth/handler.rs");
-    }
 
     #[test]
     fn test_file_content_mode_language_detection_rs() {

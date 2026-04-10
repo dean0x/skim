@@ -35,12 +35,9 @@ pub(super) const ACK_PREFIX_PATTERNS: &[&[&str]] = &[
 /// assert!(!is_segment_ack(&[]));
 /// ```
 pub(super) fn is_segment_ack(tokens: &[&str]) -> bool {
-    for pattern in ACK_PREFIX_PATTERNS {
-        if tokens.len() >= pattern.len() && &tokens[..pattern.len()] == *pattern {
-            return true;
-        }
-    }
-    false
+    ACK_PREFIX_PATTERNS
+        .iter()
+        .any(|pattern| tokens.len() >= pattern.len() && &tokens[..pattern.len()] == *pattern)
 }
 
 // ============================================================================
