@@ -24,7 +24,7 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
 
-use super::{map_exit_code, run_passthrough};
+use super::{finalize_git_output, finalize_git_output_owned, map_exit_code, run_passthrough};
 
 /// Maximum file size for AST processing (100 KB). Larger files fall back
 /// to raw diff hunks.
@@ -199,10 +199,21 @@ pub(super) fn run_diff(
 
     let duration = output.duration;
     let raw_diff = output.stdout;
+    // Build label once; reused by early-return paths and the analytics tail.
+    let label = format!("skim git diff {}", args.join(" "));
 
-    // Handle empty diff
+    // Handle empty diff — record zero-compression analytics so the DB stays
+    // consistent with run_passthrough (which always records, even for no-op passes).
     if raw_diff.trim().is_empty() {
         eprintln!("No changes");
+        finalize_git_output(
+            &raw_diff,
+            &raw_diff,
+            label,
+            show_stats,
+            crate::analytics::CommandType::Git,
+            duration,
+        );
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -213,6 +224,18 @@ pub(super) fn run_diff(
 
         if file_diffs.is_empty() {
             eprintln!("No changes");
+            // Reconstruct label: the first empty-diff guard consumed it via move.
+            // This branch is only hit when parse_unified_diff returns an empty vec
+            // despite raw_diff being non-empty (malformed diff); keep a consistent
+            // analytics record identical to the trim-is-empty branch above.
+            finalize_git_output(
+                &raw_diff,
+                &raw_diff,
+                format!("skim git diff {}", args.join(" ")),
+                show_stats,
+                crate::analytics::CommandType::Git,
+                duration,
+            );
             return Ok(ExitCode::SUCCESS);
         }
 
@@ -282,23 +305,16 @@ pub(super) fn run_diff(
         }
     }; // file_diffs dropped here, raw_diff is free to move
 
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_diff, &result_str);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    // Record analytics (fire-and-forget, non-blocking).
-    // Move `raw_diff` into the call to avoid cloning the entire diff string.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw_diff,
-            result_str,
-            format!("skim git diff {}", args.join(" ")),
-            crate::analytics::CommandType::Git,
-            duration,
-            None,
-        );
-    }
+    // Both `raw_diff` and `result_str` are owned here; use the owned variant to
+    // move them directly without cloning (handles stats + analytics in one call).
+    finalize_git_output_owned(
+        raw_diff,
+        result_str,
+        label,
+        show_stats,
+        crate::analytics::CommandType::Git,
+        duration,
+    );
 
     Ok(ExitCode::SUCCESS)
 }

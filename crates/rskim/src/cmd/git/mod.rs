@@ -184,12 +184,23 @@ fn has_limit_flag(args: &[String]) -> bool {
 ///
 /// Centralises the analytics + stats tail that previously appeared inline in
 /// `run_passthrough`, `run_parsed_command`, and the deleted `record_show_result`.
-/// Callers pass borrowed strings so the common disabled-analytics path avoids
-/// cloning large outputs; the owned copies are made only when
-/// `is_analytics_enabled()` returns `true`, matching the guard pattern used
-/// throughout this module.
 ///
-/// # Parameters
+/// Two variants are provided to minimise allocations:
+///
+/// - [`finalize_git_output`] — borrowed variant; callers that only hold `&str`
+///   (e.g. `show.rs` where the same `String` is still needed by the guardrail)
+///   avoid cloning when analytics are disabled.  When analytics ARE enabled one
+///   `.to_string()` clone is performed per parameter.
+///
+/// - [`finalize_git_output_owned`] — owned variant; callers that already own
+///   the `String` (e.g. `run_passthrough`, `run_parsed_command`, `run_diff`)
+///   move the values directly into the analytics call — zero extra allocations
+///   on the analytics path, and still zero allocations when analytics are off.
+///
+/// `show.rs` call sites continue to use the borrowed variant; the Wave 2
+/// Resolver may migrate them to `_owned` once `emit_show_commit` is updated.
+///
+/// # Parameters (shared by both variants)
 /// - `raw`          — Original git output before any compression.
 /// - `output`       — Compressed output (may equal `raw` for passthrough).
 /// - `label`        — Command label stored in the analytics DB.
@@ -217,6 +228,33 @@ pub(super) fn finalize_git_output(
             duration,
             None,
         );
+    }
+}
+
+/// Owned variant of [`finalize_git_output`].
+///
+/// Takes ownership of `raw` and `output`, moving them directly into the
+/// analytics call when analytics are enabled — eliminating the extra
+/// `.to_string()` clone that the borrowed variant must perform.  When
+/// analytics are disabled neither string is heap-touched after the stats
+/// computation (which only needs `&str`).
+///
+/// Use this variant in handlers that already own their output strings
+/// (i.e. the string would be dropped immediately after the call anyway).
+pub(super) fn finalize_git_output_owned(
+    raw: String,
+    output: String,
+    label: String,
+    show_stats: bool,
+    command_type: crate::analytics::CommandType,
+    duration: std::time::Duration,
+) {
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw, &output);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(raw, output, label, command_type, duration, None);
     }
 }
 
@@ -248,11 +286,14 @@ fn run_passthrough(
         eprint!("{}", output.stderr);
     }
 
-    // Passthrough: raw == compressed (no transformation applied); pass the same
-    // ref twice so finalize_git_output computes accurate (zero) savings.
-    finalize_git_output(
-        &output.stdout,
-        &output.stdout,
+    // Passthrough: raw == compressed (no transformation applied).
+    // Move stdout into _owned so both the analytics path (when enabled) and the
+    // stats path share a single allocation rather than two `.to_string()` clones.
+    // `output.stdout` is no longer needed after the print above.
+    let stdout_owned = output.stdout;
+    finalize_git_output_owned(
+        stdout_owned.clone(),
+        stdout_owned,
         format!("skim git {} {}", subcmd, args.join(" ")),
         show_stats,
         crate::analytics::CommandType::Git,
@@ -317,23 +358,16 @@ where
         }
     };
 
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw, &result_str);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid allocations when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw,
-            result_str,
-            format!("skim git {}", subcmd_args.join(" ")),
-            crate::analytics::CommandType::Git,
-            output.duration,
-            None,
-        );
-    }
+    // Both `raw` and `result_str` are owned here and consumed at end-of-function;
+    // use the owned variant to move them directly rather than cloning.
+    finalize_git_output_owned(
+        raw,
+        result_str,
+        format!("skim git {}", subcmd_args.join(" ")),
+        show_stats,
+        crate::analytics::CommandType::Git,
+        output.duration,
+    );
 
     Ok(ExitCode::SUCCESS)
 }
