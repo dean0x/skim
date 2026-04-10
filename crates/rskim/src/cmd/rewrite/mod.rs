@@ -155,8 +155,9 @@ enum SegmentClassification {
     Rewritten(Vec<String>),
     /// Segment is acknowledged compact — store original tokens for passthrough.
     AlreadyCompact(Vec<String>),
-    /// No rule matched.
-    NoMatch(Vec<String>),
+    /// No rule matched. Carries no payload: callers that reach this branch
+    /// return `Unhandled` immediately without inspecting the tokens.
+    NoMatch,
 }
 
 /// Classify a tokenized single (non-compound) command segment.
@@ -173,8 +174,9 @@ fn classify_segment(tokens: &[&str]) -> CommandClassification {
 /// Classify a tokenized segment, returning the fine-grained `SegmentClassification`.
 ///
 /// The `owned: Vec<String>` clone is deferred to the branches that actually need
-/// it (`AlreadyCompact` and `NoMatch`). On the hot `Rewritten` path the engine
-/// already returns its own token vector, so no additional clone is required.
+/// it (`AlreadyCompact`). On the hot `Rewritten` path the engine already returns
+/// its own token vector, so no additional clone is required. `NoMatch` carries no
+/// payload because all call sites return `Unhandled` immediately on that branch.
 fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
     if is_segment_ack(tokens) {
         let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
@@ -182,10 +184,7 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
     }
     match try_rewrite(tokens) {
         Some(r) => SegmentClassification::Rewritten(r.tokens),
-        None => {
-            let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
-            SegmentClassification::NoMatch(owned)
-        }
+        None => SegmentClassification::NoMatch,
     }
 }
 
@@ -201,7 +200,7 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
 /// are left unchanged. This prevents wrapping `git diff | less` into
 /// `skim git diff | skim less`.
 ///
-/// Implementation uses a two-pass approach to eliminate mutable flags:
+/// Implementation uses a three-pass approach to eliminate mutable flags:
 /// 1. Classify every segment into a `Vec<SegmentClassification>`.
 /// 2. Early-return `Unhandled` if any segment is `NoMatch`.
 /// 3. Reconstruct the compound string from all classified segments.
@@ -231,7 +230,7 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
     // Pass 2: early-exit on any NoMatch.
     if classified
         .iter()
-        .any(|(c, _)| matches!(c, SegmentClassification::NoMatch(_)))
+        .any(|(c, _)| matches!(c, SegmentClassification::NoMatch))
     {
         return CommandClassification::Unhandled;
     }
@@ -248,9 +247,11 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
     let mut parts: Vec<String> = Vec::new();
     for (classification, op) in classified {
         let segment_text = match classification {
-            SegmentClassification::Rewritten(tokens) => tokens.join(" "),
-            SegmentClassification::AlreadyCompact(tokens)
-            | SegmentClassification::NoMatch(tokens) => tokens.join(" "),
+            SegmentClassification::Rewritten(tokens)
+            | SegmentClassification::AlreadyCompact(tokens) => tokens.join(" "),
+            // NoMatch is unreachable here: Pass 2 already returned Unhandled if
+            // any segment was NoMatch. Kept for exhaustiveness.
+            SegmentClassification::NoMatch => unreachable!("NoMatch filtered in Pass 2"),
         };
         parts.push(segment_text);
         if let Some(op) = op {
@@ -287,7 +288,7 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
 
     match first_classification {
         SegmentClassification::AlreadyCompact(_) => CommandClassification::AlreadyCompact,
-        SegmentClassification::NoMatch(_) => CommandClassification::Unhandled,
+        SegmentClassification::NoMatch => CommandClassification::Unhandled,
         SegmentClassification::Rewritten(rewritten_tokens) => {
             // Reconstruct: rewritten first segment | rest unchanged.
             let mut parts: Vec<String> = Vec::new();
@@ -350,7 +351,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         None => return emit_result(suggest_mode, "", None, false),
     };
 
-    run_classify_and_emit(suggest_mode, tokens)
+    run_classify_and_emit(suggest_mode, &tokens)
 }
 
 /// Collect command tokens from positional args or a single stdin line.
@@ -391,7 +392,24 @@ fn collect_input_tokens(positional_args: &[&str]) -> anyhow::Result<Option<Vec<S
 /// `try_rewrite_compound` semantics (any-match wins, leaving unmatched
 /// segments as-is), which is distinct from `classify_command` used by
 /// `discover` for per-segment gap detection.
-fn run_classify_and_emit(suggest_mode: bool, tokens: Vec<String>) -> anyhow::Result<ExitCode> {
+///
+/// # DESIGN NOTE — intentional CLI / discover split
+///
+/// The CLI (`rewrite` subcommand) deliberately uses `try_rewrite_compound`
+/// (binary match/no-match) for compound commands rather than the tri-state
+/// `classify_command`. Reasons:
+///
+/// 1. **User-visible output contract**: the CLI prints either a rewritten
+///    command or exits 1. A third "AlreadyCompact" state would change the
+///    contract for users who rely on exit codes in shell scripts.
+/// 2. **`classify_command` is discover-only**: it was introduced to give
+///    `discover` fine-grained gap detection (AD-2). Its `AlreadyCompact`
+///    variant has no meaningful mapping to CLI exit codes.
+///
+/// If the CLI contract is ever extended (e.g. exit code 2 for AlreadyCompact),
+/// this function can be migrated to `classify_command` and the simple-command
+/// fast-path below already uses it implicitly via `is_segment_ack`.
+fn run_classify_and_emit(suggest_mode: bool, tokens: &[String]) -> anyhow::Result<ExitCode> {
     let original = tokens.join(" ");
 
     // Fast path: if no compound operator chars are present, use classify_command
@@ -413,7 +431,7 @@ fn run_classify_and_emit(suggest_mode: bool, tokens: Vec<String>) -> anyhow::Res
 
         // Normal rewrite path — uses the real RewriteResult (with correct category).
         let result = try_rewrite(&token_refs);
-        return emit_rewrite_result(suggest_mode, &original, result, false);
+        return emit_rewrite_result(suggest_mode, &original, result.as_ref(), false);
     }
 
     // Compound commands: use original try_rewrite_compound semantics (any match wins).
@@ -424,11 +442,11 @@ fn run_classify_and_emit(suggest_mode: bool, tokens: Vec<String>) -> anyhow::Res
         CompoundSplitResult::Simple(simple_tokens) => {
             let token_refs: Vec<&str> = simple_tokens.iter().map(|s| s.as_str()).collect();
             let result = try_rewrite(&token_refs);
-            emit_rewrite_result(suggest_mode, &original, result, false)
+            emit_rewrite_result(suggest_mode, &original, result.as_ref(), false)
         }
         CompoundSplitResult::Compound(segments) => {
             let result = try_rewrite_compound(&segments);
-            emit_rewrite_result(suggest_mode, &original, result, true)
+            emit_rewrite_result(suggest_mode, &original, result.as_ref(), true)
         }
     }
 }
@@ -461,12 +479,11 @@ fn emit_result(
 fn emit_rewrite_result(
     suggest_mode: bool,
     original: &str,
-    result: Option<RewriteResult>,
+    result: Option<&RewriteResult>,
     compound: bool,
 ) -> anyhow::Result<ExitCode> {
-    let rewritten = result.as_ref().map(|r| r.tokens.join(" "));
+    let rewritten = result.map(|r| r.tokens.join(" "));
     let match_info = result
-        .as_ref()
         .zip(rewritten.as_ref())
         .map(|(r, s)| (s.as_str(), r.category));
     emit_result(suggest_mode, original, match_info, compound)
@@ -732,6 +749,104 @@ mod tests {
         assert!(
             would_rewrite("cargo test && cargo clippy").is_some(),
             "All-rewritable compound must return Some"
+        );
+    }
+
+    // ========================================================================
+    // has_compound_operators() — byte-scanner edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_has_compound_operators_empty() {
+        assert!(!has_compound_operators(""), "empty string has no operators");
+    }
+
+    #[test]
+    fn test_has_compound_operators_single_char_no_op() {
+        assert!(!has_compound_operators("a"), "single non-op char");
+        assert!(!has_compound_operators("x"), "single non-op char x");
+    }
+
+    #[test]
+    fn test_has_compound_operators_pipe() {
+        assert!(has_compound_operators("git log | less"), "| is an operator");
+        assert!(has_compound_operators("|"), "bare | is an operator");
+    }
+
+    #[test]
+    fn test_has_compound_operators_semicolon() {
+        assert!(
+            has_compound_operators("echo a; echo b"),
+            "; is an operator"
+        );
+        assert!(has_compound_operators(";"), "bare ; is an operator");
+    }
+
+    #[test]
+    fn test_has_compound_operators_double_ampersand() {
+        assert!(
+            has_compound_operators("cargo test && cargo clippy"),
+            "&& is an operator"
+        );
+        assert!(has_compound_operators("&&"), "bare && is an operator");
+    }
+
+    #[test]
+    fn test_has_compound_operators_single_ampersand_is_not_compound() {
+        // A lone `&` (background job) is intentionally NOT treated as a
+        // compound operator by this scanner; only `&&` triggers it.
+        assert!(
+            !has_compound_operators("cargo test &"),
+            "trailing single & is not a compound operator"
+        );
+        assert!(
+            !has_compound_operators("&"),
+            "bare single & is not a compound operator"
+        );
+    }
+
+    #[test]
+    fn test_has_compound_operators_double_pipe() {
+        // `||` starts with `|` which is immediately detected as an operator.
+        assert!(
+            has_compound_operators("cmd1 || cmd2"),
+            "|| contains | which is an operator"
+        );
+    }
+
+    #[test]
+    fn test_has_compound_operators_pipe_ampersand_combo() {
+        // `|&` starts with `|` — detected on the first byte.
+        assert!(
+            has_compound_operators("cmd |& tee out.txt"),
+            "|& starts with | which is an operator"
+        );
+    }
+
+    #[test]
+    fn test_has_compound_operators_lookahead_at_end() {
+        // `bytes.get(i + 1) == Some(&b'&')` must return false (not panic)
+        // when the trailing byte is a lone `&` at end-of-string.
+        assert!(
+            !has_compound_operators("cmd &"),
+            "trailing lone & without a second & is not an operator"
+        );
+        // But trailing `&&` is valid.
+        assert!(
+            has_compound_operators("cmd &&"),
+            "trailing && is a compound operator"
+        );
+    }
+
+    #[test]
+    fn test_has_compound_operators_plain_command() {
+        assert!(
+            !has_compound_operators("git status"),
+            "plain command has no compound operator"
+        );
+        assert!(
+            !has_compound_operators("cargo test --lib"),
+            "cargo test with flags has no compound operator"
         );
     }
 }
