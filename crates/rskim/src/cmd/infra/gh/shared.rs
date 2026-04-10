@@ -196,7 +196,6 @@ pub fn parse_view_text(text: &str, operation: &str) -> Option<InfraResult> {
 /// get this for free.
 ///
 /// Returns `None` if the input is not valid JSON or if `f` returns `None`.
-#[allow(dead_code)]
 pub fn try_parse_json_object<F>(trimmed: &str, f: F) -> Option<InfraResult>
 where
     F: FnOnce(&serde_json::Value) -> Option<InfraResult>,

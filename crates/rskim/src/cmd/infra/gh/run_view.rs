@@ -15,8 +15,8 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::{
-    inject_json_fields, three_tier_parse, MAX_STEP_DETAIL, RE_GH_RUN_HEADER, RE_GH_RUN_JOB,
-    RE_GH_VIEW_FIELD,
+    inject_json_fields, three_tier_parse, try_parse_json_object, MAX_STEP_DETAIL, RE_GH_RUN_HEADER,
+    RE_GH_RUN_JOB, RE_GH_VIEW_FIELD,
 };
 
 /// JSON fields to inject for `gh run view`.
@@ -31,11 +31,7 @@ pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
 pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     three_tier_parse(
         output,
-        |trimmed| {
-            serde_json::from_str::<serde_json::Value>(trimmed)
-                .ok()
-                .and_then(|obj| try_parse_json(&obj))
-        },
+        |trimmed| try_parse_json_object(trimmed, try_parse_json),
         |t| t.starts_with('{'),
         try_parse_text,
         false,

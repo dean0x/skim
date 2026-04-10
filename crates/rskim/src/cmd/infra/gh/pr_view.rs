@@ -15,7 +15,9 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::{inject_json_fields, issue_view, parse_view_text, three_tier_parse};
+use super::{
+    inject_json_fields, issue_view, parse_view_text, three_tier_parse, try_parse_json_object,
+};
 
 /// JSON fields to inject for `gh pr view`.
 ///
@@ -32,11 +34,7 @@ pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
 pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     three_tier_parse(
         output,
-        |trimmed| {
-            serde_json::from_str::<serde_json::Value>(trimmed)
-                .ok()
-                .and_then(|obj| try_parse_json(&obj))
-        },
+        |trimmed| try_parse_json_object(trimmed, try_parse_json),
         |t| t.starts_with('{'),
         try_parse_text,
         false,

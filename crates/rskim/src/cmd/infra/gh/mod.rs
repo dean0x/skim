@@ -32,7 +32,6 @@ pub(super) mod shared;
 
 // Re-export everything from `shared` so that submodule `use super::…` imports
 // continue to resolve without any changes to the sub-parser files.
-#[allow(unused_imports)]
 pub(super) use shared::{
     extract_comments, inject_json_fields, parse_view_text, three_tier_parse, truncate_body,
     try_parse_json_object, MAX_BODY_LINES, MAX_COMMENTS, MAX_ITEMS, MAX_JSON_BYTES,
