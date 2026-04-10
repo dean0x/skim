@@ -36,7 +36,7 @@ pub(super) use shared::{
     extract_comments, inject_json_fields, parse_view_text, three_tier_parse, truncate_body,
     try_parse_json_object, MAX_BODY_LINES, MAX_COMMENTS, MAX_ITEMS, MAX_JSON_BYTES,
     MAX_STEP_DETAIL, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, RE_GH_RUN_HEADER, RE_GH_RUN_JOB,
-    RE_GH_VIEW_FIELD,
+    RE_GH_TAB_ROW, RE_GH_VIEW_FIELD,
 };
 
 use crate::output::canonical::InfraResult;

@@ -96,6 +96,19 @@ pub static RE_GH_RUN_HEADER: LazyLock<Regex> =
 pub static RE_GH_RUN_JOB: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[✓✗X\-*]\s+(.+?)\s{2,}(\w+)\s+\S+\s*$").unwrap());
 
+/// Matches tab-separated gh list text output: `<number>\t<rest>`.
+///
+/// Used by [`crate::cmd::infra::gh::list::try_parse_regex`] as the Tier 2
+/// fallback when `gh pr list` / `issue list` / `run list` is invoked without
+/// `--json` (or when JSON injection is suppressed).
+///
+/// # Design decision
+///
+/// Lives in `shared.rs` alongside the check/view/run regexes to keep ALL
+/// `gh` regex patterns discoverable in one place. Before batch-C this
+/// regex lived in `list.rs`; it was moved here for consistency.
+pub static RE_GH_TAB_ROW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)\t(.+)").unwrap());
+
 // ============================================================================
 // Shared helpers
 // ============================================================================

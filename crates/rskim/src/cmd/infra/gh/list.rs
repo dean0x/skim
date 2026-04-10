@@ -9,21 +9,13 @@
 //! - **Tier 2 (Degraded)**: Tab-separated text (`#N\t...`) → label/value pairs
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 
-use std::sync::LazyLock;
-
-use regex::Regex;
-
 use crate::cmd::user_has_flag;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
-use super::{MAX_ITEMS, MAX_JSON_BYTES};
-
-/// Matches tab-separated gh text output: `<number>\t<rest>`.
-pub(super) static RE_GH_TAB_ROW: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(\d+)\t(.+)").unwrap());
+use super::{MAX_ITEMS, MAX_JSON_BYTES, RE_GH_TAB_ROW};
 
 /// Inject `--json` fields for list commands if not already present.
 ///
