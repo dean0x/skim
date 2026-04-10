@@ -48,8 +48,6 @@ pub(super) fn prepare_args(_cmd_args: &mut Vec<String>) {
 pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     three_tier_parse(
         output,
-        // `try_parse_checks_json` does its own internal trim, so passing the
-        // already-trimmed slice from the gate is equivalent to the original.
         try_parse_checks_json,
         |t| t.starts_with('[') || t.starts_with('{'),
         try_parse_checks_text,
@@ -62,12 +60,24 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // Tier 1a: JSON parsing (user-provided --json)
 // ============================================================================
 
-/// Parse `gh pr checks --json` output.
+/// Parse a pre-trimmed `gh pr checks --json` string into an [`InfraResult`].
 ///
-/// The JSON format is a JSON array of check objects with fields including
-/// `name`, `state`/`status`, `startedAt`, `completedAt`, and `detailsUrl`.
-pub(super) fn try_parse_checks_json(stdout: &str) -> Option<InfraResult> {
-    let trimmed = stdout.trim();
+/// # Preconditions
+///
+/// Callers are expected to pass pre-trimmed input. Two call paths exist:
+/// - [`parse_impl`] delegates to [`three_tier_parse`], which trims stdout
+///   before invoking this function.
+/// - [`super::parse_impl_with_auto_detect`] passes the pre-computed `trimmed`
+///   slice directly (batch-C, see `mod.rs`).
+///
+/// # Design decision
+///
+/// Both the `[` (array) and `{` (wrapping-object) gates are retained as
+/// defense-in-depth. Some `gh` versions emit `{"checkRuns": [...]}` instead of
+/// a bare array, so both shapes must be handled. The gates guard against
+/// accidental misuse with non-JSON input even when call sites guarantee a valid
+/// prefix, keeping this function self-contained and reusable.
+pub(super) fn try_parse_checks_json(trimmed: &str) -> Option<InfraResult> {
     if trimmed.len() > MAX_JSON_BYTES {
         return None;
     }

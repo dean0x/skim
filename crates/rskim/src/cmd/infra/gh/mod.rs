@@ -22,6 +22,20 @@
 //! - `"headRefName"` field → PR view
 //! - `"number"` + `"state"` + body/labels/assignees → issue view
 //! - JSON array → list parser (may fall through to checks JSON)
+//!
+//! # Adding a new sub-parser
+//!
+//! New `gh` subcommand parsers should follow the established pattern:
+//! 1. Use [`shared::three_tier_parse`] as the `parse_impl` scaffold.
+//! 2. Use [`shared::try_parse_json_object`] to compose the Tier 1 JSON closure
+//!    (avoids the duplicated `serde_json::from_str(...).and_then(...)`
+//!    plumbing).
+//! 3. Document the JSON gate choice (`{`, `[`, or both), the
+//!    `text_is_full` flag, and the degraded-reason string as a design
+//!    decision in `parse_impl`'s rustdoc.
+//! 4. Accept pre-trimmed input in any Tier 1 JSON function that might also
+//!    be called from [`parse_impl_with_auto_detect`] — pass the `trimmed`
+//!    slice from there rather than `&output.stdout`.
 
 pub(crate) mod issue_view;
 pub(crate) mod list;
@@ -139,12 +153,15 @@ pub(crate) fn parse_impl_with_auto_detect(output: &CommandOutput) -> ParseResult
         return ParseResult::Passthrough(combined.into_owned());
     }
 
-    // JSON array — try list first, then checks JSON
+    // JSON array — try list first, then checks JSON.
+    // NOTE: pass the pre-computed `trimmed` slice, not `&output.stdout`.
+    // Both `try_parse_json_list` and `try_parse_checks_json` now require
+    // pre-trimmed input as a documented precondition (batch-C).
     if trimmed.starts_with('[') {
-        if let Some(result) = list::try_parse_json_list(&output.stdout) {
+        if let Some(result) = list::try_parse_json_list(trimmed) {
             return ParseResult::Full(result);
         }
-        if let Some(result) = pr_checks::try_parse_checks_json(&output.stdout) {
+        if let Some(result) = pr_checks::try_parse_checks_json(trimmed) {
             return ParseResult::Full(result);
         }
         // Unknown JSON array (e.g., gh api) → passthrough

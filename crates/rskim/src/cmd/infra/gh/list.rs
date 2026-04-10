@@ -122,12 +122,27 @@ fn json_entry_to_infra_item(entry: &serde_json::Value) -> Option<InfraItem> {
     Some(InfraItem { label, value })
 }
 
-/// Parse gh JSON array output.
+/// Parse a pre-trimmed gh JSON array string into an [`InfraResult`].
+///
+/// # Preconditions
+///
+/// Callers are expected to pass pre-trimmed input. Two call paths exist:
+/// - [`parse_impl`] delegates to [`three_tier_parse`], which trims stdout
+///   before invoking this function.
+/// - [`super::parse_impl_with_auto_detect`] passes the pre-computed `trimmed`
+///   slice directly (batch-C, see `mod.rs`).
+///
+/// # Design decision
+///
+/// Retains the `starts_with('[')` and `MAX_JSON_BYTES` gates as defense-in-depth
+/// even though both call paths guarantee a pre-trimmed, `[`-prefixed string by
+/// the time this function is reached. The gates prevent accidental misuse if this
+/// function is called directly (e.g., from tests or future callers) with untrimmed
+/// or non-array input, without requiring callers to know internal preconditions.
 ///
 /// Returns `None` if the input is not a JSON array, is larger than
 /// [`MAX_JSON_BYTES`], or fails to deserialize.
-pub(super) fn try_parse_json_list(stdout: &str) -> Option<InfraResult> {
-    let trimmed = stdout.trim();
+pub(super) fn try_parse_json_list(trimmed: &str) -> Option<InfraResult> {
     if !trimmed.starts_with('[') || trimmed.len() > MAX_JSON_BYTES {
         return None;
     }
@@ -216,6 +231,10 @@ mod tests {
 
     #[test]
     fn test_tier1_gh_fail_non_json() {
+        // After batch-C, `try_parse_json_list` takes pre-trimmed input. This test
+        // still passes `"not json"` directly (already trimmed) and expects None,
+        // which is returned by the internal `starts_with('[')` defense-in-depth
+        // gate before serde_json is invoked.
         let result = try_parse_json_list("not json");
         assert!(result.is_none());
     }
