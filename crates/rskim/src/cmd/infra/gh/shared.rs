@@ -178,6 +178,33 @@ pub fn parse_view_text(text: &str, operation: &str) -> Option<InfraResult> {
     ))
 }
 
+/// Parse a pre-trimmed JSON string into a [`serde_json::Value`] and dispatch to `f`.
+///
+/// # Design decision
+///
+/// Exists to remove closure duplication across view sub-parsers. Before this
+/// helper, each of `issue_view`, `pr_view`, and `run_view` embedded the same
+/// `serde_json::from_str(...).ok().and_then(|obj| try_parse_json(&obj))`
+/// plumbing inside its [`three_tier_parse`] JSON closure. Centralizing that
+/// two-step dance here keeps the call sites focused on "which parser handles
+/// this object" rather than "how do I hand serde_json a slice."
+///
+/// # Preconditions
+///
+/// The caller is expected to pass pre-trimmed input. [`three_tier_parse`]
+/// already trims before invoking the JSON closure, so callers on that path
+/// get this for free.
+///
+/// Returns `None` if the input is not valid JSON or if `f` returns `None`.
+#[allow(dead_code)]
+pub fn try_parse_json_object<F>(trimmed: &str, f: F) -> Option<InfraResult>
+where
+    F: FnOnce(&serde_json::Value) -> Option<InfraResult>,
+{
+    let obj: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    f(&obj)
+}
+
 /// Extract the last `max` comments, stripping quoted-reply (`>`) lines.
 ///
 /// Returns one entry per comment in the format `"@author: first_line..."`.
