@@ -182,8 +182,8 @@ fn has_limit_flag(args: &[String]) -> bool {
 
 /// Record token stats and fire-and-forget analytics for any git handler.
 ///
-/// Centralises the analytics + stats tail that previously appeared in
-/// `run_passthrough`, `run_parsed_command`, and `show.rs::record_show_result`.
+/// Centralises the analytics + stats tail that previously appeared inline in
+/// `run_passthrough`, `run_parsed_command`, and the deleted `record_show_result`.
 /// Callers pass borrowed strings so the common disabled-analytics path avoids
 /// cloning large outputs; the owned copies are made only when
 /// `is_analytics_enabled()` returns `true`, matching the guard pattern used
@@ -248,27 +248,16 @@ fn run_passthrough(
         eprint!("{}", output.stderr);
     }
 
-    if show_stats {
-        // Passthrough: raw == compressed (no savings)
-        let raw = &output.stdout;
-        let (orig, comp) = crate::process::count_token_pair(raw, raw);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    // Record analytics (fire-and-forget, non-blocking).
-    // Passthrough: raw == compressed (no transformation applied).
-    // Guard behind is_analytics_enabled() to avoid cloning large git output
-    // (100 KB+) when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            output.stdout.clone(),
-            output.stdout,
-            format!("skim git {} {}", subcmd, args.join(" ")),
-            crate::analytics::CommandType::Git,
-            output.duration,
-            None,
-        );
-    }
+    // Passthrough: raw == compressed (no transformation applied); pass the same
+    // ref twice so finalize_git_output computes accurate (zero) savings.
+    finalize_git_output(
+        &output.stdout,
+        &output.stdout,
+        format!("skim git {} {}", subcmd, args.join(" ")),
+        show_stats,
+        crate::analytics::CommandType::Git,
+        output.duration,
+    );
 
     Ok(map_exit_code(output.exit_code))
 }

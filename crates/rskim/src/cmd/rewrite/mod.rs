@@ -91,7 +91,7 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
             let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
             classify_segment(&refs)
         }
-        CompoundSplitResult::Compound(segments) => classify_compound(command, &segments),
+        CompoundSplitResult::Compound(segments) => classify_compound(&segments),
     }
 }
 
@@ -205,7 +205,7 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
 /// 1. Classify every segment into a `Vec<SegmentClassification>`.
 /// 2. Early-return `Unhandled` if any segment is `NoMatch`.
 /// 3. Reconstruct the compound string from all classified segments.
-fn classify_compound(original: &str, segments: &[CommandSegment]) -> CommandClassification {
+fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
     if segments.is_empty() {
         return CommandClassification::Unhandled;
     }
@@ -216,7 +216,7 @@ fn classify_compound(original: &str, segments: &[CommandSegment]) -> CommandClas
         .any(|s| s.trailing_operator == Some(CompoundOp::Pipe));
 
     if has_pipe {
-        return classify_compound_pipe(original, segments);
+        return classify_compound_pipe(segments);
     }
 
     // Pass 1: classify all segments.
@@ -266,7 +266,7 @@ fn classify_compound(original: &str, segments: &[CommandSegment]) -> CommandClas
 /// Only the first segment (output producer) is considered for rewriting.
 /// If the first segment is `AlreadyCompact`, the whole pipe is `AlreadyCompact`.
 /// If the first segment is `NoMatch` (or unclassified), the whole pipe is `Unhandled`.
-fn classify_compound_pipe(_original: &str, segments: &[CommandSegment]) -> CommandClassification {
+fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification {
     if segments.is_empty() {
         return CommandClassification::Unhandled;
     }
