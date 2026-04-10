@@ -221,8 +221,12 @@ mod tests {
 
     #[test]
     fn test_tier1_gh_pass() {
+        // `try_parse_json_list` requires pre-trimmed input (batch-C contract).
+        // `load_fixture` returns the raw file contents which may have a trailing
+        // newline, so we trim before calling — matching what `three_tier_parse`
+        // and `parse_impl_with_auto_detect` do in production.
         let input = load_fixture("gh_pr_list.json");
-        let result = try_parse_json_list(&input);
+        let result = try_parse_json_list(input.trim());
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
         assert!(result.as_ref().contains("INFRA: gh list"));
