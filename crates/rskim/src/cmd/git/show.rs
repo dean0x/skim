@@ -115,22 +115,26 @@ const PASSTHROUGH_FLAGS: &[&str] = &[
 
 /// Record token stats to stderr and fire-and-forget analytics for a `git show` operation.
 ///
-/// `command_label` is the human-readable command string (e.g. `"skim git show HEAD"`).
+/// Takes both strings by reference so the common disabled-analytics path
+/// avoids cloning potentially large outputs. Cloning happens only when
+/// `is_analytics_enabled()` is true, matching the pattern used by
+/// `run_passthrough` in `git/mod.rs`.
 fn record_show_result(
-    raw: String,
-    output: String,
+    raw: &str,
+    output: &str,
     command_label: String,
     show_stats: bool,
     duration: std::time::Duration,
 ) {
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw, &output);
+        let (orig, comp) = crate::process::count_token_pair(raw, output);
         crate::process::report_token_stats(orig, comp, "");
     }
     if crate::analytics::is_analytics_enabled() {
+        // Clone only when analytics is actually going to consume the strings.
         crate::analytics::try_record_command(
-            raw,
-            output,
+            raw.to_string(),
+            output.to_string(),
             command_label,
             crate::analytics::CommandType::Git,
             duration,
@@ -194,6 +198,13 @@ struct CommitHeader {
 ///
 /// Returns `None` when the output does not start with `commit ` (e.g., annotated
 /// tags) — those fall back to passthrough.
+///
+/// # Line-ending handling
+/// The diff-body split uses a direct substring search (`str::find`) rather
+/// than summing per-line byte lengths. This is robust to CRLF endings,
+/// missing trailing newlines, and other quirks that would misalign a
+/// hand-rolled byte counter. Git outputs LF by default but users may pipe
+/// through tools that introduce CRLF.
 fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     let mut header = CommitHeader::default();
 
@@ -202,21 +213,28 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
         return None;
     }
 
-    let mut lines = raw.lines();
+    // Locate the start of the diff body using a direct substring search.
+    // The leading `\n` anchors the match to the start of a line to avoid
+    // false positives inside commit message bodies that might mention
+    // `diff --git` textually.
+    let diff_body = match raw.find("\ndiff --git ") {
+        Some(pos) => &raw[pos + 1..], // +1 to skip the anchoring newline
+        None => "",
+    };
+
+    // Walk the header region (everything before the diff body, or the
+    // whole string if there is no diff body) to extract hash/author/date
+    // /subject. `lines()` handles both LF and CRLF endings.
+    let header_region = if diff_body.is_empty() {
+        raw
+    } else {
+        // Safe: diff_body is a suffix of raw; subtracting its length from
+        // raw.len() yields the header region's end in bytes.
+        &raw[..raw.len() - diff_body.len()]
+    };
+
     let mut in_body = false;
-    let mut body_start_byte: usize = 0;
-
-    // We walk the raw string byte-by-byte to find the diff start position.
-    let mut byte_pos: usize = 0;
-
-    for line in lines.by_ref() {
-        let line_bytes = line.len() + 1; // +1 for newline
-
-        if line.starts_with("diff --git ") {
-            body_start_byte = byte_pos;
-            break;
-        }
-
+    for line in header_region.lines() {
         if in_body {
             // First non-blank line after the blank separator is the subject.
             let trimmed = line.trim();
@@ -244,17 +262,7 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
         } else if line.is_empty() && !header.hash.is_empty() {
             in_body = true;
         }
-
-        byte_pos += line_bytes;
     }
-
-    // If we exhausted the header without finding `diff --git`, the diff body
-    // is empty (e.g., merge commits with no file changes).
-    let diff_body = if body_start_byte > 0 && body_start_byte <= raw.len() {
-        &raw[body_start_byte..]
-    } else {
-        ""
-    };
 
     if header.hash.is_empty() {
         return None;
@@ -344,11 +352,11 @@ fn run_show_commit(
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
             println!("{json}");
-            record_show_result(raw, json, label, show_stats, duration);
+            record_show_result(&raw, &json, label, show_stats, duration);
         }
         OutputFormat::Text => {
             print!("{final_output}");
-            record_show_result(raw, final_output, label, show_stats, duration);
+            record_show_result(&raw, &final_output, label, show_stats, duration);
         }
     }
 
@@ -413,7 +421,8 @@ fn run_show_file_content(
         // Unsupported or serde-based language — passthrough.
         print!("{raw}");
         let label = format!("skim git show {}", args.join(" "));
-        record_show_result(raw.clone(), raw, label, show_stats, duration);
+        // Raw equals output on passthrough; pass the same ref twice.
+        record_show_result(&raw, &raw, label, show_stats, duration);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -434,7 +443,7 @@ fn run_show_file_content(
 
     print!("{final_output}");
     let label = format!("skim git show {}", args.join(" "));
-    record_show_result(raw, final_output, label, show_stats, duration);
+    record_show_result(&raw, &final_output, label, show_stats, duration);
 
     Ok(ExitCode::SUCCESS)
 }
@@ -586,6 +595,50 @@ mod tests {
     #[test]
     fn test_parse_commit_header_empty_returns_none() {
         assert!(parse_commit_header("").is_none());
+    }
+
+    /// CRLF line endings must not misalign the `diff_body` split.
+    ///
+    /// Earlier the parser walked `byte_pos` by `line.len() + 1`, which
+    /// under-counted CRLF endings by 1 byte per line. With multi-line
+    /// headers the diff body slice would start mid-byte and break the
+    /// unified-diff parser downstream. The find-based implementation is
+    /// line-ending-agnostic.
+    #[test]
+    fn test_parse_commit_header_crlf_line_endings() {
+        let raw = "commit abc1234\r\n\
+                   Author: Test <t@t.com>\r\n\
+                   Date:   Thu Apr 10 12:00:00 2025\r\n\
+                   \r\n\
+                       feat: crlf subject\r\n\
+                   \r\n\
+                   diff --git a/x.rs b/x.rs\r\n\
+                   index aaa..bbb 100644\r\n";
+        let (header, diff_body) = parse_commit_header(raw).expect("CRLF commit should parse");
+        assert!(
+            header.hash.starts_with("abc1234"),
+            "hash must be parsed with CRLF, got: {:?}",
+            header.hash
+        );
+        assert_eq!(header.subject, "feat: crlf subject");
+        assert!(
+            diff_body.starts_with("diff --git "),
+            "diff_body must start exactly at `diff --git ` (no stray \\r or header bytes): {:?}",
+            &diff_body[..diff_body.len().min(40)]
+        );
+    }
+
+    /// A commit with no trailing newline must still parse cleanly.
+    #[test]
+    fn test_parse_commit_header_no_trailing_newline() {
+        let raw = "commit abc1234\nAuthor: Test\nDate: now\n\n    subject";
+        let (header, diff_body) =
+            parse_commit_header(raw).expect("missing-trailing-newline commit should parse");
+        assert_eq!(header.subject, "subject");
+        assert!(
+            diff_body.is_empty(),
+            "empty diff body for header-only commit"
+        );
     }
 
     // ========================================================================

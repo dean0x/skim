@@ -409,37 +409,54 @@ mod tests {
         );
     }
 
-    /// Strict-match sweep: for each skip prefix in all rules, the exact form
-    /// (`--flag`) must suppress rewrite, but a longer arg with the same prefix
-    /// must NOT suppress rewrite unless it also follows the `--flag=value` pattern.
+    /// Strict-match sweep: for each skip prefix in all rules, constructs a
+    /// longer arg (`{skip}x`) with no `=` at the split point and asserts that
+    /// `try_rewrite()` still matches the rule. A looser matcher (old behavior)
+    /// would cause the rule to skip, hiding `--staged` and similar collisions.
+    ///
+    /// This exercises the real engine path rather than a local copy of the
+    /// closure, so it will catch regressions in `try_table_match` directly.
     #[test]
     fn test_strict_skip_no_false_prefix_collisions() {
         use super::super::rules::REWRITE_RULES;
 
-        // For every rule's skip prefix, construct a longer arg that does NOT
-        // have `=` at the split point and verify it does NOT trigger the skip.
         for rule in REWRITE_RULES {
             for &skip in rule.skip_if_flag_prefix {
-                // The longer variant (skip + "x") must not be eaten by the
-                // skip rule for the base flag.
+                // Build a command: rule.prefix ++ [extended_arg]
+                // where extended_arg = skip + "x" (e.g., "--stat" -> "--statx")
                 let extended = format!("{skip}x");
-                let strict_skip_match = |arg: &str, flag: &str| -> bool {
-                    arg == flag
-                        || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
-                };
+                let mut tokens: Vec<&str> = rule.prefix.to_vec();
+                tokens.push(&extended);
+
+                let result = try_rewrite(&tokens);
                 assert!(
-                    !strict_skip_match(&extended, skip),
-                    "strict_skip_match({:?}, {:?}) must be false — only exact or =value forms allowed",
-                    extended, skip
+                    result.is_some(),
+                    "Rule {:?} with extended arg {:?} must rewrite — \
+                     the engine's strict-match must not confuse {:?} with {:?}",
+                    rule.prefix,
+                    extended,
+                    extended,
+                    skip
+                );
+                let out = result.unwrap().tokens.join(" ");
+                assert!(
+                    out.contains(&extended),
+                    "Rewritten output must preserve the extended arg {:?}: {}",
+                    extended,
+                    out
                 );
 
-                // The `--flag=value` form must be eaten.
+                // And the exact `--flag=value` form should be skipped (returns None),
+                // proving the engine *does* honor `=value` as a valid skip trigger.
                 let with_value = format!("{skip}=somevalue");
+                let mut tokens_eq: Vec<&str> = rule.prefix.to_vec();
+                tokens_eq.push(&with_value);
+                let result_eq = try_rewrite(&tokens_eq);
                 assert!(
-                    strict_skip_match(&with_value, skip),
-                    "strict_skip_match({:?}, {:?}) must be true for =value form",
-                    with_value,
-                    skip
+                    result_eq.is_none(),
+                    "Rule {:?} with arg {:?} must be skipped by strict `=value` match",
+                    rule.prefix,
+                    with_value
                 );
             }
         }
