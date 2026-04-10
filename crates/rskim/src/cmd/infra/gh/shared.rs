@@ -3,18 +3,19 @@
 //!
 //! # Design Decision: three_tier_parse scaffolding
 //!
-//! All four `parse_impl` functions in the `gh` sub-parsers follow identical
-//! three-tier scaffolding:
-//! 1. Trim stdout; if it looks like a JSON object within the size limit, try
-//!    the JSON parser.
+//! All five `parse_impl` functions in the `gh` sub-parsers (`issue_view`,
+//! `pr_view`, `run_view`, `pr_checks`, and `list`) follow identical three-tier
+//! scaffolding:
+//! 1. Trim stdout; if it looks like JSON within the size limit, try the JSON
+//!    parser.
 //! 2. Combine stdout + stderr; try the text/regex parser.
 //! 3. Return passthrough.
 //!
 //! The only variation between parsers is:
-//! - The text tier returns `Degraded` for view commands (text is a fallback)
-//!   but `Full` for `pr checks` (text is the primary format).
-//! - `pr checks` has a slightly wider JSON gate (`[` or `{`) vs. `{` only for
-//!   view commands.
+//! - The text tier returns `Degraded` for view commands and `list` (text is a
+//!   fallback) but `Full` for `pr checks` (text is the primary format).
+//! - JSON gate character: `{` for view commands; `[` for `list`; `[` or `{`
+//!   for `pr checks` (both formats exist in the wild).
 //!
 //! [`three_tier_parse`] captures the common skeleton while allowing callers to
 //! provide the JSON parser, the text parser, and a flag controlling whether a

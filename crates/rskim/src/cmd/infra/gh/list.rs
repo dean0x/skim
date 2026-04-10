@@ -4,18 +4,21 @@
 //! fields when the user has not already supplied them, then parsing the JSON
 //! array response.
 //!
-//! Three tiers:
-//! - **Tier 1 (Full)**: JSON array (`[...]`) → structured items
+//! Three tiers (via [`shared::three_tier_parse`](super::shared::three_tier_parse)):
+//! - **Tier 1 (Full)**: JSON array gate (`starts_with('[')`) → structured items
+//!   via [`try_parse_json_list`]. Text is not the primary format here, so a
+//!   successful Tier 1 parse returns [`ParseResult::Full`].
 //! - **Tier 2 (Degraded)**: Tab-separated text (`#N\t...`) → label/value pairs
-//! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
+//!   via [`try_parse_regex`]. Returns [`ParseResult::Degraded`] because text is
+//!   a fallback, not the primary format.
+//! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation.
 
 use crate::cmd::user_has_flag;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::combine_stdout_stderr;
-use super::{MAX_ITEMS, MAX_JSON_BYTES, RE_GH_TAB_ROW};
+use super::{three_tier_parse, MAX_ITEMS, MAX_JSON_BYTES, RE_GH_TAB_ROW};
 
 /// Inject `--json` fields for list commands if not already present.
 ///
@@ -50,23 +53,30 @@ pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
 
 /// Three-tier parse function for gh list output.
 ///
-/// Called by `parse_impl_with_auto_detect` in `gh/mod.rs` as the final text
-/// fallback after JSON auto-detection fails. Also exercised by unit tests.
+/// # Design decision
+///
+/// Adopts `shared::three_tier_parse` for consistency with the view parsers
+/// (batch-C). Prior to batch-C this function hand-rolled the three-tier flow;
+/// it now delegates to the shared scaffolding, passing:
+/// - `try_parse_json_list` as the Tier 1 JSON parser
+/// - `starts_with('[')` as the JSON gate (list responses are JSON arrays)
+/// - `try_parse_regex` as the Tier 2 text parser
+/// - `text_is_full: false` (text regex matches are a fallback, JSON is primary)
+/// - `"gh: JSON parse failed, using regex"` as the degraded reason (preserved
+///   verbatim from the pre-batch-C string to avoid breaking any consumer that
+///   might match on it, though none are currently known).
+///
+/// Called by `parse_impl_with_auto_detect` in `gh/mod.rs` as the final
+/// text fallback after JSON auto-detection fails. Also exercised by unit tests.
 pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
-    if let Some(result) = try_parse_json_list(&output.stdout) {
-        return ParseResult::Full(result);
-    }
-
-    let combined = combine_stdout_stderr(output);
-
-    if let Some(result) = try_parse_regex(&combined) {
-        return ParseResult::Degraded(
-            result,
-            vec!["gh: JSON parse failed, using regex".to_string()],
-        );
-    }
-
-    ParseResult::Passthrough(combined.into_owned())
+    three_tier_parse(
+        output,
+        try_parse_json_list,
+        |t| t.starts_with('['),
+        try_parse_regex,
+        false,
+        "gh: JSON parse failed, using regex",
+    )
 }
 
 // ============================================================================
