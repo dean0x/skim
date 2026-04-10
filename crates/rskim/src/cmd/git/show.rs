@@ -349,7 +349,7 @@ fn render_show_diff(
         header.date,
         header.subject,
         diff_file_entries,
-        rendered_diff,
+        &rendered_diff,
     ))
 }
 
@@ -812,7 +812,7 @@ mod tests {
             header.date,
             header.subject,
             vec![],
-            "diff output".to_string(),
+            "diff output",
         );
         let rendered = result.to_string();
         assert!(

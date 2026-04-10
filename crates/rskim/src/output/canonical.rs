@@ -625,6 +625,15 @@ impl DiffResult {
         }
     }
 
+    /// Consume `self` and return the pre-rendered text, avoiding a clone.
+    ///
+    /// Prefer this over `to_string()` at call sites that own the result and do
+    /// not need the other fields afterwards.  The `Display` impl re-runs a
+    /// `write!` through the formatter, which allocates; this method is zero-copy.
+    pub(crate) fn into_rendered(self) -> String {
+        self.rendered
+    }
+
     /// Recompute rendered field if empty (e.g., after deserialization)
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
@@ -1651,7 +1660,7 @@ mod tests {
             "2024-01-15 10:00:00 +0000".to_string(),
             "feat: add feature".to_string(),
             files,
-            "diff content here".to_string(),
+            "diff content here",
         );
         let output = format!("{result}");
         // Hash is truncated to 7 chars
@@ -1679,7 +1688,7 @@ mod tests {
             "2024-01-15".to_string(),
             "short hash commit".to_string(),
             vec![],
-            String::new(),
+            "",
         );
         let output = format!("{result}");
         assert!(output.contains("abc"), "short hash must appear: {output}");
@@ -1705,7 +1714,7 @@ mod tests {
             "2024-01-16".to_string(),
             "fix: remove b".to_string(),
             files,
-            String::new(),
+            "",
         );
         assert_eq!(
             result.files_changed, 2,
@@ -1726,7 +1735,7 @@ mod tests {
             "2024-02-01 12:00:00 +0000".to_string(),
             "refactor: clean up".to_string(),
             files,
-            "the diff body".to_string(),
+            "the diff body",
         );
         let json = serde_json::to_string(&original).unwrap();
         let deserialized: ShowCommitResult = serde_json::from_str(&json).unwrap();
@@ -1789,7 +1798,7 @@ mod tests {
             "2024-04-01".to_string(),
             "docs: update readme".to_string(),
             vec![],
-            String::new(),
+            "",
         );
         // rendered is set by new() even with empty diff.
         assert!(!result.as_ref().is_empty(), "non-empty diff still renders");
@@ -1812,7 +1821,7 @@ mod tests {
             "2024-05-15 09:30:00 +0000".to_string(),
             "test: add coverage".to_string(),
             vec![],
-            String::new(),
+            "",
         );
         let text = result.to_string();
         assert!(
@@ -1854,6 +1863,7 @@ pub(crate) struct ShowCommitResult {
     /// Commit subject (first line of commit message).
     pub(crate) subject: String,
     /// Number of files changed (mirrors `files.len()` for quick JSON access).
+    #[serde(default)]
     pub(crate) files_changed: usize,
     /// Files changed in this commit.
     pub(crate) files: Vec<DiffFileEntry>,
@@ -1869,10 +1879,10 @@ impl ShowCommitResult {
         date: String,
         subject: String,
         files: Vec<DiffFileEntry>,
-        diff_output: String,
+        diff_output: &str,
     ) -> Self {
         let files_changed = files.len();
-        let rendered = Self::render(&hash, &author, &subject, &diff_output);
+        let rendered = Self::render(&hash, &author, &subject, diff_output);
         Self {
             hash,
             author,
@@ -1886,7 +1896,13 @@ impl ShowCommitResult {
 
     fn render(hash: &str, author: &str, subject: &str, diff_output: &str) -> String {
         use std::fmt::Write;
-        let short = if hash.len() >= 7 { &hash[..7] } else { hash };
+        let short_owned: String;
+        let short = if hash.len() >= 7 {
+            short_owned = hash.chars().take(7).collect();
+            &short_owned
+        } else {
+            hash
+        };
         let mut output = format!("{short} {author} \u{2014} {subject}");
         if !diff_output.is_empty() {
             let _ = write!(output, "\n\n{diff_output}");
@@ -1909,8 +1925,10 @@ impl ShowCommitResult {
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
             use std::fmt::Write;
+            let short_owned: String;
             let short = if self.hash.len() >= 7 {
-                &self.hash[..7]
+                short_owned = self.hash.chars().take(7).collect();
+                &short_owned
             } else {
                 &self.hash
             };
