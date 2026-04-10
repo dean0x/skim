@@ -173,7 +173,7 @@ pub(super) fn run_show(
         }
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
-            run_show_commit(global_flags, &git_args, output_format, show_stats)
+            run_show_commit(global_flags, &git_args, args, output_format, show_stats)
         }
     }
 }
@@ -272,9 +272,15 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
 }
 
 /// Run `git show` in commit mode: parse header + AST-aware diff.
+///
+/// `original_args` is the full args slice before `--json` extraction, used to
+/// build the analytics label.  This preserves the `--json` flag in the label
+/// so the analytics DB can distinguish `skim git show HEAD --json` from
+/// `skim git show HEAD`, matching the label convention in `diff/mod.rs`.
 fn run_show_commit(
     global_flags: &[String],
     git_args: &[String],
+    original_args: &[String],
     output_format: OutputFormat,
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -341,22 +347,38 @@ fn run_show_commit(
         rendered_diff,
     );
 
-    // Apply guardrail: if compressed output is larger than raw, emit raw.
-    let result_str = result.to_string();
-    let guardrail = crate::output::guardrail::apply_to_stderr(raw.clone(), result_str)?;
-    let final_output = guardrail.into_output();
+    // Build the analytics label from the original args (before --json extraction)
+    // so the DB sees `skim git show HEAD --json` vs `skim git show HEAD` as
+    // distinct entries — matching the convention used by `diff/mod.rs:286`.
+    let label = format!("skim git show {}", original_args.join(" "));
 
-    let label = format!("skim git show {}", git_args.join(" "));
     match output_format {
         OutputFormat::Json => {
+            // JSON: serialise result directly; guardrail is irrelevant here
+            // because the JSON output is never substituted for raw text.
+            // Running the guardrail on JSON would double the memory cost and
+            // could spuriously emit `[skim:guardrail]` to stderr.
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
             println!("{json}");
             record_show_result(&raw, &json, label, show_stats, duration);
         }
         OutputFormat::Text => {
+            // Apply guardrail: if compressed output is larger than raw, emit raw.
+            // Move `raw` into the guardrail to avoid cloning; clone only when
+            // analytics recording will actually use it.
+            let result_str = result.to_string();
+            let record_raw = if show_stats || crate::analytics::is_analytics_enabled() {
+                Some(raw.clone())
+            } else {
+                None
+            };
+            let guardrail = crate::output::guardrail::apply_to_stderr(raw, result_str)?;
+            let final_output = guardrail.into_output();
             print!("{final_output}");
-            record_show_result(&raw, &final_output, label, show_stats, duration);
+            // Use the pre-move clone when stats/analytics need the original raw.
+            let raw_ref = record_raw.as_deref().unwrap_or("");
+            record_show_result(raw_ref, &final_output, label, show_stats, duration);
         }
     }
 
@@ -431,9 +453,18 @@ fn run_show_file_content(
     let config = TransformConfig::default();
     let transformed = match rskim_core::transform(&raw, lang, config.mode) {
         Ok(t) => t,
-        Err(_) => {
-            // Transform failed — passthrough.
+        Err(e) => {
+            // Transform failed — fall back to raw passthrough.
+            // Record as a zero-compression pass so analytics and --show-stats
+            // remain consistent with the unsupported-language branch above.
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "[skim:debug] git show file-content transform failed for {path_str}: {e}"
+                );
+            }
             print!("{raw}");
+            let label = format!("skim git show {}", args.join(" "));
+            record_show_result(&raw, &raw, label, show_stats, duration);
             return Ok(ExitCode::SUCCESS);
         }
     };
