@@ -106,12 +106,24 @@ pub(super) fn try_table_match(
         // Middle args: everything between prefix and separator
         let middle = &before_sep[rule.prefix.len()..];
 
-        // Check skip_if_flag_prefix: if any middle arg starts with a skip prefix
+        // Check skip_if_flag_prefix: if any middle arg exactly matches a skip flag
+        // (or matches as `--flag=value`).
+        //
+        // DESIGN NOTE (AD-1): We use strict matching here — `arg == flag` or
+        // `arg.starts_with(flag) && next_byte == b'='` — which mirrors
+        // `cmd::mod::user_has_flag`. The previous loose `starts_with` check
+        // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
+        // the AST-aware diff pipeline for staged changes.
+        let strict_skip_match = |arg: &str, flag: &str| -> bool {
+            arg == flag
+                || (arg.starts_with(flag)
+                    && arg.as_bytes().get(flag.len()) == Some(&b'='))
+        };
         if !rule.skip_if_flag_prefix.is_empty()
             && middle.iter().any(|arg| {
                 rule.skip_if_flag_prefix
                     .iter()
-                    .any(|skip| arg.starts_with(skip))
+                    .any(|skip| strict_skip_match(arg, skip))
             })
         {
             return None;
@@ -372,9 +384,67 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // Strict flag matching (AD-1 hygiene)
+    // ========================================================================
+
+    /// Regression: `--staged` must NOT be eaten by a `--stat` skip prefix.
+    ///
+    /// With the old loose `starts_with` check, `"--staged".starts_with("--stat")`
+    /// returned `true`, silently blocking the AST-aware diff pipeline for staged
+    /// changes. The strict-match fix (AD-1) resolves this.
     #[test]
-    fn test_git_diff_stat_skipped() {
-        assert!(try_rewrite(&["git", "diff", "--stat"]).is_none());
+    fn test_staged_not_eaten_by_stat_prefix() {
+        // After skip-list trim (AD-4), `--stat` is no longer in the git diff
+        // skip list, so `--staged` rewrites regardless. This test also verifies
+        // that the strict engine itself would not eat `--staged` even if
+        // `--stat` were still in the list.
+        let result = try_rewrite(&["git", "diff", "--staged"]);
+        assert!(
+            result.is_some(),
+            "git diff --staged must rewrite after engine strict-match fix"
+        );
+        let rewritten = result.unwrap().tokens.join(" ");
+        assert!(
+            rewritten.contains("--staged"),
+            "rewritten command must preserve --staged: {rewritten}"
+        );
+    }
+
+    /// Strict-match sweep: for each skip prefix in all rules, the exact form
+    /// (`--flag`) must suppress rewrite, but a longer arg with the same prefix
+    /// must NOT suppress rewrite unless it also follows the `--flag=value` pattern.
+    #[test]
+    fn test_strict_skip_no_false_prefix_collisions() {
+        use super::super::rules::REWRITE_RULES;
+
+        // For every rule's skip prefix, construct a longer arg that does NOT
+        // have `=` at the split point and verify it does NOT trigger the skip.
+        for rule in REWRITE_RULES {
+            for &skip in rule.skip_if_flag_prefix {
+                // The longer variant (skip + "x") must not be eaten by the
+                // skip rule for the base flag.
+                let extended = format!("{skip}x");
+                let strict_skip_match = |arg: &str, flag: &str| -> bool {
+                    arg == flag
+                        || (arg.starts_with(flag)
+                            && arg.as_bytes().get(flag.len()) == Some(&b'='))
+                };
+                assert!(
+                    !strict_skip_match(&extended, skip),
+                    "strict_skip_match({:?}, {:?}) must be false — only exact or =value forms allowed",
+                    extended, skip
+                );
+
+                // The `--flag=value` form must be eaten.
+                let with_value = format!("{skip}=somevalue");
+                assert!(
+                    strict_skip_match(&with_value, skip),
+                    "strict_skip_match({:?}, {:?}) must be true for =value form",
+                    with_value, skip
+                );
+            }
+        }
     }
 
     // ========================================================================

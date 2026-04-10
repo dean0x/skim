@@ -331,16 +331,19 @@ fn test_rewrite_redirect_git_with_skip_flags() {
 }
 
 // ============================================================================
-// Git with skip flags
+// Git with skip flags (AD-4: --stat and --format/--pretty removed from skip list)
 // ============================================================================
 
+/// `git log --format=...` now rewrites (AD-4: --format removed from skip list).
+/// The log handler detects --format via user_has_flag and passthroughs to git.
 #[test]
-fn test_rewrite_git_log_format_skipped() {
+fn test_rewrite_git_log_format_rewrites() {
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "git", "log", "--format=%H"])
         .assert()
-        .failure();
+        .success()
+        .stdout(predicate::str::contains("skim git log --format=%H"));
 }
 
 #[test]
@@ -353,13 +356,60 @@ fn test_rewrite_git_status_success() {
         .stdout(predicate::str::contains("skim git status"));
 }
 
+/// `git diff --stat` now rewrites (AD-4: --stat removed from skip list).
+/// The diff handler detects --stat via user_has_flag and passthroughs to git.
 #[test]
-fn test_rewrite_git_diff_stat_skipped() {
+fn test_rewrite_git_diff_stat_rewrites() {
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "git", "diff", "--stat"])
         .assert()
-        .failure();
+        .success()
+        .stdout(predicate::str::contains("skim git diff --stat"));
+}
+
+/// `git diff --staged` rewrites after engine strict-match fix (AD-1).
+#[test]
+fn test_rewrite_git_diff_staged_rewrites() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "diff", "--staged"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git diff --staged"));
+}
+
+/// `git diff --name-only` rewrites (AD-4: --name-only removed from skip list).
+#[test]
+fn test_rewrite_git_diff_name_only_rewrites() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "diff", "--name-only"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git diff --name-only"));
+}
+
+/// `git show HEAD` rewrites (new rule, AD-5).
+#[test]
+fn test_rewrite_git_show_rewrites() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "show", "HEAD"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git show HEAD"));
+}
+
+/// `git show HEAD:src/main.rs` rewrites (new rule, AD-5).
+#[test]
+fn test_rewrite_git_show_file_content_rewrites() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "git", "show", "HEAD:src/main.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim git show HEAD:src/main.rs"));
 }
 
 // ============================================================================

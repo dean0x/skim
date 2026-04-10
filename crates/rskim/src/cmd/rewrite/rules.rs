@@ -1,6 +1,6 @@
 //! Declarative rewrite rule table.
 //!
-//! 68 rules, ordered longest-prefix-first within the same leading token.
+//! 69 rules, ordered longest-prefix-first within the same leading token.
 //! Only `engine.rs` consumes `REWRITE_RULES`.
 
 use super::types::{RewriteCategory, RewriteRule};
@@ -101,17 +101,17 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
+    // DESIGN NOTE (AD-4): `--stat`, `--name-only` removed from skip list.
+    // These are Group B flags (already-compact output). Removing them allows
+    // `git diff --stat` and `git diff --name-only` to flow through to the
+    // handler's passthrough branch. The handler's `user_has_flag` check
+    // (diff/mod.rs) still catches these and calls `run_passthrough`, so
+    // output is byte-identical to raw git. This also fixes the `--staged`
+    // collision (previously eaten by loose `--stat` prefix matching).
     RewriteRule {
         prefix: &["git", "diff"],
         rewrite_to: &["skim", "git", "diff"],
-        skip_if_flag_prefix: &[
-            "--stat",
-            "--shortstat",
-            "--numstat",
-            "--name-only",
-            "--name-status",
-            "--check",
-        ],
+        skip_if_flag_prefix: &["--shortstat", "--numstat", "--name-status", "--check"],
         category: RewriteCategory::Git,
     },
     RewriteRule {
@@ -120,10 +120,25 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--dry-run", "-q", "--quiet"],
         category: RewriteCategory::Git,
     },
+    // DESIGN NOTE (AD-4): `--format` and `--pretty` removed from skip list.
+    // The log handler (log.rs) already detects these flags and calls
+    // `run_passthrough`, so users see raw git output. Removing them from
+    // the skip list means the rewrite rule fires and the handler decides.
     RewriteRule {
         prefix: &["git", "log"],
         rewrite_to: &["skim", "git", "log"],
-        skip_if_flag_prefix: &["--format", "--pretty"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Git,
+    },
+    // git show — new rule (AD-5)
+    //
+    // Handles `git show <hash>`, `git show <hash>:<path>`, and defaults.
+    // The handler (cmd/git/show.rs) dispatches to commit-mode or
+    // file-content-mode based on argument shape.
+    RewriteRule {
+        prefix: &["git", "show"],
+        rewrite_to: &["skim", "git", "show"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
     // tsc bare
@@ -468,7 +483,7 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with REWRITE_RULES.
-    const EXPECTED_RULE_COUNT: usize = 68;
+    const EXPECTED_RULE_COUNT: usize = 69;
 
     #[test]
     fn test_rule_count_matches_expected() {

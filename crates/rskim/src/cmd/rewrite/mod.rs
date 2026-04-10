@@ -265,12 +265,16 @@ mod tests {
         );
     }
 
+    /// `git diff --stat` now rewrites (--stat removed from skip list per AD-4).
+    /// The diff handler detects --stat via user_has_flag and calls run_passthrough,
+    /// so the user sees byte-identical git output.
     #[test]
-    fn test_would_rewrite_justified_skip_returns_none() {
+    fn test_would_rewrite_git_diff_stat_rewrites() {
+        let result = would_rewrite("git diff --stat");
         assert_eq!(
-            would_rewrite("git diff --stat"),
-            None,
-            "git diff --stat is a justified skip"
+            result,
+            Some("skim git diff --stat".to_string()),
+            "git diff --stat must rewrite after AD-4 skip-list trim"
         );
     }
 
