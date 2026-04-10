@@ -5,7 +5,7 @@ use crate::output::canonical::DiffFileStatus;
 
 /// A single hunk from a unified diff.
 #[derive(Debug, Clone)]
-pub(super) struct DiffHunk<'a> {
+pub(in crate::cmd::git) struct DiffHunk<'a> {
     /// Start line in the old file (1-indexed).
     /// Used in tests and for hunk-to-node overlap calculations.
     #[allow(dead_code)]
@@ -25,7 +25,7 @@ pub(super) struct DiffHunk<'a> {
 
 /// Parsed representation of a single file in a unified diff.
 #[derive(Debug, Clone)]
-pub(super) struct FileDiff<'a> {
+pub(in crate::cmd::git) struct FileDiff<'a> {
     /// File path (new path for renames/adds, old path for deletes)
     pub path: String,
     /// Original path for renames (old name)

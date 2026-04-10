@@ -167,7 +167,7 @@ pub(super) fn resolve_file_info(
 /// - Deleted files (`+++ /dev/null`)
 /// - Renamed files (`rename from` / `rename to`)
 /// - Binary files (`Binary files ... differ`)
-pub(super) fn parse_unified_diff<'a>(output: &'a str) -> Vec<FileDiff<'a>> {
+pub(in crate::cmd::git) fn parse_unified_diff<'a>(output: &'a str) -> Vec<FileDiff<'a>> {
     let mut files: Vec<FileDiff<'a>> = Vec::new();
     let lines: Vec<&str> = output.lines().collect();
     let mut i = 0;

@@ -10,6 +10,12 @@ mod render;
 mod source;
 pub(super) mod types;
 
+// Re-export for show.rs (sibling of diff/ within cmd/git/).
+// AD-6: Raising visibility to pub(in crate::cmd::git) enables show.rs to
+// reuse the diff pipeline without duplicating parsing or rendering logic.
+pub(in crate::cmd::git) use parse::parse_unified_diff;
+pub(in crate::cmd::git) use render::render_diff_file;
+
 use std::process::ExitCode;
 
 use rayon::prelude::*;
@@ -19,8 +25,6 @@ use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
 
 use super::{map_exit_code, run_passthrough};
-use parse::parse_unified_diff;
-use render::render_diff_file;
 
 /// Maximum file size for AST processing (100 KB). Larger files fall back
 /// to raw diff hunks.
@@ -28,7 +32,8 @@ const MAX_AST_FILE_SIZE: usize = 100 * 1024;
 
 /// Maximum number of files processed through the AST pipeline. Files beyond
 /// this limit fall back to raw diff hunks to keep diff rendering bounded.
-const MAX_AST_FILE_COUNT: usize = 200;
+/// Exposed `pub(in crate::cmd::git)` so `show.rs` (sibling module) can reuse the limit.
+pub(in crate::cmd::git) const MAX_AST_FILE_COUNT: usize = 200;
 
 /// Minimum file count to engage rayon parallelism. Below this, thread pool
 /// scheduling overhead exceeds the per-file render cost.
@@ -40,7 +45,7 @@ const PARALLEL_THRESHOLD: usize = 5;
 /// - `Structure`: Unchanged nodes are shown as signatures (`{ /* ... */ }`).
 /// - `Full`: Unchanged nodes are shown in full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DiffMode {
+pub(in crate::cmd::git) enum DiffMode {
     /// Only changed AST nodes with `+`/`-` markers.
     Default,
     /// Changed nodes + unchanged nodes rendered as signatures.

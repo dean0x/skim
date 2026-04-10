@@ -30,7 +30,7 @@ thread_local! {
 /// - `Default`: Only changed nodes.
 /// - `Structure`: Changed + unchanged nodes as signatures.
 /// - `Full`: Changed + unchanged nodes in full.
-pub(super) fn render_diff_file(
+pub(in crate::cmd::git) fn render_diff_file(
     file_diff: &FileDiff<'_>,
     global_flags: &[String],
     args: &[String],

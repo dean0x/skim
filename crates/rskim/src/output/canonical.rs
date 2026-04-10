@@ -1634,3 +1634,79 @@ mod tests {
         assert!(!output.contains('['));
     }
 }
+
+// ============================================================================
+// ShowCommitResult types (#132)
+// ============================================================================
+
+/// A single file changed in a `git show` commit diff entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ShowDiffFileEntry {
+    pub(crate) path: String,
+    pub(crate) status: DiffFileStatus,
+    pub(crate) changed_regions: usize,
+}
+
+/// Result of `skim git show <hash>` (commit mode).
+///
+/// Follows the same pattern as `DiffResult`: a pre-rendered `String` is stored
+/// so JSON and text consumers share the same rendering logic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ShowCommitResult {
+    /// Short commit hash (first 7 characters).
+    pub(crate) hash: String,
+    /// Author string (name + email).
+    pub(crate) author: String,
+    /// Commit date.
+    pub(crate) date: String,
+    /// Commit subject (first line of commit message).
+    pub(crate) subject: String,
+    /// Files changed in this commit.
+    pub(crate) files: Vec<ShowDiffFileEntry>,
+    #[serde(default)]
+    rendered: String,
+}
+
+impl ShowCommitResult {
+    /// Create a new `ShowCommitResult` with pre-computed rendered output.
+    pub(crate) fn new(
+        hash: String,
+        author: String,
+        date: String,
+        subject: String,
+        files: Vec<ShowDiffFileEntry>,
+        diff_output: String,
+    ) -> Self {
+        let rendered = Self::render(&hash, &author, &subject, &diff_output);
+        Self {
+            hash,
+            author,
+            date,
+            subject,
+            files,
+            rendered,
+        }
+    }
+
+    fn render(hash: &str, author: &str, subject: &str, diff_output: &str) -> String {
+        use std::fmt::Write;
+        let short = if hash.len() >= 7 { &hash[..7] } else { hash };
+        let mut output = format!("{short} {author} \u{2014} {subject}");
+        if !diff_output.is_empty() {
+            let _ = write!(output, "\n\n{diff_output}");
+        }
+        output
+    }
+}
+
+impl AsRef<str> for ShowCommitResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for ShowCommitResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
