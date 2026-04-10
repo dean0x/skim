@@ -22,7 +22,7 @@
 //!
 //! # Design decisions
 //!
-//! **AD-5** — Dispatch-on-arg-shape.
+//! **AD-7** — Dispatch-on-arg-shape.
 //!
 //! The single entry point [`run_show`] inspects the first non-flag argument to
 //! determine which of the three modes to enter (file-content, commit, multi-ref
@@ -42,7 +42,7 @@ use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
 
 use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
-use super::{finalize_git_output, map_exit_code, run_passthrough};
+use super::{finalize_git_output, finalize_git_output_owned, map_exit_code, run_passthrough};
 
 // ============================================================================
 // Utilities
@@ -249,6 +249,7 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
             let trimmed = line.trim();
             if !trimmed.is_empty() && header.subject.is_empty() {
                 header.subject = trimmed.to_string();
+                break; // Subject captured; no need to scan remaining header lines.
             }
         } else if line.starts_with("commit ") {
             header.hash = line
@@ -310,7 +311,17 @@ fn run_git_show_raw(
     Ok(Ok((output.stdout, output.duration)))
 }
 
-/// Parse the commit body into a `ShowCommitResult`.
+/// Parse the commit body and render it into a `ShowCommitResult`.
+///
+/// # SRP note
+///
+/// This function both *parses* (`parse_commit_header`, `parse_unified_diff`)
+/// and *renders* (`render_diff_file`, `ShowCommitResult::new`). Splitting
+/// these into a pure-parse step and a pure-render step would reduce the hot-path
+/// scan from two O(n) passes to one, but requires exposing an intermediate
+/// `ParsedCommit` struct. That refactor is deferred until a second caller
+/// emerges; until then the dual responsibility is documented here so it is not
+/// silently expanded.
 ///
 /// Returns `None` when the raw output does not represent a regular commit
 /// (e.g., annotated tag, blob, tree) — the caller should passthrough in that
@@ -358,6 +369,11 @@ fn render_show_diff(
 /// Accepts ownership of `raw` to avoid cloning for the common text+analytics
 /// path. The `label` is pre-built lazily by the caller (empty string when
 /// neither stats nor analytics are active).
+///
+/// Both output formats use [`finalize_git_output_owned`] to move strings
+/// directly into the analytics call — eliminating the conditional `Option`
+/// clone dance that previously guarded against a TOCTOU double-check of
+/// `is_analytics_enabled()` (MEDIUM-11, MEDIUM-22).
 fn emit_show_commit(
     result: ShowCommitResult,
     raw: String,
@@ -375,9 +391,9 @@ fn emit_show_commit(
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
             println!("{json}");
-            finalize_git_output(
-                &raw,
-                &json,
+            finalize_git_output_owned(
+                raw,
+                json,
                 label,
                 show_stats,
                 crate::analytics::CommandType::Git,
@@ -389,20 +405,18 @@ fn emit_show_commit(
             // `into_rendered` consumes result and returns the pre-built String
             // directly, avoiding the extra allocation `to_string()` would incur.
             let result_str = result.into_rendered();
-            // Clone raw before moving it into the guardrail — only when the
-            // clone will actually be used by stats/analytics.
-            let record_raw = if show_stats || crate::analytics::is_analytics_enabled() {
-                Some(raw.clone())
-            } else {
-                None
-            };
+            // Clone raw before the guardrail consumes it so finalize can record
+            // both the original and the (possibly guardrail-substituted) output.
+            // The guard on `show_stats || is_analytics_enabled()` is moved into
+            // `finalize_git_output_owned` — a single consistent check at the
+            // boundary eliminates the previous TOCTOU double-read (MEDIUM-22).
+            let raw_for_record = raw.clone();
             let guardrail = crate::output::guardrail::apply_to_stderr(raw, result_str)?;
             let final_output = guardrail.into_output();
             print!("{final_output}");
-            let raw_ref = record_raw.as_deref().unwrap_or("");
-            finalize_git_output(
-                raw_ref,
-                &final_output,
+            finalize_git_output_owned(
+                raw_for_record,
+                final_output,
                 label,
                 show_stats,
                 crate::analytics::CommandType::Git,
@@ -431,19 +445,31 @@ fn run_show_commit(
         Err(code) => return Ok(code),
     };
 
-    let Some(result) = render_show_diff(&raw, global_flags, git_args) else {
-        // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
-        print!("{raw}");
-        return Ok(ExitCode::SUCCESS);
-    };
-
     // Build the label lazily: skip the allocation when neither stats display
     // nor analytics recording will use it.  Derived from *original* args
     // (before `--json` extraction) so the DB records the full invocation.
+    // Computed before the `render_show_diff` check so both the passthrough and
+    // the normal path share the same guard (HIGH-3).
     let label = if show_stats || crate::analytics::is_analytics_enabled() {
         format!("skim git show {}", original_args.join(" "))
     } else {
         String::new()
+    };
+
+    let Some(result) = render_show_diff(&raw, global_flags, git_args) else {
+        // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
+        // Route through finalize so the analytics DB records a zero-compression
+        // entry instead of silently dropping the invocation (HIGH-3).
+        print!("{raw}");
+        finalize_git_output_owned(
+            raw.clone(),
+            raw,
+            label,
+            show_stats,
+            crate::analytics::CommandType::Git,
+            duration,
+        );
+        return Ok(ExitCode::SUCCESS);
     };
 
     emit_show_commit(result, raw, label, output_format, show_stats, duration)?;
@@ -456,15 +482,20 @@ fn run_show_commit(
 
 /// Emit raw `git show` output unchanged and record analytics/stats.
 ///
-/// All three degradation tiers that cannot transform the content (unsupported
-/// extension, transform error, guardrail-triggered fallback) share this path.
-/// Centralising here ensures consistent analytics accounting: raw == output in
-/// all passthrough cases so the DB records zero compression gain, matching the
+/// Tiers 2 (unsupported extension) and 3 (transform error) share this path.
+/// The guardrail-inflate case (Tier 1 with inflate) does NOT call this
+/// function; the guardrail's `into_output()` returns the raw string directly
+/// and the Tier-1 `finalize_git_output` call records the zero-compression
+/// result inline (MEDIUM-23).
+///
+/// Centralising tiers 2 and 3 here ensures consistent analytics accounting:
+/// raw == output so the DB records zero compression gain, matching the
 /// behaviour of `run_passthrough` for other subcommands.
 ///
-/// `label` is constructed once at the top of `run_show_file_content` and
-/// threaded through — eliminating the per-branch `format!` duplication that
-/// previously appeared at three call sites (complexity-5 / perf-3 subsumption).
+/// `label` is a pre-built String passed from `run_show_file_content`.  The
+/// closure that produces it is invoked at most once per execution path, so
+/// each branch allocates at most one String — allocation is deferred to
+/// branch-time, not cached (MEDIUM-24).
 fn passthrough_file_content(
     raw: &str,
     label: String,
@@ -489,8 +520,11 @@ fn passthrough_file_content(
 /// Four-tier dispatch:
 ///   Tier 0: `--json` flag → exit 2 (unsupported).
 ///   Tier 1: language supported → transform via rskim-core + guardrail.
+///            Guardrail-inflate sub-case: guardrail returns raw; recorded
+///            inline by the Tier-1 `finalize_git_output` call (not via
+///            `passthrough_file_content`).
 ///   Tier 2: unsupported or serde-based extension → `passthrough_file_content`.
-///   Tier 3: transform error or guardrail inflate → `passthrough_file_content`.
+///   Tier 3: transform error → `passthrough_file_content`.
 fn run_show_file_content(
     global_flags: &[String],
     args: &[String],
@@ -512,6 +546,9 @@ fn run_show_file_content(
 
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.push("show".to_string());
+    // --no-color matches commit-mode's run_git_show_raw: prevents ANSI escapes
+    // from user configs that set `color.ui = always` (MEDIUM-17).
+    full_args.push("--no-color".to_string());
     // Pass through all original args (show.rs does not strip args for file-content mode).
     full_args.extend_from_slice(args);
 
@@ -531,16 +568,21 @@ fn run_show_file_content(
     let raw = output.stdout;
     let duration = output.duration;
 
-    // Build label once here; threaded through passthrough_file_content to
-    // avoid repeated format! calls at each fallback branch (perf-3 / complexity-5).
-    let label = || format!("skim git show {}", args.join(" "));
+    // Build label only when analytics or stats will actually consume it (HIGH-4).
+    // Parity with run_show_commit's lazy guard; avoids a format! allocation on
+    // the hot path when both flags are off.
+    let label = if show_stats || crate::analytics::is_analytics_enabled() {
+        format!("skim git show {}", args.join(" "))
+    } else {
+        String::new()
+    };
 
     // Detect language from path extension.
     let lang = Language::from_path(Path::new(path_str)).filter(|l| !l.is_serde_based());
 
     let Some(lang) = lang else {
         // Tier 2: unsupported or serde-based language — passthrough.
-        passthrough_file_content(&raw, label(), show_stats, duration);
+        passthrough_file_content(&raw, label, show_stats, duration);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -557,12 +599,14 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(&raw, label(), show_stats, duration);
+            passthrough_file_content(&raw, label, show_stats, duration);
             return Ok(ExitCode::SUCCESS);
         }
     };
 
     // Guardrail: if transformation inflated the output, emit raw.
+    // Clone raw only here (Tier 1 success path), not on every branch (MEDIUM-18).
+    // After HIGH-4 the label is already owned; finalize_git_output borrows it.
     let guardrail = crate::output::guardrail::apply_to_stderr(raw.clone(), transformed)?;
     let final_output = guardrail.into_output();
 
@@ -570,7 +614,7 @@ fn run_show_file_content(
     finalize_git_output(
         &raw,
         &final_output,
-        label(),
+        label,
         show_stats,
         crate::analytics::CommandType::Git,
         duration,
