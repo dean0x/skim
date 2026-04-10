@@ -30,7 +30,7 @@ use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
 
 use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
-use super::{map_exit_code, run_passthrough};
+use super::{finalize_git_output, map_exit_code, run_passthrough};
 
 // ============================================================================
 // Mode detection
@@ -108,40 +108,6 @@ const PASSTHROUGH_FLAGS: &[&str] = &[
     "--format",
     "--pretty",
 ];
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Record token stats to stderr and fire-and-forget analytics for a `git show` operation.
-///
-/// Takes both strings by reference so the common disabled-analytics path
-/// avoids cloning potentially large outputs. Cloning happens only when
-/// `is_analytics_enabled()` is true, matching the pattern used by
-/// `run_passthrough` in `git/mod.rs`.
-fn record_show_result(
-    raw: &str,
-    output: &str,
-    command_label: String,
-    show_stats: bool,
-    duration: std::time::Duration,
-) {
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(raw, output);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-    if crate::analytics::is_analytics_enabled() {
-        // Clone only when analytics is actually going to consume the strings.
-        crate::analytics::try_record_command(
-            raw.to_string(),
-            output.to_string(),
-            command_label,
-            crate::analytics::CommandType::Git,
-            duration,
-            None,
-        );
-    }
-}
 
 // ============================================================================
 // Entry point
@@ -361,7 +327,14 @@ fn run_show_commit(
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
             println!("{json}");
-            record_show_result(&raw, &json, label, show_stats, duration);
+            finalize_git_output(
+                &raw,
+                &json,
+                label,
+                show_stats,
+                crate::analytics::CommandType::Git,
+                duration,
+            );
         }
         OutputFormat::Text => {
             // Apply guardrail: if compressed output is larger than raw, emit raw.
@@ -378,7 +351,14 @@ fn run_show_commit(
             print!("{final_output}");
             // Use the pre-move clone when stats/analytics need the original raw.
             let raw_ref = record_raw.as_deref().unwrap_or("");
-            record_show_result(raw_ref, &final_output, label, show_stats, duration);
+            finalize_git_output(
+                raw_ref,
+                &final_output,
+                label,
+                show_stats,
+                crate::analytics::CommandType::Git,
+                duration,
+            );
         }
     }
 
@@ -445,7 +425,14 @@ fn run_show_file_content(
         print!("{raw}");
         let label = format!("skim git show {}", args.join(" "));
         // Raw equals output on passthrough; pass the same ref twice.
-        record_show_result(&raw, &raw, label, show_stats, duration);
+        finalize_git_output(
+            &raw,
+            &raw,
+            label,
+            show_stats,
+            crate::analytics::CommandType::Git,
+            duration,
+        );
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -464,7 +451,14 @@ fn run_show_file_content(
             }
             print!("{raw}");
             let label = format!("skim git show {}", args.join(" "));
-            record_show_result(&raw, &raw, label, show_stats, duration);
+            finalize_git_output(
+                &raw,
+                &raw,
+                label,
+                show_stats,
+                crate::analytics::CommandType::Git,
+                duration,
+            );
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -475,7 +469,14 @@ fn run_show_file_content(
 
     print!("{final_output}");
     let label = format!("skim git show {}", args.join(" "));
-    record_show_result(&raw, &final_output, label, show_stats, duration);
+    finalize_git_output(
+        &raw,
+        &final_output,
+        label,
+        show_stats,
+        crate::analytics::CommandType::Git,
+        duration,
+    );
 
     Ok(ExitCode::SUCCESS)
 }

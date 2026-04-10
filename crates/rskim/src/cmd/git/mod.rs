@@ -180,6 +180,46 @@ fn has_limit_flag(args: &[String]) -> bool {
         .any(|a| a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count="))
 }
 
+/// Record token stats and fire-and-forget analytics for any git handler.
+///
+/// Centralises the analytics + stats tail that previously appeared in
+/// `run_passthrough`, `run_parsed_command`, and `show.rs::record_show_result`.
+/// Callers pass borrowed strings so the common disabled-analytics path avoids
+/// cloning large outputs; the owned copies are made only when
+/// `is_analytics_enabled()` returns `true`, matching the guard pattern used
+/// throughout this module.
+///
+/// # Parameters
+/// - `raw`          — Original git output before any compression.
+/// - `output`       — Compressed output (may equal `raw` for passthrough).
+/// - `label`        — Command label stored in the analytics DB.
+/// - `show_stats`   — Whether to print token-savings stats to stderr.
+/// - `command_type` — Analytics command-type tag (e.g., `CommandType::Git`).
+/// - `duration`     — Wall-clock duration of the underlying git command.
+pub(super) fn finalize_git_output(
+    raw: &str,
+    output: &str,
+    label: String,
+    show_stats: bool,
+    command_type: crate::analytics::CommandType,
+    duration: std::time::Duration,
+) {
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(raw, output);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+    if crate::analytics::is_analytics_enabled() {
+        crate::analytics::try_record_command(
+            raw.to_string(),
+            output.to_string(),
+            label,
+            command_type,
+            duration,
+            None,
+        );
+    }
+}
+
 /// Convert an optional exit code to an ExitCode.
 fn map_exit_code(code: Option<i32>) -> ExitCode {
     match code {

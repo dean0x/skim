@@ -265,9 +265,16 @@ pub(super) fn run_diff(
                 json
             }
             OutputFormat::Text => {
+                // Apply guardrail: if compressed output is larger than raw,
+                // emit raw. Matches the guardrail applied in show.rs for commit
+                // mode, ensuring both handlers share the same safety envelope.
+                // Clone `raw_diff` here; file_diffs still holds a borrow so
+                // we cannot move raw_diff until the block ends.
                 let s = result.to_string();
-                print!("{s}");
-                s
+                let guardrail = crate::output::guardrail::apply_to_stderr(raw_diff.clone(), s)?;
+                let final_output = guardrail.into_output();
+                print!("{final_output}");
+                final_output
             }
         }
     }; // file_diffs dropped here, raw_diff is free to move
