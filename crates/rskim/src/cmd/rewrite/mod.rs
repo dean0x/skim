@@ -103,6 +103,19 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
 /// Returns `Some(rewritten_command)` if the command matches a rewrite rule,
 /// `None` if no rewrite applies (including skim commands, empty input,
 /// unsupported shell syntax, and acknowledged-compact commands).
+///
+/// # Mixed-compound semantics (AD-2 / regression-2)
+///
+/// For compound commands containing a segment with no match, this function
+/// returns `None` — even if other segments would rewrite successfully.
+/// This changed from the old behavior (which could return `Some` for
+/// "any-match wins").  The new rule is:
+///
+/// - `"cargo test && cargo clippy"` → `Some(...)` (all segments rewrite)
+/// - `"cargo test && echo done"` → `None` (one segment is `Unhandled`)
+/// - `"git worktree list && cargo test"` → `Some(...)` (AlreadyCompact + Rewritten)
+///
+/// If you need the full tri-state result, call `classify_command` directly.
 // Kept for backward-compatibility; primary callers are tests in discover.rs.
 #[allow(dead_code)]
 pub(crate) fn would_rewrite(command: &str) -> Option<String> {
@@ -119,8 +132,20 @@ pub(crate) fn would_rewrite(command: &str) -> Option<String> {
 /// Return `true` when `s` contains a shell compound operator (`&&`, `||`, `;`, `|`).
 ///
 /// Used as a fast-path gate before invoking the full compound-split state machine.
+/// Single-pass byte scan: stops at the first compound-operator byte rather than
+/// doing four independent `contains` calls across the full string.
 fn has_compound_operators(s: &str) -> bool {
-    s.contains("&&") || s.contains("||") || s.contains(';') || s.contains('|')
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'|' | b';' => return true,
+            b'&' if bytes.get(i + 1) == Some(&b'&') => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Classification result for a single command segment (not a full command string).
@@ -146,14 +171,21 @@ fn classify_segment(tokens: &[&str]) -> CommandClassification {
 }
 
 /// Classify a tokenized segment, returning the fine-grained `SegmentClassification`.
+///
+/// The `owned: Vec<String>` clone is deferred to the branches that actually need
+/// it (`AlreadyCompact` and `NoMatch`). On the hot `Rewritten` path the engine
+/// already returns its own token vector, so no additional clone is required.
 fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
-    let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
     if is_segment_ack(tokens) {
+        let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
         return SegmentClassification::AlreadyCompact(owned);
     }
     match try_rewrite(tokens) {
         Some(r) => SegmentClassification::Rewritten(r.tokens),
-        None => SegmentClassification::NoMatch(owned),
+        None => {
+            let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
+            SegmentClassification::NoMatch(owned)
+        }
     }
 }
 
@@ -168,6 +200,11 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
 /// of a pipe expression is classified for rewriting. Subsequent pipe stages
 /// are left unchanged. This prevents wrapping `git diff | less` into
 /// `skim git diff | skim less`.
+///
+/// Implementation uses a two-pass approach to eliminate mutable flags:
+/// 1. Classify every segment into a `Vec<SegmentClassification>`.
+/// 2. Early-return `Unhandled` if any segment is `NoMatch`.
+/// 3. Reconstruct the compound string from all classified segments.
 fn classify_compound(original: &str, segments: &[CommandSegment]) -> CommandClassification {
     if segments.is_empty() {
         return CommandClassification::Unhandled;
@@ -182,46 +219,46 @@ fn classify_compound(original: &str, segments: &[CommandSegment]) -> CommandClas
         return classify_compound_pipe(original, segments);
     }
 
-    // For &&/||/; — classify each segment independently.
-    let mut any_rewritten = false;
-    let mut any_unhandled = false;
+    // Pass 1: classify all segments.
+    let classified: Vec<(SegmentClassification, Option<CompoundOp>)> = segments
+        .iter()
+        .map(|seg| {
+            let token_refs: Vec<&str> = seg.tokens.iter().map(|s| s.as_str()).collect();
+            (classify_segment_fine(&token_refs), seg.trailing_operator)
+        })
+        .collect();
+
+    // Pass 2: early-exit on any NoMatch.
+    if classified
+        .iter()
+        .any(|(c, _)| matches!(c, SegmentClassification::NoMatch(_)))
+    {
+        return CommandClassification::Unhandled;
+    }
+
+    // Pass 3: reconstruct compound string; track whether any segment rewrote.
+    let any_rewritten = classified
+        .iter()
+        .any(|(c, _)| matches!(c, SegmentClassification::Rewritten(_)));
+
+    if !any_rewritten {
+        return CommandClassification::AlreadyCompact;
+    }
+
     let mut parts: Vec<String> = Vec::new();
-
-    for seg in segments {
-        let token_refs: Vec<&str> = seg.tokens.iter().map(|s| s.as_str()).collect();
-        let classification = classify_segment_fine(&token_refs);
-
+    for (classification, op) in classified {
         let segment_text = match classification {
-            SegmentClassification::Rewritten(rewritten_tokens) => {
-                any_rewritten = true;
-                rewritten_tokens.join(" ")
-            }
-            SegmentClassification::AlreadyCompact(original_tokens) => {
-                // Passthrough: AlreadyCompact segments use their original text.
-                original_tokens.join(" ")
-            }
-            SegmentClassification::NoMatch(original_tokens) => {
-                any_unhandled = true;
-                original_tokens.join(" ")
-            }
+            SegmentClassification::Rewritten(tokens) => tokens.join(" "),
+            SegmentClassification::AlreadyCompact(tokens)
+            | SegmentClassification::NoMatch(tokens) => tokens.join(" "),
         };
-
         parts.push(segment_text);
-        if let Some(op) = seg.trailing_operator {
+        if let Some(op) = op {
             parts.push(op.as_str().to_string());
         }
     }
 
-    if any_unhandled {
-        return CommandClassification::Unhandled;
-    }
-
-    if any_rewritten {
-        return CommandClassification::Rewritten(parts.join(" "));
-    }
-
-    // All segments were AlreadyCompact.
-    CommandClassification::AlreadyCompact
+    CommandClassification::Rewritten(parts.join(" "))
 }
 
 /// Classify a pipe expression.
@@ -284,10 +321,10 @@ fn classify_compound_pipe(_original: &str, segments: &[CommandSegment]) -> Comma
 /// - 0: rewrite found (printed to stdout), or AlreadyCompact (original printed to stdout)
 /// - 1: no rewrite match (Unhandled) or invalid input
 ///
-/// For compound commands (`&&`, `||`, `;`, `|`), the original rewrite semantics
-/// apply: ANY matched segment causes a rewrite (leaving unmatched segments as-is).
-/// For simple (non-compound) commands, `classify_command` is used which also
-/// handles the `AlreadyCompact` case.
+/// Control flow shape:
+/// 1. `--help` / `--hook` are handled before touching tokens.
+/// 2. `collect_input_tokens` reads from positional args or stdin.
+/// 3. `run_classify_and_emit` classifies once and dispatches on the tri-state.
 pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     // Handle --help / -h
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
@@ -297,26 +334,34 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 
     // Hook mode: run as agent PreToolUse hook (#44)
     if args.iter().any(|a| a == "--hook") {
-        // Parse optional --agent flag
         let agent = parse_agent_flag(args);
         return run_hook_mode(agent);
     }
 
-    // Check for --suggest flag (must be first non-help flag)
     let suggest_mode = args.first().is_some_and(|a| a == "--suggest");
-
-    // Collect command tokens: skip leading --suggest if present
     let positional_start = if suggest_mode { 1 } else { 0 };
     let positional_args: Vec<&str> = args[positional_start..]
         .iter()
         .map(|s| s.as_str())
         .collect();
 
-    // Get command tokens from positional args or stdin
-    let tokens: Vec<String> = if positional_args.is_empty() {
+    let tokens = match collect_input_tokens(&positional_args)? {
+        Some(t) => t,
+        None => return emit_result(suggest_mode, "", None, false),
+    };
+
+    run_classify_and_emit(suggest_mode, tokens)
+}
+
+/// Collect command tokens from positional args or a single stdin line.
+///
+/// Returns `Ok(None)` when there is nothing to classify (empty input or
+/// interactive stdin), and `Ok(Some(tokens))` otherwise.
+fn collect_input_tokens(positional_args: &[&str]) -> anyhow::Result<Option<Vec<String>>> {
+    if positional_args.is_empty() {
         // Try reading from stdin if it's piped
         if io::stdin().is_terminal() {
-            return emit_result(suggest_mode, "", None, false);
+            return Ok(None);
         }
         // Read one line from stdin, capped at 4 KiB to prevent unbounded allocation.
         // Uses take() to bound memory before reading, so even input without a newline
@@ -325,17 +370,28 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         io::BufReader::new(io::stdin().lock().take(4096)).read_line(&mut line)?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            return emit_result(suggest_mode, "", None, false);
+            return Ok(None);
         }
-        trimmed.split_whitespace().map(String::from).collect()
-    } else {
-        positional_args.iter().map(|s| s.to_string()).collect()
-    };
-
-    if tokens.is_empty() {
-        return emit_result(suggest_mode, "", None, false);
+        return Ok(Some(trimmed.split_whitespace().map(String::from).collect()));
     }
+    let tokens: Vec<String> = positional_args.iter().map(|s| s.to_string()).collect();
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(tokens))
+}
 
+/// Classify `tokens` and emit the result.
+///
+/// This is the single dispatch point after input collection. It handles the
+/// three branches (simple / compound-bail / compound-match) uniformly via
+/// `emit_result` / `emit_rewrite_result`.
+///
+/// For compound commands (`&&`, `||`, `;`, `|`), the CLI uses
+/// `try_rewrite_compound` semantics (any-match wins, leaving unmatched
+/// segments as-is), which is distinct from `classify_command` used by
+/// `discover` for per-segment gap detection.
+fn run_classify_and_emit(suggest_mode: bool, tokens: Vec<String>) -> anyhow::Result<ExitCode> {
     let original = tokens.join(" ");
 
     // Fast path: if no compound operator chars are present, use classify_command
@@ -650,6 +706,32 @@ mod tests {
             would_rewrite("npx jest src/"),
             Some("skim test jest src/".to_string()),
             "npx jest should rewrite to skim test jest"
+        );
+    }
+
+    /// Regression test for mixed-compound semantics (regression-2 / AD-2).
+    ///
+    /// `would_rewrite` wraps `classify_command`, which returns `Unhandled` when
+    /// ANY segment of a compound command has no match.  A compound like
+    /// `"cargo test && echo done"` has one rewritable segment (`cargo test`) and
+    /// one unhandled segment (`echo done`), so `classify_command` returns
+    /// `Unhandled` and `would_rewrite` returns `None`.
+    ///
+    /// This is intentional: `would_rewrite` is a conservative API — `None` means
+    /// "the full compound cannot be cleanly rewritten".  Callers that need
+    /// per-segment resolution should use `classify_command` directly.
+    #[test]
+    fn test_would_rewrite_mixed_compound_returns_none() {
+        // One rewritable segment + one unhandled segment → None.
+        assert_eq!(
+            would_rewrite("cargo test && echo done"),
+            None,
+            "Mixed compound with an unhandled segment must return None"
+        );
+        // Sanity: pure-rewritable compound still returns Some.
+        assert!(
+            would_rewrite("cargo test && cargo clippy").is_some(),
+            "All-rewritable compound must return Some"
         );
     }
 }

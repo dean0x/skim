@@ -114,6 +114,15 @@ pub(super) fn try_table_match(
         // `cmd::mod::user_has_flag`. The previous loose `starts_with` check
         // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
         // the AST-aware diff pipeline for staged changes.
+        //
+        // Side effect on glued short flags (e.g. `-XPOST`, `--files-with-matches`):
+        // Because the strict match only triggers on exact equality or `flag=value`,
+        // a glued short flag like `-XPOST` (where the skip prefix is, say, `-X`)
+        // will NOT match and therefore will NOT suppress the rewrite. This means
+        // `curl -XPOST` is rewritten, passing the flag through to the skim wrapper.
+        // This is intentional: glued short flags are passed through unmodified in
+        // the output (middle tokens are preserved verbatim), so the skim wrapper
+        // receives the correct invocation.
         let strict_skip_match = |arg: &str, flag: &str| -> bool {
             arg == flag || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
         };
@@ -460,6 +469,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // Glued short-flag behavior (regression-1 / AD-1 side effect)
+    // ========================================================================
+
+    /// Strict-match fix (AD-1) side effect: glued short flags like `-qverbose`
+    /// do NOT match the skip prefix `-q` (strict match requires exact equality or
+    /// `flag=value`).  This means `git fetch -qverbose` is NOT suppressed by the
+    /// `-q` skip rule — it rewrites, passing `-qverbose` through to the skim
+    /// wrapper unchanged.  This is intentional and correct: the skim wrapper
+    /// receives the user's flag verbatim.
+    #[test]
+    fn test_strict_match_glued_short_flag_rewrites() {
+        // `-q` is in the `git fetch` skip list.  A glued flag `-qverbose` must
+        // NOT trigger the skip — the rule should still fire.
+        let result = try_rewrite(&["git", "fetch", "-qverbose"]);
+        assert!(
+            result.is_some(),
+            "git fetch -qverbose must rewrite: glued short flag must not match the -q skip prefix"
+        );
+        let rewritten = result.unwrap().tokens.join(" ");
+        assert!(
+            rewritten.contains("-qverbose"),
+            "Glued flag must be preserved verbatim in output: {rewritten}"
+        );
+
+        // Sanity: the exact `-q` flag IS still skipped.
+        let skipped = try_rewrite(&["git", "fetch", "-q"]);
+        assert!(
+            skipped.is_none(),
+            "git fetch -q must still be skipped (exact match)"
+        );
     }
 
     // ========================================================================
