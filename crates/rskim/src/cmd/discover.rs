@@ -254,7 +254,10 @@ fn classify_bash_command(command: &str) -> Option<BashCommandInfo> {
     // `git worktree list`) are treated as "has_rewrite = true" — discover stops
     // flagging them as gaps even though no handler rewrites them.
     let classification = super::rewrite::classify_command(command);
-    let has_rewrite = !matches!(classification, super::rewrite::CommandClassification::Unhandled);
+    let has_rewrite = !matches!(
+        classification,
+        super::rewrite::CommandClassification::Unhandled
+    );
     let rewrite_target = match classification {
         super::rewrite::CommandClassification::Rewritten(s) => Some(s),
         _ => None,

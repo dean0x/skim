@@ -115,9 +115,7 @@ pub(super) fn try_table_match(
         // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
         // the AST-aware diff pipeline for staged changes.
         let strict_skip_match = |arg: &str, flag: &str| -> bool {
-            arg == flag
-                || (arg.starts_with(flag)
-                    && arg.as_bytes().get(flag.len()) == Some(&b'='))
+            arg == flag || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
         };
         if !rule.skip_if_flag_prefix.is_empty()
             && middle.iter().any(|arg| {
@@ -427,8 +425,7 @@ mod tests {
                 let extended = format!("{skip}x");
                 let strict_skip_match = |arg: &str, flag: &str| -> bool {
                     arg == flag
-                        || (arg.starts_with(flag)
-                            && arg.as_bytes().get(flag.len()) == Some(&b'='))
+                        || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
                 };
                 assert!(
                     !strict_skip_match(&extended, skip),
@@ -441,7 +438,8 @@ mod tests {
                 assert!(
                     strict_skip_match(&with_value, skip),
                     "strict_skip_match({:?}, {:?}) must be true for =value form",
-                    with_value, skip
+                    with_value,
+                    skip
                 );
             }
         }

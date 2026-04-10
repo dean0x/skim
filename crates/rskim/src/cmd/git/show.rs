@@ -29,8 +29,8 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{ShowCommitResult, ShowDiffFileEntry};
 use crate::runner::CommandRunner;
 
-use super::{map_exit_code, run_passthrough};
 use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
+use super::{map_exit_code, run_passthrough};
 
 // ============================================================================
 // Mode detection
@@ -278,7 +278,13 @@ fn run_show_commit(
 
     for (i, file_diff) in file_diffs.iter().enumerate() {
         let skip_ast = i >= super::diff::MAX_AST_FILE_COUNT;
-        let rendered = render_diff_file(file_diff, global_flags, git_args, DiffMode::Default, skip_ast);
+        let rendered = render_diff_file(
+            file_diff,
+            global_flags,
+            git_args,
+            DiffMode::Default,
+            skip_ast,
+        );
         rendered_diff.push_str(&rendered);
 
         diff_file_entries.push(ShowDiffFileEntry {
@@ -434,8 +440,7 @@ fn run_show_file_content(
     };
 
     // Guardrail: if transformation inflated the output, emit raw.
-    let guardrail =
-        crate::output::guardrail::apply_to_stderr(raw.clone(), transformed)?;
+    let guardrail = crate::output::guardrail::apply_to_stderr(raw.clone(), transformed)?;
     let final_output = guardrail.into_output();
 
     print!("{final_output}");
@@ -617,7 +622,10 @@ mod tests {
         let fixture = include_str!("../../../tests/fixtures/cmd/git/show_commit.txt");
         let (header, diff_body) = parse_commit_header(fixture).unwrap();
         let file_diffs = parse_unified_diff(diff_body);
-        assert!(!file_diffs.is_empty(), "fixture must produce at least one file diff");
+        assert!(
+            !file_diffs.is_empty(),
+            "fixture must produce at least one file diff"
+        );
 
         // Render each file — should not panic.
         for (i, fd) in file_diffs.iter().enumerate() {
@@ -635,7 +643,10 @@ mod tests {
             "diff output".to_string(),
         );
         let rendered = result.to_string();
-        assert!(rendered.contains("abc1234"), "hash must appear in rendered output");
+        assert!(
+            rendered.contains("abc1234"),
+            "hash must appear in rendered output"
+        );
         assert!(rendered.contains("feat: add user authentication handler"));
     }
 
@@ -647,7 +658,10 @@ mod tests {
     fn test_file_content_mode_path_extraction() {
         // Verify the path extraction logic used by run_show_file_content.
         let refpath = "HEAD:src/auth/handler.rs";
-        let path_str = refpath.rfind(':').map(|pos| &refpath[pos + 1..]).unwrap_or(refpath);
+        let path_str = refpath
+            .rfind(':')
+            .map(|pos| &refpath[pos + 1..])
+            .unwrap_or(refpath);
         assert_eq!(path_str, "src/auth/handler.rs");
     }
 
@@ -686,7 +700,10 @@ mod tests {
         // `.lock` has no language → passthrough (no transform).
         let path = Path::new("Cargo.lock");
         let lang = Language::from_path(path).filter(|l| !l.is_serde_based());
-        assert!(lang.is_none(), "Cargo.lock must not have a tree-sitter language");
+        assert!(
+            lang.is_none(),
+            "Cargo.lock must not have a tree-sitter language"
+        );
     }
 
     // ========================================================================
@@ -732,7 +749,10 @@ mod tests {
         let mut buf = Vec::new();
         let outcome = crate::output::guardrail::apply(raw.clone(), inflated, &mut buf).unwrap();
         // Guardrail should have triggered and returned the raw content.
-        assert!(outcome.was_triggered(), "guardrail must trigger when output inflates");
+        assert!(
+            outcome.was_triggered(),
+            "guardrail must trigger when output inflates"
+        );
         assert_eq!(outcome.into_output(), raw);
     }
 
