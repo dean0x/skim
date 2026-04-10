@@ -193,12 +193,10 @@ fn has_limit_flag(args: &[String]) -> bool {
 ///   `.to_string()` clone is performed per parameter.
 ///
 /// - [`finalize_git_output_owned`] — owned variant; callers that already own
-///   the `String` (e.g. `run_passthrough`, `run_parsed_command`, `run_diff`)
-///   move the values directly into the analytics call — zero extra allocations
-///   on the analytics path, and still zero allocations when analytics are off.
-///
-/// `show.rs` call sites continue to use the borrowed variant; the Wave 2
-/// Resolver may migrate them to `_owned` once `emit_show_commit` is updated.
+///   the `String` and raw ≠ output (e.g. `run_parsed_command`, `run_diff`,
+///   `emit_show_commit`) move the values directly into the analytics call —
+///   zero extra allocations on the analytics path, and still zero allocations
+///   when analytics are off.
 ///
 /// # Parameters (shared by both variants)
 /// - `raw`          — Original git output before any compression.
@@ -286,14 +284,12 @@ fn run_passthrough(
         eprint!("{}", output.stderr);
     }
 
-    // Passthrough: raw == compressed (no transformation applied).
-    // Move stdout into _owned so both the analytics path (when enabled) and the
-    // stats path share a single allocation rather than two `.to_string()` clones.
-    // `output.stdout` is no longer needed after the print above.
-    let stdout_owned = output.stdout;
-    finalize_git_output_owned(
-        stdout_owned.clone(),
-        stdout_owned,
+    // Passthrough: raw == compressed, so pass the same &str twice.
+    // The borrowed variant avoids an unconditional clone; `.to_string()`
+    // is only called inside finalize when analytics are actually enabled.
+    finalize_git_output(
+        &output.stdout,
+        &output.stdout,
         format!("skim git {} {}", subcmd, args.join(" ")),
         show_stats,
         crate::analytics::CommandType::Git,

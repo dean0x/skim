@@ -460,10 +460,12 @@ fn run_show_commit(
         // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
         // Route through finalize so the analytics DB records a zero-compression
         // entry instead of silently dropping the invocation (HIGH-3).
+        // raw == output here, so pass the same &str twice via the borrowed
+        // variant — avoids an unconditional clone.
         print!("{raw}");
-        finalize_git_output_owned(
-            raw.clone(),
-            raw,
+        finalize_git_output(
+            &raw,
+            &raw,
             label,
             show_stats,
             crate::analytics::CommandType::Git,
