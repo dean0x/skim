@@ -182,9 +182,8 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
     // Issue view: "number" + "state" + issue-specific field
     let has_number = obj.get("number").is_some();
     let has_state = obj.get("state").is_some();
-    let has_issue_fields = obj.get("body").is_some()
-        || obj.get("labels").is_some()
-        || obj.get("assignees").is_some();
+    let has_issue_fields =
+        obj.get("body").is_some() || obj.get("labels").is_some() || obj.get("assignees").is_some();
 
     if has_number && has_state && has_issue_fields {
         return issue_view::try_parse_json(obj);
@@ -225,8 +224,8 @@ pub(super) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_helpers::{load_fixture, make_output};
+    use super::*;
 
     // --- truncate_body ---
 
@@ -260,7 +259,11 @@ mod tests {
         })];
         let result = extract_comments(&comments, 3);
         assert_eq!(result.len(), 1);
-        assert!(result[0].contains("Actual reply here"), "got: {}", result[0]);
+        assert!(
+            result[0].contains("Actual reply here"),
+            "got: {}",
+            result[0]
+        );
         assert!(!result[0].contains("quoted text"));
     }
 

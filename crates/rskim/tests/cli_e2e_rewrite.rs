@@ -1153,7 +1153,16 @@ fn test_rewrite_gh_issue_view_web_skipped() {
 #[test]
 fn test_rewrite_gh_issue_view_jq_skipped() {
     skim_cmd()
-        .args(["rewrite", "--suggest", "gh", "issue", "view", "42", "--jq", ".title"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "issue",
+            "view",
+            "42",
+            "--jq",
+            ".title",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -1207,7 +1216,15 @@ fn test_rewrite_gh_pr_checks() {
 #[test]
 fn test_rewrite_gh_pr_checks_watch_skipped() {
     skim_cmd()
-        .args(["rewrite", "--suggest", "gh", "pr", "checks", "15", "--watch"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "pr",
+            "checks",
+            "15",
+            "--watch",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -1225,7 +1242,15 @@ fn test_rewrite_gh_run_view() {
 #[test]
 fn test_rewrite_gh_run_view_log_skipped() {
     skim_cmd()
-        .args(["rewrite", "--suggest", "gh", "run", "view", "12345", "--log"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "gh",
+            "run",
+            "view",
+            "12345",
+            "--log",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));

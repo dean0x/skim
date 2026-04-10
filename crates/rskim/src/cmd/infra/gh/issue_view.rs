@@ -61,7 +61,10 @@ fn push_array_field(
     } else {
         joined
     };
-    items.push(InfraItem { label: label.to_string(), value });
+    items.push(InfraItem {
+        label: label.to_string(),
+        value,
+    });
 }
 
 /// Inject `--json` for issue view if not already present.
@@ -115,7 +118,10 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         .and_then(|a| a.get("login"))
         .and_then(|l| l.as_str())
         .unwrap_or("unknown");
-    items.push(InfraItem { label: "author".to_string(), value: author.to_string() });
+    items.push(InfraItem {
+        label: "author".to_string(),
+        value: author.to_string(),
+    });
 
     // Labels — array of {name: string}
     push_array_field(&mut items, "labels", obj, "labels", "name", "(none)");
@@ -126,18 +132,34 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
     // Milestone — optional nested object: milestone.title
     let milestone = obj
         .get("milestone")
-        .and_then(|m| if m.is_null() { None } else { m.get("title").and_then(|t| t.as_str()) })
+        .and_then(|m| {
+            if m.is_null() {
+                None
+            } else {
+                m.get("title").and_then(|t| t.as_str())
+            }
+        })
         .unwrap_or("(none)");
-    items.push(InfraItem { label: "milestone".to_string(), value: milestone.to_string() });
+    items.push(InfraItem {
+        label: "milestone".to_string(),
+        value: milestone.to_string(),
+    });
 
     // Body — truncated to MAX_BODY_LINES
-    let body = obj.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let body = obj
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     let body_value = if body.is_empty() {
         "(empty)".to_string()
     } else {
         truncate_body(body, MAX_BODY_LINES)
     };
-    items.push(InfraItem { label: "body".to_string(), value: body_value });
+    items.push(InfraItem {
+        label: "body".to_string(),
+        value: body_value,
+    });
 
     // Comments count + last MAX_COMMENTS previews
     let comments_arr = obj
@@ -146,9 +168,15 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     let count = comments_arr.len();
-    items.push(InfraItem { label: "comments".to_string(), value: format!("{count} total") });
+    items.push(InfraItem {
+        label: "comments".to_string(),
+        value: format!("{count} total"),
+    });
     for c in extract_comments(comments_arr, MAX_COMMENTS) {
-        items.push(InfraItem { label: "comment".to_string(), value: c });
+        items.push(InfraItem {
+            label: "comment".to_string(),
+            value: c,
+        });
     }
 
     Some(InfraResult::new(
@@ -174,8 +202,8 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{load_fixture, make_output};
+    use super::*;
 
     #[test]
     fn test_tier1_json() {
@@ -265,7 +293,11 @@ mod tests {
         ];
         let original_len = args.len();
         prepare_args(&mut args);
-        assert_eq!(args.len(), original_len, "Should not inject when --json present");
+        assert_eq!(
+            args.len(),
+            original_len,
+            "Should not inject when --json present"
+        );
     }
 
     #[test]

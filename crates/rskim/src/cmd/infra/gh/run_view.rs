@@ -53,14 +53,20 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 /// iteration each have a single responsibility.
 fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
     for job in jobs {
-        let job_name = job.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let job_name = job
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let job_conclusion = job
             .get("conclusion")
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| job.get("status").and_then(|v| v.as_str()).unwrap_or("?"))
             .to_lowercase();
 
-        items.push(InfraItem { label: format!("job:{job_name}"), value: job_conclusion.clone() });
+        items.push(InfraItem {
+            label: format!("job:{job_name}"),
+            value: job_conclusion.clone(),
+        });
 
         // For failed jobs, show step details (up to MAX_STEP_DETAIL non-passing steps)
         if job_conclusion == "failure" || job_conclusion == "failed" {
@@ -210,8 +216,8 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{load_fixture, make_output};
+    use super::*;
 
     #[test]
     fn test_tier1_json() {
@@ -265,7 +271,11 @@ mod tests {
         let input = load_fixture("gh_run_view_success.json");
         let obj: serde_json::Value = serde_json::from_str(&input).unwrap();
         let result = try_parse_json(&obj).unwrap();
-        assert!(result.as_ref().contains("success"), "got: {}", result.as_ref());
+        assert!(
+            result.as_ref().contains("success"),
+            "got: {}",
+            result.as_ref()
+        );
         // No failed steps — no step detail items
         let step_items: Vec<_> = result
             .items
@@ -344,12 +354,26 @@ mod tests {
         }"#;
         let obj: serde_json::Value = serde_json::from_str(json).unwrap();
         let result = try_parse_json(&obj);
-        assert!(result.is_some(), "Expected parse to succeed for empty jobs array");
+        assert!(
+            result.is_some(),
+            "Expected parse to succeed for empty jobs array"
+        );
         let result = result.unwrap();
         assert!(result.as_ref().contains("#99"), "got: {}", result.as_ref());
-        assert!(result.as_ref().contains("Empty Run"), "got: {}", result.as_ref());
-        let job_items: Vec<_> = result.items.iter().filter(|i| i.label.starts_with("job:")).collect();
-        assert!(job_items.is_empty(), "Expected no job items for empty jobs array");
+        assert!(
+            result.as_ref().contains("Empty Run"),
+            "got: {}",
+            result.as_ref()
+        );
+        let job_items: Vec<_> = result
+            .items
+            .iter()
+            .filter(|i| i.label.starts_with("job:"))
+            .collect();
+        assert!(
+            job_items.is_empty(),
+            "Expected no job items for empty jobs array"
+        );
     }
 
     #[test]
@@ -363,6 +387,10 @@ mod tests {
         ];
         let original_len = args.len();
         prepare_args(&mut args);
-        assert_eq!(args.len(), original_len, "Should not inject when --json present");
+        assert_eq!(
+            args.len(),
+            original_len,
+            "Should not inject when --json present"
+        );
     }
 }

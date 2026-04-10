@@ -66,8 +66,15 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
     // by threading raw fields back through issue_view's return type — not worth
     // the added coupling for three string reads.
     let number = obj.get("number").and_then(|v| v.as_u64())?;
-    let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
-    let state = obj.get("state").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let title = obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no title)");
+    let state = obj
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
     let summary = format!("#{number}: {title} ({state})");
 
     // Start with the issue items
@@ -88,14 +95,8 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
     });
 
     // PR-specific overlay: diff stats
-    let additions = obj
-        .get("additions")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let deletions = obj
-        .get("deletions")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let additions = obj.get("additions").and_then(|v| v.as_u64()).unwrap_or(0);
+    let deletions = obj.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0);
     let changed_files = obj
         .get("changedFiles")
         .and_then(|v| v.as_u64())
@@ -128,8 +129,8 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{load_fixture, make_output};
+    use super::*;
 
     #[test]
     fn test_tier1_json() {
@@ -173,7 +174,11 @@ mod tests {
         ];
         let original_len = args.len();
         prepare_args(&mut args);
-        assert_eq!(args.len(), original_len, "Should not inject when --json present");
+        assert_eq!(
+            args.len(),
+            original_len,
+            "Should not inject when --json present"
+        );
     }
 
     #[test]

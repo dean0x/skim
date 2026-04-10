@@ -111,7 +111,11 @@ fn json_entry_to_infra_item(entry: &serde_json::Value) -> Option<InfraItem> {
         .unwrap_or("")
         .to_lowercase();
 
-    let value = if state.is_empty() { title } else { format!("{title} ({state})") };
+    let value = if state.is_empty() {
+        title
+    } else {
+        format!("{title} ({state})")
+    };
 
     Some(InfraItem { label, value })
 }
@@ -122,10 +126,7 @@ fn json_entry_to_infra_item(entry: &serde_json::Value) -> Option<InfraItem> {
 /// [`MAX_JSON_BYTES`], or fails to deserialize.
 pub(super) fn try_parse_json_list(stdout: &str) -> Option<InfraResult> {
     let trimmed = stdout.trim();
-    if !trimmed.starts_with('[') {
-        return None;
-    }
-    if trimmed.len() > MAX_JSON_BYTES {
+    if !trimmed.starts_with('[') || trimmed.len() > MAX_JSON_BYTES {
         return None;
     }
 
@@ -198,8 +199,8 @@ pub(super) fn try_parse_regex(text: &str) -> Option<InfraResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{load_fixture, make_output};
+    use super::*;
 
     #[test]
     fn test_tier1_gh_pass() {

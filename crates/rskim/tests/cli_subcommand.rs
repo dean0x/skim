@@ -600,7 +600,10 @@ fn test_subcommand_infra_gh_issue_view_json_output() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(json.get("tool").is_some(), "JSON output should have 'tool' field");
+    assert!(
+        json.get("tool").is_some(),
+        "JSON output should have 'tool' field"
+    );
     assert_eq!(
         json.get("tool").and_then(|v| v.as_str()),
         Some("gh"),
@@ -618,7 +621,10 @@ fn test_subcommand_infra_gh_run_view_json_output() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(json.get("tool").is_some(), "JSON output should have 'tool' field");
+    assert!(
+        json.get("tool").is_some(),
+        "JSON output should have 'tool' field"
+    );
 }
 
 #[test]

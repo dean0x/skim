@@ -179,8 +179,14 @@ fn build_checks_result(checks: Vec<(String, String, Option<String>)>) -> Option<
     }
 
     let total = checks.len();
-    let pass = checks.iter().filter(|(_, s, _)| s == "pass" || s == "success").count();
-    let fail = checks.iter().filter(|(_, s, _)| s == "fail" || s == "failure").count();
+    let pass = checks
+        .iter()
+        .filter(|(_, s, _)| s == "pass" || s == "success")
+        .count();
+    let fail = checks
+        .iter()
+        .filter(|(_, s, _)| s == "fail" || s == "failure")
+        .count();
     let pending = checks
         .iter()
         .filter(|(_, s, _)| s == "pending" || s == "in_progress")
@@ -188,17 +194,15 @@ fn build_checks_result(checks: Vec<(String, String, Option<String>)>) -> Option<
     // Catch-all for cancelled, neutral, skipped, timed_out, and any future states
     let other = total - pass - fail - pending;
 
-    let summary = if other > 0 {
-        format!(
-            "{total} check{}: {pass} pass, {fail} fail, {pending} pending, {other} other",
-            if total == 1 { "" } else { "s" }
-        )
+    let other_suffix = if other > 0 {
+        format!(", {other} other")
     } else {
-        format!(
-            "{total} check{}: {pass} pass, {fail} fail, {pending} pending",
-            if total == 1 { "" } else { "s" }
-        )
+        String::new()
     };
+    let summary = format!(
+        "{total} check{}: {pass} pass, {fail} fail, {pending} pending{other_suffix}",
+        if total == 1 { "" } else { "s" }
+    );
 
     let items: Vec<InfraItem> = checks
         .into_iter()
@@ -226,8 +230,8 @@ fn build_checks_result(checks: Vec<(String, String, Option<String>)>) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{load_fixture, make_output};
+    use super::*;
 
     #[test]
     fn test_tier1_tab_text() {
@@ -280,9 +284,15 @@ mod tests {
         let result = try_parse_checks_text(&input).unwrap();
         // Fixture: 4 pass, 1 fail, 1 pending = 5 total... let's check summary
         let summary = &result.summary;
-        assert!(summary.contains("5 checks"), "Expected '5 checks' in: {summary}");
+        assert!(
+            summary.contains("5 checks"),
+            "Expected '5 checks' in: {summary}"
+        );
         assert!(summary.contains("fail"), "Expected 'fail' in: {summary}");
-        assert!(summary.contains("pending"), "Expected 'pending' in: {summary}");
+        assert!(
+            summary.contains("pending"),
+            "Expected 'pending' in: {summary}"
+        );
     }
 
     #[test]
@@ -319,7 +329,11 @@ mod tests {
             "Expected JSON parse to succeed for checkRuns wrapper, got None"
         );
         let result = result.unwrap();
-        assert!(result.as_ref().contains("1 check"), "got: {}", result.as_ref());
+        assert!(
+            result.as_ref().contains("1 check"),
+            "got: {}",
+            result.as_ref()
+        );
     }
 
     #[test]
