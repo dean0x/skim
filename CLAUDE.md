@@ -153,7 +153,7 @@ cargo fmt -- --check           # Format check
 - `completions` — Shell completion scripts
 - `discover` — Scan agent sessions for missed skim optimization opportunities (`--since`, `--agent`, `--json`)
 - `file` — File operations compression: find, ls, tree, grep, rg output parsing (`--json`, `--show-stats`)
-- `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch. All support `--json`.
+- `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch, show. All support `--json`.
 - `infra` — Infrastructure tool compression: gh, aws, curl, wget output parsing (`--json`, `--show-stats`)
 - `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode)
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`)

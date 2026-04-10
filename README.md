@@ -84,6 +84,10 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
   - `--mode structure` adds unchanged functions as signatures for context
   - `--mode full` shows entire files with change markers
   - Supports `--staged`, commit ranges (`HEAD~3`, `main..feature`)
+- **`skim git show`** -- compresses `git show` output in two modes:
+  - Commit mode (default, e.g. `skim git show HEAD`): strips commit header noise and renders the diff with the AST-aware pipeline
+  - File-content mode (e.g. `skim git show HEAD:src/main.rs`): applies skim's source transform to the file content
+  - Three-tier degradation: AST-aware render → raw hunk render → guardrail passthrough
 - Compresses `git status` and `git log` with flag-aware passthrough
 - All subcommands support `--json` for machine-readable output
 
