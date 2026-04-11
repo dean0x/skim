@@ -221,7 +221,7 @@ fn parse_tree(output: &CommandOutput) -> ParseResult<FileResult> {
     if let Some(result) = try_parse_tree_text(&output.stdout) {
         return ParseResult::Degraded(
             result,
-            vec!["ls: structured parse failed, using regex".to_string()],
+            vec!["tree: structured parse failed, using regex".to_string()],
         );
     }
 
@@ -449,6 +449,29 @@ mod tests {
             "Tree text output should degrade gracefully, got {}",
             result.tier_name()
         );
+    }
+
+    /// Degradation marker for `parse_tree` must use "tree:" prefix, not "ls:".
+    /// Regression for copy-paste bug where parse_tree emitted the sibling
+    /// parse_ls marker, violating the cross-handler tool-name contract
+    /// established in v2.3.0 (CHANGELOG consistency review HIGH-2).
+    #[test]
+    fn test_parse_tree_degradation_marker_uses_tree_prefix() {
+        let input = load_fixture("tree_basic.txt");
+        let output = make_output(&input);
+        let result = parse_tree(&output);
+        if let ParseResult::Degraded(_, markers) = result {
+            let joined = markers.join(" ");
+            assert!(
+                joined.contains("tree:"),
+                "parse_tree degradation marker must start with 'tree:' but got: {joined}"
+            );
+            assert!(
+                !joined.contains("ls:"),
+                "parse_tree degradation marker must NOT contain 'ls:' but got: {joined}"
+            );
+        }
+        // If Full or Passthrough, the marker contract is not exercised — that's OK.
     }
 
     #[test]
