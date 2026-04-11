@@ -199,8 +199,14 @@ pub(super) fn run_diff(
 
     let duration = output.duration;
     let raw_diff = output.stdout;
-    // Build label once; reused by early-return paths and the analytics tail.
-    let label = format!("skim git diff {}", args.join(" "));
+    // Build label only when analytics or stats will actually consume it (HIGH-2).
+    // Parity with run_show_commit / run_show_file_content lazy-guard pattern;
+    // avoids a format! allocation on the hot path when both flags are off.
+    let label = if show_stats || crate::analytics::is_analytics_enabled() {
+        format!("skim git diff {}", args.join(" "))
+    } else {
+        String::new()
+    };
 
     // Handle empty diff — record zero-compression analytics so the DB stays
     // consistent with run_passthrough (which always records, even for no-op passes).
@@ -224,14 +230,14 @@ pub(super) fn run_diff(
 
         if file_diffs.is_empty() {
             eprintln!("No changes");
-            // Reconstruct label: the first empty-diff guard consumed it via move.
+            // Reuse the same lazy label built above — no second format! needed.
             // This branch is only hit when parse_unified_diff returns an empty vec
             // despite raw_diff being non-empty (malformed diff); keep a consistent
             // analytics record identical to the trim-is-empty branch above.
             finalize_git_output(
                 &raw_diff,
                 &raw_diff,
-                format!("skim git diff {}", args.join(" ")),
+                label,
                 show_stats,
                 crate::analytics::CommandType::Git,
                 duration,
@@ -296,7 +302,9 @@ pub(super) fn run_diff(
                 // mode, ensuring both handlers share the same safety envelope.
                 // Clone `raw_diff` here; file_diffs still holds a borrow so
                 // we cannot move raw_diff until the block ends.
-                let s = result.to_string();
+                // Use into_rendered() instead of to_string(): avoids a redundant
+                // Display::fmt allocation + copy of the pre-built rendered String.
+                let s = result.into_rendered();
                 let guardrail = crate::output::guardrail::apply_to_stderr(raw_diff.clone(), s)?;
                 let final_output = guardrail.into_output();
                 print!("{final_output}");
