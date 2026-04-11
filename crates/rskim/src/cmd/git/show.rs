@@ -405,12 +405,16 @@ fn emit_show_commit(
             // `into_rendered` consumes result and returns the pre-built String
             // directly, avoiding the extra allocation `to_string()` would incur.
             let result_str = result.into_rendered();
-            // Clone raw before the guardrail consumes it so finalize can record
-            // both the original and the (possibly guardrail-substituted) output.
-            // The guard on `show_stats || is_analytics_enabled()` is moved into
-            // `finalize_git_output_owned` — a single consistent check at the
-            // boundary eliminates the previous TOCTOU double-read (MEDIUM-22).
-            let raw_for_record = raw.clone();
+            // Clone raw only when the caller will actually consume it: either
+            // --show-stats is printing token counts or analytics is recording.
+            // Guarding here avoids a full memcpy (~100-500 KB) on the no-telemetry
+            // hot path (HIGH-1).  The owned variant then moves both strings into
+            // `finalize_git_output_owned` without further cloning (MEDIUM-22).
+            let raw_for_record = if show_stats || crate::analytics::is_analytics_enabled() {
+                raw.clone()
+            } else {
+                String::new()
+            };
             let guardrail = crate::output::guardrail::apply_to_stderr(raw, result_str)?;
             let final_output = guardrail.into_output();
             print!("{final_output}");
@@ -494,10 +498,10 @@ fn run_show_commit(
 /// raw == output so the DB records zero compression gain, matching the
 /// behaviour of `run_passthrough` for other subcommands.
 ///
-/// `label` is a pre-built String passed from `run_show_file_content`.  The
-/// closure that produces it is invoked at most once per execution path, so
-/// each branch allocates at most one String — allocation is deferred to
-/// branch-time, not cached (MEDIUM-24).
+/// `label` is a pre-built String passed from `run_show_file_content`.  It is
+/// computed via a guarded `if/else` that returns `String::new()` when neither
+/// `--show-stats` nor analytics are enabled, so each branch allocates at most
+/// one String — allocation is deferred to branch-time, not cached (MEDIUM-24).
 fn passthrough_file_content(
     raw: &str,
     label: String,
@@ -608,14 +612,23 @@ fn run_show_file_content(
 
     // Guardrail: if transformation inflated the output, emit raw.
     // Clone raw only here (Tier 1 success path), not on every branch (MEDIUM-18).
-    // After HIGH-4 the label is already owned; finalize_git_output borrows it.
-    let guardrail = crate::output::guardrail::apply_to_stderr(raw.clone(), transformed)?;
+    // `apply_to_stderr` takes ownership of raw; clone it first so we can pass
+    // the original into `finalize_git_output_owned` without a second allocation.
+    let raw_for_record = if show_stats || crate::analytics::is_analytics_enabled() {
+        raw.clone()
+    } else {
+        String::new()
+    };
+    let guardrail = crate::output::guardrail::apply_to_stderr(raw, transformed)?;
     let final_output = guardrail.into_output();
 
     print!("{final_output}");
-    finalize_git_output(
-        &raw,
-        &final_output,
+    // Both raw_for_record and final_output are owned Strings; use the owned
+    // variant to move them directly into analytics, avoiding two extra .to_string()
+    // clones that the borrowed finalize_git_output would incur (HIGH-3, PF-018).
+    finalize_git_output_owned(
+        raw_for_record,
+        final_output,
         label,
         show_stats,
         crate::analytics::CommandType::Git,
