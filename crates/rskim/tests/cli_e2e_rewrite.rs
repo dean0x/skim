@@ -924,22 +924,28 @@ fn test_rewrite_pip3_list() {
 // Phase 8: Wave B rewrite rules (#116)
 // ============================================================================
 
+/// AD-11: `prettier --check` is acknowledged as already-compact.
+/// The original command is echoed on stdout (exit 0) rather than being
+/// rewritten to `skim lint prettier`, per the compress-or-skip rule.
 #[test]
-fn test_rewrite_prettier_check() {
+fn test_rewrite_prettier_check_acknowledged() {
     skim_cmd()
         .args(["rewrite", "prettier", "--check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint prettier"));
+        .stdout(predicate::str::contains("prettier --check"));
 }
 
+/// AD-11: `rustfmt --check` is acknowledged as already-compact.
+/// The original command is echoed on stdout rather than being
+/// rewritten to `skim lint rustfmt`.
 #[test]
-fn test_rewrite_rustfmt_check() {
+fn test_rewrite_rustfmt_check_acknowledged() {
     skim_cmd()
         .args(["rewrite", "rustfmt", "--check", "src/main.rs"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint rustfmt"));
+        .stdout(predicate::str::contains("rustfmt --check"));
 }
 
 #[test]

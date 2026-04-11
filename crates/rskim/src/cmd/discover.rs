@@ -608,11 +608,21 @@ mod tests {
 
     #[test]
     fn test_would_rewrite_lint_and_infra_tools() {
-        // lint tools
-        assert!(would_rewrite("prettier --check .").is_some());
-        assert!(would_rewrite("rustfmt --check src/main.rs").is_some());
-        assert!(would_rewrite("npx prettier --check .").is_some());
-        // infra tools
+        // AD-11: prettier --check and rustfmt --check are now acknowledged as
+        // already-compact. would_rewrite returns None (not Rewritten) for them.
+        assert!(
+            would_rewrite("prettier --check .").is_none(),
+            "prettier --check is now acknowledged, not rewritten"
+        );
+        assert!(
+            would_rewrite("rustfmt --check src/main.rs").is_none(),
+            "rustfmt --check is now acknowledged, not rewritten"
+        );
+        assert!(
+            would_rewrite("npx prettier --check .").is_none(),
+            "npx prettier --check is now acknowledged, not rewritten"
+        );
+        // infra tools (still rewritten)
         assert!(would_rewrite("gh pr list").is_some());
         assert!(would_rewrite("gh issue list").is_some());
         assert!(would_rewrite("gh run list").is_some());
