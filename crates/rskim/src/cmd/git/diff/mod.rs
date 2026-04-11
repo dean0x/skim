@@ -199,14 +199,7 @@ pub(super) fn run_diff(
 
     let duration = output.duration;
     let raw_diff = output.stdout;
-    // Build label only when analytics or stats will actually consume it (HIGH-2).
-    // Parity with run_show_commit / run_show_file_content lazy-guard pattern;
-    // avoids a format! allocation on the hot path when both flags are off.
-    let label = if show_stats || crate::analytics::is_analytics_enabled() {
-        format!("skim git diff {}", args.join(" "))
-    } else {
-        String::new()
-    };
+    let label = super::build_analytics_label("diff", args, show_stats);
 
     // Handle empty diff — record zero-compression analytics so the DB stays
     // consistent with run_passthrough (which always records, even for no-op passes).

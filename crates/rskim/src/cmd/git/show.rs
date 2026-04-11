@@ -42,7 +42,10 @@ use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
 
 use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
-use super::{finalize_git_output, finalize_git_output_owned, map_exit_code, run_passthrough};
+use super::{
+    build_analytics_label, finalize_git_output, finalize_git_output_owned, map_exit_code,
+    run_passthrough,
+};
 
 // ============================================================================
 // Utilities
@@ -449,16 +452,10 @@ fn run_show_commit(
         Err(code) => return Ok(code),
     };
 
-    // Build the label lazily: skip the allocation when neither stats display
-    // nor analytics recording will use it.  Derived from *original* args
-    // (before `--json` extraction) so the DB records the full invocation.
-    // Computed before the `render_show_diff` check so both the passthrough and
-    // the normal path share the same guard (HIGH-3).
-    let label = if show_stats || crate::analytics::is_analytics_enabled() {
-        format!("skim git show {}", original_args.join(" "))
-    } else {
-        String::new()
-    };
+    // Built before the `render_show_diff` check so both the passthrough and
+    // the normal path share the same label (HIGH-3).  Derived from *original*
+    // args (before `--json` extraction) so the DB records the full invocation.
+    let label = build_analytics_label("show", original_args, show_stats);
 
     let Some(result) = render_show_diff(&raw, global_flags, git_args) else {
         // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
@@ -574,14 +571,7 @@ fn run_show_file_content(
     let raw = output.stdout;
     let duration = output.duration;
 
-    // Build label only when analytics or stats will actually consume it (HIGH-4).
-    // Parity with run_show_commit's lazy guard; avoids a format! allocation on
-    // the hot path when both flags are off.
-    let label = if show_stats || crate::analytics::is_analytics_enabled() {
-        format!("skim git show {}", args.join(" "))
-    } else {
-        String::new()
-    };
+    let label = build_analytics_label("show", args, show_stats);
 
     // Detect language from path extension.
     let lang = Language::from_path(Path::new(path_str)).filter(|l| !l.is_serde_based());

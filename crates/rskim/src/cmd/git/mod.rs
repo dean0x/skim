@@ -180,6 +180,23 @@ fn has_limit_flag(args: &[String]) -> bool {
         .any(|a| a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count="))
 }
 
+/// Build the analytics label string for a git subcommand invocation.
+///
+/// Returns `"skim git {subcmd} {args}"` when either `--show-stats` or analytics
+/// recording is active, and an empty `String` otherwise.  This avoids an
+/// unconditional `format!` allocation on the hot path when both flags are off.
+///
+/// All six parsed-command handlers (`show` ×2, `diff`, `status`, `log`, `fetch`)
+/// share this exact guard logic; centralising it here eliminates the repeated
+/// five-line block at each call site.
+pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: bool) -> String {
+    if show_stats || crate::analytics::is_analytics_enabled() {
+        format!("skim git {subcmd} {}", args.join(" "))
+    } else {
+        String::new()
+    }
+}
+
 /// Record token stats and fire-and-forget analytics for any git handler.
 ///
 /// Centralises the analytics + stats tail that previously appeared inline in
@@ -305,16 +322,7 @@ fn run_passthrough(
 /// calling this function.
 ///
 /// `label` is the analytics label string built by the caller from the user's
-/// **original** (pre-rewrite) args.  Callers should build it lazily using the
-/// same guard as `run_show_commit`:
-///
-/// ```rust,ignore
-/// let label = if show_stats || crate::analytics::is_analytics_enabled() {
-///     format!("skim git <subcmd> {}", args.join(" "))
-/// } else {
-///     String::new()
-/// };
-/// ```
+/// **original** (pre-rewrite) args via [`build_analytics_label`].
 ///
 /// When `combine_stderr` is `true`, the parser receives `stderr + stdout`
 /// combined. Git fetch writes its output to stderr, so fetch uses `true`;
