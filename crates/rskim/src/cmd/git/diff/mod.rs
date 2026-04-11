@@ -196,18 +196,19 @@ pub(super) fn run_diff(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
+        let exit_code = output.exit_code;
         // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. raw == compressed on error path; use single-clone
-        // passthrough variant to avoid cloning the same buffer twice (PF-018).
+        // invocations. Move stdout: 1 allocation (clone) on the analytics
+        // path, 0 when disabled (PF-018 resolution).
         super::finalize_git_output_passthrough(
-            &output.stdout,
+            output.stdout,
             super::build_analytics_label("diff", args, show_stats),
             show_stats,
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
         );
-        return Ok(map_exit_code(output.exit_code));
+        return Ok(map_exit_code(exit_code));
     }
 
     // Surface git diff stderr warnings (e.g., "warning: LF will be replaced by CRLF")
@@ -225,9 +226,10 @@ pub(super) fn run_diff(
     // consistent with run_passthrough (which always records, even for no-op passes).
     if raw_diff.trim().is_empty() {
         eprintln!("No changes");
-        // raw == compressed; single-clone passthrough variant (PF-018).
+        // Move raw_diff: 1 allocation (clone) on the analytics path, 0 when
+        // disabled (PF-018 resolution).
         super::finalize_git_output_passthrough(
-            &raw_diff,
+            raw_diff,
             label,
             show_stats,
             crate::analytics::CommandType::Git,
@@ -248,9 +250,11 @@ pub(super) fn run_diff(
             // This branch is only hit when parse_unified_diff returns an empty vec
             // despite raw_diff being non-empty (malformed diff); keep a consistent
             // analytics record identical to the trim-is-empty branch above.
-            // raw == compressed; single-clone passthrough variant (PF-018).
+            // Drop file_diffs first so the borrow on raw_diff ends, then move
+            // raw_diff into the passthrough variant (PF-018 resolution).
+            drop(file_diffs);
             super::finalize_git_output_passthrough(
-                &raw_diff,
+                raw_diff,
                 label,
                 show_stats,
                 crate::analytics::CommandType::Git,

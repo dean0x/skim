@@ -252,15 +252,17 @@ pub(super) fn finalize_git_output_owned(
 /// Passthrough variant of [`finalize_git_output`].
 ///
 /// Use this when `raw` and `output` are **the same string** (passthrough
-/// semantics: no compression occurred).  Clones the buffer **once** when
-/// analytics are enabled instead of the **twice** the borrowed variant would
-/// perform when called with `raw == output` (PF-018 resolution).
+/// semantics: no compression occurred).  Takes ownership of `raw` so that
+/// when analytics are enabled the buffer is **cloned once** (for
+/// `raw_text`) and **moved once** (for `compressed_text`) — exactly 1 heap
+/// allocation on the analytics-enabled path, 0 on the disabled path.
+/// This is the PF-018 resolution: one clone + one move, not two clones.
 ///
 /// Call sites: `run_passthrough`, `run_parsed_command` non-zero exit,
 /// `run_diff` non-zero exit / empty diff / empty-after-parse, and the
 /// equivalent failure paths in `show.rs`.
 pub(super) fn finalize_git_output_passthrough(
-    raw: &str,
+    raw: String,
     label: String,
     show_stats: bool,
     command_type: crate::analytics::CommandType,
@@ -268,16 +270,16 @@ pub(super) fn finalize_git_output_passthrough(
     parse_tier: Option<&'static str>,
 ) {
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(raw, raw);
+        // ALLOC NOTE: count_token_pair borrows; no allocation here.
+        let (orig, comp) = crate::process::count_token_pair(&raw, &raw);
         crate::process::report_token_stats(orig, comp, "");
     }
     if crate::analytics::is_analytics_enabled() {
-        // Clone once: both `raw_text` and `compressed_text` are the same
-        // string, so we clone once and reuse.
-        let s = raw.to_string();
+        // 1 allocation: raw.clone() produces raw_text; raw is moved as
+        // compressed_text.  Zero allocations when analytics are disabled.
         crate::analytics::try_record_command(
-            s.clone(),
-            s,
+            raw.clone(),
+            raw,
             label,
             command_type,
             duration,
@@ -314,12 +316,14 @@ fn run_passthrough(
         eprint!("{}", output.stderr);
     }
 
-    // Passthrough: raw == compressed. Use the single-clone passthrough variant
-    // to avoid cloning the same buffer twice (PF-018).  Label is built lazily
-    // via build_analytics_label so the format! is skipped when both
-    // show_stats and analytics are disabled (PF-021).
+    let exit_code = output.exit_code;
+    // Passthrough: raw == compressed. Move stdout into the passthrough variant
+    // so the analytics path clones once and moves once — 1 allocation total
+    // instead of 2 (PF-018 resolution).  Label is built lazily via
+    // build_analytics_label so the format! is skipped when both show_stats
+    // and analytics are disabled (PF-021).
     finalize_git_output_passthrough(
-        &output.stdout,
+        output.stdout,
         build_analytics_label(subcmd, args, show_stats),
         show_stats,
         crate::analytics::CommandType::Git,
@@ -327,7 +331,7 @@ fn run_passthrough(
         Some("passthrough"),
     );
 
-    Ok(map_exit_code(output.exit_code))
+    Ok(map_exit_code(exit_code))
 }
 
 /// Run a git command and parse its output with the given parser function.
@@ -373,18 +377,19 @@ where
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
+        let exit_code = output.exit_code;
         // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. raw == compressed here; use single-clone passthrough
-        // variant to avoid cloning the same buffer twice (PF-018).
+        // invocations. Move stdout into the passthrough variant: 1 allocation
+        // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
         finalize_git_output_passthrough(
-            &output.stdout,
+            output.stdout,
             label,
             show_stats,
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
         );
-        return Ok(map_exit_code(output.exit_code));
+        return Ok(map_exit_code(exit_code));
     }
 
     // Git fetch writes to stderr; other subcommands write to stdout.

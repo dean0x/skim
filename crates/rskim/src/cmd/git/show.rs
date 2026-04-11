@@ -591,10 +591,10 @@ fn run_show_commit(
             // Record analytics on the failure path so the DB reflects failed
             // `git show` invocations (Commit 9). raw == compressed
             // (passthrough semantics) — mirrors run_parsed_command and
-            // run_diff non-zero-exit recording. Single-clone passthrough
-            // variant avoids cloning the same buffer twice (PF-018).
+            // run_diff non-zero-exit recording. Move stdout: 1 allocation
+            // (clone) on the analytics path, 0 when disabled (PF-018).
             super::finalize_git_output_passthrough(
-                &stdout,
+                stdout,
                 build_analytics_label("show", original_args, show_stats),
                 show_stats,
                 crate::analytics::CommandType::Git,
@@ -614,11 +614,11 @@ fn run_show_commit(
         // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
         // Route through finalize so the analytics DB records a zero-compression
         // entry instead of silently dropping the invocation (HIGH-3).
-        // raw == output; single-clone passthrough variant to avoid cloning the
-        // same buffer twice (PF-018).
+        // raw == output; move raw into the passthrough variant: 1 allocation
+        // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
         print!("{raw}");
         super::finalize_git_output_passthrough(
-            &raw,
+            raw,
             label,
             show_stats,
             crate::analytics::CommandType::Git,
@@ -656,7 +656,7 @@ fn run_show_commit(
 /// Emits a stderr notice matching `diff/mod.rs:301` `[skim:guardrail]` style so
 /// callers can observe which tier was selected without parsing structured output.
 fn passthrough_file_content(
-    raw: &str,
+    raw: String,
     label: String,
     show_stats: bool,
     duration: std::time::Duration,
@@ -664,8 +664,9 @@ fn passthrough_file_content(
 ) {
     eprintln!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
-    // raw == output (passthrough); use the single-clone passthrough variant
-    // to avoid cloning the same buffer twice (PF-018).
+    // raw == output (passthrough); move raw into finalize_git_output_passthrough
+    // so the analytics path clones once and moves once — 1 allocation total
+    // instead of 2 (PF-018 resolution).
     // Map numeric tier to canonical tier-name strings for the analytics DB.
     let tier_name: Option<&'static str> = match tier {
         1 => Some("full"),
@@ -730,20 +731,19 @@ fn run_show_file_content(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
+        let exit_code = output.exit_code;
         // Record analytics on the error path so the DB reflects failed
-        // invocations (e.g. `git show HEAD:missing.rs`). raw == compressed
-        // (passthrough semantics) — mirrors the pattern in run_parsed_command
-        // and diff/mod.rs for non-zero exit consistency. Single-clone
-        // passthrough variant to avoid cloning the same buffer twice (PF-018).
+        // invocations (e.g. `git show HEAD:missing.rs`). Move stdout: 1
+        // allocation (clone) on the analytics path, 0 when disabled (PF-018).
         super::finalize_git_output_passthrough(
-            &output.stdout,
+            output.stdout,
             build_analytics_label("show", args, show_stats),
             show_stats,
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
         );
-        return Ok(map_exit_code(output.exit_code));
+        return Ok(map_exit_code(exit_code));
     }
 
     let raw = output.stdout;
@@ -756,7 +756,9 @@ fn run_show_file_content(
 
     let Some(lang) = lang else {
         // Tier 2: unsupported or serde-based language — passthrough.
-        passthrough_file_content(&raw, label, show_stats, duration, 2);
+        // Move raw: the else branch always returns, so Rust knows raw is
+        // available after the let-else for the Tier 1 path.
+        passthrough_file_content(raw, label, show_stats, duration, 2);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -768,12 +770,14 @@ fn run_show_file_content(
             // Tier 3: transform failed — fall back to raw passthrough.
             // Record as a zero-compression pass so analytics and --show-stats
             // remain consistent with the unsupported-language branch above.
+            // Move raw: the Err arm always returns, so Rust knows raw is
+            // available after the match for the Ok path.
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(&raw, label, show_stats, duration, 3);
+            passthrough_file_content(raw, label, show_stats, duration, 3);
             return Ok(ExitCode::SUCCESS);
         }
     };

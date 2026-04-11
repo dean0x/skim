@@ -297,9 +297,21 @@ const MAX_JSON_MSG_LEN: usize = 16 * 1024;
 fn extract_json_level(obj: &Value) -> Option<String> {
     for key in &["level", "severity", "lvl", "log_level"] {
         if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
-            // Truncate at a char boundary to avoid splitting multi-byte sequences.
-            let truncated: String = v.chars().take(MAX_JSON_LEVEL_LEN).collect();
-            return Some(truncated.to_uppercase());
+            // Fast path: level values ("ERROR", "WARN", "INFO", "DEBUG",
+            // "TRACE") are overwhelmingly ASCII and well under 32 bytes.
+            // Byte-length check is a reliable proxy for char-length when
+            // the value is ASCII (byte == char), and level fields in
+            // non-ASCII locales still fit comfortably within the 32-byte
+            // cap (e.g. "WARNUNG" is 7 bytes / 7 chars, "ERREUR" is 6/6).
+            // Only adversarially long or non-BMP level values take the slow
+            // path, which is the case the cap exists to bound.
+            if v.len() <= MAX_JSON_LEVEL_LEN {
+                return Some(v.to_uppercase()); // 1 allocation
+            }
+            // Slow path: truncate at a char boundary to avoid splitting
+            // multi-byte sequences, then uppercase.
+            let truncated: String = v.chars().take(MAX_JSON_LEVEL_LEN).collect(); // alloc #1
+            return Some(truncated.to_uppercase()); // alloc #2
         }
     }
     None
