@@ -1,0 +1,19 @@
+{
+  "number": 77,
+  "title": "docs: update README",
+  "state": "OPEN",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "author": {"login": "bob"},
+  "body": "Just docs.",
+  "labels": [],
+  "assignees": [],
+  "milestone": null,
+  "headRefName": "docs/update",
+  "baseRefName": "main",
+  "additions": 5,
+  "deletions": 2,
+  "changedFiles": 1,
+  "statusCheckRollup": null,
+  "comments": []
+}
