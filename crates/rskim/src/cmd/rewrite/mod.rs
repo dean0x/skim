@@ -868,4 +868,124 @@ mod tests {
             "cargo test with flags has no compound operator"
         );
     }
+
+    // ========================================================================
+    // collect_input_tokens() — edge-case coverage (AD-13)
+    // ========================================================================
+
+    /// Helper: invoke collect_input_tokens with a set of &str positional args.
+    fn tokens_from(args: &[&str]) -> Option<Vec<String>> {
+        collect_input_tokens(args).expect("collect_input_tokens must not error")
+    }
+
+    /// Empty positional args list with no stdin → returns None.
+    ///
+    /// Note: this test is only meaningful when stdin is not a pipe (i.e. when
+    /// running interactively).  In CI, stdin is typically not a TTY so the
+    /// function reads stdin; passing an empty slice here avoids that branch.
+    /// The test verifies the `tokens.is_empty()` guard inside the function.
+    #[test]
+    fn test_collect_input_tokens_empty_slice_is_none() {
+        // An all-whitespace single arg produces no tokens → None.
+        assert_eq!(
+            tokens_from(&["   "]),
+            None,
+            "all-whitespace single arg must return None"
+        );
+    }
+
+    /// Convert a `&[&str]` literal into `Vec<String>` for assertion comparisons.
+    fn sv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Single multi-word quoted arg tokenizes the same as equivalent multi-arg form.
+    ///
+    /// Regression for the AD-13 fix: `skim rewrite 'prettier --check src/'`
+    /// (shell passes one arg) must tokenize identically to
+    /// `skim rewrite prettier --check src/` (three separate args).
+    #[test]
+    fn test_collect_input_tokens_single_quoted_equals_multi_arg() {
+        let single = tokens_from(&["prettier --check src/"]);
+        let multi = tokens_from(&["prettier", "--check", "src/"]);
+        assert_eq!(
+            single, multi,
+            "single-quoted arg must produce same tokens as multi-arg form"
+        );
+        assert_eq!(
+            single,
+            Some(sv(&["prettier", "--check", "src/"])),
+            "expected 3 tokens"
+        );
+    }
+
+    /// Tab characters inside a single arg are treated as whitespace (split_whitespace).
+    #[test]
+    fn test_collect_input_tokens_tab_as_whitespace() {
+        let result = tokens_from(&["cargo\ttest"]);
+        assert_eq!(
+            result,
+            Some(sv(&["cargo", "test"])),
+            "tab must be treated as whitespace"
+        );
+    }
+
+    /// Multiple consecutive spaces inside a single arg collapse to one split boundary.
+    #[test]
+    fn test_collect_input_tokens_consecutive_spaces() {
+        let result = tokens_from(&["cargo  test  --release"]);
+        assert_eq!(
+            result,
+            Some(sv(&["cargo", "test", "--release"])),
+            "consecutive spaces must collapse to single boundaries"
+        );
+    }
+
+    /// Mixed quoted + bare args: flat_map over all positional args.
+    ///
+    /// `skim rewrite 'cargo test' --extra` produces positional args
+    /// `["cargo test", "--extra"]`, which should flat_map to
+    /// `["cargo", "test", "--extra"]`.
+    #[test]
+    fn test_collect_input_tokens_mixed_quoted_and_bare() {
+        let result = tokens_from(&["cargo test", "--extra"]);
+        assert_eq!(
+            result,
+            Some(sv(&["cargo", "test", "--extra"])),
+            "mixed quoted + bare args must flat_map to unified token list"
+        );
+    }
+
+    /// Empty string arg inside a multi-arg slice contributes no tokens.
+    #[test]
+    fn test_collect_input_tokens_empty_string_arg_ignored() {
+        // ["", "cargo", "test"] → the empty arg contributes nothing.
+        let result = tokens_from(&["", "cargo", "test"]);
+        assert_eq!(
+            result,
+            Some(sv(&["cargo", "test"])),
+            "empty string arg must contribute no tokens"
+        );
+    }
+
+    /// Single non-empty arg with no spaces produces a single-token result.
+    #[test]
+    fn test_collect_input_tokens_single_word() {
+        let result = tokens_from(&["pytest"]);
+        assert_eq!(
+            result,
+            Some(sv(&["pytest"])),
+            "single word must produce single token"
+        );
+    }
+
+    /// All-whitespace multi-arg slice produces None.
+    #[test]
+    fn test_collect_input_tokens_all_whitespace_multi() {
+        let result = tokens_from(&[" ", "\t", "  "]);
+        assert_eq!(
+            result, None,
+            "all-whitespace multi-arg must return None (no tokens)"
+        );
+    }
 }

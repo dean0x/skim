@@ -1,12 +1,27 @@
 //! Rewrite-to-handler alignment tests.
 //!
-//! These tests form a closed loop: `skim rewrite <cmd>` produces a rewritten
-//! command string, and `skim <subcommand>` called with matching fixture stdin
-//! produces compressed output. Together they verify that:
+//! Two verification modes live in this file:
+//!
+//! **Pair verification** (most tests): `skim rewrite <cmd>` is asserted to
+//! produce a string containing the expected handler name, and `skim <handler>`
+//! is independently invoked with a fixture.  The two steps are independent —
+//! the handler invocation is hardcoded, not derived from the rewrite output.
+//! This proves (a) the rewrite rule emits a plausible string and (b) the
+//! handler parses the fixture, but does NOT prove the rewrite output is itself
+//! a valid invocation.
+//!
+//! **True round-trip** (`test_alignment_cargo_test_true_roundtrip`): step 1's
+//! stdout is captured, whitespace-split into tokens, and used verbatim as the
+//! step 2 invocation.  This proves the rewrite output is executable and catches
+//! typos in the rewrite rule table (e.g. `skim tset cargo` would fail here
+//! even though pair-verification tests would remain green).
+//!
+//! Together the tests verify that:
 //!
 //! 1. The rewrite rule maps to a subcommand that actually exists.
 //! 2. The handler parses the fixture and emits a non-empty compressed summary.
 //! 3. The compressed summary is smaller than or equal to the original fixture.
+//! 4. (Round-trip only) The rewrite output is a valid executable invocation.
 //!
 //! This test file complements `cli_e2e_rewrite.rs` (which only checks the
 //! rewrite string) and `cli_e2e_exit_codes.rs` (which only checks exit codes).
@@ -54,6 +69,57 @@ fn test_alignment_cargo_test_rewrite_and_handler() {
     let fixture = include_str!("fixtures/cmd/test/cargo_pass.json");
     skim_cmd()
         .args(["test", "cargo"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PASS"));
+}
+
+/// True round-trip: capture `skim rewrite cargo test` stdout, split into
+/// tokens, execute those tokens as the handler command.
+///
+/// This is the only test in this file that actually feeds step-1 output into
+/// step-2 as the command line.  It proves the rewrite output is a valid,
+/// executable handler invocation — a typo like `skim tset cargo` would be
+/// caught here even though pair-verification tests would remain green.
+///
+/// Other alignment tests use the "pair verification" pattern (step 2 hardcodes
+/// the handler name) because that is sufficient for testing the handler's
+/// parsing behaviour.  Migrating all 12 to true round-trips is tracked as
+/// follow-up work.
+#[test]
+fn test_alignment_cargo_test_true_roundtrip() {
+    // Step 1: capture the rewrite output.
+    let rewrite_out = skim_cmd()
+        .args(["rewrite", "cargo", "test"])
+        .output()
+        .unwrap();
+    assert!(
+        rewrite_out.status.success(),
+        "skim rewrite cargo test must succeed; got: {:?}",
+        rewrite_out.status
+    );
+
+    let rewritten = String::from_utf8(rewrite_out.stdout).unwrap();
+    let rewritten = rewritten.trim();
+    assert!(
+        !rewritten.is_empty(),
+        "skim rewrite cargo test must emit a non-empty command string"
+    );
+
+    // Step 2: parse the rewrite output into tokens and execute.
+    // `rewritten` is e.g. "skim test cargo" — split by whitespace and
+    // drop the leading "skim" token (assert_cmd already selects the binary).
+    let tokens: Vec<&str> = rewritten.split_whitespace().collect();
+    assert!(
+        tokens.first() == Some(&"skim"),
+        "rewrite output must start with 'skim'; got: {rewritten}"
+    );
+    let handler_args = &tokens[1..]; // ["test", "cargo"]
+
+    let fixture = include_str!("fixtures/cmd/test/cargo_pass.json");
+    skim_cmd()
+        .args(handler_args)
         .write_stdin(fixture)
         .assert()
         .success()

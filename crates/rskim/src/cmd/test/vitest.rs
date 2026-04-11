@@ -381,6 +381,9 @@ static COMMA_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// [`scrape_failures`] so the Tier-2 result includes a list of failing
 /// tests rather than an empty entries list (AD-Commit2, 2026-04-11).
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
+    // Strip ANSI once here; pass `cleaned` into `scrape_failures` so it can
+    // skip its own ANSI-strip pass (fast-path in shared::scrape_failures detects
+    // the absence of ESC bytes and borrows the slice directly — no second scan).
     let cleaned = crate::output::strip_ansi(raw);
 
     // Pattern 1: "Tests  3 passed | 0 failed | 3 total"
@@ -397,7 +400,7 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
             duration_ms: None,
         };
         let entries = if fail > 0 {
-            scrape_failures(raw, TestKind::Vitest)
+            scrape_failures(&cleaned, TestKind::Vitest)
         } else {
             vec![]
         };
@@ -424,7 +427,7 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
             duration_ms: None,
         };
         let entries = if fail > 0 {
-            scrape_failures(raw, TestKind::Vitest)
+            scrape_failures(&cleaned, TestKind::Vitest)
         } else {
             vec![]
         };

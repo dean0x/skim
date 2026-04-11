@@ -1,7 +1,0 @@
---- FAIL: TestFoo (0.01s)
-    foo_test.go:15: expected 42, got 0
---- PASS: TestBar (0.00s)
---- FAIL: TestBaz (0.02s)
-    baz_test.go:33: unexpected nil
-FAIL
-FAIL	example.com/mypackage	0.03s

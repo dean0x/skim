@@ -75,7 +75,16 @@ static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
     // Strip ANSI escape codes so color-enabled output (e.g. pytest --color=yes,
     // vitest with TTY detected) does not break pattern matching.
-    let cleaned = RE_ANSI.replace_all(text, "");
+    //
+    // Fast-path: when the caller has already stripped ANSI (no ESC bytes remain),
+    // borrow the slice directly rather than running the regex over it a second time.
+    // This eliminates the double-strip in `vitest::try_parse_regex`, which calls
+    // `output::strip_ansi(raw)` → `cleaned` and then passes `cleaned` here.
+    let cleaned: std::borrow::Cow<str> = if text.as_bytes().contains(&0x1b) {
+        std::borrow::Cow::Owned(RE_ANSI.replace_all(text, "").into_owned())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
 
     let re = match kind {
         TestKind::Cargo => &*RE_CARGO_FAIL,

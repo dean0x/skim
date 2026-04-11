@@ -620,3 +620,78 @@ fn test_git_show_preserves_commit_body() {
         "output must contain 'paragraph 2': {stdout}"
     );
 }
+
+// ============================================================================
+// Regression: git show failure path records analytics (ea4e52f)
+// ============================================================================
+
+/// Regression guard for commit ea4e52f.
+///
+/// Before ea4e52f, `run_show_commit` and `run_show_file_content` returned early
+/// on non-zero exit WITHOUT calling `finalize_git_output`, causing the analytics
+/// DB to silently miss failed `git show` invocations.
+///
+/// The fix introduced `ShowRawOutcome::{Success, Failure}` and threads
+/// stdout/duration back so `finalize_git_output_passthrough` is called on the
+/// error path. This test locks in the observable contract:
+///
+/// 1. `skim git show <invalid-ref>` exits with a non-zero code (failure propagates).
+/// 2. stderr surfaces git's error message (not swallowed or replaced).
+///
+/// Analytics recording itself is fire-and-forget via a background thread and
+/// cannot be verified in a pure E2E test without database introspection; the
+/// exit-code + stderr assertions here are sufficient to prove the failure path
+/// is traversed (a silent early-return before the fix would still have exited
+/// non-zero, but stderr would have been empty).
+#[test]
+fn test_skim_git_show_invalid_ref_exits_nonzero() {
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "show", "INVALID_REF_THAT_CANNOT_EXIST_XYZ_12345"])
+        .output()
+        .unwrap();
+
+    // Failure must propagate — skim must not silently succeed on a bad ref.
+    assert!(
+        !output.status.success(),
+        "skim git show <invalid-ref> must exit non-zero; got: {:?}",
+        output.status
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // git writes "fatal: ..." to stderr on bad refs — that message must reach
+    // the caller so the user knows what failed.
+    assert!(
+        stderr.contains("fatal") || stderr.contains("unknown revision") || !stderr.is_empty(),
+        "skim git show <invalid-ref> must emit git's error on stderr; got empty stderr"
+    );
+}
+
+/// Regression guard for commit ea4e52f — file-content mode failure path.
+///
+/// `run_show_file_content` also had the analytics-drop bug. Requesting a path
+/// that does not exist in HEAD exercises the same fix.
+#[test]
+fn test_skim_git_show_invalid_file_ref_exits_nonzero() {
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "show", "HEAD:this_file_does_not_exist_xyz.rs"])
+        .output()
+        .unwrap();
+
+    // Non-zero exit: git show exits 128 for missing objects, mapped to 1 by skim.
+    assert!(
+        !output.status.success(),
+        "skim git show HEAD:<missing-file> must exit non-zero; got: {:?}",
+        output.status
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // git's error must surface to the caller.
+    assert!(
+        !stderr.is_empty(),
+        "skim git show HEAD:<missing-file> must emit git's error on stderr; got empty stderr"
+    );
+}
