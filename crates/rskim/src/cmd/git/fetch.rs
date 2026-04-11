@@ -36,7 +36,14 @@ pub(super) fn run_fetch(
 
     let label = super::build_analytics_label("fetch", args, show_stats);
 
-    run_parsed_command(&full_args, show_stats, output_format, true, label, parse_fetch)
+    run_parsed_command(
+        &full_args,
+        show_stats,
+        output_format,
+        true,
+        label,
+        parse_fetch,
+    )
 }
 
 // ============================================================================

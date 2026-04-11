@@ -95,9 +95,7 @@ pub(crate) struct DebugTestGuard {
 impl DebugTestGuard {
     /// Acquire the debug test lock and reset the flag to a known-clean state.
     pub(crate) fn acquire() -> Self {
-        let guard = DEBUG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let guard = DEBUG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_debug_for_tests();
         Self { _guard: guard }
     }
