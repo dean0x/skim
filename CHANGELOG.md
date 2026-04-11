@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `parse_tier` field added to `GitResult` and propagated through all git handlers to the analytics DB (AD-12). Git invocations now appear with `"full"`, `"degraded"`, or `"passthrough"` tier labels, consistent with the file/lint/infra handler families.
 
 ### Testing
-- **2,006 tests passing** (up from 1,986 in v2.3.1; +16 alignment E2E, +4 parse_tier, +various unit tests)
+- **2,447 tests passing** (up from 2,223 in v2.3.1; +16 alignment E2E, +parse_tier unit tests, +stack-trace/dedup/npm-audit/gh-pr-view/scrape_failures/scrutinizer-regression unit tests)
 - New `cli_e2e_rewrite_alignment.rs` — 16 tests closing the rewrite→execute loop for all major command families
 
 ## [2.3.1] - 2026-04-09

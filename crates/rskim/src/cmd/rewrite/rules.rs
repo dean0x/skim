@@ -101,13 +101,24 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
-    // DESIGN NOTE (AD-4): `--stat`, `--name-only` removed from skip list.
-    // These are Group B flags (already-compact output). Removing them allows
-    // `git diff --stat` and `git diff --name-only` to flow through to the
-    // handler's passthrough branch. The handler's `user_has_flag` check
-    // (diff/mod.rs) still catches these and calls `run_passthrough`, so
-    // output is byte-identical to raw git. This also fixes the `--staged`
-    // collision (previously eaten by loose `--stat` prefix matching).
+    // DESIGN NOTE (AD-4, extended 2026-04-11): `--stat`, `--name-only` removed
+    // from skip list. These are Group B flags (already-compact output).
+    // Removing them allows `git diff --stat` and `git diff --name-only` to
+    // flow through to the handler's passthrough branch. The handler's
+    // `user_has_flag` check (diff/mod.rs) still catches these and calls
+    // `run_passthrough`, so output is byte-identical to raw git. This also
+    // fixes the `--staged` collision (previously eaten by loose `--stat`
+    // prefix matching).
+    //
+    // Extension (AD-11, see rewrite/acknowledge.rs): lint tools whose raw
+    // output is already minimal (`prettier --check`, `rustfmt --check`,
+    // `cargo fmt --check`) are acknowledged via ACK prefix patterns in
+    // acknowledge.rs and short-circuit before the rule table. The prettier
+    // and rustfmt entries further down in this table are therefore dead code
+    // kept only to document the historical mapping — the ACK path in
+    // engine.rs runs first. Removing them entirely is out of scope per the
+    // "don't refactor rewrite engine" rule; the ACK tests in
+    // cli_e2e_rewrite_alignment.rs prove they are unreachable.
     RewriteRule {
         prefix: &["git", "diff"],
         rewrite_to: &["skim", "git", "diff"],
@@ -130,11 +141,17 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
-    // git show — new rule (AD-5)
+    // git show — new rule (AD-5, updated 2026-04-11)
     //
     // Handles `git show <hash>`, `git show <hash>:<path>`, and defaults.
     // The handler (cmd/git/show.rs) dispatches to commit-mode or
     // file-content-mode based on argument shape.
+    //
+    // As of AD-8 (see show.rs), the commit-mode path preserves the full
+    // commit message body AND `Merge: p1 p2` parent lines via the structured
+    // `body: String` and `parents: Option<String>` fields on `CommitHeader`.
+    // Earlier versions dropped both, which was corrected in the PR that
+    // bundles this AD-5 update with the AD-8 body/parents-preservation work.
     RewriteRule {
         prefix: &["git", "show"],
         rewrite_to: &["skim", "git", "show"],
