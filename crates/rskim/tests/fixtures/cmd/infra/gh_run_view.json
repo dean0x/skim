@@ -21,6 +21,7 @@
       "name": "test",
       "status": "completed",
       "conclusion": "failure",
+      "url": "https://github.com/example/repo/actions/runs/12345/jobs/67891",
       "steps": [
         {"name": "Set up job", "conclusion": "success"},
         {"name": "Checkout", "conclusion": "success"},

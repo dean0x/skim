@@ -9,6 +9,13 @@
 //! to diagnose CI failures without fetching full logs. We include up to
 //! [`MAX_STEP_DETAIL`] steps per failed job, filtered to only show non-passing
 //! steps. Successful jobs show only a one-line summary to minimize context.
+//!
+//! # Design Decision: URL surfacing for failed jobs
+//!
+//! Failed jobs include a `" — {url}"` suffix in their item value when a
+//! `url`/`htmlUrl` field is present in the JSON. This gives agents a direct
+//! link to the failing job log without requiring a follow-up `gh run view --job`
+//! invocation. Passing jobs omit the URL to reduce noise.
 
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
@@ -47,6 +54,9 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 ///
 /// Separated from [`try_parse_json`] so that run metadata extraction and job
 /// iteration each have a single responsibility.
+///
+/// For failed/failure jobs a `" — {url}"` suffix is appended to the item value
+/// when a `url` or `htmlUrl` field is present. See module-level design decision.
 fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
     for job in jobs {
         let job_name = job
@@ -59,9 +69,24 @@ fn extract_job_items(jobs: &[serde_json::Value], items: &mut Vec<InfraItem>) {
             .unwrap_or_else(|| job.get("status").and_then(|v| v.as_str()).unwrap_or("?"))
             .to_lowercase();
 
+        let is_failing = job_conclusion == "failure" || job_conclusion == "failed";
+        let job_url = if is_failing {
+            job.get("url")
+                .or_else(|| job.get("htmlUrl"))
+                .and_then(|v| v.as_str())
+        } else {
+            None
+        };
+
+        let job_value = if let Some(url) = job_url {
+            format!("{job_conclusion} — {url}")
+        } else {
+            job_conclusion.clone()
+        };
+
         items.push(InfraItem {
             label: format!("job:{job_name}"),
-            value: job_conclusion.clone(),
+            value: job_value,
         });
 
         // For failed jobs, show step details (up to MAX_STEP_DETAIL non-passing steps)
@@ -387,6 +412,36 @@ mod tests {
             args.len(),
             original_len,
             "Should not inject when --json present"
+        );
+    }
+
+    /// Failed job items must include URL when available; passing jobs must not.
+    #[test]
+    fn test_failed_job_includes_url() {
+        let input = load_fixture("gh_run_view.json");
+        let obj: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let result = try_parse_json(&obj).expect("must parse");
+        // The "test" job is failing and has a url field in the fixture.
+        let test_job = result
+            .items
+            .iter()
+            .find(|i| i.label == "job:test")
+            .expect("job:test must be present");
+        assert!(
+            test_job.value.contains("https://"),
+            "Failed job must include URL: {}",
+            test_job.value
+        );
+        // The "build" job is passing and must not include a URL.
+        let build_job = result
+            .items
+            .iter()
+            .find(|i| i.label == "job:build")
+            .expect("job:build must be present");
+        assert!(
+            !build_job.value.contains("https://"),
+            "Passing job must not include URL: {}",
+            build_job.value
         );
     }
 }
