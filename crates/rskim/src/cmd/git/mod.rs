@@ -304,6 +304,18 @@ fn run_passthrough(
 /// Callers are responsible for baking global flags into `subcmd_args` before
 /// calling this function.
 ///
+/// `label` is the analytics label string built by the caller from the user's
+/// **original** (pre-rewrite) args.  Callers should build it lazily using the
+/// same guard as `run_show_commit`:
+///
+/// ```rust,ignore
+/// let label = if show_stats || crate::analytics::is_analytics_enabled() {
+///     format!("skim git <subcmd> {}", args.join(" "))
+/// } else {
+///     String::new()
+/// };
+/// ```
+///
 /// When `combine_stderr` is `true`, the parser receives `stderr + stdout`
 /// combined. Git fetch writes its output to stderr, so fetch uses `true`;
 /// all other subcommands use `false` (stdout only).
@@ -312,6 +324,7 @@ pub(super) fn run_parsed_command<F>(
     show_stats: bool,
     output_format: OutputFormat,
     combine_stderr: bool,
+    label: String,
     parser: F,
 ) -> anyhow::Result<ExitCode>
 where
@@ -356,10 +369,12 @@ where
 
     // Both `raw` and `result_str` are owned here and consumed at end-of-function;
     // use the owned variant to move them directly rather than cloning.
+    // `label` is supplied by the caller from the user's original (pre-rewrite) args
+    // so the analytics DB records the invocation as the user typed it.
     finalize_git_output_owned(
         raw,
         result_str,
-        format!("skim git {}", subcmd_args.join(" ")),
+        label,
         show_stats,
         crate::analytics::CommandType::Git,
         output.duration,

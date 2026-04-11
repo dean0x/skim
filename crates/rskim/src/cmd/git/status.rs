@@ -41,7 +41,15 @@ pub(super) fn run_status(
     ]);
     full_args.extend_from_slice(&filtered_args);
 
-    run_parsed_command(&full_args, show_stats, output_format, false, parse_status)
+    // Build analytics label lazily from user's original args (before flag injection)
+    // to match the convention used by run_show_commit and run_show_file_content.
+    let label = if show_stats || crate::analytics::is_analytics_enabled() {
+        format!("skim git status {}", args.join(" "))
+    } else {
+        String::new()
+    };
+
+    run_parsed_command(&full_args, show_stats, output_format, false, label, parse_status)
 }
 
 /// Accumulated per-category file lists from a porcelain v2 status parse.
