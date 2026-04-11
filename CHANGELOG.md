@@ -7,9 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Fixed
 - `skim git diff` now records a zero-compression analytics row when the diff is empty (previously uncounted). This unifies analytics recording across empty and non-empty invocations. ([#132](https://github.com/dean0x/skim/issues/132), [#135](https://github.com/dean0x/skim/pull/135))
 - `skim git show <annotated-tag|blob|tree>` (non-commit passthrough) now records analytics (previously uncounted). This unifies analytics recording across all `git show` modes. ([#132](https://github.com/dean0x/skim/issues/132), [#135](https://github.com/dean0x/skim/pull/135))
+- `skim git log`, `skim git status`, `skim git fetch`, `skim git diff` now record analytics on non-zero exit codes (previously, failed git invocations were silently dropped from the analytics DB). AD-9.
+- `skim infra gh pr checks` and `skim infra gh run view` now include URLs for failing checks and run items so agents can navigate directly to the failure without a second command. AD-9.
+- `skim log` now tracks stack frames attached to the preceding log entry (up to 3 frames shown; elision count in `LogResult.stack_frames_elided`). Deduplication is level-aware (`level|message` key). AD-10.
+- `skim infra curl` now surfaces up to 20 object keys (was 5) before truncating. The truncation notice displays the actual cap.
+- `skim file tree` depth-capped output now reports the count of hidden deeper entries (`"(N deeper entries hidden)"`) instead of a generic cap notice.
+- `skim lint golangci` severity now inferred from linter name and message text (was always `Warning`). AD-8.
+- `skim lint rustfmt` location messages now include the diff line number (`"formatting difference at line N"` vs. `"formatting difference detected"`). AD-8.
+- `skim git diff` warns on non-empty stderr at exit 0 (`[skim] git diff notice: ...`) so LF/CRLF replacement warnings are not silently discarded.
+
+### Added
+- `prettier --check` and `rustfmt --check` are now acknowledged as already-compact (AD-11, compress-or-skip rule). `skim rewrite` echoes the original command instead of rewriting to `skim lint prettier/rustfmt`. This prevents the skim header from inflating output on clean or near-clean codebases.
+- `parse_tier` field added to `GitResult` and propagated through all git handlers to the analytics DB (AD-12). Git invocations now appear with `"full"`, `"degraded"`, or `"passthrough"` tier labels, consistent with the file/lint/infra handler families.
+
+### Testing
+- **2,006 tests passing** (up from 1,986 in v2.3.1; +16 alignment E2E, +4 parse_tier, +various unit tests)
+- New `cli_e2e_rewrite_alignment.rs` — 16 tests closing the rewrite→execute loop for all major command families
 
 ## [2.3.1] - 2026-04-09
 
