@@ -39,8 +39,16 @@ static RE_LOG_LEVEL_BRACKET: LazyLock<Regex> =
 static RE_LOG_LEVEL_BARE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?i)(ERROR|WARN|WARNING|INFO|DEBUG|TRACE):?\s+(.*)").unwrap());
 
-/// Matches Java/Node.js stack trace lines.
-static RE_LOG_STACK_TRACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+at\s+").unwrap());
+/// Matches Java/Node.js/Python stack trace lines.
+///
+/// # AD-10 (2026-04-11) — Multi-language stack trace patterns
+/// - Java/Node.js: `    at <method>` (leading whitespace + "at ")
+/// - Python: `  File "...", line N` (leading whitespace + 'File "')
+///
+/// Both patterns are anchored to leading whitespace so they don't match
+/// regular log lines that happen to contain these substrings mid-sentence.
+static RE_LOG_STACK_TRACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^\s+at\s+|^\s+File\s+")"#).unwrap());
 
 // ============================================================================
 // Flags
@@ -263,7 +271,7 @@ fn try_parse_json_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         all_entries.push((level, message));
     }
 
-    Some(apply_compression(all_entries, total_lines, flags))
+    Some(apply_compression(all_entries, total_lines, 0, flags))
 }
 
 fn extract_json_level(obj: &Value) -> Option<String> {
@@ -288,18 +296,57 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 // Tier 2: regex-based log formats
 // ============================================================================
 
+/// Parse regex-based log formats into a LogResult.
+///
+/// # AD-10 (2026-04-11) — Stack trace capture and last-3-frame elision
+/// Stack trace lines (Java `at …`, Python `File "…"`) are buffered in
+/// `pending_stack`. When the next log line is encountered, the accumulated
+/// frames are attached to the previous entry's message:
+///
+/// 1. Total frame count is recorded as `total_frames`.
+/// 2. Keep only the **last** 3 frames (preserving their relative order):
+///    `pending_stack.iter().rev().take(3).rev()`.
+/// 3. The frames are appended as a newline-joined suffix to the previous
+///    entry's message.
+/// 4. Elided count: `total_frames.saturating_sub(3)` — accumulated across
+///    all entries and surfaced in `LogResult::stack_frames_elided`.
 fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     let mut all_entries: Vec<(Option<String>, String)> = Vec::with_capacity(256);
     let mut total_lines = 0usize;
     let mut found_structured = false;
+    // Stack trace capture state (AD-10)
+    let mut pending_stack: Vec<String> = Vec::new();
+    let mut total_stack_frames_elided: usize = 0;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
-        if trimmed.is_empty() || RE_LOG_STACK_TRACE.is_match(line) {
-            // Skip blank lines and stack trace lines (checked on original line to
-            // preserve leading whitespace detection).
+        if trimmed.is_empty() {
+            // Blank lines flush the pending stack (end of exception block).
+            if !pending_stack.is_empty() && !all_entries.is_empty() {
+                flush_stack_frames(
+                    &mut all_entries,
+                    &mut pending_stack,
+                    &mut total_stack_frames_elided,
+                );
+            }
             continue;
         }
+
+        // Check on the original (untrimmed) line to detect leading whitespace.
+        if RE_LOG_STACK_TRACE.is_match(line) {
+            pending_stack.push(trimmed.to_string());
+            continue;
+        }
+
+        // New log line: flush any accumulated stack frames onto the previous entry.
+        if !pending_stack.is_empty() && !all_entries.is_empty() {
+            flush_stack_frames(
+                &mut all_entries,
+                &mut pending_stack,
+                &mut total_stack_frames_elided,
+            );
+        }
+
         total_lines += 1;
 
         let without_ts = strip_timestamp(trimmed, flags.keep_timestamps);
@@ -311,6 +358,15 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         }
     }
 
+    // Flush any trailing stack frames at end-of-input.
+    if !pending_stack.is_empty() && !all_entries.is_empty() {
+        flush_stack_frames(
+            &mut all_entries,
+            &mut pending_stack,
+            &mut total_stack_frames_elided,
+        );
+    }
+
     // Issue 8: if no structured log levels were found, entries are plain text —
     // return None to fall through to Passthrough rather than producing a
     // misleading Degraded result.
@@ -318,7 +374,40 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         return None;
     }
 
-    Some(apply_compression(all_entries, total_lines, flags))
+    Some(apply_compression(
+        all_entries,
+        total_lines,
+        total_stack_frames_elided,
+        flags,
+    ))
+}
+
+/// Flush `pending_stack` onto the last entry in `all_entries`.
+///
+/// Keeps the last 3 frames (in original order) and appends them as a
+/// newline-joined suffix. Increments `elided` by the number dropped.
+///
+/// Both `all_entries` and `pending_stack` must remain `&mut Vec` rather than
+/// slices: `all_entries` uses `.last_mut()` (Vec-level borrow), `pending_stack`
+/// calls `.clear()` which is not available on `&mut [_]`.
+#[allow(clippy::ptr_arg)]
+fn flush_stack_frames(
+    all_entries: &mut Vec<(Option<String>, String)>,
+    pending_stack: &mut Vec<String>,
+    elided: &mut usize,
+) {
+    let total = pending_stack.len();
+    let keep: Vec<String> = pending_stack.iter().rev().take(3).rev().cloned().collect();
+    *elided += total.saturating_sub(3);
+
+    if let Some((_, msg)) = all_entries.last_mut() {
+        for frame in &keep {
+            msg.push('\n');
+            msg.push_str(frame);
+        }
+    }
+
+    pending_stack.clear();
 }
 
 /// Strip the timestamp prefix from a log line, unless `keep_timestamps` is true.
@@ -380,16 +469,29 @@ fn filter_debug_entries(
     (filtered, debug_hidden)
 }
 
-/// Deduplicate entries by normalized message, incrementing count on collision.
+/// Deduplicate entries by level-aware normalized key, incrementing count on collision.
 ///
-/// Returns the deduplicated output entries.
+/// # AD-10 (2026-04-11) — Level-aware dedup
+/// The dedup key is `"{level}|{normalized_message}"` rather than just the
+/// normalized message. Previously an ERROR and a WARN with the same text were
+/// merged into a single entry, losing the level distinction. With level-aware
+/// keys, `ERROR: foo` and `WARN: foo` remain separate entries, so agents can
+/// accurately count ERROR vs WARN occurrences.
+///
+/// The `"-"` placeholder is used for entries with no level (e.g., unstructured
+/// plain-text lines) to keep the key format consistent.
 fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -> Vec<LogEntry> {
     // Issue 6: pre-size the dedup map and output vec to avoid repeated reallocation.
     let mut dedup_map: HashMap<String, usize> = HashMap::with_capacity(1024);
     let mut output_entries: Vec<LogEntry> = Vec::with_capacity(256);
 
     for (level, message) in entries {
-        let normalized = message.to_lowercase();
+        // AD-10: key includes level so ERROR+WARN with same text are NOT merged.
+        let normalized_key = format!(
+            "{}|{}",
+            level.as_deref().unwrap_or("-"),
+            message.to_lowercase()
+        );
 
         if no_dedup {
             // Issue 3: `level` and `message` are owned — no clone needed.
@@ -398,11 +500,11 @@ fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -
                 message,
                 count: 1,
             });
-        } else if let Some(&idx) = dedup_map.get(&normalized) {
+        } else if let Some(&idx) = dedup_map.get(&normalized_key) {
             output_entries[idx].count += 1;
         } else {
             let idx = output_entries.len();
-            dedup_map.insert(normalized, idx);
+            dedup_map.insert(normalized_key, idx);
             // Issue 3: `level` and `message` are owned — no clone needed.
             output_entries.push(LogEntry {
                 level,
@@ -421,30 +523,39 @@ fn build_log_result(
     total_lines: usize,
     debug_hidden: usize,
     debug_only: bool,
+    stack_frames_elided: usize,
 ) -> LogResult {
     let unique_messages = output_entries.len();
     let deduplicated_count = total_lines
         .saturating_sub(unique_messages)
         .saturating_sub(debug_hidden);
 
-    LogResult::new(
+    LogResult::new_with_stack(
         total_lines,
         unique_messages,
         debug_hidden,
         deduplicated_count,
         output_entries,
         debug_only,
+        stack_frames_elided,
     )
 }
 
 fn apply_compression(
     all_entries: Vec<(Option<String>, String)>,
     total_lines: usize,
+    stack_frames_elided: usize,
     flags: &LogFlags,
 ) -> LogResult {
     let (filtered, debug_hidden) = filter_debug_entries(all_entries, flags);
     let output_entries = deduplicate_entries(filtered, flags.no_dedup);
-    build_log_result(output_entries, total_lines, debug_hidden, flags.debug_only)
+    build_log_result(
+        output_entries,
+        total_lines,
+        debug_hidden,
+        flags.debug_only,
+        stack_frames_elided,
+    )
 }
 
 // ============================================================================
@@ -645,17 +756,138 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_trace_lines_skipped() {
+    fn test_stack_trace_lines_attached_to_entry() {
+        // AD-10: stack trace lines are now attached to the preceding entry, not skipped.
         let input = "ERROR: something failed\n    at main() line 5\n    at run() line 10\nINFO: continuing\n";
         let flags = make_flags();
         let result = try_parse_regex_logs(input, &flags).unwrap();
-        // Stack trace lines should be skipped
+        // The error entry should have both stack frames appended (only 2 frames, none elided).
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
         assert!(
+            error_entry.message.contains("at main()"),
+            "Stack frame should be attached to error entry: {}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("at run()"),
+            "Second stack frame should be attached: {}",
+            error_entry.message
+        );
+        // INFO entry should not contain stack frames
+        let info_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("INFO"))
+            .expect("INFO entry must exist");
+        assert!(
+            !info_entry.message.contains("at main()"),
+            "Stack frames must not bleed into INFO entry: {}",
+            info_entry.message
+        );
+    }
+
+    /// AD-10: ERROR and WARN entries with the same text must NOT merge.
+    #[test]
+    fn test_log_dedup_preserves_level() {
+        let input = load_fixture("dedup_error_warn.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        // ERROR+ERROR dedup'd to 1 ERROR(×2), WARN+WARN dedup'd to 1 WARN(×2),
+        // INFO stays as 1 INFO(×1) — 3 distinct entries total.
+        assert_eq!(
+            result.entries.len(),
+            3,
+            "ERROR and WARN with same message must remain separate: {:?}",
             result
                 .entries
                 .iter()
-                .all(|e| !e.message.contains("at main()")),
-            "Stack trace lines should not appear in entries"
+                .map(|e| (&e.level, &e.message, e.count))
+                .collect::<Vec<_>>()
+        );
+        let error = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .unwrap();
+        assert_eq!(error.count, 2, "ERROR must appear ×2");
+        let warn = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("WARN"))
+            .unwrap();
+        assert_eq!(warn.count, 2, "WARN must appear ×2");
+    }
+
+    /// AD-10: 5-frame Java trace → last 3 kept, 2 elided.
+    #[test]
+    fn test_log_stack_elision_keeps_last_3() {
+        let input = load_fixture("stack_trace_java.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+        // Last 3 of the 5 frames must be present.
+        assert!(
+            error_entry.message.contains("OrderService.run"),
+            "3rd-from-last frame must be kept: {}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("Main.main"),
+            "Last frame must be kept: {}",
+            error_entry.message
+        );
+        // First 2 frames (process, handle) must be absent.
+        assert!(
+            !error_entry.message.contains("OrderService.process"),
+            "Elided frame must not appear: {}",
+            error_entry.message
+        );
+    }
+
+    /// AD-10: elided count renders in the footer when non-zero.
+    #[test]
+    fn test_log_stack_elision_footer() {
+        let input = load_fixture("stack_trace_java.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        // 5 frames total, 3 kept → 2 elided.
+        assert_eq!(result.stack_frames_elided, 2, "Should elide 2 of 5 frames");
+        let display = result.as_ref();
+        assert!(
+            display.contains("+2 stack frames elided"),
+            "Footer must appear when frames are elided: {display}"
+        );
+    }
+
+    /// AD-10: Python `File "..."` stack traces are recognised.
+    #[test]
+    fn test_log_python_traceback_recognised() {
+        let input = load_fixture("stack_trace_python.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+        // Python traces use `File "…"` — must be attached and last-3 kept.
+        assert!(
+            error_entry.message.contains("threading.py"),
+            "Last Python frame must be kept: {}",
+            error_entry.message
+        );
+        // 4 frames total, 3 kept → 1 elided.
+        assert_eq!(
+            result.stack_frames_elided, 1,
+            "Should elide 1 of 4 Python frames"
         );
     }
 

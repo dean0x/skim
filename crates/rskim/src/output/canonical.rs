@@ -773,12 +773,23 @@ pub(crate) struct LogResult {
     /// True when --debug-only mode was requested.
     #[serde(default)]
     pub(crate) debug_only: bool,
+    /// Number of stack frames elided from all captured traces (last 3 per trace kept).
+    ///
+    /// # AD-10 (2026-04-11)
+    /// When non-zero, a `(+{n} stack frames elided)` footer is appended to the
+    /// text render so agents know stack traces were truncated. Zero means either
+    /// no traces were encountered or all frames fit within the 3-frame window.
+    #[serde(default)]
+    pub(crate) stack_frames_elided: usize,
     #[serde(default)]
     rendered: String,
 }
 
 impl LogResult {
     /// Create a new LogResult with pre-computed rendered output.
+    ///
+    /// `stack_frames_elided` is the total number of stack frames dropped across
+    /// all captured traces (0 when no elision occurred). See AD-10.
     pub(crate) fn new(
         total_lines: usize,
         unique_messages: usize,
@@ -787,6 +798,27 @@ impl LogResult {
         entries: Vec<LogEntry>,
         debug_only: bool,
     ) -> Self {
+        Self::new_with_stack(
+            total_lines,
+            unique_messages,
+            debug_hidden,
+            deduplicated_count,
+            entries,
+            debug_only,
+            0,
+        )
+    }
+
+    /// Create a new LogResult with stack frame elision count.
+    pub(crate) fn new_with_stack(
+        total_lines: usize,
+        unique_messages: usize,
+        debug_hidden: usize,
+        deduplicated_count: usize,
+        entries: Vec<LogEntry>,
+        debug_only: bool,
+        stack_frames_elided: usize,
+    ) -> Self {
         let rendered = Self::render(
             total_lines,
             unique_messages,
@@ -794,6 +826,7 @@ impl LogResult {
             deduplicated_count,
             &entries,
             debug_only,
+            stack_frames_elided,
         );
         Self {
             total_lines,
@@ -802,6 +835,7 @@ impl LogResult {
             deduplicated_count,
             entries,
             debug_only,
+            stack_frames_elided,
             rendered,
         }
     }
@@ -816,6 +850,7 @@ impl LogResult {
                 self.deduplicated_count,
                 &self.entries,
                 self.debug_only,
+                self.stack_frames_elided,
             );
         }
     }
@@ -827,6 +862,7 @@ impl LogResult {
         deduplicated_count: usize,
         entries: &[LogEntry],
         debug_only: bool,
+        stack_frames_elided: usize,
     ) -> String {
         use std::fmt::Write;
 
@@ -866,6 +902,11 @@ impl LogResult {
                     }
                 }
             }
+        }
+
+        // AD-10: append elision footer when frames were truncated.
+        if stack_frames_elided > 0 {
+            let _ = write!(output, "\n(+{stack_frames_elided} stack frames elided)");
         }
 
         output
@@ -1624,6 +1665,7 @@ mod tests {
             deduplicated_count: 45,
             entries: vec![],
             debug_only: false,
+            stack_frames_elided: 0,
             rendered: String::new(),
         };
         result.ensure_rendered();
@@ -2008,7 +2050,14 @@ impl ShowCommitResult {
         diff_output: &str,
     ) -> Self {
         let files_changed = files.len();
-        let rendered = Self::render(&hash, &author, &subject, &body, parents.as_deref(), diff_output);
+        let rendered = Self::render(
+            &hash,
+            &author,
+            &subject,
+            &body,
+            parents.as_deref(),
+            diff_output,
+        );
         Self {
             hash,
             author,
@@ -2028,7 +2077,14 @@ impl ShowCommitResult {
     /// - `parents` (when `Some`) is prepended as `Merge: {parents}\n` before the summary.
     /// - `body` (when non-empty) is appended as `\n\n{body}` after the summary.
     /// - Empty body produces no trailing newlines, keeping subject-only commits compact.
-    fn render(hash: &str, author: &str, subject: &str, body: &str, parents: Option<&str>, diff_output: &str) -> String {
+    fn render(
+        hash: &str,
+        author: &str,
+        subject: &str,
+        body: &str,
+        parents: Option<&str>,
+        diff_output: &str,
+    ) -> String {
         use std::fmt::Write;
         let short = hash.get(..7).unwrap_or(hash);
         let mut output = String::new();

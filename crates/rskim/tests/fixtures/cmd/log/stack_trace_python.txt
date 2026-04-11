@@ -1,0 +1,6 @@
+ERROR: ValueError: invalid literal for int()
+    File "/app/service.py", line 55, in parse_value
+    File "/app/service.py", line 102, in handle_request
+    File "/app/service.py", line 201, in run
+    File "/usr/lib/python3.11/threading.py", line 1000, in _bootstrap
+INFO: continuing after error
