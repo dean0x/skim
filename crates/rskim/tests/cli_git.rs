@@ -420,8 +420,9 @@ fn test_skim_git_show_head_commit_mode_json() {
     );
 
     // Assertion 2: stdout must be valid JSON.
-    let json: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout must be valid JSON; parse error: {e}\nstdout: {stdout}"));
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON; parse error: {e}\nstdout: {stdout}")
+    });
 
     // Assertion 3: JSON must have the expected ShowCommitResult top-level keys.
     for key in &["hash", "author", "subject", "files_changed", "files"] {

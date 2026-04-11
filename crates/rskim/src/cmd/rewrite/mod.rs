@@ -775,10 +775,7 @@ mod tests {
 
     #[test]
     fn test_has_compound_operators_semicolon() {
-        assert!(
-            has_compound_operators("echo a; echo b"),
-            "; is an operator"
-        );
+        assert!(has_compound_operators("echo a; echo b"), "; is an operator");
         assert!(has_compound_operators(";"), "bare ; is an operator");
     }
 
