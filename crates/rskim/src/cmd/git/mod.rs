@@ -202,23 +202,11 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 /// Centralises the analytics + stats tail that previously appeared inline in
 /// `run_passthrough`, `run_parsed_command`, and the deleted `record_show_result`.
 ///
-/// Three variants are provided to minimise allocations:
+/// Two production variants:
+///   - [`finalize_git_output_owned`] — callers that own both strings (raw ≠ output).
+///   - [`finalize_git_output_passthrough`] — callers where raw == output.
 ///
-/// - [`finalize_git_output`] — borrowed variant; for the rare case where
-///   `raw != output` but the caller still holds `&str` references.  Performs
-///   one `.to_string()` clone per argument when analytics are enabled.
-///   **Not used in production call sites currently — prefer the owned or
-///   passthrough variants.**
-///
-/// - [`finalize_git_output_owned`] — owned variant; callers that already own
-///   the `String` and raw ≠ output (e.g. `run_parsed_command`, `run_diff`,
-///   `emit_show_commit`) move the values directly into the analytics call —
-///   zero extra allocations on the analytics path, and still zero allocations
-///   when analytics are off.
-///
-/// - [`finalize_git_output_passthrough`] — passthrough variant; for all call
-///   sites where raw == output (no compression occurred).  Clones once instead
-///   of twice when analytics are enabled (PF-018).
+/// A borrowed variant exists in `#[cfg(test)]` only.
 ///
 /// # Parameters (shared by all variants)
 /// - `raw`          — Original git output before any compression.
@@ -228,46 +216,13 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 /// - `command_type` — Analytics command-type tag (e.g., `CommandType::Git`).
 /// - `duration`     — Wall-clock duration of the underlying git command.
 /// - `parse_tier`   — Optional tier label set by the parser (AD-12).
-// Allow dead_code: used in tests (see `test_finalize_git_output_accepts_empty_strings`)
-// and available as a fallback for future handlers where raw != output but no
-// owned String is available.
-#[allow(dead_code)]
-pub(super) fn finalize_git_output(
-    raw: &str,
-    output: &str,
-    label: String,
-    show_stats: bool,
-    command_type: crate::analytics::CommandType,
-    duration: std::time::Duration,
-    parse_tier: Option<&'static str>,
-) {
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(raw, output);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw.to_string(),
-            output.to_string(),
-            label,
-            command_type,
-            duration,
-            parse_tier,
-        );
-    }
-}
-
-/// Owned variant of [`finalize_git_output`].
 ///
 /// Takes ownership of `raw` and `output`, moving them directly into the
-/// analytics call when analytics are enabled — eliminating the extra
-/// `.to_string()` clone that the borrowed variant must perform.  When
-/// analytics are disabled neither string is heap-touched after the stats
-/// computation (which only needs `&str`).
+/// analytics call when analytics are enabled — zero extra allocations on
+/// the analytics path and zero allocations when analytics are off.
 ///
 /// Use this variant in handlers that already own their output strings
 /// (i.e. the string would be dropped immediately after the call anyway).
-///
 /// `parse_tier` is forwarded to the analytics record (AD-12).
 pub(super) fn finalize_git_output_owned(
     raw: String,
@@ -715,6 +670,36 @@ mod tests {
     // ========================================================================
     // Non-zero exit analytics documentation
     // ========================================================================
+
+    /// Borrowed variant of `finalize_git_output_owned` — test-only.
+    ///
+    /// Takes `&str` references and clones them only when analytics are enabled.
+    /// No production call site uses this; prefer `finalize_git_output_owned` or
+    /// `finalize_git_output_passthrough` in handlers.
+    fn finalize_git_output(
+        raw: &str,
+        output: &str,
+        label: String,
+        show_stats: bool,
+        command_type: crate::analytics::CommandType,
+        duration: std::time::Duration,
+        parse_tier: Option<&'static str>,
+    ) {
+        if show_stats {
+            let (orig, comp) = crate::process::count_token_pair(raw, output);
+            crate::process::report_token_stats(orig, comp, "");
+        }
+        if crate::analytics::is_analytics_enabled() {
+            crate::analytics::try_record_command(
+                raw.to_string(),
+                output.to_string(),
+                label,
+                command_type,
+                duration,
+                parse_tier,
+            );
+        }
+    }
 
     /// Documents that `run_parsed_command` records analytics on non-zero exit.
     ///
