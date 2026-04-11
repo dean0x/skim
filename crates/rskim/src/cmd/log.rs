@@ -22,6 +22,14 @@ use crate::output::ParseResult;
 /// Maximum input lines before truncation.
 const MAX_INPUT_LINES: usize = 100_000;
 
+/// Maximum frames buffered in `pending_stack` before the oldest is dropped.
+///
+/// Keeps memory at O(PENDING_STACK_CAP) regardless of input length.
+/// `flush_stack_frames` retains only the last 3 frames, so a cap of 4 is
+/// sufficient: the sliding window holds the 4 most-recent frames, and the
+/// flush then drops 1 more, yielding exactly the last 3 in output.
+const PENDING_STACK_CAP: usize = 4;
+
 /// Matches ISO8601 / common log timestamp prefix to strip before dedup.
 /// e.g. `2024-01-15T10:30:00Z `, `2024-01-15 10:30:00 `, `[2024-01-15T10:30:00]`
 static RE_LOG_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
@@ -274,10 +282,24 @@ fn try_parse_json_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     Some(apply_compression(all_entries, total_lines, 0, flags))
 }
 
+/// Maximum byte length for a JSON log-level field.
+///
+/// Level values ("ERROR", "WARN", "INFO", "DEBUG", "TRACE") are well under
+/// 32 bytes; anything longer is either malformed or adversarial.
+const MAX_JSON_LEVEL_LEN: usize = 32;
+
+/// Maximum byte length for a JSON log-message field.
+///
+/// 16 KiB preserves meaningful log text while bounding adversarial allocation.
+/// Truncated values get a "[truncated]" suffix so consumers can detect elision.
+const MAX_JSON_MSG_LEN: usize = 16 * 1024;
+
 fn extract_json_level(obj: &Value) -> Option<String> {
     for key in &["level", "severity", "lvl", "log_level"] {
         if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
-            return Some(v.to_uppercase());
+            // Truncate at a char boundary to avoid splitting multi-byte sequences.
+            let truncated: String = v.chars().take(MAX_JSON_LEVEL_LEN).collect();
+            return Some(truncated.to_uppercase());
         }
     }
     None
@@ -286,7 +308,16 @@ fn extract_json_level(obj: &Value) -> Option<String> {
 fn extract_json_message(obj: &Value) -> Option<String> {
     for key in &["msg", "message", "text", "body"] {
         if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
-            return Some(v.to_string());
+            if v.len() <= MAX_JSON_MSG_LEN {
+                return Some(v.to_string());
+            }
+            // Truncate at a char boundary; append a marker so consumers know.
+            let mut s = String::with_capacity(MAX_JSON_MSG_LEN + 11);
+            for c in v.chars().take(MAX_JSON_MSG_LEN) {
+                s.push(c);
+            }
+            s.push_str("[truncated]");
+            return Some(s);
         }
     }
     None
@@ -334,6 +365,12 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
 
         // Check on the original (untrimmed) line to detect leading whitespace.
         if RE_LOG_STACK_TRACE.is_match(line) {
+            // Sliding-window cap: drop the oldest frame and count it as elided
+            // immediately, keeping memory at O(PENDING_STACK_CAP).
+            if pending_stack.len() >= PENDING_STACK_CAP {
+                pending_stack.remove(0);
+                total_stack_frames_elided += 1;
+            }
             pending_stack.push(trimmed.to_string());
             continue;
         }
@@ -485,13 +522,22 @@ fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -
     let mut dedup_map: HashMap<String, usize> = HashMap::with_capacity(1024);
     let mut output_entries: Vec<LogEntry> = Vec::with_capacity(256);
 
+    // Scratch buffer reused across iterations: zero allocations on dedup-hit,
+    // one allocation on dedup-miss (the key clone for the map insert).
+    let mut key_buf = String::with_capacity(128);
+
     for (level, message) in entries {
         // AD-10: key includes level so ERROR+WARN with same text are NOT merged.
-        let normalized_key = format!(
-            "{}|{}",
-            level.as_deref().unwrap_or("-"),
-            message.to_lowercase()
-        );
+        // Build the key in-place to avoid the two-allocation format!() pattern
+        // (to_lowercase() intermediate + format! output).
+        key_buf.clear();
+        key_buf.push_str(level.as_deref().unwrap_or("-"));
+        key_buf.push('|');
+        for c in message.chars() {
+            for lc in c.to_lowercase() {
+                key_buf.push(lc);
+            }
+        }
 
         if no_dedup {
             // Issue 3: `level` and `message` are owned — no clone needed.
@@ -500,11 +546,11 @@ fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -
                 message,
                 count: 1,
             });
-        } else if let Some(&idx) = dedup_map.get(&normalized_key) {
+        } else if let Some(&idx) = dedup_map.get(key_buf.as_str()) {
             output_entries[idx].count += 1;
         } else {
             let idx = output_entries.len();
-            dedup_map.insert(normalized_key, idx);
+            dedup_map.insert(key_buf.clone(), idx);
             // Issue 3: `level` and `message` are owned — no clone needed.
             output_entries.push(LogEntry {
                 level,
@@ -1001,5 +1047,98 @@ mod tests {
         assert_eq!(output.len(), 2);
         let hello = output.iter().find(|e| e.message == "hello").unwrap();
         assert_eq!(hello.count, 2);
+    }
+
+    /// Regression test for the unbounded `pending_stack` growth fix (batch-3-log).
+    ///
+    /// Feeds an ERROR line followed by 20 stack-trace frames. Before the fix,
+    /// all 20 frames would be accumulated in `pending_stack` before
+    /// `flush_stack_frames` discarded 17 of them — wasting ~17× the necessary
+    /// allocation. After the fix, `pending_stack` never exceeds PENDING_STACK_CAP
+    /// frames; the elision is counted incrementally as frames arrive.
+    ///
+    /// Invariants verified:
+    /// 1. `stack_frames_elided` == 20 - 3 == 17 (last 3 kept, rest elided).
+    /// 2. The rendered output contains the elision summary line.
+    /// 3. None of the elided frames appear in the rendered output.
+    #[test]
+    fn test_pending_stack_cap_elides_excess_frames() {
+        // Build input: one ERROR line + 20 stack frames + a follow-up INFO line
+        // to trigger the final flush.
+        let mut input = String::from("ERROR: something went wrong\n");
+        for i in 1..=20 {
+            input.push_str(&format!("    at com.example.Service.frame{i}(Service.java:{i})\n"));
+        }
+        input.push_str("INFO: recovered\n");
+
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+
+        // 20 frames total, last 3 kept → 17 elided.
+        assert_eq!(
+            result.stack_frames_elided, 17,
+            "Expected 17 elided frames (20 total, last 3 kept), got {}",
+            result.stack_frames_elided
+        );
+
+        let display = result.as_ref();
+
+        // Rendered output must surface the elision count.
+        assert!(
+            display.contains("+17 stack frames elided"),
+            "Output must contain elision summary; got: {display}"
+        );
+
+        // Frame 1 must have been dropped by the cap. Match on the exact frame
+        // name to avoid substring collisions with "frame10"–"frame17".
+        assert!(
+            !display.contains("frame1(Service.java:1)"),
+            "Elided frame1 must not appear in output; got: {display}"
+        );
+
+        // The last 3 frames (18, 19, 20) must be present.
+        assert!(
+            display.contains("frame18"),
+            "frame18 (3rd-from-last) must be kept; got: {display}"
+        );
+        assert!(
+            display.contains("frame20"),
+            "frame20 (last) must be kept; got: {display}"
+        );
+    }
+
+    /// Regression test: extract_json_message truncates oversized fields.
+    ///
+    /// A pathological JSON line with a message field larger than MAX_JSON_MSG_LEN
+    /// must be truncated to MAX_JSON_MSG_LEN chars and suffixed with "[truncated]".
+    #[test]
+    fn test_extract_json_message_truncates_large_field() {
+        let large_msg = "A".repeat(MAX_JSON_MSG_LEN + 100);
+        let obj = serde_json::json!({ "msg": large_msg });
+        let result = extract_json_message(&obj).unwrap();
+        assert!(
+            result.ends_with("[truncated]"),
+            "Oversized message must end with [truncated]; got len={}",
+            result.len()
+        );
+        // The result must not exceed MAX_JSON_MSG_LEN chars + len("[truncated]").
+        assert!(
+            result.chars().count() <= MAX_JSON_MSG_LEN + 11,
+            "Truncated message must not exceed bound; got len={}",
+            result.len()
+        );
+    }
+
+    /// Regression test: extract_json_level truncates oversized level fields.
+    #[test]
+    fn test_extract_json_level_truncates_large_field() {
+        let large_level = "X".repeat(MAX_JSON_LEVEL_LEN + 50);
+        let obj = serde_json::json!({ "level": large_level });
+        let result = extract_json_level(&obj).unwrap();
+        assert_eq!(
+            result.chars().count(),
+            MAX_JSON_LEVEL_LEN,
+            "Level must be truncated to MAX_JSON_LEVEL_LEN chars"
+        );
     }
 }
