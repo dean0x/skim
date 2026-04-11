@@ -69,8 +69,46 @@ pub(crate) fn reset_debug_for_tests() {
 ///
 /// Handle lock poisoning with `.unwrap_or_else(|e| e.into_inner())` — a
 /// prior test panic shouldn't cascade into every subsequent test.
+///
+/// Prefer [`DebugTestGuard::acquire`] over direct use of this lock — the RAII
+/// guard handles reset on construction and Drop automatically.
 #[cfg(test)]
 pub(crate) static DEBUG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard for tests that touch the process-wide debug flag.
+///
+/// Acquiring this guard:
+/// 1. Takes the [`DEBUG_TEST_LOCK`] mutex (serializes with other flag-touching tests)
+/// 2. Resets the flag to `false` so the test starts in a known state
+/// 3. On Drop, resets the flag to `false` again so subsequent tests (and the
+///    lock-holder's sibling tests that run in parallel after release) see a clean state
+///
+/// Lock poisoning is handled via `.unwrap_or_else(|e| e.into_inner())` so a prior
+/// test panic doesn't cascade into every subsequent test.
+#[cfg(test)]
+#[must_use = "the guard must be bound to a variable to extend its lifetime through the test body"]
+pub(crate) struct DebugTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl DebugTestGuard {
+    /// Acquire the debug test lock and reset the flag to a known-clean state.
+    pub(crate) fn acquire() -> Self {
+        let guard = DEBUG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_debug_for_tests();
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DebugTestGuard {
+    fn drop(&mut self) {
+        reset_debug_for_tests();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -78,16 +116,14 @@ mod tests {
 
     #[test]
     fn test_force_enable_debug() {
-        let _guard = DEBUG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_debug_for_tests();
+        let _guard = DebugTestGuard::acquire();
         force_enable_debug();
         assert!(is_debug_enabled());
-        reset_debug_for_tests();
     }
 
     #[test]
     fn test_reset_clears_flag() {
-        let _guard = DEBUG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DebugTestGuard::acquire();
         force_enable_debug();
         reset_debug_for_tests();
         assert!(!is_debug_enabled());
