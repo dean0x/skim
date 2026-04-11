@@ -194,6 +194,16 @@ pub(super) fn run_diff(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
+        // Record analytics even on non-zero exit so the DB reflects failed
+        // invocations. Raw == compressed (passthrough) on error path.
+        finalize_git_output(
+            &output.stdout,
+            &output.stdout,
+            super::build_analytics_label("diff", args, show_stats),
+            show_stats,
+            crate::analytics::CommandType::Git,
+            output.duration,
+        );
         return Ok(map_exit_code(output.exit_code));
     }
 

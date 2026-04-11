@@ -157,7 +157,10 @@ mod tests {
         let text = "✕ math > adds correctly\n\
                     ✓ math > multiplies\n";
         let entries = scrape_failures(text, TestKind::Vitest);
-        assert!(!entries.is_empty(), "should find vitest failure: {entries:?}");
+        assert!(
+            !entries.is_empty(),
+            "should find vitest failure: {entries:?}"
+        );
         assert!(
             entries[0].name.contains("adds correctly"),
             "entry: {:?}",
@@ -189,13 +192,21 @@ mod tests {
             text.push_str(&format!("test test_{i} ... FAILED\n"));
         }
         let entries = scrape_failures(&text, TestKind::Cargo);
-        assert_eq!(entries.len(), 100, "must be capped at 100: {}", entries.len());
+        assert_eq!(
+            entries.len(),
+            100,
+            "must be capped at 100: {}",
+            entries.len()
+        );
     }
 
     #[test]
     fn test_scrape_failures_no_matches_returns_empty() {
         let text = "test foo ... ok\ntest bar ... ok\n";
         let entries = scrape_failures(text, TestKind::Cargo);
-        assert!(entries.is_empty(), "no failures should return empty: {entries:?}");
+        assert!(
+            entries.is_empty(),
+            "no failures should return empty: {entries:?}"
+        );
     }
 }

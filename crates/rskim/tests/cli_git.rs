@@ -590,7 +590,8 @@ fn test_git_show_preserves_commit_body() {
         .expect("git config name");
 
     // Create a commit with multi-paragraph body.
-    let commit_msg = "feat: multi paragraph test\n\nparagraph 1 of the body\n\nparagraph 2 of the body";
+    let commit_msg =
+        "feat: multi paragraph test\n\nparagraph 1 of the body\n\nparagraph 2 of the body";
     std::process::Command::new("git")
         .args(["commit", "--allow-empty", "-m", commit_msg])
         .current_dir(path)

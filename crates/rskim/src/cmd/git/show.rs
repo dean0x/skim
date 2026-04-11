@@ -1266,8 +1266,7 @@ mod tests {
 
     #[test]
     fn test_parse_commit_header_multi_paragraph_body() {
-        let fixture =
-            include_str!("../../../tests/fixtures/cmd/git/show_multi_paragraph.txt");
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_multi_paragraph.txt");
         let (header, _diff_body) =
             parse_commit_header(fixture).expect("multi-paragraph commit must parse");
         assert!(
@@ -1290,8 +1289,7 @@ mod tests {
     #[test]
     fn test_parse_commit_header_merge_parents() {
         let fixture = include_str!("../../../tests/fixtures/cmd/git/show_merge.txt");
-        let (header, _diff_body) =
-            parse_commit_header(fixture).expect("merge commit must parse");
+        let (header, _diff_body) = parse_commit_header(fixture).expect("merge commit must parse");
         assert_eq!(
             header.parents,
             Some("abc123 def456 fed321".to_string()),
@@ -1303,8 +1301,7 @@ mod tests {
     #[test]
     fn test_parse_commit_header_signed_commit() {
         let fixture = include_str!("../../../tests/fixtures/cmd/git/show_signed.txt");
-        let (header, _diff_body) =
-            parse_commit_header(fixture).expect("signed commit must parse");
+        let (header, _diff_body) = parse_commit_header(fixture).expect("signed commit must parse");
         // Body should not contain PGP signature content.
         assert!(
             !header.body.contains("BEGIN PGP SIGNATURE"),

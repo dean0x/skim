@@ -746,7 +746,10 @@ mod tests {
     fn test_tier2_regex_scrapes_failing_test_names() {
         let input = load_fixture("cargo_regex_fail.txt");
         let result = try_parse_regex(&input);
-        assert!(result.is_some(), "regex parse must succeed on failure fixture");
+        assert!(
+            result.is_some(),
+            "regex parse must succeed on failure fixture"
+        );
         let result = result.unwrap();
         assert!(result.summary.fail > 0, "must have failures");
         // Tier-2 entries should now include failing test names.

@@ -171,10 +171,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
 /// Deterministic: FAILURE|CANCELLED|TIMED_OUT wins over PENDING|QUEUED|IN_PROGRESS
 /// wins over SUCCESS. Returns `"none"` when the field is null, absent, or empty.
 fn aggregate_ci_status(obj: &serde_json::Value) -> String {
-    let checks = match obj
-        .get("statusCheckRollup")
-        .and_then(|v| v.as_array())
-    {
+    let checks = match obj.get("statusCheckRollup").and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
         _ => return "none".to_string(),
     };
@@ -312,14 +309,23 @@ mod tests {
         let result = try_parse_json(&obj).expect("must parse");
         let display = result.as_ref();
         assert!(display.contains("draft"), "must render draft: {display}");
-        assert!(display.contains("mergeable"), "must render mergeable: {display}");
+        assert!(
+            display.contains("mergeable"),
+            "must render mergeable: {display}"
+        );
         assert!(display.contains("ci"), "must render ci: {display}");
         // Values
         assert!(display.contains("true"), "draft must be true: {display}");
-        assert!(display.contains("conflicting"), "mergeable must be conflicting: {display}");
+        assert!(
+            display.contains("conflicting"),
+            "mergeable must be conflicting: {display}"
+        );
         assert!(display.contains("failing"), "ci must be failing: {display}");
         // Summary must be prefixed with [DRAFT]
-        assert!(display.contains("[DRAFT]"), "summary must have [DRAFT] prefix: {display}");
+        assert!(
+            display.contains("[DRAFT]"),
+            "summary must have [DRAFT] prefix: {display}"
+        );
     }
 
     #[test]
@@ -329,11 +335,23 @@ mod tests {
         let obj: serde_json::Value = serde_json::from_str(&input).unwrap();
         let result = try_parse_json(&obj).expect("must parse");
         let display = result.as_ref();
-        assert!(display.contains("draft"), "must render draft even when false: {display}");
-        assert!(display.contains("mergeable"), "must render mergeable even when clean: {display}");
-        assert!(display.contains("ci"), "must render ci even when passing: {display}");
+        assert!(
+            display.contains("draft"),
+            "must render draft even when false: {display}"
+        );
+        assert!(
+            display.contains("mergeable"),
+            "must render mergeable even when clean: {display}"
+        );
+        assert!(
+            display.contains("ci"),
+            "must render ci even when passing: {display}"
+        );
         assert!(display.contains("false"), "draft must be false: {display}");
-        assert!(display.contains("clean"), "mergeable must be clean: {display}");
+        assert!(
+            display.contains("clean"),
+            "mergeable must be clean: {display}"
+        );
         assert!(display.contains("passing"), "ci must be passing: {display}");
     }
 
@@ -344,7 +362,10 @@ mod tests {
         let result = try_parse_json(&obj).expect("must parse");
         let display = result.as_ref();
         assert!(display.contains("ci"), "must render ci item: {display}");
-        assert!(display.contains("none"), "ci must be none when statusCheckRollup is null: {display}");
+        assert!(
+            display.contains("none"),
+            "ci must be none when statusCheckRollup is null: {display}"
+        );
     }
 
     #[test]

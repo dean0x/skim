@@ -35,8 +35,7 @@ static RE_NPM_VULN_COUNT: LazyLock<Regex> =
 /// Matches the canonical GitHub advisory URL structure:
 /// `https://github.com/advisories/GHSA-xxxx-yyyy-zzzz`
 /// The ID itself is `GHSA-` followed by 14–19 word chars (hyphens/alphanumerics).
-static RE_GHSA: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(GHSA-[\w-]{14,19})").unwrap());
+static RE_GHSA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(GHSA-[\w-]{14,19})").unwrap());
 
 pub(super) fn run_audit(
     args: &[String],
@@ -114,9 +113,7 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
         // 1. GHSA ID from first matching via[i]["url"] (RE_GHSA pattern).
         // 2. Numeric source → formatted as `NPM-{source}`.
         // 3. Last-resort "unknown".
-        let via_array = vuln
-            .get("via")
-            .and_then(|v| v.as_array());
+        let via_array = vuln.get("via").and_then(|v| v.as_array());
 
         let advisory_id = via_array
             .and_then(|arr| {
@@ -130,7 +127,10 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
                     // Fall back to numeric source → NPM-{source}.
                     entry
                         .get("source")
-                        .and_then(|s| s.as_u64().or_else(|| s.as_str().and_then(|s| s.parse().ok())))
+                        .and_then(|s| {
+                            s.as_u64()
+                                .or_else(|| s.as_str().and_then(|s| s.parse().ok()))
+                        })
                         .map(|n| format!("NPM-{n}"))
                 })
             })
@@ -268,7 +268,11 @@ mod tests {
         assert!(display.contains("moderate: 1"));
         assert!(display.contains("total: 3"));
         // Detail format is now "{id} {name}: {title} ({severity})"
-        assert!(display.contains("lodash") && display.contains("Prototype Pollution") && display.contains("high"));
+        assert!(
+            display.contains("lodash")
+                && display.contains("Prototype Pollution")
+                && display.contains("high")
+        );
     }
 
     #[test]

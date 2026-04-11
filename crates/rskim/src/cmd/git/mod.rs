@@ -350,6 +350,16 @@ where
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
+        // Record analytics even on non-zero exit so the DB reflects failed
+        // invocations. Use stdout as both raw and compressed (passthrough).
+        finalize_git_output(
+            &output.stdout,
+            &output.stdout,
+            label,
+            show_stats,
+            crate::analytics::CommandType::Git,
+            output.duration,
+        );
         return Ok(map_exit_code(output.exit_code));
     }
 
@@ -627,5 +637,34 @@ mod tests {
                 "--check"
             ]
         ));
+    }
+
+    // ========================================================================
+    // Non-zero exit analytics documentation
+    // ========================================================================
+
+    /// Documents that `run_parsed_command` records analytics on non-zero exit.
+    ///
+    /// Previously, a non-zero exit returned early without recording, causing
+    /// failed invocations (e.g., `git log` on a bare repo) to be invisible in
+    /// the analytics DB. The fix calls `finalize_git_output` on the error path
+    /// with raw==compressed (passthrough semantics) so the DB is consistent.
+    ///
+    /// This test validates `finalize_git_output` itself is callable with
+    /// empty strings (the non-zero path uses empty stdout on most failures).
+    #[test]
+    fn test_finalize_git_output_accepts_empty_strings() {
+        // Analytics is fire-and-forget; we just ensure the call path compiles
+        // and does not panic. SKIM_DISABLE_ANALYTICS=1 suppresses DB writes.
+        std::env::set_var("SKIM_DISABLE_ANALYTICS", "1");
+        finalize_git_output(
+            "",
+            "",
+            "skim git log".to_string(),
+            false,
+            crate::analytics::CommandType::Git,
+            std::time::Duration::ZERO,
+        );
+        std::env::remove_var("SKIM_DISABLE_ANALYTICS");
     }
 }
