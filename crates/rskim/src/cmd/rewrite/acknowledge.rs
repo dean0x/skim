@@ -58,6 +58,14 @@ pub(super) const ACK_PREFIX_PATTERNS: &[&[&str]] = &[
     // AD-11: `rustfmt --check [files]` — empty on clean, short diff headers on
     // failure. The skim LINT OK wrapper adds tokens without reducing agent load.
     &["rustfmt", "--check"],
+    // AD-11: `cargo fmt --check` is a `rustfmt --check`-equivalent wrapper;
+    // same empty-on-clean contract. Both the short form and the `--` pass-through
+    // form are ACKed so `skim rewrite` echoes them unchanged.
+    &["cargo", "fmt", "--check"],
+    // AD-11: `cargo fmt -- --check` — pass-through variant. The `--` token is
+    // treated literally by `is_segment_ack`; there is no compound-operator
+    // splitting on bare `--` (CompoundOp only recognizes `&&|;`).
+    &["cargo", "fmt", "--", "--check"],
 ];
 
 /// Return `true` if `tokens` starts with any acknowledged-compact prefix.
@@ -190,6 +198,41 @@ mod tests {
         assert!(
             !is_segment_ack(&["rustfmt", "src/main.rs"]),
             "rustfmt without --check must NOT be acknowledged"
+        );
+    }
+
+    // AD-11: cargo fmt --check acknowledgement (added in evaluator follow-up)
+
+    #[test]
+    fn test_is_segment_ack_cargo_fmt_check() {
+        assert!(
+            is_segment_ack(&["cargo", "fmt", "--check"]),
+            "cargo fmt --check must be acknowledged"
+        );
+    }
+
+    #[test]
+    fn test_is_segment_ack_cargo_fmt_dashdash_check() {
+        assert!(
+            is_segment_ack(&["cargo", "fmt", "--", "--check"]),
+            "cargo fmt -- --check must be acknowledged (pass-through variant)"
+        );
+    }
+
+    #[test]
+    fn test_is_segment_ack_cargo_fmt_without_check_not_matched() {
+        // `cargo fmt` without --check reformats in-place; not acknowledged.
+        assert!(
+            !is_segment_ack(&["cargo", "fmt"]),
+            "cargo fmt without --check must NOT be acknowledged"
+        );
+    }
+
+    #[test]
+    fn test_is_segment_ack_cargo_fmt_check_with_trailing_args() {
+        assert!(
+            is_segment_ack(&["cargo", "fmt", "--check", "--manifest-path", "Cargo.toml"]),
+            "cargo fmt --check with trailing args must be acknowledged"
         );
     }
 }

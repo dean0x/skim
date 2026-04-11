@@ -306,6 +306,85 @@ fn test_alignment_rustfmt_check_acked_not_rewritten_to_handler() {
     );
 }
 
+/// AD-11: `cargo fmt --check` is ACKed — added in the evaluator follow-up.
+#[test]
+fn test_alignment_cargo_fmt_check_acked() {
+    let output = skim_cmd()
+        .args(["rewrite", "cargo", "fmt", "--check"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("cargo fmt --check"),
+        "ACK must echo original command: {stdout}"
+    );
+    assert!(
+        !stdout.contains("skim lint rustfmt"),
+        "ACK must NOT rewrite to a handler: {stdout}"
+    );
+}
+
+/// AD-11: `cargo fmt -- --check` is ACKed — pass-through variant.
+#[test]
+fn test_alignment_cargo_fmt_dashdash_check_acked() {
+    let output = skim_cmd()
+        .args(["rewrite", "cargo", "fmt", "--", "--check"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("cargo fmt -- --check"),
+        "ACK must echo original command: {stdout}"
+    );
+}
+
+/// AD-13 (tokenization): `skim rewrite '<full command>'` with a single quoted
+/// positional arg must tokenize by whitespace the same way stdin input does.
+///
+/// Regression: previously, positional args were passed through as single
+/// tokens, so `skim rewrite 'prettier --check src/'` became one token
+/// `"prettier --check src/"` which matched no rule and no ACK prefix,
+/// silently returning exit 1 with empty stdout.
+#[test]
+fn test_alignment_rewrite_single_quoted_string_tokenizes_correctly() {
+    // Single arg form must produce the same result as multi-arg form.
+    let output = skim_cmd()
+        .args(["rewrite", "prettier --check src/"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "single quoted arg must succeed, got: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("prettier --check"),
+        "single quoted arg must ACK-echo the command: {stdout}"
+    );
+}
+
+/// AD-13 (tokenization): same test for `cargo fmt --check` in single-arg form.
+#[test]
+fn test_alignment_rewrite_single_quoted_cargo_fmt() {
+    let output = skim_cmd()
+        .args(["rewrite", "cargo fmt --check"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("cargo fmt --check"),
+        "single quoted cargo fmt --check must ACK-echo: {stdout}"
+    );
+}
+
 // ============================================================================
 // Handler dispatch alignment: verify subcommand routing
 // ============================================================================

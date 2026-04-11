@@ -358,6 +358,24 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 ///
 /// Returns `Ok(None)` when there is nothing to classify (empty input or
 /// interactive stdin), and `Ok(Some(tokens))` otherwise.
+///
+/// # Design decision (2026-04-11, AD-13)
+/// Positional args are flattened via `split_whitespace` so that both shell
+/// invocation shapes produce the same token sequence:
+///
+/// - `skim rewrite prettier --check src/`       → 3 args → 3 tokens
+/// - `skim rewrite 'prettier --check src/'`     → 1 arg  → 3 tokens
+///
+/// Without the flatten, the second form would classify as a single-token
+/// command `"prettier --check src/"` which matches no rule and no ACK prefix,
+/// silently returning `Unhandled` (observed as empty stdout with exit 1 in
+/// user-facing scenarios). The flatten is safe because shell-level argument
+/// splitting removes whitespace at token boundaries — any whitespace inside
+/// a single arg is present either because the user quoted a whole command
+/// string (the intended case) or because the user quoted a value containing
+/// whitespace (e.g., `--format='%H %s'`). The second case is rare in
+/// rewrite-triggering commands and the passthrough path still handles it
+/// downstream.
 fn collect_input_tokens(positional_args: &[&str]) -> anyhow::Result<Option<Vec<String>>> {
     if positional_args.is_empty() {
         // Try reading from stdin if it's piped
@@ -375,7 +393,11 @@ fn collect_input_tokens(positional_args: &[&str]) -> anyhow::Result<Option<Vec<S
         }
         return Ok(Some(trimmed.split_whitespace().map(String::from).collect()));
     }
-    let tokens: Vec<String> = positional_args.iter().map(|s| s.to_string()).collect();
+    let tokens: Vec<String> = positional_args
+        .iter()
+        .flat_map(|s| s.split_whitespace())
+        .map(String::from)
+        .collect();
     if tokens.is_empty() {
         return Ok(None);
     }
