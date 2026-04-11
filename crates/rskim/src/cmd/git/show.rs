@@ -356,16 +356,34 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     Some((header, diff_body))
 }
 
-/// Execute `git show` and return `(stdout, stderr, duration)` on success.
+/// Outcome of invoking `git show` via [`run_git_show_raw`].
 ///
-/// On non-zero exit the error streams are forwarded to the terminal and the
-/// appropriate exit code is returned via the `Err` variant of the inner
-/// `ExitCode`. Using a dedicated return type avoids surfacing git process
-/// errors as `anyhow::Error`, keeping the call-site match arm clean.
+/// Split into `Success` and `Failure` so callers can record failure analytics
+/// at the call site without losing the stdout that git produced on the error
+/// path (e.g. partial output from `git show INVALID`). Mirrors the
+/// non-zero-exit recording pattern established in `run_parsed_command`
+/// (cmd/git/mod.rs) and `diff/mod.rs`.
+enum ShowRawOutcome {
+    Success {
+        stdout: String,
+        duration: std::time::Duration,
+    },
+    Failure {
+        stdout: String,
+        exit_code: ExitCode,
+        duration: std::time::Duration,
+    },
+}
+
+/// Execute `git show` and return a structured outcome.
+///
+/// On non-zero exit the error streams are forwarded to the terminal, and the
+/// stdout, exit code, and duration are returned via [`ShowRawOutcome::Failure`]
+/// so the caller can record analytics for the failed invocation (Commit 9).
 fn run_git_show_raw(
     global_flags: &[String],
     git_args: &[String],
-) -> anyhow::Result<Result<(String, std::time::Duration), ExitCode>> {
+) -> anyhow::Result<ShowRawOutcome> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["show".to_string(), "--no-color".to_string()]);
     full_args.extend_from_slice(git_args);
@@ -380,10 +398,17 @@ fn run_git_show_raw(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        return Ok(Err(map_exit_code(output.exit_code)));
+        return Ok(ShowRawOutcome::Failure {
+            stdout: output.stdout,
+            exit_code: map_exit_code(output.exit_code),
+            duration: output.duration,
+        });
     }
 
-    Ok(Ok((output.stdout, output.duration)))
+    Ok(ShowRawOutcome::Success {
+        stdout: output.stdout,
+        duration: output.duration,
+    })
 }
 
 /// Parse the commit body and render it into a `ShowCommitResult`.
@@ -524,8 +549,27 @@ fn run_show_commit(
     show_stats: bool,
 ) -> anyhow::Result<ExitCode> {
     let (raw, duration) = match run_git_show_raw(global_flags, git_args)? {
-        Ok(pair) => pair,
-        Err(code) => return Ok(code),
+        ShowRawOutcome::Success { stdout, duration } => (stdout, duration),
+        ShowRawOutcome::Failure {
+            stdout,
+            exit_code,
+            duration,
+        } => {
+            // Record analytics on the failure path so the DB reflects failed
+            // `git show` invocations (Commit 9). Raw == compressed
+            // (passthrough semantics) — mirrors run_parsed_command and
+            // run_diff non-zero-exit recording.
+            finalize_git_output(
+                &stdout,
+                &stdout,
+                build_analytics_label("show", original_args, show_stats),
+                show_stats,
+                crate::analytics::CommandType::Git,
+                duration,
+                Some("passthrough"),
+            );
+            return Ok(exit_code);
+        }
     };
 
     // Built before the `render_show_diff` check so both the passthrough and
@@ -655,6 +699,19 @@ fn run_show_file_content(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
+        // Record analytics on the error path so the DB reflects failed
+        // invocations (e.g. `git show HEAD:missing.rs`). Raw == compressed
+        // (passthrough semantics) — mirrors the pattern in run_parsed_command
+        // and diff/mod.rs for non-zero exit consistency.
+        finalize_git_output(
+            &output.stdout,
+            &output.stdout,
+            build_analytics_label("show", args, show_stats),
+            show_stats,
+            crate::analytics::CommandType::Git,
+            output.duration,
+            Some("passthrough"),
+        );
         return Ok(map_exit_code(output.exit_code));
     }
 

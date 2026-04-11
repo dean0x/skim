@@ -726,6 +726,33 @@ Duration: 1.5s";
         }
     }
 
+    /// AD-Commit2 integration: Tier-2 vitest path must scrape failing-test names
+    /// from the real fixture and populate `entries` (not `vec![]`). Regression
+    /// guard for the original scrape_failures wiring + the indented-line regex.
+    #[test]
+    fn test_tier2_regex_scrapes_failing_test_names_from_fixture() {
+        let fixture = std::fs::read_to_string({
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests/fixtures/cmd/test/vitest_regex_fail.txt");
+            p
+        })
+        .expect("fixture must load");
+        let result = try_parse_regex(&fixture).expect("must parse");
+        assert!(result.summary.fail > 0, "fixture must declare failures");
+        assert!(
+            !result.entries.is_empty(),
+            "Tier-2 must populate failing test names from vitest output, got empty entries"
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|e| e.name.contains("divides by zero")),
+            "entries must include the failing test name 'divides by zero': {:?}",
+            result.entries
+        );
+    }
+
     // ========================================================================
     // Tier 3: Passthrough tests
     // ========================================================================

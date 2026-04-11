@@ -53,8 +53,10 @@ static RE_GO_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
-    // `✕ describe > it name` or `✗ test name` or `× test name`
-    Regex::new(r"^[✕✗×]\s+(.+?)$").expect("valid vitest fail regex")
+    // `✕ describe > it name`, `✗ test name`, or `× test name` — with optional
+    // leading whitespace because vitest and jest indent failing-test lines.
+    // Example real output: `   × divides by zero`.
+    Regex::new(r"^\s*[✕✗×]\s+(.+?)$").expect("valid vitest fail regex")
 });
 
 /// Extract failing test entries from plain-text runner output when JSON parsing
@@ -162,6 +164,27 @@ mod tests {
             entries[0].name.contains("adds correctly"),
             "entry: {:?}",
             entries[0].name
+        );
+    }
+
+    /// Regression: vitest indents failing-test lines with leading whitespace
+    /// (e.g. `   × divides by zero`). The regex must tolerate optional
+    /// leading whitespace so real vitest output matches, not just the
+    /// hand-crafted unit fixture.
+    #[test]
+    fn test_scrape_failures_vitest_indented_failure_line() {
+        let text = " ❯ src/utils.test.ts (3 tests | 1 failed)\n\
+                     ✓ adds numbers\n\
+                     ✓ subtracts numbers\n\
+                     × divides by zero\n";
+        let entries = scrape_failures(text, TestKind::Vitest);
+        assert!(
+            !entries.is_empty(),
+            "indented vitest fail line must match: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.name.contains("divides by zero")),
+            "entries must contain 'divides by zero': {entries:?}"
         );
     }
 
