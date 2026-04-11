@@ -504,6 +504,9 @@ mod tests {
 
     #[test]
     fn test_emit_markers_degraded_writes_warnings() {
+        let _guard = crate::debug::DEBUG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::debug::reset_debug_for_tests();
         crate::debug::force_enable_debug();
         let markers = vec!["issue one".to_string(), "issue two".to_string()];
@@ -524,6 +527,9 @@ mod tests {
 
     #[test]
     fn test_emit_markers_passthrough_writes_notice() {
+        let _guard = crate::debug::DEBUG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::debug::reset_debug_for_tests();
         crate::debug::force_enable_debug();
         let result: ParseResult<String> = ParseResult::Passthrough("raw".to_string());
@@ -539,6 +545,9 @@ mod tests {
 
     #[test]
     fn test_emit_markers_degraded_silent_without_debug() {
+        let _guard = crate::debug::DEBUG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::debug::reset_debug_for_tests();
         let markers = vec!["issue one".to_string(), "issue two".to_string()];
         let result: ParseResult<String> = ParseResult::Degraded("content".to_string(), markers);
@@ -552,6 +561,9 @@ mod tests {
 
     #[test]
     fn test_emit_markers_passthrough_silent_without_debug() {
+        let _guard = crate::debug::DEBUG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::debug::reset_debug_for_tests();
         let result: ParseResult<String> = ParseResult::Passthrough("raw".to_string());
         let mut buf = Vec::new();

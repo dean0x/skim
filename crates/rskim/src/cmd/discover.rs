@@ -869,6 +869,9 @@ mod tests {
 
     #[test]
     fn test_parse_args_debug() {
+        let _guard = crate::debug::DEBUG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // --debug flag sets debug=true
         let config = parse_args(&["--debug".to_string()]).unwrap();
         assert!(config.debug);
@@ -882,6 +885,9 @@ mod tests {
     /// `parse_args` and `command` together.
     #[test]
     fn test_parse_args_and_command_are_in_sync() {
+        let _guard = crate::debug::DEBUG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Build the clap command for validation
         let cmd = command();
 

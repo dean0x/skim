@@ -59,12 +59,26 @@ pub(crate) fn reset_debug_for_tests() {
     DEBUG_FORCE_ENABLED.store(false, Ordering::Release);
 }
 
+/// Serializes tests that mutate the process-wide [`DEBUG_FORCE_ENABLED`] flag.
+///
+/// Cargo runs unit tests in parallel by default, so any test that calls
+/// [`force_enable_debug`] or [`reset_debug_for_tests`] races against any
+/// other test that observes `is_debug_enabled()`. Acquire this mutex at the
+/// start of each such test so they run serially with respect to one another
+/// while still running in parallel with tests that don't touch the flag.
+///
+/// Handle lock poisoning with `.unwrap_or_else(|e| e.into_inner())` — a
+/// prior test panic shouldn't cascade into every subsequent test.
+#[cfg(test)]
+pub(crate) static DEBUG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_force_enable_debug() {
+        let _guard = DEBUG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_debug_for_tests();
         force_enable_debug();
         assert!(is_debug_enabled());
@@ -73,6 +87,7 @@ mod tests {
 
     #[test]
     fn test_reset_clears_flag() {
+        let _guard = DEBUG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         force_enable_debug();
         reset_debug_for_tests();
         assert!(!is_debug_enabled());
