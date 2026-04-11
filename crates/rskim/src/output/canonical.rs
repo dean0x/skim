@@ -608,6 +608,7 @@ pub(crate) struct DiffFileEntry {
 /// Complete diff result with file entries and pre-rendered display
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DiffResult {
+    #[serde(default)]
     pub(crate) files_changed: usize,
     pub(crate) files: Vec<DiffFileEntry>,
     #[serde(default)]
@@ -1896,13 +1897,7 @@ impl ShowCommitResult {
 
     fn render(hash: &str, author: &str, subject: &str, diff_output: &str) -> String {
         use std::fmt::Write;
-        let short_owned: String;
-        let short = if hash.len() >= 7 {
-            short_owned = hash.chars().take(7).collect();
-            &short_owned
-        } else {
-            hash
-        };
+        let short = hash.get(..7).unwrap_or(hash);
         let mut output = format!("{short} {author} \u{2014} {subject}");
         if !diff_output.is_empty() {
             let _ = write!(output, "\n\n{diff_output}");
@@ -1925,13 +1920,7 @@ impl ShowCommitResult {
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
             use std::fmt::Write;
-            let short_owned: String;
-            let short = if self.hash.len() >= 7 {
-                short_owned = self.hash.chars().take(7).collect();
-                &short_owned
-            } else {
-                &self.hash
-            };
+            let short = self.hash.get(..7).unwrap_or(&self.hash);
             let mut output = format!(
                 "{short} {} \u{2014} {} [{} files]",
                 self.author, self.subject, self.files_changed
