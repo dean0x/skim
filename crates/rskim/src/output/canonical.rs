@@ -138,6 +138,28 @@ impl fmt::Display for TestResult {
 /// The field is skipped during serialization because it is a runtime annotation,
 /// not part of the persistent JSON schema. Callers that do not set it default to
 /// `None`, which is stored in the analytics DB as NULL (pre-existing behaviour).
+///
+/// # Relationship to `ParseResult::tier_name()` (parallel mechanism, not equivalent)
+///
+/// Non-git command families (lint, file, infra, pkg, test) convey their parse tier
+/// via [`crate::output::ParseResult`] — specifically `ParseResult::tier_name()` —
+/// which wraps the entire parsed value and is consumed by the generic
+/// `finalize_output` / `record_analytics` paths.  Git handlers do not use
+/// `ParseResult`; they call `finalize_git_output*` directly and carry the tier
+/// annotation on `GitResult::parse_tier` instead.
+///
+/// These two mechanisms are parallel, not equivalent.
+/// TECH_DEBT: Unifying them would require git handlers to wrap `GitResult` in
+/// `ParseResult`, which would change the git analytics recording path. That
+/// unification is tracked separately and not attempted in this batch.
+///
+/// # Call sites (files that call `.with_tier(...)`)
+///
+/// - `crates/rskim/src/cmd/git/log.rs`
+/// - `crates/rskim/src/cmd/git/status.rs` (if present)
+/// - `crates/rskim/src/cmd/git/fetch.rs`
+/// - `crates/rskim/src/cmd/git/diff/mod.rs`
+/// - `crates/rskim/src/cmd/git/show.rs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GitResult {
     pub(crate) operation: String,

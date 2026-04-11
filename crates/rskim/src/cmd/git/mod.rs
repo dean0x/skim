@@ -386,6 +386,15 @@ fn run_passthrough(
 /// When `combine_stderr` is `true`, the parser receives `stderr + stdout`
 /// combined. Git fetch writes its output to stderr, so fetch uses `true`;
 /// all other subcommands use `false` (stdout only).
+///
+/// # AD-14 (2026-04-11) — analytics recording on non-zero exit
+///
+/// Previously, a non-zero exit code caused an early return with no analytics
+/// recording, so every failed git invocation was silently absent from the DB.
+/// The fix calls `finalize_git_output_passthrough` on the failure path using
+/// the empty stdout buffer, keeping analytics consistent with the passing path.
+/// `raw == compressed` on failure, so the single-clone passthrough variant is
+/// used (PF-018).  The same pattern applies to `run_diff` non-zero exits.
 pub(super) fn run_parsed_command<F>(
     subcmd_args: &[String],
     show_stats: bool,

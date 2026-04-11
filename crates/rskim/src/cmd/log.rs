@@ -1067,7 +1067,9 @@ mod tests {
         // to trigger the final flush.
         let mut input = String::from("ERROR: something went wrong\n");
         for i in 1..=20 {
-            input.push_str(&format!("    at com.example.Service.frame{i}(Service.java:{i})\n"));
+            input.push_str(&format!(
+                "    at com.example.Service.frame{i}(Service.java:{i})\n"
+            ));
         }
         input.push_str("INFO: recovered\n");
 

@@ -82,6 +82,14 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 
 /// Parse rustfmt `--check` output by scanning `Diff in <path> at line <N>:` headers.
 ///
+/// # AD-17 (2026-04-11) — line-number inclusion in rustfmt location messages
+///
+/// The Tier-1 parse extracts the exact line number from the `Diff in <path> at
+/// line <N>:` header and embeds it in the message string as
+/// `"formatting difference at line N"` rather than the generic
+/// `"formatting difference detected"` used by Tier-2.  This lets agents navigate
+/// directly to the affected line without re-running rustfmt.
+///
 /// Rustfmt check output format:
 /// ```text
 /// Diff in /path/to/src/main.rs at line 15:

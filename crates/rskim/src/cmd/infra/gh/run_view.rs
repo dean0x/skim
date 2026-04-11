@@ -10,7 +10,7 @@
 //! [`MAX_STEP_DETAIL`] steps per failed job, filtered to only show non-passing
 //! steps. Successful jobs show only a one-line summary to minimize context.
 //!
-//! # Design Decision: URL surfacing for failed jobs
+//! # AD-15 (2026-04-11) — URL surfacing for failed jobs
 //!
 //! Failed jobs include a `" — {url}"` suffix in their item value when a
 //! `url`/`htmlUrl` field is present in the JSON. This gives agents a direct

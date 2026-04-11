@@ -1,6 +1,6 @@
 //! npm audit parser.
 //!
-//! # Design decision: advisory ID extraction mirrors `cargo audit`
+//! # AD-18 (2026-04-11) — advisory ID extraction mirrors `cargo audit`
 //!
 //! `cargo audit` includes GHSA/RUSTSEC IDs in its details (see `pkg/cargo.rs`).
 //! npm audit details previously omitted IDs, making it impossible to look up
@@ -8,6 +8,7 @@
 //! the GHSA ID from `via[i]["url"]` using RE_GHSA. For advisories without a
 //! GHSA URL (legacy numeric `source` IDs), the fallback is `NPM-{source}`.
 //! For entries with no extractable identifier, `"unknown"` is used.
+//! The same advisory-ID convention applies to `pnpm audit` (see `pkg/pnpm.rs`).
 
 use std::process::ExitCode;
 use std::sync::LazyLock;
@@ -311,7 +312,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Advisory ID extraction tests (AD-Commit3, 2026-04-11)
+    // Advisory ID extraction tests (AD-18, 2026-04-11)
     // ========================================================================
 
     #[test]

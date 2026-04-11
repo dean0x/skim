@@ -26,7 +26,7 @@
 //! X  CI / lint   1m5s   https://...
 //! ```
 //!
-//! # Design Decision: URL surfacing for failing checks
+//! # AD-15 (2026-04-11) — URL surfacing for failing checks
 //!
 //! URLs are included in the item value **only for failing checks**
 //! (`fail`/`failure` status). Passing checks do not need a URL because
@@ -156,7 +156,12 @@ pub(super) fn try_parse_checks_json(trimmed: &str) -> Option<InfraResult> {
                     .or_else(|| c.get("url"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                ParsedCheck { name, status, duration: None, url }
+                ParsedCheck {
+                    name,
+                    status,
+                    duration: None,
+                    url,
+                }
             })
             .collect(),
     )
@@ -265,7 +270,10 @@ fn build_checks_result(checks: Vec<ParsedCheck>) -> Option<InfraResult> {
                 (None, Some(u)) => format!("{} — {u}", c.status),
                 (None, None) => c.status,
             };
-            InfraItem { label: c.name, value }
+            InfraItem {
+                label: c.name,
+                value,
+            }
         })
         .collect();
 

@@ -57,9 +57,7 @@ use rayon::prelude::*;
 use super::diff::{
     parse_unified_diff, render_diff_file, DiffMode, MAX_AST_FILE_COUNT, PARALLEL_THRESHOLD,
 };
-use super::{
-    build_analytics_label, finalize_git_output_owned, map_exit_code, run_passthrough,
-};
+use super::{build_analytics_label, finalize_git_output_owned, map_exit_code, run_passthrough};
 
 // ============================================================================
 // Utilities
@@ -453,8 +451,13 @@ fn render_show_diff(
     // PARALLEL_THRESHOLD, serial otherwise.  `par_iter().collect()` preserves
     // insertion order so output is deterministic regardless of scheduling.
     let render_one = |i: usize, fd: &_| {
-        let rendered =
-            render_diff_file(fd, global_flags, git_args, DiffMode::Default, i >= MAX_AST_FILE_COUNT);
+        let rendered = render_diff_file(
+            fd,
+            global_flags,
+            git_args,
+            DiffMode::Default,
+            i >= MAX_AST_FILE_COUNT,
+        );
         let entry = DiffFileEntry {
             path: fd.path.clone(),
             status: fd.status.clone(),
