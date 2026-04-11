@@ -24,7 +24,7 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
 
-use super::{finalize_git_output, finalize_git_output_owned, map_exit_code, run_passthrough};
+use super::{finalize_git_output_owned, map_exit_code, run_passthrough};
 
 /// Maximum file size for AST processing (100 KB). Larger files fall back
 /// to raw diff hunks.
@@ -37,7 +37,9 @@ pub(in crate::cmd::git) const MAX_AST_FILE_COUNT: usize = 200;
 
 /// Minimum file count to engage rayon parallelism. Below this, thread pool
 /// scheduling overhead exceeds the per-file render cost.
-const PARALLEL_THRESHOLD: usize = 5;
+/// Exposed to `show.rs` so `render_show_diff` can mirror the same dispatch
+/// threshold rather than hard-coding a separate constant.
+pub(in crate::cmd::git) const PARALLEL_THRESHOLD: usize = 5;
 
 /// Controls how unchanged AST nodes are rendered alongside changed nodes.
 ///
@@ -195,9 +197,9 @@ pub(super) fn run_diff(
             print!("{}", output.stdout);
         }
         // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. Raw == compressed (passthrough) on error path.
-        finalize_git_output(
-            &output.stdout,
+        // invocations. raw == compressed on error path; use single-clone
+        // passthrough variant to avoid cloning the same buffer twice (PF-018).
+        super::finalize_git_output_passthrough(
             &output.stdout,
             super::build_analytics_label("diff", args, show_stats),
             show_stats,
@@ -223,8 +225,8 @@ pub(super) fn run_diff(
     // consistent with run_passthrough (which always records, even for no-op passes).
     if raw_diff.trim().is_empty() {
         eprintln!("No changes");
-        finalize_git_output(
-            &raw_diff,
+        // raw == compressed; single-clone passthrough variant (PF-018).
+        super::finalize_git_output_passthrough(
             &raw_diff,
             label,
             show_stats,
@@ -246,8 +248,8 @@ pub(super) fn run_diff(
             // This branch is only hit when parse_unified_diff returns an empty vec
             // despite raw_diff being non-empty (malformed diff); keep a consistent
             // analytics record identical to the trim-is-empty branch above.
-            finalize_git_output(
-                &raw_diff,
+            // raw == compressed; single-clone passthrough variant (PF-018).
+            super::finalize_git_output_passthrough(
                 &raw_diff,
                 label,
                 show_stats,

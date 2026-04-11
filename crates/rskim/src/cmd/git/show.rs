@@ -52,10 +52,13 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
 
-use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
+use rayon::prelude::*;
+
+use super::diff::{
+    parse_unified_diff, render_diff_file, DiffMode, MAX_AST_FILE_COUNT, PARALLEL_THRESHOLD,
+};
 use super::{
-    build_analytics_label, finalize_git_output, finalize_git_output_owned, map_exit_code,
-    run_passthrough,
+    build_analytics_label, finalize_git_output_owned, map_exit_code, run_passthrough,
 };
 
 // ============================================================================
@@ -237,7 +240,86 @@ struct CommitHeader {
     parents: Option<String>,
 }
 
-/// Parse commit header lines (up to the first blank line after the message).
+/// Walk `header_region` lines and populate `header` with extracted fields.
+///
+/// Returns the accumulated body lines as `Vec<&str>` slices borrowed from
+/// `header_region`, avoiding per-line allocations (zero-copy body accumulation).
+///
+/// # State machine
+/// - Phase 0 (`in_body == false`): parse git trailer lines (`commit `,
+///   `Author: `, `Date: `, `Merge: `). All other lines (gpgsig, mergetag,
+///   continuation lines starting with a space) are silently skipped per AD-8.
+/// - Phase 1 (`in_body == true`, `subject_captured == false`): capture the
+///   subject (first non-blank body line), stripping the canonical 4-space indent.
+/// - Phase 2 (`in_body == true`, `subject_captured == true`): accumulate body
+///   lines, stripping 4-space indent.
+fn parse_header_lines<'a>(header_region: &'a str, header: &mut CommitHeader) -> Vec<&'a str> {
+    // Extract the trimmed value from a `Key: value` header line.
+    let header_value = |line: &str, prefix: &str| -> String {
+        line.strip_prefix(prefix)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+
+    let mut in_body = false;
+    let mut subject_captured = false;
+    let mut body_lines: Vec<&'a str> = Vec::new();
+
+    for line in header_region.lines() {
+        if !in_body {
+            if line.starts_with("commit ") {
+                header.hash = header_value(line, "commit ");
+            } else if line.starts_with("Merge: ") {
+                // AD-8: capture merge parents as structured field.
+                header.parents = Some(header_value(line, "Merge: "));
+            } else if line.starts_with("Author: ") {
+                header.author = header_value(line, "Author: ");
+            } else if line.starts_with("Date: ") {
+                header.date = header_value(line, "Date: ");
+            } else if line.is_empty() && !header.hash.is_empty() {
+                in_body = true;
+            }
+        } else if !subject_captured {
+            // Phase 1: first non-blank line is the subject.
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                header.subject = line.strip_prefix("    ").unwrap_or(trimmed).to_string();
+                subject_captured = true;
+            }
+        } else {
+            // Phase 2: borrow each body line slice — no allocation per line.
+            body_lines.push(line.strip_prefix("    ").unwrap_or(line));
+        }
+    }
+
+    body_lines
+}
+
+/// Trim leading and trailing blank lines from accumulated body slices and join.
+///
+/// Leading blanks arise from the blank separator between subject and body.
+/// Trailing blanks arise from the header_region split position.
+/// Returns an empty `String` when no non-blank lines remain.
+fn trim_body_blanks(body_lines: &[&str]) -> String {
+    let start = body_lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(body_lines.len());
+    let end = body_lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    if start < end {
+        body_lines[start..end].join("\n")
+    } else {
+        String::new()
+    }
+}
+
+/// Parse the commit header and split off the diff body from `git show` output.
 ///
 /// Returns `(header, diff_body)` where `diff_body` starts at the first
 /// `diff --git` line, or is empty if no diff is present.
@@ -260,8 +342,6 @@ struct CommitHeader {
 /// are explicitly recognised (`commit `, `Author: `, `Date: `, `Merge: `) are
 /// captured; everything else is ignored.
 fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
-    let mut header = CommitHeader::default();
-
     // Annotated tags start with `tag ` not `commit `.
     if !raw.starts_with("commit ") {
         return None;
@@ -270,88 +350,21 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     // Locate the split position between the commit header and the diff body.
     // The leading `\n` anchors the match to the start of a line to avoid
     // false positives inside commit message bodies that might mention
-    // `diff --git` textually.  `split_at(pos)` makes the contract explicit:
-    // header_region = everything up to (but not including) the `\n`, and
-    // diff_body starts exactly at `diff --git`.
+    // `diff --git` textually.
     let split_pos = raw
         .find("\ndiff --git ")
         .map(|p| p + 1)
         .unwrap_or(raw.len());
     let (header_region, diff_body) = raw.split_at(split_pos);
 
-    // Walk the header region to extract hash/author/date/subject/body.
-    // `lines()` handles both LF and CRLF endings.
-    //
-    // State machine:
-    //   Phase 0 (in_body == false): parse git trailer lines (commit, Author, etc.)
-    //   Phase 1 (in_body == true, subject_captured == false): capture subject
-    //   Phase 2 (in_body == true, subject_captured == true): accumulate body
-
-    // Extract the value portion of a `Key: value` header line.
-    let header_value = |line: &str, prefix: &str| -> String {
-        line.strip_prefix(prefix)
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    };
-
-    let mut in_body = false;
-    let mut subject_captured = false;
-    let mut body_lines: Vec<String> = Vec::new();
-
-    for line in header_region.lines() {
-        if !in_body {
-            if line.starts_with("commit ") {
-                header.hash = header_value(line, "commit ");
-            } else if line.starts_with("Merge: ") {
-                // AD-8: capture merge parents as structured field.
-                header.parents = Some(header_value(line, "Merge: "));
-            } else if line.starts_with("Author: ") {
-                header.author = header_value(line, "Author: ");
-            } else if line.starts_with("Date: ") {
-                header.date = header_value(line, "Date: ");
-            } else if line.is_empty() && !header.hash.is_empty() {
-                in_body = true;
-            }
-            // All other header lines (gpgsig, mergetag, continuation lines
-            // starting with a space) are silently skipped per AD-8.
-        } else if !subject_captured {
-            // Phase 1: find subject (first non-blank line after the separator).
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                // Strip the canonical 4-space indent git adds to commit messages.
-                header.subject = line.strip_prefix("    ").unwrap_or(trimmed).to_string();
-                subject_captured = true;
-            }
-        } else {
-            // Phase 2: accumulate body lines, stripping 4-space indent.
-            let stripped = line.strip_prefix("    ").unwrap_or(line);
-            body_lines.push(stripped.to_string());
-        }
-    }
+    let mut header = CommitHeader::default();
+    let body_lines = parse_header_lines(header_region, &mut header);
 
     if header.hash.is_empty() {
         return None;
     }
 
-    // Build body: trim leading and trailing blank lines.
-    // Leading blanks: the blank line between subject and body.
-    // Trailing blanks: artifact of the header_region split position.
-    let start = body_lines
-        .iter()
-        .position(|l| !l.trim().is_empty())
-        .unwrap_or(body_lines.len());
-    let end = body_lines
-        .iter()
-        .rposition(|l| !l.trim().is_empty())
-        .map(|p| p + 1)
-        .unwrap_or(0);
-
-    header.body = if start < end {
-        body_lines[start..end].join("\n")
-    } else {
-        String::new()
-    };
+    header.body = trim_body_blanks(&body_lines);
 
     Some((header, diff_body))
 }
@@ -435,23 +448,40 @@ fn render_show_diff(
     let (header, diff_body) = parse_commit_header(raw)?;
 
     let file_diffs = parse_unified_diff(diff_body);
-    let mut rendered_diff = String::new();
-    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
 
-    for (i, file_diff) in file_diffs.iter().enumerate() {
-        let rendered = render_diff_file(
-            file_diff,
-            global_flags,
-            git_args,
-            DiffMode::Default,
-            i >= super::diff::MAX_AST_FILE_COUNT,
-        );
+    // Mirror run_diff's parallel dispatch: use rayon when file count exceeds
+    // PARALLEL_THRESHOLD, serial otherwise.  `par_iter().collect()` preserves
+    // insertion order so output is deterministic regardless of scheduling.
+    let render_one = |i: usize, fd: &_| {
+        let rendered =
+            render_diff_file(fd, global_flags, git_args, DiffMode::Default, i >= MAX_AST_FILE_COUNT);
+        let entry = DiffFileEntry {
+            path: fd.path.clone(),
+            status: fd.status.clone(),
+            changed_regions: fd.hunks.len(),
+        };
+        (rendered, entry)
+    };
+
+    let rendered_files: Vec<(String, DiffFileEntry)> = if file_diffs.len() >= PARALLEL_THRESHOLD {
+        file_diffs
+            .par_iter()
+            .enumerate()
+            .map(|(i, fd)| render_one(i, fd))
+            .collect()
+    } else {
+        file_diffs
+            .iter()
+            .enumerate()
+            .map(|(i, fd)| render_one(i, fd))
+            .collect()
+    };
+
+    let mut rendered_diff = String::new();
+    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::with_capacity(rendered_files.len());
+    for (rendered, entry) in rendered_files {
         rendered_diff.push_str(&rendered);
-        diff_file_entries.push(DiffFileEntry {
-            path: file_diff.path.clone(),
-            status: file_diff.status.clone(),
-            changed_regions: file_diff.hunks.len(),
-        });
+        diff_file_entries.push(entry);
     }
 
     Some(ShowCommitResult::new(
@@ -556,11 +586,11 @@ fn run_show_commit(
             duration,
         } => {
             // Record analytics on the failure path so the DB reflects failed
-            // `git show` invocations (Commit 9). Raw == compressed
+            // `git show` invocations (Commit 9). raw == compressed
             // (passthrough semantics) — mirrors run_parsed_command and
-            // run_diff non-zero-exit recording.
-            finalize_git_output(
-                &stdout,
+            // run_diff non-zero-exit recording. Single-clone passthrough
+            // variant avoids cloning the same buffer twice (PF-018).
+            super::finalize_git_output_passthrough(
                 &stdout,
                 build_analytics_label("show", original_args, show_stats),
                 show_stats,
@@ -581,11 +611,10 @@ fn run_show_commit(
         // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
         // Route through finalize so the analytics DB records a zero-compression
         // entry instead of silently dropping the invocation (HIGH-3).
-        // raw == output here, so pass the same &str twice via the borrowed
-        // variant — avoids an unconditional clone.
+        // raw == output; single-clone passthrough variant to avoid cloning the
+        // same buffer twice (PF-018).
         print!("{raw}");
-        finalize_git_output(
-            &raw,
+        super::finalize_git_output_passthrough(
             &raw,
             label,
             show_stats,
@@ -632,8 +661,8 @@ fn passthrough_file_content(
 ) {
     eprintln!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
-    // Raw equals output on passthrough; pass the same ref twice so
-    // finalize_git_output can compute accurate compression ratios.
+    // raw == output (passthrough); use the single-clone passthrough variant
+    // to avoid cloning the same buffer twice (PF-018).
     // Map numeric tier to canonical tier-name strings for the analytics DB.
     let tier_name: Option<&'static str> = match tier {
         1 => Some("full"),
@@ -641,8 +670,7 @@ fn passthrough_file_content(
         3 => Some("passthrough"),
         _ => None,
     };
-    finalize_git_output(
-        raw,
+    super::finalize_git_output_passthrough(
         raw,
         label,
         show_stats,
@@ -700,11 +728,11 @@ fn run_show_file_content(
             print!("{}", output.stdout);
         }
         // Record analytics on the error path so the DB reflects failed
-        // invocations (e.g. `git show HEAD:missing.rs`). Raw == compressed
+        // invocations (e.g. `git show HEAD:missing.rs`). raw == compressed
         // (passthrough semantics) — mirrors the pattern in run_parsed_command
-        // and diff/mod.rs for non-zero exit consistency.
-        finalize_git_output(
-            &output.stdout,
+        // and diff/mod.rs for non-zero exit consistency. Single-clone
+        // passthrough variant to avoid cloning the same buffer twice (PF-018).
+        super::finalize_git_output_passthrough(
             &output.stdout,
             build_analytics_label("show", args, show_stats),
             show_stats,

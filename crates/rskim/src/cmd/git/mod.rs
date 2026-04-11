@@ -202,12 +202,13 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 /// Centralises the analytics + stats tail that previously appeared inline in
 /// `run_passthrough`, `run_parsed_command`, and the deleted `record_show_result`.
 ///
-/// Two variants are provided to minimise allocations:
+/// Three variants are provided to minimise allocations:
 ///
-/// - [`finalize_git_output`] — borrowed variant; callers that only hold `&str`
-///   (e.g. `show.rs` where the same `String` is still needed by the guardrail)
-///   avoid cloning when analytics are disabled.  When analytics ARE enabled one
-///   `.to_string()` clone is performed per parameter.
+/// - [`finalize_git_output`] — borrowed variant; for the rare case where
+///   `raw != output` but the caller still holds `&str` references.  Performs
+///   one `.to_string()` clone per argument when analytics are enabled.
+///   **Not used in production call sites currently — prefer the owned or
+///   passthrough variants.**
 ///
 /// - [`finalize_git_output_owned`] — owned variant; callers that already own
 ///   the `String` and raw ≠ output (e.g. `run_parsed_command`, `run_diff`,
@@ -215,7 +216,11 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 ///   zero extra allocations on the analytics path, and still zero allocations
 ///   when analytics are off.
 ///
-/// # Parameters (shared by both variants)
+/// - [`finalize_git_output_passthrough`] — passthrough variant; for all call
+///   sites where raw == output (no compression occurred).  Clones once instead
+///   of twice when analytics are enabled (PF-018).
+///
+/// # Parameters (shared by all variants)
 /// - `raw`          — Original git output before any compression.
 /// - `output`       — Compressed output (may equal `raw` for passthrough).
 /// - `label`        — Command label stored in the analytics DB.
@@ -223,6 +228,10 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 /// - `command_type` — Analytics command-type tag (e.g., `CommandType::Git`).
 /// - `duration`     — Wall-clock duration of the underlying git command.
 /// - `parse_tier`   — Optional tier label set by the parser (AD-12).
+// Allow dead_code: used in tests (see `test_finalize_git_output_accepts_empty_strings`)
+// and available as a fallback for future handlers where raw != output but no
+// owned String is available.
+#[allow(dead_code)]
 pub(super) fn finalize_git_output(
     raw: &str,
     output: &str,
@@ -285,6 +294,43 @@ pub(super) fn finalize_git_output_owned(
     }
 }
 
+/// Passthrough variant of [`finalize_git_output`].
+///
+/// Use this when `raw` and `output` are **the same string** (passthrough
+/// semantics: no compression occurred).  Clones the buffer **once** when
+/// analytics are enabled instead of the **twice** the borrowed variant would
+/// perform when called with `raw == output` (PF-018 resolution).
+///
+/// Call sites: `run_passthrough`, `run_parsed_command` non-zero exit,
+/// `run_diff` non-zero exit / empty diff / empty-after-parse, and the
+/// equivalent failure paths in `show.rs`.
+pub(super) fn finalize_git_output_passthrough(
+    raw: &str,
+    label: String,
+    show_stats: bool,
+    command_type: crate::analytics::CommandType,
+    duration: std::time::Duration,
+    parse_tier: Option<&'static str>,
+) {
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(raw, raw);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+    if crate::analytics::is_analytics_enabled() {
+        // Clone once: both `raw_text` and `compressed_text` are the same
+        // string, so we clone once and reuse.
+        let s = raw.to_string();
+        crate::analytics::try_record_command(
+            s.clone(),
+            s,
+            label,
+            command_type,
+            duration,
+            parse_tier,
+        );
+    }
+}
+
 /// Convert an optional exit code to an ExitCode.
 fn map_exit_code(code: Option<i32>) -> ExitCode {
     match code {
@@ -313,13 +359,13 @@ fn run_passthrough(
         eprint!("{}", output.stderr);
     }
 
-    // Passthrough: raw == compressed, so pass the same &str twice.
-    // The borrowed variant avoids an unconditional clone; `.to_string()`
-    // is only called inside finalize when analytics are actually enabled.
-    finalize_git_output(
+    // Passthrough: raw == compressed. Use the single-clone passthrough variant
+    // to avoid cloning the same buffer twice (PF-018).  Label is built lazily
+    // via build_analytics_label so the format! is skipped when both
+    // show_stats and analytics are disabled (PF-021).
+    finalize_git_output_passthrough(
         &output.stdout,
-        &output.stdout,
-        format!("skim git {} {}", subcmd, args.join(" ")),
+        build_analytics_label(subcmd, args, show_stats),
         show_stats,
         crate::analytics::CommandType::Git,
         output.duration,
@@ -364,9 +410,9 @@ where
             print!("{}", output.stdout);
         }
         // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. Use stdout as both raw and compressed (passthrough).
-        finalize_git_output(
-            &output.stdout,
+        // invocations. raw == compressed here; use single-clone passthrough
+        // variant to avoid cloning the same buffer twice (PF-018).
+        finalize_git_output_passthrough(
             &output.stdout,
             label,
             show_stats,
