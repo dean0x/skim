@@ -484,6 +484,7 @@ fn emit_show_commit(
                 show_stats,
                 crate::analytics::CommandType::Git,
                 duration,
+                Some("full"),
             );
         }
         OutputFormat::Text => {
@@ -511,6 +512,7 @@ fn emit_show_commit(
                 show_stats,
                 crate::analytics::CommandType::Git,
                 duration,
+                Some("full"),
             );
         }
     }
@@ -554,6 +556,7 @@ fn run_show_commit(
             show_stats,
             crate::analytics::CommandType::Git,
             duration,
+            Some("passthrough"),
         );
         return Ok(ExitCode::SUCCESS);
     };
@@ -596,6 +599,13 @@ fn passthrough_file_content(
     print!("{raw}");
     // Raw equals output on passthrough; pass the same ref twice so
     // finalize_git_output can compute accurate compression ratios.
+    // Map numeric tier to canonical tier-name strings for the analytics DB.
+    let tier_name: Option<&'static str> = match tier {
+        1 => Some("full"),
+        2 => Some("degraded"),
+        3 => Some("passthrough"),
+        _ => None,
+    };
     finalize_git_output(
         raw,
         raw,
@@ -603,6 +613,7 @@ fn passthrough_file_content(
         show_stats,
         crate::analytics::CommandType::Git,
         duration,
+        tier_name,
     );
 }
 
@@ -711,6 +722,7 @@ fn run_show_file_content(
         show_stats,
         crate::analytics::CommandType::Git,
         duration,
+        Some("full"),
     );
 
     Ok(ExitCode::SUCCESS)

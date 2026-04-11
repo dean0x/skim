@@ -69,7 +69,7 @@ fn parse_log(output: &str) -> GitResult {
         format!("{count} commits")
     };
 
-    GitResult::new("log".to_string(), summary, lines)
+    GitResult::new("log".to_string(), summary, lines).with_tier("full")
 }
 
 // ============================================================================
@@ -110,5 +110,18 @@ mod tests {
         let result = parse_log("");
         assert_eq!(result.summary, "no commits");
         assert!(result.details.is_empty());
+    }
+
+    /// AD-12: parse_tier must be propagated so analytics can bucket git log
+    /// invocations by tier. The log parser always succeeds (no fallback tiers),
+    /// so every result is tagged `"full"`.
+    #[test]
+    fn test_parse_log_parse_tier_is_full() {
+        let result = parse_log("abc1234 feat: init (1 day ago) <Author>\n");
+        assert_eq!(
+            result.parse_tier,
+            Some("full"),
+            "git log parser must tag parse_tier as 'full' (AD-12)"
+        );
     }
 }

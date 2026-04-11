@@ -127,6 +127,17 @@ impl fmt::Display for TestResult {
 // ============================================================================
 
 /// Result of a git operation
+///
+/// # AD-12 (2026-04-11) — parse_tier propagation through git handlers
+///
+/// Git handlers (log, status, fetch) each use a single parsing strategy
+/// (unlike lint handlers which have Full/Degraded/Passthrough tiers). To make
+/// the analytics DB consistent with the file/lint/infra command families, we
+/// add a `parse_tier` field that each parser can tag with its tier name.
+///
+/// The field is skipped during serialization because it is a runtime annotation,
+/// not part of the persistent JSON schema. Callers that do not set it default to
+/// `None`, which is stored in the analytics DB as NULL (pre-existing behaviour).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GitResult {
     pub(crate) operation: String,
@@ -134,10 +145,18 @@ pub(crate) struct GitResult {
     pub(crate) details: Vec<String>,
     #[serde(default)]
     rendered: String,
+    /// Parse tier label (e.g., `"full"`, `"degraded"`, `"passthrough"`).
+    ///
+    /// Skipped in JSON serialization — this is a runtime annotation for the
+    /// analytics layer, not a schema field.
+    #[serde(skip)]
+    pub(crate) parse_tier: Option<&'static str>,
 }
 
 impl GitResult {
-    /// Create a new GitResult with pre-computed rendered output
+    /// Create a new GitResult with pre-computed rendered output.
+    ///
+    /// `parse_tier` defaults to `None`. Use [`GitResult::with_tier`] to set it.
     pub(crate) fn new(operation: String, summary: String, details: Vec<String>) -> Self {
         let rendered = Self::render(&operation, &summary, &details);
         Self {
@@ -145,7 +164,18 @@ impl GitResult {
             summary,
             details,
             rendered,
+            parse_tier: None,
         }
+    }
+
+    /// Set the parse tier and return `self` for builder-style chaining.
+    ///
+    /// ```ignore
+    /// GitResult::new("log".to_string(), summary, lines).with_tier("full")
+    /// ```
+    pub(crate) fn with_tier(mut self, tier: &'static str) -> Self {
+        self.parse_tier = Some(tier);
+        self
     }
 
     /// Recompute rendered field if empty (e.g., after deserialization)
@@ -1133,6 +1163,46 @@ mod tests {
         assert!(display.contains("[push]"));
         assert!(display.contains("pushed to origin/main"));
         assert!(display.contains("abc123 feat: add feature"));
+    }
+
+    /// AD-12: `GitResult::new` must default `parse_tier` to `None` so callers
+    /// that do not set a tier do not crash and the analytics DB records NULL.
+    #[test]
+    fn test_git_result_parse_tier_defaults_to_none() {
+        let result = GitResult::new("op".to_string(), "summary".to_string(), vec![]);
+        assert_eq!(
+            result.parse_tier, None,
+            "parse_tier must default to None for backwards-compat callers"
+        );
+    }
+
+    /// AD-12: `GitResult::with_tier` must set the parse tier without affecting
+    /// other fields or the rendered output.
+    #[test]
+    fn test_git_result_with_tier_sets_tier() {
+        let result =
+            GitResult::new("log".to_string(), "5 commits".to_string(), vec![]).with_tier("full");
+        assert_eq!(
+            result.parse_tier,
+            Some("full"),
+            "with_tier must store the tier name"
+        );
+        // Other fields must not be disturbed.
+        assert_eq!(result.operation, "log");
+        assert_eq!(result.summary, "5 commits");
+    }
+
+    /// AD-12: `parse_tier` must be skipped during JSON serialization because it
+    /// is a runtime annotation, not a persistent schema field.
+    #[test]
+    fn test_git_result_parse_tier_skipped_in_json() {
+        let result =
+            GitResult::new("log".to_string(), "3 commits".to_string(), vec![]).with_tier("full");
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("parse_tier"),
+            "parse_tier must not appear in JSON serialization: {json}"
+        );
     }
 
     // ========================================================================

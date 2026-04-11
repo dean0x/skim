@@ -203,6 +203,7 @@ pub(super) fn run_diff(
             show_stats,
             crate::analytics::CommandType::Git,
             output.duration,
+            Some("passthrough"),
         );
         return Ok(map_exit_code(output.exit_code));
     }
@@ -229,6 +230,7 @@ pub(super) fn run_diff(
             show_stats,
             crate::analytics::CommandType::Git,
             duration,
+            Some("full"),
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -251,6 +253,7 @@ pub(super) fn run_diff(
                 show_stats,
                 crate::analytics::CommandType::Git,
                 duration,
+                Some("degraded"),
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -332,6 +335,7 @@ pub(super) fn run_diff(
         show_stats,
         crate::analytics::CommandType::Git,
         duration,
+        Some("full"),
     );
 
     Ok(ExitCode::SUCCESS)

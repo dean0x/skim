@@ -167,7 +167,7 @@ impl StatusCategories {
             parts.join(", ")
         };
 
-        GitResult::new("status".to_string(), summary, details)
+        GitResult::new("status".to_string(), summary, details).with_tier("full")
     }
 }
 
@@ -293,14 +293,15 @@ mod tests {
         }
 
         if summary_line.is_empty() && file_stats.is_empty() {
-            return GitResult::new("diff".to_string(), "no changes".to_string(), vec![]);
+            return GitResult::new("diff".to_string(), "no changes".to_string(), vec![])
+                .with_tier("full");
         }
 
         if summary_line.is_empty() {
             summary_line = format!("{} files changed", file_stats.len());
         }
 
-        GitResult::new("diff".to_string(), summary_line, file_stats)
+        GitResult::new("diff".to_string(), summary_line, file_stats).with_tier("full")
     }
 
     // ========================================================================

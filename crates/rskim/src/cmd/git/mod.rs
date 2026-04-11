@@ -222,6 +222,7 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 /// - `show_stats`   — Whether to print token-savings stats to stderr.
 /// - `command_type` — Analytics command-type tag (e.g., `CommandType::Git`).
 /// - `duration`     — Wall-clock duration of the underlying git command.
+/// - `parse_tier`   — Optional tier label set by the parser (AD-12).
 pub(super) fn finalize_git_output(
     raw: &str,
     output: &str,
@@ -229,6 +230,7 @@ pub(super) fn finalize_git_output(
     show_stats: bool,
     command_type: crate::analytics::CommandType,
     duration: std::time::Duration,
+    parse_tier: Option<&'static str>,
 ) {
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(raw, output);
@@ -241,7 +243,7 @@ pub(super) fn finalize_git_output(
             label,
             command_type,
             duration,
-            None,
+            parse_tier,
         );
     }
 }
@@ -256,6 +258,8 @@ pub(super) fn finalize_git_output(
 ///
 /// Use this variant in handlers that already own their output strings
 /// (i.e. the string would be dropped immediately after the call anyway).
+///
+/// `parse_tier` is forwarded to the analytics record (AD-12).
 pub(super) fn finalize_git_output_owned(
     raw: String,
     output: String,
@@ -263,13 +267,21 @@ pub(super) fn finalize_git_output_owned(
     show_stats: bool,
     command_type: crate::analytics::CommandType,
     duration: std::time::Duration,
+    parse_tier: Option<&'static str>,
 ) {
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&raw, &output);
         crate::process::report_token_stats(orig, comp, "");
     }
     if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(raw, output, label, command_type, duration, None);
+        crate::analytics::try_record_command(
+            raw,
+            output,
+            label,
+            command_type,
+            duration,
+            parse_tier,
+        );
     }
 }
 
@@ -311,6 +323,7 @@ fn run_passthrough(
         show_stats,
         crate::analytics::CommandType::Git,
         output.duration,
+        Some("passthrough"),
     );
 
     Ok(map_exit_code(output.exit_code))
@@ -359,6 +372,7 @@ where
             show_stats,
             crate::analytics::CommandType::Git,
             output.duration,
+            Some("passthrough"),
         );
         return Ok(map_exit_code(output.exit_code));
     }
@@ -371,6 +385,8 @@ where
     };
 
     let result = parser(&raw);
+    // Capture parse_tier before result is consumed by rendering.
+    let parse_tier = result.parse_tier;
     let result_str = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
@@ -389,6 +405,7 @@ where
     // use the owned variant to move them directly rather than cloning.
     // `label` is supplied by the caller from the user's original (pre-rewrite) args
     // so the analytics DB records the invocation as the user typed it.
+    // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-12).
     finalize_git_output_owned(
         raw,
         result_str,
@@ -396,6 +413,7 @@ where
         show_stats,
         crate::analytics::CommandType::Git,
         output.duration,
+        parse_tier,
     );
 
     Ok(ExitCode::SUCCESS)
@@ -664,6 +682,7 @@ mod tests {
             false,
             crate::analytics::CommandType::Git,
             std::time::Duration::ZERO,
+            None,
         );
         std::env::remove_var("SKIM_DISABLE_ANALYTICS");
     }

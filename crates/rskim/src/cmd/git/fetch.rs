@@ -237,7 +237,8 @@ fn parse_fetch(input: &str) -> GitResult {
     let lines: Vec<&str> = input.lines().collect();
 
     if lines.iter().all(|l| l.trim().is_empty()) {
-        return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new());
+        return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new())
+            .with_tier("full");
     }
 
     let cats = classify_lines(lines.iter().copied());
@@ -273,13 +274,14 @@ fn parse_fetch(input: &str) -> GitResult {
     }
 
     if parts.is_empty() && cats.submodule_map.is_empty() {
-        return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new());
+        return GitResult::new("fetch".to_string(), "up to date".to_string(), Vec::new())
+            .with_tier("full");
     }
 
     let details = build_details(&cats);
     let display_summary = build_summary(&cats.remote, &parts);
 
-    GitResult::new("fetch".to_string(), display_summary, details)
+    GitResult::new("fetch".to_string(), display_summary, details).with_tier("full")
 }
 
 fn build_summary(remote: &str, parts: &[String]) -> String {
