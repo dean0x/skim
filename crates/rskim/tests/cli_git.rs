@@ -557,3 +557,65 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
         .success()
         .stdout(predicate::str::contains("[fetch]").or(predicate::str::contains("up to date")));
 }
+
+// ============================================================================
+// AD-8: commit body and merge parents (Commit 1, 2026-04-11)
+// ============================================================================
+
+/// E2E test: git show must preserve multi-paragraph commit body.
+///
+/// Creates a temp git repo with a commit that has a multi-paragraph body,
+/// invokes `skim git show HEAD`, and asserts the body paragraphs appear in
+/// the output.
+#[test]
+fn test_git_show_preserves_commit_body() {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let path = dir.path();
+
+    // Init repo and configure identity.
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(path)
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(path)
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(path)
+        .output()
+        .expect("git config name");
+
+    // Create a commit with multi-paragraph body.
+    let commit_msg = "feat: multi paragraph test\n\nparagraph 1 of the body\n\nparagraph 2 of the body";
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", commit_msg])
+        .current_dir(path)
+        .output()
+        .expect("git commit");
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["git", "show", "HEAD"])
+        .current_dir(path)
+        .output()
+        .expect("skim git show must not fail to spawn");
+
+    assert!(
+        output.status.success(),
+        "skim git show HEAD must exit 0 on valid commit"
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("paragraph 1"),
+        "output must contain 'paragraph 1': {stdout}"
+    );
+    assert!(
+        stdout.contains("paragraph 2"),
+        "output must contain 'paragraph 2': {stdout}"
+    );
+}

@@ -1,0 +1,22 @@
+commit 1234567890abcdef1234567890abcdef12345678
+gpgsig -----BEGIN PGP SIGNATURE-----
+ iQEzBAABCAAdFiEEabcdefghijklmnopqrstuvwxyz01234FiEEABCDEFGH
+ ijklmnopqrstuvwxyz01234567890abcdef1234567890abcdef12345678
+ -----END PGP SIGNATURE-----
+Author: Signed Dev <signed@example.com>
+Date:   Wed Apr 9 14:00:00 2025 +0000
+
+    security: signed commit with GPG signature
+
+    This commit body should appear in the output.
+    The PGP signature block above should be silently skipped.
+
+diff --git a/src/secure.rs b/src/secure.rs
+new file mode 100644
+index 0000000..aabbcc
+--- /dev/null
++++ b/src/secure.rs
+@@ -0,0 +1,3 @@
++pub fn check() -> bool {
++    true
++}

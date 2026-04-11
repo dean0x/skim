@@ -1660,6 +1660,8 @@ mod tests {
             "Alice <alice@example.com>".to_string(),
             "2024-01-15 10:00:00 +0000".to_string(),
             "feat: add feature".to_string(),
+            String::new(),
+            None,
             files,
             "diff content here",
         );
@@ -1688,6 +1690,8 @@ mod tests {
             "Bob".to_string(),
             "2024-01-15".to_string(),
             "short hash commit".to_string(),
+            String::new(),
+            None,
             vec![],
             "",
         );
@@ -1714,6 +1718,8 @@ mod tests {
             "Carol".to_string(),
             "2024-01-16".to_string(),
             "fix: remove b".to_string(),
+            String::new(),
+            None,
             files,
             "",
         );
@@ -1735,6 +1741,8 @@ mod tests {
             "Dave <dave@example.com>".to_string(),
             "2024-02-01 12:00:00 +0000".to_string(),
             "refactor: clean up".to_string(),
+            String::new(),
+            None,
             files,
             "the diff body",
         );
@@ -1761,6 +1769,8 @@ mod tests {
             author: "Eve".to_string(),
             date: "2024-03-01".to_string(),
             subject: "chore: cleanup".to_string(),
+            body: String::new(),
+            parents: None,
             files_changed: 1,
             files: vec![DiffFileEntry {
                 path: "src/foo.rs".to_string(),
@@ -1798,6 +1808,8 @@ mod tests {
             "Frank".to_string(),
             "2024-04-01".to_string(),
             "docs: update readme".to_string(),
+            String::new(),
+            None,
             vec![],
             "",
         );
@@ -1821,6 +1833,8 @@ mod tests {
             "Grace".to_string(),
             "2024-05-15 09:30:00 +0000".to_string(),
             "test: add coverage".to_string(),
+            String::new(),
+            None,
             vec![],
             "",
         );
@@ -1833,6 +1847,87 @@ mod tests {
         assert!(
             json.contains("2024-05-15"),
             "date MUST appear in JSON output: {json}"
+        );
+    }
+
+    // AD-8 tests: body and parents preservation
+    #[test]
+    fn test_show_commit_result_body_in_render() {
+        let result = ShowCommitResult::new(
+            "abc1234567".to_string(),
+            "Alice".to_string(),
+            "2026-04-11".to_string(),
+            "feat: multi-paragraph".to_string(),
+            "Paragraph 1 of body.\n\nParagraph 2 of body.".to_string(),
+            None,
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        assert!(
+            text.contains("Paragraph 1 of body."),
+            "body paragraph 1 must appear: {text}"
+        );
+        assert!(
+            text.contains("Paragraph 2 of body."),
+            "body paragraph 2 must appear: {text}"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_empty_body_no_trailing_newlines() {
+        let result = ShowCommitResult::new(
+            "abc1234".to_string(),
+            "Bob".to_string(),
+            "2026-04-11".to_string(),
+            "fix: subject only".to_string(),
+            String::new(),
+            None,
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        // Subject-only commits must not have trailing blank lines (compact output).
+        assert!(!text.ends_with("\n\n"), "no trailing blank lines: {text:?}");
+    }
+
+    #[test]
+    fn test_show_commit_result_parents_in_render() {
+        let result = ShowCommitResult::new(
+            "fedcba9".to_string(),
+            "Merger".to_string(),
+            "2026-04-11".to_string(),
+            "Merge pull request #42".to_string(),
+            String::new(),
+            Some("abc123 def456 fed321".to_string()),
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        assert!(
+            text.contains("Merge: abc123 def456 fed321"),
+            "parents must appear as Merge: line: {text}"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_parents_before_summary() {
+        let result = ShowCommitResult::new(
+            "cafebabe".to_string(),
+            "Merger".to_string(),
+            "2026-04-11".to_string(),
+            "Merge feature branch".to_string(),
+            String::new(),
+            Some("aaa111 bbb222".to_string()),
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        let merge_pos = text.find("Merge:").unwrap();
+        let summary_pos = text.find('\u{2014}').unwrap();
+        assert!(
+            merge_pos < summary_pos,
+            "Merge: line must appear before summary em-dash: {text}"
         );
     }
 }
@@ -1853,6 +1948,14 @@ mod tests {
 /// The `date` field is serialized to JSON but intentionally omitted from the
 /// text render: the single-line summary (`<hash> <author> — <subject>`) is
 /// already compact; callers that need the full date should use `--json`.
+///
+/// # AD-8 (2026-04-11) — body and parents
+///
+/// `body` stores the full multi-paragraph commit message below the subject
+/// line. It is appended to the text render only when non-empty, keeping
+/// subject-only commits compact. `parents` captures the tail of `Merge: `
+/// header lines; when present it is rendered as `Merge: {parents}` on a
+/// dedicated line before the summary, matching `git show` output order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShowCommitResult {
     /// Short commit hash (first 7 characters).
@@ -1863,6 +1966,20 @@ pub(crate) struct ShowCommitResult {
     pub(crate) date: String,
     /// Commit subject (first line of commit message).
     pub(crate) subject: String,
+    /// Full commit message body below the subject line (empty for subject-only commits).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Preserved verbatim with 4-space indent stripped. Appended to text render
+    /// as `\n\n{body}` only when non-empty.
+    #[serde(default)]
+    pub(crate) body: String,
+    /// Merge parent hashes, when present (e.g. `"abc123 def456"`).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Rendered as `Merge: {parents}\n` before the summary line in text output.
+    /// Octopus merges store all parent hashes space-separated in one string.
+    #[serde(default)]
+    pub(crate) parents: Option<String>,
     /// Number of files changed (mirrors `files.len()` for quick JSON access).
     #[serde(default)]
     pub(crate) files_changed: usize,
@@ -1874,31 +1991,54 @@ pub(crate) struct ShowCommitResult {
 
 impl ShowCommitResult {
     /// Create a new `ShowCommitResult` with pre-computed rendered output.
+    ///
+    /// # AD-8 (2026-04-11)
+    /// `body` and `parents` are new required parameters. `parents` renders as
+    /// `Merge: {parents}\n` before the summary line. `body` renders as
+    /// `\n\n{body}` after the summary only when non-empty.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         hash: String,
         author: String,
         date: String,
         subject: String,
+        body: String,
+        parents: Option<String>,
         files: Vec<DiffFileEntry>,
         diff_output: &str,
     ) -> Self {
         let files_changed = files.len();
-        let rendered = Self::render(&hash, &author, &subject, diff_output);
+        let rendered = Self::render(&hash, &author, &subject, &body, parents.as_deref(), diff_output);
         Self {
             hash,
             author,
             date,
             subject,
+            body,
+            parents,
             files_changed,
             files,
             rendered,
         }
     }
 
-    fn render(hash: &str, author: &str, subject: &str, diff_output: &str) -> String {
+    /// Render the commit result to a human-readable string.
+    ///
+    /// # AD-8 (2026-04-11)
+    /// - `parents` (when `Some`) is prepended as `Merge: {parents}\n` before the summary.
+    /// - `body` (when non-empty) is appended as `\n\n{body}` after the summary.
+    /// - Empty body produces no trailing newlines, keeping subject-only commits compact.
+    fn render(hash: &str, author: &str, subject: &str, body: &str, parents: Option<&str>, diff_output: &str) -> String {
         use std::fmt::Write;
         let short = hash.get(..7).unwrap_or(hash);
-        let mut output = format!("{short} {author} \u{2014} {subject}");
+        let mut output = String::new();
+        if let Some(p) = parents {
+            let _ = writeln!(output, "Merge: {p}");
+        }
+        let _ = write!(output, "{short} {author} \u{2014} {subject}");
+        if !body.is_empty() {
+            let _ = write!(output, "\n\n{body}");
+        }
         if !diff_output.is_empty() {
             let _ = write!(output, "\n\n{diff_output}");
         }
@@ -1917,11 +2057,20 @@ impl ShowCommitResult {
     /// Recompute `rendered` if empty (e.g. after JSON deserialization that
     /// stripped the field).  Produces a lossy summary — file paths, statuses,
     /// and region counts — because the original diff body is not stored.
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Respects `parents` (prepends `Merge: {parents}\n`) and `body` (appends
+    /// when non-empty) for consistency with `render()`.
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
             use std::fmt::Write;
             let short = self.hash.get(..7).unwrap_or(&self.hash);
-            let mut output = format!(
+            let mut output = String::new();
+            if let Some(p) = &self.parents {
+                let _ = writeln!(output, "Merge: {p}");
+            }
+            let _ = write!(
+                output,
                 "{short} {} \u{2014} {} [{} files]",
                 self.author, self.subject, self.files_changed
             );
@@ -1931,6 +2080,9 @@ impl ShowCommitResult {
                     "\n  {} ({}, {} regions)",
                     file.path, file.status, file.changed_regions
                 );
+            }
+            if !self.body.is_empty() {
+                let _ = write!(output, "\n\n{}", self.body);
             }
             self.rendered = output;
         }

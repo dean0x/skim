@@ -31,6 +31,17 @@
 //! token unambiguously signals a tree-object ref, while its absence means a
 //! commit-ish. All other dispatch logic (passthrough flags, `--json` rejection,
 //! annotated-tag detection) is layered on top of this primary shape test.
+//!
+//! **AD-8 (2026-04-11)** — Commit body and merge-parent preservation.
+//!
+//! `CommitHeader` now captures `body` (full multi-paragraph commit message
+//! below the subject line) and `parents` (the tail of `Merge: ` header lines,
+//! stored as a structured `Option<String>` field rather than inlined into the
+//! body). `parents` is rendered as `Merge: {parents}` before the summary line;
+//! `body` is appended as `\n\n{body}` only when non-empty, so subject-only
+//! commits remain compact. GPG/SSH signature blocks (`gpgsig `/ `mergetag `
+//! lines and their continuation lines) appear before the blank separator and
+//! are silently skipped — they are implementation artefacts, not user content.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -202,10 +213,28 @@ pub(super) fn run_show(
 /// Parsed fields from a `git show` commit header.
 #[derive(Debug, Default)]
 struct CommitHeader {
+    /// Full 40-character commit hash.
     hash: String,
+    /// Author name and email.
     author: String,
+    /// Commit date string.
     date: String,
+    /// First (subject) line of the commit message.
     subject: String,
+    /// Full commit message body below the subject line (may be empty).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Multi-paragraph bodies are preserved verbatim with 4-space indent stripped.
+    /// Empty when the commit has only a subject line.
+    body: String,
+    /// Tail of a `Merge: ` header line, when present (e.g. `"abc123 def456"`).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Stored as a structured field rather than inlined into `body` so that
+    /// `ShowCommitResult::render` can emit `Merge: {parents}` as a dedicated
+    /// prefix line. Octopus merges have all parent hashes in one space-separated
+    /// string — the tail is stored unchanged.
+    parents: Option<String>,
 }
 
 /// Parse commit header lines (up to the first blank line after the message).
@@ -222,6 +251,14 @@ struct CommitHeader {
 /// missing trailing newlines, and other quirks that would misalign a
 /// hand-rolled byte counter. Git outputs LF by default but users may pipe
 /// through tools that introduce CRLF.
+///
+/// # Signature blocks (AD-8)
+/// `gpgsig ` and `mergetag ` header lines (and their multi-line continuations
+/// that start with a space) appear between the `commit ` line and the blank
+/// separator. They are silently skipped — they are implementation artefacts,
+/// not user-authored content. The skip is implicit: only lines whose prefixes
+/// are explicitly recognised (`commit `, `Author: `, `Date: `, `Merge: `) are
+/// captured; everything else is ignored.
 fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     let mut header = CommitHeader::default();
 
@@ -242,44 +279,88 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
         .unwrap_or(raw.len());
     let (header_region, diff_body) = raw.split_at(split_pos);
 
-    // Walk the header region to extract hash/author/date/subject.
+    // Walk the header region to extract hash/author/date/subject/body.
     // `lines()` handles both LF and CRLF endings.
+    //
+    // State machine:
+    //   Phase 0 (in_body == false): parse git trailer lines (commit, Author, etc.)
+    //   Phase 1 (in_body == true, subject_captured == false): capture subject
+    //   Phase 2 (in_body == true, subject_captured == true): accumulate body
 
     let mut in_body = false;
+    let mut subject_captured = false;
+    let mut body_lines: Vec<String> = Vec::new();
+
     for line in header_region.lines() {
-        if in_body {
-            // First non-blank line after the blank separator is the subject.
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && header.subject.is_empty() {
-                header.subject = trimmed.to_string();
-                break; // Subject captured; no need to scan remaining header lines.
+        if !in_body {
+            if line.starts_with("commit ") {
+                header.hash = line
+                    .strip_prefix("commit ")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+            } else if line.starts_with("Merge: ") {
+                // AD-8: capture merge parents as structured field.
+                header.parents = Some(
+                    line.strip_prefix("Merge: ")
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                );
+            } else if line.starts_with("Author: ") {
+                header.author = line
+                    .strip_prefix("Author: ")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+            } else if line.starts_with("Date: ") {
+                header.date = line
+                    .strip_prefix("Date: ")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+            } else if line.is_empty() && !header.hash.is_empty() {
+                in_body = true;
             }
-        } else if line.starts_with("commit ") {
-            header.hash = line
-                .strip_prefix("commit ")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        } else if line.starts_with("Author: ") {
-            header.author = line
-                .strip_prefix("Author: ")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        } else if line.starts_with("Date: ") {
-            header.date = line
-                .strip_prefix("Date: ")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        } else if line.is_empty() && !header.hash.is_empty() {
-            in_body = true;
+            // All other header lines (gpgsig, mergetag, continuation lines
+            // starting with a space) are silently skipped per AD-8.
+        } else if !subject_captured {
+            // Phase 1: find subject (first non-blank line after the separator).
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                // Strip the canonical 4-space indent git adds to commit messages.
+                header.subject = line.strip_prefix("    ").unwrap_or(trimmed).to_string();
+                subject_captured = true;
+            }
+        } else {
+            // Phase 2: accumulate body lines, stripping 4-space indent.
+            let stripped = line.strip_prefix("    ").unwrap_or(line);
+            body_lines.push(stripped.to_string());
         }
     }
 
     if header.hash.is_empty() {
         return None;
     }
+
+    // Build body: trim leading and trailing blank lines.
+    // Leading blanks: the blank line between subject and body.
+    // Trailing blanks: artifact of the header_region split position.
+    let start = body_lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(body_lines.len());
+    let end = body_lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    header.body = if start < end {
+        body_lines[start..end].join("\n")
+    } else {
+        String::new()
+    };
 
     Some((header, diff_body))
 }
@@ -362,6 +443,8 @@ fn render_show_diff(
         header.author,
         header.date,
         header.subject,
+        header.body,
+        header.parents,
         diff_file_entries,
         &rendered_diff,
     ))
@@ -499,12 +582,17 @@ fn run_show_commit(
 /// computed via a guarded `if/else` that returns `String::new()` when neither
 /// `--show-stats` nor analytics are enabled, so each branch allocates at most
 /// one String — allocation is deferred to branch-time, not cached (MEDIUM-24).
+///
+/// Emits a stderr notice matching `diff/mod.rs:301` `[skim:guardrail]` style so
+/// callers can observe which tier was selected without parsing structured output.
 fn passthrough_file_content(
     raw: &str,
     label: String,
     show_stats: bool,
     duration: std::time::Duration,
+    tier: u8,
 ) {
+    eprintln!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
     // Raw equals output on passthrough; pass the same ref twice so
     // finalize_git_output can compute accurate compression ratios.
@@ -578,7 +666,7 @@ fn run_show_file_content(
 
     let Some(lang) = lang else {
         // Tier 2: unsupported or serde-based language — passthrough.
-        passthrough_file_content(&raw, label, show_stats, duration);
+        passthrough_file_content(&raw, label, show_stats, duration, 2);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -595,7 +683,7 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(&raw, label, show_stats, duration);
+            passthrough_file_content(&raw, label, show_stats, duration, 3);
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -860,6 +948,8 @@ mod tests {
             header.author,
             header.date,
             header.subject,
+            String::new(),
+            None,
             vec![],
             "diff output",
         );
@@ -1167,6 +1257,87 @@ mod tests {
         assert!(
             rendered.contains("chore: update lockfile"),
             "subject must appear in Tier-2 rendered output, got: {rendered}"
+        );
+    }
+
+    // ========================================================================
+    // AD-8: body and parents parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_commit_header_multi_paragraph_body() {
+        let fixture =
+            include_str!("../../../tests/fixtures/cmd/git/show_multi_paragraph.txt");
+        let (header, _diff_body) =
+            parse_commit_header(fixture).expect("multi-paragraph commit must parse");
+        assert!(
+            header.body.contains("paragraph 1"),
+            "body must contain paragraph 1: {:?}",
+            header.body
+        );
+        assert!(
+            header.body.contains("paragraph 2"),
+            "body must contain paragraph 2: {:?}",
+            header.body
+        );
+        assert!(
+            header.body.contains("paragraph 3"),
+            "body must contain paragraph 3: {:?}",
+            header.body
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_header_merge_parents() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_merge.txt");
+        let (header, _diff_body) =
+            parse_commit_header(fixture).expect("merge commit must parse");
+        assert_eq!(
+            header.parents,
+            Some("abc123 def456 fed321".to_string()),
+            "octopus merge parents must be captured: {:?}",
+            header.parents
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_header_signed_commit() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_signed.txt");
+        let (header, _diff_body) =
+            parse_commit_header(fixture).expect("signed commit must parse");
+        // Body should not contain PGP signature content.
+        assert!(
+            !header.body.contains("BEGIN PGP SIGNATURE"),
+            "PGP signature block must be silently skipped: {:?}",
+            header.body
+        );
+        assert!(
+            !header.body.contains("END PGP SIGNATURE"),
+            "PGP signature block end must be silently skipped: {:?}",
+            header.body
+        );
+        // The actual commit body should be present.
+        assert!(
+            header.body.contains("This commit body should appear"),
+            "commit body must be preserved in signed commit: {:?}",
+            header.body
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_header_empty_body() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_empty_body.txt");
+        let (header, _diff_body) =
+            parse_commit_header(fixture).expect("subject-only commit must parse");
+        assert!(
+            header.body.is_empty(),
+            "subject-only commit must have empty body: {:?}",
+            header.body
+        );
+        assert!(
+            header.parents.is_none(),
+            "non-merge commit must have no parents: {:?}",
+            header.parents
         );
     }
 }
