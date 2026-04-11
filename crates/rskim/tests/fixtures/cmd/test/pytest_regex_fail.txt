@@ -1,0 +1,8 @@
+============================= test session starts ==============================
+FAILED tests/test_math.py::test_divide - ZeroDivisionError: division by zero
+FAILED tests/test_api.py::test_endpoint - AssertionError: 404 != 200
+
+short test summary info
+FAILED tests/test_math.py::test_divide - ZeroDivisionError: division by zero
+FAILED tests/test_api.py::test_endpoint - AssertionError: 404 != 200
+============================== 2 failed in 0.15s ==============================

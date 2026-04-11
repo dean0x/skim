@@ -20,6 +20,8 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
 
+use super::shared::{scrape_failures, TestKind};
+
 // ============================================================================
 // Public entry point
 // ============================================================================
@@ -374,6 +376,10 @@ static COMMA_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Try to parse test summary from plain text output using regex patterns.
+///
+/// When failures are detected, individual test names are scraped via
+/// [`scrape_failures`] so the Tier-2 result includes a list of failing
+/// tests rather than an empty entries list (AD-Commit2, 2026-04-11).
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
     let cleaned = crate::output::strip_ansi(raw);
 
@@ -390,7 +396,12 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
             skip,
             duration_ms: None,
         };
-        return Some(TestResult::new(summary, vec![]));
+        let entries = if fail > 0 {
+            scrape_failures(raw, TestKind::Vitest)
+        } else {
+            vec![]
+        };
+        return Some(TestResult::new(summary, entries));
     }
 
     // Pattern 2: "Tests:\s+N passed(?:,\s+N failed)?(?:,\s+N total)?"
@@ -412,7 +423,12 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
             skip,
             duration_ms: None,
         };
-        return Some(TestResult::new(summary, vec![]));
+        let entries = if fail > 0 {
+            scrape_failures(raw, TestKind::Vitest)
+        } else {
+            vec![]
+        };
+        return Some(TestResult::new(summary, entries));
     }
 
     None

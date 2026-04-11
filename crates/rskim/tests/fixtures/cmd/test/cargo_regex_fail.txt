@@ -1,0 +1,14 @@
+running 3 tests
+test my_module::test_foo ... FAILED
+test other::test_bar ... ok
+test util::test_baz ... FAILED
+
+failures:
+
+---- my_module::test_foo stdout ----
+thread 'my_module::test_foo' panicked at 'assertion failed: false'
+
+---- util::test_baz stdout ----
+thread 'util::test_baz' panicked at 'assertion `left == right` failed'
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out

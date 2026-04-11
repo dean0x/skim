@@ -6,6 +6,7 @@
 pub(crate) mod cargo;
 pub(crate) mod go;
 mod pytest;
+mod shared;
 pub(crate) mod vitest;
 
 use std::process::ExitCode;
