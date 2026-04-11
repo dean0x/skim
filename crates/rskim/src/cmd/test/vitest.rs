@@ -137,7 +137,7 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
         final_args.push("--reporter=json".to_string());
     }
 
-    let arg_refs: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
 
     let runner = CommandRunner::new(None);
     let output = runner.run(program, &arg_refs).map_err(|e| {

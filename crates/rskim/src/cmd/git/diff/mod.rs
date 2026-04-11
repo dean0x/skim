@@ -184,7 +184,7 @@ pub(super) fn run_diff(
     full_args.extend_from_slice(&git_args);
 
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {

@@ -397,11 +397,11 @@ fn flush_stack_frames(
     elided: &mut usize,
 ) {
     let total = pending_stack.len();
-    let keep: Vec<String> = pending_stack.iter().rev().take(3).rev().cloned().collect();
-    *elided += total.saturating_sub(3);
+    let skip = total.saturating_sub(3);
+    *elided += skip;
 
     if let Some((_, msg)) = all_entries.last_mut() {
-        for frame in &keep {
+        for frame in pending_stack.iter().skip(skip) {
             msg.push('\n');
             msg.push_str(frame);
         }

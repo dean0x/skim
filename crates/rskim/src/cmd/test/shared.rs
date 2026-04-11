@@ -88,10 +88,7 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
             break;
         }
         if let Some(caps) = re.captures(line) {
-            let name = caps
-                .get(1)
-                .map(|m| m.as_str().trim().to_string())
-                .unwrap_or_default();
+            let name = caps[1].trim().to_string();
             if !name.is_empty() {
                 entries.push(TestEntry {
                     name,

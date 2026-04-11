@@ -305,7 +305,7 @@ fn run_passthrough(
     full_args.extend_from_slice(args);
 
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
     print!("{}", output.stdout);
@@ -352,7 +352,7 @@ where
     F: FnOnce(&str) -> GitResult,
 {
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = subcmd_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = subcmd_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {

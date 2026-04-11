@@ -287,6 +287,14 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     //   Phase 1 (in_body == true, subject_captured == false): capture subject
     //   Phase 2 (in_body == true, subject_captured == true): accumulate body
 
+    // Extract the value portion of a `Key: value` header line.
+    let header_value = |line: &str, prefix: &str| -> String {
+        line.strip_prefix(prefix)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+
     let mut in_body = false;
     let mut subject_captured = false;
     let mut body_lines: Vec<String> = Vec::new();
@@ -294,31 +302,14 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     for line in header_region.lines() {
         if !in_body {
             if line.starts_with("commit ") {
-                header.hash = line
-                    .strip_prefix("commit ")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                header.hash = header_value(line, "commit ");
             } else if line.starts_with("Merge: ") {
                 // AD-8: capture merge parents as structured field.
-                header.parents = Some(
-                    line.strip_prefix("Merge: ")
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string(),
-                );
+                header.parents = Some(header_value(line, "Merge: "));
             } else if line.starts_with("Author: ") {
-                header.author = line
-                    .strip_prefix("Author: ")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                header.author = header_value(line, "Author: ");
             } else if line.starts_with("Date: ") {
-                header.date = line
-                    .strip_prefix("Date: ")
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
+                header.date = header_value(line, "Date: ");
             } else if line.is_empty() && !header.hash.is_empty() {
                 in_body = true;
             }

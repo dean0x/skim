@@ -57,16 +57,13 @@ fn parse_log(output: &str) -> GitResult {
     let lines: Vec<String> = output
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
+        .map(str::to_string)
         .collect();
 
-    let count = lines.len();
-    let summary = if count == 0 {
-        "no commits".to_string()
-    } else if count == 1 {
-        "1 commit".to_string()
-    } else {
-        format!("{count} commits")
+    let summary = match lines.len() {
+        0 => "no commits".to_string(),
+        1 => "1 commit".to_string(),
+        n => format!("{n} commits"),
     };
 
     GitResult::new("log".to_string(), summary, lines).with_tier("full")
