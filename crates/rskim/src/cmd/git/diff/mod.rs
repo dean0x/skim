@@ -10,6 +10,12 @@ mod render;
 mod source;
 pub(super) mod types;
 
+// Re-export for show.rs (sibling of diff/ within cmd/git/).
+// AD-6: Raising visibility to pub(in crate::cmd::git) enables show.rs to
+// reuse the diff pipeline without duplicating parsing or rendering logic.
+pub(in crate::cmd::git) use parse::parse_unified_diff;
+pub(in crate::cmd::git) use render::render_diff_file;
+
 use std::process::ExitCode;
 
 use rayon::prelude::*;
@@ -18,9 +24,7 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
 
-use super::{map_exit_code, run_passthrough};
-use parse::parse_unified_diff;
-use render::render_diff_file;
+use super::{finalize_git_output, finalize_git_output_owned, map_exit_code, run_passthrough};
 
 /// Maximum file size for AST processing (100 KB). Larger files fall back
 /// to raw diff hunks.
@@ -28,7 +32,8 @@ const MAX_AST_FILE_SIZE: usize = 100 * 1024;
 
 /// Maximum number of files processed through the AST pipeline. Files beyond
 /// this limit fall back to raw diff hunks to keep diff rendering bounded.
-const MAX_AST_FILE_COUNT: usize = 200;
+/// Exposed `pub(in crate::cmd::git)` so `show.rs` (sibling module) can reuse the limit.
+pub(in crate::cmd::git) const MAX_AST_FILE_COUNT: usize = 200;
 
 /// Minimum file count to engage rayon parallelism. Below this, thread pool
 /// scheduling overhead exceeds the per-file render cost.
@@ -39,8 +44,11 @@ const PARALLEL_THRESHOLD: usize = 5;
 /// - `Default`: Only changed nodes are shown (no unchanged context).
 /// - `Structure`: Unchanged nodes are shown as signatures (`{ /* ... */ }`).
 /// - `Full`: Unchanged nodes are shown in full.
+///
+/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` so that
+/// `show.rs` can specify the render mode when reusing `render_diff_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DiffMode {
+pub(in crate::cmd::git) enum DiffMode {
     /// Only changed AST nodes with `+`/`-` markers.
     Default,
     /// Changed nodes + unchanged nodes rendered as signatures.
@@ -191,10 +199,20 @@ pub(super) fn run_diff(
 
     let duration = output.duration;
     let raw_diff = output.stdout;
+    let label = super::build_analytics_label("diff", args, show_stats);
 
-    // Handle empty diff
+    // Handle empty diff — record zero-compression analytics so the DB stays
+    // consistent with run_passthrough (which always records, even for no-op passes).
     if raw_diff.trim().is_empty() {
         eprintln!("No changes");
+        finalize_git_output(
+            &raw_diff,
+            &raw_diff,
+            label,
+            show_stats,
+            crate::analytics::CommandType::Git,
+            duration,
+        );
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -205,6 +223,18 @@ pub(super) fn run_diff(
 
         if file_diffs.is_empty() {
             eprintln!("No changes");
+            // Reuse the same lazy label built above — no second format! needed.
+            // This branch is only hit when parse_unified_diff returns an empty vec
+            // despite raw_diff being non-empty (malformed diff); keep a consistent
+            // analytics record identical to the trim-is-empty branch above.
+            finalize_git_output(
+                &raw_diff,
+                &raw_diff,
+                label,
+                show_stats,
+                crate::analytics::CommandType::Git,
+                duration,
+            );
             return Ok(ExitCode::SUCCESS);
         }
 
@@ -260,30 +290,32 @@ pub(super) fn run_diff(
                 json
             }
             OutputFormat::Text => {
-                let s = result.to_string();
-                print!("{s}");
-                s
+                // Apply guardrail: if compressed output is larger than raw,
+                // emit raw. Matches the guardrail applied in show.rs for commit
+                // mode, ensuring both handlers share the same safety envelope.
+                // Clone `raw_diff` here; file_diffs still holds a borrow so
+                // we cannot move raw_diff until the block ends.
+                // Use into_rendered() instead of to_string(): avoids a redundant
+                // Display::fmt allocation + copy of the pre-built rendered String.
+                let s = result.into_rendered();
+                let guardrail = crate::output::guardrail::apply_to_stderr(raw_diff.clone(), s)?;
+                let final_output = guardrail.into_output();
+                print!("{final_output}");
+                final_output
             }
         }
     }; // file_diffs dropped here, raw_diff is free to move
 
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_diff, &result_str);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    // Record analytics (fire-and-forget, non-blocking).
-    // Move `raw_diff` into the call to avoid cloning the entire diff string.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw_diff,
-            result_str,
-            format!("skim git diff {}", args.join(" ")),
-            crate::analytics::CommandType::Git,
-            duration,
-            None,
-        );
-    }
+    // Both `raw_diff` and `result_str` are owned here; use the owned variant to
+    // move them directly without cloning (handles stats + analytics in one call).
+    finalize_git_output_owned(
+        raw_diff,
+        result_str,
+        label,
+        show_stats,
+        crate::analytics::CommandType::Git,
+        duration,
+    );
 
     Ok(ExitCode::SUCCESS)
 }

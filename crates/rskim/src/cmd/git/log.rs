@@ -40,7 +40,16 @@ pub(super) fn run_log(
 
     full_args.extend_from_slice(&filtered_args);
 
-    run_parsed_command(&full_args, show_stats, output_format, false, parse_log)
+    let label = super::build_analytics_label("log", args, show_stats);
+
+    run_parsed_command(
+        &full_args,
+        show_stats,
+        output_format,
+        false,
+        label,
+        parse_log,
+    )
 }
 
 /// Parse formatted `git log` output into a compressed GitResult.

@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_emit_markers_degraded_writes_warnings() {
-        crate::debug::reset_debug_for_tests();
+        let _guard = crate::debug::DebugTestGuard::acquire();
         crate::debug::force_enable_debug();
         let markers = vec!["issue one".to_string(), "issue two".to_string()];
         let result: ParseResult<String> = ParseResult::Degraded("content".to_string(), markers);
@@ -519,12 +519,11 @@ mod tests {
             output.contains("[skim:warning] issue two"),
             "expected warning for second marker, got: {output}"
         );
-        crate::debug::reset_debug_for_tests();
     }
 
     #[test]
     fn test_emit_markers_passthrough_writes_notice() {
-        crate::debug::reset_debug_for_tests();
+        let _guard = crate::debug::DebugTestGuard::acquire();
         crate::debug::force_enable_debug();
         let result: ParseResult<String> = ParseResult::Passthrough("raw".to_string());
         let mut buf = Vec::new();
@@ -534,12 +533,11 @@ mod tests {
             output.contains("[skim:notice]"),
             "expected notice in output, got: {output}"
         );
-        crate::debug::reset_debug_for_tests();
     }
 
     #[test]
     fn test_emit_markers_degraded_silent_without_debug() {
-        crate::debug::reset_debug_for_tests();
+        let _guard = crate::debug::DebugTestGuard::acquire();
         let markers = vec!["issue one".to_string(), "issue two".to_string()];
         let result: ParseResult<String> = ParseResult::Degraded("content".to_string(), markers);
         let mut buf = Vec::new();
@@ -552,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_emit_markers_passthrough_silent_without_debug() {
-        crate::debug::reset_debug_for_tests();
+        let _guard = crate::debug::DebugTestGuard::acquire();
         let result: ParseResult<String> = ParseResult::Passthrough("raw".to_string());
         let mut buf = Vec::new();
         result.emit_markers(&mut buf).unwrap();

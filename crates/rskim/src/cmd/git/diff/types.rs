@@ -4,8 +4,14 @@ use super::DiffMode;
 use crate::output::canonical::DiffFileStatus;
 
 /// A single hunk from a unified diff.
+///
+/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` to match
+/// `FileDiff` (below). `show.rs` accesses hunks transitively through `FileDiff::hunks`
+/// (not by referencing `DiffHunk` directly) when iterating `FileDiff` entries returned
+/// by `parse_unified_diff`. Widening is required at the field level so that `show.rs`
+/// can consume hunk data without a duplicate type definition.
 #[derive(Debug, Clone)]
-pub(super) struct DiffHunk<'a> {
+pub(in crate::cmd::git) struct DiffHunk<'a> {
     /// Start line in the old file (1-indexed).
     /// Used in tests and for hunk-to-node overlap calculations.
     #[allow(dead_code)]
@@ -24,8 +30,12 @@ pub(super) struct DiffHunk<'a> {
 }
 
 /// Parsed representation of a single file in a unified diff.
+///
+/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` so that
+/// `show.rs` can iterate over `FileDiff` entries returned by `parse_unified_diff`
+/// without requiring a parallel data model in the show handler.
 #[derive(Debug, Clone)]
-pub(super) struct FileDiff<'a> {
+pub(in crate::cmd::git) struct FileDiff<'a> {
     /// File path (new path for renames/adds, old path for deletes)
     pub path: String,
     /// Original path for renames (old name)

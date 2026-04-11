@@ -249,11 +249,19 @@ fn classify_bash_command(command: &str) -> Option<BashCommandInfo> {
         return None;
     }
 
-    // `would_rewrite` is the single source of truth for rewrite eligibility.
-    // It is heavier than a simple prefix heuristic but eliminates rule
-    // duplication and guarantees correctness — correctness over micro-performance.
-    let rewrite_target = super::rewrite::would_rewrite(command);
-    let has_rewrite = rewrite_target.is_some();
+    // `classify_command` is the single source of truth for rewrite eligibility.
+    // Using the tri-state API (AD-2) means AlreadyCompact commands (e.g.,
+    // `git worktree list`) are treated as "has_rewrite = true" — discover stops
+    // flagging them as gaps even though no handler rewrites them.
+    //
+    // Single destructure: extract both `has_rewrite` and `rewrite_target` in
+    // one `match` arm rather than a `!matches!` check followed by a second
+    // `match` on the same value (complexity-6).
+    let (has_rewrite, rewrite_target) = match super::rewrite::classify_command(command) {
+        super::rewrite::CommandClassification::Rewritten(s) => (true, Some(s)),
+        super::rewrite::CommandClassification::AlreadyCompact => (true, None),
+        super::rewrite::CommandClassification::Unhandled => (false, None),
+    };
 
     Some(BashCommandInfo {
         command: command.to_string(),
@@ -743,6 +751,35 @@ mod tests {
         assert!(info.rewrite_target.is_none());
     }
 
+    /// `AlreadyCompact` commands (acknowledged as near-optimal by skim) must be
+    /// reported as `has_rewrite = true` with `rewrite_target = None` so that
+    /// `discover` does not flag them as compression gaps (testing-7 / AD-2).
+    #[test]
+    fn test_classify_bash_already_compact_commands() {
+        // `git worktree list` is acknowledged compact — output is already minimal.
+        let info = classify_bash_command("git worktree list").unwrap();
+        assert!(
+            info.has_rewrite,
+            "AlreadyCompact commands must report has_rewrite=true to suppress gap reporting"
+        );
+        assert!(
+            info.rewrite_target.is_none(),
+            "AlreadyCompact commands must have no rewrite_target (no replacement command)"
+        );
+        assert_eq!(info.command, "git worktree list");
+
+        // Compound variant: AlreadyCompact && AlreadyCompact → Unhandled by
+        // classify_command (mixed compound with non-ack second segment returns
+        // Unhandled).  Verify the single-segment case is sufficient here.
+        // A pure all-ack compound is AlreadyCompact and therefore has_rewrite=true.
+        let compound_ack = classify_bash_command("git worktree list && git worktree list").unwrap();
+        assert!(
+            compound_ack.has_rewrite,
+            "All-AlreadyCompact compound must also report has_rewrite=true"
+        );
+        assert!(compound_ack.rewrite_target.is_none());
+    }
+
     // ---- analyze_invocations: skim command exclusion ----
 
     fn default_config() -> DiscoverConfig {
@@ -832,11 +869,10 @@ mod tests {
 
     #[test]
     fn test_parse_args_debug() {
+        let _guard = crate::debug::DebugTestGuard::acquire();
         // --debug flag sets debug=true
         let config = parse_args(&["--debug".to_string()]).unwrap();
         assert!(config.debug);
-        // Clean up process-wide debug state set by parse_args
-        crate::debug::reset_debug_for_tests();
     }
 
     /// Sync test: verifies that `parse_args` and `command()` accept the same flags.
@@ -845,6 +881,7 @@ mod tests {
     /// `parse_args` and `command` together.
     #[test]
     fn test_parse_args_and_command_are_in_sync() {
+        let _guard = crate::debug::DebugTestGuard::acquire();
         // Build the clap command for validation
         let cmd = command();
 
@@ -901,8 +938,5 @@ mod tests {
             Some("latest"),
             "clap --session value should be 'latest'"
         );
-
-        // Clean up process-wide debug state set by parse_args (via --debug)
-        crate::debug::reset_debug_for_tests();
     }
 }

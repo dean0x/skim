@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `skim git diff` now records a zero-compression analytics row when the diff is empty (previously uncounted). This unifies analytics recording across empty and non-empty invocations. ([#132](https://github.com/dean0x/skim/issues/132), [#135](https://github.com/dean0x/skim/pull/135))
+- `skim git show <annotated-tag|blob|tree>` (non-commit passthrough) now records analytics (previously uncounted). This unifies analytics recording across all `git show` modes. ([#132](https://github.com/dean0x/skim/issues/132), [#135](https://github.com/dean0x/skim/pull/135))
+
 ## [2.3.1] - 2026-04-09
 
 Patch release: discover/rewrite alignment, rewritable gap closures, stats bar fix.

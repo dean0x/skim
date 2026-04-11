@@ -1,0 +1,21 @@
+tag v1.0.0
+Tagger: Release Bot <releases@example.com>
+Date:   Thu Apr 10 12:00:00 2025 +0000
+
+Release v1.0.0 — initial stable release
+
+commit abc1234def5678901234567890abcdef01234567
+Author: Jane Dev <jane@example.com>
+Date:   Wed Apr 9 18:00:00 2025 +0000
+
+    release: v1.0.0
+
+diff --git a/Cargo.toml b/Cargo.toml
+index aaa..bbb 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,4 +3,4 @@
+ [package]
+ name = "myapp"
+-version = "0.9.9"
++version = "1.0.0"

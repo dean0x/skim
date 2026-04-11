@@ -608,6 +608,7 @@ pub(crate) struct DiffFileEntry {
 /// Complete diff result with file entries and pre-rendered display
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DiffResult {
+    #[serde(default)]
     pub(crate) files_changed: usize,
     pub(crate) files: Vec<DiffFileEntry>,
     #[serde(default)]
@@ -623,6 +624,15 @@ impl DiffResult {
             files,
             rendered,
         }
+    }
+
+    /// Consume `self` and return the pre-rendered text, avoiding a clone.
+    ///
+    /// Prefer this over `to_string()` at call sites that own the result and do
+    /// not need the other fields afterwards.  The `Display` impl re-runs a
+    /// `write!` through the formatter, which allocates; this method is zero-copy.
+    pub(crate) fn into_rendered(self) -> String {
+        self.rendered
     }
 
     /// Recompute rendered field if empty (e.g., after deserialization)
@@ -1632,5 +1642,309 @@ mod tests {
         let output = format!("{result}");
         assert!(output.contains("  plain message"));
         assert!(!output.contains('['));
+    }
+
+    // ========================================================================
+    // ShowCommitResult tests (#132)
+    // ========================================================================
+
+    #[test]
+    fn test_show_commit_result_display_basic() {
+        let files = vec![DiffFileEntry {
+            path: "src/main.rs".to_string(),
+            status: DiffFileStatus::Modified,
+            changed_regions: 2,
+        }];
+        let result = ShowCommitResult::new(
+            "abc1234567".to_string(),
+            "Alice <alice@example.com>".to_string(),
+            "2024-01-15 10:00:00 +0000".to_string(),
+            "feat: add feature".to_string(),
+            files,
+            "diff content here",
+        );
+        let output = format!("{result}");
+        // Hash is truncated to 7 chars
+        assert!(output.contains("abc1234"), "hash must appear: {output}");
+        assert!(
+            output.contains("Alice <alice@example.com>"),
+            "author must appear: {output}"
+        );
+        assert!(
+            output.contains("feat: add feature"),
+            "subject must appear: {output}"
+        );
+        assert!(
+            output.contains("diff content here"),
+            "diff must appear: {output}"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_short_hash() {
+        // Hash shorter than 7 chars must not panic; used as-is.
+        let result = ShowCommitResult::new(
+            "abc".to_string(),
+            "Bob".to_string(),
+            "2024-01-15".to_string(),
+            "short hash commit".to_string(),
+            vec![],
+            "",
+        );
+        let output = format!("{result}");
+        assert!(output.contains("abc"), "short hash must appear: {output}");
+    }
+
+    #[test]
+    fn test_show_commit_result_files_changed_field() {
+        let files = vec![
+            DiffFileEntry {
+                path: "a.rs".to_string(),
+                status: DiffFileStatus::Added,
+                changed_regions: 1,
+            },
+            DiffFileEntry {
+                path: "b.rs".to_string(),
+                status: DiffFileStatus::Deleted,
+                changed_regions: 3,
+            },
+        ];
+        let result = ShowCommitResult::new(
+            "deadbeef".to_string(),
+            "Carol".to_string(),
+            "2024-01-16".to_string(),
+            "fix: remove b".to_string(),
+            files,
+            "",
+        );
+        assert_eq!(
+            result.files_changed, 2,
+            "files_changed must equal files.len()"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_serialize_deserialize() {
+        let files = vec![DiffFileEntry {
+            path: "src/lib.rs".to_string(),
+            status: DiffFileStatus::Modified,
+            changed_regions: 5,
+        }];
+        let original = ShowCommitResult::new(
+            "cafebabe".to_string(),
+            "Dave <dave@example.com>".to_string(),
+            "2024-02-01 12:00:00 +0000".to_string(),
+            "refactor: clean up".to_string(),
+            files,
+            "the diff body",
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: ShowCommitResult = serde_json::from_str(&json).unwrap();
+
+        // Scalar fields survive round-trip.
+        assert_eq!(deserialized.hash, original.hash);
+        assert_eq!(deserialized.author, original.author);
+        assert_eq!(deserialized.date, original.date);
+        assert_eq!(deserialized.subject, original.subject);
+        assert_eq!(deserialized.files_changed, original.files_changed);
+        assert_eq!(deserialized.files.len(), original.files.len());
+        // rendered is preserved when serialized with the full field set.
+        assert_eq!(deserialized.as_ref(), original.as_ref());
+    }
+
+    #[test]
+    fn test_show_commit_result_ensure_rendered_recomputes_when_empty() {
+        // Simulate deserialization that strips `rendered` (e.g., consumer
+        // writes their own JSON without that private field).
+        let mut result = ShowCommitResult {
+            hash: "1234567890ab".to_string(),
+            author: "Eve".to_string(),
+            date: "2024-03-01".to_string(),
+            subject: "chore: cleanup".to_string(),
+            files_changed: 1,
+            files: vec![DiffFileEntry {
+                path: "src/foo.rs".to_string(),
+                status: DiffFileStatus::Modified,
+                changed_regions: 4,
+            }],
+            rendered: String::new(),
+        };
+        assert_eq!(result.as_ref(), "", "rendered must start empty");
+
+        result.ensure_rendered();
+
+        let output = result.as_ref();
+        assert!(!output.is_empty(), "ensure_rendered must populate rendered");
+        assert!(
+            output.contains("1234567"),
+            "short hash must appear: {output}"
+        );
+        assert!(output.contains("Eve"), "author must appear: {output}");
+        assert!(
+            output.contains("chore: cleanup"),
+            "subject must appear: {output}"
+        );
+        assert!(
+            output.contains("src/foo.rs"),
+            "file path must appear: {output}"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_ensure_rendered_empty_diff() {
+        // Empty diff and files list — no panic, minimal output.
+        let mut result = ShowCommitResult::new(
+            "aabbccd".to_string(),
+            "Frank".to_string(),
+            "2024-04-01".to_string(),
+            "docs: update readme".to_string(),
+            vec![],
+            "",
+        );
+        // rendered is set by new() even with empty diff.
+        assert!(!result.as_ref().is_empty(), "non-empty diff still renders");
+        // Calling ensure_rendered when already populated is a no-op.
+        let before = result.as_ref().to_string();
+        result.ensure_rendered();
+        assert_eq!(
+            result.as_ref(),
+            before,
+            "ensure_rendered must not overwrite existing rendered"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_date_is_json_only() {
+        // date must appear in JSON but not in the text render.
+        let result = ShowCommitResult::new(
+            "fedcba9".to_string(),
+            "Grace".to_string(),
+            "2024-05-15 09:30:00 +0000".to_string(),
+            "test: add coverage".to_string(),
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        assert!(
+            !text.contains("2024-05-15"),
+            "date must NOT appear in text render (JSON-only): {text}"
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("2024-05-15"),
+            "date MUST appear in JSON output: {json}"
+        );
+    }
+}
+
+// ============================================================================
+// ShowCommitResult types (#132)
+// ============================================================================
+
+/// Result of `skim git show <hash>` (commit mode).
+///
+/// Follows the same pattern as `DiffResult`: a pre-rendered `String` is stored
+/// so JSON and text consumers share the same rendering logic. Files are
+/// represented as [`DiffFileEntry`] — the same type used by `DiffResult` — to
+/// keep the JSON shape consistent across all diff-bearing results.
+///
+/// # Field visibility
+///
+/// The `date` field is serialized to JSON but intentionally omitted from the
+/// text render: the single-line summary (`<hash> <author> — <subject>`) is
+/// already compact; callers that need the full date should use `--json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ShowCommitResult {
+    /// Short commit hash (first 7 characters).
+    pub(crate) hash: String,
+    /// Author string (name + email).
+    pub(crate) author: String,
+    /// Commit date (JSON-only; omitted from text render for terseness).
+    pub(crate) date: String,
+    /// Commit subject (first line of commit message).
+    pub(crate) subject: String,
+    /// Number of files changed (mirrors `files.len()` for quick JSON access).
+    #[serde(default)]
+    pub(crate) files_changed: usize,
+    /// Files changed in this commit.
+    pub(crate) files: Vec<DiffFileEntry>,
+    #[serde(default)]
+    rendered: String,
+}
+
+impl ShowCommitResult {
+    /// Create a new `ShowCommitResult` with pre-computed rendered output.
+    pub(crate) fn new(
+        hash: String,
+        author: String,
+        date: String,
+        subject: String,
+        files: Vec<DiffFileEntry>,
+        diff_output: &str,
+    ) -> Self {
+        let files_changed = files.len();
+        let rendered = Self::render(&hash, &author, &subject, diff_output);
+        Self {
+            hash,
+            author,
+            date,
+            subject,
+            files_changed,
+            files,
+            rendered,
+        }
+    }
+
+    fn render(hash: &str, author: &str, subject: &str, diff_output: &str) -> String {
+        use std::fmt::Write;
+        let short = hash.get(..7).unwrap_or(hash);
+        let mut output = format!("{short} {author} \u{2014} {subject}");
+        if !diff_output.is_empty() {
+            let _ = write!(output, "\n\n{diff_output}");
+        }
+        output
+    }
+
+    /// Consume `self` and return the pre-rendered text, avoiding a clone.
+    ///
+    /// Prefer this over `to_string()` at call sites that own the result and do
+    /// not need the other fields afterwards.  The `Display` impl re-runs a
+    /// `write!` through the formatter, which allocates; this method is zero-copy.
+    pub(crate) fn into_rendered(self) -> String {
+        self.rendered
+    }
+
+    /// Recompute `rendered` if empty (e.g. after JSON deserialization that
+    /// stripped the field).  Produces a lossy summary — file paths, statuses,
+    /// and region counts — because the original diff body is not stored.
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            use std::fmt::Write;
+            let short = self.hash.get(..7).unwrap_or(&self.hash);
+            let mut output = format!(
+                "{short} {} \u{2014} {} [{} files]",
+                self.author, self.subject, self.files_changed
+            );
+            for file in &self.files {
+                let _ = write!(
+                    output,
+                    "\n  {} ({}, {} regions)",
+                    file.path, file.status, file.changed_regions
+                );
+            }
+            self.rendered = output;
+        }
+    }
+}
+
+impl AsRef<str> for ShowCommitResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for ShowCommitResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
     }
 }

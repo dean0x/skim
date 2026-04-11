@@ -106,12 +106,31 @@ pub(super) fn try_table_match(
         // Middle args: everything between prefix and separator
         let middle = &before_sep[rule.prefix.len()..];
 
-        // Check skip_if_flag_prefix: if any middle arg starts with a skip prefix
+        // Check skip_if_flag_prefix: if any middle arg exactly matches a skip flag
+        // (or matches as `--flag=value`).
+        //
+        // DESIGN NOTE (AD-1): We use strict matching here — `arg == flag` or
+        // `arg.starts_with(flag) && next_byte == b'='` — which mirrors
+        // `cmd::mod::user_has_flag`. The previous loose `starts_with` check
+        // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
+        // the AST-aware diff pipeline for staged changes.
+        //
+        // Side effect on glued short flags (e.g. `-XPOST`, `--files-with-matches`):
+        // Because the strict match only triggers on exact equality or `flag=value`,
+        // a glued short flag like `-XPOST` (where the skip prefix is, say, `-X`)
+        // will NOT match and therefore will NOT suppress the rewrite. This means
+        // `curl -XPOST` is rewritten, passing the flag through to the skim wrapper.
+        // This is intentional: glued short flags are passed through unmodified in
+        // the output (middle tokens are preserved verbatim), so the skim wrapper
+        // receives the correct invocation.
+        let strict_skip_match = |arg: &str, flag: &str| -> bool {
+            arg == flag || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
+        };
         if !rule.skip_if_flag_prefix.is_empty()
             && middle.iter().any(|arg| {
                 rule.skip_if_flag_prefix
                     .iter()
-                    .any(|skip| arg.starts_with(skip))
+                    .any(|skip| strict_skip_match(arg, skip))
             })
         {
             return None;
@@ -372,9 +391,117 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // Strict flag matching (AD-1 hygiene)
+    // ========================================================================
+
+    /// Regression: `--staged` must NOT be eaten by a `--stat` skip prefix.
+    ///
+    /// With the old loose `starts_with` check, `"--staged".starts_with("--stat")`
+    /// returned `true`, silently blocking the AST-aware diff pipeline for staged
+    /// changes. The strict-match fix (AD-1) resolves this.
     #[test]
-    fn test_git_diff_stat_skipped() {
-        assert!(try_rewrite(&["git", "diff", "--stat"]).is_none());
+    fn test_staged_not_eaten_by_stat_prefix() {
+        // After skip-list trim (AD-4), `--stat` is no longer in the git diff
+        // skip list, so `--staged` rewrites regardless. This test also verifies
+        // that the strict engine itself would not eat `--staged` even if
+        // `--stat` were still in the list.
+        let result = try_rewrite(&["git", "diff", "--staged"]);
+        assert!(
+            result.is_some(),
+            "git diff --staged must rewrite after engine strict-match fix"
+        );
+        let rewritten = result.unwrap().tokens.join(" ");
+        assert!(
+            rewritten.contains("--staged"),
+            "rewritten command must preserve --staged: {rewritten}"
+        );
+    }
+
+    /// Strict-match sweep: for each skip prefix in all rules, constructs a
+    /// longer arg (`{skip}x`) with no `=` at the split point and asserts that
+    /// `try_rewrite()` still matches the rule. A looser matcher (old behavior)
+    /// would cause the rule to skip, hiding `--staged` and similar collisions.
+    ///
+    /// This exercises the real engine path rather than a local copy of the
+    /// closure, so it will catch regressions in `try_table_match` directly.
+    #[test]
+    fn test_strict_skip_no_false_prefix_collisions() {
+        use super::super::rules::REWRITE_RULES;
+
+        for rule in REWRITE_RULES {
+            for &skip in rule.skip_if_flag_prefix {
+                // Build a command: rule.prefix ++ [extended_arg]
+                // where extended_arg = skip + "x" (e.g., "--stat" -> "--statx")
+                let extended = format!("{skip}x");
+                let mut tokens: Vec<&str> = rule.prefix.to_vec();
+                tokens.push(&extended);
+
+                let result = try_rewrite(&tokens);
+                assert!(
+                    result.is_some(),
+                    "Rule {:?} with extended arg {:?} must rewrite — \
+                     the engine's strict-match must not confuse {:?} with {:?}",
+                    rule.prefix,
+                    extended,
+                    extended,
+                    skip
+                );
+                let out = result.unwrap().tokens.join(" ");
+                assert!(
+                    out.contains(&extended),
+                    "Rewritten output must preserve the extended arg {:?}: {}",
+                    extended,
+                    out
+                );
+
+                // And the exact `--flag=value` form should be skipped (returns None),
+                // proving the engine *does* honor `=value` as a valid skip trigger.
+                let with_value = format!("{skip}=somevalue");
+                let mut tokens_eq: Vec<&str> = rule.prefix.to_vec();
+                tokens_eq.push(&with_value);
+                let result_eq = try_rewrite(&tokens_eq);
+                assert!(
+                    result_eq.is_none(),
+                    "Rule {:?} with arg {:?} must be skipped by strict `=value` match",
+                    rule.prefix,
+                    with_value
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Glued short-flag behavior (regression-1 / AD-1 side effect)
+    // ========================================================================
+
+    /// Strict-match fix (AD-1) side effect: glued short flags like `-qverbose`
+    /// do NOT match the skip prefix `-q` (strict match requires exact equality or
+    /// `flag=value`).  This means `git fetch -qverbose` is NOT suppressed by the
+    /// `-q` skip rule — it rewrites, passing `-qverbose` through to the skim
+    /// wrapper unchanged.  This is intentional and correct: the skim wrapper
+    /// receives the user's flag verbatim.
+    #[test]
+    fn test_strict_match_glued_short_flag_rewrites() {
+        // `-q` is in the `git fetch` skip list.  A glued flag `-qverbose` must
+        // NOT trigger the skip — the rule should still fire.
+        let result = try_rewrite(&["git", "fetch", "-qverbose"]);
+        assert!(
+            result.is_some(),
+            "git fetch -qverbose must rewrite: glued short flag must not match the -q skip prefix"
+        );
+        let rewritten = result.unwrap().tokens.join(" ");
+        assert!(
+            rewritten.contains("-qverbose"),
+            "Glued flag must be preserved verbatim in output: {rewritten}"
+        );
+
+        // Sanity: the exact `-q` flag IS still skipped.
+        let skipped = try_rewrite(&["git", "fetch", "-q"]);
+        assert!(
+            skipped.is_none(),
+            "git fetch -q must still be skipped (exact match)"
+        );
     }
 
     // ========================================================================

@@ -221,7 +221,10 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
 /// Commands that should NOT have their pipe output rewritten.
 /// These are typically output-producing tools where the pipe consumer (head, grep, etc.)
 /// is what the user actually wants to control.
-const PIPE_EXCLUDED_SOURCES: &[&str] = &["find", "fd", "ls", "rg", "grep", "ag"];
+///
+/// Exposed as `pub(super)` so `mod.rs::classify_compound_pipe` can share the
+/// same exclusion logic as `try_rewrite_compound_pipe` without duplication.
+pub(super) const PIPE_EXCLUDED_SOURCES: &[&str] = &["find", "fd", "ls", "rg", "grep", "ag"];
 
 /// Attempt to rewrite a compound command expression.
 ///
