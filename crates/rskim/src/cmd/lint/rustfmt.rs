@@ -105,7 +105,9 @@ fn try_parse_structured(text: &str) -> Option<LintResult> {
                 file: file_path,
                 line: line_num,
                 rule: "formatting".to_string(),
-                message: "formatting difference detected".to_string(),
+                // Include line number in message so agents can navigate directly
+                // to the first formatting difference without re-running rustfmt.
+                message: format!("formatting difference at line {line_num}"),
                 severity: LintSeverity::Warning,
             });
         }
@@ -198,6 +200,34 @@ mod tests {
         assert_eq!(result.warnings, 2);
         assert_eq!(result.errors, 0);
         assert!(result.groups.iter().any(|g| g.rule == "formatting"));
+    }
+
+    /// Tier 1 locations must include the exact line number from the diff header.
+    ///
+    /// `group_issues` formats locations as `"file:line"` — both file path and
+    /// line number must be present so agents can navigate directly to the diff
+    /// without re-running rustfmt.
+    #[test]
+    fn test_tier1_rustfmt_location_includes_file_and_line() {
+        let input = "Diff in /path/to/src/main.rs at line 15:\n-old\n+new\n";
+        let result = try_parse_structured(input).expect("must parse");
+        let group = &result.groups[0];
+        assert_eq!(
+            group.locations.len(),
+            1,
+            "Must have exactly one location: {:?}",
+            group.locations
+        );
+        let loc = &group.locations[0];
+        // Location is formatted as "file:line" by group_issues.
+        assert!(
+            loc.contains("main.rs"),
+            "Location must contain file name: {loc}"
+        );
+        assert!(
+            loc.contains("15"),
+            "Location must contain line number: {loc}"
+        );
     }
 
     #[test]

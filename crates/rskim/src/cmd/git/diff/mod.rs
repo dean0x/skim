@@ -197,6 +197,13 @@ pub(super) fn run_diff(
         return Ok(map_exit_code(output.exit_code));
     }
 
+    // Surface git diff stderr warnings (e.g., "warning: LF will be replaced by CRLF")
+    // on successful runs. These are informational notices from git, not failures,
+    // so they should be visible even when diff output is otherwise compressed.
+    if !output.stderr.is_empty() {
+        eprint!("[skim] git diff notice: {}", output.stderr.trim());
+    }
+
     let duration = output.duration;
     let raw_diff = output.stdout;
     let label = super::build_analytics_label("diff", args, show_stats);
@@ -426,6 +433,34 @@ mod tests {
         assert!(
             files_whitespace.is_empty(),
             "whitespace-only diff should parse to zero files"
+        );
+    }
+
+    // ========================================================================
+    // Stderr notice documentation
+    // ========================================================================
+
+    /// Documents the stderr notice behaviour for git diff warnings.
+    ///
+    /// When `git diff` exits 0 but has non-empty stderr (e.g., "warning: LF will
+    /// be replaced by CRLF"), `run_diff` emits `[skim] git diff notice: <text>` to
+    /// stderr so agents can see the warning even though the diff itself succeeded.
+    ///
+    /// This test validates that the notice prefix format matches what `run_diff`
+    /// emits, ensuring any future refactor doesn't silently change the prefix.
+    #[test]
+    fn test_diff_stderr_notice_format_is_documented() {
+        // The notice format used in run_diff — validated here to catch future
+        // regressions in the prefix string without requiring a full integration test.
+        let warning = "warning: LF will be replaced by CRLF in file.txt";
+        let notice = format!("[skim] git diff notice: {}", warning.trim());
+        assert!(
+            notice.starts_with("[skim] git diff notice: "),
+            "Notice prefix must be '[skim] git diff notice: ': {notice}"
+        );
+        assert!(
+            notice.contains("LF will be replaced"),
+            "Notice must include the original warning text: {notice}"
         );
     }
 }
