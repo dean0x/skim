@@ -189,7 +189,12 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
     let mut low: usize = 0;
     let mut details: Vec<String> = Vec::new();
 
-    for (_id, advisory) in advisories {
+    // Design decision: advisory ID extraction mirrors `cargo audit` (see npm/audit.rs).
+    // The pnpm audit JSON object key IS the advisory ID — it may be a GHSA string
+    // (e.g. "GHSA-1234-abcd-xyz0") or a numeric string (e.g. "1234").
+    // We use the key directly as the ID without transformation so that both forms
+    // are preserved accurately. pnpm IDs sometimes numeric strings — preserve as-is.
+    for (id, advisory) in advisories {
         let severity = advisory
             .get("severity")
             .and_then(|v| v.as_str())
@@ -211,7 +216,7 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
             _ => {}
         }
 
-        details.push(format!("{module_name}: {title} ({severity})"));
+        details.push(format!("{id} {module_name}: {title} ({severity})"));
     }
 
     // Use details.len() instead of summing severity buckets so entries with
@@ -407,6 +412,22 @@ mod tests {
             result.is_passthrough(),
             "Expected Passthrough, got {}",
             result.tier_name()
+        );
+    }
+
+    // ========================================================================
+    // Advisory ID extraction tests (AD-Commit3, 2026-04-11)
+    // ========================================================================
+
+    #[test]
+    fn test_pnpm_audit_uses_key_as_id() {
+        let input = load_fixture("pnpm_audit_ghsa_key.json");
+        let result = try_parse_audit_json(&input).expect("must parse");
+        let display = format!("{result}");
+        // The GHSA-1234-abcd-xyz0 key must appear in the detail string.
+        assert!(
+            display.contains("GHSA-1234-abcd-xyz0"),
+            "must include the pnpm advisory key as the ID: {display}"
         );
     }
 }

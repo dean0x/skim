@@ -1,0 +1,21 @@
+{
+  "advisories": {
+    "GHSA-1234-abcd-xyz0": {
+      "module_name": "express",
+      "severity": "high",
+      "title": "Open Redirect",
+      "url": "https://github.com/advisories/GHSA-1234-abcd-xyz0",
+      "findings": [{"version": "4.17.0", "paths": [".>express"]}]
+    },
+    "5678": {
+      "module_name": "lodash",
+      "severity": "critical",
+      "title": "Prototype Pollution",
+      "url": "https://github.com/advisories/GHSA-5678-wxyz-abcd",
+      "findings": [{"version": "4.17.20", "paths": ["."]}]
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {"info": 0, "low": 0, "moderate": 0, "high": 1, "critical": 1, "total": 2}
+  }
+}
