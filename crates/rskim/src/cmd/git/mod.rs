@@ -30,7 +30,7 @@ use crate::runner::CommandRunner;
 /// Run the `git` subcommand.
 ///
 /// Dispatches to `status`, `diff`, `log`, `show`, etc., or prints help.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(args: &[String], analytics: &crate::analytics::AnalyticsConfig) -> anyhow::Result<ExitCode> {
     // Handle --help / -h at the `skim git` level: only when the first
     // non-global-flag token is the help flag (e.g., `skim git --help`),
     // not when it appears deeper inside a subcommand (`skim git show --help`).
@@ -53,13 +53,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     };
 
     let subcmd_args = &rest[1..];
+    let analytics_enabled = analytics.enabled;
 
     match subcmd.as_str() {
-        "status" => status::run_status(&global_flags, subcmd_args, show_stats),
-        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats),
-        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats),
-        "log" => log::run_log(&global_flags, subcmd_args, show_stats),
-        "show" => show::run_show(&global_flags, subcmd_args, show_stats),
+        "status" => status::run_status(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "log" => log::run_log(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "show" => show::run_show(&global_flags, subcmd_args, show_stats, analytics_enabled),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
@@ -189,8 +190,8 @@ fn has_limit_flag(args: &[String]) -> bool {
 /// All six parsed-command handlers (`show` ×2, `diff`, `status`, `log`, `fetch`)
 /// share this exact guard logic; centralising it here eliminates the repeated
 /// five-line block at each call site.
-pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: bool) -> String {
-    if show_stats || crate::analytics::is_analytics_enabled() {
+pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: bool, analytics_enabled: bool) -> String {
+    if show_stats || analytics_enabled {
         format!("skim git {subcmd} {}", args.join(" "))
     } else {
         String::new()
@@ -229,6 +230,7 @@ pub(super) fn finalize_git_output_owned(
     output: String,
     label: String,
     show_stats: bool,
+    analytics_enabled: bool,
     command_type: crate::analytics::CommandType,
     duration: std::time::Duration,
     parse_tier: Option<&'static str>,
@@ -237,16 +239,15 @@ pub(super) fn finalize_git_output_owned(
         let (orig, comp) = crate::process::count_token_pair(&raw, &output);
         crate::process::report_token_stats(orig, comp, "");
     }
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw,
-            output,
-            label,
-            command_type,
-            duration,
-            parse_tier,
-        );
-    }
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        raw,
+        output,
+        label,
+        command_type,
+        duration,
+        parse_tier,
+    );
 }
 
 /// Passthrough variant of [`finalize_git_output`].
@@ -265,6 +266,7 @@ pub(super) fn finalize_git_output_passthrough(
     raw: String,
     label: String,
     show_stats: bool,
+    analytics_enabled: bool,
     command_type: crate::analytics::CommandType,
     duration: std::time::Duration,
     parse_tier: Option<&'static str>,
@@ -274,10 +276,11 @@ pub(super) fn finalize_git_output_passthrough(
         let (orig, comp) = crate::process::count_token_pair(&raw, &raw);
         crate::process::report_token_stats(orig, comp, "");
     }
-    if crate::analytics::is_analytics_enabled() {
+    if analytics_enabled {
         // 1 allocation: raw.clone() produces raw_text; raw is moved as
         // compressed_text.  Zero allocations when analytics are disabled.
         crate::analytics::try_record_command(
+            true,
             raw.clone(),
             raw,
             label,
@@ -297,11 +300,12 @@ fn map_exit_code(code: Option<i32>) -> ExitCode {
 }
 
 /// Run a git command with passthrough (no parsing).
-fn run_passthrough(
+pub(super) fn run_passthrough(
     global_flags: &[String],
     subcmd: &str,
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.push(subcmd.to_string());
@@ -324,8 +328,9 @@ fn run_passthrough(
     // and analytics are disabled (PF-021).
     finalize_git_output_passthrough(
         output.stdout,
-        build_analytics_label(subcmd, args, show_stats),
+        build_analytics_label(subcmd, args, show_stats, analytics_enabled),
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         output.duration,
         Some("passthrough"),
@@ -357,6 +362,7 @@ fn run_passthrough(
 pub(super) fn run_parsed_command<F>(
     subcmd_args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
     output_format: OutputFormat,
     combine_stderr: bool,
     label: String,
@@ -385,6 +391,7 @@ where
             output.stdout,
             label,
             show_stats,
+            analytics_enabled,
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
@@ -426,6 +433,7 @@ where
         result_str,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         output.duration,
         parse_tier,
@@ -686,6 +694,7 @@ mod tests {
         output: &str,
         label: String,
         show_stats: bool,
+        analytics_enabled: bool,
         command_type: crate::analytics::CommandType,
         duration: std::time::Duration,
         parse_tier: Option<&'static str>,
@@ -694,16 +703,15 @@ mod tests {
             let (orig, comp) = crate::process::count_token_pair(raw, output);
             crate::process::report_token_stats(orig, comp, "");
         }
-        if crate::analytics::is_analytics_enabled() {
-            crate::analytics::try_record_command(
-                raw.to_string(),
-                output.to_string(),
-                label,
-                command_type,
-                duration,
-                parse_tier,
-            );
-        }
+        crate::analytics::try_record_command(
+            analytics_enabled,
+            raw.to_string(),
+            output.to_string(),
+            label,
+            command_type,
+            duration,
+            parse_tier,
+        );
     }
 
     /// Documents that `run_parsed_command` records analytics on non-zero exit.
@@ -717,18 +725,16 @@ mod tests {
     /// empty strings (the non-zero path uses empty stdout on most failures).
     #[test]
     fn test_finalize_git_output_accepts_empty_strings() {
-        // Analytics is fire-and-forget; we just ensure the call path compiles
-        // and does not panic. SKIM_DISABLE_ANALYTICS=1 suppresses DB writes.
-        std::env::set_var("SKIM_DISABLE_ANALYTICS", "1");
+        // Analytics disabled via injected false — no env var mutation needed.
         finalize_git_output(
             "",
             "",
             "skim git log".to_string(),
             false,
+            false,
             crate::analytics::CommandType::Git,
             std::time::Duration::ZERO,
             None,
         );
-        std::env::remove_var("SKIM_DISABLE_ANALYTICS");
     }
 }

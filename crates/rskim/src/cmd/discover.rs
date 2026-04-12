@@ -9,7 +9,10 @@ use std::process::ExitCode;
 use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
 
 /// Run the discover subcommand.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    _analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);

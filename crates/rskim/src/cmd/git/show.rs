@@ -184,6 +184,7 @@ pub(super) fn run_show(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_show_help();
@@ -192,17 +193,17 @@ pub(super) fn run_show(
 
     // Passthrough for stat-family and format flags.
     if user_has_flag(args, PASSTHROUGH_FLAGS) {
-        return run_passthrough(global_flags, "show", args, show_stats);
+        return run_passthrough(global_flags, "show", args, show_stats, analytics_enabled);
     }
 
     match detect_show_mode(args) {
-        ShowMode::MultiRef => run_passthrough(global_flags, "show", args, show_stats),
+        ShowMode::MultiRef => run_passthrough(global_flags, "show", args, show_stats, analytics_enabled),
         ShowMode::FileContent { refpath } => {
-            run_show_file_content(global_flags, args, &refpath, show_stats)
+            run_show_file_content(global_flags, args, &refpath, show_stats, analytics_enabled)
         }
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
-            run_show_commit(global_flags, &git_args, args, output_format, show_stats)
+            run_show_commit(global_flags, &git_args, args, output_format, show_stats, analytics_enabled)
         }
     }
 }
@@ -515,6 +516,7 @@ fn emit_show_commit(
     label: String,
     output_format: OutputFormat,
     show_stats: bool,
+    analytics_enabled: bool,
     duration: std::time::Duration,
 ) -> anyhow::Result<()> {
     match output_format {
@@ -531,6 +533,7 @@ fn emit_show_commit(
                 json,
                 label,
                 show_stats,
+                analytics_enabled,
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("full"),
@@ -546,7 +549,7 @@ fn emit_show_commit(
             // Guarding here avoids a full memcpy (~100-500 KB) on the no-telemetry
             // hot path (HIGH-1).  The owned variant then moves both strings into
             // `finalize_git_output_owned` without further cloning (MEDIUM-22).
-            let raw_for_record = if show_stats || crate::analytics::is_analytics_enabled() {
+            let raw_for_record = if show_stats || analytics_enabled {
                 raw.clone()
             } else {
                 String::new()
@@ -559,6 +562,7 @@ fn emit_show_commit(
                 final_output,
                 label,
                 show_stats,
+                analytics_enabled,
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("full"),
@@ -580,6 +584,7 @@ fn run_show_commit(
     original_args: &[String],
     output_format: OutputFormat,
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     let (raw, duration) = match run_git_show_raw(global_flags, git_args)? {
         ShowRawOutcome::Success { stdout, duration } => (stdout, duration),
@@ -595,8 +600,9 @@ fn run_show_commit(
             // (clone) on the analytics path, 0 when disabled (PF-018).
             super::finalize_git_output_passthrough(
                 stdout,
-                build_analytics_label("show", original_args, show_stats),
+                build_analytics_label("show", original_args, show_stats, analytics_enabled),
                 show_stats,
+                analytics_enabled,
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("passthrough"),
@@ -608,7 +614,7 @@ fn run_show_commit(
     // Built before the `render_show_diff` check so both the passthrough and
     // the normal path share the same label (HIGH-3).  Derived from *original*
     // args (before `--json` extraction) so the DB records the full invocation.
-    let label = build_analytics_label("show", original_args, show_stats);
+    let label = build_analytics_label("show", original_args, show_stats, analytics_enabled);
 
     let Some(result) = render_show_diff(&raw, global_flags, git_args) else {
         // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
@@ -621,6 +627,7 @@ fn run_show_commit(
             raw,
             label,
             show_stats,
+            analytics_enabled,
             crate::analytics::CommandType::Git,
             duration,
             Some("passthrough"),
@@ -628,7 +635,7 @@ fn run_show_commit(
         return Ok(ExitCode::SUCCESS);
     };
 
-    emit_show_commit(result, raw, label, output_format, show_stats, duration)?;
+    emit_show_commit(result, raw, label, output_format, show_stats, analytics_enabled, duration)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -659,6 +666,7 @@ fn passthrough_file_content(
     raw: String,
     label: String,
     show_stats: bool,
+    analytics_enabled: bool,
     duration: std::time::Duration,
     tier: u8,
 ) {
@@ -678,6 +686,7 @@ fn passthrough_file_content(
         raw,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         duration,
         tier_name,
@@ -699,6 +708,7 @@ fn run_show_file_content(
     args: &[String],
     refpath: &str,
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     // --json is not meaningful for file-content mode.
     if user_has_flag(args, &["--json"]) {
@@ -737,8 +747,9 @@ fn run_show_file_content(
         // allocation (clone) on the analytics path, 0 when disabled (PF-018).
         super::finalize_git_output_passthrough(
             output.stdout,
-            build_analytics_label("show", args, show_stats),
+            build_analytics_label("show", args, show_stats, analytics_enabled),
             show_stats,
+            analytics_enabled,
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
@@ -749,7 +760,7 @@ fn run_show_file_content(
     let raw = output.stdout;
     let duration = output.duration;
 
-    let label = build_analytics_label("show", args, show_stats);
+    let label = build_analytics_label("show", args, show_stats, analytics_enabled);
 
     // Detect language from path extension.
     let lang = Language::from_path(Path::new(path_str)).filter(|l| !l.is_serde_based());
@@ -758,7 +769,7 @@ fn run_show_file_content(
         // Tier 2: unsupported or serde-based language — passthrough.
         // Move raw: the else branch always returns, so Rust knows raw is
         // available after the let-else for the Tier 1 path.
-        passthrough_file_content(raw, label, show_stats, duration, 2);
+        passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 2);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -777,7 +788,7 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(raw, label, show_stats, duration, 3);
+            passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 3);
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -786,7 +797,7 @@ fn run_show_file_content(
     // Clone raw only here (Tier 1 success path), not on every branch (MEDIUM-18).
     // `apply_to_stderr` takes ownership of raw; clone it first so we can pass
     // the original into `finalize_git_output_owned` without a second allocation.
-    let raw_for_record = if show_stats || crate::analytics::is_analytics_enabled() {
+    let raw_for_record = if show_stats || analytics_enabled {
         raw.clone()
     } else {
         String::new()
@@ -803,6 +814,7 @@ fn run_show_file_content(
         final_output,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         duration,
         Some("full"),

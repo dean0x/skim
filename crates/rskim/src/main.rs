@@ -469,13 +469,6 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
 }
 
 fn main() -> ExitCode {
-    // Extract --disable-analytics from raw args before routing, so it
-    // applies to both file operations and subcommands. Uses an AtomicBool
-    // instead of env::set_var to avoid unsoundness in multi-threaded context.
-    if std::env::args().any(|a| a == "--disable-analytics") {
-        analytics::force_disable_analytics();
-    }
-
     // Initialise debug flag from SKIM_DEBUG env var once, before any threads
     // are spawned. After this call, is_debug_enabled() is a pure atomic load.
     debug::init_debug_from_env();
@@ -485,9 +478,14 @@ fn main() -> ExitCode {
         debug::force_enable_debug();
     }
 
+    // Read analytics config from env + CLI flag once at the system boundary.
+    // Thread the struct down to all callers — no per-call env reads.
+    let cli_disable_analytics = std::env::args().any(|a| a == "--disable-analytics");
+    let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics);
+
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
-        Invocation::FileOperation => run_file_operation().map(|()| ExitCode::SUCCESS),
-        Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args),
+        Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
+        Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args, &analytics),
     };
 
     match result {
@@ -503,12 +501,9 @@ fn main() -> ExitCode {
 ///
 /// Parses CLI args via clap, validates constraints, then delegates to
 /// the appropriate processor (stdin, directory, glob, or single file).
-fn run_file_operation() -> anyhow::Result<()> {
+fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
-
-    // --disable-analytics is handled in main() before routing via
-    // analytics::force_disable_analytics(). No env var mutation needed.
 
     if args.clear_cache {
         cache::clear_cache()?;
@@ -533,14 +528,10 @@ fn run_file_operation() -> anyhow::Result<()> {
         },
     };
 
-    let disable_analytics = args.disable_analytics;
-
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
         process::write_result_and_stats(&result, args.show_stats)?;
-        if !disable_analytics {
-            record_file_analytics(&result, "skim -", &args);
-        }
+        record_file_analytics(analytics.enabled, &result, "skim -", &args);
         return Ok(());
     }
 
@@ -551,7 +542,7 @@ fn run_file_operation() -> anyhow::Result<()> {
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,
-        disable_analytics,
+        analytics_enabled: analytics.enabled,
     };
 
     if path.is_dir() {
@@ -564,15 +555,18 @@ fn run_file_operation() -> anyhow::Result<()> {
 
     let result = process::process_file(&path, process_options)?;
     process::write_result_and_stats(&result, args.show_stats)?;
-    if !disable_analytics {
-        record_file_analytics(&result, &format!("skim {file}"), &args);
-    }
+    record_file_analytics(analytics.enabled, &result, &format!("skim {file}"), &args);
     Ok(())
 }
 
 /// Record token analytics for file operations (single file or stdin).
-fn record_file_analytics(result: &process::ProcessResult, cmd: &str, args: &Args) {
-    if !analytics::is_analytics_enabled() {
+fn record_file_analytics(
+    enabled: bool,
+    result: &process::ProcessResult,
+    cmd: &str,
+    args: &Args,
+) {
+    if !enabled {
         return;
     }
     if let (Some(raw), Some(comp)) = (result.original_tokens, result.transformed_tokens) {
@@ -584,7 +578,7 @@ fn record_file_analytics(result: &process::ProcessResult, cmd: &str, args: &Args
             .language
             .map(|l| format!("{:?}", Language::from(l)).to_lowercase());
         let mode = format!("{:?}", Mode::from(args.mode)).to_lowercase();
-        analytics::record_with_counts(analytics::TokenSavingsRecord {
+        analytics::record_with_counts(true, analytics::TokenSavingsRecord {
             timestamp: analytics::now_unix_secs(),
             command_type: analytics::CommandType::File,
             original_cmd: cmd.to_string(),

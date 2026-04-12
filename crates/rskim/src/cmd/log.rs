@@ -99,7 +99,10 @@ fn parse_flags(args: &[String]) -> LogFlags {
 /// Run the `skim log` subcommand.
 ///
 /// Reads from stdin (mandatory — log is stdin-primary).
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
@@ -131,7 +134,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         crate::process::report_token_stats(raw_tokens, compressed_tokens, "");
     }
 
-    record_analytics(raw_tokens, compressed_tokens, duration, result.tier_name());
+    record_analytics(analytics.enabled, raw_tokens, compressed_tokens, duration, result.tier_name());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -148,21 +151,21 @@ fn read_stdin() -> anyhow::Result<String> {
 
 /// Record analytics for this command invocation (fire-and-forget).
 fn record_analytics(
+    enabled: bool,
     raw_tokens: Option<usize>,
     compressed_tokens: Option<usize>,
     duration: std::time::Duration,
     tier: &str,
 ) {
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command_with_counts(
-            raw_tokens.unwrap_or(0),
-            compressed_tokens.unwrap_or(0),
-            "skim log".to_string(),
-            crate::analytics::CommandType::Log,
-            duration,
-            Some(tier),
-        );
-    }
+    crate::analytics::try_record_command_with_counts(
+        enabled,
+        raw_tokens.unwrap_or(0),
+        compressed_tokens.unwrap_or(0),
+        "skim log".to_string(),
+        crate::analytics::CommandType::Log,
+        duration,
+        Some(tier),
+    );
 }
 
 fn print_help() {

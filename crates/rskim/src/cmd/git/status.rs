@@ -23,6 +23,7 @@ pub(super) fn run_status(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     // Strip conflicting format flags — handler injects --porcelain=v2 itself.
     let stripped_args: Vec<String> = args
@@ -41,11 +42,12 @@ pub(super) fn run_status(
     ]);
     full_args.extend_from_slice(&filtered_args);
 
-    let label = super::build_analytics_label("status", args, show_stats);
+    let label = super::build_analytics_label("status", args, show_stats, analytics_enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
+        analytics_enabled,
         output_format,
         false,
         label,

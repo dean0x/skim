@@ -23,9 +23,10 @@ pub(super) fn run_fetch(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--dry-run", "-q", "--quiet"]) {
-        return run_passthrough(global_flags, "fetch", args, show_stats);
+        return run_passthrough(global_flags, "fetch", args, show_stats, analytics_enabled);
     }
 
     let (filtered_args, output_format) = extract_output_format(args);
@@ -34,11 +35,12 @@ pub(super) fn run_fetch(
     full_args.push("fetch".to_string());
     full_args.extend_from_slice(&filtered_args);
 
-    let label = super::build_analytics_label("fetch", args, show_stats);
+    let label = super::build_analytics_label("fetch", args, show_stats, analytics_enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
+        analytics_enabled,
         output_format,
         true,
         label,

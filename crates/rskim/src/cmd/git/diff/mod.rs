@@ -156,6 +156,7 @@ pub(super) fn run_diff(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_diff_help();
@@ -173,7 +174,7 @@ pub(super) fn run_diff(
             "--check",
         ],
     ) {
-        return run_passthrough(global_flags, "diff", args, show_stats);
+        return run_passthrough(global_flags, "diff", args, show_stats, analytics_enabled);
     }
 
     // Extract skim-specific flags before passing args to git
@@ -202,8 +203,9 @@ pub(super) fn run_diff(
         // path, 0 when disabled (PF-018 resolution).
         super::finalize_git_output_passthrough(
             output.stdout,
-            super::build_analytics_label("diff", args, show_stats),
+            super::build_analytics_label("diff", args, show_stats, analytics_enabled),
             show_stats,
+            analytics_enabled,
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
@@ -220,7 +222,7 @@ pub(super) fn run_diff(
 
     let duration = output.duration;
     let raw_diff = output.stdout;
-    let label = super::build_analytics_label("diff", args, show_stats);
+    let label = super::build_analytics_label("diff", args, show_stats, analytics_enabled);
 
     // Handle empty diff — record zero-compression analytics so the DB stays
     // consistent with run_passthrough (which always records, even for no-op passes).
@@ -232,6 +234,7 @@ pub(super) fn run_diff(
             raw_diff,
             label,
             show_stats,
+            analytics_enabled,
             crate::analytics::CommandType::Git,
             duration,
             Some("full"),
@@ -257,6 +260,7 @@ pub(super) fn run_diff(
                 raw_diff,
                 label,
                 show_stats,
+                analytics_enabled,
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("degraded"),
@@ -339,6 +343,7 @@ pub(super) fn run_diff(
         result_str,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         duration,
         Some("full"),

@@ -17,9 +17,10 @@ pub(super) fn run_log(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--format", "--pretty"]) {
-        return run_passthrough(global_flags, "log", args, show_stats);
+        return run_passthrough(global_flags, "log", args, show_stats, analytics_enabled);
     }
 
     // Strip --oneline — handler injects its own --format flag.
@@ -40,11 +41,12 @@ pub(super) fn run_log(
 
     full_args.extend_from_slice(&filtered_args);
 
-    let label = super::build_analytics_label("log", args, show_stats);
+    let label = super::build_analytics_label("log", args, show_stats, analytics_enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
+        analytics_enabled,
         output_format,
         false,
         label,

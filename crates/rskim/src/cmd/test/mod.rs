@@ -18,7 +18,10 @@ const KNOWN_RUNNERS: &[&str] = &["cargo", "go", "vitest", "jest", "pytest"];
 ///
 /// If no runner is specified or `--help` / `-h` is passed, prints usage
 /// and exits. Otherwise dispatches to the runner-specific handler.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
@@ -34,10 +37,10 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let runner = runner_name.as_str();
 
     match runner {
-        "cargo" => cargo::run(runner_args, show_stats),
-        "go" => go::run(runner_args, show_stats),
-        "vitest" | "jest" => vitest::run(runner, runner_args, show_stats),
-        "pytest" => pytest::run(runner_args, show_stats),
+        "cargo" => cargo::run(runner_args, show_stats, analytics.enabled),
+        "go" => go::run(runner_args, show_stats, analytics.enabled),
+        "vitest" | "jest" => vitest::run(runner, runner_args, show_stats, analytics.enabled),
+        "pytest" => pytest::run(runner_args, show_stats, analytics.enabled),
         _ => {
             let safe_runner = crate::cmd::sanitize_for_display(runner);
             eprintln!(

@@ -21,7 +21,10 @@ use crate::runner::{CommandOutput, CommandRunner};
 /// Dispatch the `build` subcommand.
 ///
 /// Usage: `skim build {cargo|clippy|tsc} [args...]`
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     // Handle --help / -h
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -36,9 +39,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     };
 
     match sub {
-        Some("cargo") => cargo::run(remaining, show_stats),
-        Some("clippy") => cargo::run_clippy(remaining, show_stats),
-        Some("tsc") => tsc::run(remaining, show_stats),
+        Some("cargo") => cargo::run(remaining, show_stats, analytics.enabled),
+        Some("clippy") => cargo::run_clippy(remaining, show_stats, analytics.enabled),
+        Some("tsc") => tsc::run(remaining, show_stats, analytics.enabled),
         Some(unknown) => {
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             anyhow::bail!(
@@ -99,6 +102,7 @@ pub(super) fn run_parsed_command(
     env_vars: &[(&str, &str)],
     install_hint: &str,
     show_stats: bool,
+    analytics_enabled: bool,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
 ) -> anyhow::Result<ExitCode> {
     let runner = CommandRunner::new(Some(Duration::from_secs(600)));
@@ -172,17 +176,15 @@ pub(super) fn run_parsed_command(
     };
 
     // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid .to_string() allocation when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw_text,
-            result.content().to_string(),
-            format!("skim build {program} {}", args.join(" ")),
-            crate::analytics::CommandType::Build,
-            output.duration,
-            Some(result.tier_name()),
-        );
-    }
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        raw_text,
+        result.content().to_string(),
+        format!("skim build {program} {}", args.join(" ")),
+        crate::analytics::CommandType::Build,
+        output.duration,
+        Some(result.tier_name()),
+    );
 
     Ok(exit_code)
 }

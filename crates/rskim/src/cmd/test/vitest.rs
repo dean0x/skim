@@ -30,7 +30,12 @@ use super::shared::{scrape_failures, TestKind};
 ///
 /// `program` is the runner binary name (e.g. `"vitest"` or `"jest"`), used when
 /// stdin is not piped and we need to spawn the process directly.
-pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    program: &str,
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     let raw_output = if stdin_has_data() {
         read_stdin()?
@@ -70,17 +75,15 @@ pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::R
     }
 
     // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid .to_string() allocation when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw_output,
-            result.content().to_string(),
-            format!("skim test {program} {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
-            start.elapsed(),
-            Some(result.tier_name()),
-        );
-    }
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        raw_output,
+        result.content().to_string(),
+        format!("skim test {program} {}", args.join(" ")),
+        crate::analytics::CommandType::Test,
+        start.elapsed(),
+        Some(result.tier_name()),
+    );
 
     Ok(exit_code)
 }

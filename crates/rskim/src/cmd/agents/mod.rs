@@ -15,7 +15,10 @@ use detection::detect_all_agents;
 use formatting::{print_help, print_json, print_text};
 
 /// Run the `skim agents` subcommand.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    _analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);

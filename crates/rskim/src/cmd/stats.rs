@@ -21,7 +21,7 @@ use crate::tokens;
 // ============================================================================
 
 /// Run the `skim stats` subcommand.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(args: &[String], analytics: &crate::analytics::AnalyticsConfig) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
@@ -58,10 +58,10 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let mut stdout = io::stdout().lock();
 
     if format.as_deref() == Some("json") {
-        return run_json(&mut stdout, &db, since_ts, show_cost);
+        return run_json(&mut stdout, &db, since_ts, show_cost, analytics.input_cost_per_mtok);
     }
 
-    run_dashboard(&mut stdout, &db, since_ts, show_cost, since_str.as_deref())
+    run_dashboard(&mut stdout, &db, since_ts, show_cost, since_str.as_deref(), analytics.input_cost_per_mtok)
 }
 
 // ============================================================================
@@ -131,6 +131,7 @@ fn run_json(
     db: &dyn AnalyticsStore,
     since: Option<i64>,
     show_cost: bool,
+    cost_override: Option<f64>,
 ) -> anyhow::Result<ExitCode> {
     let summary = db.query_summary(since)?;
     let daily = db.query_daily(since)?;
@@ -149,7 +150,7 @@ fn run_json(
     });
 
     if show_cost {
-        let pricing = PricingModel::from_env_or_default();
+        let pricing = PricingModel::from_cost_override(cost_override);
         let cost_savings = pricing.estimate_savings(summary.tokens_saved);
         // INTENTIONAL API CHANGE (stats dashboard v3 refactor): the `cost_estimate`
         // object uses `tier` (e.g. "Standard") rather than the previous `model` key
@@ -521,8 +522,8 @@ fn render_parse_quality(
     Ok(())
 }
 
-fn render_cost_section(w: &mut dyn Write, tokens_saved: u64) -> anyhow::Result<()> {
-    let pricing = PricingModel::from_env_or_default();
+fn render_cost_section(w: &mut dyn Write, tokens_saved: u64, cost_override: Option<f64>) -> anyhow::Result<()> {
+    let pricing = PricingModel::from_cost_override(cost_override);
     writeln!(w, "{}", section_header("Cost Estimates"))?;
     writeln!(
         w,
@@ -564,6 +565,7 @@ fn run_dashboard(
     since: Option<i64>,
     show_cost: bool,
     since_str: Option<&str>,
+    cost_override: Option<f64>,
 ) -> anyhow::Result<ExitCode> {
     let summary = db.query_summary(since)?;
 
@@ -588,7 +590,7 @@ fn run_dashboard(
     render_parse_quality(w, &db.query_tier_distribution(since)?)?;
 
     if show_cost {
-        render_cost_section(w, summary.tokens_saved)?;
+        render_cost_section(w, summary.tokens_saved, cost_override)?;
     }
 
     Ok(ExitCode::SUCCESS)

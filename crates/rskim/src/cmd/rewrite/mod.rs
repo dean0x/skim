@@ -326,7 +326,10 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
 /// 1. `--help` / `--hook` are handled before touching tokens.
 /// 2. `collect_input_tokens` reads from positional args or stdin.
 /// 3. `run_classify_and_emit` classifies once and dispatches on the tri-state.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    _analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     // Handle --help / -h
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
