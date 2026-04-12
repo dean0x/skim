@@ -7,7 +7,7 @@
 //! Commits with more than [`MAX_FILES_PER_COMMIT`] files are skipped entirely
 //! (bulk-merge guard).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 
@@ -48,14 +48,18 @@ const TOP_K_PER_FILE: usize = 50;
 /// - An empty input returns an empty vec.
 #[must_use = "build_cochange_matrix returns the matrix; discarding it is likely a bug"]
 pub fn build_cochange_matrix(commits: &[CommitInfo]) -> Vec<CochangeEntry> {
-    // Step 1: Per-file commit counts.
-    let file_commit_count = compute_file_commit_counts(commits);
+    // Build an intern table once so all downstream helpers work with u32 IDs
+    // instead of cloning PathBuf on every inner-loop iteration.
+    let (path_to_id, id_to_path) = build_intern_table(commits);
 
-    // Step 2: Pairwise co-occurrence counts.
-    let pair_count = compute_pair_counts(commits);
+    // Step 1: Per-file commit counts (id → count).
+    let file_commit_count = compute_file_commit_counts(commits, &path_to_id);
+
+    // Step 2: Pairwise co-occurrence counts (id pair → count).
+    let pair_count = compute_pair_counts(commits, &path_to_id);
 
     // Step 3: Convert to CochangeEntry with Jaccard, filtering below threshold.
-    let mut entries = build_entries(&file_commit_count, pair_count);
+    let mut entries = build_entries(&file_commit_count, pair_count, &id_to_path);
 
     // Step 4: Apply top-K retention per file.
     let retained = apply_top_k(&mut entries);
@@ -71,17 +75,52 @@ pub fn build_cochange_matrix(commits: &[CommitInfo]) -> Vec<CochangeEntry> {
 // Internal helpers
 // ============================================================================
 
-/// Count the number of qualifying commits each file appears in.
+/// Build a path intern table from all files referenced in `commits`.
 ///
-/// Commits with more than [`MAX_FILES_PER_COMMIT`] files are skipped entirely.
-fn compute_file_commit_counts(commits: &[CommitInfo]) -> FxHashMap<PathBuf, u32> {
-    let mut counts: FxHashMap<PathBuf, u32> = FxHashMap::default();
+/// Returns `(path_to_id, id_to_path)` where `id_to_path[id]` is the canonical
+/// `&Path` for that id, and `path_to_id` maps each path to its u32 id.
+/// IDs are assigned in first-seen order across all qualifying commits.
+fn build_intern_table<'a>(
+    commits: &'a [CommitInfo],
+) -> (FxHashMap<&'a Path, u32>, Vec<&'a Path>) {
+    let mut path_to_id: FxHashMap<&'a Path, u32> = FxHashMap::default();
+    let mut id_to_path: Vec<&'a Path> = Vec::new();
+
     for commit in commits {
         if commit.changed_files.len() > MAX_FILES_PER_COMMIT {
             continue;
         }
         for file in &commit.changed_files {
-            *counts.entry(file.clone()).or_default() += 1;
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                path_to_id.entry(file.as_path())
+            {
+                let id = u32::try_from(id_to_path.len()).unwrap_or(u32::MAX);
+                e.insert(id);
+                id_to_path.push(file.as_path());
+            }
+        }
+    }
+
+    (path_to_id, id_to_path)
+}
+
+/// Count the number of qualifying commits each file appears in.
+///
+/// Commits with more than [`MAX_FILES_PER_COMMIT`] files are skipped entirely.
+/// Returns a map of `file_id → commit_count`.
+fn compute_file_commit_counts(
+    commits: &[CommitInfo],
+    path_to_id: &FxHashMap<&Path, u32>,
+) -> FxHashMap<u32, u32> {
+    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
+    for commit in commits {
+        if commit.changed_files.len() > MAX_FILES_PER_COMMIT {
+            continue;
+        }
+        for file in &commit.changed_files {
+            if let Some(&id) = path_to_id.get(file.as_path()) {
+                *counts.entry(id).or_default() += 1;
+            }
         }
     }
     counts
@@ -89,27 +128,37 @@ fn compute_file_commit_counts(commits: &[CommitInfo]) -> FxHashMap<PathBuf, u32>
 
 /// Count the number of commits where each ordered file pair co-appears.
 ///
-/// Pairs are stored in canonical form: `(min, max)` lexicographically.
-/// Duplicate file paths within a single commit are deduplicated before
-/// pairing so a commit touching the same path twice counts as one.
-fn compute_pair_counts(commits: &[CommitInfo]) -> FxHashMap<(PathBuf, PathBuf), u32> {
-    let mut counts: FxHashMap<(PathBuf, PathBuf), u32> = FxHashMap::default();
+/// Pairs are stored in canonical form with IDs ordered by their corresponding
+/// path's lexicographic order (smaller path first), matching the original
+/// `PathBuf` key behaviour. Duplicate file paths within a single commit are
+/// deduplicated before pairing so a commit touching the same path twice counts
+/// as one. Returns a map of `(id_a, id_b) → co_occurrence_count` where
+/// `id_to_path[id_a] < id_to_path[id_b]` lexicographically.
+fn compute_pair_counts(
+    commits: &[CommitInfo],
+    path_to_id: &FxHashMap<&Path, u32>,
+) -> FxHashMap<(u32, u32), u32> {
+    let mut counts: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     for commit in commits {
         if commit.changed_files.len() > MAX_FILES_PER_COMMIT {
             continue;
         }
-        // Deduplicate within commit — defensive against duplicate paths from gix.
-        let mut unique: Vec<&PathBuf> = commit.changed_files.iter().collect();
-        unique.sort();
-        unique.dedup();
+        // Resolve paths to (path, id) pairs, sort by path for canonical ordering,
+        // then deduplicate — defensive against duplicate paths from gix.
+        let mut unique: Vec<(&Path, u32)> = commit
+            .changed_files
+            .iter()
+            .filter_map(|f| path_to_id.get(f.as_path()).map(|&id| (f.as_path(), id)))
+            .collect();
+        // Sort by path to produce lexicographic canonical ordering (smaller path first).
+        unique.sort_unstable_by_key(|&(p, _)| p);
+        unique.dedup_by_key(|&mut (p, _)| p);
 
         for i in 0..unique.len() {
             for j in (i + 1)..unique.len() {
-                // unique is sorted, so unique[i] <= unique[j] always holds —
+                // unique is sorted by path, so unique[i].0 <= unique[j].0 always —
                 // canonical ordering (smaller path first) is preserved by construction.
-                *counts
-                    .entry((unique[i].clone(), unique[j].clone()))
-                    .or_default() += 1;
+                *counts.entry((unique[i].1, unique[j].1)).or_default() += 1;
             }
         }
     }
@@ -120,28 +169,33 @@ fn compute_pair_counts(commits: &[CommitInfo]) -> FxHashMap<(PathBuf, PathBuf), 
 ///
 /// Pairs below [`MIN_CO_OCCURRENCES`] and pairs whose union is zero (impossible
 /// in practice but guarded defensively) are discarded.
+/// Only at this point are IDs converted back to `PathBuf` for the output structs.
 fn build_entries(
-    file_commit_count: &FxHashMap<PathBuf, u32>,
-    pair_count: FxHashMap<(PathBuf, PathBuf), u32>,
+    file_commit_count: &FxHashMap<u32, u32>,
+    pair_count: FxHashMap<(u32, u32), u32>,
+    id_to_path: &[&Path],
 ) -> Vec<CochangeEntry> {
     let mut entries = Vec::with_capacity(pair_count.len());
-    for ((a, b), co_occurrences) in pair_count {
+    for ((id_a, id_b), co_occurrences) in pair_count {
         if co_occurrences < MIN_CO_OCCURRENCES {
             continue;
         }
-        let count_a = file_commit_count.get(&a).copied().unwrap_or(0);
-        let count_b = file_commit_count.get(&b).copied().unwrap_or(0);
+        let count_a = file_commit_count.get(&id_a).copied().unwrap_or(0);
+        let count_b = file_commit_count.get(&id_b).copied().unwrap_or(0);
         // Jaccard union: |A ∪ B| = |A| + |B| - |A ∩ B|
-        // Saturating sub guards against impossible underflow.
-        let union = count_a + count_b - co_occurrences;
+        // Widen to u64 to prevent overflow when count_a + count_b exceeds u32::MAX.
+        let union = u64::from(count_a) + u64::from(count_b) - u64::from(co_occurrences);
         if union == 0 {
             // Defensive guard — cannot happen if co_occurrences >= 1.
             continue;
         }
         let jaccard = co_occurrences as f32 / union as f32;
+        // Convert IDs back to PathBuf only at output boundary.
+        let path_a = id_to_path[id_a as usize].to_path_buf();
+        let path_b = id_to_path[id_b as usize].to_path_buf();
         entries.push(CochangeEntry {
-            path_a: a,
-            path_b: b,
+            path_a,
+            path_b,
             co_occurrences,
             jaccard,
         });

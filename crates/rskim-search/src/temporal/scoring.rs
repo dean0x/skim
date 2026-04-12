@@ -16,7 +16,7 @@
 //! `fix_density = 0.0` to suppress false 1/1 = 1.0 positives. The file with
 //! the highest density receives `score = 1.0`.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use rustc_hash::FxHashMap;
 
@@ -41,6 +41,36 @@ const HOTSPOT_90D_WINDOW: u64 = 90 * 86_400;
 const MIN_COMMITS_FOR_RISK: u32 = 3;
 
 // ============================================================================
+// Internal helpers
+// ============================================================================
+
+/// Build a path intern table from all files referenced in `commits`.
+///
+/// Returns `(path_to_id, id_to_path)` where `id_to_path[id]` is the canonical
+/// `&Path` for that id, and `path_to_id` maps each path to its u32 id.
+/// IDs are assigned in first-seen order across all commits.
+fn build_intern_table<'a>(
+    commits: &'a [CommitInfo],
+) -> (FxHashMap<&'a Path, u32>, Vec<&'a Path>) {
+    let mut path_to_id: FxHashMap<&'a Path, u32> = FxHashMap::default();
+    let mut id_to_path: Vec<&'a Path> = Vec::new();
+
+    for commit in commits {
+        for file in &commit.changed_files {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                path_to_id.entry(file.as_path())
+            {
+                let id = u32::try_from(id_to_path.len()).unwrap_or(u32::MAX);
+                e.insert(id);
+                id_to_path.push(file.as_path());
+            }
+        }
+    }
+
+    (path_to_id, id_to_path)
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -58,8 +88,11 @@ const MIN_COMMITS_FOR_RISK: u32 = 3;
 /// - Returns an empty vec for empty input or when all commits are future-dated.
 #[must_use = "hotspot_scores returns the scores; discarding them is likely a bug"]
 pub fn hotspot_scores(commits: &[CommitInfo], now: u64) -> Vec<HotspotScore> {
+    // Build an intern table so inner loops use u32 IDs instead of cloning PathBuf.
+    let (path_to_id, id_to_path) = build_intern_table(commits);
+
     // Accumulate per-file: (commit_count_30d, commit_count_90d, decayed_weight)
-    let mut per_file: FxHashMap<PathBuf, (u32, u32, f32)> = FxHashMap::default();
+    let mut per_file: FxHashMap<u32, (u32, u32, f32)> = FxHashMap::default();
 
     for commit in commits {
         // Skip future-dated commits (clock skew).
@@ -77,14 +110,16 @@ pub fn hotspot_scores(commits: &[CommitInfo], now: u64) -> Vec<HotspotScore> {
         let decay = (-(2.0_f32).ln() * age_days / HALF_LIFE_DAYS).exp();
 
         for file in &commit.changed_files {
-            let entry = per_file.entry(file.clone()).or_insert((0, 0, 0.0));
-            if in_30d {
-                entry.0 += 1;
+            if let Some(&id) = path_to_id.get(file.as_path()) {
+                let entry = per_file.entry(id).or_insert((0, 0, 0.0));
+                if in_30d {
+                    entry.0 += 1;
+                }
+                if in_90d {
+                    entry.1 += 1;
+                }
+                entry.2 += decay;
             }
-            if in_90d {
-                entry.1 += 1;
-            }
-            entry.2 += decay;
         }
     }
 
@@ -94,18 +129,19 @@ pub fn hotspot_scores(commits: &[CommitInfo], now: u64) -> Vec<HotspotScore> {
         .map(|(_, _, w)| *w)
         .fold(0.0_f32, f32::max);
 
+    // Convert IDs back to PathBuf only at the output boundary.
     let mut scores: Vec<HotspotScore> = per_file
         .into_iter()
         // Git-history-only scope: exclude files with no activity in 90 days.
         .filter(|(_, (_, c90, _))| *c90 > 0)
-        .map(|(path, (c30, c90, w))| {
+        .map(|(id, (c30, c90, w))| {
             let score = if max_weight > 0.0 {
                 w / max_weight
             } else {
                 0.0
             };
             HotspotScore {
-                path,
+                path: id_to_path[id as usize].to_path_buf(),
                 commit_count_30d: c30,
                 commit_count_90d: c90,
                 score,
@@ -138,45 +174,51 @@ pub fn hotspot_scores(commits: &[CommitInfo], now: u64) -> Vec<HotspotScore> {
 /// - Returns an empty vec for empty input.
 #[must_use = "risk_scores returns the scores; discarding them is likely a bug"]
 pub fn risk_scores(commits: &[CommitInfo]) -> Vec<RiskScore> {
+    // Build an intern table so inner loops use u32 IDs instead of cloning PathBuf.
+    let (path_to_id, id_to_path) = build_intern_table(commits);
+
     // Accumulate per-file: (total_commits, fix_commits)
-    let mut per_file: FxHashMap<PathBuf, (u32, u32)> = FxHashMap::default();
+    let mut per_file: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
 
     for commit in commits {
         for file in &commit.changed_files {
-            let entry = per_file.entry(file.clone()).or_insert((0, 0));
-            entry.0 += 1;
-            if commit.is_fix {
-                entry.1 += 1;
+            if let Some(&id) = path_to_id.get(file.as_path()) {
+                let entry = per_file.entry(id).or_insert((0, 0));
+                entry.0 += 1;
+                if commit.is_fix {
+                    entry.1 += 1;
+                }
             }
         }
     }
 
     // Compute fix_density per file; zero below minimum sample size.
-    let raw: Vec<(PathBuf, u32, u32, f32)> = per_file
+    let raw: Vec<(u32, u32, u32, f32)> = per_file
         .into_iter()
-        .map(|(path, (total, fixes))| {
+        .map(|(id, (total, fixes))| {
             let density = if total < MIN_COMMITS_FOR_RISK {
                 0.0
             } else {
                 fixes as f32 / total as f32
             };
-            (path, total, fixes, density)
+            (id, total, fixes, density)
         })
         .collect();
 
     // Normalize score to [0, 1] by dividing by max density.
     let max_density = raw.iter().map(|(_, _, _, d)| *d).fold(0.0_f32, f32::max);
 
+    // Convert IDs back to PathBuf only at the output boundary.
     let mut scores: Vec<RiskScore> = raw
         .into_iter()
-        .map(|(path, total, fixes, density)| {
+        .map(|(id, total, fixes, density)| {
             let score = if max_density > 0.0 {
                 density / max_density
             } else {
                 0.0
             };
             RiskScore {
-                path,
+                path: id_to_path[id as usize].to_path_buf(),
                 total_commits: total,
                 fix_commits: fixes,
                 fix_density: density,
