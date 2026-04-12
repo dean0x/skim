@@ -232,6 +232,13 @@ fn test_search_query_returns_results() {
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
+
+    // stdout must be non-empty: "SearchQuery" appears throughout the codebase.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "search for 'SearchQuery' must return at least one result; stdout was empty"
+    );
 }
 
 #[test]
@@ -609,5 +616,152 @@ fn test_search_build_in_git_dir_builds_temporal() {
     assert!(
         dir_contains_file(cache.path(), "temporal.db"),
         "temporal.db must exist after --build in a git repo"
+    );
+}
+
+// ============================================================================
+// Flag parse error tests (wave-2-W1-A4: fail-fast on bad --lookback / --limit)
+// ============================================================================
+
+/// `--lookback abc` must exit non-zero and include "error", "lookback" in stderr.
+/// Silent fallback to 365 would mislead users who intend to constrain resource usage.
+#[test]
+fn test_search_lookback_invalid_value_fails() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--build-temporal", "--lookback", "abc"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error"))
+        .stderr(predicate::str::contains("lookback"));
+}
+
+/// `--limit xyz` must exit non-zero and include "error", "limit" in stderr.
+#[test]
+fn test_search_limit_invalid_value_fails() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--build-temporal", "--limit", "xyz"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error"))
+        .stderr(predicate::str::contains("limit"));
+}
+
+/// `--lookback 30` must be accepted and the build must succeed.
+#[test]
+fn test_search_lookback_valid_value_succeeds() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--build-temporal", "--lookback", "30"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success();
+}
+
+// ============================================================================
+// Standalone temporal signal tests (--cold, --risky, multi-signal)
+// ============================================================================
+
+#[test]
+fn test_search_cold_standalone() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--cold", "--limit", "5"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_search_risky_standalone() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--risky", "--limit", "5"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_search_hot_and_risky_multi_signal() {
+    let repo = init_temp_git_repo();
+    let cache = tempfile::tempdir().unwrap();
+    // --hot and --risky together form a composite temporal query; must not crash.
+    skim_cmd()
+        .current_dir(repo.path())
+        .args(["search", "--hot", "--risky", "--limit", "5"])
+        .env("SKIM_CACHE_DIR", cache.path())
+        .assert()
+        .success();
+}
+
+// ============================================================================
+// Composite query: text search + temporal signal
+// ============================================================================
+
+#[test]
+fn test_search_text_with_hot_composite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_dir = tmp.path().to_str().unwrap().to_string();
+
+    // Build the index inside the real repo (cwd is workspace root during tests).
+    skim_cmd()
+        .args(["search", "--build"])
+        .env("SKIM_CACHE_DIR", &cache_dir)
+        .assert()
+        .success();
+
+    // Text + --hot exercises the composite query path (lexical reranked by hotspot).
+    let output = skim_cmd()
+        .args(["search", "SearchQuery", "--hot", "--limit", "10"])
+        .env("SKIM_CACHE_DIR", &cache_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "text + --hot composite query must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--limit 5` must be accepted (numeric validation is pass-through for valid input).
+#[test]
+fn test_search_limit_valid_value_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache_dir = tmp.path().to_str().unwrap().to_string();
+
+    skim_cmd()
+        .args(["search", "--build"])
+        .env("SKIM_CACHE_DIR", &cache_dir)
+        .assert()
+        .success();
+
+    let output = skim_cmd()
+        .args(["search", "--json", "--limit", "5", "fn"])
+        .env("SKIM_CACHE_DIR", &cache_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "--limit 5 should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

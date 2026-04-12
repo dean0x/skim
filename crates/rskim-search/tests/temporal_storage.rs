@@ -372,6 +372,7 @@ fn storage_schema_version_too_new_rejected() {
 // 12. Blast radius symmetry
 // ============================================================================
 
+
 #[test]
 fn storage_blast_radius_symmetric() {
     let repo_dir = TempDir::new().expect("repo tempdir");
@@ -398,5 +399,112 @@ fn storage_blast_radius_symmetric() {
     assert!(
         partners_b.iter().any(|(p, _)| p == &PathBuf::from("a.rs")),
         "b.rs blast radius must contain a.rs; got {partners_b:?}"
+    );
+}
+
+// ============================================================================
+// 13. load_scores_batch — empty paths returns empty HashMap
+// ============================================================================
+
+#[test]
+fn load_scores_batch_empty_paths_returns_empty_map() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("temporal.db");
+    let db = TemporalDb::open(&db_path).expect("open");
+
+    let result = db
+        .load_scores_batch(&[], ScoreKind::Hotspot)
+        .expect("load_scores_batch empty");
+
+    assert!(
+        result.is_empty(),
+        "empty input must yield empty HashMap, got {result:?}"
+    );
+}
+
+// ============================================================================
+// 14. load_scores_batch — mixed found/not-found returns only found entries
+// ============================================================================
+
+#[test]
+fn load_scores_batch_mixed_found_and_missing() {
+    let repo_dir = TempDir::new().expect("repo tempdir");
+    let db_dir = TempDir::new().expect("db tempdir");
+
+    build_cochange_fixture(repo_dir.path());
+
+    let db_path = db_dir.path().join("temporal.db");
+    let db = TemporalDb::build(repo_dir.path(), &db_path, 365).expect("build");
+
+    let a = PathBuf::from("a.rs");
+    let b = PathBuf::from("b.rs");
+    let ghost = PathBuf::from("does_not_exist.rs");
+
+    let paths: Vec<&std::path::Path> = vec![a.as_path(), b.as_path(), ghost.as_path()];
+    let result = db
+        .load_scores_batch(&paths, ScoreKind::Hotspot)
+        .expect("load_scores_batch mixed");
+
+    // Both real files must appear.
+    assert!(
+        result.contains_key("a.rs"),
+        "a.rs must be in batch result; got {result:?}"
+    );
+    assert!(
+        result.contains_key("b.rs"),
+        "b.rs must be in batch result; got {result:?}"
+    );
+
+    // The non-existent file must NOT appear.
+    assert!(
+        !result.contains_key("does_not_exist.rs"),
+        "missing file must not appear in batch result; got {result:?}"
+    );
+}
+
+// ============================================================================
+// 15. load_scores_batch — paths exceeding CHUNK_SIZE (500) are chunked correctly
+// ============================================================================
+
+#[test]
+fn load_scores_batch_exceeds_chunk_size() {
+    let repo_dir = TempDir::new().expect("repo tempdir");
+    let db_dir = TempDir::new().expect("db tempdir");
+
+    build_cochange_fixture(repo_dir.path());
+
+    let db_path = db_dir.path().join("temporal.db");
+    let db = TemporalDb::build(repo_dir.path(), &db_path, 365).expect("build");
+
+    // Build a path list of 600 entries: 598 non-existent paths, plus a.rs and b.rs.
+    // This forces load_scores_batch to issue two chunks (500 + 100).
+    let a = PathBuf::from("a.rs");
+    let b = PathBuf::from("b.rs");
+    let phantoms: Vec<PathBuf> = (0..598).map(|i| PathBuf::from(format!("phantom_{i}.rs"))).collect();
+
+    let mut path_refs: Vec<&std::path::Path> = phantoms.iter().map(|p| p.as_path()).collect();
+    path_refs.push(a.as_path());
+    path_refs.push(b.as_path());
+    assert_eq!(path_refs.len(), 600, "must have 600 entries to exceed chunk size");
+
+    let result = db
+        .load_scores_batch(&path_refs, ScoreKind::Hotspot)
+        .expect("load_scores_batch 600 paths");
+
+    // a.rs and b.rs were indexed and must be present.
+    assert!(
+        result.contains_key("a.rs"),
+        "a.rs must be in result after chunked batch query; got {result:?}"
+    );
+    assert!(
+        result.contains_key("b.rs"),
+        "b.rs must be in result after chunked batch query; got {result:?}"
+    );
+
+    // Phantom files were never indexed, so the map should contain at most 2 entries.
+    assert!(
+        result.len() <= 2,
+        "only indexed files must appear; got {} entries: {result:?}",
+        result.len()
     );
 }

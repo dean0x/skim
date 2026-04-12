@@ -4,6 +4,7 @@
 //! that combines temporal signals (hot, cold, risky) via normalized rank
 //! averaging.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -15,6 +16,16 @@ use crate::{Result, SearchError, TemporalFlags, TemporalQuery};
 /// `final = (1 - alpha) * lexical_rank + alpha * temporal_rank`.
 /// Higher alpha means temporal signals dominate more.
 const DEFAULT_TEMPORAL_ALPHA: f32 = 0.3;
+
+/// Temporal signals active for a given rerank call.
+///
+/// `blast_radius` is handled separately and is not represented here.
+#[derive(Clone, Copy)]
+enum Signal {
+    Hot,
+    Cold,
+    Risky,
+}
 
 /// Temporal layer query interface.
 ///
@@ -30,6 +41,12 @@ pub struct TemporalIndex {
     db: Mutex<TemporalDb>,
     alpha: f32,
 }
+
+// Compile-time assertion: TemporalDb must be Send so Mutex<TemporalDb> is Sync.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<TemporalDb>();
+};
 
 impl TemporalIndex {
     /// Open an existing temporal index from `db_path`.
@@ -65,6 +82,72 @@ impl TemporalIndex {
             .map_err(|_| SearchError::IndexBuildError("temporal db mutex poisoned".to_string()))?;
         f(&db)
     }
+
+    /// Acquire the DB lock once and issue batch score queries for all active signals.
+    ///
+    /// Returns `(hotspot_map, risk_map)` keyed by POSIX-normalised path strings.
+    /// Maps are empty when the corresponding signal kind is not needed.
+    fn fetch_score_maps(
+        &self,
+        paths: &[&Path],
+        active_signals: &[Signal],
+    ) -> Result<(HashMap<String, f32>, HashMap<String, f32>)> {
+        let needs_hotspot = active_signals
+            .iter()
+            .any(|s| matches!(s, Signal::Hot | Signal::Cold));
+        let needs_risk = active_signals.iter().any(|s| matches!(s, Signal::Risky));
+
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| SearchError::IndexBuildError("temporal db mutex poisoned".to_string()))?;
+
+        let hotspot_map = if needs_hotspot {
+            db.load_scores_batch(paths, ScoreKind::Hotspot)?
+        } else {
+            HashMap::new()
+        };
+        let risk_map = if needs_risk {
+            db.load_scores_batch(paths, ScoreKind::Risk)?
+        } else {
+            HashMap::new()
+        };
+
+        Ok((hotspot_map, risk_map))
+    }
+
+    /// Pure: compute per-file temporal composite scores from pre-fetched maps.
+    ///
+    /// For each file the score is the average of the active signal contributions:
+    /// - `Hot`   → hotspot score
+    /// - `Cold`  → `1.0 - hotspot score`
+    /// - `Risky` → risk score
+    ///
+    /// Returns scores paired with their paths, in the same order as `lexical_results`.
+    fn compute_temporal_composite(
+        lexical_results: &[(PathBuf, f32)],
+        active_signals: &[Signal],
+        hotspot_map: &HashMap<String, f32>,
+        risk_map: &HashMap<String, f32>,
+    ) -> Vec<(PathBuf, f32)> {
+        let mut out = Vec::with_capacity(lexical_results.len());
+        for (path, _) in lexical_results {
+            let path_str = path.to_string_lossy().replace('\\', "/");
+            let mut sum = 0.0_f32;
+            for &signal in active_signals {
+                let score = match signal {
+                    Signal::Hot => hotspot_map.get(&path_str).copied().unwrap_or(0.0),
+                    Signal::Cold => 1.0 - hotspot_map.get(&path_str).copied().unwrap_or(0.0),
+                    Signal::Risky => risk_map.get(&path_str).copied().unwrap_or(0.0),
+                };
+                sum += score;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let avg = sum / active_signals.len() as f32;
+            out.push((path.clone(), avg));
+        }
+        out
+    }
 }
 
 impl TemporalQuery for TemporalIndex {
@@ -87,12 +170,12 @@ impl TemporalQuery for TemporalIndex {
     /// Rerank lexical results using temporal signals.
     ///
     /// Algorithm:
-    /// 1. Compute temporal composite score per file (average of normalized
-    ///    hotspot/cold/risk scores for enabled flags)
-    /// 2. Normalize both lexical and temporal scores via rank position:
-    ///    `(n - rank) / n` where rank is 0-indexed
-    /// 3. Blend: `final = (1 - alpha) * lexical_norm + alpha * temporal_norm`
-    /// 4. Sort by final score desc, ties broken by path
+    /// 1. Determine active signals from `flags`
+    /// 2. Fetch hotspot and risk score maps in a single DB lock acquisition
+    /// 3. Compute per-file temporal composite scores (pure, no I/O)
+    /// 4. Rank-normalize both lexical and temporal score lists
+    /// 5. Blend: `final = (1 - alpha) * lexical_norm + alpha * temporal_norm`
+    /// 6. Sort by final score desc, ties broken by path
     fn rerank(
         &self,
         lexical_results: &[(PathBuf, f32)],
@@ -102,14 +185,7 @@ impl TemporalQuery for TemporalIndex {
             return Ok(Vec::new());
         }
 
-        // Collect which temporal signals are active (blast_radius is ignored in rerank).
-        #[derive(Clone, Copy)]
-        enum Signal {
-            Hot,
-            Cold,
-            Risky,
-        }
-
+        // Determine which temporal signals are active (blast_radius is not used in rerank).
         let mut active_signals: Vec<Signal> = Vec::new();
         if flags.hot {
             active_signals.push(Signal::Hot);
@@ -121,53 +197,35 @@ impl TemporalQuery for TemporalIndex {
             active_signals.push(Signal::Risky);
         }
 
-        // If no temporal flags active, return lexical unchanged.
         if active_signals.is_empty() {
             return Ok(lexical_results.to_vec());
         }
 
-        // Compute composite temporal score per file.
-        // Acquire the lock once for the entire loop to avoid repeated locking overhead.
-        let db = self
-            .db
-            .lock()
-            .map_err(|_| SearchError::IndexBuildError("temporal db mutex poisoned".to_string()))?;
+        let paths: Vec<&Path> = lexical_results.iter().map(|(p, _)| p.as_path()).collect();
+        let (hotspot_map, risk_map) = self.fetch_score_maps(&paths, &active_signals)?;
 
-        let mut temporal_composite: Vec<(PathBuf, f32)> = Vec::with_capacity(lexical_results.len());
-        for (path, _) in lexical_results {
-            let mut sum = 0.0_f32;
-            for &signal in &active_signals {
-                let score = match signal {
-                    Signal::Hot => db.load_score_for(path, ScoreKind::Hotspot)?.unwrap_or(0.0),
-                    Signal::Cold => {
-                        1.0 - db.load_score_for(path, ScoreKind::Hotspot)?.unwrap_or(0.0)
-                    }
-                    Signal::Risky => db.load_score_for(path, ScoreKind::Risk)?.unwrap_or(0.0),
-                };
-                sum += score;
-            }
-            #[allow(clippy::cast_precision_loss)]
-            let avg = sum / active_signals.len() as f32;
-            temporal_composite.push((path.clone(), avg));
-        }
-        // Release the lock before doing pure computation.
-        drop(db);
+        let temporal_composite = Self::compute_temporal_composite(
+            lexical_results,
+            &active_signals,
+            &hotspot_map,
+            &risk_map,
+        );
 
-        // Percentile-normalize both lexical and temporal by rank.
+        // rank_normalize returns scores only (Vec<f32>) in original input order;
+        // paths are carried from lexical_results to avoid cloning them here.
         let lexical_norm = rank_normalize(lexical_results);
         let temporal_norm = rank_normalize(&temporal_composite);
 
-        // Blend via alpha.
-        let mut blended: Vec<(PathBuf, f32)> = lexical_norm
-            .into_iter()
+        let mut blended: Vec<(PathBuf, f32)> = lexical_results
+            .iter()
+            .zip(lexical_norm)
             .zip(temporal_norm)
-            .map(|((path, lex), (_, temp))| {
+            .map(|(((path, _), lex), temp)| {
                 let score = (1.0 - self.alpha) * lex + self.alpha * temp;
-                (path, score)
+                (path.clone(), score)
             })
             .collect();
 
-        // Sort: score desc, path asc tie-break.
         blended.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -182,18 +240,19 @@ impl TemporalQuery for TemporalIndex {
 ///
 /// Each entry's new score is `(n - rank) / n` where rank is its 0-indexed
 /// position after sorting by score desc. Ties are broken by original index
-/// (stable sort). Returns entries **in their original input order** so the
-/// caller can zip two rank-normalized lists together.
+/// (stable sort). Returns scores **in their original input order** so the
+/// caller can zip two rank-normalized score lists together alongside the
+/// original paths (which it already holds).
 ///
 /// Single-element input: score 1.0.
 /// Empty input: empty.
-fn rank_normalize(results: &[(PathBuf, f32)]) -> Vec<(PathBuf, f32)> {
+fn rank_normalize(results: &[(PathBuf, f32)]) -> Vec<f32> {
     if results.is_empty() {
         return Vec::new();
     }
     let n = results.len();
     if n == 1 {
-        return vec![(results[0].0.clone(), 1.0)];
+        return vec![1.0];
     }
 
     // Sort indices by score desc (stable relative to original index on ties).
@@ -213,11 +272,7 @@ fn rank_normalize(results: &[(PathBuf, f32)]) -> Vec<(PathBuf, f32)> {
         normalized[*orig_idx] = score;
     }
 
-    results
-        .iter()
-        .enumerate()
-        .map(|(i, (p, _))| (p.clone(), normalized[i]))
-        .collect()
+    normalized
 }
 
 // ============================================================================
@@ -238,7 +293,7 @@ mod tests {
         let input = vec![(PathBuf::from("a"), 5.0)];
         let out = rank_normalize(&input);
         assert_eq!(out.len(), 1);
-        assert!((out[0].1 - 1.0).abs() < f32::EPSILON);
+        assert!((out[0] - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -251,13 +306,10 @@ mod tests {
             (PathBuf::from("c"), 2.0),
         ];
         let out = rank_normalize(&input);
-        // Output order matches input order.
-        assert_eq!(out[0].0, PathBuf::from("a"));
-        assert_eq!(out[1].0, PathBuf::from("b"));
-        assert_eq!(out[2].0, PathBuf::from("c"));
-        assert!((out[0].1 - 1.0).abs() < f32::EPSILON);
-        assert!((out[1].1 - (1.0 / 3.0)).abs() < 0.01);
-        assert!((out[2].1 - (2.0 / 3.0)).abs() < 0.01);
+        // Output order matches input order (a, b, c).
+        assert!((out[0] - 1.0).abs() < f32::EPSILON);
+        assert!((out[1] - (1.0 / 3.0)).abs() < 0.01);
+        assert!((out[2] - (2.0 / 3.0)).abs() < 0.01);
     }
 
     #[test]
@@ -265,7 +317,7 @@ mod tests {
         // n=2: top gets 2/2=1.0, bottom gets 1/2=0.5
         let input = vec![(PathBuf::from("high"), 10.0), (PathBuf::from("low"), 1.0)];
         let out = rank_normalize(&input);
-        assert!((out[0].1 - 1.0).abs() < f32::EPSILON);
-        assert!((out[1].1 - 0.5).abs() < f32::EPSILON);
+        assert!((out[0] - 1.0).abs() < f32::EPSILON);
+        assert!((out[1] - 0.5).abs() < f32::EPSILON);
     }
 }
