@@ -26,7 +26,7 @@ mod stats;
 mod test;
 
 use std::borrow::Cow;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use crate::output::ParseResult;
@@ -168,40 +168,6 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub command_type: crate::analytics::CommandType,
     pub output_format: OutputFormat,
     pub analytics_enabled: bool,
-}
-
-/// Execute an external command, parse its output, and emit the result.
-///
-/// Convenience wrapper that auto-detects stdin piping via `is_terminal()`.
-/// Use [`run_parsed_command_with_mode`] when you need explicit control
-/// over stdin vs execute behavior.
-#[allow(dead_code)]
-pub(crate) fn run_parsed_command<T>(
-    program: &str,
-    args: &[String],
-    env_overrides: &[(&str, &str)],
-    install_hint: &str,
-    show_stats: bool,
-    command_type: crate::analytics::CommandType,
-    analytics_enabled: bool,
-    parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
-) -> anyhow::Result<ExitCode>
-where
-    T: AsRef<str> + serde::Serialize,
-{
-    let use_stdin = !io::stdin().is_terminal();
-    let config = ParsedCommandConfig {
-        program,
-        args,
-        env_overrides,
-        install_hint,
-        use_stdin,
-        show_stats,
-        command_type,
-        output_format: OutputFormat::default(),
-        analytics_enabled,
-    };
-    run_parsed_command_with_mode(config, parse)
 }
 
 /// Execute an external command, parse its output, and emit the result.

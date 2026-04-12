@@ -225,6 +225,15 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 /// Use this variant in handlers that already own their output strings
 /// (i.e. the string would be dropped immediately after the call anyway).
 /// `parse_tier` is forwarded to the analytics record (AD-12).
+///
+/// # Note on argument count
+/// The 8 parameters are all semantically distinct: `raw`/`output` are the text
+/// payload, `label`/`show_stats` control reporting, and
+/// `analytics_enabled`/`command_type`/`duration`/`parse_tier` are analytics
+/// metadata injected from the caller for dependency-injection testability.
+/// Collapsing them into an intermediate struct would not reduce call-site
+/// complexity for the 5 callers that supply all values individually.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_git_output_owned(
     raw: String,
     output: String,

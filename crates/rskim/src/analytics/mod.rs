@@ -632,9 +632,11 @@ fn persist_record(record: &TokenSavingsRecord) {
 }
 
 /// Record command output token savings. Defers token counting to background thread.
-/// Guard `enabled` BEFORE cloning strings to avoid unnecessary allocations.
-pub(crate) fn record_fire_and_forget(
-    enabled: bool,
+///
+/// Callers must check `enabled` before calling; this function always records.
+/// The single external caller (`try_record_command`) already guards on `enabled`,
+/// so removing the redundant parameter here keeps the argument count at 7.
+fn record_fire_and_forget(
     raw_text: String,
     compressed_text: String,
     original_cmd: String,
@@ -643,9 +645,6 @@ pub(crate) fn record_fire_and_forget(
     project_path: String,
     parse_tier: Option<String>,
 ) {
-    if !enabled {
-        return;
-    }
     std::thread::spawn(move || {
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
             return;
@@ -710,7 +709,6 @@ pub(crate) fn try_record_command(
         .display()
         .to_string();
     record_fire_and_forget(
-        true,
         raw_text,
         compressed_text,
         original_cmd,
