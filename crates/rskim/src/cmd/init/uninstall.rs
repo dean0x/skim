@@ -6,6 +6,7 @@ use super::helpers::{
     resolve_config_dir_for_agent, resolve_real_settings_path, HOOK_SCRIPT_NAME, SETTINGS_FILE,
 };
 use super::state::{has_skim_hook_entry, read_settings_json};
+use crate::cmd::session::InstructionEnv;
 
 /// Remove skim hook entries and marketplace registration from a settings.json value.
 ///
@@ -148,7 +149,8 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
 
     // Remove guidance from instruction file
     let global = !flags.project;
-    super::install::remove_guidance(flags.agent, global)?;
+    let env = InstructionEnv::from_process();
+    super::install::remove_guidance(flags.agent, global, &env)?;
 
     println!();
     println!("  skim hook has been uninstalled.");

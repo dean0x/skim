@@ -28,13 +28,18 @@ use crate::runner::CommandOutput;
 ///
 /// tsc writes errors to stderr in its standard format. No flag injection
 /// is needed (unlike cargo).
-pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     run_parsed_command(
         "tsc",
         args,
         &[],
         "npm install -g typescript",
         show_stats,
+        analytics_enabled,
         parse_tsc,
     )
 }

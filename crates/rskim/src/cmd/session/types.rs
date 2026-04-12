@@ -146,31 +146,41 @@ impl AgentKind {
     /// Returns `None` when the requested scope is not supported by the agent.
     ///
     /// For `global = true`: returns home-relative absolute path (e.g., `~/.claude/CLAUDE.md`).
-    ///   Respects agent-specific env var overrides for global config directories.
+    ///   Respects agent-specific env var overrides via `env` parameter.
     /// For `global = false`: returns project-relative path (e.g., `CLAUDE.md`).
-    pub(crate) fn instruction_file(&self, global: bool) -> Option<std::path::PathBuf> {
+    pub(crate) fn instruction_file(
+        &self,
+        global: bool,
+        env: &InstructionEnv,
+    ) -> Option<std::path::PathBuf> {
         match (self, global) {
             // Global scope — with env var overrides
             (AgentKind::ClaudeCode, true) => {
-                let base = std::env::var_os("CLAUDE_CONFIG_DIR")
-                    .map(PathBuf::from)
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+                let base = env
+                    .claude_config_dir
+                    .clone()
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".claude")));
                 base.map(|d| d.join("CLAUDE.md"))
             }
-            (AgentKind::GeminiCli, true) => dirs::home_dir().map(|h| h.join(".gemini/GEMINI.md")),
+            (AgentKind::GeminiCli, true) => {
+                env.home_dir.as_ref().map(|h| h.join(".gemini/GEMINI.md"))
+            }
             (AgentKind::CodexCli, true) => {
-                let base = std::env::var_os("CODEX_HOME")
-                    .map(PathBuf::from)
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".codex")));
+                let base = env
+                    .codex_home
+                    .clone()
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".codex")));
                 base.map(|d| d.join("AGENTS.md"))
             }
-            (AgentKind::CopilotCli, true) => {
-                dirs::home_dir().map(|h| h.join(".copilot/copilot-instructions.md"))
-            }
+            (AgentKind::CopilotCli, true) => env
+                .home_dir
+                .as_ref()
+                .map(|h| h.join(".copilot/copilot-instructions.md")),
             (AgentKind::OpenCode, true) => {
-                let base = std::env::var_os("OPENCODE_CONFIG_DIR")
-                    .map(PathBuf::from)
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".config/opencode")));
+                let base = env
+                    .opencode_config_dir
+                    .clone()
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".config/opencode")));
                 base.map(|d| d.join("AGENTS.md"))
             }
             (AgentKind::Cursor, true) => None, // UI-only, no file-based global config
@@ -197,6 +207,40 @@ impl AgentKind {
 impl std::fmt::Display for AgentKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.display_name())
+    }
+}
+
+// ============================================================================
+// InstructionEnv — injected environment for instruction_file()
+// ============================================================================
+
+/// Injected environment values for [`AgentKind::instruction_file`].
+///
+/// Created once at a system boundary (e.g., `run_install`) and threaded to
+/// callers, eliminating per-call env-var reads and enabling race-free testing.
+///
+/// ARCHITECTURE: Mirrors the `config_dir(&self, home: &Path)` pattern already
+/// used in `AgentKind`. Process env is read exactly once via
+/// [`InstructionEnv::from_process`]; test code constructs this struct directly
+/// with controlled values.
+#[derive(Debug, Default)]
+pub(crate) struct InstructionEnv {
+    pub home_dir: Option<PathBuf>,
+    pub claude_config_dir: Option<PathBuf>, // CLAUDE_CONFIG_DIR
+    pub codex_home: Option<PathBuf>,        // CODEX_HOME
+    pub opencode_config_dir: Option<PathBuf>, // OPENCODE_CONFIG_DIR
+}
+
+impl InstructionEnv {
+    /// Read env once at the system boundary. Call this in `main`-adjacent code,
+    /// then thread the struct down to callers — never call from within library functions.
+    pub fn from_process() -> Self {
+        Self {
+            home_dir: dirs::home_dir(),
+            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+            codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
+            opencode_config_dir: std::env::var_os("OPENCODE_CONFIG_DIR").map(PathBuf::from),
+        }
     }
 }
 
@@ -558,145 +602,137 @@ mod tests {
     }
 
     // ---- AgentKind::instruction_file ----
+    //
+    // Tests construct InstructionEnv directly with controlled values.
+    // No env mutation, no mutex, no unsafe — deterministic and parallel-safe.
+
+    fn fake_home() -> PathBuf {
+        PathBuf::from("/fake/home")
+    }
+
+    fn default_env() -> InstructionEnv {
+        InstructionEnv {
+            home_dir: Some(fake_home()),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_instruction_file_claude_code_global() {
-        let path = AgentKind::ClaudeCode.instruction_file(true).unwrap();
-        assert!(
-            path.ends_with(".claude/CLAUDE.md"),
-            "got: {}",
-            path.display()
-        );
+        let env = default_env();
+        let path = AgentKind::ClaudeCode.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/fake/home/.claude/CLAUDE.md"));
     }
 
     #[test]
     fn test_instruction_file_claude_code_project() {
-        let path = AgentKind::ClaudeCode.instruction_file(false).unwrap();
+        let env = default_env();
+        let path = AgentKind::ClaudeCode.instruction_file(false, &env).unwrap();
         assert_eq!(path, PathBuf::from("CLAUDE.md"));
     }
 
     #[test]
     fn test_instruction_file_gemini_global() {
-        let path = AgentKind::GeminiCli.instruction_file(true).unwrap();
-        assert!(
-            path.ends_with(".gemini/GEMINI.md"),
-            "got: {}",
-            path.display()
-        );
+        let env = default_env();
+        let path = AgentKind::GeminiCli.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/fake/home/.gemini/GEMINI.md"));
     }
 
     #[test]
     fn test_instruction_file_gemini_project() {
-        let path = AgentKind::GeminiCli.instruction_file(false).unwrap();
+        let env = default_env();
+        let path = AgentKind::GeminiCli.instruction_file(false, &env).unwrap();
         assert_eq!(path, PathBuf::from("GEMINI.md"));
     }
 
     #[test]
     fn test_instruction_file_cursor_project() {
-        let path = AgentKind::Cursor.instruction_file(false).unwrap();
+        let env = default_env();
+        let path = AgentKind::Cursor.instruction_file(false, &env).unwrap();
         assert_eq!(path, PathBuf::from(".cursor/rules/skim.mdc"));
     }
 
     #[test]
     fn test_instruction_file_cursor_global_unsupported() {
-        assert!(AgentKind::Cursor.instruction_file(true).is_none());
+        let env = default_env();
+        assert!(AgentKind::Cursor.instruction_file(true, &env).is_none());
     }
 
     #[test]
     fn test_instruction_file_copilot_project() {
-        let path = AgentKind::CopilotCli.instruction_file(false).unwrap();
+        let env = default_env();
+        let path = AgentKind::CopilotCli.instruction_file(false, &env).unwrap();
         assert_eq!(path, PathBuf::from(".github/copilot-instructions.md"));
     }
 
     #[test]
     fn test_instruction_file_copilot_global() {
-        let path = AgentKind::CopilotCli.instruction_file(true).unwrap();
-        assert!(
-            path.to_string_lossy()
-                .ends_with(".copilot/copilot-instructions.md"),
-            "got: {}",
-            path.display()
+        let env = default_env();
+        let path = AgentKind::CopilotCli.instruction_file(true, &env).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/fake/home/.copilot/copilot-instructions.md")
         );
     }
 
     #[test]
     fn test_instruction_file_codex_global() {
-        let path = AgentKind::CodexCli.instruction_file(true).unwrap();
-        assert!(
-            path.to_string_lossy().ends_with(".codex/AGENTS.md"),
-            "got: {}",
-            path.display()
-        );
+        let env = default_env();
+        let path = AgentKind::CodexCli.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/fake/home/.codex/AGENTS.md"));
     }
 
     #[test]
     fn test_instruction_file_opencode_global() {
-        let path = AgentKind::OpenCode.instruction_file(true).unwrap();
-        assert!(
-            path.to_string_lossy()
-                .ends_with(".config/opencode/AGENTS.md"),
-            "got: {}",
-            path.display()
-        );
+        let env = default_env();
+        let path = AgentKind::OpenCode.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/fake/home/.config/opencode/AGENTS.md"));
     }
 
     #[test]
     fn test_instruction_file_claude_code_env_override() {
-        let key = "CLAUDE_CONFIG_DIR";
-        let old = std::env::var_os(key);
-        // SAFETY: `CLAUDE_CONFIG_DIR` is only read by `instruction_file()`, which is
-        // called synchronously below before the variable is restored. No other test in
-        // this crate reads this env var, so there is no concurrent reader to race with.
-        unsafe { std::env::set_var(key, "/tmp/test-claude") };
-        let path = AgentKind::ClaudeCode.instruction_file(true).unwrap();
-        match old {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        let env = InstructionEnv {
+            home_dir: Some(fake_home()),
+            claude_config_dir: Some(PathBuf::from("/tmp/test-claude")),
+            ..Default::default()
+        };
+        let path = AgentKind::ClaudeCode.instruction_file(true, &env).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test-claude/CLAUDE.md"));
     }
 
     #[test]
     fn test_instruction_file_codex_env_override() {
-        let key = "CODEX_HOME";
-        let old = std::env::var_os(key);
-        // SAFETY: `CODEX_HOME` is only read by `instruction_file()`, which is called
-        // synchronously below before the variable is restored. No other test in this
-        // crate reads this env var, so there is no concurrent reader to race with.
-        unsafe { std::env::set_var(key, "/tmp/test-codex") };
-        let path = AgentKind::CodexCli.instruction_file(true).unwrap();
-        match old {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        let env = InstructionEnv {
+            home_dir: Some(fake_home()),
+            codex_home: Some(PathBuf::from("/tmp/test-codex")),
+            ..Default::default()
+        };
+        let path = AgentKind::CodexCli.instruction_file(true, &env).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test-codex/AGENTS.md"));
     }
 
     #[test]
     fn test_instruction_file_opencode_env_override() {
-        let key = "OPENCODE_CONFIG_DIR";
-        let old = std::env::var_os(key);
-        // SAFETY: `OPENCODE_CONFIG_DIR` is only read by `instruction_file()`, which is
-        // called synchronously below before the variable is restored. No other test in
-        // this crate reads this env var, so there is no concurrent reader to race with.
-        unsafe { std::env::set_var(key, "/tmp/test-opencode") };
-        let path = AgentKind::OpenCode.instruction_file(true).unwrap();
-        match old {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
+        let env = InstructionEnv {
+            home_dir: Some(fake_home()),
+            opencode_config_dir: Some(PathBuf::from("/tmp/test-opencode")),
+            ..Default::default()
+        };
+        let path = AgentKind::OpenCode.instruction_file(true, &env).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test-opencode/AGENTS.md"));
     }
 
     #[test]
     fn test_instruction_file_codex_project() {
-        let path = AgentKind::CodexCli.instruction_file(false).unwrap();
+        let env = default_env();
+        let path = AgentKind::CodexCli.instruction_file(false, &env).unwrap();
         assert_eq!(path, PathBuf::from("AGENTS.md"));
     }
 
     #[test]
     fn test_instruction_file_opencode_project() {
-        let path = AgentKind::OpenCode.instruction_file(false).unwrap();
+        let env = default_env();
+        let path = AgentKind::OpenCode.instruction_file(false, &env).unwrap();
         assert_eq!(path, PathBuf::from("AGENTS.md"));
     }
 

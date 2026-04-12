@@ -29,6 +29,8 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
+use super::shared::{scrape_failures, TestKind};
+
 // Static regex patterns compiled once via LazyLock (avoids per-call compilation).
 static RE_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());
 static RE_FAILED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+failed").unwrap());
@@ -43,7 +45,11 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 /// three-tier degradation. For nextest, skips JSON injection entirely.
 /// For standard cargo test, injects `--message-format=json` to get build
 /// artifact JSON on stdout (test results still come as plain text).
-pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     let is_nextest = args.iter().any(|a| a == "nextest");
 
     // Build command args: start with "test", append all user args
@@ -75,6 +81,7 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
             show_stats,
             command_type: crate::analytics::CommandType::Test,
             output_format: OutputFormat::default(),
+            analytics_enabled,
         },
         move |output, _args| parse_impl(output, is_nextest),
     )
@@ -475,7 +482,9 @@ fn parse_nextest_summary(line: &str) -> Option<(usize, usize, usize, Option<u64>
 /// Cargo runs multiple test binaries, each producing its own summary line:
 /// `test result: ok. N passed; N failed; N ignored`
 ///
-/// This function finds ALL such lines and aggregates the totals.
+/// This function finds ALL such lines and aggregates the totals. When failures
+/// are present, individual test names are scraped via [`scrape_failures`] so
+/// LLMs receive a list of failing tests (AD-Commit2, 2026-04-11).
 fn try_parse_regex(text: &str) -> Option<TestResult> {
     let mut total_passed: usize = 0;
     let mut total_failed: usize = 0;
@@ -500,7 +509,15 @@ fn try_parse_regex(text: &str) -> Option<TestResult> {
         duration_ms: None,
     };
 
-    Some(TestResult::new(summary, vec![]))
+    // Scrape failing test names from the full text output so the Tier-2 result
+    // includes individual test names rather than an empty entries list.
+    let entries = if total_failed > 0 {
+        scrape_failures(text, TestKind::Cargo)
+    } else {
+        vec![]
+    };
+
+    Some(TestResult::new(summary, entries))
 }
 
 // ============================================================================
@@ -724,5 +741,44 @@ mod tests {
         inject_flag_before_separator(&mut args, "--message-format=json");
         // Should be appended at the end
         assert_eq!(args.last().unwrap(), "--message-format=json");
+    }
+
+    // ========================================================================
+    // Tier-2 scrape_failures integration (AD-Commit2)
+    // ========================================================================
+
+    #[test]
+    fn test_tier2_regex_scrapes_failing_test_names() {
+        let input = load_fixture("cargo_regex_fail.txt");
+        let result = try_parse_regex(&input);
+        assert!(
+            result.is_some(),
+            "regex parse must succeed on failure fixture"
+        );
+        let result = result.unwrap();
+        assert!(result.summary.fail > 0, "must have failures");
+        // Tier-2 entries should now include failing test names.
+        assert!(
+            !result.entries.is_empty(),
+            "Tier-2 must list failing test names, got empty entries"
+        );
+        assert!(
+            result.entries.iter().any(|e| e.name.contains("test_foo")),
+            "must contain test_foo: {:?}",
+            result.entries
+        );
+    }
+
+    #[test]
+    fn test_tier2_regression_tier1_json_still_populates_entries() {
+        // Tier-1 JSON path must still populate entries (regression guard).
+        let input = load_fixture("cargo_fail.json");
+        let result = try_parse_json(&input);
+        assert!(result.is_some(), "Tier-1 JSON parse must succeed");
+        let result = result.unwrap();
+        assert!(
+            !result.entries.is_empty(),
+            "Tier-1 entries must not be empty after Tier-2 changes"
+        );
     }
 }

@@ -23,6 +23,7 @@ pub(super) fn run_status(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     // Strip conflicting format flags — handler injects --porcelain=v2 itself.
     let stripped_args: Vec<String> = args
@@ -41,11 +42,12 @@ pub(super) fn run_status(
     ]);
     full_args.extend_from_slice(&filtered_args);
 
-    let label = super::build_analytics_label("status", args, show_stats);
+    let label = super::build_analytics_label("status", args, show_stats, analytics_enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
+        analytics_enabled,
         output_format,
         false,
         label,
@@ -167,7 +169,7 @@ impl StatusCategories {
             parts.join(", ")
         };
 
-        GitResult::new("status".to_string(), summary, details)
+        GitResult::new("status".to_string(), summary, details).with_tier("full")
     }
 }
 
@@ -293,14 +295,15 @@ mod tests {
         }
 
         if summary_line.is_empty() && file_stats.is_empty() {
-            return GitResult::new("diff".to_string(), "no changes".to_string(), vec![]);
+            return GitResult::new("diff".to_string(), "no changes".to_string(), vec![])
+                .with_tier("full");
         }
 
         if summary_line.is_empty() {
             summary_line = format!("{} files changed", file_stats.len());
         }
 
-        GitResult::new("diff".to_string(), summary_line, file_stats)
+        GitResult::new("diff".to_string(), summary_line, file_stats).with_tier("full")
     }
 
     // ========================================================================

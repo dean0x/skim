@@ -75,13 +75,24 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 // Tier 1: JSON body detection
 // ============================================================================
 
-/// Summarize a JSON object: collect top-level key-value items (up to 5).
+/// Maximum number of top-level keys shown per JSON object in Tier 1.
+///
+/// 20 keys gives agents enough context to understand the response schema
+/// without requiring a follow-up request for most REST API responses.
+/// Keys beyond this cap produce a `truncated` notice item rather than
+/// the blanket 5-key cut that was masking useful fields.
+const MAX_OBJECT_KEYS: usize = 20;
+
+/// Summarize a JSON object: collect top-level key-value items (up to [`MAX_OBJECT_KEYS`]).
+///
 /// Returns a human-readable summary string and the collected items.
+/// When the object has more than [`MAX_OBJECT_KEYS`] keys, a `truncated`
+/// notice item is appended by the caller via the existing truncation path.
 fn summarize_json_object(map: &serde_json::Map<String, Value>) -> (String, Vec<InfraItem>) {
     let count = map.len();
     let items: Vec<InfraItem> = map
         .iter()
-        .take(5)
+        .take(MAX_OBJECT_KEYS)
         .map(|(k, v)| InfraItem {
             label: k.clone(),
             value: json_value_to_string(v),
@@ -152,11 +163,11 @@ fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult
         Value::Object(map) => {
             let (summary, extra) = summarize_json_object(map);
             items.extend(extra);
-            // Truncation notice when source object exceeds cap
-            if map.len() > MAX_ITEMS {
+            // Truncation notice when source object exceeds MAX_OBJECT_KEYS
+            if map.len() > MAX_OBJECT_KEYS {
                 items.push(InfraItem {
                     label: "truncated".to_string(),
-                    value: format!("output capped at {MAX_ITEMS} items"),
+                    value: format!("showing {MAX_OBJECT_KEYS} of {} keys", map.len()),
                 });
             }
             summary
@@ -395,6 +406,37 @@ mod tests {
             result.is_degraded(),
             "Expected Degraded parse result, got {}",
             result.tier_name()
+        );
+    }
+
+    /// Object with 6 keys must show all 6 keys (cap raised from 5 to MAX_OBJECT_KEYS).
+    #[test]
+    fn test_summarize_json_object_shows_up_to_max_keys() {
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"a":1,"b":2,"c":3,"d":4,"e":5,"f":6}"#).unwrap();
+        let map = json.as_object().unwrap();
+        let (_, items) = summarize_json_object(map);
+        assert_eq!(
+            items.len(),
+            6,
+            "All 6 keys must be shown (cap is {MAX_OBJECT_KEYS}), got {} items",
+            items.len()
+        );
+    }
+
+    /// Object with more than MAX_OBJECT_KEYS fields must produce a truncated notice.
+    #[test]
+    fn test_summarize_json_object_truncation_notice() {
+        let fields: String = (0..=MAX_OBJECT_KEYS)
+            .map(|i| format!("\"k{i}\": {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let json_str = format!("{{{fields}}}");
+        let result = try_parse_json(&json_str, None).expect("must parse");
+        assert!(
+            result.items.iter().any(|i| i.label == "truncated"),
+            "Must produce truncated notice for >{MAX_OBJECT_KEYS} keys: {:?}",
+            result.items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
     }
 }

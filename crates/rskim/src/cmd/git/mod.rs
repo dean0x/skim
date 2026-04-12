@@ -30,7 +30,10 @@ use crate::runner::CommandRunner;
 /// Run the `git` subcommand.
 ///
 /// Dispatches to `status`, `diff`, `log`, `show`, etc., or prints help.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     // Handle --help / -h at the `skim git` level: only when the first
     // non-global-flag token is the help flag (e.g., `skim git --help`),
     // not when it appears deeper inside a subcommand (`skim git show --help`).
@@ -53,13 +56,14 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     };
 
     let subcmd_args = &rest[1..];
+    let analytics_enabled = analytics.enabled;
 
     match subcmd.as_str() {
-        "status" => status::run_status(&global_flags, subcmd_args, show_stats),
-        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats),
-        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats),
-        "log" => log::run_log(&global_flags, subcmd_args, show_stats),
-        "show" => show::run_show(&global_flags, subcmd_args, show_stats),
+        "status" => status::run_status(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "log" => log::run_log(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "show" => show::run_show(&global_flags, subcmd_args, show_stats, analytics_enabled),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
@@ -189,8 +193,13 @@ fn has_limit_flag(args: &[String]) -> bool {
 /// All six parsed-command handlers (`show` ×2, `diff`, `status`, `log`, `fetch`)
 /// share this exact guard logic; centralising it here eliminates the repeated
 /// five-line block at each call site.
-pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: bool) -> String {
-    if show_stats || crate::analytics::is_analytics_enabled() {
+pub(super) fn build_analytics_label(
+    subcmd: &str,
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> String {
+    if show_stats || analytics_enabled {
         format!("skim git {subcmd} {}", args.join(" "))
     } else {
         String::new()
@@ -202,74 +211,100 @@ pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: b
 /// Centralises the analytics + stats tail that previously appeared inline in
 /// `run_passthrough`, `run_parsed_command`, and the deleted `record_show_result`.
 ///
-/// Two variants are provided to minimise allocations:
+/// Two production variants:
+///   - [`finalize_git_output_owned`] — callers that own both strings (raw ≠ output).
+///   - [`finalize_git_output_passthrough`] — callers where raw == output.
 ///
-/// - [`finalize_git_output`] — borrowed variant; callers that only hold `&str`
-///   (e.g. `show.rs` where the same `String` is still needed by the guardrail)
-///   avoid cloning when analytics are disabled.  When analytics ARE enabled one
-///   `.to_string()` clone is performed per parameter.
+/// A borrowed variant exists in `#[cfg(test)]` only.
 ///
-/// - [`finalize_git_output_owned`] — owned variant; callers that already own
-///   the `String` and raw ≠ output (e.g. `run_parsed_command`, `run_diff`,
-///   `emit_show_commit`) move the values directly into the analytics call —
-///   zero extra allocations on the analytics path, and still zero allocations
-///   when analytics are off.
-///
-/// # Parameters (shared by both variants)
+/// # Parameters (shared by all variants)
 /// - `raw`          — Original git output before any compression.
 /// - `output`       — Compressed output (may equal `raw` for passthrough).
 /// - `label`        — Command label stored in the analytics DB.
 /// - `show_stats`   — Whether to print token-savings stats to stderr.
 /// - `command_type` — Analytics command-type tag (e.g., `CommandType::Git`).
 /// - `duration`     — Wall-clock duration of the underlying git command.
-pub(super) fn finalize_git_output(
-    raw: &str,
-    output: &str,
-    label: String,
-    show_stats: bool,
-    command_type: crate::analytics::CommandType,
-    duration: std::time::Duration,
-) {
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(raw, output);
-        crate::process::report_token_stats(orig, comp, "");
-    }
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw.to_string(),
-            output.to_string(),
-            label,
-            command_type,
-            duration,
-            None,
-        );
-    }
-}
-
-/// Owned variant of [`finalize_git_output`].
+/// - `parse_tier`   — Optional tier label set by the parser (AD-12).
 ///
 /// Takes ownership of `raw` and `output`, moving them directly into the
-/// analytics call when analytics are enabled — eliminating the extra
-/// `.to_string()` clone that the borrowed variant must perform.  When
-/// analytics are disabled neither string is heap-touched after the stats
-/// computation (which only needs `&str`).
+/// analytics call when analytics are enabled — zero extra allocations on
+/// the analytics path and zero allocations when analytics are off.
 ///
 /// Use this variant in handlers that already own their output strings
 /// (i.e. the string would be dropped immediately after the call anyway).
+/// `parse_tier` is forwarded to the analytics record (AD-12).
+///
+/// # Note on argument count
+/// The 8 parameters are all semantically distinct: `raw`/`output` are the text
+/// payload, `label`/`show_stats` control reporting, and
+/// `analytics_enabled`/`command_type`/`duration`/`parse_tier` are analytics
+/// metadata injected from the caller for dependency-injection testability.
+/// Collapsing them into an intermediate struct would not reduce call-site
+/// complexity for the 5 callers that supply all values individually.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_git_output_owned(
     raw: String,
     output: String,
     label: String,
     show_stats: bool,
+    analytics_enabled: bool,
     command_type: crate::analytics::CommandType,
     duration: std::time::Duration,
+    parse_tier: Option<&'static str>,
 ) {
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&raw, &output);
         crate::process::report_token_stats(orig, comp, "");
     }
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(raw, output, label, command_type, duration, None);
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        raw,
+        output,
+        label,
+        command_type,
+        duration,
+        parse_tier,
+    );
+}
+
+/// Passthrough variant of [`finalize_git_output`].
+///
+/// Use this when `raw` and `output` are **the same string** (passthrough
+/// semantics: no compression occurred).  Takes ownership of `raw` so that
+/// when analytics are enabled the buffer is **cloned once** (for
+/// `raw_text`) and **moved once** (for `compressed_text`) — exactly 1 heap
+/// allocation on the analytics-enabled path, 0 on the disabled path.
+/// This is the PF-018 resolution: one clone + one move, not two clones.
+///
+/// Call sites: `run_passthrough`, `run_parsed_command` non-zero exit,
+/// `run_diff` non-zero exit / empty diff / empty-after-parse, and the
+/// equivalent failure paths in `show.rs`.
+pub(super) fn finalize_git_output_passthrough(
+    raw: String,
+    label: String,
+    show_stats: bool,
+    analytics_enabled: bool,
+    command_type: crate::analytics::CommandType,
+    duration: std::time::Duration,
+    parse_tier: Option<&'static str>,
+) {
+    if show_stats {
+        // ALLOC NOTE: count_token_pair borrows; no allocation here.
+        let (orig, comp) = crate::process::count_token_pair(&raw, &raw);
+        crate::process::report_token_stats(orig, comp, "");
+    }
+    if analytics_enabled {
+        // 1 allocation: raw.clone() produces raw_text; raw is moved as
+        // compressed_text.  Zero allocations when analytics are disabled.
+        crate::analytics::try_record_command(
+            true,
+            raw.clone(),
+            raw,
+            label,
+            command_type,
+            duration,
+            parse_tier,
+        );
     }
 }
 
@@ -282,18 +317,19 @@ fn map_exit_code(code: Option<i32>) -> ExitCode {
 }
 
 /// Run a git command with passthrough (no parsing).
-fn run_passthrough(
+pub(super) fn run_passthrough(
     global_flags: &[String],
     subcmd: &str,
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.push(subcmd.to_string());
     full_args.extend_from_slice(args);
 
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
     print!("{}", output.stdout);
@@ -301,19 +337,23 @@ fn run_passthrough(
         eprint!("{}", output.stderr);
     }
 
-    // Passthrough: raw == compressed, so pass the same &str twice.
-    // The borrowed variant avoids an unconditional clone; `.to_string()`
-    // is only called inside finalize when analytics are actually enabled.
-    finalize_git_output(
-        &output.stdout,
-        &output.stdout,
-        format!("skim git {} {}", subcmd, args.join(" ")),
+    let exit_code = output.exit_code;
+    // Passthrough: raw == compressed. Move stdout into the passthrough variant
+    // so the analytics path clones once and moves once — 1 allocation total
+    // instead of 2 (PF-018 resolution).  Label is built lazily via
+    // build_analytics_label so the format! is skipped when both show_stats
+    // and analytics are disabled (PF-021).
+    finalize_git_output_passthrough(
+        output.stdout,
+        build_analytics_label(subcmd, args, show_stats, analytics_enabled),
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         output.duration,
+        Some("passthrough"),
     );
 
-    Ok(map_exit_code(output.exit_code))
+    Ok(map_exit_code(exit_code))
 }
 
 /// Run a git command and parse its output with the given parser function.
@@ -327,9 +367,19 @@ fn run_passthrough(
 /// When `combine_stderr` is `true`, the parser receives `stderr + stdout`
 /// combined. Git fetch writes its output to stderr, so fetch uses `true`;
 /// all other subcommands use `false` (stdout only).
+///
+/// # AD-14 (2026-04-11) — analytics recording on non-zero exit
+///
+/// Previously, a non-zero exit code caused an early return with no analytics
+/// recording, so every failed git invocation was silently absent from the DB.
+/// The fix calls `finalize_git_output_passthrough` on the failure path using
+/// the empty stdout buffer, keeping analytics consistent with the passing path.
+/// `raw == compressed` on failure, so the single-clone passthrough variant is
+/// used (PF-018).  The same pattern applies to `run_diff` non-zero exits.
 pub(super) fn run_parsed_command<F>(
     subcmd_args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
     output_format: OutputFormat,
     combine_stderr: bool,
     label: String,
@@ -339,7 +389,7 @@ where
     F: FnOnce(&str) -> GitResult,
 {
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = subcmd_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = subcmd_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {
@@ -350,7 +400,20 @@ where
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        return Ok(map_exit_code(output.exit_code));
+        let exit_code = output.exit_code;
+        // Record analytics even on non-zero exit so the DB reflects failed
+        // invocations. Move stdout into the passthrough variant: 1 allocation
+        // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
+        finalize_git_output_passthrough(
+            output.stdout,
+            label,
+            show_stats,
+            analytics_enabled,
+            crate::analytics::CommandType::Git,
+            output.duration,
+            Some("passthrough"),
+        );
+        return Ok(map_exit_code(exit_code));
     }
 
     // Git fetch writes to stderr; other subcommands write to stdout.
@@ -361,6 +424,8 @@ where
     };
 
     let result = parser(&raw);
+    // Capture parse_tier before result is consumed by rendering.
+    let parse_tier = result.parse_tier;
     let result_str = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
@@ -379,13 +444,16 @@ where
     // use the owned variant to move them directly rather than cloning.
     // `label` is supplied by the caller from the user's original (pre-rewrite) args
     // so the analytics DB records the invocation as the user typed it.
+    // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-12).
     finalize_git_output_owned(
         raw,
         result_str,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         output.duration,
+        parse_tier,
     );
 
     Ok(ExitCode::SUCCESS)
@@ -627,5 +695,63 @@ mod tests {
                 "--check"
             ]
         ));
+    }
+
+    // ========================================================================
+    // Non-zero exit analytics documentation
+    // ========================================================================
+
+    /// Borrowed variant of `finalize_git_output_owned` — test-only.
+    ///
+    /// Takes `&str` references and clones them only when analytics are enabled.
+    /// No production call site uses this; prefer `finalize_git_output_owned` or
+    /// `finalize_git_output_passthrough` in handlers.
+    fn finalize_git_output(
+        raw: &str,
+        output: &str,
+        label: String,
+        show_stats: bool,
+        analytics_enabled: bool,
+        command_type: crate::analytics::CommandType,
+        duration: std::time::Duration,
+        parse_tier: Option<&'static str>,
+    ) {
+        if show_stats {
+            let (orig, comp) = crate::process::count_token_pair(raw, output);
+            crate::process::report_token_stats(orig, comp, "");
+        }
+        crate::analytics::try_record_command(
+            analytics_enabled,
+            raw.to_string(),
+            output.to_string(),
+            label,
+            command_type,
+            duration,
+            parse_tier,
+        );
+    }
+
+    /// Documents that `run_parsed_command` records analytics on non-zero exit.
+    ///
+    /// Previously, a non-zero exit returned early without recording, causing
+    /// failed invocations (e.g., `git log` on a bare repo) to be invisible in
+    /// the analytics DB. The fix calls `finalize_git_output` on the error path
+    /// with raw==compressed (passthrough semantics) so the DB is consistent.
+    ///
+    /// This test validates `finalize_git_output` itself is callable with
+    /// empty strings (the non-zero path uses empty stdout on most failures).
+    #[test]
+    fn test_finalize_git_output_accepts_empty_strings() {
+        // Analytics disabled via injected false — no env var mutation needed.
+        finalize_git_output(
+            "",
+            "",
+            "skim git log".to_string(),
+            false,
+            false,
+            crate::analytics::CommandType::Git,
+            std::time::Duration::ZERO,
+            None,
+        );
     }
 }

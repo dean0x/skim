@@ -15,7 +15,8 @@ pub(crate) mod types;
 
 #[allow(unused_imports)] // ToolResult used by learn.rs tests
 pub(crate) use types::{
-    parse_duration_ago, AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation, ToolResult,
+    parse_duration_ago, AgentKind, InstructionEnv, SessionFile, TimeFilter, ToolInput,
+    ToolInvocation, ToolResult,
 };
 
 // ============================================================================

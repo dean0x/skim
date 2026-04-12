@@ -20,7 +20,6 @@
 mod schema;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -162,18 +161,19 @@ impl PricingModel {
         Self::STANDARD
     }
 
-    pub(crate) fn from_env_or_default() -> Self {
-        if let Ok(val) = std::env::var("SKIM_INPUT_COST_PER_MTOK") {
-            if let Ok(cost) = val.parse::<f64>() {
-                if cost.is_finite() && cost >= 0.0 {
-                    return Self {
-                        input_cost_per_mtok: cost,
-                        tier_name: "Custom",
-                    };
-                }
-            }
+    /// Build a pricing model from an optional cost override.
+    ///
+    /// If `cost` is `Some(value)`, returns a Custom tier with that rate.
+    /// Otherwise returns the default Standard pricing.
+    /// Pure function: no env reads.
+    pub(crate) fn from_cost_override(cost: Option<f64>) -> Self {
+        match cost {
+            Some(c) if c.is_finite() && c >= 0.0 => Self {
+                input_cost_per_mtok: c,
+                tier_name: "Custom",
+            },
+            _ => Self::default_pricing(),
         }
-        Self::default_pricing()
     }
 
     pub(crate) fn estimate_savings(&self, tokens_saved: u64) -> f64 {
@@ -182,38 +182,47 @@ impl PricingModel {
 }
 
 // ============================================================================
-// Analytics enabled check
+// AnalyticsConfig — injected analytics configuration
 // ============================================================================
 
-/// Process-wide flag to disable analytics without mutating environment
-/// variables. Set via [`force_disable_analytics`] at startup, before any
-/// background threads are spawned. Checked by [`is_analytics_enabled`].
-static ANALYTICS_FORCE_DISABLED: AtomicBool = AtomicBool::new(false);
-
-/// Disable analytics for the lifetime of this process.
+/// Injected analytics configuration created once at the system boundary.
 ///
-/// Thread-safe alternative to `std::env::set_var("SKIM_DISABLE_ANALYTICS", "1")`.
-/// Call this early in `main()` when `--disable-analytics` is detected.
-pub(crate) fn force_disable_analytics() {
-    ANALYTICS_FORCE_DISABLED.store(true, Ordering::Relaxed);
+/// ARCHITECTURE: Replaces the process-global `ANALYTICS_FORCE_DISABLED` AtomicBool
+/// and per-call `SKIM_DISABLE_ANALYTICS` / `SKIM_INPUT_COST_PER_MTOK` env reads.
+/// Created in `main()` after CLI parsing and threaded to all callers.
+/// Tests construct this struct directly with controlled values — no env mutation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AnalyticsConfig {
+    pub enabled: bool,
+    pub input_cost_per_mtok: Option<f64>,
 }
 
-/// Check if analytics recording is enabled.
-///
-/// Returns `false` when:
-/// - [`force_disable_analytics`] has been called (e.g., `--disable-analytics` flag), OR
-/// - `SKIM_DISABLE_ANALYTICS` env var is set to a truthy value
-///   (`1`, `true`, or `yes`, case-insensitive).
-///
-/// Any other value (including `0`, `false`, `no`) keeps analytics enabled.
-/// Unsetting the variable also keeps analytics enabled (the default).
-pub(crate) fn is_analytics_enabled() -> bool {
-    if ANALYTICS_FORCE_DISABLED.load(Ordering::Relaxed) {
-        return false;
+impl AnalyticsConfig {
+    /// Read process env once at the system boundary.
+    ///
+    /// `cli_disable` is the value of `--disable-analytics` from CLI parsing.
+    /// Call this in main(), then thread the result down to all callers.
+    pub fn from_process(cli_disable: bool) -> Self {
+        let env_disabled = std::env::var("SKIM_DISABLE_ANALYTICS")
+            .ok()
+            .map(|v| Self::parse_disable_value(&v))
+            .unwrap_or(false);
+        let cost = std::env::var("SKIM_INPUT_COST_PER_MTOK")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|c| c.is_finite() && *c >= 0.0);
+        Self {
+            enabled: !cli_disable && !env_disabled,
+            input_cost_per_mtok: cost,
+        }
     }
-    match std::env::var("SKIM_DISABLE_ANALYTICS") {
-        Ok(val) => !matches!(val.to_lowercase().as_str(), "1" | "true" | "yes"),
-        Err(_) => true,
+
+    /// Parse a `SKIM_DISABLE_ANALYTICS` env value string.
+    ///
+    /// Returns `true` when the value is `"1"`, `"true"`, or `"yes"` (case-insensitive).
+    /// Extracted as a pure function so tests can exercise the parsing logic directly.
+    pub(crate) fn parse_disable_value(val: &str) -> bool {
+        matches!(val.to_lowercase().as_str(), "1" | "true" | "yes")
     }
 }
 
@@ -631,8 +640,11 @@ fn persist_record(record: &TokenSavingsRecord) {
 }
 
 /// Record command output token savings. Defers token counting to background thread.
-/// Check is_analytics_enabled() BEFORE cloning strings.
-pub(crate) fn record_fire_and_forget(
+///
+/// Callers must check `enabled` before calling; this function always records.
+/// The single external caller (`try_record_command`) already guards on `enabled`,
+/// so removing the redundant parameter here keeps the argument count at 7.
+fn record_fire_and_forget(
     raw_text: String,
     compressed_text: String,
     original_cmd: String,
@@ -641,9 +653,6 @@ pub(crate) fn record_fire_and_forget(
     project_path: String,
     parse_tier: Option<String>,
 ) {
-    if !is_analytics_enabled() {
-        return;
-    }
     std::thread::spawn(move || {
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
             return;
@@ -674,8 +683,8 @@ pub(crate) fn record_fire_and_forget(
 /// a background thread. The `timestamp` and `savings_pct` fields should
 /// be populated by the caller (use [`now_unix_secs`] and
 /// [`savings_percentage`] helpers).
-pub(crate) fn record_with_counts(record: TokenSavingsRecord) {
-    if !is_analytics_enabled() {
+pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
+    if !enabled {
         return;
     }
     std::thread::spawn(move || {
@@ -687,11 +696,12 @@ pub(crate) fn record_with_counts(record: TokenSavingsRecord) {
 // Convenience helpers for subcommand call sites
 // ============================================================================
 
-/// Record command output analytics with automatic enabled-check and cwd detection.
+/// Record command output analytics with enabled-check and cwd detection.
 ///
 /// Reduces the 12-15 line inline pattern at each subcommand call site to a
 /// single function call. Token counting is deferred to a background thread.
 pub(crate) fn try_record_command(
+    enabled: bool,
     raw_text: String,
     compressed_text: String,
     original_cmd: String,
@@ -699,7 +709,7 @@ pub(crate) fn try_record_command(
     duration: Duration,
     parse_tier: Option<&str>,
 ) {
-    if !is_analytics_enabled() {
+    if !enabled {
         return;
     }
     let cwd = std::env::current_dir()
@@ -726,6 +736,7 @@ pub(crate) fn try_record_command(
 /// Delegates to [`record_with_counts`] after resolving cwd and building
 /// the record.
 pub(crate) fn try_record_command_with_counts(
+    enabled: bool,
     raw_tokens: usize,
     compressed_tokens: usize,
     original_cmd: String,
@@ -733,26 +744,29 @@ pub(crate) fn try_record_command_with_counts(
     duration: Duration,
     parse_tier: Option<&str>,
 ) {
-    if !is_analytics_enabled() {
+    if !enabled {
         return;
     }
     let cwd = std::env::current_dir()
         .unwrap_or_default()
         .display()
         .to_string();
-    record_with_counts(TokenSavingsRecord {
-        timestamp: now_unix_secs(),
-        command_type,
-        original_cmd,
-        raw_tokens,
-        compressed_tokens: compressed_tokens.min(raw_tokens),
-        savings_pct: savings_percentage(raw_tokens, compressed_tokens),
-        duration_ms: duration.as_millis() as u64,
-        project_path: cwd,
-        mode: None,
-        language: None,
-        parse_tier: parse_tier.map(str::to_string),
-    });
+    record_with_counts(
+        true,
+        TokenSavingsRecord {
+            timestamp: now_unix_secs(),
+            command_type,
+            original_cmd,
+            raw_tokens,
+            compressed_tokens: compressed_tokens.min(raw_tokens),
+            savings_pct: savings_percentage(raw_tokens, compressed_tokens),
+            duration_ms: duration.as_millis() as u64,
+            project_path: cwd,
+            mode: None,
+            language: None,
+            parse_tier: parse_tier.map(str::to_string),
+        },
+    );
 }
 
 // ============================================================================
@@ -978,186 +992,92 @@ mod tests {
     }
 
     // ========================================================================
-    // is_analytics_enabled() tests
+    // AnalyticsConfig::parse_disable_value tests
+    //
+    // Tests call the production parse_disable_value function directly.
+    // No env mutation, no struct construction boilerplate.
     // ========================================================================
 
-    /// Temporarily set an env var to `value` (or unset it when `None`),
-    /// run `f`, then restore the original value. Panics in `f` are re-raised
-    /// after restoration so the env is always left clean.
-    ///
-    /// The caller must hold a lock on the appropriate static mutex before
-    /// calling this to prevent concurrent env-var mutations between tests.
-    fn with_env_var_locked(var: &str, value: Option<&str>, f: impl FnOnce()) {
-        let prev = std::env::var(var).ok();
-        match value {
-            Some(v) => std::env::set_var(var, v),
-            None => std::env::remove_var(var),
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        match prev {
-            Some(v) => std::env::set_var(var, v),
-            None => std::env::remove_var(var),
-        }
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
-    }
-
-    /// Run a closure with `SKIM_DISABLE_ANALYTICS` set to the given value,
-    /// then restore the original environment.
-    fn with_env_var(value: Option<&str>, f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
-        with_env_var_locked("SKIM_DISABLE_ANALYTICS", value, f);
-    }
-
     #[test]
-    fn test_analytics_enabled_when_env_unset() {
-        with_env_var(None, || {
-            assert!(
-                is_analytics_enabled(),
-                "analytics should be enabled when SKIM_DISABLE_ANALYTICS is unset"
-            );
-        });
+    fn test_analytics_enabled_with_empty_string() {
+        assert!(!AnalyticsConfig::parse_disable_value(""));
     }
 
     #[test]
     fn test_analytics_disabled_with_value_1() {
-        with_env_var(Some("1"), || {
-            assert!(
-                !is_analytics_enabled(),
-                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=1"
-            );
-        });
+        assert!(AnalyticsConfig::parse_disable_value("1"));
     }
 
     #[test]
     fn test_analytics_disabled_with_value_true() {
-        with_env_var(Some("true"), || {
-            assert!(
-                !is_analytics_enabled(),
-                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=true"
-            );
-        });
+        assert!(AnalyticsConfig::parse_disable_value("true"));
     }
 
     #[test]
     fn test_analytics_disabled_with_value_yes() {
-        with_env_var(Some("yes"), || {
-            assert!(
-                !is_analytics_enabled(),
-                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=yes"
-            );
-        });
+        assert!(AnalyticsConfig::parse_disable_value("yes"));
     }
 
     #[test]
     fn test_analytics_disabled_case_insensitive() {
-        with_env_var(Some("TRUE"), || {
-            assert!(
-                !is_analytics_enabled(),
-                "analytics should be disabled when SKIM_DISABLE_ANALYTICS=TRUE (case-insensitive)"
-            );
-        });
+        assert!(AnalyticsConfig::parse_disable_value("TRUE"));
     }
 
     #[test]
     fn test_analytics_enabled_with_value_0() {
-        with_env_var(Some("0"), || {
-            assert!(
-                is_analytics_enabled(),
-                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=0"
-            );
-        });
+        assert!(!AnalyticsConfig::parse_disable_value("0"));
     }
 
     #[test]
     fn test_analytics_enabled_with_value_false() {
-        with_env_var(Some("false"), || {
-            assert!(
-                is_analytics_enabled(),
-                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=false"
-            );
-        });
+        assert!(!AnalyticsConfig::parse_disable_value("false"));
     }
 
     #[test]
     fn test_analytics_enabled_with_value_no() {
-        with_env_var(Some("no"), || {
-            assert!(
-                is_analytics_enabled(),
-                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=no"
-            );
-        });
-    }
-
-    #[test]
-    fn test_analytics_enabled_with_empty_string() {
-        with_env_var(Some(""), || {
-            assert!(
-                is_analytics_enabled(),
-                "analytics should remain enabled when SKIM_DISABLE_ANALYTICS is empty"
-            );
-        });
+        assert!(!AnalyticsConfig::parse_disable_value("no"));
     }
 
     // ========================================================================
-    // Pricing validation tests
+    // Pricing validation tests — use from_cost_override (pure fn, no env reads)
     // ========================================================================
-
-    /// Run a closure with `SKIM_INPUT_COST_PER_MTOK` set to the given value,
-    /// then restore the original environment.
-    fn with_cost_env_var(value: Option<&str>, f: impl FnOnce()) {
-        use std::sync::Mutex;
-        static COST_ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = COST_ENV_LOCK.lock().unwrap();
-        with_env_var_locked("SKIM_INPUT_COST_PER_MTOK", value, f);
-    }
 
     #[test]
     fn test_pricing_negative_falls_back_to_default() {
-        with_cost_env_var(Some("-5"), || {
-            let p = PricingModel::from_env_or_default();
-            assert_eq!(
-                p.input_cost_per_mtok, 3.0,
-                "negative cost should fall back to default"
-            );
-            assert_eq!(p.tier_name, "Standard");
-        });
+        // negative cost: parse would yield -5.0, which fails the >= 0.0 guard
+        let p = PricingModel::from_cost_override(Some(-5.0));
+        assert_eq!(
+            p.input_cost_per_mtok, 3.0,
+            "negative cost should fall back to default"
+        );
+        assert_eq!(p.tier_name, "Standard");
     }
 
     #[test]
     fn test_pricing_zero_is_valid() {
-        with_cost_env_var(Some("0"), || {
-            let p = PricingModel::from_env_or_default();
-            assert_eq!(p.input_cost_per_mtok, 0.0, "zero cost should be accepted");
-            assert_eq!(p.tier_name, "Custom");
-        });
+        let p = PricingModel::from_cost_override(Some(0.0));
+        assert_eq!(p.input_cost_per_mtok, 0.0, "zero cost should be accepted");
+        assert_eq!(p.tier_name, "Custom");
     }
 
     #[test]
     fn test_pricing_infinity_falls_back_to_default() {
-        with_cost_env_var(Some("inf"), || {
-            let p = PricingModel::from_env_or_default();
-            assert_eq!(
-                p.input_cost_per_mtok, 3.0,
-                "infinite cost should fall back to default"
-            );
-            assert_eq!(p.tier_name, "Standard");
-        });
+        let p = PricingModel::from_cost_override(Some(f64::INFINITY));
+        assert_eq!(
+            p.input_cost_per_mtok, 3.0,
+            "infinite cost should fall back to default"
+        );
+        assert_eq!(p.tier_name, "Standard");
     }
 
     #[test]
     fn test_pricing_nan_falls_back_to_default() {
-        with_cost_env_var(Some("NaN"), || {
-            let p = PricingModel::from_env_or_default();
-            assert_eq!(
-                p.input_cost_per_mtok, 3.0,
-                "NaN cost should fall back to default"
-            );
-            assert_eq!(p.tier_name, "Standard");
-        });
+        let p = PricingModel::from_cost_override(Some(f64::NAN));
+        assert_eq!(
+            p.input_cost_per_mtok, 3.0,
+            "NaN cost should fall back to default"
+        );
+        assert_eq!(p.tier_name, "Standard");
     }
 
     // ========================================================================
@@ -1180,32 +1100,6 @@ mod tests {
             count, 1,
             "analytics_meta table should be created by migration"
         );
-    }
-
-    // ========================================================================
-    // force_disable_analytics / AtomicBool tests
-    // ========================================================================
-
-    #[test]
-    fn test_force_disable_analytics_disables() {
-        // Reset state (tests share the process-wide atomic)
-        ANALYTICS_FORCE_DISABLED.store(false, Ordering::Relaxed);
-
-        // Should be enabled by default (assuming env var not set by another test)
-        with_env_var(None, || {
-            assert!(
-                is_analytics_enabled(),
-                "should be enabled before force_disable"
-            );
-            force_disable_analytics();
-            assert!(
-                !is_analytics_enabled(),
-                "should be disabled after force_disable"
-            );
-        });
-
-        // Reset to not pollute other tests
-        ANALYTICS_FORCE_DISABLED.store(false, Ordering::Relaxed);
     }
 
     // ========================================================================

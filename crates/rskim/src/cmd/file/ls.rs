@@ -221,7 +221,7 @@ fn parse_tree(output: &CommandOutput) -> ParseResult<FileResult> {
     if let Some(result) = try_parse_tree_text(&output.stdout) {
         return ParseResult::Degraded(
             result,
-            vec!["ls: structured parse failed, using regex".to_string()],
+            vec!["tree: structured parse failed, using regex".to_string()],
         );
     }
 
@@ -262,12 +262,16 @@ fn try_parse_tree_json(stdout: &str) -> Option<FileResult> {
 }
 
 /// Tier 2: regex on tree text output.
+///
+/// Entries deeper than `MAX_DEPTH` are elided to cap output size. The count of
+/// elided entries is surfaced in the footer as `(N deeper entries hidden)` so
+/// agents know the tree was truncated rather than inferring the directory is flat.
 fn try_parse_tree_text(stdout: &str) -> Option<FileResult> {
     const MAX_DEPTH: usize = 3;
     let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
     let mut total_count = 0usize;
     let mut summary: Option<String> = None;
-    let mut depth_cap_active = false;
+    let mut depth_hidden: usize = 0;
 
     for line in stdout.lines().take(MAX_INPUT_LINES) {
         if let Some((dirs, files)) = parse_tree_summary_line(line) {
@@ -283,7 +287,7 @@ fn try_parse_tree_text(stdout: &str) -> Option<FileResult> {
         }
         let depth = count_tree_depth(line);
         if depth > MAX_DEPTH {
-            depth_cap_active = true;
+            depth_hidden += 1;
             continue;
         }
         if entries.len() < MAX_DISPLAY_ENTRIES {
@@ -296,7 +300,7 @@ fn try_parse_tree_text(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
-    let footer = build_tree_footer(depth_cap_active, summary.as_deref());
+    let footer = build_tree_footer(depth_hidden, summary.as_deref());
     if total_count == 0 {
         total_count = shown_count;
     }
@@ -319,13 +323,17 @@ fn parse_tree_summary_line(line: &str) -> Option<(usize, usize)> {
     Some((dirs, files))
 }
 
-/// Assemble the tree footer from depth-cap and summary parts.
+/// Assemble the tree footer from depth-hidden count and summary parts.
+///
+/// When `depth_hidden > 0`, adds `"(N deeper entries hidden)"` so agents
+/// know the tree was truncated at `MAX_DEPTH` rather than assuming the
+/// displayed entries are exhaustive.
 ///
 /// Returns `None` when neither part is present.
-fn build_tree_footer(depth_cap_active: bool, summary: Option<&str>) -> Option<String> {
+fn build_tree_footer(depth_hidden: usize, summary: Option<&str>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    if depth_cap_active {
-        parts.push("(deeper levels truncated)".to_string());
+    if depth_hidden > 0 {
+        parts.push(format!("({depth_hidden} deeper entries hidden)"));
     }
     if let Some(s) = summary {
         parts.push(s.to_string());
@@ -443,6 +451,29 @@ mod tests {
         );
     }
 
+    /// Degradation marker for `parse_tree` must use "tree:" prefix, not "ls:".
+    /// Regression for copy-paste bug where parse_tree emitted the sibling
+    /// parse_ls marker, violating the cross-handler tool-name contract
+    /// established in v2.3.0 (CHANGELOG consistency review HIGH-2).
+    #[test]
+    fn test_parse_tree_degradation_marker_uses_tree_prefix() {
+        let input = load_fixture("tree_basic.txt");
+        let output = make_output(&input);
+        let result = parse_tree(&output);
+        if let ParseResult::Degraded(_, markers) = result {
+            let joined = markers.join(" ");
+            assert!(
+                joined.contains("tree:"),
+                "parse_tree degradation marker must start with 'tree:' but got: {joined}"
+            );
+            assert!(
+                !joined.contains("ls:"),
+                "parse_tree degradation marker must NOT contain 'ls:' but got: {joined}"
+            );
+        }
+        // If Full or Passthrough, the marker contract is not exercised — that's OK.
+    }
+
     #[test]
     fn test_empty_output_passthrough() {
         let output = make_output("");
@@ -485,5 +516,48 @@ mod tests {
     #[test]
     fn test_count_tree_depth_nested() {
         assert_eq!(count_tree_depth("|   |-- lib.rs"), 1);
+    }
+
+    /// build_tree_footer must include count of depth-hidden entries when > 0.
+    #[test]
+    fn test_build_tree_footer_depth_hidden_count() {
+        let footer = build_tree_footer(7, None);
+        assert!(
+            footer.is_some(),
+            "Footer must be Some when depth_hidden > 0"
+        );
+        let footer = footer.unwrap();
+        assert!(
+            footer.contains("7 deeper entries hidden"),
+            "Footer must include count: {footer}"
+        );
+    }
+
+    /// build_tree_footer with depth_hidden == 0 and no summary returns None.
+    #[test]
+    fn test_build_tree_footer_no_hidden_no_summary() {
+        let footer = build_tree_footer(0, None);
+        assert!(
+            footer.is_none(),
+            "Footer must be None when nothing to report"
+        );
+    }
+
+    /// tree text with deeply nested entries must report count of hidden entries.
+    #[test]
+    fn test_tree_text_depth_cap_reports_count() {
+        // 4 levels deep (depth 3 is the max; depth 4 triggers elision)
+        let text = "|-- src\n\
+                    |   |-- lib.rs\n\
+                    |   |   |-- deep.rs\n\
+                    |   |   |   |-- very_deep.rs\n\
+                    |   |   |   |   |-- too_deep.rs\n\
+                    0 directories, 5 files\n";
+        let result = try_parse_tree_text(text).expect("must parse");
+        let footer = result.footer.as_deref().unwrap_or("");
+        assert!(
+            footer.contains("deeper entries hidden"),
+            "Footer must mention hidden entries when depth cap is hit: {footer}"
+        );
     }
 }

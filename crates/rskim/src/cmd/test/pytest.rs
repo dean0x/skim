@@ -40,7 +40,11 @@ use crate::runner::{CommandOutput, CommandRunner};
 /// - If stdin is not a terminal → attempt to read stdin; if empty, fall back
 ///   to running pytest (handles test harness environments where stdin is a
 ///   pipe with no data)
-pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     // Intercept --help/-h: show skim's pytest help, then forward to real pytest
     // so the user sees both skim's flags and pytest's own options.
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
@@ -79,17 +83,15 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     }
 
     // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid .to_string() allocation when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            cleaned,
-            result.content().to_string(),
-            format!("skim test pytest {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
-            output.duration,
-            Some(result.tier_name()),
-        );
-    }
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        cleaned,
+        result.content().to_string(),
+        format!("skim test pytest {}", args.join(" ")),
+        crate::analytics::CommandType::Test,
+        output.duration,
+        Some(result.tier_name()),
+    );
 
     // Exit code: mirror pytest's exit code if we ran it, or infer from parse
     let code = match output.exit_code {

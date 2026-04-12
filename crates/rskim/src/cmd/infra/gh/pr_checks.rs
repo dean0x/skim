@@ -25,12 +25,46 @@
 //! ✓  CI / build  2m30s  https://...
 //! X  CI / lint   1m5s   https://...
 //! ```
+//!
+//! # AD-15 (2026-04-11) — URL surfacing for failing checks
+//!
+//! URLs are included in the item value **only for failing checks**
+//! (`fail`/`failure` status). Passing checks do not need a URL because
+//! there is nothing to investigate; including URLs for all checks would add
+//! noise without benefit. Failing checks benefit most from a direct link
+//! to the log output.
+//!
+//! Format: `"{status} ({duration}) — {url}"` for failing checks with a URL.
+//! For checks without a URL (JSON tier), the URL field is omitted.
 
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 use super::{three_tier_parse, MAX_ITEMS, MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB};
+
+/// A single parsed check entry, shared across text and JSON parse paths.
+///
+/// Named fields prevent silent positional swaps when the tuple had the shape
+/// `(String, String, Option<String>, Option<String>)` — particularly important
+/// because both `duration` and `url` are `Option<String>`.
+struct ParsedCheck {
+    name: String,
+    status: String,
+    duration: Option<String>,
+    url: Option<String>,
+}
+
+/// Extract a non-empty string from an optional regex capture match.
+///
+/// Returns `None` when the capture group is absent or its trimmed text is empty,
+/// collapsing the two-step `is_some` / `is_empty` guard into a single combinator
+/// chain and eliminating 2 nesting levels at each call site.
+fn non_empty_capture(m: Option<regex::Match<'_>>) -> Option<String> {
+    m.map(|m| m.as_str().trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
 
 /// No-op `prepare_args`: `gh pr checks` has no stable `--json` flag to inject.
 ///
@@ -111,13 +145,23 @@ pub(super) fn try_parse_checks_json(trimmed: &str) -> Option<InfraResult> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let state = c
+                let status = c
                     .get("state")
                     .or_else(|| c.get("status"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_lowercase();
-                (name, state, None)
+                let url = c
+                    .get("detailsUrl")
+                    .or_else(|| c.get("url"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                ParsedCheck {
+                    name,
+                    status,
+                    duration: None,
+                    url,
+                }
             })
             .collect(),
     )
@@ -130,9 +174,10 @@ pub(super) fn try_parse_checks_json(trimmed: &str) -> Option<InfraResult> {
 /// Parse `gh pr checks` text output (tab or symbol format).
 ///
 /// Tries both formats and takes whichever produces results first.
-/// URLs are stripped from the output items to reduce noise.
+/// URLs are captured and included in the item value **only for failing checks**
+/// to help agents navigate directly to the failing CI log.
 pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
-    let mut parsed: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut parsed: Vec<ParsedCheck> = Vec::new();
 
     for line in text.lines() {
         if parsed.len() >= MAX_ITEMS {
@@ -145,30 +190,30 @@ pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
 
         // Try tab format: name\tstatus\tduration\turl
         if let Some(caps) = RE_GH_CHECK_TAB.captures(line) {
-            let name = caps[1].trim().to_string();
-            let status = caps[2].trim().to_lowercase();
-            let duration = caps[3].trim();
-            let dur = if duration.is_empty() {
-                None
-            } else {
-                Some(duration.to_string())
-            };
-            parsed.push((name, status, dur));
+            parsed.push(ParsedCheck {
+                name: caps[1].trim().to_string(),
+                status: caps[2].trim().to_lowercase(),
+                duration: non_empty_capture(caps.get(3)),
+                url: non_empty_capture(caps.get(4)),
+            });
             continue;
         }
 
         // Try symbol format: ✓/X/- name  duration  url
         if let Some(caps) = RE_GH_CHECK_SYMBOL.captures(line) {
             let symbol = caps[1].trim();
-            let name = caps[2].trim().to_string();
-            let duration = caps[3].trim();
             let status = match symbol {
                 "✓" => "pass",
                 "X" | "✗" => "fail",
                 "-" | "*" => "pending",
                 _ => "unknown",
             };
-            parsed.push((name, status.to_string(), Some(duration.to_string())));
+            parsed.push(ParsedCheck {
+                name: caps[2].trim().to_string(),
+                status: status.to_string(),
+                duration: non_empty_capture(caps.get(3)),
+                url: non_empty_capture(caps.get(4)),
+            });
         }
     }
 
@@ -181,9 +226,10 @@ pub(super) fn try_parse_checks_text(text: &str) -> Option<InfraResult> {
 
 /// Build a [`InfraResult`] from parsed check entries.
 ///
-/// Computes pass/fail/pending counts for the summary and formats
-/// each check as `"name: status (duration)"`.
-fn build_checks_result(checks: Vec<(String, String, Option<String>)>) -> Option<InfraResult> {
+/// Computes pass/fail/pending counts for the summary and formats each check as
+/// `"name: status (duration)"`. For failing checks, appends `" — {url}"` when
+/// a URL is available so agents can navigate directly to the CI log output.
+fn build_checks_result(checks: Vec<ParsedCheck>) -> Option<InfraResult> {
     if checks.is_empty() {
         return None;
     }
@@ -191,15 +237,15 @@ fn build_checks_result(checks: Vec<(String, String, Option<String>)>) -> Option<
     let total = checks.len();
     let pass = checks
         .iter()
-        .filter(|(_, s, _)| s == "pass" || s == "success")
+        .filter(|c| c.status == "pass" || c.status == "success")
         .count();
     let fail = checks
         .iter()
-        .filter(|(_, s, _)| s == "fail" || s == "failure")
+        .filter(|c| c.status == "fail" || c.status == "failure")
         .count();
     let pending = checks
         .iter()
-        .filter(|(_, s, _)| s == "pending" || s == "in_progress")
+        .filter(|c| c.status == "pending" || c.status == "in_progress")
         .count();
     // Catch-all for cancelled, neutral, skipped, timed_out, and any future states
     let other = total - pass - fail - pending;
@@ -216,13 +262,18 @@ fn build_checks_result(checks: Vec<(String, String, Option<String>)>) -> Option<
 
     let items: Vec<InfraItem> = checks
         .into_iter()
-        .map(|(name, status, duration)| {
-            let value = if let Some(dur) = duration {
-                format!("{status} ({dur})")
-            } else {
-                status
+        .map(|c| {
+            let is_failing = c.status == "fail" || c.status == "failure";
+            let value = match (c.duration, c.url.filter(|_| is_failing)) {
+                (Some(dur), Some(u)) => format!("{} ({dur}) — {u}", c.status),
+                (Some(dur), None) => format!("{} ({dur})", c.status),
+                (None, Some(u)) => format!("{} — {u}", c.status),
+                (None, None) => c.status,
             };
-            InfraItem { label: name, value }
+            InfraItem {
+                label: c.name,
+                value,
+            }
         })
         .collect();
 
@@ -350,9 +401,24 @@ mod tests {
     fn test_other_states_appear_in_summary() {
         // cancelled/skipped/neutral states must not be lumped into "pending"
         let checks = vec![
-            ("CI / build".to_string(), "pass".to_string(), None),
-            ("CI / cancel".to_string(), "cancelled".to_string(), None),
-            ("CI / skip".to_string(), "skipped".to_string(), None),
+            ParsedCheck {
+                name: "CI / build".to_string(),
+                status: "pass".to_string(),
+                duration: None,
+                url: None,
+            },
+            ParsedCheck {
+                name: "CI / cancel".to_string(),
+                status: "cancelled".to_string(),
+                duration: None,
+                url: None,
+            },
+            ParsedCheck {
+                name: "CI / skip".to_string(),
+                status: "skipped".to_string(),
+                duration: None,
+                url: None,
+            },
         ];
         let result = build_checks_result(checks).unwrap();
         assert!(
@@ -364,6 +430,52 @@ mod tests {
             !result.summary.contains("2 pending"),
             "Should not label cancelled/skipped as pending, got: {}",
             result.summary
+        );
+    }
+
+    /// Failing checks must include URL in item value; passing checks must not.
+    #[test]
+    fn test_failing_check_includes_url() {
+        let input = load_fixture("gh_pr_checks_text.txt");
+        let result = try_parse_checks_text(&input).expect("must parse");
+        // The fixture has 1 failing check (CI / lint) with a URL.
+        let lint_item = result
+            .items
+            .iter()
+            .find(|i| i.label == "CI / lint")
+            .expect("CI / lint must be present");
+        assert!(
+            lint_item.value.contains("https://"),
+            "Failing check must include URL: {}",
+            lint_item.value
+        );
+        // Passing check must NOT include URL.
+        let build_item = result
+            .items
+            .iter()
+            .find(|i| i.label == "CI / build")
+            .expect("CI / build must be present");
+        assert!(
+            !build_item.value.contains("https://"),
+            "Passing check must not include URL: {}",
+            build_item.value
+        );
+    }
+
+    /// Symbol-format failing checks must also include URL.
+    #[test]
+    fn test_failing_check_symbol_includes_url() {
+        let input = load_fixture("gh_pr_checks_symbol.txt");
+        let result = try_parse_checks_text(&input).expect("must parse");
+        let lint_item = result
+            .items
+            .iter()
+            .find(|i| i.label == "CI / lint")
+            .expect("CI / lint must be present");
+        assert!(
+            lint_item.value.contains("https://"),
+            "Symbol-format failing check must include URL: {}",
+            lint_item.value
         );
     }
 }

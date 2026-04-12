@@ -1,3 +1,15 @@
+//! npm audit parser.
+//!
+//! # AD-18 (2026-04-11) — advisory ID extraction mirrors `cargo audit`
+//!
+//! `cargo audit` includes GHSA/RUSTSEC IDs in its details (see `pkg/cargo.rs`).
+//! npm audit details previously omitted IDs, making it impossible to look up
+//! the advisory without knowing the package name.  This module now extracts
+//! the GHSA ID from `via[i]["url"]` using RE_GHSA. For advisories without a
+//! GHSA URL (legacy numeric `source` IDs), the fallback is `NPM-{source}`.
+//! For entries with no extractable identifier, `"unknown"` is used.
+//! The same advisory-ID convention applies to `pnpm audit` (see `pkg/pnpm.rs`).
+
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -18,6 +30,13 @@ static RE_NPM_VULNS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+)\s+vulnerabilit(?:y|ies)\s*\(([^)]+)\)").unwrap());
 static RE_NPM_VULN_COUNT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\d+)\s+(critical|high|moderate|low|info)").unwrap());
+
+/// Pattern to extract a GHSA advisory ID from a GitHub advisory URL.
+///
+/// Matches the canonical GitHub advisory URL structure:
+/// `https://github.com/advisories/GHSA-xxxx-yyyy-zzzz`
+/// The ID itself is `GHSA-` followed by 14–19 word chars (hyphens/alphanumerics).
+static RE_GHSA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(GHSA-[\w-]{14,19})").unwrap());
 
 pub(super) fn run_audit(
     args: &[String],
@@ -87,12 +106,38 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
             _ => {}
         }
 
-        // Extract advisory title from via array. Entries can be either
-        // objects (advisories with a `title` field) or plain strings
-        // (transitive dependency names).
-        let title = vuln
-            .get("via")
-            .and_then(|v| v.as_array())
+        // Extract advisory ID and title from via array. Entries can be either
+        // objects (advisories with a `title`, `url`, and optionally `source` field)
+        // or plain strings (transitive dependency names).
+        //
+        // Advisory ID extraction order (mirrors cargo audit design decision):
+        // 1. GHSA ID from first matching via[i]["url"] (RE_GHSA pattern).
+        // 2. Numeric source → formatted as `NPM-{source}`.
+        // 3. Last-resort "unknown".
+        let via_array = vuln.get("via").and_then(|v| v.as_array());
+
+        let advisory_id = via_array
+            .and_then(|arr| {
+                arr.iter().find_map(|entry| {
+                    // Try to get GHSA from the url field.
+                    if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
+                        if let Some(caps) = RE_GHSA.captures(url) {
+                            return Some(caps[1].to_string());
+                        }
+                    }
+                    // Fall back to numeric source → NPM-{source}.
+                    entry
+                        .get("source")
+                        .and_then(|s| {
+                            s.as_u64()
+                                .or_else(|| s.as_str().and_then(|s| s.parse().ok()))
+                        })
+                        .map(|n| format!("NPM-{n}"))
+                })
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let title = via_array
             .and_then(|arr| {
                 arr.iter()
                     .find_map(|entry| {
@@ -111,7 +156,7 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
             })
             .unwrap_or_else(|| "unknown".to_string());
 
-        details.push(format!("{name}: {title} ({severity})"));
+        details.push(format!("{advisory_id} {name}: {title} ({severity})"));
     }
 
     // Use details.len() instead of summing severity buckets so entries with
@@ -223,7 +268,12 @@ mod tests {
         assert!(display.contains("high: 1"));
         assert!(display.contains("moderate: 1"));
         assert!(display.contains("total: 3"));
-        assert!(display.contains("lodash: Prototype Pollution (high)"));
+        // Detail format is now "{id} {name}: {title} ({severity})"
+        assert!(
+            display.contains("lodash")
+                && display.contains("Prototype Pollution")
+                && display.contains("high")
+        );
     }
 
     #[test]
@@ -259,5 +309,32 @@ mod tests {
         let result = result.unwrap();
         let display = format!("{result}");
         assert!(display.contains("total: 0"));
+    }
+
+    // ========================================================================
+    // Advisory ID extraction tests (AD-18, 2026-04-11)
+    // ========================================================================
+
+    #[test]
+    fn test_npm_audit_extracts_ghsa_from_url() {
+        let input = load_fixture("npm_audit_with_via_id.json");
+        let result = try_parse_audit_json(&input).expect("must parse");
+        let display = format!("{result}");
+        assert!(
+            display.contains("GHSA-abc1-def2-ghi3"),
+            "must include GHSA ID extracted from URL: {display}"
+        );
+    }
+
+    #[test]
+    fn test_npm_audit_fallback_to_source_number() {
+        let input = load_fixture("npm_audit_with_via_id.json");
+        let result = try_parse_audit_json(&input).expect("must parse");
+        let display = format!("{result}");
+        // minimist entry has no URL, only a numeric source → NPM-{source}
+        assert!(
+            display.contains("NPM-98765"),
+            "must include NPM-{{source}} fallback for numeric source: {display}"
+        );
     }
 }

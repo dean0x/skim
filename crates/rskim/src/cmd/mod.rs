@@ -26,7 +26,7 @@ mod stats;
 mod test;
 
 use std::borrow::Cow;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use crate::output::ParseResult;
@@ -167,38 +167,7 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub show_stats: bool,
     pub command_type: crate::analytics::CommandType,
     pub output_format: OutputFormat,
-}
-
-/// Execute an external command, parse its output, and emit the result.
-///
-/// Convenience wrapper that auto-detects stdin piping via `is_terminal()`.
-/// Use [`run_parsed_command_with_mode`] when you need explicit control
-/// over stdin vs execute behavior.
-#[allow(dead_code)]
-pub(crate) fn run_parsed_command<T>(
-    program: &str,
-    args: &[String],
-    env_overrides: &[(&str, &str)],
-    install_hint: &str,
-    show_stats: bool,
-    command_type: crate::analytics::CommandType,
-    parse: impl FnOnce(&CommandOutput, &[String]) -> ParseResult<T>,
-) -> anyhow::Result<ExitCode>
-where
-    T: AsRef<str> + serde::Serialize,
-{
-    let use_stdin = !io::stdin().is_terminal();
-    let config = ParsedCommandConfig {
-        program,
-        args,
-        env_overrides,
-        install_hint,
-        use_stdin,
-        show_stats,
-        command_type,
-        output_format: OutputFormat::default(),
-    };
-    run_parsed_command_with_mode(config, parse)
+    pub analytics_enabled: bool,
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -234,6 +203,7 @@ where
         show_stats,
         command_type,
         output_format,
+        analytics_enabled,
     } = config;
 
     let output = if use_stdin {
@@ -315,17 +285,15 @@ where
     }
 
     // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid allocation when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            output.stdout,
-            compressed,
-            format!("skim {program} {}", args.join(" ")),
-            command_type,
-            output.duration,
-            Some(result.tier_name()),
-        );
-    }
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        output.stdout,
+        compressed,
+        format!("skim {program} {}", args.join(" ")),
+        command_type,
+        output.duration,
+        Some(result.tier_name()),
+    );
 
     // Map exit code: preserve full 0-255 exit code granularity from the
     // underlying process. This maintains documented semantics (0=success,
@@ -338,7 +306,11 @@ where
 /// Exit code semantics (GRANITE lesson — exit code corruption is P1):
 /// - `--help` / `-h`: prints description to stdout, returns SUCCESS
 /// - Otherwise: prints "not yet implemented" to stderr, returns FAILURE
-pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn dispatch(
+    subcommand: &str,
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if !is_known_subcommand(subcommand) {
         anyhow::bail!(
             "Unknown subcommand: '{subcommand}'\n\
@@ -349,21 +321,21 @@ pub(crate) fn dispatch(subcommand: &str, args: &[String]) -> anyhow::Result<Exit
     }
 
     match subcommand {
-        "agents" => agents::run(args),
-        "build" => build::run(args),
-        "completions" => completions::run(args),
-        "discover" => discover::run(args),
-        "file" => file::run(args),
-        "git" => git::run(args),
-        "infra" => infra::run(args),
-        "init" => init::run(args),
-        "learn" => learn::run(args),
-        "lint" => lint::run(args),
-        "log" => log::run(args),
-        "pkg" => pkg::run(args),
-        "rewrite" => rewrite::run(args),
-        "stats" => stats::run(args),
-        "test" => test::run(args),
+        "agents" => agents::run(args, analytics),
+        "build" => build::run(args, analytics),
+        "completions" => completions::run(args, analytics),
+        "discover" => discover::run(args, analytics),
+        "file" => file::run(args, analytics),
+        "git" => git::run(args, analytics),
+        "infra" => infra::run(args, analytics),
+        "init" => init::run(args, analytics),
+        "learn" => learn::run(args, analytics),
+        "lint" => lint::run(args, analytics),
+        "log" => log::run(args, analytics),
+        "pkg" => pkg::run(args, analytics),
+        "rewrite" => rewrite::run(args, analytics),
+        "stats" => stats::run(args, analytics),
+        "test" => test::run(args, analytics),
         // Unreachable: is_known_subcommand guard above rejects unknown names
         _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
     }

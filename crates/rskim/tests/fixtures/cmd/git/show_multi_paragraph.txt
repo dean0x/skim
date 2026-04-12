@@ -1,0 +1,23 @@
+commit abc1234def5678901234567890abcdef01234567
+Author: Jane Dev <jane@example.com>
+Date:   Thu Apr 10 12:00:00 2025 +0000
+
+    feat: add multi-paragraph commit body
+
+    This is paragraph 1 of the commit body. It explains the motivation
+    for this change in detail.
+
+    This is paragraph 2 of the commit body. It describes the approach
+    taken and any relevant trade-offs.
+
+    This is paragraph 3 of the commit body. It lists any follow-up tasks
+    or known limitations of this implementation.
+
+diff --git a/src/main.rs b/src/main.rs
+index 111aaa..222bbb 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
+ fn main() {
++    println!("hello");
+ }

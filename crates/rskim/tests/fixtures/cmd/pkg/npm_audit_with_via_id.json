@@ -1,0 +1,27 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "lodash": {
+      "name": "lodash",
+      "severity": "high",
+      "isDirect": true,
+      "via": [{"title": "Prototype Pollution", "severity": "high", "url": "https://github.com/advisories/GHSA-abc1-def2-ghi3", "source": 12345}],
+      "effects": [],
+      "range": "<4.17.21",
+      "fixAvailable": true
+    },
+    "minimist": {
+      "name": "minimist",
+      "severity": "critical",
+      "isDirect": false,
+      "via": [{"title": "Command Injection", "severity": "critical", "source": 98765}],
+      "effects": [],
+      "range": "<1.2.6",
+      "fixAvailable": true
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {"info": 0, "low": 0, "moderate": 0, "high": 1, "critical": 1, "total": 2},
+    "dependencies": {"prod": 10, "dev": 5, "optional": 0, "peer": 0, "peerOptional": 0, "total": 15}
+  }
+}

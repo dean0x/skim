@@ -7,9 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
+- `skim infra gh pr view` now always renders `draft`, `mergeable`, and `ci` items so agents observe the full merge-readiness signal set even on clean PRs. A `[DRAFT]` prefix is added to the summary when the PR is a draft. CI aggregation: `FAILURE`/`CANCELLED`/`TIMED_OUT` → `failing`; `PENDING`/`QUEUED`/`IN_PROGRESS` → `pending`; else `passing`; null/empty → `none`. (AD-9, commit 689e397, see `crates/rskim/src/cmd/infra/gh/pr_view.rs`)
+- `prettier --check`, `rustfmt --check`, `cargo fmt --check`, and `cargo fmt -- --check` are now acknowledged as already-compact (AD-11, compress-or-skip rule). `skim rewrite` echoes the original command instead of rewriting to `skim lint prettier/rustfmt`. This prevents the skim header from inflating output on clean or near-clean codebases.
+- `parse_tier` field added to `GitResult` and propagated through all git handlers to the analytics DB (AD-12). Git invocations now appear with `"full"`, `"degraded"`, or `"passthrough"` tier labels, consistent with the file/lint/infra handler families.
+
+### Fixed
+- `skim git show <commit>` now preserves the full commit message body (multi-paragraph) and merge-parent hashes (`Merge: p1 p2` prefix in rendered output). Previously both were silently dropped. GPG/SSH signature blocks (`gpgsig`/`mergetag`) remain elided. (AD-8, commit 0f9c82b, see `ShowCommitResult::body` and `parents` fields in `crates/rskim/src/cmd/git/show.rs`)
 - `skim git diff` now records a zero-compression analytics row when the diff is empty (previously uncounted). This unifies analytics recording across empty and non-empty invocations. ([#132](https://github.com/dean0x/skim/issues/132), [#135](https://github.com/dean0x/skim/pull/135))
 - `skim git show <annotated-tag|blob|tree>` (non-commit passthrough) now records analytics (previously uncounted). This unifies analytics recording across all `git show` modes. ([#132](https://github.com/dean0x/skim/issues/132), [#135](https://github.com/dean0x/skim/pull/135))
+- `skim git log`, `skim git status`, `skim git fetch`, `skim git diff` now record analytics on non-zero exit codes (previously, failed git invocations were silently dropped from the analytics DB). (AD-14, commit ea4e52f)
+- `skim infra gh pr checks` and `skim infra gh run view` now include URLs for failing checks and run items so agents can navigate directly to the failure without a second command. (AD-15, see `crates/rskim/src/cmd/infra/gh/pr_checks.rs` and `run_view.rs`)
+- `skim pkg npm audit` and `skim pkg pnpm audit` now include advisory identifiers (`GHSA-xxxx-yyyy-zzzz` extracted from `via[i].url`, or `NPM-{source}` fallback for legacy numeric IDs) in rendered advisory details. Mirrors `skim pkg cargo audit` existing behaviour. (AD-18, commit 9041511)
+- `skim test cargo` and `skim test vitest` now surface failing test names in their Tier-2 regex fallback paths (previously returned empty entries). Names are capped at 100 to match Tier-1 semantics. ANSI codes are stripped before regex matching. (commit cc662e6, see `crates/rskim/src/cmd/test/shared.rs::scrape_failures`)
+- `skim test vitest` Tier-2 regex now tolerates leading whitespace on failing-test lines (e.g. `   × divides by zero`), matching real vitest output rather than only bare-`✕` hand-crafted fixtures. (AD-19, commit ea4e52f)
+- `skim rewrite '<full command>'` with a single quoted-string argument now tokenizes the same way as stdin input (via `split_whitespace` inside `collect_input_tokens`). Previously the single-arg form produced a one-element vector that matched no rule and no ACK prefix, silently returning exit 1. (AD-13, commit 48dded7)
+- `skim log` pending_stack is now capped at 4 frames (sliding window); excess frames are elided incrementally rather than accumulating unboundedly. Output behavior is unchanged (last 3 frames shown + elision count in `LogResult.stack_frames_elided`), but memory is now bounded at O(1) regardless of input length. (DoS hardening, commit ec32165)
+- `skim log` JSON log fields are now capped before processing: `level` at 32 chars, `message` at 16 KiB. Values that exceed the cap are truncated and suffixed with `[truncated]` so consumers can detect elision. Prevents resource exhaustion from adversarially large JSON log lines. (DoS hardening, commit ec32165)
+- `skim log` deduplication allocations reduced: key construction no longer heap-allocates on the common (non-duplicate) path. (commit ec32165)
+- `skim log` now tracks stack frames attached to the preceding log entry (up to 3 frames shown; elision count in `LogResult.stack_frames_elided`). Deduplication is level-aware (`level|message` key). (AD-10)
+- `skim file ls` degradation marker now uses `"tree:"` prefix, matching the format contract for all `skim file` parsers. (commit e8fbf50)
+- `skim infra curl` now surfaces up to 20 object keys (was 5) before truncating. The truncation notice displays the actual cap.
+- `skim file tree` depth-capped output now reports the count of hidden deeper entries (`"(N deeper entries hidden)"`) instead of a generic cap notice.
+- `skim lint golangci` severity now inferred from linter name and message text (was always `Warning`). (AD-16, see `crates/rskim/src/cmd/lint/golangci.rs::infer_severity_from_text`)
+- `skim lint rustfmt` location messages now include the diff line number (`"formatting difference at line N"` vs. `"formatting difference detected"`). (AD-17, see `crates/rskim/src/cmd/lint/rustfmt.rs`)
+- `skim git diff` warns on non-empty stderr at exit 0 (`[skim] git diff notice: ...`) so LF/CRLF replacement warnings are not silently discarded.
+- PF-018 fully resolved: `finalize_git_output_passthrough` eliminates double-clone on passthrough paths across all git handlers. (commit 6f06e9d)
+- PF-021 fully resolved: `run_passthrough` now uses `build_analytics_label` so format strings are not allocated when analytics are disabled. (commit 6f06e9d)
+
+### Changed
+- `git show` diff rendering (`render_show_diff`) now uses rayon parallel iteration for large multi-file diffs, consistent with other multi-file diff paths. (commit 6f06e9d)
+- `parse_commit_header` refactored to borrow body slices from the input rather than cloning them, reducing allocations on the hot path. (commit 6f06e9d)
+- `gh pr checks` parser extracted `ParsedCheck` struct and `non_empty_capture` helper, replacing positional tuple usage and eliminating silent field-swap risk. (commit d6ff12c)
+
+### Testing
+- **2,470 tests passing** (up from 2,223 in v2.3.1; +16 alignment E2E, +parse_tier unit tests, +stack-trace/dedup/npm-audit/gh-pr-view/scrape_failures/scrutinizer-regression unit tests, +Wave 1 regression tests for git show failure analytics and rewrite tokenization)
+- New `cli_e2e_rewrite_alignment.rs` — 16 tests closing the rewrite→execute loop for all major command families
+- Double ANSI strip eliminated in vitest Tier-2 test path (commit fd3ce4f)
+- New regression tests: `git show` failure-path analytics, `skim rewrite` single-arg tokenization (commit fd3ce4f)
 
 ## [2.3.1] - 2026-04-09
 

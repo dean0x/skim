@@ -1,0 +1,22 @@
+{
+  "number": 99,
+  "title": "feat: clean PR ready to merge",
+  "state": "OPEN",
+  "isDraft": false,
+  "mergeable": "MERGEABLE",
+  "author": {"login": "alice"},
+  "body": "Ready to merge.",
+  "labels": [],
+  "assignees": [],
+  "milestone": null,
+  "headRefName": "feature/clean",
+  "baseRefName": "main",
+  "additions": 20,
+  "deletions": 3,
+  "changedFiles": 1,
+  "statusCheckRollup": [
+    {"name": "ci/build", "conclusion": "SUCCESS"},
+    {"name": "ci/test", "conclusion": "SUCCESS"}
+  ],
+  "comments": []
+}

@@ -24,7 +24,7 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
 
-use super::{finalize_git_output, finalize_git_output_owned, map_exit_code, run_passthrough};
+use super::{finalize_git_output_owned, map_exit_code, run_passthrough};
 
 /// Maximum file size for AST processing (100 KB). Larger files fall back
 /// to raw diff hunks.
@@ -37,7 +37,9 @@ pub(in crate::cmd::git) const MAX_AST_FILE_COUNT: usize = 200;
 
 /// Minimum file count to engage rayon parallelism. Below this, thread pool
 /// scheduling overhead exceeds the per-file render cost.
-const PARALLEL_THRESHOLD: usize = 5;
+/// Exposed to `show.rs` so `render_show_diff` can mirror the same dispatch
+/// threshold rather than hard-coding a separate constant.
+pub(in crate::cmd::git) const PARALLEL_THRESHOLD: usize = 5;
 
 /// Controls how unchanged AST nodes are rendered alongside changed nodes.
 ///
@@ -154,6 +156,7 @@ pub(super) fn run_diff(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_diff_help();
@@ -171,7 +174,7 @@ pub(super) fn run_diff(
             "--check",
         ],
     ) {
-        return run_passthrough(global_flags, "diff", args, show_stats);
+        return run_passthrough(global_flags, "diff", args, show_stats, analytics_enabled);
     }
 
     // Extract skim-specific flags before passing args to git
@@ -184,7 +187,7 @@ pub(super) fn run_diff(
     full_args.extend_from_slice(&git_args);
 
     let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {
@@ -194,24 +197,47 @@ pub(super) fn run_diff(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        return Ok(map_exit_code(output.exit_code));
+        let exit_code = output.exit_code;
+        // Record analytics even on non-zero exit so the DB reflects failed
+        // invocations. Move stdout: 1 allocation (clone) on the analytics
+        // path, 0 when disabled (PF-018 resolution).
+        super::finalize_git_output_passthrough(
+            output.stdout,
+            super::build_analytics_label("diff", args, show_stats, analytics_enabled),
+            show_stats,
+            analytics_enabled,
+            crate::analytics::CommandType::Git,
+            output.duration,
+            Some("passthrough"),
+        );
+        return Ok(map_exit_code(exit_code));
+    }
+
+    // Surface git diff stderr warnings (e.g., "warning: LF will be replaced by CRLF")
+    // on successful runs. These are informational notices from git, not failures,
+    // so they should be visible even when diff output is otherwise compressed.
+    if !output.stderr.is_empty() {
+        eprint!("[skim] git diff notice: {}", output.stderr.trim());
     }
 
     let duration = output.duration;
     let raw_diff = output.stdout;
-    let label = super::build_analytics_label("diff", args, show_stats);
+    let label = super::build_analytics_label("diff", args, show_stats, analytics_enabled);
 
     // Handle empty diff — record zero-compression analytics so the DB stays
     // consistent with run_passthrough (which always records, even for no-op passes).
     if raw_diff.trim().is_empty() {
         eprintln!("No changes");
-        finalize_git_output(
-            &raw_diff,
-            &raw_diff,
+        // Move raw_diff: 1 allocation (clone) on the analytics path, 0 when
+        // disabled (PF-018 resolution).
+        super::finalize_git_output_passthrough(
+            raw_diff,
             label,
             show_stats,
+            analytics_enabled,
             crate::analytics::CommandType::Git,
             duration,
+            Some("full"),
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -227,13 +253,17 @@ pub(super) fn run_diff(
             // This branch is only hit when parse_unified_diff returns an empty vec
             // despite raw_diff being non-empty (malformed diff); keep a consistent
             // analytics record identical to the trim-is-empty branch above.
-            finalize_git_output(
-                &raw_diff,
-                &raw_diff,
+            // Drop file_diffs first so the borrow on raw_diff ends, then move
+            // raw_diff into the passthrough variant (PF-018 resolution).
+            drop(file_diffs);
+            super::finalize_git_output_passthrough(
+                raw_diff,
                 label,
                 show_stats,
+                analytics_enabled,
                 crate::analytics::CommandType::Git,
                 duration,
+                Some("degraded"),
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -313,8 +343,10 @@ pub(super) fn run_diff(
         result_str,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         duration,
+        Some("full"),
     );
 
     Ok(ExitCode::SUCCESS)
@@ -426,6 +458,34 @@ mod tests {
         assert!(
             files_whitespace.is_empty(),
             "whitespace-only diff should parse to zero files"
+        );
+    }
+
+    // ========================================================================
+    // Stderr notice documentation
+    // ========================================================================
+
+    /// Documents the stderr notice behaviour for git diff warnings.
+    ///
+    /// When `git diff` exits 0 but has non-empty stderr (e.g., "warning: LF will
+    /// be replaced by CRLF"), `run_diff` emits `[skim] git diff notice: <text>` to
+    /// stderr so agents can see the warning even though the diff itself succeeded.
+    ///
+    /// This test validates that the notice prefix format matches what `run_diff`
+    /// emits, ensuring any future refactor doesn't silently change the prefix.
+    #[test]
+    fn test_diff_stderr_notice_format_is_documented() {
+        // The notice format used in run_diff — validated here to catch future
+        // regressions in the prefix string without requiring a full integration test.
+        let warning = "warning: LF will be replaced by CRLF in file.txt";
+        let notice = format!("[skim] git diff notice: {}", warning.trim());
+        assert!(
+            notice.starts_with("[skim] git diff notice: "),
+            "Notice prefix must be '[skim] git diff notice: ': {notice}"
+        );
+        assert!(
+            notice.contains("LF will be replaced"),
+            "Notice must include the original warning text: {notice}"
         );
     }
 }

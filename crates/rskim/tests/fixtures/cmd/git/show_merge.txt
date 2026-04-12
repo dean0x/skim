@@ -1,0 +1,15 @@
+commit fedcba9876543210fedcba9876543210fedcba98
+Merge: abc123 def456 fed321
+Author: Release Bot <bot@example.com>
+Date:   Fri Apr 11 09:00:00 2025 +0000
+
+    Merge pull request #42 from feature/awesome
+
+    Merges feature branch with octopus 3-parent strategy.
+
+diff --git a/src/lib.rs b/src/lib.rs
+index aaabbb..cccddd 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,3 +5,4 @@ pub fn hello() {}
++pub fn world() {}

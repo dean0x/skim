@@ -22,6 +22,14 @@ use crate::output::ParseResult;
 /// Maximum input lines before truncation.
 const MAX_INPUT_LINES: usize = 100_000;
 
+/// Maximum frames buffered in `pending_stack` before the oldest is dropped.
+///
+/// Keeps memory at O(PENDING_STACK_CAP) regardless of input length.
+/// `flush_stack_frames` retains only the last 3 frames, so a cap of 4 is
+/// sufficient: the sliding window holds the 4 most-recent frames, and the
+/// flush then drops 1 more, yielding exactly the last 3 in output.
+const PENDING_STACK_CAP: usize = 4;
+
 /// Matches ISO8601 / common log timestamp prefix to strip before dedup.
 /// e.g. `2024-01-15T10:30:00Z `, `2024-01-15 10:30:00 `, `[2024-01-15T10:30:00]`
 static RE_LOG_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
@@ -39,8 +47,16 @@ static RE_LOG_LEVEL_BRACKET: LazyLock<Regex> =
 static RE_LOG_LEVEL_BARE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?i)(ERROR|WARN|WARNING|INFO|DEBUG|TRACE):?\s+(.*)").unwrap());
 
-/// Matches Java/Node.js stack trace lines.
-static RE_LOG_STACK_TRACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+at\s+").unwrap());
+/// Matches Java/Node.js/Python stack trace lines.
+///
+/// # AD-10 (2026-04-11) — Multi-language stack trace patterns
+/// - Java/Node.js: `    at <method>` (leading whitespace + "at ")
+/// - Python: `  File "...", line N` (leading whitespace + 'File "')
+///
+/// Both patterns are anchored to leading whitespace so they don't match
+/// regular log lines that happen to contain these substrings mid-sentence.
+static RE_LOG_STACK_TRACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:^\s+at\s+|^\s+File\s+")"#).unwrap());
 
 // ============================================================================
 // Flags
@@ -83,7 +99,10 @@ fn parse_flags(args: &[String]) -> LogFlags {
 /// Run the `skim log` subcommand.
 ///
 /// Reads from stdin (mandatory — log is stdin-primary).
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
@@ -115,7 +134,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         crate::process::report_token_stats(raw_tokens, compressed_tokens, "");
     }
 
-    record_analytics(raw_tokens, compressed_tokens, duration, result.tier_name());
+    record_analytics(
+        analytics.enabled,
+        raw_tokens,
+        compressed_tokens,
+        duration,
+        result.tier_name(),
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -132,21 +157,21 @@ fn read_stdin() -> anyhow::Result<String> {
 
 /// Record analytics for this command invocation (fire-and-forget).
 fn record_analytics(
+    enabled: bool,
     raw_tokens: Option<usize>,
     compressed_tokens: Option<usize>,
     duration: std::time::Duration,
     tier: &str,
 ) {
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command_with_counts(
-            raw_tokens.unwrap_or(0),
-            compressed_tokens.unwrap_or(0),
-            "skim log".to_string(),
-            crate::analytics::CommandType::Log,
-            duration,
-            Some(tier),
-        );
-    }
+    crate::analytics::try_record_command_with_counts(
+        enabled,
+        raw_tokens.unwrap_or(0),
+        compressed_tokens.unwrap_or(0),
+        "skim log".to_string(),
+        crate::analytics::CommandType::Log,
+        duration,
+        Some(tier),
+    );
 }
 
 fn print_help() {
@@ -263,13 +288,39 @@ fn try_parse_json_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         all_entries.push((level, message));
     }
 
-    Some(apply_compression(all_entries, total_lines, flags))
+    Some(apply_compression(all_entries, total_lines, 0, flags))
 }
+
+/// Maximum byte length for a JSON log-level field.
+///
+/// Level values ("ERROR", "WARN", "INFO", "DEBUG", "TRACE") are well under
+/// 32 bytes; anything longer is either malformed or adversarial.
+const MAX_JSON_LEVEL_LEN: usize = 32;
+
+/// Maximum byte length for a JSON log-message field.
+///
+/// 16 KiB preserves meaningful log text while bounding adversarial allocation.
+/// Truncated values get a "[truncated]" suffix so consumers can detect elision.
+const MAX_JSON_MSG_LEN: usize = 16 * 1024;
 
 fn extract_json_level(obj: &Value) -> Option<String> {
     for key in &["level", "severity", "lvl", "log_level"] {
         if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
-            return Some(v.to_uppercase());
+            // Fast path: level values ("ERROR", "WARN", "INFO", "DEBUG",
+            // "TRACE") are overwhelmingly ASCII and well under 32 bytes.
+            // Byte-length check is a reliable proxy for char-length when
+            // the value is ASCII (byte == char), and level fields in
+            // non-ASCII locales still fit comfortably within the 32-byte
+            // cap (e.g. "WARNUNG" is 7 bytes / 7 chars, "ERREUR" is 6/6).
+            // Only adversarially long or non-BMP level values take the slow
+            // path, which is the case the cap exists to bound.
+            if v.len() <= MAX_JSON_LEVEL_LEN {
+                return Some(v.to_uppercase()); // 1 allocation
+            }
+            // Slow path: truncate at a char boundary to avoid splitting
+            // multi-byte sequences, then uppercase.
+            let truncated: String = v.chars().take(MAX_JSON_LEVEL_LEN).collect(); // alloc #1
+            return Some(truncated.to_uppercase()); // alloc #2
         }
     }
     None
@@ -278,7 +329,16 @@ fn extract_json_level(obj: &Value) -> Option<String> {
 fn extract_json_message(obj: &Value) -> Option<String> {
     for key in &["msg", "message", "text", "body"] {
         if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
-            return Some(v.to_string());
+            if v.len() <= MAX_JSON_MSG_LEN {
+                return Some(v.to_string());
+            }
+            // Truncate at a char boundary; append a marker so consumers know.
+            let mut s = String::with_capacity(MAX_JSON_MSG_LEN + 11);
+            for c in v.chars().take(MAX_JSON_MSG_LEN) {
+                s.push(c);
+            }
+            s.push_str("[truncated]");
+            return Some(s);
         }
     }
     None
@@ -288,18 +348,63 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 // Tier 2: regex-based log formats
 // ============================================================================
 
+/// Parse regex-based log formats into a LogResult.
+///
+/// # AD-10 (2026-04-11) — Stack trace capture and last-3-frame elision
+/// Stack trace lines (Java `at …`, Python `File "…"`) are buffered in
+/// `pending_stack`. When the next log line is encountered, the accumulated
+/// frames are attached to the previous entry's message:
+///
+/// 1. Total frame count is recorded as `total_frames`.
+/// 2. Keep only the **last** 3 frames (preserving their relative order):
+///    `pending_stack.iter().rev().take(3).rev()`.
+/// 3. The frames are appended as a newline-joined suffix to the previous
+///    entry's message.
+/// 4. Elided count: `total_frames.saturating_sub(3)` — accumulated across
+///    all entries and surfaced in `LogResult::stack_frames_elided`.
 fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     let mut all_entries: Vec<(Option<String>, String)> = Vec::with_capacity(256);
     let mut total_lines = 0usize;
     let mut found_structured = false;
+    // Stack trace capture state (AD-10)
+    let mut pending_stack: Vec<String> = Vec::new();
+    let mut total_stack_frames_elided: usize = 0;
 
     for line in input.lines().take(MAX_INPUT_LINES) {
         let trimmed = line.trim();
-        if trimmed.is_empty() || RE_LOG_STACK_TRACE.is_match(line) {
-            // Skip blank lines and stack trace lines (checked on original line to
-            // preserve leading whitespace detection).
+        if trimmed.is_empty() {
+            // Blank lines flush the pending stack (end of exception block).
+            if !pending_stack.is_empty() && !all_entries.is_empty() {
+                flush_stack_frames(
+                    &mut all_entries,
+                    &mut pending_stack,
+                    &mut total_stack_frames_elided,
+                );
+            }
             continue;
         }
+
+        // Check on the original (untrimmed) line to detect leading whitespace.
+        if RE_LOG_STACK_TRACE.is_match(line) {
+            // Sliding-window cap: drop the oldest frame and count it as elided
+            // immediately, keeping memory at O(PENDING_STACK_CAP).
+            if pending_stack.len() >= PENDING_STACK_CAP {
+                pending_stack.remove(0);
+                total_stack_frames_elided += 1;
+            }
+            pending_stack.push(trimmed.to_string());
+            continue;
+        }
+
+        // New log line: flush any accumulated stack frames onto the previous entry.
+        if !pending_stack.is_empty() && !all_entries.is_empty() {
+            flush_stack_frames(
+                &mut all_entries,
+                &mut pending_stack,
+                &mut total_stack_frames_elided,
+            );
+        }
+
         total_lines += 1;
 
         let without_ts = strip_timestamp(trimmed, flags.keep_timestamps);
@@ -311,6 +416,15 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         }
     }
 
+    // Flush any trailing stack frames at end-of-input.
+    if !pending_stack.is_empty() && !all_entries.is_empty() {
+        flush_stack_frames(
+            &mut all_entries,
+            &mut pending_stack,
+            &mut total_stack_frames_elided,
+        );
+    }
+
     // Issue 8: if no structured log levels were found, entries are plain text —
     // return None to fall through to Passthrough rather than producing a
     // misleading Degraded result.
@@ -318,7 +432,40 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
         return None;
     }
 
-    Some(apply_compression(all_entries, total_lines, flags))
+    Some(apply_compression(
+        all_entries,
+        total_lines,
+        total_stack_frames_elided,
+        flags,
+    ))
+}
+
+/// Flush `pending_stack` onto the last entry in `all_entries`.
+///
+/// Keeps the last 3 frames (in original order) and appends them as a
+/// newline-joined suffix. Increments `elided` by the number dropped.
+///
+/// Both `all_entries` and `pending_stack` must remain `&mut Vec` rather than
+/// slices: `all_entries` uses `.last_mut()` (Vec-level borrow), `pending_stack`
+/// calls `.clear()` which is not available on `&mut [_]`.
+#[allow(clippy::ptr_arg)]
+fn flush_stack_frames(
+    all_entries: &mut Vec<(Option<String>, String)>,
+    pending_stack: &mut Vec<String>,
+    elided: &mut usize,
+) {
+    let total = pending_stack.len();
+    let skip = total.saturating_sub(3);
+    *elided += skip;
+
+    if let Some((_, msg)) = all_entries.last_mut() {
+        for frame in pending_stack.iter().skip(skip) {
+            msg.push('\n');
+            msg.push_str(frame);
+        }
+    }
+
+    pending_stack.clear();
 }
 
 /// Strip the timestamp prefix from a log line, unless `keep_timestamps` is true.
@@ -380,16 +527,38 @@ fn filter_debug_entries(
     (filtered, debug_hidden)
 }
 
-/// Deduplicate entries by normalized message, incrementing count on collision.
+/// Deduplicate entries by level-aware normalized key, incrementing count on collision.
 ///
-/// Returns the deduplicated output entries.
+/// # AD-10 (2026-04-11) — Level-aware dedup
+/// The dedup key is `"{level}|{normalized_message}"` rather than just the
+/// normalized message. Previously an ERROR and a WARN with the same text were
+/// merged into a single entry, losing the level distinction. With level-aware
+/// keys, `ERROR: foo` and `WARN: foo` remain separate entries, so agents can
+/// accurately count ERROR vs WARN occurrences.
+///
+/// The `"-"` placeholder is used for entries with no level (e.g., unstructured
+/// plain-text lines) to keep the key format consistent.
 fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -> Vec<LogEntry> {
     // Issue 6: pre-size the dedup map and output vec to avoid repeated reallocation.
     let mut dedup_map: HashMap<String, usize> = HashMap::with_capacity(1024);
     let mut output_entries: Vec<LogEntry> = Vec::with_capacity(256);
 
+    // Scratch buffer reused across iterations: zero allocations on dedup-hit,
+    // one allocation on dedup-miss (the key clone for the map insert).
+    let mut key_buf = String::with_capacity(128);
+
     for (level, message) in entries {
-        let normalized = message.to_lowercase();
+        // AD-10: key includes level so ERROR+WARN with same text are NOT merged.
+        // Build the key in-place to avoid the two-allocation format!() pattern
+        // (to_lowercase() intermediate + format! output).
+        key_buf.clear();
+        key_buf.push_str(level.as_deref().unwrap_or("-"));
+        key_buf.push('|');
+        for c in message.chars() {
+            for lc in c.to_lowercase() {
+                key_buf.push(lc);
+            }
+        }
 
         if no_dedup {
             // Issue 3: `level` and `message` are owned — no clone needed.
@@ -398,11 +567,11 @@ fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -
                 message,
                 count: 1,
             });
-        } else if let Some(&idx) = dedup_map.get(&normalized) {
+        } else if let Some(&idx) = dedup_map.get(key_buf.as_str()) {
             output_entries[idx].count += 1;
         } else {
             let idx = output_entries.len();
-            dedup_map.insert(normalized, idx);
+            dedup_map.insert(key_buf.clone(), idx);
             // Issue 3: `level` and `message` are owned — no clone needed.
             output_entries.push(LogEntry {
                 level,
@@ -421,30 +590,39 @@ fn build_log_result(
     total_lines: usize,
     debug_hidden: usize,
     debug_only: bool,
+    stack_frames_elided: usize,
 ) -> LogResult {
     let unique_messages = output_entries.len();
     let deduplicated_count = total_lines
         .saturating_sub(unique_messages)
         .saturating_sub(debug_hidden);
 
-    LogResult::new(
+    LogResult::new_with_stack(
         total_lines,
         unique_messages,
         debug_hidden,
         deduplicated_count,
         output_entries,
         debug_only,
+        stack_frames_elided,
     )
 }
 
 fn apply_compression(
     all_entries: Vec<(Option<String>, String)>,
     total_lines: usize,
+    stack_frames_elided: usize,
     flags: &LogFlags,
 ) -> LogResult {
     let (filtered, debug_hidden) = filter_debug_entries(all_entries, flags);
     let output_entries = deduplicate_entries(filtered, flags.no_dedup);
-    build_log_result(output_entries, total_lines, debug_hidden, flags.debug_only)
+    build_log_result(
+        output_entries,
+        total_lines,
+        debug_hidden,
+        flags.debug_only,
+        stack_frames_elided,
+    )
 }
 
 // ============================================================================
@@ -645,17 +823,138 @@ mod tests {
     }
 
     #[test]
-    fn test_stack_trace_lines_skipped() {
+    fn test_stack_trace_lines_attached_to_entry() {
+        // AD-10: stack trace lines are now attached to the preceding entry, not skipped.
         let input = "ERROR: something failed\n    at main() line 5\n    at run() line 10\nINFO: continuing\n";
         let flags = make_flags();
         let result = try_parse_regex_logs(input, &flags).unwrap();
-        // Stack trace lines should be skipped
+        // The error entry should have both stack frames appended (only 2 frames, none elided).
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
         assert!(
+            error_entry.message.contains("at main()"),
+            "Stack frame should be attached to error entry: {}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("at run()"),
+            "Second stack frame should be attached: {}",
+            error_entry.message
+        );
+        // INFO entry should not contain stack frames
+        let info_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("INFO"))
+            .expect("INFO entry must exist");
+        assert!(
+            !info_entry.message.contains("at main()"),
+            "Stack frames must not bleed into INFO entry: {}",
+            info_entry.message
+        );
+    }
+
+    /// AD-10: ERROR and WARN entries with the same text must NOT merge.
+    #[test]
+    fn test_log_dedup_preserves_level() {
+        let input = load_fixture("dedup_error_warn.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        // ERROR+ERROR dedup'd to 1 ERROR(×2), WARN+WARN dedup'd to 1 WARN(×2),
+        // INFO stays as 1 INFO(×1) — 3 distinct entries total.
+        assert_eq!(
+            result.entries.len(),
+            3,
+            "ERROR and WARN with same message must remain separate: {:?}",
             result
                 .entries
                 .iter()
-                .all(|e| !e.message.contains("at main()")),
-            "Stack trace lines should not appear in entries"
+                .map(|e| (&e.level, &e.message, e.count))
+                .collect::<Vec<_>>()
+        );
+        let error = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .unwrap();
+        assert_eq!(error.count, 2, "ERROR must appear ×2");
+        let warn = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("WARN"))
+            .unwrap();
+        assert_eq!(warn.count, 2, "WARN must appear ×2");
+    }
+
+    /// AD-10: 5-frame Java trace → last 3 kept, 2 elided.
+    #[test]
+    fn test_log_stack_elision_keeps_last_3() {
+        let input = load_fixture("stack_trace_java.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+        // Last 3 of the 5 frames must be present.
+        assert!(
+            error_entry.message.contains("OrderService.run"),
+            "3rd-from-last frame must be kept: {}",
+            error_entry.message
+        );
+        assert!(
+            error_entry.message.contains("Main.main"),
+            "Last frame must be kept: {}",
+            error_entry.message
+        );
+        // First 2 frames (process, handle) must be absent.
+        assert!(
+            !error_entry.message.contains("OrderService.process"),
+            "Elided frame must not appear: {}",
+            error_entry.message
+        );
+    }
+
+    /// AD-10: elided count renders in the footer when non-zero.
+    #[test]
+    fn test_log_stack_elision_footer() {
+        let input = load_fixture("stack_trace_java.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        // 5 frames total, 3 kept → 2 elided.
+        assert_eq!(result.stack_frames_elided, 2, "Should elide 2 of 5 frames");
+        let display = result.as_ref();
+        assert!(
+            display.contains("+2 stack frames elided"),
+            "Footer must appear when frames are elided: {display}"
+        );
+    }
+
+    /// AD-10: Python `File "..."` stack traces are recognised.
+    #[test]
+    fn test_log_python_traceback_recognised() {
+        let input = load_fixture("stack_trace_python.txt");
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+        let error_entry = result
+            .entries
+            .iter()
+            .find(|e| e.level.as_deref() == Some("ERROR"))
+            .expect("ERROR entry must exist");
+        // Python traces use `File "…"` — must be attached and last-3 kept.
+        assert!(
+            error_entry.message.contains("threading.py"),
+            "Last Python frame must be kept: {}",
+            error_entry.message
+        );
+        // 4 frames total, 3 kept → 1 elided.
+        assert_eq!(
+            result.stack_frames_elided, 1,
+            "Should elide 1 of 4 Python frames"
         );
     }
 
@@ -769,5 +1068,100 @@ mod tests {
         assert_eq!(output.len(), 2);
         let hello = output.iter().find(|e| e.message == "hello").unwrap();
         assert_eq!(hello.count, 2);
+    }
+
+    /// Regression test for the unbounded `pending_stack` growth fix (batch-3-log).
+    ///
+    /// Feeds an ERROR line followed by 20 stack-trace frames. Before the fix,
+    /// all 20 frames would be accumulated in `pending_stack` before
+    /// `flush_stack_frames` discarded 17 of them — wasting ~17× the necessary
+    /// allocation. After the fix, `pending_stack` never exceeds PENDING_STACK_CAP
+    /// frames; the elision is counted incrementally as frames arrive.
+    ///
+    /// Invariants verified:
+    /// 1. `stack_frames_elided` == 20 - 3 == 17 (last 3 kept, rest elided).
+    /// 2. The rendered output contains the elision summary line.
+    /// 3. None of the elided frames appear in the rendered output.
+    #[test]
+    fn test_pending_stack_cap_elides_excess_frames() {
+        // Build input: one ERROR line + 20 stack frames + a follow-up INFO line
+        // to trigger the final flush.
+        let mut input = String::from("ERROR: something went wrong\n");
+        for i in 1..=20 {
+            input.push_str(&format!(
+                "    at com.example.Service.frame{i}(Service.java:{i})\n"
+            ));
+        }
+        input.push_str("INFO: recovered\n");
+
+        let flags = make_flags();
+        let result = try_parse_regex_logs(&input, &flags).unwrap();
+
+        // 20 frames total, last 3 kept → 17 elided.
+        assert_eq!(
+            result.stack_frames_elided, 17,
+            "Expected 17 elided frames (20 total, last 3 kept), got {}",
+            result.stack_frames_elided
+        );
+
+        let display = result.as_ref();
+
+        // Rendered output must surface the elision count.
+        assert!(
+            display.contains("+17 stack frames elided"),
+            "Output must contain elision summary; got: {display}"
+        );
+
+        // Frame 1 must have been dropped by the cap. Match on the exact frame
+        // name to avoid substring collisions with "frame10"–"frame17".
+        assert!(
+            !display.contains("frame1(Service.java:1)"),
+            "Elided frame1 must not appear in output; got: {display}"
+        );
+
+        // The last 3 frames (18, 19, 20) must be present.
+        assert!(
+            display.contains("frame18"),
+            "frame18 (3rd-from-last) must be kept; got: {display}"
+        );
+        assert!(
+            display.contains("frame20"),
+            "frame20 (last) must be kept; got: {display}"
+        );
+    }
+
+    /// Regression test: extract_json_message truncates oversized fields.
+    ///
+    /// A pathological JSON line with a message field larger than MAX_JSON_MSG_LEN
+    /// must be truncated to MAX_JSON_MSG_LEN chars and suffixed with "[truncated]".
+    #[test]
+    fn test_extract_json_message_truncates_large_field() {
+        let large_msg = "A".repeat(MAX_JSON_MSG_LEN + 100);
+        let obj = serde_json::json!({ "msg": large_msg });
+        let result = extract_json_message(&obj).unwrap();
+        assert!(
+            result.ends_with("[truncated]"),
+            "Oversized message must end with [truncated]; got len={}",
+            result.len()
+        );
+        // The result must not exceed MAX_JSON_MSG_LEN chars + len("[truncated]").
+        assert!(
+            result.chars().count() <= MAX_JSON_MSG_LEN + 11,
+            "Truncated message must not exceed bound; got len={}",
+            result.len()
+        );
+    }
+
+    /// Regression test: extract_json_level truncates oversized level fields.
+    #[test]
+    fn test_extract_json_level_truncates_large_field() {
+        let large_level = "X".repeat(MAX_JSON_LEVEL_LEN + 50);
+        let obj = serde_json::json!({ "level": large_level });
+        let result = extract_json_level(&obj).unwrap();
+        assert_eq!(
+            result.chars().count(),
+            MAX_JSON_LEVEL_LEN,
+            "Level must be truncated to MAX_JSON_LEVEL_LEN chars"
+        );
     }
 }

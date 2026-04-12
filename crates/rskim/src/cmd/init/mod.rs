@@ -34,7 +34,10 @@ pub(crate) use state::has_skim_hook_entry;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 
 /// Run the `init` subcommand.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    _analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     // Unix-only guard
     if !cfg!(unix) {
         anyhow::bail!(

@@ -17,9 +17,10 @@ pub(super) fn run_log(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--format", "--pretty"]) {
-        return run_passthrough(global_flags, "log", args, show_stats);
+        return run_passthrough(global_flags, "log", args, show_stats, analytics_enabled);
     }
 
     // Strip --oneline — handler injects its own --format flag.
@@ -40,11 +41,12 @@ pub(super) fn run_log(
 
     full_args.extend_from_slice(&filtered_args);
 
-    let label = super::build_analytics_label("log", args, show_stats);
+    let label = super::build_analytics_label("log", args, show_stats, analytics_enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
+        analytics_enabled,
         output_format,
         false,
         label,
@@ -57,19 +59,16 @@ fn parse_log(output: &str) -> GitResult {
     let lines: Vec<String> = output
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
+        .map(str::to_string)
         .collect();
 
-    let count = lines.len();
-    let summary = if count == 0 {
-        "no commits".to_string()
-    } else if count == 1 {
-        "1 commit".to_string()
-    } else {
-        format!("{count} commits")
+    let summary = match lines.len() {
+        0 => "no commits".to_string(),
+        1 => "1 commit".to_string(),
+        n => format!("{n} commits"),
     };
 
-    GitResult::new("log".to_string(), summary, lines)
+    GitResult::new("log".to_string(), summary, lines).with_tier("full")
 }
 
 // ============================================================================
@@ -110,5 +109,18 @@ mod tests {
         let result = parse_log("");
         assert_eq!(result.summary, "no commits");
         assert!(result.details.is_empty());
+    }
+
+    /// AD-12: parse_tier must be propagated so analytics can bucket git log
+    /// invocations by tier. The log parser always succeeds (no fallback tiers),
+    /// so every result is tagged `"full"`.
+    #[test]
+    fn test_parse_log_parse_tier_is_full() {
+        let result = parse_log("abc1234 feat: init (1 day ago) <Author>\n");
+        assert_eq!(
+            result.parse_tier,
+            Some("full"),
+            "git log parser must tag parse_tier as 'full' (AD-12)"
+        );
     }
 }

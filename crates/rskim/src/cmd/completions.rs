@@ -15,7 +15,10 @@ use clap_complete::Shell;
 /// Parses a shell name from `args`, builds a full synthetic command that
 /// includes all file-operation flags and known subcommands, then generates
 /// the completion script to stdout.
-pub(crate) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    _analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     // Handle --help / -h (matches existing dispatch pattern)
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();

@@ -1,0 +1,22 @@
+{
+  "number": 42,
+  "title": "wip: draft PR with conflicts",
+  "state": "OPEN",
+  "isDraft": true,
+  "mergeable": "CONFLICTING",
+  "author": {"login": "dev"},
+  "body": "Work in progress.",
+  "labels": [],
+  "assignees": [],
+  "milestone": null,
+  "headRefName": "feature/wip",
+  "baseRefName": "main",
+  "additions": 10,
+  "deletions": 5,
+  "changedFiles": 2,
+  "statusCheckRollup": [
+    {"name": "ci/build", "conclusion": "FAILURE", "startedAt": "2026-04-11T08:00:00Z"},
+    {"name": "ci/lint", "conclusion": "PENDING", "startedAt": "2026-04-11T08:01:00Z"}
+  ],
+  "comments": []
+}

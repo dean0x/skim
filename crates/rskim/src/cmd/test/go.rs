@@ -23,7 +23,11 @@ use crate::runner::CommandRunner;
 /// Injects `-json` if the user hasn't already set `-json` or `-v`,
 /// then runs the command through [`CommandRunner`] and parses output
 /// via three-tier degradation.
-pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     let mut go_args: Vec<String> = vec!["test".to_string()];
 
     // Inject -json before any `--` separator, unless the user already specified
@@ -98,17 +102,15 @@ pub(crate) fn run(args: &[String], show_stats: bool) -> anyhow::Result<ExitCode>
     }
 
     // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid .to_string() allocation when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            combined,
-            parsed.content().to_string(),
-            format!("skim test go {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
-            output.duration,
-            Some(parsed.tier_name()),
-        );
-    }
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        combined,
+        parsed.content().to_string(),
+        format!("skim test go {}", args.join(" ")),
+        crate::analytics::CommandType::Test,
+        output.duration,
+        Some(parsed.tier_name()),
+    );
 
     Ok(exit_code)
 }

@@ -20,6 +20,8 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
 
+use super::shared::{scrape_failures, TestKind};
+
 // ============================================================================
 // Public entry point
 // ============================================================================
@@ -28,7 +30,12 @@ use crate::runner::CommandRunner;
 ///
 /// `program` is the runner binary name (e.g. `"vitest"` or `"jest"`), used when
 /// stdin is not piped and we need to spawn the process directly.
-pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    program: &str,
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     let start = std::time::Instant::now();
     let raw_output = if stdin_has_data() {
         read_stdin()?
@@ -68,17 +75,15 @@ pub(crate) fn run(program: &str, args: &[String], show_stats: bool) -> anyhow::R
     }
 
     // Record analytics (fire-and-forget, non-blocking).
-    // Guard to avoid .to_string() allocation when analytics are disabled.
-    if crate::analytics::is_analytics_enabled() {
-        crate::analytics::try_record_command(
-            raw_output,
-            result.content().to_string(),
-            format!("skim test {program} {}", args.join(" ")),
-            crate::analytics::CommandType::Test,
-            start.elapsed(),
-            Some(result.tier_name()),
-        );
-    }
+    crate::analytics::try_record_command(
+        analytics_enabled,
+        raw_output,
+        result.content().to_string(),
+        format!("skim test {program} {}", args.join(" ")),
+        crate::analytics::CommandType::Test,
+        start.elapsed(),
+        Some(result.tier_name()),
+    );
 
     Ok(exit_code)
 }
@@ -135,7 +140,7 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
         final_args.push("--reporter=json".to_string());
     }
 
-    let arg_refs: Vec<&str> = final_args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
 
     let runner = CommandRunner::new(None);
     let output = runner.run(program, &arg_refs).map_err(|e| {
@@ -374,7 +379,14 @@ static COMMA_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Try to parse test summary from plain text output using regex patterns.
+///
+/// When failures are detected, individual test names are scraped via
+/// [`scrape_failures`] so the Tier-2 result includes a list of failing
+/// tests rather than an empty entries list (AD-Commit2, 2026-04-11).
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
+    // Strip ANSI once here; pass `cleaned` into `scrape_failures` so it can
+    // skip its own ANSI-strip pass (fast-path in shared::scrape_failures detects
+    // the absence of ESC bytes and borrows the slice directly — no second scan).
     let cleaned = crate::output::strip_ansi(raw);
 
     // Pattern 1: "Tests  3 passed | 0 failed | 3 total"
@@ -390,7 +402,12 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
             skip,
             duration_ms: None,
         };
-        return Some(TestResult::new(summary, vec![]));
+        let entries = if fail > 0 {
+            scrape_failures(&cleaned, TestKind::Vitest)
+        } else {
+            vec![]
+        };
+        return Some(TestResult::new(summary, entries));
     }
 
     // Pattern 2: "Tests:\s+N passed(?:,\s+N failed)?(?:,\s+N total)?"
@@ -412,7 +429,12 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
             skip,
             duration_ms: None,
         };
-        return Some(TestResult::new(summary, vec![]));
+        let entries = if fail > 0 {
+            scrape_failures(&cleaned, TestKind::Vitest)
+        } else {
+            vec![]
+        };
+        return Some(TestResult::new(summary, entries));
     }
 
     None
@@ -708,6 +730,33 @@ Duration: 1.5s";
             assert_eq!(test_result.summary.fail, 2);
             assert_eq!(test_result.summary.skip, 0);
         }
+    }
+
+    /// AD-Commit2 integration: Tier-2 vitest path must scrape failing-test names
+    /// from the real fixture and populate `entries` (not `vec![]`). Regression
+    /// guard for the original scrape_failures wiring + the indented-line regex.
+    #[test]
+    fn test_tier2_regex_scrapes_failing_test_names_from_fixture() {
+        let fixture = std::fs::read_to_string({
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests/fixtures/cmd/test/vitest_regex_fail.txt");
+            p
+        })
+        .expect("fixture must load");
+        let result = try_parse_regex(&fixture).expect("must parse");
+        assert!(result.summary.fail > 0, "fixture must declare failures");
+        assert!(
+            !result.entries.is_empty(),
+            "Tier-2 must populate failing test names from vitest output, got empty entries"
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|e| e.name.contains("divides by zero")),
+            "entries must include the failing test name 'divides by zero': {:?}",
+            result.entries
+        );
     }
 
     // ========================================================================

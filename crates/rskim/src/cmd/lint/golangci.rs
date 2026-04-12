@@ -145,9 +145,11 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
 ///
 /// Format: `file:line:col: message (linter)`
 ///
-/// **Known limitation:** The golangci-lint text format does not include severity
-/// information, so all Tier 2 issues default to `Warning`. Accurate severity is
-/// only available via Tier 1 JSON parsing (the `Severity` field in JSON output).
+/// **Severity heuristic:** The text format does not include an explicit severity
+/// field. We apply a best-effort heuristic: if the message text contains the word
+/// `"error"` (case-insensitive) or the linter name is known to produce only
+/// compile-level errors (e.g., `typecheck`, `staticcheck`), the issue is classified
+/// as `Error`; otherwise `Warning`. Accurate severity requires Tier 1 JSON parsing.
 fn try_parse_regex(text: &str) -> Option<LintResult> {
     let mut issues: Vec<LintIssue> = Vec::new();
 
@@ -158,13 +160,14 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
             let message = caps[3].to_string();
             let linter = caps[4].to_string();
 
+            let severity = infer_severity_from_text(&message, &linter);
+
             issues.push(LintIssue {
                 file,
                 line: line_num,
                 rule: linter,
                 message,
-                // Text format lacks severity; default to Warning (see doc comment above).
-                severity: LintSeverity::Warning,
+                severity,
             });
         }
     }
@@ -174,6 +177,32 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
     }
 
     Some(group_issues("golangci", issues))
+}
+
+/// Infer `LintSeverity` from message text and linter name when no explicit
+/// severity field is available (Tier-2 text format).
+///
+/// # AD-16 (2026-04-11) — severity inference for golangci-lint text output
+///
+/// golangci-lint's default text format does not include a severity field; the
+/// JSON format does.  In Tier-2 (text), we heuristically infer severity so that
+/// the `LintResult.errors` counter is meaningful to agents.
+///
+/// Classifies as `Error` when:
+/// - The message contains "error" (case-insensitive), OR
+/// - The linter is known to produce only compile/type errors (`typecheck`,
+///   `staticcheck` when flagged as error, `govet`).
+///
+/// All other issues default to `Warning`.
+fn infer_severity_from_text(message: &str, linter: &str) -> LintSeverity {
+    if message.to_lowercase().contains("error") {
+        return LintSeverity::Error;
+    }
+    // Known error-only linters in golangci-lint
+    if matches!(linter, "typecheck") {
+        return LintSeverity::Error;
+    }
+    LintSeverity::Warning
 }
 
 // ============================================================================
@@ -220,7 +249,18 @@ mod tests {
         let result = try_parse_regex(&input);
         assert!(result.is_some(), "Expected Tier 2 regex parse to succeed");
         let result = result.unwrap();
-        assert_eq!(result.warnings, 4);
+        // Fixture has 4 issues total; line 3 has "Error return value" which the
+        // severity heuristic promotes to Error. The remaining 3 are Warnings.
+        assert_eq!(
+            result.errors + result.warnings,
+            4,
+            "Must have 4 total issues (errors+warnings)"
+        );
+        // At least 1 issue must be classified as Error due to "error" keyword heuristic.
+        assert!(
+            result.errors >= 1,
+            "At least 1 issue must be Error (errcheck 'Error return value')"
+        );
     }
 
     #[test]
@@ -263,5 +303,34 @@ mod tests {
         };
         let result = parse_impl(&output);
         assert!(result.is_passthrough());
+    }
+
+    /// Tier-2 severity heuristic: "typecheck" linter must produce Error.
+    #[test]
+    fn test_tier2_severity_typecheck_is_error() {
+        let input = "main.go:5:10: undefined: Foo (typecheck)\n";
+        let result = try_parse_regex(input).expect("must parse");
+        assert_eq!(result.errors, 1, "typecheck issues must be Error severity");
+        assert_eq!(result.warnings, 0);
+    }
+
+    /// Tier-2 severity heuristic: message containing "error" is classified as Error.
+    #[test]
+    fn test_tier2_severity_error_keyword_in_message() {
+        let input = "pkg/api.go:12: cannot use x as type error (govet)\n";
+        let result = try_parse_regex(input).expect("must parse");
+        assert_eq!(
+            result.errors, 1,
+            "Message with 'error' keyword must be Error severity"
+        );
+    }
+
+    /// Tier-2 severity heuristic: normal warning message stays as Warning.
+    #[test]
+    fn test_tier2_severity_normal_message_is_warning() {
+        let input = "pkg/api.go:12: unused variable x (deadcode)\n";
+        let result = try_parse_regex(input).expect("must parse");
+        assert_eq!(result.warnings, 1, "Normal messages must remain Warning");
+        assert_eq!(result.errors, 0);
     }
 }

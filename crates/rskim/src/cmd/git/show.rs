@@ -31,6 +31,17 @@
 //! token unambiguously signals a tree-object ref, while its absence means a
 //! commit-ish. All other dispatch logic (passthrough flags, `--json` rejection,
 //! annotated-tag detection) is layered on top of this primary shape test.
+//!
+//! **AD-8 (2026-04-11)** — Commit body and merge-parent preservation.
+//!
+//! `CommitHeader` now captures `body` (full multi-paragraph commit message
+//! below the subject line) and `parents` (the tail of `Merge: ` header lines,
+//! stored as a structured `Option<String>` field rather than inlined into the
+//! body). `parents` is rendered as `Merge: {parents}` before the summary line;
+//! `body` is appended as `\n\n{body}` only when non-empty, so subject-only
+//! commits remain compact. GPG/SSH signature blocks (`gpgsig `/ `mergetag `
+//! lines and their continuation lines) appear before the blank separator and
+//! are silently skipped — they are implementation artefacts, not user content.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -41,11 +52,12 @@ use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
 use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
 
-use super::diff::{parse_unified_diff, render_diff_file, DiffMode};
-use super::{
-    build_analytics_label, finalize_git_output, finalize_git_output_owned, map_exit_code,
-    run_passthrough,
+use rayon::prelude::*;
+
+use super::diff::{
+    parse_unified_diff, render_diff_file, DiffMode, MAX_AST_FILE_COUNT, PARALLEL_THRESHOLD,
 };
+use super::{build_analytics_label, finalize_git_output_owned, map_exit_code, run_passthrough};
 
 // ============================================================================
 // Utilities
@@ -172,6 +184,7 @@ pub(super) fn run_show(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_show_help();
@@ -180,17 +193,26 @@ pub(super) fn run_show(
 
     // Passthrough for stat-family and format flags.
     if user_has_flag(args, PASSTHROUGH_FLAGS) {
-        return run_passthrough(global_flags, "show", args, show_stats);
+        return run_passthrough(global_flags, "show", args, show_stats, analytics_enabled);
     }
 
     match detect_show_mode(args) {
-        ShowMode::MultiRef => run_passthrough(global_flags, "show", args, show_stats),
+        ShowMode::MultiRef => {
+            run_passthrough(global_flags, "show", args, show_stats, analytics_enabled)
+        }
         ShowMode::FileContent { refpath } => {
-            run_show_file_content(global_flags, args, &refpath, show_stats)
+            run_show_file_content(global_flags, args, &refpath, show_stats, analytics_enabled)
         }
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
-            run_show_commit(global_flags, &git_args, args, output_format, show_stats)
+            run_show_commit(
+                global_flags,
+                &git_args,
+                args,
+                output_format,
+                show_stats,
+                analytics_enabled,
+            )
         }
     }
 }
@@ -202,13 +224,110 @@ pub(super) fn run_show(
 /// Parsed fields from a `git show` commit header.
 #[derive(Debug, Default)]
 struct CommitHeader {
+    /// Full 40-character commit hash.
     hash: String,
+    /// Author name and email.
     author: String,
+    /// Commit date string.
     date: String,
+    /// First (subject) line of the commit message.
     subject: String,
+    /// Full commit message body below the subject line (may be empty).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Multi-paragraph bodies are preserved verbatim with 4-space indent stripped.
+    /// Empty when the commit has only a subject line.
+    body: String,
+    /// Tail of a `Merge: ` header line, when present (e.g. `"abc123 def456"`).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Stored as a structured field rather than inlined into `body` so that
+    /// `ShowCommitResult::render` can emit `Merge: {parents}` as a dedicated
+    /// prefix line. Octopus merges have all parent hashes in one space-separated
+    /// string — the tail is stored unchanged.
+    parents: Option<String>,
 }
 
-/// Parse commit header lines (up to the first blank line after the message).
+/// Walk `header_region` lines and populate `header` with extracted fields.
+///
+/// Returns the accumulated body lines as `Vec<&str>` slices borrowed from
+/// `header_region`, avoiding per-line allocations (zero-copy body accumulation).
+///
+/// # State machine
+/// - Phase 0 (`in_body == false`): parse git trailer lines (`commit `,
+///   `Author: `, `Date: `, `Merge: `). All other lines (gpgsig, mergetag,
+///   continuation lines starting with a space) are silently skipped per AD-8.
+/// - Phase 1 (`in_body == true`, `subject_captured == false`): capture the
+///   subject (first non-blank body line), stripping the canonical 4-space indent.
+/// - Phase 2 (`in_body == true`, `subject_captured == true`): accumulate body
+///   lines, stripping 4-space indent.
+fn parse_header_lines<'a>(header_region: &'a str, header: &mut CommitHeader) -> Vec<&'a str> {
+    // Extract the trimmed value from a `Key: value` header line.
+    let header_value = |line: &str, prefix: &str| -> String {
+        line.strip_prefix(prefix)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+
+    let mut in_body = false;
+    let mut subject_captured = false;
+    let mut body_lines: Vec<&'a str> = Vec::new();
+
+    for line in header_region.lines() {
+        if !in_body {
+            if line.starts_with("commit ") {
+                header.hash = header_value(line, "commit ");
+            } else if line.starts_with("Merge: ") {
+                // AD-8: capture merge parents as structured field.
+                header.parents = Some(header_value(line, "Merge: "));
+            } else if line.starts_with("Author: ") {
+                header.author = header_value(line, "Author: ");
+            } else if line.starts_with("Date: ") {
+                header.date = header_value(line, "Date: ");
+            } else if line.is_empty() && !header.hash.is_empty() {
+                in_body = true;
+            }
+        } else if !subject_captured {
+            // Phase 1: first non-blank line is the subject.
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                header.subject = line.strip_prefix("    ").unwrap_or(trimmed).to_string();
+                subject_captured = true;
+            }
+        } else {
+            // Phase 2: borrow each body line slice — no allocation per line.
+            body_lines.push(line.strip_prefix("    ").unwrap_or(line));
+        }
+    }
+
+    body_lines
+}
+
+/// Trim leading and trailing blank lines from accumulated body slices and join.
+///
+/// Leading blanks arise from the blank separator between subject and body.
+/// Trailing blanks arise from the header_region split position.
+/// Returns an empty `String` when no non-blank lines remain.
+fn trim_body_blanks(body_lines: &[&str]) -> String {
+    let start = body_lines
+        .iter()
+        .position(|l| !l.trim().is_empty())
+        .unwrap_or(body_lines.len());
+    let end = body_lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    if start < end {
+        body_lines[start..end].join("\n")
+    } else {
+        String::new()
+    }
+}
+
+/// Parse the commit header and split off the diff body from `git show` output.
 ///
 /// Returns `(header, diff_body)` where `diff_body` starts at the first
 /// `diff --git` line, or is empty if no diff is present.
@@ -222,9 +341,15 @@ struct CommitHeader {
 /// missing trailing newlines, and other quirks that would misalign a
 /// hand-rolled byte counter. Git outputs LF by default but users may pipe
 /// through tools that introduce CRLF.
+///
+/// # Signature blocks (AD-8)
+/// `gpgsig ` and `mergetag ` header lines (and their multi-line continuations
+/// that start with a space) appear between the `commit ` line and the blank
+/// separator. They are silently skipped — they are implementation artefacts,
+/// not user-authored content. The skip is implicit: only lines whose prefixes
+/// are explicitly recognised (`commit `, `Author: `, `Date: `, `Merge: `) are
+/// captured; everything else is ignored.
 fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
-    let mut header = CommitHeader::default();
-
     // Annotated tags start with `tag ` not `commit `.
     if !raw.starts_with("commit ") {
         return None;
@@ -233,67 +358,53 @@ fn parse_commit_header(raw: &str) -> Option<(CommitHeader, &str)> {
     // Locate the split position between the commit header and the diff body.
     // The leading `\n` anchors the match to the start of a line to avoid
     // false positives inside commit message bodies that might mention
-    // `diff --git` textually.  `split_at(pos)` makes the contract explicit:
-    // header_region = everything up to (but not including) the `\n`, and
-    // diff_body starts exactly at `diff --git`.
+    // `diff --git` textually.
     let split_pos = raw
         .find("\ndiff --git ")
         .map(|p| p + 1)
         .unwrap_or(raw.len());
     let (header_region, diff_body) = raw.split_at(split_pos);
 
-    // Walk the header region to extract hash/author/date/subject.
-    // `lines()` handles both LF and CRLF endings.
-
-    let mut in_body = false;
-    for line in header_region.lines() {
-        if in_body {
-            // First non-blank line after the blank separator is the subject.
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && header.subject.is_empty() {
-                header.subject = trimmed.to_string();
-                break; // Subject captured; no need to scan remaining header lines.
-            }
-        } else if line.starts_with("commit ") {
-            header.hash = line
-                .strip_prefix("commit ")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        } else if line.starts_with("Author: ") {
-            header.author = line
-                .strip_prefix("Author: ")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        } else if line.starts_with("Date: ") {
-            header.date = line
-                .strip_prefix("Date: ")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-        } else if line.is_empty() && !header.hash.is_empty() {
-            in_body = true;
-        }
-    }
+    let mut header = CommitHeader::default();
+    let body_lines = parse_header_lines(header_region, &mut header);
 
     if header.hash.is_empty() {
         return None;
     }
 
+    header.body = trim_body_blanks(&body_lines);
+
     Some((header, diff_body))
 }
 
-/// Execute `git show` and return `(stdout, stderr, duration)` on success.
+/// Outcome of invoking `git show` via [`run_git_show_raw`].
 ///
-/// On non-zero exit the error streams are forwarded to the terminal and the
-/// appropriate exit code is returned via the `Err` variant of the inner
-/// `ExitCode`. Using a dedicated return type avoids surfacing git process
-/// errors as `anyhow::Error`, keeping the call-site match arm clean.
+/// Split into `Success` and `Failure` so callers can record failure analytics
+/// at the call site without losing the stdout that git produced on the error
+/// path (e.g. partial output from `git show INVALID`). Mirrors the
+/// non-zero-exit recording pattern established in `run_parsed_command`
+/// (cmd/git/mod.rs) and `diff/mod.rs`.
+enum ShowRawOutcome {
+    Success {
+        stdout: String,
+        duration: std::time::Duration,
+    },
+    Failure {
+        stdout: String,
+        exit_code: ExitCode,
+        duration: std::time::Duration,
+    },
+}
+
+/// Execute `git show` and return a structured outcome.
+///
+/// On non-zero exit the error streams are forwarded to the terminal, and the
+/// stdout, exit code, and duration are returned via [`ShowRawOutcome::Failure`]
+/// so the caller can record analytics for the failed invocation (Commit 9).
 fn run_git_show_raw(
     global_flags: &[String],
     git_args: &[String],
-) -> anyhow::Result<Result<(String, std::time::Duration), ExitCode>> {
+) -> anyhow::Result<ShowRawOutcome> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["show".to_string(), "--no-color".to_string()]);
     full_args.extend_from_slice(git_args);
@@ -308,10 +419,17 @@ fn run_git_show_raw(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        return Ok(Err(map_exit_code(output.exit_code)));
+        return Ok(ShowRawOutcome::Failure {
+            stdout: output.stdout,
+            exit_code: map_exit_code(output.exit_code),
+            duration: output.duration,
+        });
     }
 
-    Ok(Ok((output.stdout, output.duration)))
+    Ok(ShowRawOutcome::Success {
+        stdout: output.stdout,
+        duration: output.duration,
+    })
 }
 
 /// Parse the commit body and render it into a `ShowCommitResult`.
@@ -338,23 +456,45 @@ fn render_show_diff(
     let (header, diff_body) = parse_commit_header(raw)?;
 
     let file_diffs = parse_unified_diff(diff_body);
-    let mut rendered_diff = String::new();
-    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::new();
 
-    for (i, file_diff) in file_diffs.iter().enumerate() {
+    // Mirror run_diff's parallel dispatch: use rayon when file count exceeds
+    // PARALLEL_THRESHOLD, serial otherwise.  `par_iter().collect()` preserves
+    // insertion order so output is deterministic regardless of scheduling.
+    let render_one = |i: usize, fd: &_| {
         let rendered = render_diff_file(
-            file_diff,
+            fd,
             global_flags,
             git_args,
             DiffMode::Default,
-            i >= super::diff::MAX_AST_FILE_COUNT,
+            i >= MAX_AST_FILE_COUNT,
         );
+        let entry = DiffFileEntry {
+            path: fd.path.clone(),
+            status: fd.status.clone(),
+            changed_regions: fd.hunks.len(),
+        };
+        (rendered, entry)
+    };
+
+    let rendered_files: Vec<(String, DiffFileEntry)> = if file_diffs.len() >= PARALLEL_THRESHOLD {
+        file_diffs
+            .par_iter()
+            .enumerate()
+            .map(|(i, fd)| render_one(i, fd))
+            .collect()
+    } else {
+        file_diffs
+            .iter()
+            .enumerate()
+            .map(|(i, fd)| render_one(i, fd))
+            .collect()
+    };
+
+    let mut rendered_diff = String::new();
+    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::with_capacity(rendered_files.len());
+    for (rendered, entry) in rendered_files {
         rendered_diff.push_str(&rendered);
-        diff_file_entries.push(DiffFileEntry {
-            path: file_diff.path.clone(),
-            status: file_diff.status.clone(),
-            changed_regions: file_diff.hunks.len(),
-        });
+        diff_file_entries.push(entry);
     }
 
     Some(ShowCommitResult::new(
@@ -362,6 +502,8 @@ fn render_show_diff(
         header.author,
         header.date,
         header.subject,
+        header.body,
+        header.parents,
         diff_file_entries,
         &rendered_diff,
     ))
@@ -375,14 +517,15 @@ fn render_show_diff(
 ///
 /// Both output formats use [`finalize_git_output_owned`] to move strings
 /// directly into the analytics call — eliminating the conditional `Option`
-/// clone dance that previously guarded against a TOCTOU double-check of
-/// `is_analytics_enabled()` (MEDIUM-11, MEDIUM-22).
+/// clone dance that previously required a TOCTOU double-check of
+/// an analytics-enabled global (MEDIUM-11, MEDIUM-22).
 fn emit_show_commit(
     result: ShowCommitResult,
     raw: String,
     label: String,
     output_format: OutputFormat,
     show_stats: bool,
+    analytics_enabled: bool,
     duration: std::time::Duration,
 ) -> anyhow::Result<()> {
     match output_format {
@@ -399,8 +542,10 @@ fn emit_show_commit(
                 json,
                 label,
                 show_stats,
+                analytics_enabled,
                 crate::analytics::CommandType::Git,
                 duration,
+                Some("full"),
             );
         }
         OutputFormat::Text => {
@@ -413,7 +558,7 @@ fn emit_show_commit(
             // Guarding here avoids a full memcpy (~100-500 KB) on the no-telemetry
             // hot path (HIGH-1).  The owned variant then moves both strings into
             // `finalize_git_output_owned` without further cloning (MEDIUM-22).
-            let raw_for_record = if show_stats || crate::analytics::is_analytics_enabled() {
+            let raw_for_record = if show_stats || analytics_enabled {
                 raw.clone()
             } else {
                 String::new()
@@ -426,8 +571,10 @@ fn emit_show_commit(
                 final_output,
                 label,
                 show_stats,
+                analytics_enabled,
                 crate::analytics::CommandType::Git,
                 duration,
+                Some("full"),
             );
         }
     }
@@ -446,36 +593,66 @@ fn run_show_commit(
     original_args: &[String],
     output_format: OutputFormat,
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     let (raw, duration) = match run_git_show_raw(global_flags, git_args)? {
-        Ok(pair) => pair,
-        Err(code) => return Ok(code),
+        ShowRawOutcome::Success { stdout, duration } => (stdout, duration),
+        ShowRawOutcome::Failure {
+            stdout,
+            exit_code,
+            duration,
+        } => {
+            // Record analytics on the failure path so the DB reflects failed
+            // `git show` invocations (Commit 9). raw == compressed
+            // (passthrough semantics) — mirrors run_parsed_command and
+            // run_diff non-zero-exit recording. Move stdout: 1 allocation
+            // (clone) on the analytics path, 0 when disabled (PF-018).
+            super::finalize_git_output_passthrough(
+                stdout,
+                build_analytics_label("show", original_args, show_stats, analytics_enabled),
+                show_stats,
+                analytics_enabled,
+                crate::analytics::CommandType::Git,
+                duration,
+                Some("passthrough"),
+            );
+            return Ok(exit_code);
+        }
     };
 
     // Built before the `render_show_diff` check so both the passthrough and
     // the normal path share the same label (HIGH-3).  Derived from *original*
     // args (before `--json` extraction) so the DB records the full invocation.
-    let label = build_analytics_label("show", original_args, show_stats);
+    let label = build_analytics_label("show", original_args, show_stats, analytics_enabled);
 
     let Some(result) = render_show_diff(&raw, global_flags, git_args) else {
         // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
         // Route through finalize so the analytics DB records a zero-compression
         // entry instead of silently dropping the invocation (HIGH-3).
-        // raw == output here, so pass the same &str twice via the borrowed
-        // variant — avoids an unconditional clone.
+        // raw == output; move raw into the passthrough variant: 1 allocation
+        // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
         print!("{raw}");
-        finalize_git_output(
-            &raw,
-            &raw,
+        super::finalize_git_output_passthrough(
+            raw,
             label,
             show_stats,
+            analytics_enabled,
             crate::analytics::CommandType::Git,
             duration,
+            Some("passthrough"),
         );
         return Ok(ExitCode::SUCCESS);
     };
 
-    emit_show_commit(result, raw, label, output_format, show_stats, duration)?;
+    emit_show_commit(
+        result,
+        raw,
+        label,
+        output_format,
+        show_stats,
+        analytics_enabled,
+        duration,
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -499,22 +676,37 @@ fn run_show_commit(
 /// computed via a guarded `if/else` that returns `String::new()` when neither
 /// `--show-stats` nor analytics are enabled, so each branch allocates at most
 /// one String — allocation is deferred to branch-time, not cached (MEDIUM-24).
+///
+/// Emits a stderr notice matching `diff/mod.rs:301` `[skim:guardrail]` style so
+/// callers can observe which tier was selected without parsing structured output.
 fn passthrough_file_content(
-    raw: &str,
+    raw: String,
     label: String,
     show_stats: bool,
+    analytics_enabled: bool,
     duration: std::time::Duration,
+    tier: u8,
 ) {
+    eprintln!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
-    // Raw equals output on passthrough; pass the same ref twice so
-    // finalize_git_output can compute accurate compression ratios.
-    finalize_git_output(
-        raw,
+    // raw == output (passthrough); move raw into finalize_git_output_passthrough
+    // so the analytics path clones once and moves once — 1 allocation total
+    // instead of 2 (PF-018 resolution).
+    // Map numeric tier to canonical tier-name strings for the analytics DB.
+    let tier_name: Option<&'static str> = match tier {
+        1 => Some("full"),
+        2 => Some("degraded"),
+        3 => Some("passthrough"),
+        _ => None,
+    };
+    super::finalize_git_output_passthrough(
         raw,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         duration,
+        tier_name,
     );
 }
 
@@ -533,6 +725,7 @@ fn run_show_file_content(
     args: &[String],
     refpath: &str,
     show_stats: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     // --json is not meaningful for file-content mode.
     if user_has_flag(args, &["--json"]) {
@@ -565,20 +758,35 @@ fn run_show_file_content(
         if !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        return Ok(map_exit_code(output.exit_code));
+        let exit_code = output.exit_code;
+        // Record analytics on the error path so the DB reflects failed
+        // invocations (e.g. `git show HEAD:missing.rs`). Move stdout: 1
+        // allocation (clone) on the analytics path, 0 when disabled (PF-018).
+        super::finalize_git_output_passthrough(
+            output.stdout,
+            build_analytics_label("show", args, show_stats, analytics_enabled),
+            show_stats,
+            analytics_enabled,
+            crate::analytics::CommandType::Git,
+            output.duration,
+            Some("passthrough"),
+        );
+        return Ok(map_exit_code(exit_code));
     }
 
     let raw = output.stdout;
     let duration = output.duration;
 
-    let label = build_analytics_label("show", args, show_stats);
+    let label = build_analytics_label("show", args, show_stats, analytics_enabled);
 
     // Detect language from path extension.
     let lang = Language::from_path(Path::new(path_str)).filter(|l| !l.is_serde_based());
 
     let Some(lang) = lang else {
         // Tier 2: unsupported or serde-based language — passthrough.
-        passthrough_file_content(&raw, label, show_stats, duration);
+        // Move raw: the else branch always returns, so Rust knows raw is
+        // available after the let-else for the Tier 1 path.
+        passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 2);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -590,12 +798,14 @@ fn run_show_file_content(
             // Tier 3: transform failed — fall back to raw passthrough.
             // Record as a zero-compression pass so analytics and --show-stats
             // remain consistent with the unsupported-language branch above.
+            // Move raw: the Err arm always returns, so Rust knows raw is
+            // available after the match for the Ok path.
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(&raw, label, show_stats, duration);
+            passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 3);
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -604,7 +814,7 @@ fn run_show_file_content(
     // Clone raw only here (Tier 1 success path), not on every branch (MEDIUM-18).
     // `apply_to_stderr` takes ownership of raw; clone it first so we can pass
     // the original into `finalize_git_output_owned` without a second allocation.
-    let raw_for_record = if show_stats || crate::analytics::is_analytics_enabled() {
+    let raw_for_record = if show_stats || analytics_enabled {
         raw.clone()
     } else {
         String::new()
@@ -621,8 +831,10 @@ fn run_show_file_content(
         final_output,
         label,
         show_stats,
+        analytics_enabled,
         crate::analytics::CommandType::Git,
         duration,
+        Some("full"),
     );
 
     Ok(ExitCode::SUCCESS)
@@ -860,6 +1072,8 @@ mod tests {
             header.author,
             header.date,
             header.subject,
+            String::new(),
+            None,
             vec![],
             "diff output",
         );
@@ -949,7 +1163,7 @@ mod tests {
     fn test_file_content_mode_json_rejected() {
         let global_flags: Vec<String> = vec![];
         let args: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
-        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false)
+        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, false)
             .expect("run_show_file_content must not return an anyhow error for --json rejection");
         assert_eq!(
             result,
@@ -1167,6 +1381,84 @@ mod tests {
         assert!(
             rendered.contains("chore: update lockfile"),
             "subject must appear in Tier-2 rendered output, got: {rendered}"
+        );
+    }
+
+    // ========================================================================
+    // AD-8: body and parents parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_commit_header_multi_paragraph_body() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_multi_paragraph.txt");
+        let (header, _diff_body) =
+            parse_commit_header(fixture).expect("multi-paragraph commit must parse");
+        assert!(
+            header.body.contains("paragraph 1"),
+            "body must contain paragraph 1: {:?}",
+            header.body
+        );
+        assert!(
+            header.body.contains("paragraph 2"),
+            "body must contain paragraph 2: {:?}",
+            header.body
+        );
+        assert!(
+            header.body.contains("paragraph 3"),
+            "body must contain paragraph 3: {:?}",
+            header.body
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_header_merge_parents() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_merge.txt");
+        let (header, _diff_body) = parse_commit_header(fixture).expect("merge commit must parse");
+        assert_eq!(
+            header.parents,
+            Some("abc123 def456 fed321".to_string()),
+            "octopus merge parents must be captured: {:?}",
+            header.parents
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_header_signed_commit() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_signed.txt");
+        let (header, _diff_body) = parse_commit_header(fixture).expect("signed commit must parse");
+        // Body should not contain PGP signature content.
+        assert!(
+            !header.body.contains("BEGIN PGP SIGNATURE"),
+            "PGP signature block must be silently skipped: {:?}",
+            header.body
+        );
+        assert!(
+            !header.body.contains("END PGP SIGNATURE"),
+            "PGP signature block end must be silently skipped: {:?}",
+            header.body
+        );
+        // The actual commit body should be present.
+        assert!(
+            header.body.contains("This commit body should appear"),
+            "commit body must be preserved in signed commit: {:?}",
+            header.body
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_header_empty_body() {
+        let fixture = include_str!("../../../tests/fixtures/cmd/git/show_empty_body.txt");
+        let (header, _diff_body) =
+            parse_commit_header(fixture).expect("subject-only commit must parse");
+        assert!(
+            header.body.is_empty(),
+            "subject-only commit must have empty body: {:?}",
+            header.body
+        );
+        assert!(
+            header.parents.is_none(),
+            "non-merge commit must have no parents: {:?}",
+            header.parents
         );
     }
 }

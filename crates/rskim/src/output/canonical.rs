@@ -127,6 +127,39 @@ impl fmt::Display for TestResult {
 // ============================================================================
 
 /// Result of a git operation
+///
+/// # AD-12 (2026-04-11) — parse_tier propagation through git handlers
+///
+/// Git handlers (log, status, fetch) each use a single parsing strategy
+/// (unlike lint handlers which have Full/Degraded/Passthrough tiers). To make
+/// the analytics DB consistent with the file/lint/infra command families, we
+/// add a `parse_tier` field that each parser can tag with its tier name.
+///
+/// The field is skipped during serialization because it is a runtime annotation,
+/// not part of the persistent JSON schema. Callers that do not set it default to
+/// `None`, which is stored in the analytics DB as NULL (pre-existing behaviour).
+///
+/// # Relationship to `ParseResult::tier_name()` (parallel mechanism, not equivalent)
+///
+/// Non-git command families (lint, file, infra, pkg, test) convey their parse tier
+/// via [`crate::output::ParseResult`] — specifically `ParseResult::tier_name()` —
+/// which wraps the entire parsed value and is consumed by the generic
+/// `finalize_output` / `record_analytics` paths.  Git handlers do not use
+/// `ParseResult`; they call `finalize_git_output*` directly and carry the tier
+/// annotation on `GitResult::parse_tier` instead.
+///
+/// These two mechanisms are parallel, not equivalent.
+/// TECH_DEBT: Unifying them would require git handlers to wrap `GitResult` in
+/// `ParseResult`, which would change the git analytics recording path. That
+/// unification is tracked separately and not attempted in this batch.
+///
+/// # Call sites (files that call `.with_tier(...)`)
+///
+/// - `crates/rskim/src/cmd/git/log.rs`
+/// - `crates/rskim/src/cmd/git/status.rs` (if present)
+/// - `crates/rskim/src/cmd/git/fetch.rs`
+/// - `crates/rskim/src/cmd/git/diff/mod.rs`
+/// - `crates/rskim/src/cmd/git/show.rs`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GitResult {
     pub(crate) operation: String,
@@ -134,10 +167,18 @@ pub(crate) struct GitResult {
     pub(crate) details: Vec<String>,
     #[serde(default)]
     rendered: String,
+    /// Parse tier label (e.g., `"full"`, `"degraded"`, `"passthrough"`).
+    ///
+    /// Skipped in JSON serialization — this is a runtime annotation for the
+    /// analytics layer, not a schema field.
+    #[serde(skip)]
+    pub(crate) parse_tier: Option<&'static str>,
 }
 
 impl GitResult {
-    /// Create a new GitResult with pre-computed rendered output
+    /// Create a new GitResult with pre-computed rendered output.
+    ///
+    /// `parse_tier` defaults to `None`. Use [`GitResult::with_tier`] to set it.
     pub(crate) fn new(operation: String, summary: String, details: Vec<String>) -> Self {
         let rendered = Self::render(&operation, &summary, &details);
         Self {
@@ -145,7 +186,18 @@ impl GitResult {
             summary,
             details,
             rendered,
+            parse_tier: None,
         }
+    }
+
+    /// Set the parse tier and return `self` for builder-style chaining.
+    ///
+    /// ```ignore
+    /// GitResult::new("log".to_string(), summary, lines).with_tier("full")
+    /// ```
+    pub(crate) fn with_tier(mut self, tier: &'static str) -> Self {
+        self.parse_tier = Some(tier);
+        self
     }
 
     /// Recompute rendered field if empty (e.g., after deserialization)
@@ -773,12 +825,23 @@ pub(crate) struct LogResult {
     /// True when --debug-only mode was requested.
     #[serde(default)]
     pub(crate) debug_only: bool,
+    /// Number of stack frames elided from all captured traces (last 3 per trace kept).
+    ///
+    /// # AD-10 (2026-04-11)
+    /// When non-zero, a `(+{n} stack frames elided)` footer is appended to the
+    /// text render so agents know stack traces were truncated. Zero means either
+    /// no traces were encountered or all frames fit within the 3-frame window.
+    #[serde(default)]
+    pub(crate) stack_frames_elided: usize,
     #[serde(default)]
     rendered: String,
 }
 
 impl LogResult {
     /// Create a new LogResult with pre-computed rendered output.
+    ///
+    /// `stack_frames_elided` is the total number of stack frames dropped across
+    /// all captured traces (0 when no elision occurred). See AD-10.
     pub(crate) fn new(
         total_lines: usize,
         unique_messages: usize,
@@ -787,6 +850,27 @@ impl LogResult {
         entries: Vec<LogEntry>,
         debug_only: bool,
     ) -> Self {
+        Self::new_with_stack(
+            total_lines,
+            unique_messages,
+            debug_hidden,
+            deduplicated_count,
+            entries,
+            debug_only,
+            0,
+        )
+    }
+
+    /// Create a new LogResult with stack frame elision count.
+    pub(crate) fn new_with_stack(
+        total_lines: usize,
+        unique_messages: usize,
+        debug_hidden: usize,
+        deduplicated_count: usize,
+        entries: Vec<LogEntry>,
+        debug_only: bool,
+        stack_frames_elided: usize,
+    ) -> Self {
         let rendered = Self::render(
             total_lines,
             unique_messages,
@@ -794,6 +878,7 @@ impl LogResult {
             deduplicated_count,
             &entries,
             debug_only,
+            stack_frames_elided,
         );
         Self {
             total_lines,
@@ -802,6 +887,7 @@ impl LogResult {
             deduplicated_count,
             entries,
             debug_only,
+            stack_frames_elided,
             rendered,
         }
     }
@@ -816,6 +902,7 @@ impl LogResult {
                 self.deduplicated_count,
                 &self.entries,
                 self.debug_only,
+                self.stack_frames_elided,
             );
         }
     }
@@ -827,6 +914,7 @@ impl LogResult {
         deduplicated_count: usize,
         entries: &[LogEntry],
         debug_only: bool,
+        stack_frames_elided: usize,
     ) -> String {
         use std::fmt::Write;
 
@@ -866,6 +954,11 @@ impl LogResult {
                     }
                 }
             }
+        }
+
+        // AD-10: append elision footer when frames were truncated.
+        if stack_frames_elided > 0 {
+            let _ = write!(output, "\n(+{stack_frames_elided} stack frames elided)");
         }
 
         output
@@ -1092,6 +1185,46 @@ mod tests {
         assert!(display.contains("[push]"));
         assert!(display.contains("pushed to origin/main"));
         assert!(display.contains("abc123 feat: add feature"));
+    }
+
+    /// AD-12: `GitResult::new` must default `parse_tier` to `None` so callers
+    /// that do not set a tier do not crash and the analytics DB records NULL.
+    #[test]
+    fn test_git_result_parse_tier_defaults_to_none() {
+        let result = GitResult::new("op".to_string(), "summary".to_string(), vec![]);
+        assert_eq!(
+            result.parse_tier, None,
+            "parse_tier must default to None for backwards-compat callers"
+        );
+    }
+
+    /// AD-12: `GitResult::with_tier` must set the parse tier without affecting
+    /// other fields or the rendered output.
+    #[test]
+    fn test_git_result_with_tier_sets_tier() {
+        let result =
+            GitResult::new("log".to_string(), "5 commits".to_string(), vec![]).with_tier("full");
+        assert_eq!(
+            result.parse_tier,
+            Some("full"),
+            "with_tier must store the tier name"
+        );
+        // Other fields must not be disturbed.
+        assert_eq!(result.operation, "log");
+        assert_eq!(result.summary, "5 commits");
+    }
+
+    /// AD-12: `parse_tier` must be skipped during JSON serialization because it
+    /// is a runtime annotation, not a persistent schema field.
+    #[test]
+    fn test_git_result_parse_tier_skipped_in_json() {
+        let result =
+            GitResult::new("log".to_string(), "3 commits".to_string(), vec![]).with_tier("full");
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("parse_tier"),
+            "parse_tier must not appear in JSON serialization: {json}"
+        );
     }
 
     // ========================================================================
@@ -1624,6 +1757,7 @@ mod tests {
             deduplicated_count: 45,
             entries: vec![],
             debug_only: false,
+            stack_frames_elided: 0,
             rendered: String::new(),
         };
         result.ensure_rendered();
@@ -1660,6 +1794,8 @@ mod tests {
             "Alice <alice@example.com>".to_string(),
             "2024-01-15 10:00:00 +0000".to_string(),
             "feat: add feature".to_string(),
+            String::new(),
+            None,
             files,
             "diff content here",
         );
@@ -1688,6 +1824,8 @@ mod tests {
             "Bob".to_string(),
             "2024-01-15".to_string(),
             "short hash commit".to_string(),
+            String::new(),
+            None,
             vec![],
             "",
         );
@@ -1714,6 +1852,8 @@ mod tests {
             "Carol".to_string(),
             "2024-01-16".to_string(),
             "fix: remove b".to_string(),
+            String::new(),
+            None,
             files,
             "",
         );
@@ -1735,6 +1875,8 @@ mod tests {
             "Dave <dave@example.com>".to_string(),
             "2024-02-01 12:00:00 +0000".to_string(),
             "refactor: clean up".to_string(),
+            String::new(),
+            None,
             files,
             "the diff body",
         );
@@ -1761,6 +1903,8 @@ mod tests {
             author: "Eve".to_string(),
             date: "2024-03-01".to_string(),
             subject: "chore: cleanup".to_string(),
+            body: String::new(),
+            parents: None,
             files_changed: 1,
             files: vec![DiffFileEntry {
                 path: "src/foo.rs".to_string(),
@@ -1798,6 +1942,8 @@ mod tests {
             "Frank".to_string(),
             "2024-04-01".to_string(),
             "docs: update readme".to_string(),
+            String::new(),
+            None,
             vec![],
             "",
         );
@@ -1821,6 +1967,8 @@ mod tests {
             "Grace".to_string(),
             "2024-05-15 09:30:00 +0000".to_string(),
             "test: add coverage".to_string(),
+            String::new(),
+            None,
             vec![],
             "",
         );
@@ -1833,6 +1981,87 @@ mod tests {
         assert!(
             json.contains("2024-05-15"),
             "date MUST appear in JSON output: {json}"
+        );
+    }
+
+    // AD-8 tests: body and parents preservation
+    #[test]
+    fn test_show_commit_result_body_in_render() {
+        let result = ShowCommitResult::new(
+            "abc1234567".to_string(),
+            "Alice".to_string(),
+            "2026-04-11".to_string(),
+            "feat: multi-paragraph".to_string(),
+            "Paragraph 1 of body.\n\nParagraph 2 of body.".to_string(),
+            None,
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        assert!(
+            text.contains("Paragraph 1 of body."),
+            "body paragraph 1 must appear: {text}"
+        );
+        assert!(
+            text.contains("Paragraph 2 of body."),
+            "body paragraph 2 must appear: {text}"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_empty_body_no_trailing_newlines() {
+        let result = ShowCommitResult::new(
+            "abc1234".to_string(),
+            "Bob".to_string(),
+            "2026-04-11".to_string(),
+            "fix: subject only".to_string(),
+            String::new(),
+            None,
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        // Subject-only commits must not have trailing blank lines (compact output).
+        assert!(!text.ends_with("\n\n"), "no trailing blank lines: {text:?}");
+    }
+
+    #[test]
+    fn test_show_commit_result_parents_in_render() {
+        let result = ShowCommitResult::new(
+            "fedcba9".to_string(),
+            "Merger".to_string(),
+            "2026-04-11".to_string(),
+            "Merge pull request #42".to_string(),
+            String::new(),
+            Some("abc123 def456 fed321".to_string()),
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        assert!(
+            text.contains("Merge: abc123 def456 fed321"),
+            "parents must appear as Merge: line: {text}"
+        );
+    }
+
+    #[test]
+    fn test_show_commit_result_parents_before_summary() {
+        let result = ShowCommitResult::new(
+            "cafebabe".to_string(),
+            "Merger".to_string(),
+            "2026-04-11".to_string(),
+            "Merge feature branch".to_string(),
+            String::new(),
+            Some("aaa111 bbb222".to_string()),
+            vec![],
+            "",
+        );
+        let text = result.to_string();
+        let merge_pos = text.find("Merge:").unwrap();
+        let summary_pos = text.find('\u{2014}').unwrap();
+        assert!(
+            merge_pos < summary_pos,
+            "Merge: line must appear before summary em-dash: {text}"
         );
     }
 }
@@ -1853,6 +2082,14 @@ mod tests {
 /// The `date` field is serialized to JSON but intentionally omitted from the
 /// text render: the single-line summary (`<hash> <author> — <subject>`) is
 /// already compact; callers that need the full date should use `--json`.
+///
+/// # AD-8 (2026-04-11) — body and parents
+///
+/// `body` stores the full multi-paragraph commit message below the subject
+/// line. It is appended to the text render only when non-empty, keeping
+/// subject-only commits compact. `parents` captures the tail of `Merge: `
+/// header lines; when present it is rendered as `Merge: {parents}` on a
+/// dedicated line before the summary, matching `git show` output order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShowCommitResult {
     /// Short commit hash (first 7 characters).
@@ -1863,6 +2100,20 @@ pub(crate) struct ShowCommitResult {
     pub(crate) date: String,
     /// Commit subject (first line of commit message).
     pub(crate) subject: String,
+    /// Full commit message body below the subject line (empty for subject-only commits).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Preserved verbatim with 4-space indent stripped. Appended to text render
+    /// as `\n\n{body}` only when non-empty.
+    #[serde(default)]
+    pub(crate) body: String,
+    /// Merge parent hashes, when present (e.g. `"abc123 def456"`).
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Rendered as `Merge: {parents}\n` before the summary line in text output.
+    /// Octopus merges store all parent hashes space-separated in one string.
+    #[serde(default)]
+    pub(crate) parents: Option<String>,
     /// Number of files changed (mirrors `files.len()` for quick JSON access).
     #[serde(default)]
     pub(crate) files_changed: usize,
@@ -1874,31 +2125,68 @@ pub(crate) struct ShowCommitResult {
 
 impl ShowCommitResult {
     /// Create a new `ShowCommitResult` with pre-computed rendered output.
+    ///
+    /// # AD-8 (2026-04-11)
+    /// `body` and `parents` are new required parameters. `parents` renders as
+    /// `Merge: {parents}\n` before the summary line. `body` renders as
+    /// `\n\n{body}` after the summary only when non-empty.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         hash: String,
         author: String,
         date: String,
         subject: String,
+        body: String,
+        parents: Option<String>,
         files: Vec<DiffFileEntry>,
         diff_output: &str,
     ) -> Self {
         let files_changed = files.len();
-        let rendered = Self::render(&hash, &author, &subject, diff_output);
+        let rendered = Self::render(
+            &hash,
+            &author,
+            &subject,
+            &body,
+            parents.as_deref(),
+            diff_output,
+        );
         Self {
             hash,
             author,
             date,
             subject,
+            body,
+            parents,
             files_changed,
             files,
             rendered,
         }
     }
 
-    fn render(hash: &str, author: &str, subject: &str, diff_output: &str) -> String {
+    /// Render the commit result to a human-readable string.
+    ///
+    /// # AD-8 (2026-04-11)
+    /// - `parents` (when `Some`) is prepended as `Merge: {parents}\n` before the summary.
+    /// - `body` (when non-empty) is appended as `\n\n{body}` after the summary.
+    /// - Empty body produces no trailing newlines, keeping subject-only commits compact.
+    fn render(
+        hash: &str,
+        author: &str,
+        subject: &str,
+        body: &str,
+        parents: Option<&str>,
+        diff_output: &str,
+    ) -> String {
         use std::fmt::Write;
         let short = hash.get(..7).unwrap_or(hash);
-        let mut output = format!("{short} {author} \u{2014} {subject}");
+        let mut output = String::new();
+        if let Some(p) = parents {
+            let _ = writeln!(output, "Merge: {p}");
+        }
+        let _ = write!(output, "{short} {author} \u{2014} {subject}");
+        if !body.is_empty() {
+            let _ = write!(output, "\n\n{body}");
+        }
         if !diff_output.is_empty() {
             let _ = write!(output, "\n\n{diff_output}");
         }
@@ -1917,11 +2205,20 @@ impl ShowCommitResult {
     /// Recompute `rendered` if empty (e.g. after JSON deserialization that
     /// stripped the field).  Produces a lossy summary — file paths, statuses,
     /// and region counts — because the original diff body is not stored.
+    ///
+    /// # AD-8 (2026-04-11)
+    /// Respects `parents` (prepends `Merge: {parents}\n`) and `body` (appends
+    /// when non-empty) for consistency with `render()`.
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
             use std::fmt::Write;
             let short = self.hash.get(..7).unwrap_or(&self.hash);
-            let mut output = format!(
+            let mut output = String::new();
+            if let Some(p) = &self.parents {
+                let _ = writeln!(output, "Merge: {p}");
+            }
+            let _ = write!(
+                output,
                 "{short} {} \u{2014} {} [{} files]",
                 self.author, self.subject, self.files_changed
             );
@@ -1931,6 +2228,9 @@ impl ShowCommitResult {
                     "\n  {} ({}, {} regions)",
                     file.path, file.status, file.changed_regions
                 );
+            }
+            if !self.body.is_empty() {
+                let _ = write!(output, "\n\n{}", self.body);
             }
             self.rendered = output;
         }
