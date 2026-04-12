@@ -17,12 +17,48 @@ const MAX_LOG_SIZE: u64 = 1024 * 1024;
 /// Maximum number of archive files to keep.
 const MAX_ARCHIVES: u32 = 3;
 
+/// Injected cache-directory configuration for hook-log operations.
+///
+/// Constructed once at the call-site boundary so that tests can supply an
+/// isolated temp directory without mutating process-global env vars.
+#[derive(Debug, Default)]
+pub(crate) struct CacheEnv {
+    /// Value of `$SKIM_CACHE_DIR`, if set at construction time.
+    pub cache_dir_override: Option<std::path::PathBuf>,
+}
+
+impl CacheEnv {
+    /// Build from the process environment (`SKIM_CACHE_DIR`).
+    pub fn from_process() -> Self {
+        Self {
+            cache_dir_override: std::env::var_os("SKIM_CACHE_DIR").map(std::path::PathBuf::from),
+        }
+    }
+
+    /// Resolve the skim cache directory using the injected override or
+    /// platform default (`dirs::cache_dir()/skim`).
+    pub fn resolve_cache_dir(&self) -> Option<std::path::PathBuf> {
+        if let Some(dir) = &self.cache_dir_override {
+            return Some(dir.clone());
+        }
+        dirs::cache_dir().map(|c| c.join("skim"))
+    }
+}
+
 /// Log a warning to `~/.cache/skim/hook.log` with rotation.
 ///
 /// NEVER outputs to stderr -- safe for use in hook execution context.
 /// All failures are silently ignored to never break the hook.
 pub(crate) fn log_hook_warning(message: &str) {
-    let log_path = match cache_dir() {
+    log_hook_warning_with_env(message, &CacheEnv::from_process());
+}
+
+/// Inner implementation of [`log_hook_warning`] with injected [`CacheEnv`].
+///
+/// Separated so tests can supply an isolated cache directory without
+/// mutating process-global env vars via `unsafe { std::env::set_var }`.
+pub(crate) fn log_hook_warning_with_env(message: &str, env: &CacheEnv) {
+    let log_path = match env.resolve_cache_dir() {
         Some(dir) => dir.join("hook.log"),
         None => return,
     };
@@ -78,11 +114,11 @@ fn archive_path(log_path: &Path, index: u32) -> std::path::PathBuf {
 /// Priority: `SKIM_CACHE_DIR` env > `dirs::cache_dir()/skim`.
 /// The env override enables test isolation on all platforms (especially macOS
 /// where `dirs::cache_dir()` ignores `$XDG_CACHE_HOME`).
+///
+/// Production callers use this convenience wrapper. Tests that need isolation
+/// should construct a [`CacheEnv`] directly and call [`CacheEnv::resolve_cache_dir`].
 pub(super) fn cache_dir() -> Option<std::path::PathBuf> {
-    if let Ok(dir) = std::env::var("SKIM_CACHE_DIR") {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    dirs::cache_dir().map(|c| c.join("skim"))
+    CacheEnv::from_process().resolve_cache_dir()
 }
 
 /// Generate a timestamp string in ISO-8601 format (UTC approximation).
@@ -238,9 +274,9 @@ mod tests {
 
     #[test]
     fn test_log_hook_warning_triggers_rotation() {
-        // End-to-end: call log_hook_warning with a >1MB log file already in place.
-        // Verifies that log_hook_warning rotates the existing file to .1 and
-        // creates a fresh hook.log with the new message.
+        // End-to-end: call log_hook_warning_with_env with a >1MB log file already in place.
+        // Verifies rotation to .1 and creation of a fresh hook.log with the new message.
+        // Uses CacheEnv directly — no unsafe { std::env::set_var } needed.
         let dir = tempfile::TempDir::new().unwrap();
         let cache = dir.path().join("skim-cache");
         std::fs::create_dir_all(&cache).unwrap();
@@ -250,10 +286,11 @@ mod tests {
         let big_content = "z".repeat(MAX_LOG_SIZE as usize + 100);
         std::fs::write(&log_path, &big_content).unwrap();
 
-        // Override SKIM_CACHE_DIR so log_hook_warning writes to our temp dir
-        std::env::set_var("SKIM_CACHE_DIR", &cache);
-        log_hook_warning("rotation integration test");
-        std::env::remove_var("SKIM_CACHE_DIR");
+        // Use CacheEnv directly instead of mutating the process env.
+        let env = CacheEnv {
+            cache_dir_override: Some(cache.clone()),
+        };
+        log_hook_warning_with_env("rotation integration test", &env);
 
         // The old oversized log should be archived to .1
         let archive1 = archive_path(&log_path, 1);
