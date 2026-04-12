@@ -508,8 +508,8 @@ fn render_show_diff(
 ///
 /// Both output formats use [`finalize_git_output_owned`] to move strings
 /// directly into the analytics call — eliminating the conditional `Option`
-/// clone dance that previously guarded against a TOCTOU double-check of
-/// `is_analytics_enabled()` (MEDIUM-11, MEDIUM-22).
+/// clone dance that previously required a TOCTOU double-check of
+/// an analytics-enabled global (MEDIUM-11, MEDIUM-22).
 fn emit_show_commit(
     result: ShowCommitResult,
     raw: String,
@@ -1146,7 +1146,7 @@ mod tests {
     fn test_file_content_mode_json_rejected() {
         let global_flags: Vec<String> = vec![];
         let args: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
-        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false)
+        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, false)
             .expect("run_show_file_content must not return an anyhow error for --json rejection");
         assert_eq!(
             result,

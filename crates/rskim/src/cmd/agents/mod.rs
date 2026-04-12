@@ -55,15 +55,21 @@ mod tests {
     use crate::cmd::session::AgentKind;
     use types::HookStatus;
 
+    /// Stub analytics config for tests — analytics disabled, no cost override.
+    const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
+        enabled: false,
+        input_cost_per_mtok: None,
+    };
+
     #[test]
     fn test_agents_run_no_crash() {
-        let result = run(&[]);
+        let result = run(&[], &TEST_ANALYTICS);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_agents_help_flag() {
-        let result = run(&["--help".to_string()]);
+        let result = run(&["--help".to_string()], &TEST_ANALYTICS);
         assert!(result.is_ok());
     }
 
@@ -76,7 +82,7 @@ mod tests {
             "agent count should match supported kinds"
         );
 
-        let result = run(&["--json".to_string()]);
+        let result = run(&["--json".to_string()], &TEST_ANALYTICS);
         assert!(result.is_ok());
 
         for agent in &agents {

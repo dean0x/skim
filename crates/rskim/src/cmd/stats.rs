@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn test_run_json_empty_store() {
         let store = MockStore::empty();
-        let output = capture(|w| run_json(w, &store, None, false));
+        let output = capture(|w| run_json(w, &store, None, false, None));
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("output should be valid JSON");
         let summary = &parsed["summary"];
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn test_run_json_with_data() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_json(w, &store, None, false));
+        let output = capture(|w| run_json(w, &store, None, false, None));
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("output should be valid JSON");
         let summary = &parsed["summary"];
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn test_run_json_with_cost() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_json(w, &store, None, true));
+        let output = capture(|w| run_json(w, &store, None, true, None));
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("output should be valid JSON");
         let cost = &parsed["cost_estimate"];
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn test_run_dashboard_empty_store() {
         let store = MockStore::empty();
-        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
             output.contains("No analytics data found"),
             "empty dashboard should show empty message"
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn test_run_dashboard_with_data() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
             output.contains("42"),
             "dashboard should show invocation count"
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn test_run_dashboard_with_cost() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_dashboard(w, &store, None, true, None));
+        let output = capture(|w| run_dashboard(w, &store, None, true, None, None));
         assert!(
             output.contains("Cost Estimates"),
             "dashboard should show cost section"
@@ -946,7 +946,7 @@ mod tests {
     #[test]
     fn test_run_dashboard_with_since_label() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_dashboard(w, &store, None, false, Some("7d")));
+        let output = capture(|w| run_dashboard(w, &store, None, false, Some("7d"), None));
         assert!(
             output.contains("last 7d"),
             "dashboard should show since period"
@@ -1007,7 +1007,7 @@ mod tests {
             ],
             ..MockStore::with_data()
         };
-        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
             output.contains("Daily Trend (tokens saved)"),
             "dashboard should show daily trend section with subtitle"
@@ -1017,7 +1017,7 @@ mod tests {
     #[test]
     fn test_daily_trend_subtitle() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
             output.contains("tokens saved"),
             "daily trend header should include 'tokens saved' subtitle"
@@ -1030,7 +1030,7 @@ mod tests {
             daily: vec![],
             ..MockStore::with_data()
         };
-        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
             !output.contains("Daily Trend"),
             "dashboard should skip daily trend section when no daily data"
@@ -1298,7 +1298,7 @@ mod tests {
     #[test]
     fn test_run_json_tier_distribution_values() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_json(w, &store, None, false));
+        let output = capture(|w| run_json(w, &store, None, false, None));
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("output should be valid JSON");
         let tier = &parsed["tier_distribution"];
@@ -1326,7 +1326,7 @@ mod tests {
     #[test]
     fn test_run_json_cost_tier_value() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_json(w, &store, None, true));
+        let output = capture(|w| run_json(w, &store, None, true, None));
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("output should be valid JSON");
         let cost = &parsed["cost_estimate"];
@@ -1343,7 +1343,7 @@ mod tests {
     fn test_dashboard_shows_command_labels() {
         let store = MockStore::with_data();
         // MockStore::with_data() has command_type: "file"
-        let output = capture(|w| run_dashboard(w, &store, None, false, None));
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
             output.contains("Source files"),
             "dashboard should show 'Source files' label for 'file' command type"
@@ -1357,7 +1357,7 @@ mod tests {
     #[test]
     fn test_dashboard_multi_tier_cost() {
         let store = MockStore::with_data();
-        let output = capture(|w| run_dashboard(w, &store, None, true, None));
+        let output = capture(|w| run_dashboard(w, &store, None, true, None, None));
         assert!(
             output.contains("Economy"),
             "cost section should show Economy tier"
