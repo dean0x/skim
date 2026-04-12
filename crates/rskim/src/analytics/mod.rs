@@ -205,7 +205,7 @@ impl AnalyticsConfig {
     pub fn from_process(cli_disable: bool) -> Self {
         let env_disabled = std::env::var("SKIM_DISABLE_ANALYTICS")
             .ok()
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .map(|v| Self::parse_disable_value(&v))
             .unwrap_or(false);
         let cost = std::env::var("SKIM_INPUT_COST_PER_MTOK")
             .ok()
@@ -215,6 +215,14 @@ impl AnalyticsConfig {
             enabled: !cli_disable && !env_disabled,
             input_cost_per_mtok: cost,
         }
+    }
+
+    /// Parse a `SKIM_DISABLE_ANALYTICS` env value string.
+    ///
+    /// Returns `true` when the value is `"1"`, `"true"`, or `"yes"` (case-insensitive).
+    /// Extracted as a pure function so tests can exercise the parsing logic directly.
+    pub(crate) fn parse_disable_value(val: &str) -> bool {
+        matches!(val.to_lowercase().as_str(), "1" | "true" | "yes")
     }
 }
 
@@ -981,86 +989,50 @@ mod tests {
     }
 
     // ========================================================================
-    // AnalyticsConfig parsing tests
+    // AnalyticsConfig::parse_disable_value tests
     //
-    // Tests use AnalyticsConfig::from_process with mocked logic by constructing
-    // the struct directly, without env mutation. The parsing logic is tested via
-    // the pure parse helpers below.
+    // Tests call the production parse_disable_value function directly.
+    // No env mutation, no struct construction boilerplate.
     // ========================================================================
 
-    /// Helper: parse SKIM_DISABLE_ANALYTICS value as AnalyticsConfig would.
-    fn parse_disable_analytics(val: Option<&str>) -> bool {
-        val.map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    }
-
     #[test]
-    fn test_analytics_enabled_when_env_unset() {
-        let disabled = parse_disable_analytics(None);
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(cfg.enabled, "analytics should be enabled when SKIM_DISABLE_ANALYTICS is unset");
+    fn test_analytics_enabled_with_empty_string() {
+        assert!(!AnalyticsConfig::parse_disable_value(""));
     }
 
     #[test]
     fn test_analytics_disabled_with_value_1() {
-        let disabled = parse_disable_analytics(Some("1"));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(!cfg.enabled, "analytics should be disabled when SKIM_DISABLE_ANALYTICS=1");
+        assert!(AnalyticsConfig::parse_disable_value("1"));
     }
 
     #[test]
     fn test_analytics_disabled_with_value_true() {
-        let disabled = parse_disable_analytics(Some("true"));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(!cfg.enabled, "analytics should be disabled when SKIM_DISABLE_ANALYTICS=true");
+        assert!(AnalyticsConfig::parse_disable_value("true"));
     }
 
     #[test]
     fn test_analytics_disabled_with_value_yes() {
-        let disabled = parse_disable_analytics(Some("yes"));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(!cfg.enabled, "analytics should be disabled when SKIM_DISABLE_ANALYTICS=yes");
+        assert!(AnalyticsConfig::parse_disable_value("yes"));
     }
 
     #[test]
     fn test_analytics_disabled_case_insensitive() {
-        let disabled = parse_disable_analytics(Some("TRUE"));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(
-            !cfg.enabled,
-            "analytics should be disabled when SKIM_DISABLE_ANALYTICS=TRUE (case-insensitive)"
-        );
+        assert!(AnalyticsConfig::parse_disable_value("TRUE"));
     }
 
     #[test]
     fn test_analytics_enabled_with_value_0() {
-        let disabled = parse_disable_analytics(Some("0"));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(cfg.enabled, "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=0");
+        assert!(!AnalyticsConfig::parse_disable_value("0"));
     }
 
     #[test]
     fn test_analytics_enabled_with_value_false() {
-        let disabled = parse_disable_analytics(Some("false"));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(cfg.enabled, "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=false");
+        assert!(!AnalyticsConfig::parse_disable_value("false"));
     }
 
     #[test]
     fn test_analytics_enabled_with_value_no() {
-        let disabled = parse_disable_analytics(Some("no"));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(cfg.enabled, "analytics should remain enabled when SKIM_DISABLE_ANALYTICS=no");
-    }
-
-    #[test]
-    fn test_analytics_enabled_with_empty_string() {
-        let disabled = parse_disable_analytics(Some(""));
-        let cfg = AnalyticsConfig { enabled: !disabled, input_cost_per_mtok: None };
-        assert!(
-            cfg.enabled,
-            "analytics should remain enabled when SKIM_DISABLE_ANALYTICS is empty"
-        );
+        assert!(!AnalyticsConfig::parse_disable_value("no"));
     }
 
     // ========================================================================
@@ -1116,23 +1088,6 @@ mod tests {
             count, 1,
             "analytics_meta table should be created by migration"
         );
-    }
-
-    // ========================================================================
-    // AnalyticsConfig cli_disable tests
-    // ========================================================================
-
-    #[test]
-    fn test_analytics_config_cli_disable_overrides_enabled() {
-        // cli_disable=true → enabled=false regardless of env
-        let cfg = AnalyticsConfig { enabled: false, input_cost_per_mtok: None };
-        assert!(!cfg.enabled, "cli_disable should disable analytics");
-    }
-
-    #[test]
-    fn test_analytics_config_enabled_by_default() {
-        let cfg = AnalyticsConfig { enabled: true, input_cost_per_mtok: None };
-        assert!(cfg.enabled, "analytics should be enabled when not disabled");
     }
 
     // ========================================================================
