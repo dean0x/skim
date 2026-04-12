@@ -751,19 +751,22 @@ pub(crate) fn try_record_command_with_counts(
         .unwrap_or_default()
         .display()
         .to_string();
-    record_with_counts(true, TokenSavingsRecord {
-        timestamp: now_unix_secs(),
-        command_type,
-        original_cmd,
-        raw_tokens,
-        compressed_tokens: compressed_tokens.min(raw_tokens),
-        savings_pct: savings_percentage(raw_tokens, compressed_tokens),
-        duration_ms: duration.as_millis() as u64,
-        project_path: cwd,
-        mode: None,
-        language: None,
-        parse_tier: parse_tier.map(str::to_string),
-    });
+    record_with_counts(
+        true,
+        TokenSavingsRecord {
+            timestamp: now_unix_secs(),
+            command_type,
+            original_cmd,
+            raw_tokens,
+            compressed_tokens: compressed_tokens.min(raw_tokens),
+            savings_pct: savings_percentage(raw_tokens, compressed_tokens),
+            duration_ms: duration.as_millis() as u64,
+            project_path: cwd,
+            mode: None,
+            language: None,
+            parse_tier: parse_tier.map(str::to_string),
+        },
+    );
 }
 
 // ============================================================================
@@ -1043,7 +1046,10 @@ mod tests {
     fn test_pricing_negative_falls_back_to_default() {
         // negative cost: parse would yield -5.0, which fails the >= 0.0 guard
         let p = PricingModel::from_cost_override(Some(-5.0));
-        assert_eq!(p.input_cost_per_mtok, 3.0, "negative cost should fall back to default");
+        assert_eq!(
+            p.input_cost_per_mtok, 3.0,
+            "negative cost should fall back to default"
+        );
         assert_eq!(p.tier_name, "Standard");
     }
 
@@ -1057,14 +1063,20 @@ mod tests {
     #[test]
     fn test_pricing_infinity_falls_back_to_default() {
         let p = PricingModel::from_cost_override(Some(f64::INFINITY));
-        assert_eq!(p.input_cost_per_mtok, 3.0, "infinite cost should fall back to default");
+        assert_eq!(
+            p.input_cost_per_mtok, 3.0,
+            "infinite cost should fall back to default"
+        );
         assert_eq!(p.tier_name, "Standard");
     }
 
     #[test]
     fn test_pricing_nan_falls_back_to_default() {
         let p = PricingModel::from_cost_override(Some(f64::NAN));
-        assert_eq!(p.input_cost_per_mtok, 3.0, "NaN cost should fall back to default");
+        assert_eq!(
+            p.input_cost_per_mtok, 3.0,
+            "NaN cost should fall back to default"
+        );
         assert_eq!(p.tier_name, "Standard");
     }
 

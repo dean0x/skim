@@ -227,7 +227,7 @@ impl std::fmt::Display for AgentKind {
 pub(crate) struct InstructionEnv {
     pub home_dir: Option<PathBuf>,
     pub claude_config_dir: Option<PathBuf>, // CLAUDE_CONFIG_DIR
-    pub codex_home: Option<PathBuf>,         // CODEX_HOME
+    pub codex_home: Option<PathBuf>,        // CODEX_HOME
     pub opencode_config_dir: Option<PathBuf>, // OPENCODE_CONFIG_DIR
 }
 
@@ -686,10 +686,7 @@ mod tests {
     fn test_instruction_file_opencode_global() {
         let env = default_env();
         let path = AgentKind::OpenCode.instruction_file(true, &env).unwrap();
-        assert_eq!(
-            path,
-            PathBuf::from("/fake/home/.config/opencode/AGENTS.md")
-        );
+        assert_eq!(path, PathBuf::from("/fake/home/.config/opencode/AGENTS.md"));
     }
 
     #[test]

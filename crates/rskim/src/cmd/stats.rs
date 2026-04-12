@@ -21,7 +21,10 @@ use crate::tokens;
 // ============================================================================
 
 /// Run the `skim stats` subcommand.
-pub(crate) fn run(args: &[String], analytics: &crate::analytics::AnalyticsConfig) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
@@ -58,10 +61,23 @@ pub(crate) fn run(args: &[String], analytics: &crate::analytics::AnalyticsConfig
     let mut stdout = io::stdout().lock();
 
     if format.as_deref() == Some("json") {
-        return run_json(&mut stdout, &db, since_ts, show_cost, analytics.input_cost_per_mtok);
+        return run_json(
+            &mut stdout,
+            &db,
+            since_ts,
+            show_cost,
+            analytics.input_cost_per_mtok,
+        );
     }
 
-    run_dashboard(&mut stdout, &db, since_ts, show_cost, since_str.as_deref(), analytics.input_cost_per_mtok)
+    run_dashboard(
+        &mut stdout,
+        &db,
+        since_ts,
+        show_cost,
+        since_str.as_deref(),
+        analytics.input_cost_per_mtok,
+    )
 }
 
 // ============================================================================
@@ -522,7 +538,11 @@ fn render_parse_quality(
     Ok(())
 }
 
-fn render_cost_section(w: &mut dyn Write, tokens_saved: u64, cost_override: Option<f64>) -> anyhow::Result<()> {
+fn render_cost_section(
+    w: &mut dyn Write,
+    tokens_saved: u64,
+    cost_override: Option<f64>,
+) -> anyhow::Result<()> {
     let pricing = PricingModel::from_cost_override(cost_override);
     writeln!(w, "{}", section_header("Cost Estimates"))?;
     writeln!(

@@ -560,12 +560,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
 }
 
 /// Record token analytics for file operations (single file or stdin).
-fn record_file_analytics(
-    enabled: bool,
-    result: &process::ProcessResult,
-    cmd: &str,
-    args: &Args,
-) {
+fn record_file_analytics(enabled: bool, result: &process::ProcessResult, cmd: &str, args: &Args) {
     if !enabled {
         return;
     }
@@ -578,19 +573,22 @@ fn record_file_analytics(
             .language
             .map(|l| format!("{:?}", Language::from(l)).to_lowercase());
         let mode = format!("{:?}", Mode::from(args.mode)).to_lowercase();
-        analytics::record_with_counts(true, analytics::TokenSavingsRecord {
-            timestamp: analytics::now_unix_secs(),
-            command_type: analytics::CommandType::File,
-            original_cmd: cmd.to_string(),
-            raw_tokens: raw,
-            compressed_tokens: comp,
-            savings_pct: analytics::savings_percentage(raw, comp),
-            duration_ms: 0,
-            project_path: cwd,
-            mode: Some(mode),
-            language: lang,
-            parse_tier: result.parse_tier.map(str::to_string),
-        });
+        analytics::record_with_counts(
+            true,
+            analytics::TokenSavingsRecord {
+                timestamp: analytics::now_unix_secs(),
+                command_type: analytics::CommandType::File,
+                original_cmd: cmd.to_string(),
+                raw_tokens: raw,
+                compressed_tokens: comp,
+                savings_pct: analytics::savings_percentage(raw, comp),
+                duration_ms: 0,
+                project_path: cwd,
+                mode: Some(mode),
+                language: lang,
+                parse_tier: result.parse_tier.map(str::to_string),
+            },
+        );
     }
 }
 

@@ -197,13 +197,22 @@ pub(super) fn run_show(
     }
 
     match detect_show_mode(args) {
-        ShowMode::MultiRef => run_passthrough(global_flags, "show", args, show_stats, analytics_enabled),
+        ShowMode::MultiRef => {
+            run_passthrough(global_flags, "show", args, show_stats, analytics_enabled)
+        }
         ShowMode::FileContent { refpath } => {
             run_show_file_content(global_flags, args, &refpath, show_stats, analytics_enabled)
         }
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
-            run_show_commit(global_flags, &git_args, args, output_format, show_stats, analytics_enabled)
+            run_show_commit(
+                global_flags,
+                &git_args,
+                args,
+                output_format,
+                show_stats,
+                analytics_enabled,
+            )
         }
     }
 }
@@ -635,7 +644,15 @@ fn run_show_commit(
         return Ok(ExitCode::SUCCESS);
     };
 
-    emit_show_commit(result, raw, label, output_format, show_stats, analytics_enabled, duration)?;
+    emit_show_commit(
+        result,
+        raw,
+        label,
+        output_format,
+        show_stats,
+        analytics_enabled,
+        duration,
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 

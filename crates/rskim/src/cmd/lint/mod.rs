@@ -26,7 +26,10 @@ const KNOWN_LINTERS: &[&str] = &["eslint", "golangci", "mypy", "prettier", "ruff
 ///
 /// If no linter is specified or `--help` / `-h` is passed, prints usage
 /// and exits. Otherwise dispatches to the linter-specific handler.
-pub(crate) fn run(args: &[String], _analytics: &crate::analytics::AnalyticsConfig) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    _analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);

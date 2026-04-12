@@ -30,7 +30,10 @@ use crate::runner::CommandRunner;
 /// Run the `git` subcommand.
 ///
 /// Dispatches to `status`, `diff`, `log`, `show`, etc., or prints help.
-pub(crate) fn run(args: &[String], analytics: &crate::analytics::AnalyticsConfig) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     // Handle --help / -h at the `skim git` level: only when the first
     // non-global-flag token is the help flag (e.g., `skim git --help`),
     // not when it appears deeper inside a subcommand (`skim git show --help`).
@@ -190,7 +193,12 @@ fn has_limit_flag(args: &[String]) -> bool {
 /// All six parsed-command handlers (`show` ×2, `diff`, `status`, `log`, `fetch`)
 /// share this exact guard logic; centralising it here eliminates the repeated
 /// five-line block at each call site.
-pub(super) fn build_analytics_label(subcmd: &str, args: &[String], show_stats: bool, analytics_enabled: bool) -> String {
+pub(super) fn build_analytics_label(
+    subcmd: &str,
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> String {
     if show_stats || analytics_enabled {
         format!("skim git {subcmd} {}", args.join(" "))
     } else {

@@ -45,7 +45,11 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 /// three-tier degradation. For nextest, skips JSON injection entirely.
 /// For standard cargo test, injects `--message-format=json` to get build
 /// artifact JSON on stdout (test results still come as plain text).
-pub(crate) fn run(args: &[String], show_stats: bool, analytics_enabled: bool) -> anyhow::Result<ExitCode> {
+pub(crate) fn run(
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     let is_nextest = args.iter().any(|a| a == "nextest");
 
     // Build command args: start with "test", append all user args

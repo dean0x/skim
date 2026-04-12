@@ -134,7 +134,13 @@ pub(crate) fn run(
         crate::process::report_token_stats(raw_tokens, compressed_tokens, "");
     }
 
-    record_analytics(analytics.enabled, raw_tokens, compressed_tokens, duration, result.tier_name());
+    record_analytics(
+        analytics.enabled,
+        raw_tokens,
+        compressed_tokens,
+        duration,
+        result.tier_name(),
+    );
     Ok(ExitCode::SUCCESS)
 }
 
