@@ -9,7 +9,7 @@ use super::helpers::{
     resolve_real_settings_path, HOOK_SCRIPT_NAME, SETTINGS_BACKUP, SETTINGS_FILE,
 };
 use super::state::{detect_state, has_skim_hook_entry, DetectedState};
-use crate::cmd::session::AgentKind;
+use crate::cmd::session::{AgentKind, InstructionEnv};
 
 /// Resolved install options from interactive prompts or --yes defaults.
 struct InstallOptions {
@@ -124,14 +124,14 @@ fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::R
 /// - `--no-guidance` is set, or
 /// - The agent has no instruction file (guidance feature not applicable), or
 /// - The file content contains the versioned start marker for `skim_version`.
-fn is_guidance_current(flags: &InitFlags, skim_version: &str) -> bool {
+fn is_guidance_current(flags: &InitFlags, skim_version: &str, env: &InstructionEnv) -> bool {
     if flags.no_guidance {
         return true;
     }
     let global = !flags.project;
     flags
         .agent
-        .instruction_file(global)
+        .instruction_file(global, env)
         .map(|p| {
             std::fs::read_to_string(&p)
                 .ok()
@@ -142,6 +142,7 @@ fn is_guidance_current(flags: &InitFlags, skim_version: &str) -> bool {
 }
 
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let env = InstructionEnv::from_process();
     let state = detect_state(flags)?;
 
     // Verify agent is installed before proceeding
@@ -170,7 +171,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     }
 
     // Already up to date check
-    let guidance_current = is_guidance_current(flags, &state.skim_version);
+    let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
     if state.hook_installed
         && state.hook_version.as_deref() == Some(&state.skim_version)
         && state.marketplace_installed
@@ -230,6 +231,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
             options.install_marketplace,
             flags_override.no_guidance,
             !flags_override.project,
+            &env,
         )?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -240,6 +242,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
         options.install_marketplace,
         flags_override.no_guidance,
         !flags_override.project,
+        &env,
     )?;
 
     println!();
@@ -304,6 +307,7 @@ fn execute_install(
     install_marketplace: bool,
     no_guidance: bool,
     global: bool,
+    env: &InstructionEnv,
 ) -> anyhow::Result<()> {
     // B7: Create hook script
     create_hook_script(state)?;
@@ -319,7 +323,7 @@ fn execute_install(
                 state.agent_cli_name
             )
         })?;
-        inject_guidance(agent, global)?;
+        inject_guidance(agent, global, env)?;
     }
 
     Ok(())
@@ -607,8 +611,12 @@ fn find_skim_section(content: &str) -> Option<(usize, usize)> {
 
 /// Resolve the instruction file path for `agent`, falling back from global to
 /// project scope when the agent does not support a global instruction file.
-fn resolve_instruction_path(agent: AgentKind, global: bool) -> anyhow::Result<std::path::PathBuf> {
-    match agent.instruction_file(global) {
+fn resolve_instruction_path(
+    agent: AgentKind,
+    global: bool,
+    env: &InstructionEnv,
+) -> anyhow::Result<std::path::PathBuf> {
+    match agent.instruction_file(global, env) {
         Some(p) => Ok(p),
         None if global => {
             eprintln!(
@@ -616,7 +624,7 @@ fn resolve_instruction_path(agent: AgentKind, global: bool) -> anyhow::Result<st
                 agent.display_name()
             );
             agent
-                .instruction_file(false)
+                .instruction_file(false, env)
                 .ok_or_else(|| anyhow::anyhow!("No instruction file for {}", agent.display_name()))
         }
         None => anyhow::bail!("No instruction file for {}", agent.display_name()),
@@ -694,8 +702,12 @@ fn guidance_append(
 /// - **Append**: File exists but has no skim section → append to end
 /// - **Update**: File has a skim section with older version → replace in place
 /// - **Skip**: File has a skim section with current version → idempotent no-op
-pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<()> {
-    let path = resolve_instruction_path(agent, global)?;
+pub(super) fn inject_guidance(
+    agent: AgentKind,
+    global: bool,
+    env: &InstructionEnv,
+) -> anyhow::Result<()> {
+    let path = resolve_instruction_path(agent, global, env)?;
     let path = super::helpers::resolve_real_settings_path(&path)?;
 
     let version = env!("CARGO_PKG_VERSION");
@@ -773,8 +785,12 @@ pub(super) fn inject_guidance(agent: AgentKind, global: bool) -> anyhow::Result<
 }
 
 /// Remove skim guidance section from the agent's main instruction file.
-pub(super) fn remove_guidance(agent: AgentKind, global: bool) -> anyhow::Result<()> {
-    let path = match agent.instruction_file(global) {
+pub(super) fn remove_guidance(
+    agent: AgentKind,
+    global: bool,
+    env: &InstructionEnv,
+) -> anyhow::Result<()> {
+    let path = match agent.instruction_file(global, env) {
         Some(p) if p.exists() => p,
         _ => {
             // For Cursor, even if the new path doesn't exist, check legacy .cursorrules
@@ -914,6 +930,7 @@ pub(super) fn print_dry_run_actions(
     install_marketplace: bool,
     no_guidance: bool,
     global: bool,
+    env: &InstructionEnv,
 ) -> anyhow::Result<()> {
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
@@ -942,7 +959,7 @@ pub(super) fn print_dry_run_actions(
                 state.agent_cli_name
             )
         })?;
-        if let Some(path) = agent.instruction_file(global) {
+        if let Some(path) = agent.instruction_file(global, env) {
             println!("  [dry-run] Would inject guidance into {}", path.display());
         }
     }
