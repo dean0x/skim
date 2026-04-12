@@ -51,12 +51,11 @@ pub(super) fn insert_file_paths(
     tx: &rusqlite::Transaction<'_>,
     paths: &BTreeSet<PathBuf>,
 ) -> Result<()> {
-    for path in paths {
-        tx.execute(
-            "INSERT INTO file_paths (path) VALUES (?1)",
-            params![path_to_string(path)],
-        )
+    let mut stmt = tx
+        .prepare_cached("INSERT INTO file_paths (path) VALUES (?1)")
         .map_err(sql_err)?;
+    for path in paths {
+        stmt.execute(params![path_to_string(path)]).map_err(sql_err)?;
     }
     Ok(())
 }
@@ -90,6 +89,12 @@ pub(super) fn insert_cochange(
     cochange: &[CochangeEntry],
     path_to_id: &HashMap<String, i64>,
 ) -> Result<()> {
+    let mut stmt = tx
+        .prepare_cached(
+            "INSERT INTO cochange (file_a, file_b, co_occurrences, jaccard)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(sql_err)?;
     for entry in cochange {
         let id_a = lookup_id(path_to_id, &entry.path_a)?;
         let id_b = lookup_id(path_to_id, &entry.path_b)?;
@@ -99,16 +104,12 @@ pub(super) fn insert_cochange(
         } else {
             (id_b, id_a)
         };
-        tx.execute(
-            "INSERT INTO cochange (file_a, file_b, co_occurrences, jaccard)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                a,
-                b,
-                i64::from(entry.co_occurrences),
-                f64::from(entry.jaccard)
-            ],
-        )
+        stmt.execute(params![
+            a,
+            b,
+            i64::from(entry.co_occurrences),
+            f64::from(entry.jaccard)
+        ])
         .map_err(sql_err)?;
     }
     Ok(())
@@ -120,18 +121,20 @@ pub(super) fn insert_hotspots(
     hotspots: &[HotspotScore],
     path_to_id: &HashMap<String, i64>,
 ) -> Result<()> {
-    for h in hotspots {
-        let id = lookup_id(path_to_id, &h.path)?;
-        tx.execute(
+    let mut stmt = tx
+        .prepare_cached(
             "INSERT INTO hotspot (temporal_file_id, commit_count_30d, commit_count_90d, score)
              VALUES (?1, ?2, ?3, ?4)",
-            params![
-                id,
-                i64::from(h.commit_count_30d),
-                i64::from(h.commit_count_90d),
-                f64::from(h.score)
-            ],
         )
+        .map_err(sql_err)?;
+    for h in hotspots {
+        let id = lookup_id(path_to_id, &h.path)?;
+        stmt.execute(params![
+            id,
+            i64::from(h.commit_count_30d),
+            i64::from(h.commit_count_90d),
+            f64::from(h.score)
+        ])
         .map_err(sql_err)?;
     }
     Ok(())
@@ -143,19 +146,21 @@ pub(super) fn insert_risks(
     risks: &[RiskScore],
     path_to_id: &HashMap<String, i64>,
 ) -> Result<()> {
-    for r in risks {
-        let id = lookup_id(path_to_id, &r.path)?;
-        tx.execute(
+    let mut stmt = tx
+        .prepare_cached(
             "INSERT INTO risk (temporal_file_id, total_commits, fix_commits, fix_density, score)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                id,
-                i64::from(r.total_commits),
-                i64::from(r.fix_commits),
-                f64::from(r.fix_density),
-                f64::from(r.score)
-            ],
         )
+        .map_err(sql_err)?;
+    for r in risks {
+        let id = lookup_id(path_to_id, &r.path)?;
+        stmt.execute(params![
+            id,
+            i64::from(r.total_commits),
+            i64::from(r.fix_commits),
+            f64::from(r.fix_density),
+            f64::from(r.score)
+        ])
         .map_err(sql_err)?;
     }
     Ok(())
@@ -176,15 +181,14 @@ pub(super) fn insert_meta(
         (meta_keys::LAST_BUILD_TIMESTAMP, now_secs.to_string()),
         (meta_keys::LOOKBACK_DAYS, lookback_days.to_string()),
         (meta_keys::REPO_ROOT, repo_path.display().to_string()),
-        (meta_keys::GIX_VERSION, "0.68".to_string()),
+        (meta_keys::GIX_VERSION, gix_version_string()),
         (meta_keys::COMMITS_ANALYZED, commits.len().to_string()),
     ];
-    for (k, v) in pairs {
-        tx.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![k, v],
-        )
+    let mut stmt = tx
+        .prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")
         .map_err(sql_err)?;
+    for (k, v) in pairs {
+        stmt.execute(params![k, v]).map_err(sql_err)?;
     }
     Ok(())
 }
@@ -192,6 +196,14 @@ pub(super) fn insert_meta(
 // ============================================================================
 // Internal utility
 // ============================================================================
+
+/// Return the rskim-search crate version string, embedded at compile time.
+///
+/// Used to tag the temporal DB with the build tool version. If gix is updated,
+/// the rskim-search version will be bumped accordingly.
+fn gix_version_string() -> String {
+    concat!("rskim-search/", env!("CARGO_PKG_VERSION")).to_string()
+}
 
 /// Look up a path's `temporal_file_id`, returning an error if missing.
 fn lookup_id(map: &HashMap<String, i64>, path: &Path) -> Result<i64> {

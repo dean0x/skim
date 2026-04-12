@@ -114,9 +114,8 @@ pub trait TemporalQuery: Send + Sync {
     ///
     /// Lexical and temporal ranks are both percentile-normalized internally
     /// before blending. The `flags` parameter selects which temporal signals
-    /// to apply (hot / cold / risky). `blast_radius` in `flags` is ignored by
-    /// this method — blast-radius queries are standalone (see
-    /// [`TemporalQuery::blast_radius`]).
+    /// to apply (`hot`, `cold`, `risky`). Blast-radius queries are a separate
+    /// operation — see [`TemporalQuery::blast_radius`].
     fn rerank(
         &self,
         lexical_results: &[(PathBuf, f32)],

@@ -32,8 +32,8 @@ const V1_SCHEMA_SQL: &str = r#"
     CREATE INDEX idx_file_paths_path ON file_paths(path);
 
     CREATE TABLE cochange (
-        file_a INTEGER NOT NULL REFERENCES file_paths(temporal_file_id),
-        file_b INTEGER NOT NULL REFERENCES file_paths(temporal_file_id),
+        file_a INTEGER NOT NULL REFERENCES file_paths(temporal_file_id) ON DELETE CASCADE,
+        file_b INTEGER NOT NULL REFERENCES file_paths(temporal_file_id) ON DELETE CASCADE,
         co_occurrences INTEGER NOT NULL,
         jaccard REAL NOT NULL,
         PRIMARY KEY (file_a, file_b),
@@ -43,7 +43,7 @@ const V1_SCHEMA_SQL: &str = r#"
     CREATE INDEX idx_cochange_b ON cochange(file_b, jaccard DESC);
 
     CREATE TABLE hotspot (
-        temporal_file_id INTEGER PRIMARY KEY REFERENCES file_paths(temporal_file_id),
+        temporal_file_id INTEGER PRIMARY KEY REFERENCES file_paths(temporal_file_id) ON DELETE CASCADE,
         commit_count_30d INTEGER NOT NULL,
         commit_count_90d INTEGER NOT NULL,
         score REAL NOT NULL
@@ -51,7 +51,7 @@ const V1_SCHEMA_SQL: &str = r#"
     CREATE INDEX idx_hotspot_score ON hotspot(score DESC);
 
     CREATE TABLE risk (
-        temporal_file_id INTEGER PRIMARY KEY REFERENCES file_paths(temporal_file_id),
+        temporal_file_id INTEGER PRIMARY KEY REFERENCES file_paths(temporal_file_id) ON DELETE CASCADE,
         total_commits INTEGER NOT NULL,
         fix_commits INTEGER NOT NULL,
         fix_density REAL NOT NULL,

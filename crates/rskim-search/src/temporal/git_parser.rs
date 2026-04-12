@@ -101,6 +101,15 @@ pub fn parse_history(repo_path: &Path, lookback_days: u32) -> Result<Vec<CommitI
     let mut commits = Vec::new();
     let mut diff_state = gix::diff::tree::State::default();
 
+    // gix's first-parent rev_walk yields commits roughly newest-first but
+    // does not guarantee strict date order.  We use a consecutive-miss counter
+    // to break out of the walk once we have seen many commits in a row that
+    // all fall outside the lookback window — at that depth the chance of
+    // finding any in-window commit is negligible and we avoid scanning the
+    // full history of very old repositories.
+    const MAX_CONSECUTIVE_MISSES: u32 = 500;
+    let mut consecutive_misses: u32 = 0;
+
     for info in walk {
         let info = info.map_err(|e| SearchError::GitError(format!("rev-walk entry: {e}")))?;
 
@@ -117,11 +126,17 @@ pub fn parse_history(repo_path: &Path, lookback_days: u32) -> Result<Vec<CommitI
         let timestamp = u64::try_from(time.seconds).unwrap_or(0);
 
         if timestamp < cutoff {
-            // Commits are walked newest-first; anything below the cutoff can be
-            // skipped. We cannot `break` here because gix's rev_walk without
-            // ByCommitTimeCutoff sorting does not guarantee strict date order.
+            consecutive_misses += 1;
+            if consecutive_misses >= MAX_CONSECUTIVE_MISSES {
+                // We've seen 500 consecutive commits all older than the lookback
+                // window.  Because the walk is roughly newest-first, the
+                // probability of finding an in-window commit deeper in history
+                // is negligible.  Stop iterating to bound memory and CPU cost.
+                break;
+            }
             continue;
         }
+        consecutive_misses = 0;
 
         let message_raw = commit
             .message_raw()

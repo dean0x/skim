@@ -204,12 +204,7 @@ fn wave2_rerank_empty_lexical() {
 
     let (_idx, temporal) = build_temporal_index(repo.path());
 
-    let flags = TemporalFlags {
-        blast_radius: None,
-        hot: true,
-        cold: false,
-        risky: false,
-    };
+    let flags = TemporalFlags::from_signals(true, false, false);
     let results = temporal.rerank(&[], &flags).expect("rerank");
     assert!(
         results.is_empty(),
@@ -237,12 +232,7 @@ fn wave2_rerank_with_hot_flag() {
         (PathBuf::from("cold.rs"), 0.5_f32),
     ];
 
-    let flags = TemporalFlags {
-        blast_radius: None,
-        hot: true,
-        cold: false,
-        risky: false,
-    };
+    let flags = TemporalFlags::from_signals(true, false, false);
     let reranked = temporal.rerank(&lex_results, &flags).expect("rerank");
 
     assert_eq!(
@@ -299,12 +289,7 @@ fn wave2_rerank_no_flags_passthrough() {
         (PathBuf::from("b.rs"), 1.0_f32),
     ];
 
-    let flags = TemporalFlags {
-        blast_radius: None,
-        hot: false,
-        cold: false,
-        risky: false,
-    };
+    let flags = TemporalFlags::default();
     let result = temporal.rerank(&lex_results, &flags).expect("rerank");
 
     // With no flags active, rerank returns lexical results unchanged.

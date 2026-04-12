@@ -6,29 +6,6 @@
 
 use std::path::PathBuf;
 
-/// Opaque identifier for a file within the temporal layer.
-///
-/// Distinct from lexical [`FileId`](crate::FileId) to prevent accidental
-/// cross-layer mixing at compile time. Temporal stores its own path table
-/// because files in git history may not exist in the current lexical index
-/// (deleted, renamed, gitignored).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TemporalFileId(u32);
-
-impl TemporalFileId {
-    /// Construct a `TemporalFileId` from its raw representation.
-    #[must_use]
-    pub fn new(id: u32) -> Self {
-        Self(id)
-    }
-
-    /// Return the raw `u32` value.
-    #[must_use]
-    pub fn as_u32(self) -> u32 {
-        self.0
-    }
-}
-
 /// Parsed metadata for a single git commit.
 ///
 /// Produced by the git parser (Phase 1), consumed by co-change (Phase 2a)

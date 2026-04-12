@@ -3,6 +3,8 @@
 //! Accepts files, parses ASTs, classifies fields, extracts n-grams,
 //! accumulates posting lists, and writes the persistent index to disk.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -286,9 +288,18 @@ impl crate::LayerBuilder for LexicalLayerBuilder {
             doc_lengths: self.doc_lengths,
         };
 
-        let json = serde_json::to_string_pretty(&metadata)
-            .map_err(|e| SearchError::SerializationError(e.to_string()))?;
-        std::fs::write(self.index_dir.join("metadata.json"), json).map_err(SearchError::Io)?;
+        // Write metadata atomically: serialize directly to a tmp file via BufWriter,
+        // then rename into place. Matches the atomic write strategy used for .skidx/.skpost.
+        let metadata_tmp = self.index_dir.join("metadata.json.tmp");
+        let metadata_final = self.index_dir.join("metadata.json");
+        {
+            let file = File::create(&metadata_tmp).map_err(SearchError::Io)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &metadata)
+                .map_err(|e| SearchError::SerializationError(e.to_string()))?;
+            writer.flush().map_err(SearchError::Io)?;
+        }
+        std::fs::rename(&metadata_tmp, &metadata_final).map_err(SearchError::Io)?;
 
         // --- Open and return the built layer --------------------------------
         use super::query::LexicalSearchLayer;

@@ -3,13 +3,14 @@
 //! All methods in this module are pure reads — they never modify the database.
 //! Write operations live in [`super::build_ops`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::params;
 
 use crate::Result;
 
-use super::{path_to_string, sql_err, ScoreKind, TemporalDb};
+use super::{path_to_string, sql_query_err, ScoreKind, TemporalDb};
 
 impl TemporalDb {
     /// Return co-change partners for `target`, sorted by Jaccard desc.
@@ -18,7 +19,7 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// [`SearchError::IndexBuildError`] on SQLite failures.
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
     pub fn load_blast_radius(&self, target: &Path, limit: usize) -> Result<Vec<(PathBuf, f32)>> {
         let target_str = path_to_string(target);
         let target_id: Option<i64> = self
@@ -45,18 +46,18 @@ impl TemporalDb {
                  ORDER BY c.jaccard DESC
                  LIMIT ?2",
             )
-            .map_err(sql_err)?;
+            .map_err(sql_query_err)?;
 
         let rows = stmt
             .query_map(
                 params![tid, i64::try_from(limit).unwrap_or(i64::MAX)],
                 |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
             )
-            .map_err(sql_err)?;
+            .map_err(sql_query_err)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (path_str, jaccard): (String, f64) = row.map_err(sql_err)?;
+            let (path_str, jaccard): (String, f64) = row.map_err(sql_query_err)?;
             #[allow(clippy::cast_possible_truncation)]
             out.push((PathBuf::from(path_str), jaccard as f32));
         }
@@ -67,7 +68,7 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// [`SearchError::IndexBuildError`] on SQLite failures.
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
     pub fn load_hotspots(&self, limit: usize) -> Result<Vec<(PathBuf, f32)>> {
         load_scored(
             &self.conn,
@@ -89,7 +90,7 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// [`SearchError::IndexBuildError`] on SQLite failures.
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
     pub fn load_coldspots(&self, limit: usize) -> Result<Vec<(PathBuf, f32)>> {
         load_scored(
             &self.conn,
@@ -107,7 +108,7 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// [`SearchError::IndexBuildError`] on SQLite failures.
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
     pub fn load_risk(&self, limit: usize) -> Result<Vec<(PathBuf, f32)>> {
         load_scored(
             &self.conn,
@@ -121,17 +122,106 @@ impl TemporalDb {
         )
     }
 
-    /// Look up a single file's score for re-rank operations.
+    /// Batch-load scores for a set of paths in a single SQL query.
     ///
-    /// Uses `prepare_cached` to amortize statement compilation cost across the
-    /// N iterations inside `TemporalIndex::rerank` (previously N×M fresh
-    /// `prepare` calls, now one cached statement per signal kind).
+    /// Issues `SELECT … WHERE path IN (?, …, ?)` for all paths at once, then
+    /// returns a `HashMap<String, f32>` keyed by the forward-slash path string.
+    /// Paths absent from the database are simply missing from the map (callers
+    /// should treat missing entries as `0.0`).
     ///
-    /// Returns `Ok(None)` if the file is not in the database.
+    /// Prefer this over repeated [`Self::load_score_for`] calls inside loops.
     ///
     /// # Errors
     ///
-    /// [`SearchError::IndexBuildError`] on SQLite failures.
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
+    pub fn load_scores_batch(
+        &self,
+        paths: &[&Path],
+        kind: ScoreKind,
+    ) -> Result<HashMap<String, f32>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map = HashMap::with_capacity(paths.len());
+
+        // Chunk paths to stay within SQLite's SQLITE_MAX_VARIABLE_NUMBER limit
+        // (default 999). We use 500 as a safe ceiling with margin.
+        const CHUNK_SIZE: usize = 500;
+
+        for chunk in paths.chunks(CHUNK_SIZE) {
+            self.load_scores_chunk(chunk, kind, &mut map)?;
+        }
+
+        Ok(map)
+    }
+
+    /// Execute a single `SELECT … WHERE fp.path IN (…)` for one chunk of paths.
+    ///
+    /// Called by [`Self::load_scores_batch`] per chunk to stay within SQLite's
+    /// parameter limit.
+    fn load_scores_chunk(
+        &self,
+        paths: &[&Path],
+        kind: ScoreKind,
+        out: &mut HashMap<String, f32>,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        // Build `SELECT … WHERE fp.path IN (?1, ?2, …, ?N)` dynamically.
+        // rusqlite does not support array binding natively, so we construct
+        // the placeholder list at call time. N is bounded by CHUNK_SIZE (500).
+        let placeholders: Vec<String> = (1..=paths.len()).map(|i| format!("?{i}")).collect();
+        let in_clause = placeholders.join(", ");
+
+        let sql = match kind {
+            ScoreKind::Hotspot => format!(
+                "SELECT fp.path, h.score \
+                 FROM hotspot h \
+                 JOIN file_paths fp ON fp.temporal_file_id = h.temporal_file_id \
+                 WHERE fp.path IN ({in_clause})"
+            ),
+            ScoreKind::Risk => format!(
+                "SELECT fp.path, r.score \
+                 FROM risk r \
+                 JOIN file_paths fp ON fp.temporal_file_id = r.temporal_file_id \
+                 WHERE fp.path IN ({in_clause})"
+            ),
+        };
+
+        let path_strings: Vec<String> = paths.iter().map(|p| path_to_string(p)).collect();
+
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_query_err)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(path_strings.iter()),
+                |row: &rusqlite::Row<'_>| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                },
+            )
+            .map_err(sql_query_err)?;
+
+        for row in rows {
+            let (path_str, score): (String, f64) = row.map_err(sql_query_err)?;
+            #[allow(clippy::cast_possible_truncation)]
+            out.insert(path_str, score as f32);
+        }
+        Ok(())
+    }
+
+    /// Look up a single file's score by path and kind.
+    ///
+    /// Uses `prepare_cached` to amortize statement compilation across repeated
+    /// calls on the same connection. Returns `Ok(None)` if the file is not in
+    /// the database.
+    ///
+    /// Prefer [`Self::load_scores_batch`] when looking up multiple paths at once.
+    ///
+    /// # Errors
+    ///
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
     pub fn load_score_for(&self, path: &Path, kind: ScoreKind) -> Result<Option<f32>> {
         let path_str = path_to_string(path);
         let sql = match kind {
@@ -146,9 +236,7 @@ impl TemporalDb {
                  WHERE fp.path = ?1"
             }
         };
-        // prepare_cached reuses the same compiled statement across calls,
-        // amortizing preparation cost over N rerank iterations.
-        let mut stmt = self.conn.prepare_cached(sql).map_err(sql_err)?;
+        let mut stmt = self.conn.prepare_cached(sql).map_err(sql_query_err)?;
         let score: Option<f64> = stmt
             .query_row(rusqlite::params![path_str], |row| row.get(0))
             .ok();
@@ -160,7 +248,7 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// [`SearchError::IndexBuildError`] on SQLite failures.
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -176,13 +264,13 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// [`SearchError::IndexBuildError`] on SQLite failures.
+    /// [`SearchError::TemporalQueryError`] on SQLite failures.
     pub fn file_count(&self) -> Result<u64> {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM file_paths", [], |row| row.get(0))
-            .map_err(sql_err)?;
-        Ok(n as u64)
+            .map_err(sql_query_err)?;
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 }
 
@@ -199,17 +287,17 @@ fn load_scored(
     limit: usize,
     invert: bool,
 ) -> Result<Vec<(PathBuf, f32)>> {
-    let mut stmt = conn.prepare(sql).map_err(sql_err)?;
+    let mut stmt = conn.prepare(sql).map_err(sql_query_err)?;
     let rows = stmt
         .query_map(
             params![i64::try_from(limit).unwrap_or(i64::MAX)],
             |row: &rusqlite::Row<'_>| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
         )
-        .map_err(sql_err)?;
+        .map_err(sql_query_err)?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (path_str, score): (String, f64) = row.map_err(sql_err)?;
+        let (path_str, score): (String, f64) = row.map_err(sql_query_err)?;
         #[allow(clippy::cast_possible_truncation)]
         let score_f32 = score as f32;
         let final_score = if invert { 1.0 - score_f32 } else { score_f32 };

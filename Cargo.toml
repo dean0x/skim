@@ -49,7 +49,12 @@ insta = "1.39"
 criterion = "0.5"
 rustc-hash = "1.1"
 memmap2 = "0.9"
-gix = { version = "0.68", default-features = false, features = ["max-performance-safe"] }
+gix = { version = "0.68", default-features = false, features = ["revision"] }
+# "revision" is sufficient: enables rev_walk (first-parent ancestry walking) and HEAD
+# resolution used in temporal/git_parser.rs. gix::diff::tree and gix::bstr are
+# unconditionally available without any feature. "max-performance-safe" was the prior
+# value but it pulled in parallel pack-cache crates that are unused by the code paths
+# here (we only walk commits and do tree diffs, never pack streaming).
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"

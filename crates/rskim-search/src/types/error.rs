@@ -14,6 +14,10 @@ pub enum SearchError {
     #[error("Index error: {0}")]
     IndexBuildError(String),
 
+    /// A SQLite query error occurred while reading temporal data.
+    #[error("Temporal query error: {0}")]
+    TemporalQueryError(String),
+
     /// The query is malformed or contains unsupported constructs.
     #[error("Invalid query: {0}")]
     InvalidQuery(String),
@@ -33,10 +37,6 @@ pub enum SearchError {
     /// Temporal index not found at the given path.
     #[error("Temporal index not found at {0}")]
     TemporalNotFound(String),
-
-    /// Temporal query conflict (e.g., --blast-radius combined with text search).
-    #[error("Temporal query conflict: {0}")]
-    TemporalConflict(String),
 
     /// The index file is corrupted or has an incompatible format version.
     #[error("Corrupted index at {path}: {reason}")]

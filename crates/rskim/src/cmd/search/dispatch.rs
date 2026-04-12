@@ -92,6 +92,10 @@ pub(super) fn run_standalone_temporal(
     ensure_temporal_built(repo_root, index_dir, &db_path, lookback)?;
     let temporal = TemporalIndex::open(&db_path)?;
 
+    // Cap the candidate pool to avoid unbounded queries. The pool is
+    // `limit * 5` clamped to 2500 per signal.
+    let pool_size = (limit * 5).min(2500);
+
     let results = if (hot as u8) + (cold as u8) + (risky as u8) > 1 {
         // Multiple signals: union candidates from every enabled signal so that
         // files relevant to any signal are in the working set before reranking.
@@ -99,28 +103,23 @@ pub(super) fn run_standalone_temporal(
         // dropping files that ranked low in that signal but high in others.
         let mut candidate_paths: BTreeSet<PathBuf> = BTreeSet::new();
         if hot {
-            for (p, _) in temporal.hotspots(limit * 5)? {
+            for (p, _) in temporal.hotspots(pool_size)? {
                 candidate_paths.insert(p);
             }
         }
         if cold {
-            for (p, _) in temporal.coldspots(limit * 5)? {
+            for (p, _) in temporal.coldspots(pool_size)? {
                 candidate_paths.insert(p);
             }
         }
         if risky {
-            for (p, _) in temporal.risky(limit * 5)? {
+            for (p, _) in temporal.risky(pool_size)? {
                 candidate_paths.insert(p);
             }
         }
         let candidates: Vec<(PathBuf, f32)> =
             candidate_paths.into_iter().map(|p| (p, 0.0)).collect();
-        let flags = TemporalFlags {
-            blast_radius: None,
-            hot,
-            cold,
-            risky,
-        };
+        let flags = TemporalFlags::from_signals(hot, cold, risky);
         let mut reranked = temporal.rerank(&candidates, &flags)?;
         reranked.truncate(limit);
         reranked
@@ -195,12 +194,7 @@ pub(super) fn run_lexical_or_composite(
         let temporal = TemporalIndex::open(&db_path)?;
 
         let lex_paths = lexical_to_paths(&lex_results, &layer);
-        let flags = TemporalFlags {
-            blast_radius: None,
-            hot,
-            cold,
-            risky,
-        };
+        let flags = TemporalFlags::from_signals(hot, cold, risky);
         let mut reranked = temporal.rerank(&lex_paths, &flags)?;
         reranked.truncate(limit);
 
@@ -293,14 +287,25 @@ fn resolve_blast_target(arg: &str, repo_root: &Path) -> anyhow::Result<PathBuf> 
 }
 
 /// Convert lexical `(FileId, score)` results to `(PathBuf, score)` for temporal rerank.
+///
+/// FileIds not found in the file table are skipped with a warning — this
+/// indicates an index consistency issue (stale file table vs. postings).
 fn lexical_to_paths(results: &[(FileId, f32)], layer: &dyn SearchIndex) -> Vec<(PathBuf, f32)> {
-    results
+    let mut dropped = 0u32;
+    let out: Vec<(PathBuf, f32)> = results
         .iter()
-        .filter_map(|(id, s)| {
-            layer
-                .file_table()
-                .lookup(*id)
-                .map(|p| (p.to_path_buf(), *s))
+        .filter_map(|(id, s)| match layer.file_table().lookup(*id) {
+            Some(p) => Some((p.to_path_buf(), *s)),
+            None => {
+                dropped += 1;
+                None
+            }
         })
-        .collect()
+        .collect();
+    if dropped > 0 {
+        eprintln!(
+            "warning: {dropped} search result(s) could not be resolved to file paths (stale index?)"
+        );
+    }
+    out
 }

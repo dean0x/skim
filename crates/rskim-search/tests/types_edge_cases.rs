@@ -150,25 +150,18 @@ fn test_search_query_with_text_overwrites() {
 
 #[test]
 fn test_temporal_flags_contradictory() {
-    // hot+cold both true — valid by design (combinable)
-    let flags = TemporalFlags {
-        hot: true,
-        cold: true,
-        ..Default::default()
-    };
+    // hot+cold both true — valid by design (combinable).
+    // TemporalFlags is #[non_exhaustive], so we must use from_signals.
+    let flags = TemporalFlags::from_signals(true, true, false);
     assert!(flags.hot);
     assert!(flags.cold);
 }
 
 #[test]
 fn test_temporal_flags_all_true() {
-    let flags = TemporalFlags {
-        blast_radius: Some(std::path::PathBuf::from("src/main.rs")),
-        hot: true,
-        cold: true,
-        risky: true,
-    };
-    assert!(flags.blast_radius.is_some());
+    // blast_radius was removed (Issue 3): it was dead code. The blast-radius
+    // query path goes through TemporalQuery::blast_radius(), not TemporalFlags.
+    let flags = TemporalFlags::from_signals(true, true, true);
     assert!(flags.hot);
     assert!(flags.cold);
     assert!(flags.risky);

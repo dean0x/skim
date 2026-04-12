@@ -1,7 +1,5 @@
 //! Search query types: `SearchQuery`, `TemporalFlags`, and `SearchField`.
 
-use std::path::PathBuf;
-
 use serde::{Deserialize, Serialize};
 
 /// Semantic field within a source file used for field-boosted search scoring.
@@ -88,12 +86,23 @@ impl SearchField {
 
 /// Temporal filter flags for query-time filtering by git activity signals.
 ///
-/// All flags default to `false`/`None` (disabled). Any combination is valid.
+/// All flags default to `false` (disabled). Any combination is valid.
+///
+/// # Stability
+///
+/// This struct is `#[non_exhaustive]`: new fields may be added in future
+/// minor releases. External crates must use [`TemporalFlags::from_signals`]
+/// or [`Default::default`] to construct values:
+///
+/// ```
+/// use rskim_search::TemporalFlags;
+///
+/// let flags = TemporalFlags::from_signals(true, false, false);
+/// let all_off = TemporalFlags::default();
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct TemporalFlags {
-    /// Blast-radius query target file, if this is a blast-radius query.
-    /// When `Some(path)`, temporal layer returns co-change partners of `path`.
-    pub blast_radius: Option<PathBuf>,
     /// Include only files with recent commit activity ("hot" files).
     pub hot: bool,
     /// Include only files with no recent changes ("cold" files).
@@ -102,10 +111,33 @@ pub struct TemporalFlags {
     pub risky: bool,
 }
 
+impl TemporalFlags {
+    /// Construct from explicit signal booleans.
+    ///
+    /// Required for external crates: `#[non_exhaustive]` prevents struct-literal
+    /// construction outside this crate. Use this when more than one signal flag
+    /// needs to be set at once.
+    pub fn from_signals(hot: bool, cold: bool, risky: bool) -> Self {
+        Self { hot, cold, risky }
+    }
+}
+
 /// Query to execute against the search index.
 ///
 /// Constructed via [`SearchQuery::new`] or the convenience [`SearchQuery::text`],
 /// then customised with builder methods.
+///
+/// # Design: temporal flags are not here
+///
+/// Temporal filtering (`hot`, `cold`, `risky`) is intentionally absent from this
+/// struct. `SearchQuery` represents a *lexical* query — text and AST pattern — that
+/// is passed to [`crate::SearchIndex`]. Temporal signals are a separate concern
+/// handled by [`TemporalQuery`] implementations and composed at the call site. This
+/// keeps the two layers independently testable and avoids coupling the lexical index
+/// to the temporal SQLite store.
+///
+/// See [`TemporalFlags`] and [`crate::TemporalQuery`] for how temporal filtering is
+/// applied on top of lexical results.
 ///
 /// # Examples
 ///
@@ -121,8 +153,6 @@ pub struct SearchQuery {
     pub text_query: Option<String>,
     /// AST pattern string for structural matching.
     pub ast_pattern: Option<String>,
-    /// Temporal filter flags.
-    pub temporal_flags: TemporalFlags,
     /// Maximum number of results to return.
     pub limit: usize,
     /// Number of results to skip (pagination offset).
@@ -135,7 +165,6 @@ impl SearchQuery {
         Self {
             text_query: None,
             ast_pattern: None,
-            temporal_flags: TemporalFlags::default(),
             limit: 50,
             offset: 0,
         }
@@ -171,12 +200,6 @@ impl SearchQuery {
         self.ast_pattern = Some(pattern.to_string());
         self
     }
-
-    /// Set the temporal filter flags.
-    pub fn with_temporal_flags(mut self, flags: TemporalFlags) -> Self {
-        self.temporal_flags = flags;
-        self
-    }
 }
 
 impl Default for SearchQuery {
@@ -200,10 +223,6 @@ mod tests {
         assert_eq!(q.ast_pattern, None);
         assert_eq!(q.limit, 50);
         assert_eq!(q.offset, 0);
-        assert!(q.temporal_flags.blast_radius.is_none());
-        assert!(!q.temporal_flags.hot);
-        assert!(!q.temporal_flags.cold);
-        assert!(!q.temporal_flags.risky);
     }
 
     #[test]
@@ -219,31 +238,43 @@ mod tests {
     #[test]
     fn temporal_flags_default_all_false() {
         let flags = TemporalFlags::default();
-        assert!(flags.blast_radius.is_none());
         assert!(!flags.hot);
         assert!(!flags.cold);
         assert!(!flags.risky);
     }
 
     #[test]
-    fn search_query_builder_chain() {
+    fn temporal_flags_partial_init_with_default() {
+        // Within-crate struct-literal construction via `..Default::default()`.
         let flags = TemporalFlags {
             hot: true,
             ..Default::default()
         };
+        assert!(flags.hot);
+        assert!(!flags.cold);
+        assert!(!flags.risky);
+    }
+
+    #[test]
+    fn temporal_flags_from_signals() {
+        let flags = TemporalFlags::from_signals(true, false, true);
+        assert!(flags.hot);
+        assert!(!flags.cold);
+        assert!(flags.risky);
+    }
+
+    #[test]
+    fn search_query_builder_chain() {
         let q = SearchQuery::new()
             .with_text("bar")
             .with_limit(10)
             .with_offset(5)
-            .with_ast_pattern("fn _()")
-            .with_temporal_flags(flags);
+            .with_ast_pattern("fn _()");
 
         assert_eq!(q.text_query, Some("bar".to_string()));
         assert_eq!(q.limit, 10);
         assert_eq!(q.offset, 5);
         assert_eq!(q.ast_pattern, Some("fn _()".to_string()));
-        assert!(q.temporal_flags.hot);
-        assert!(q.temporal_flags.blast_radius.is_none());
     }
 
     #[test]

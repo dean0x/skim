@@ -10,10 +10,9 @@
 //!
 //! # Decoupling from lexical
 //!
-//! Temporal data uses its own internal path table ([`TemporalFileId`]) so
-//! that files in git history but absent from the current lexical index are
-//! still tracked. The CLI joins temporal and lexical results at query time
-//! by comparing paths.
+//! Temporal data uses its own internal path table so that files in git
+//! history but absent from the current lexical index are still tracked. The
+//! CLI joins temporal and lexical results at query time by comparing paths.
 //!
 //! # Storage
 //!
@@ -33,4 +32,4 @@ pub use git_parser::parse_history;
 pub use query::TemporalIndex;
 pub use scoring::{hotspot_scores, risk_scores};
 pub use storage::{ScoreKind, TemporalDb, DEFAULT_LOOKBACK_DAYS};
-pub use types::{CochangeEntry, CommitInfo, HotspotScore, RiskScore, TemporalFileId};
+pub use types::{CochangeEntry, CommitInfo, HotspotScore, RiskScore};
