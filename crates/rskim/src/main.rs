@@ -488,13 +488,19 @@ fn main() -> ExitCode {
         Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args, &analytics),
     };
 
-    match result {
+    let exit_code = match result {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e:#}");
             ExitCode::FAILURE
         }
-    }
+    };
+
+    // Join all pending analytics background threads before the process exits.
+    // This ensures DB writes complete even for fast/short-lived commands.
+    analytics::flush_pending();
+
+    exit_code
 }
 
 /// File/directory/glob/stdin processing pipeline.

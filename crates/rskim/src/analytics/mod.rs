@@ -20,6 +20,7 @@
 mod schema;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -631,6 +632,37 @@ pub(crate) fn now_unix_secs() -> i64 {
         .as_secs() as i64
 }
 
+// ============================================================================
+// Background thread registry for join-before-exit
+// ============================================================================
+
+/// Registry of analytics thread handles for join-before-exit.
+///
+/// Each spawned analytics thread is registered here so that `flush_pending()`
+/// can join them before the process exits, ensuring DB writes complete.
+static PENDING_THREADS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Register a spawned analytics thread handle.
+fn register_thread(handle: std::thread::JoinHandle<()>) {
+    if let Ok(mut handles) = PENDING_THREADS.lock() {
+        handles.push(handle);
+    }
+}
+
+/// Join all pending analytics threads.
+///
+/// Call from `main()` before returning `ExitCode`. This ensures all
+/// background analytics DB writes complete before the process exits —
+/// without this, short-lived commands may terminate before the thread
+/// finishes writing to SQLite.
+pub(crate) fn flush_pending() {
+    if let Ok(mut handles) = PENDING_THREADS.lock() {
+        for handle in handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Persist a record to the default database, with auto-pruning.
 fn persist_record(record: &TokenSavingsRecord) {
     if let Ok(db) = AnalyticsDb::open_default() {
@@ -653,7 +685,7 @@ fn record_fire_and_forget(
     project_path: String,
     parse_tier: Option<String>,
 ) {
-    std::thread::spawn(move || {
+    register_thread(std::thread::spawn(move || {
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
             return;
         };
@@ -674,7 +706,7 @@ fn record_fire_and_forget(
             parse_tier,
         };
         persist_record(&record);
-    });
+    }));
 }
 
 /// Record file operation token savings where counts are already known.
@@ -687,9 +719,9 @@ pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
     if !enabled {
         return;
     }
-    std::thread::spawn(move || {
+    register_thread(std::thread::spawn(move || {
         persist_record(&record);
-    });
+    }));
 }
 
 // ============================================================================

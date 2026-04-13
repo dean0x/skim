@@ -104,7 +104,7 @@ where
             show_stats,
             command_type: crate::analytics::CommandType::Pkg,
             output_format: crate::cmd::OutputFormat::default(),
-            analytics_enabled: false,
+            analytics_enabled: true,
         },
         |output, _args| parse_fn(output),
     )
