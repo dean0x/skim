@@ -471,29 +471,10 @@ fn render_node_with_hunks(
 
         // Output the hunk's patch lines with per-prefix line tracking.
         for patch_line in &hunk.patch_lines {
-            match patch_line.as_bytes().first() {
-                Some(b'+') => {
-                    // Added line: new-file number
-                    let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, &patch_line[1..]);
-                    current_new_line += 1;
-                }
-                Some(b'-') => {
-                    // Removed line: old-file number
-                    let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, &patch_line[1..]);
-                    current_old_line += 1;
-                }
-                Some(b' ') => {
-                    // Context line: new-file number; both advance
-                    let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, &patch_line[1..]);
-                    current_new_line += 1;
-                    current_old_line += 1;
-                }
-                Some(b'\\') => {
-                    // No-newline marker: no line number, emit as-is
-                    let _ = writeln!(output, "{patch_line}");
-                }
-                _ => {}
-            }
+            let (new_delta, old_delta) =
+                emit_patch_line(output, patch_line, current_new_line, current_old_line, ln_width);
+            current_new_line += new_delta;
+            current_old_line += old_delta;
         }
     }
 
@@ -503,6 +484,42 @@ fn render_node_with_hunks(
             let _ = writeln!(output, " {:>ln_width$} {line}", current_new_line);
         }
         current_new_line += 1;
+    }
+}
+
+/// Emit a single patch line with its line number, updating the line counters.
+///
+/// Returns `(new_line_delta, old_line_delta)` — the amount each counter should
+/// advance after this line.  Most callers immediately add them back; splitting
+/// the counters out of this function avoids passing `&mut` through the hot path.
+///
+/// `\` (no-newline marker) and unknown prefixes are written verbatim with no
+/// line number and contribute zero delta to either counter.
+fn emit_patch_line(
+    output: &mut String,
+    patch_line: &str,
+    current_new_line: usize,
+    current_old_line: usize,
+    ln_width: usize,
+) -> (usize, usize) {
+    match patch_line.as_bytes().first() {
+        Some(b'+') => {
+            let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, &patch_line[1..]);
+            (1, 0)
+        }
+        Some(b'-') => {
+            let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, &patch_line[1..]);
+            (0, 1)
+        }
+        Some(b' ') => {
+            let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, &patch_line[1..]);
+            (1, 1)
+        }
+        _ => {
+            // `\` (no-newline marker) or unexpected prefix — emit verbatim, no line number
+            let _ = writeln!(output, "{patch_line}");
+            (0, 0)
+        }
     }
 }
 
@@ -516,28 +533,10 @@ fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str, ln_width: usize) -> 
         let mut current_new_line = hunk.new_start;
         let mut current_old_line = hunk.old_start;
         for line in &hunk.patch_lines {
-            match line.as_bytes().first() {
-                Some(b'+') => {
-                    let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, &line[1..]);
-                    current_new_line += 1;
-                }
-                Some(b'-') => {
-                    let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, &line[1..]);
-                    current_old_line += 1;
-                }
-                Some(b' ') => {
-                    let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, &line[1..]);
-                    current_new_line += 1;
-                    current_old_line += 1;
-                }
-                Some(b'\\') => {
-                    // No-newline marker: no line number
-                    let _ = writeln!(output, "{line}");
-                }
-                _ => {
-                    let _ = writeln!(output, "{line}");
-                }
-            }
+            let (new_delta, old_delta) =
+                emit_patch_line(&mut output, line, current_new_line, current_old_line, ln_width);
+            current_new_line += new_delta;
+            current_old_line += old_delta;
         }
     }
     output

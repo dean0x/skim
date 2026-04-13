@@ -190,6 +190,7 @@ fn run_json(
 const COL_NAME: usize = 14;
 const COL_COUNT: usize = 6;
 const COL_SAVED: usize = 8;
+const COL_DUR: usize = 6;
 const BAR_WIDTH: usize = 16;
 const SPARKLINE_CHAR_WIDTH: usize = 4;
 
@@ -466,17 +467,13 @@ fn render_by_command(
     for cmd in by_command {
         writeln!(
             w,
-            "  {:<width$} {:>col_count$} calls  {:>col_saved$} saved  {}  {:>col_dur$} avg  {}",
+            "  {:<COL_NAME$} {:>COL_COUNT$} calls  {:>COL_SAVED$} saved  {}  {:>COL_DUR$} avg  {}",
             command_label(&cmd.command_type),
             tokens::format_number(cmd.invocations as usize),
             format_tokens(cmd.tokens_saved),
             color_pct(cmd.avg_savings_pct),
             format_duration_ms(cmd.avg_duration_ms),
             render_bar(cmd.avg_savings_pct, BAR_WIDTH),
-            width = COL_NAME,
-            col_count = COL_COUNT,
-            col_saved = COL_SAVED,
-            col_dur = 6,
         )?;
     }
     writeln!(w)?;
@@ -494,15 +491,12 @@ fn render_by_language(
     for lang in by_language {
         writeln!(
             w,
-            "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
+            "  {:<COL_NAME$} {:>COL_COUNT$} files  {:>COL_SAVED$} saved  {}  {}",
             lang.language,
             tokens::format_number(lang.files as usize),
             format_tokens(lang.tokens_saved),
             color_pct(lang.avg_savings_pct),
             render_bar(lang.avg_savings_pct, BAR_WIDTH),
-            width = COL_NAME,
-            col_count = COL_COUNT,
-            col_saved = COL_SAVED,
         )?;
     }
     writeln!(w)?;
@@ -520,15 +514,12 @@ fn render_by_mode(
     for mode in by_mode {
         writeln!(
             w,
-            "  {:<width$} {:>col_count$} files  {:>col_saved$} saved  {}  {}",
+            "  {:<COL_NAME$} {:>COL_COUNT$} files  {:>COL_SAVED$} saved  {}  {}",
             mode.mode,
             tokens::format_number(mode.files as usize),
             format_tokens(mode.tokens_saved),
             color_pct(mode.avg_savings_pct),
             render_bar(mode.avg_savings_pct, BAR_WIDTH),
-            width = COL_NAME,
-            col_count = COL_COUNT,
-            col_saved = COL_SAVED,
         )?;
     }
     writeln!(w)?;
