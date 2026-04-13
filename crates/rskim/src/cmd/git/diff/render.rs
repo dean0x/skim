@@ -19,6 +19,22 @@ thread_local! {
     static PARSERS: RefCell<HashMap<Language, rskim_core::Parser>> = RefCell::new(HashMap::new());
 }
 
+/// Compute the minimum column width needed to display any line number in `hunks`.
+///
+/// Returns at least 1 so empty diffs still produce a consistent format.
+fn line_number_width(hunks: &[DiffHunk<'_>]) -> usize {
+    let max_line = hunks
+        .iter()
+        .map(|h| {
+            let old_end = h.old_start + h.old_count;
+            let new_end = h.new_start + h.new_count;
+            old_end.max(new_end)
+        })
+        .max()
+        .unwrap_or(0);
+    max_line.to_string().len().max(1)
+}
+
 /// Render a single file diff with AST-aware context.
 ///
 /// For supported languages: shows changed AST nodes with full boundaries,
@@ -65,14 +81,17 @@ pub(in crate::cmd::git) fn render_diff_file(
         return output;
     }
 
+    // Compute line number column width from this file's hunks.
+    let ln_width = line_number_width(&file_diff.hunks);
+
     // Added/deleted files: show all patch lines verbatim (no AST overlay needed)
     if file_diff.status == DiffFileStatus::Deleted || file_diff.status == DiffFileStatus::Added {
-        return render_raw_hunks(file_diff, &output);
+        return render_raw_hunks(file_diff, &output, ln_width);
     }
 
     // When AST is skipped (e.g., beyond MAX_AST_FILE_COUNT), render raw hunks.
     if skip_ast {
-        return render_raw_hunks(file_diff, &output);
+        return render_raw_hunks(file_diff, &output, ln_width);
     }
 
     // Determine language for parser lookup — serde-based formats (JSON, YAML,
@@ -80,7 +99,7 @@ pub(in crate::cmd::git) fn render_diff_file(
     let Some(lang) =
         Language::from_path(Path::new(&file_diff.path)).filter(|l| !l.is_serde_based())
     else {
-        return render_raw_hunks(file_diff, &output);
+        return render_raw_hunks(file_diff, &output, ln_width);
     };
 
     // Obtain a cached parser from the thread-local pool and attempt AST rendering.
@@ -91,7 +110,7 @@ pub(in crate::cmd::git) fn render_diff_file(
             }
         }
         let parser = cache.get_mut(&lang)?;
-        try_ast_render(file_diff, global_flags, args, diff_mode, parser)
+        try_ast_render(file_diff, global_flags, args, diff_mode, parser, ln_width)
     });
 
     match ast_result {
@@ -99,7 +118,7 @@ pub(in crate::cmd::git) fn render_diff_file(
             output.push_str(&ast_output);
             output
         }
-        None => render_raw_hunks(file_diff, &output),
+        None => render_raw_hunks(file_diff, &output, ln_width),
     }
 }
 
@@ -118,6 +137,7 @@ fn try_ast_render(
     args: &[String],
     diff_mode: DiffMode,
     parser: &mut rskim_core::Parser,
+    ln_width: usize,
 ) -> Option<String> {
     let source = match get_file_source(&file_diff.path, global_flags, args) {
         Ok(s) => s,
@@ -149,6 +169,7 @@ fn try_ast_render(
             source_lines: &source_lines,
             source: &source,
             diff_mode,
+            ln_width,
         };
         render_with_unchanged_context(&mut output, &tree, &ctx, parser);
     } else {
@@ -157,6 +178,7 @@ fn try_ast_render(
             &changed_ranges,
             &file_diff.hunks,
             &source_lines,
+            ln_width,
         );
     }
 
@@ -172,6 +194,7 @@ fn render_changed_only(
     changed_ranges: &[ChangedNodeRange],
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
+    ln_width: usize,
 ) {
     // Track which parent headers we have already emitted
     let mut emitted_parent_headers: HashSet<usize> = HashSet::new();
@@ -190,12 +213,12 @@ fn render_changed_only(
         if let Some(ref ctx) = range.parent_context {
             if emitted_parent_headers.insert(ctx.header_line) {
                 if let Some(line) = source_lines.get(ctx.header_line - 1) {
-                    let _ = writeln!(output, " {line}");
+                    let _ = writeln!(output, " {:>ln_width$} {line}", ctx.header_line);
                 }
             }
         }
 
-        render_node_with_hunks(output, range.start, range.end, hunks, source_lines);
+        render_node_with_hunks(output, range.start, range.end, hunks, source_lines, ln_width);
 
         // Emit parent closing brace if this is the last child with this parent
         if let Some(ref ctx) = range.parent_context {
@@ -204,7 +227,7 @@ fn render_changed_only(
                 .is_some_and(|&last_idx| last_idx == idx);
             if is_last {
                 if let Some(line) = source_lines.get(ctx.close_line - 1) {
-                    let _ = writeln!(output, " {line}");
+                    let _ = writeln!(output, " {:>ln_width$} {line}", ctx.close_line);
                 }
             }
         }
@@ -257,7 +280,7 @@ fn render_with_unchanged_context(
                 render_container_with_mode(output, &child, ctx, parser);
             } else {
                 // Non-container changed node: render with patch
-                render_node_with_hunks(output, node_start, node_end, ctx.hunks, ctx.source_lines);
+                render_node_with_hunks(output, node_start, node_end, ctx.hunks, ctx.source_lines, ctx.ln_width);
             }
         } else {
             // Unchanged node: render at mode level
@@ -268,6 +291,7 @@ fn render_with_unchanged_context(
                 ctx.source,
                 ctx.diff_mode,
                 parser,
+                ctx.ln_width,
             );
         }
     }
@@ -282,10 +306,11 @@ fn render_container_with_mode(
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
+    let ln_width = ctx.ln_width;
 
     // Emit parent header
     if let Some(line) = ctx.source_lines.get(node_start - 1) {
-        let _ = writeln!(output, " {line}");
+        let _ = writeln!(output, " {:>ln_width$} {line}", node_start);
     }
 
     // Walk children of the container
@@ -315,7 +340,7 @@ fn render_container_with_mode(
         });
 
         if child_changed {
-            render_node_with_hunks(output, child_start, child_end, ctx.hunks, ctx.source_lines);
+            render_node_with_hunks(output, child_start, child_end, ctx.hunks, ctx.source_lines, ln_width);
         } else {
             render_unchanged_node(
                 output,
@@ -324,6 +349,7 @@ fn render_container_with_mode(
                 ctx.source,
                 ctx.diff_mode,
                 parser,
+                ln_width,
             );
         }
     }
@@ -331,7 +357,7 @@ fn render_container_with_mode(
     // Emit closing brace
     if node_end > node_start {
         if let Some(line) = ctx.source_lines.get(node_end - 1) {
-            let _ = writeln!(output, " {line}");
+            let _ = writeln!(output, " {:>ln_width$} {line}", node_end);
         }
     }
 }
@@ -340,6 +366,10 @@ fn render_container_with_mode(
 ///
 /// In structure mode, reuses the provided `parser` for transformation
 /// instead of creating a new parser per node.
+///
+/// Full mode renders line numbers using `ln_width` for alignment.
+/// Structure mode emits synthetic transformed text — no line numbers
+/// since the lines don't correspond 1-to-1 with source positions.
 fn render_unchanged_node(
     output: &mut String,
     node: &tree_sitter::Node<'_>,
@@ -347,21 +377,24 @@ fn render_unchanged_node(
     source: &str,
     diff_mode: DiffMode,
     parser: &mut rskim_core::Parser,
+    ln_width: usize,
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
 
     match diff_mode {
         DiffMode::Full => {
-            // Show unchanged nodes in full
+            // Show unchanged nodes in full with line numbers
             for line_num in node_start..=node_end {
                 if let Some(line) = source_lines.get(line_num - 1) {
-                    let _ = writeln!(output, " {line}");
+                    let _ = writeln!(output, " {:>ln_width$} {line}", line_num);
                 }
             }
         }
         DiffMode::Structure => {
-            // Show unchanged nodes as structure (signatures)
+            // Show unchanged nodes as structure (signatures).
+            // Structure output is synthetic (transformed) text — line numbers
+            // are omitted because they don't correspond to real source lines.
             let node_text = node.utf8_text(source.as_bytes()).unwrap_or_default();
 
             // Transform using the reused parser (avoids per-node parser creation)
@@ -386,13 +419,21 @@ fn render_unchanged_node(
     }
 }
 
-/// Render a node region with hunk patch lines overlaid.
+/// Render a node region with hunk patch lines overlaid, including line numbers.
+///
+/// Line number assignment:
+/// - `+` (added) lines use the new-file line number; `current_new_line` advances.
+/// - `-` (removed) lines use the old-file line number; `current_old_line` advances.
+/// - ` ` (context) lines use the new-file line number; both counters advance.
+/// - `\` (no-newline marker) has no line number.
+/// - Unchanged source lines between hunks use the new-file line number.
 fn render_node_with_hunks(
     output: &mut String,
     node_start: usize,
     node_end: usize,
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
+    ln_width: usize,
 ) {
     // Hunks are sorted by new_start (they come from git's sequential output).
     // Use partition_point to skip hunks that end before node_start, then
@@ -404,10 +445,10 @@ fn render_node_with_hunks(
         .collect();
 
     if relevant_hunks.is_empty() {
-        // No hunks overlap — show as unchanged context
+        // No hunks overlap — show as unchanged context with new-file line numbers
         for line_num in node_start..=node_end {
             if let Some(line) = source_lines.get(line_num - 1) {
-                let _ = writeln!(output, " {line}");
+                let _ = writeln!(output, " {:>ln_width$} {line}", line_num);
             }
         }
         return;
@@ -416,22 +457,39 @@ fn render_node_with_hunks(
     let mut current_new_line = node_start;
 
     for hunk in &relevant_hunks {
-        // Output unchanged source lines before this hunk's position
+        // Output unchanged source lines before this hunk's position.
+        // Context lines: use new-file line number.
         while current_new_line < hunk.new_start && current_new_line <= node_end {
             if let Some(line) = source_lines.get(current_new_line - 1) {
-                let _ = writeln!(output, " {line}");
+                let _ = writeln!(output, " {:>ln_width$} {line}", current_new_line);
             }
             current_new_line += 1;
         }
 
-        // Output the hunk's patch lines
+        // Old-line cursor starts at the hunk boundary.
+        let mut current_old_line = hunk.old_start;
+
+        // Output the hunk's patch lines with per-prefix line tracking.
         for patch_line in &hunk.patch_lines {
             match patch_line.as_bytes().first() {
-                Some(b'+' | b' ') => {
-                    let _ = writeln!(output, "{patch_line}");
+                Some(b'+') => {
+                    // Added line: new-file number
+                    let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, &patch_line[1..]);
                     current_new_line += 1;
                 }
-                Some(b'-' | b'\\') => {
+                Some(b'-') => {
+                    // Removed line: old-file number
+                    let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, &patch_line[1..]);
+                    current_old_line += 1;
+                }
+                Some(b' ') => {
+                    // Context line: new-file number; both advance
+                    let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, &patch_line[1..]);
+                    current_new_line += 1;
+                    current_old_line += 1;
+                }
+                Some(b'\\') => {
+                    // No-newline marker: no line number, emit as-is
                     let _ = writeln!(output, "{patch_line}");
                 }
                 _ => {}
@@ -442,18 +500,44 @@ fn render_node_with_hunks(
     // Output remaining unchanged source lines to end of node
     while current_new_line <= node_end {
         if let Some(line) = source_lines.get(current_new_line - 1) {
-            let _ = writeln!(output, " {line}");
+            let _ = writeln!(output, " {:>ln_width$} {line}", current_new_line);
         }
         current_new_line += 1;
     }
 }
 
-/// Render raw diff hunks as fallback (no AST awareness).
-fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str) -> String {
+/// Render raw diff hunks as fallback (no AST awareness), with line numbers.
+///
+/// Tracks old and new line counters across all hunks in the file, emitting
+/// the appropriate file line number after each prefix character.
+fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str, ln_width: usize) -> String {
     let mut output = header.to_string();
     for hunk in &file_diff.hunks {
+        let mut current_new_line = hunk.new_start;
+        let mut current_old_line = hunk.old_start;
         for line in &hunk.patch_lines {
-            let _ = writeln!(output, "{line}");
+            match line.as_bytes().first() {
+                Some(b'+') => {
+                    let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, &line[1..]);
+                    current_new_line += 1;
+                }
+                Some(b'-') => {
+                    let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, &line[1..]);
+                    current_old_line += 1;
+                }
+                Some(b' ') => {
+                    let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, &line[1..]);
+                    current_new_line += 1;
+                    current_old_line += 1;
+                }
+                Some(b'\\') => {
+                    // No-newline marker: no line number
+                    let _ = writeln!(output, "{line}");
+                }
+                _ => {
+                    let _ = writeln!(output, "{line}");
+                }
+            }
         }
     }
     output
@@ -503,8 +587,13 @@ mod tests {
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("added"), "header should show 'added'");
         assert!(
-            rendered.contains("+const x = 1;"),
-            "should contain added lines"
+            rendered.contains("const x = 1;"),
+            "should contain added line content"
+        );
+        // Line numbers are prepended: format is `+{ln} {content}`
+        assert!(
+            rendered.contains("+1 const x = 1;") || rendered.contains("+ 1 const x = 1;"),
+            "added lines should have line numbers; got: {rendered}"
         );
     }
 
@@ -525,8 +614,13 @@ mod tests {
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("deleted"), "header should show 'deleted'");
         assert!(
-            rendered.contains("-const x = 1;"),
-            "should contain deleted lines"
+            rendered.contains("const x = 1;"),
+            "should contain deleted line content"
+        );
+        // Line numbers are prepended: format is `-{ln} {content}`
+        assert!(
+            rendered.contains("-1 const x = 1;") || rendered.contains("- 1 const x = 1;"),
+            "deleted lines should have line numbers; got: {rendered}"
         );
     }
 
@@ -632,16 +726,16 @@ mod tests {
             "first render should reference foo.ts"
         );
         assert!(
-            out_a.contains("+const FOO = 1;"),
-            "first render should contain its patch line"
+            out_a.contains("FOO = 1;"),
+            "first render should contain its patch line content"
         );
         assert!(
             out_b.contains("bar.ts"),
             "second render should reference bar.ts"
         );
         assert!(
-            out_b.contains("+const BAR = 2;"),
-            "second render should contain its patch line"
+            out_b.contains("BAR = 2;"),
+            "second render should contain its patch line content"
         );
         assert!(
             !out_a.contains("BAR"),
@@ -687,10 +781,122 @@ mod tests {
             output.contains("src/foo.rs (modified)"),
             "expected file header, got: {output}"
         );
-        // Should contain raw patch lines (not AST-processed)
+        // Should contain raw patch line content with line number prefix
         assert!(
-            output.contains("+    println!(\"hello\");"),
-            "expected raw patch line, got: {output}"
+            output.contains("println!(\"hello\");"),
+            "expected raw patch line content, got: {output}"
+        );
+        // Line number format: `+{ln} {content}`
+        assert!(
+            output.contains("+2     println!(\"hello\");") || output.contains("+ 2     println!(\"hello\");"),
+            "expected line-numbered patch line, got: {output}"
+        );
+    }
+
+    // ========================================================================
+    // Line number tests (Workstream 1)
+    // ========================================================================
+
+    #[test]
+    fn test_render_raw_hunks_shows_line_numbers() {
+        // render_raw_hunks (fallback path) should prefix each line with its
+        // file line number, right-aligned to the width of the largest line.
+        let file_diff = FileDiff {
+            path: "src/old.ts".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Deleted,
+            hunks: vec![DiffHunk {
+                old_start: 10,
+                old_count: 3,
+                new_start: 0,
+                new_count: 0,
+                // Three removed lines starting at old line 10
+                patch_lines: vec!["-const a = 1;", "-const b = 2;", "-const c = 3;"],
+            }],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        // Removed lines should use old-file line numbers (10, 11, 12)
+        assert!(
+            rendered.contains("-10 const a = 1;"),
+            "first removed line should carry line 10; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-11 const b = 2;"),
+            "second removed line should carry line 11; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-12 const c = 3;"),
+            "third removed line should carry line 12; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_render_raw_hunks_multi_hunk_line_tracking() {
+        // Two hunks in a single added file — line numbers must restart from each
+        // hunk's new_start and not bleed across hunk boundaries.
+        let file_diff = FileDiff {
+            path: "src/mod.ts".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Added,
+            hunks: vec![
+                DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 2,
+                    patch_lines: vec!["+const A = 1;", "+const B = 2;"],
+                },
+                DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 10,
+                    new_count: 1,
+                    patch_lines: vec!["+const C = 3;"],
+                },
+            ],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        // First hunk: lines 1 and 2
+        assert!(
+            rendered.contains("+1 const A = 1;") || rendered.contains("+ 1 const A = 1;"),
+            "first hunk line 1; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("+2 const B = 2;") || rendered.contains("+ 2 const B = 2;"),
+            "first hunk line 2; got:\n{rendered}"
+        );
+        // Second hunk: line 10
+        assert!(
+            rendered.contains("+10 const C = 3;") || rendered.contains("+10  const C = 3;"),
+            "second hunk line 10; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_line_number_width_helper() {
+        // Empty hunks → minimum width 1
+        assert_eq!(line_number_width(&[]), 1);
+        // Single-digit max
+        assert_eq!(
+            line_number_width(&[DiffHunk {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+                patch_lines: vec![]
+            }]),
+            1
+        );
+        // Three-digit max (old_end = 100 + 10 = 110)
+        assert_eq!(
+            line_number_width(&[DiffHunk {
+                old_start: 100,
+                old_count: 10,
+                new_start: 1,
+                new_count: 5,
+                patch_lines: vec![]
+            }]),
+            3
         );
     }
 }

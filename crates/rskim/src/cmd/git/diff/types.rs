@@ -110,4 +110,7 @@ pub(super) struct ModeRenderContext<'a> {
     pub source_lines: &'a [&'a str],
     pub source: &'a str,
     pub diff_mode: DiffMode,
+    /// Width for zero-padded line number column. Derived from the maximum
+    /// line number across all hunks so columns align across the whole file.
+    pub ln_width: usize,
 }
