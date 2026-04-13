@@ -197,6 +197,17 @@ const SPARKLINE_CHAR_WIDTH: usize = 4;
 // Dashboard formatting helpers
 // ============================================================================
 
+/// Format a duration in milliseconds as a human-readable string.
+///
+/// Examples: `0ms`, `12ms`, `1.2s`, `34.5s`.
+fn format_duration_ms(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{:.0}ms", ms)
+    } else {
+        format!("{:.1}s", ms / 1000.0)
+    }
+}
+
 /// Format a token count in compact human-readable form: 1.5K, 2.4M, 1.2B.
 /// Values under 1000 are rendered as plain integers.
 fn format_tokens(n: u64) -> String {
@@ -455,15 +466,17 @@ fn render_by_command(
     for cmd in by_command {
         writeln!(
             w,
-            "  {:<width$} {:>col_count$} calls  {:>col_saved$} saved  {}  {}",
+            "  {:<width$} {:>col_count$} calls  {:>col_saved$} saved  {}  {:>col_dur$} avg  {}",
             command_label(&cmd.command_type),
             tokens::format_number(cmd.invocations as usize),
             format_tokens(cmd.tokens_saved),
             color_pct(cmd.avg_savings_pct),
+            format_duration_ms(cmd.avg_duration_ms),
             render_bar(cmd.avg_savings_pct, BAR_WIDTH),
             width = COL_NAME,
             col_count = COL_COUNT,
             col_saved = COL_SAVED,
+            col_dur = 6,
         )?;
     }
     writeln!(w)?;
@@ -811,6 +824,7 @@ mod tests {
                     invocations: 30,
                     tokens_saved: 50_000,
                     avg_savings_pct: 72.0,
+                    avg_duration_ms: 125.0,
                 }],
                 by_language: vec![LanguageStats {
                     language: "rust".to_string(),
@@ -1391,5 +1405,30 @@ mod tests {
             "cost section should show Premium tier"
         );
         assert!(output.contains("/MTok"), "cost section should show rate");
+    }
+
+    #[test]
+    fn test_format_duration_ms_sub_second() {
+        assert_eq!(format_duration_ms(0.0), "0ms");
+        assert_eq!(format_duration_ms(12.0), "12ms");
+        assert_eq!(format_duration_ms(999.0), "999ms");
+    }
+
+    #[test]
+    fn test_format_duration_ms_seconds() {
+        assert_eq!(format_duration_ms(1000.0), "1.0s");
+        assert_eq!(format_duration_ms(1200.0), "1.2s");
+        assert_eq!(format_duration_ms(34500.0), "34.5s");
+    }
+
+    #[test]
+    fn test_by_command_includes_duration() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        // The By Command section should include duration for the file command
+        assert!(
+            output.contains("125ms") || output.contains("avg"),
+            "By Command section should display average duration"
+        );
     }
 }

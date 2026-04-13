@@ -105,6 +105,8 @@ pub(crate) struct CommandStats {
     pub(crate) invocations: u64,
     pub(crate) tokens_saved: u64,
     pub(crate) avg_savings_pct: f64,
+    /// Average command duration in milliseconds across all invocations.
+    pub(crate) avg_duration_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -402,7 +404,7 @@ impl AnalyticsDb {
     pub(crate) fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
         let (where_clause, params) = since_clause(since);
         let sql = format!(
-            "SELECT command_type, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {where_clause} GROUP BY command_type ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
+            "SELECT command_type, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0), COALESCE(AVG(duration_ms), 0.0) FROM token_savings {where_clause} GROUP BY command_type ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -411,6 +413,7 @@ impl AnalyticsDb {
                 invocations: row.get(1)?,
                 tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
+                avg_duration_ms: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
