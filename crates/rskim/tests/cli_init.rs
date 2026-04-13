@@ -845,8 +845,8 @@ fn test_init_creates_guidance() {
         "CLAUDE.md should have closing marker"
     );
     assert!(
-        content.contains("npx rskim"),
-        "Guidance should reference npx rskim"
+        content.contains("skim") || content.contains("rskim"),
+        "Guidance should reference skim or rskim"
     );
 }
 

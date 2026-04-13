@@ -136,25 +136,36 @@ pub(super) fn atomic_write_settings(
 /// Generate the skim guidance section content with version markers.
 ///
 /// This is a short (~300 token), self-contained preamble that tells agents
-/// skim is available for structural code exploration. Uses `npx rskim` for
-/// portability. Framed as soft guidance, not an override.
+/// skim is available for structural code exploration. Uses `skim` (or
+/// `rskim` as fallback) via Bash. Framed as strong directives, not soft
+/// suggestions, to maximise adoption across all agent sessions.
 pub(super) fn guidance_content(version: &str) -> String {
     format!(
         r#"<!-- skim-start v{version} -->
 ## Skim — Context-Optimized Code Reading
 
-`skim` is installed. When you need a structural overview of code (not editing), use
-`npx rskim <file>` via Bash for 60-80% token reduction.
+**IMPORTANT**: `skim` is installed and a rewrite hook is active that automatically
+optimizes shell commands. For explicit use, call `skim` via Bash (or `rskim` if
+`skim` is not in PATH).
 
-Good for:
-- Exploring unfamiliar code or understanding structure
-- Understanding API surfaces: `npx rskim <file> --mode=signatures`
-- Scanning entire directories: `npx rskim 'src/**/*.ts'`
+### Rules
 
-Still use Read when:
-- You need exact line content for editing
-- You need specific line numbers
-- The file is small (<50 lines)
+1. **ALWAYS prefer `skim <file>` over Read** when exploring or understanding code —
+   60-80% fewer tokens with the same structural insight.
+2. Use `skim <file> --mode=signatures` for API surfaces and interface discovery.
+3. Use `skim 'src/**/*.ts'` for scanning directories or multi-file exploration.
+4. **Use Read only when**:
+   - You need exact line content for an Edit operation
+   - You need a specific small section (< 50 lines) you will modify next
+   - The file is non-code (images, binary)
+
+### Quick Reference
+
+```
+skim <file>                    # structural overview (default)
+skim <file> --mode=signatures  # API surface only
+skim 'src/**/*.ts'             # multi-file scan
+```
 <!-- skim-end -->"#,
         version = version
     )
@@ -166,7 +177,7 @@ Still use Read when:
 pub(super) fn guidance_content_mdc(version: &str) -> String {
     let body = guidance_content(version);
     format!(
-        "---\ndescription: \"skim code reader — use skim vs Read for structural code exploration\"\nalwaysApply: true\n---\n\n{body}"
+        "---\ndescription: \"skim — ALWAYS use skim over Read for code exploration\"\nalwaysApply: true\n---\n\n{body}"
     )
 }
 
@@ -259,7 +270,11 @@ mod tests {
         let content = guidance_content("2.1.0");
         assert!(content.starts_with("<!-- skim-start v2.1.0 -->"));
         assert!(content.ends_with("<!-- skim-end -->"));
-        assert!(content.contains("npx rskim"));
+        // Version appears in the skim-start marker
+        assert!(content.contains("v2.1.0"));
+        // Strong directive language
+        assert!(content.contains("ALWAYS prefer"));
+        assert!(content.contains("Use Read only when"));
     }
 
     #[test]
