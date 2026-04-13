@@ -87,6 +87,64 @@ pub(crate) fn apply_to_stderr(raw: String, compressed: String) -> Result<Guardra
     apply(raw, compressed, &mut io::stderr())
 }
 
+/// Line-count guardrail for annotated diff output.
+///
+/// Standard byte/token comparison is not suitable for annotated diff output:
+/// line-number prefixes (e.g. `+42 fn foo()`) add bytes to every line without
+/// adding content. The true measure of compression is whether AST elision
+/// reduced the number of lines shown.
+///
+/// Two-tier comparison:
+/// 1. Tier 1: if `compressed_lines <= raw_lines`, pass immediately.
+/// 2. Tier 2: token slow path — count tokens of both; if compressed tokens
+///    exceed raw tokens, trigger.
+///
+/// Emits the same `[skim:guardrail]` warning to stderr on trigger.
+///
+/// Takes ownership of both strings to avoid unnecessary cloning on the fast path.
+pub(crate) fn apply_line_count_to_stderr(
+    raw: String,
+    compressed: String,
+    writer: &mut impl Write,
+) -> Result<GuardrailOutcome> {
+    // Tier 0: Skip for tiny raw output — transformation overhead is expected.
+    if raw.len() < MIN_RAW_SIZE_FOR_GUARDRAIL {
+        return Ok(GuardrailOutcome::Passed { output: compressed });
+    }
+
+    // Tier 1: Line-count fast path.
+    // Line-number annotations add bytes per line but not lines. Fewer or equal
+    // lines means AST elision is working even when byte count is higher.
+    let raw_lines = raw.lines().count();
+    let compressed_lines = compressed.lines().count();
+    if compressed_lines <= raw_lines {
+        return Ok(GuardrailOutcome::Passed { output: compressed });
+    }
+
+    // Tier 2: Token slow path.
+    let raw_tokens = crate::tokens::count_tokens(&raw)?;
+    let compressed_tokens = crate::tokens::count_tokens(&compressed)?;
+
+    if compressed_tokens > raw_tokens {
+        writeln!(
+            writer,
+            "[skim:guardrail] compressed output larger than raw; emitting raw"
+        )?;
+        Ok(GuardrailOutcome::Triggered { output: raw })
+    } else {
+        Ok(GuardrailOutcome::Passed { output: compressed })
+    }
+}
+
+/// Convenience wrapper: line-count guardrail with stderr as the warning writer.
+///
+/// Use this instead of `apply_to_stderr` when the compressed output contains
+/// per-line annotation overhead (e.g. line numbers in diff output) that should
+/// not count against the compression budget.
+pub(crate) fn apply_line_count_guardrail(raw: String, compressed: String) -> Result<GuardrailOutcome> {
+    apply_line_count_to_stderr(raw, compressed, &mut io::stderr())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -165,5 +223,129 @@ mod tests {
         let outcome = apply(String::new(), String::new(), &mut buf).unwrap();
         assert!(!outcome.was_triggered());
         assert_eq!(outcome.into_output(), "");
+    }
+
+    // ========================================================================
+    // apply_line_count_to_stderr tests (diff path guardrail)
+    // ========================================================================
+
+    /// Line-number annotations make each line longer but don't add lines.
+    /// A diff with line numbers should pass when line count is equal.
+    #[test]
+    fn test_line_count_passes_when_annotated_lines_equal_raw() {
+        // Simulate raw diff: 5 lines, each without line-number prefix
+        let raw = "fn foo() {\n    let x = 1;\n    let y = 2;\n    x + y\n}\n".repeat(60);
+        // Annotated output: same 5 lines but with `+42 ` prefix — more bytes, same count
+        let annotated_lines: Vec<String> = raw
+            .lines()
+            .enumerate()
+            .map(|(i, l)| format!("+{} {l}", i + 1))
+            .collect();
+        let compressed = annotated_lines.join("\n") + "\n";
+
+        // compressed has more bytes than raw, but same line count
+        assert!(
+            compressed.len() > raw.len(),
+            "compressed should be larger in bytes"
+        );
+        assert_eq!(
+            compressed.lines().count(),
+            raw.lines().count(),
+            "line counts should match"
+        );
+
+        let mut buf = Vec::new();
+        let outcome = apply_line_count_to_stderr(raw, compressed.clone(), &mut buf).unwrap();
+        assert!(
+            !outcome.was_triggered(),
+            "guardrail should not trigger when line counts are equal"
+        );
+        assert_eq!(outcome.into_output(), compressed);
+        assert!(buf.is_empty(), "no warning should be emitted");
+    }
+
+    /// AST elision removes unchanged functions — fewer lines is valid compression
+    /// even when remaining lines are byte-heavier due to annotations.
+    #[test]
+    fn test_line_count_passes_when_compressed_has_fewer_lines() {
+        // Raw diff: 20 lines (simulating a full function diff)
+        let raw = (1..=20)
+            .map(|i| format!("line {i}: some content here"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        // Compressed: only 5 lines shown (AST elision kept only changed nodes)
+        // but each line has a long line-number prefix making byte count larger
+        let compressed = (1..=5)
+            .map(|i| format!("+{:>4} some content here with extra annotation overhead padding", i))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+
+        assert!(
+            compressed.lines().count() < raw.lines().count(),
+            "compressed should have fewer lines"
+        );
+
+        let mut buf = Vec::new();
+        let outcome = apply_line_count_to_stderr(raw, compressed.clone(), &mut buf).unwrap();
+        assert!(
+            !outcome.was_triggered(),
+            "fewer lines = valid compression even with byte overhead"
+        );
+        assert_eq!(outcome.into_output(), compressed);
+    }
+
+    /// When the compressed output has more lines than raw, it genuinely inflated —
+    /// trigger the guardrail.
+    #[test]
+    fn test_line_count_triggers_when_compressed_has_more_lines_and_tokens() {
+        // Raw: 5 lines
+        let raw_line = "x".repeat(60);
+        let raw = std::iter::repeat(raw_line.as_str())
+            .take(5)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        // Ensure raw >= MIN_RAW_SIZE_FOR_GUARDRAIL
+        assert!(
+            raw.len() >= MIN_RAW_SIZE_FOR_GUARDRAIL,
+            "raw must be >= {MIN_RAW_SIZE_FOR_GUARDRAIL} bytes to activate guardrail"
+        );
+
+        // Compressed: 50 lines of short content (more lines, also more tokens)
+        let compressed = "token ".repeat(10) + "\n";
+        let compressed = compressed.repeat(50);
+        assert!(
+            compressed.lines().count() > raw.lines().count(),
+            "compressed should have more lines than raw"
+        );
+
+        let mut buf = Vec::new();
+        let outcome = apply_line_count_to_stderr(raw.clone(), compressed, &mut buf).unwrap();
+        assert!(
+            outcome.was_triggered(),
+            "guardrail should trigger when compressed has more lines and more tokens"
+        );
+        assert_eq!(outcome.into_output(), raw);
+        let warning = String::from_utf8(buf).unwrap();
+        assert!(
+            warning.contains("[skim:guardrail]"),
+            "expected guardrail warning, got: {warning}"
+        );
+    }
+
+    /// Tiny raw output (< MIN_RAW_SIZE_FOR_GUARDRAIL) always passes the line-count guardrail.
+    #[test]
+    fn test_line_count_skips_for_tiny_raw() {
+        let raw = "x\ny\n".to_string(); // 4 bytes, well below 256
+        let compressed = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut buf = Vec::new();
+        let outcome = apply_line_count_to_stderr(raw, compressed.clone(), &mut buf).unwrap();
+        assert!(
+            !outcome.was_triggered(),
+            "Tier 0 should skip for tiny files"
+        );
+        assert_eq!(outcome.into_output(), compressed);
     }
 }

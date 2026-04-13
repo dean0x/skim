@@ -321,14 +321,17 @@ pub(super) fn run_diff(
             }
             OutputFormat::Text => {
                 // Apply guardrail: if compressed output is larger than raw,
-                // emit raw. Matches the guardrail applied in show.rs for commit
-                // mode, ensuring both handlers share the same safety envelope.
+                // emit raw. Uses line-count comparison (not byte count) because
+                // line-number annotations add bytes per line without adding content.
+                // AST elision shrinks line count; annotations are metadata overhead
+                // that must not count against the compression budget.
                 // Clone `raw_diff` here; file_diffs still holds a borrow so
                 // we cannot move raw_diff until the block ends.
                 // Use into_rendered() instead of to_string(): avoids a redundant
                 // Display::fmt allocation + copy of the pre-built rendered String.
                 let s = result.into_rendered();
-                let guardrail = crate::output::guardrail::apply_to_stderr(raw_diff.clone(), s)?;
+                let guardrail =
+                    crate::output::guardrail::apply_line_count_guardrail(raw_diff.clone(), s)?;
                 let final_output = guardrail.into_output();
                 print!("{final_output}");
                 final_output
