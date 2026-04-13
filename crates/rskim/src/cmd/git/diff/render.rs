@@ -218,7 +218,38 @@ fn render_changed_only(
             }
         }
 
-        render_node_with_hunks(output, range.start, range.end, hunks, source_lines, ln_width);
+        // Clip the render range to exclude parent boundary lines that are
+        // emitted separately (header above, close brace below).  When a
+        // grandchild node starts on the same line as the container header
+        // (e.g. a class-body node at `{` on line 1) or ends on the same
+        // line as the closing brace, render_node_with_hunks would otherwise
+        // re-emit those lines as unchanged context, producing duplicates.
+        let (effective_start, effective_end) = if let Some(ref ctx) = range.parent_context {
+            let start = if range.start == ctx.header_line {
+                range.start + 1
+            } else {
+                range.start
+            };
+            let end = if range.end == ctx.close_line {
+                range.end.saturating_sub(1)
+            } else {
+                range.end
+            };
+            (start, end)
+        } else {
+            (range.start, range.end)
+        };
+
+        if effective_start <= effective_end {
+            render_node_with_hunks(
+                output,
+                effective_start,
+                effective_end,
+                hunks,
+                source_lines,
+                ln_width,
+            );
+        }
 
         // Emit parent closing brace if this is the last child with this parent
         if let Some(ref ctx) = range.parent_context {
@@ -896,6 +927,197 @@ mod tests {
                 patch_lines: vec![]
             }]),
             3
+        );
+    }
+
+    // ========================================================================
+    // Container header deduplication tests
+    // ========================================================================
+
+    /// When a changed child range starts on the same line as its parent
+    /// container header (e.g. a body node starting at `{` on line 1), the
+    /// parent header must appear exactly once in the rendered output.
+    ///
+    /// Without the fix, `render_changed_only` emits the header explicitly then
+    /// `render_node_with_hunks` re-emits it as an unchanged context line,
+    /// producing a duplicate `1 interface UserService {` pair.
+    #[test]
+    fn test_render_changed_only_no_duplicate_parent_header_when_range_starts_at_header() {
+        // interface UserService {        ← line 1 (parent header AND child start)
+        //   id: string;                  ← line 2 (changed)
+        //   name: string;               ← line 3
+        // }                             ← line 4 (parent close)
+        let source_lines: Vec<&str> =
+            vec!["interface UserService {", "  id: string;", "  name: string;", "}"];
+
+        // Hunk changes line 2 (new file)
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            patch_lines: vec!["-  id: string;", "+  id: number;"],
+        }];
+
+        // Simulate AST returning a body node that starts at line 1 (same as parent),
+        // with parent_context also at line 1. This is the scenario that triggers the
+        // duplicate: the body node covers lines 1-4 with its own start == header_line.
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1, // child starts on same line as parent header
+            end: 4,
+            parent_context: Some(super::super::types::ParentContext {
+                header_line: 1,
+                close_line: 4,
+            }),
+        }];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // Count occurrences of the header line content
+        let header_count = output
+            .lines()
+            .filter(|l| l.contains("interface UserService {"))
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "container header must appear exactly once; got {header_count}:\n{output}"
+        );
+
+        // The changed line should appear
+        assert!(
+            output.contains("id: number;"),
+            "changed line should appear in output:\n{output}"
+        );
+    }
+
+    /// When two changed child ranges share the same parent container, the
+    /// container header must appear exactly once and the close brace exactly once.
+    #[test]
+    fn test_render_changed_only_no_duplicate_header_two_children_same_parent() {
+        // interface UserService {        ← line 1 (parent header)
+        //   findById(id: string): User;  ← line 2 (changed)
+        //   createUser(): User;          ← line 3 (changed)
+        //   deleteUser(): void;          ← line 4
+        // }                             ← line 5 (parent close)
+        let source_lines: Vec<&str> = vec![
+            "interface UserService {",
+            "  findById(id: string): User;",
+            "  createUser(): User;",
+            "  deleteUser(): void;",
+            "}",
+        ];
+
+        // Two hunks, one for each changed method
+        let hunks = vec![
+            DiffHunk {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+                patch_lines: vec!["-  findById(id: string): User;", "+  findById(id: string): UserDto;"],
+            },
+            DiffHunk {
+                old_start: 3,
+                old_count: 1,
+                new_start: 3,
+                new_count: 1,
+                patch_lines: vec!["-  createUser(): User;", "+  createUser(): UserDto;"],
+            },
+        ];
+
+        // Two child ranges, both with the same parent container at lines 1-5
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 2,
+                end: 2,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+            super::super::types::ChangedNodeRange {
+                start: 3,
+                end: 3,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        let header_count = output
+            .lines()
+            .filter(|l| l.contains("interface UserService {"))
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "container header must appear exactly once; got {header_count}:\n{output}"
+        );
+
+        // Close brace is rendered as " 5 }" — ends_with(" }") counts it uniquely
+        // since none of the changed lines in this test end with " }".
+        let close_count = output.lines().filter(|l| l.ends_with(" }")).count();
+        assert_eq!(
+            close_count, 1,
+            "container close brace must appear exactly once; got {close_count}:\n{output}"
+        );
+
+        // Both changed lines should appear
+        assert!(
+            output.contains("UserDto"),
+            "changed content must appear:\n{output}"
+        );
+    }
+
+    /// When the changed range ends on the same line as the parent close brace,
+    /// the close brace must appear exactly once (not once from render_node_with_hunks
+    /// and once from the explicit is_last close brace emission).
+    #[test]
+    fn test_render_changed_only_no_duplicate_close_brace_when_range_ends_at_close() {
+        // class AuthService {   ← line 1 (parent header AND child start)
+        //   login(): void;      ← line 2 (changed)
+        // }                     ← line 3 (parent close AND child end)
+        let source_lines: Vec<&str> = vec!["class AuthService {", "  login(): void;", "}"];
+
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            patch_lines: vec!["-  login(): void;", "+  login(): Promise<void>;"],
+        }];
+
+        // Range starts at header line 1, ends at close line 3
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1,
+            end: 3,
+            parent_context: Some(super::super::types::ParentContext {
+                header_line: 1,
+                close_line: 3,
+            }),
+        }];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        let header_count = output
+            .lines()
+            .filter(|l| l.contains("class AuthService {"))
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "class header must appear exactly once; got {header_count}:\n{output}"
+        );
+
+        // Close brace rendered as " 3 }" — ends_with(" }") counts it uniquely
+        let close_count = output.lines().filter(|l| l.ends_with(" }")).count();
+        assert_eq!(
+            close_count, 1,
+            "close brace must appear exactly once; got {close_count}:\n{output}"
         );
     }
 }
