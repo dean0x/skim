@@ -293,8 +293,7 @@ pub(super) fn run_diff(
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {
-        let label =
-            super::build_analytics_label("diff", args, show_stats, analytics_enabled);
+        let label = super::build_analytics_label("diff", args, show_stats, analytics_enabled);
         return Ok(handle_error_exit(
             output.stdout,
             output.stderr,
@@ -361,7 +360,13 @@ pub(super) fn run_diff(
             return Ok(ExitCode::SUCCESS);
         }
 
-        render_and_format(file_diffs, global_flags, &git_args, diff_mode, output_format)?
+        render_and_format(
+            file_diffs,
+            global_flags,
+            &git_args,
+            diff_mode,
+            output_format,
+        )?
     }; // file_diffs dropped here, raw_diff is free to move
 
     // Both `raw_diff` and `result_str` are owned here; use the owned variant to

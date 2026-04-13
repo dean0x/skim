@@ -166,5 +166,4 @@ mod tests {
         assert!(!outcome.was_triggered());
         assert_eq!(outcome.into_output(), "");
     }
-
 }

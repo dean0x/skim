@@ -77,7 +77,15 @@ pub(crate) fn run(
             prepare_tree_args,
             parse_tree,
         ),
-        _ => run_file_tool(CONFIG_LS, args, show_stats, json_output, analytics_enabled, |_| {}, parse_ls),
+        _ => run_file_tool(
+            CONFIG_LS,
+            args,
+            show_stats,
+            json_output,
+            analytics_enabled,
+            |_| {},
+            parse_ls,
+        ),
     }
 }
 

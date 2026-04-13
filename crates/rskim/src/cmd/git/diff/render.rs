@@ -318,7 +318,14 @@ fn render_with_unchanged_context(
                 render_container_with_mode(output, &child, ctx, parser);
             } else {
                 // Non-container changed node: render with patch
-                render_node_with_hunks(output, node_start, node_end, ctx.hunks, ctx.source_lines, ctx.ln_width);
+                render_node_with_hunks(
+                    output,
+                    node_start,
+                    node_end,
+                    ctx.hunks,
+                    ctx.source_lines,
+                    ctx.ln_width,
+                );
             }
         } else {
             // Unchanged node: render at mode level
@@ -378,7 +385,14 @@ fn render_container_with_mode(
         });
 
         if child_changed {
-            render_node_with_hunks(output, child_start, child_end, ctx.hunks, ctx.source_lines, ln_width);
+            render_node_with_hunks(
+                output,
+                child_start,
+                child_end,
+                ctx.hunks,
+                ctx.source_lines,
+                ln_width,
+            );
         } else {
             render_unchanged_node(
                 output,
@@ -564,13 +578,8 @@ fn render_node_with_hunks(
         // The patch-line cursor starts at hunk.new_start so that skip logic
         // correctly advances past pre-node lines when the hunk begins before
         // node_start.
-        current_new_line = emit_hunk_patch_lines_clipped(
-            output,
-            hunk,
-            node_start,
-            node_end,
-            ln_width,
-        );
+        current_new_line =
+            emit_hunk_patch_lines_clipped(output, hunk, node_start, node_end, ln_width);
     }
 
     // Output remaining unchanged source lines to end of node
@@ -632,8 +641,13 @@ fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str, ln_width: usize) -> 
         let mut current_new_line = hunk.new_start;
         let mut current_old_line = hunk.old_start;
         for line in &hunk.patch_lines {
-            let (new_delta, old_delta) =
-                emit_patch_line(&mut output, line, current_new_line, current_old_line, ln_width);
+            let (new_delta, old_delta) = emit_patch_line(
+                &mut output,
+                line,
+                current_new_line,
+                current_old_line,
+                ln_width,
+            );
             current_new_line += new_delta;
             current_old_line += old_delta;
         }
@@ -886,7 +900,8 @@ mod tests {
         );
         // Line number format: `+{ln} {content}`
         assert!(
-            output.contains("+2     println!(\"hello\");") || output.contains("+ 2     println!(\"hello\");"),
+            output.contains("+2     println!(\"hello\");")
+                || output.contains("+ 2     println!(\"hello\");"),
             "expected line-numbered patch line, got: {output}"
         );
     }
@@ -1015,8 +1030,12 @@ mod tests {
         //   id: string;                  ← line 2 (changed)
         //   name: string;               ← line 3
         // }                             ← line 4 (parent close)
-        let source_lines: Vec<&str> =
-            vec!["interface UserService {", "  id: string;", "  name: string;", "}"];
+        let source_lines: Vec<&str> = vec![
+            "interface UserService {",
+            "  id: string;",
+            "  name: string;",
+            "}",
+        ];
 
         // Hunk changes line 2 (new file)
         let hunks = vec![DiffHunk {
@@ -1083,7 +1102,10 @@ mod tests {
                 old_count: 1,
                 new_start: 2,
                 new_count: 1,
-                patch_lines: vec!["-  findById(id: string): User;", "+  findById(id: string): UserDto;"],
+                patch_lines: vec![
+                    "-  findById(id: string): User;",
+                    "+  findById(id: string): UserDto;",
+                ],
             },
             DiffHunk {
                 old_start: 3,
@@ -1261,7 +1283,10 @@ mod tests {
         render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 2);
 
         // Each container header must appear exactly once.
-        let foo_count = output.lines().filter(|l| l.contains("interface Foo {")).count();
+        let foo_count = output
+            .lines()
+            .filter(|l| l.contains("interface Foo {"))
+            .count();
         assert_eq!(
             foo_count, 1,
             "interface Foo header must appear exactly once; got {foo_count}:\n{output}"

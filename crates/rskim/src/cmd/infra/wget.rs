@@ -51,7 +51,15 @@ pub(crate) fn run(
     analytics_enabled: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for wget — flags are too varied
-    run_infra_tool(CONFIG, args, show_stats, json_output, analytics_enabled, |_| {}, parse_impl)
+    run_infra_tool(
+        CONFIG,
+        args,
+        show_stats,
+        json_output,
+        analytics_enabled,
+        |_| {},
+        parse_impl,
+    )
 }
 
 /// Three-tier parse function for wget output.

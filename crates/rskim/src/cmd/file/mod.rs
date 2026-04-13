@@ -55,7 +55,13 @@ pub(crate) fn run(
         "grep" => grep::run(tool_args, show_stats, json_output, analytics_enabled),
         "ls" => ls::run(tool_args, show_stats, json_output, "ls", analytics_enabled),
         "rg" => rg::run(tool_args, show_stats, json_output, analytics_enabled),
-        "tree" => ls::run(tool_args, show_stats, json_output, "tree", analytics_enabled),
+        "tree" => ls::run(
+            tool_args,
+            show_stats,
+            json_output,
+            "tree",
+            analytics_enabled,
+        ),
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(

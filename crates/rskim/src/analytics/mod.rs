@@ -1386,9 +1386,7 @@ mod tests {
     /// Called at the start of each registry test to ensure a clean slate,
     /// and directly verified in the flush round-trip test.
     fn drain_registry() -> usize {
-        let mut handles = PENDING_THREADS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut handles = PENDING_THREADS.lock().unwrap_or_else(|e| e.into_inner());
         let count = handles.len();
         for h in handles.drain(..) {
             let _ = h.join();
@@ -1403,12 +1401,15 @@ mod tests {
         drain_registry(); // ensure clean state
 
         flush_pending(); // must not panic
-        // registry must still be empty afterwards
+                         // registry must still be empty afterwards
         let len = PENDING_THREADS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len();
-        assert_eq!(len, 0, "registry should be empty after flush on empty input");
+        assert_eq!(
+            len, 0,
+            "registry should be empty after flush on empty input"
+        );
     }
 
     /// `register_thread` + `flush_pending` round-trip: registered handle is
@@ -1431,7 +1432,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len();
-        assert_eq!(len, 1, "one handle should be in registry after register_thread");
+        assert_eq!(
+            len, 1,
+            "one handle should be in registry after register_thread"
+        );
 
         // unblock the spawned thread, then flush
         drop(tx);
