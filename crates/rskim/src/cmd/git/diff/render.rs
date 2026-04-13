@@ -22,6 +22,9 @@ thread_local! {
 /// Compute the minimum column width needed to display any line number in `hunks`.
 ///
 /// Returns at least 1 so empty diffs still produce a consistent format.
+///
+/// Uses integer arithmetic (`checked_ilog10`) instead of heap-allocating a
+/// `String` to count decimal digits (PF-014 perf fix).
 fn line_number_width(hunks: &[DiffHunk<'_>]) -> usize {
     let max_line = hunks
         .iter()
@@ -32,7 +35,11 @@ fn line_number_width(hunks: &[DiffHunk<'_>]) -> usize {
         })
         .max()
         .unwrap_or(0);
-    max_line.to_string().len().max(1)
+    // checked_ilog10 returns None for 0; fall back to 1 in that case.
+    max_line
+        .checked_ilog10()
+        .map(|e| e as usize + 1)
+        .unwrap_or(1)
 }
 
 /// Render a single file diff with AST-aware context.
@@ -450,6 +457,62 @@ fn render_unchanged_node(
     }
 }
 
+/// Emit patch lines from a single hunk, clipped to the node's line range
+/// `[node_start, node_end]`.
+///
+/// A single git hunk can span multiple AST nodes (one `@@` block covering both
+/// an interface ending at line 8 and a class starting at line 10).  Without
+/// clipping, every node that overlaps the hunk would emit ALL of the hunk's
+/// patch lines, producing duplicate output across adjacent nodes.
+///
+/// Clipping rules:
+/// - Skip lines before `node_start`: advance counters without emitting.
+///   Removed lines (`-`, new_delta == 0) are skipped if `patch_new_line`
+///   hasn't yet reached `node_start`.
+/// - Stop after `node_end`: break once `patch_new_line > node_end`.
+///
+/// Returns the final `patch_new_line` value so the caller can advance
+/// `current_new_line` past the lines consumed by this hunk.
+fn emit_hunk_patch_lines_clipped(
+    output: &mut String,
+    hunk: &DiffHunk<'_>,
+    node_start: usize,
+    node_end: usize,
+    ln_width: usize,
+) -> usize {
+    let mut patch_new_line = hunk.new_start;
+    let mut patch_old_line = hunk.old_start;
+
+    for patch_line in &hunk.patch_lines {
+        // Stop once we've passed the node's end boundary.
+        if patch_new_line > node_end {
+            break;
+        }
+
+        let (new_delta, old_delta) = match patch_line.as_bytes().first() {
+            Some(b'+') => (1usize, 0usize),
+            Some(b'-') => (0, 1),
+            Some(b' ') => (1, 1),
+            _ => (0, 0),
+        };
+
+        // Skip lines that fall before the node's start (hunk started earlier
+        // in the file).
+        if patch_new_line < node_start {
+            patch_new_line += new_delta;
+            patch_old_line += old_delta;
+            continue;
+        }
+
+        let (nd, od) =
+            emit_patch_line(output, patch_line, patch_new_line, patch_old_line, ln_width);
+        patch_new_line += nd;
+        patch_old_line += od;
+    }
+
+    patch_new_line
+}
+
 /// Render a node region with hunk patch lines overlaid, including line numbers.
 ///
 /// Line number assignment:
@@ -498,54 +561,16 @@ fn render_node_with_hunks(
         }
 
         // Old-line cursor starts at the hunk boundary.
-        // The patch-line cursor (patch_new_line) starts at the hunk's new_start so
-        // that skip logic can correctly advance past pre-node lines even when the
-        // hunk begins before node_start.
-        let mut patch_new_line = hunk.new_start;
-        let mut patch_old_line = hunk.old_start;
-
-        // Output the hunk's patch lines, clipped to [node_start, node_end].
-        //
-        // A single git hunk can span multiple AST nodes (one `@@` block covering
-        // both an interface ending at line 8 and a class starting at line 10).
-        // Without clipping, every node that overlaps the hunk would emit ALL of
-        // the hunk's patch lines — causing duplicate output across adjacent nodes.
-        //
-        // Clipping rules:
-        //   - Skip lines before node_start: advance counters without emitting.
-        //     Removed lines (`-`, new_delta == 0) are skipped if the current
-        //     new-file position (patch_new_line) hasn't yet reached node_start.
-        //   - Stop after node_end: break once patch_new_line > node_end.
-        for patch_line in &hunk.patch_lines {
-            // Stop once we've passed the node's end boundary.
-            if patch_new_line > node_end {
-                break;
-            }
-
-            let (new_delta, old_delta) = match patch_line.as_bytes().first() {
-                Some(b'+') => (1usize, 0usize),
-                Some(b'-') => (0, 1),
-                Some(b' ') => (1, 1),
-                _ => (0, 0),
-            };
-
-            // Skip lines that fall before the node's start (hunk started earlier
-            // in the file).
-            if patch_new_line < node_start {
-                patch_new_line += new_delta;
-                patch_old_line += old_delta;
-                continue;
-            }
-
-            let (nd, od) =
-                emit_patch_line(output, patch_line, patch_new_line, patch_old_line, ln_width);
-            patch_new_line += nd;
-            patch_old_line += od;
-        }
-
-        // Advance the outer cursor past the lines consumed by this hunk so the
-        // inter-hunk context fill and trailing-lines loops stay in sync.
-        current_new_line = patch_new_line;
+        // The patch-line cursor starts at hunk.new_start so that skip logic
+        // correctly advances past pre-node lines when the hunk begins before
+        // node_start.
+        current_new_line = emit_hunk_patch_lines_clipped(
+            output,
+            hunk,
+            node_start,
+            node_end,
+            ln_width,
+        );
     }
 
     // Output remaining unchanged source lines to end of node
@@ -572,17 +597,21 @@ fn emit_patch_line(
     current_old_line: usize,
     ln_width: usize,
 ) -> (usize, usize) {
+    // Use get(1..) instead of &s[1..] for defensive byte-slice safety (PF-020).
+    // The prefixes +/-/space are single-byte ASCII so this is always correct,
+    // but get(1..) avoids a panic if the string is somehow empty.
+    let rest = patch_line.get(1..).unwrap_or("");
     match patch_line.as_bytes().first() {
         Some(b'+') => {
-            let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, &patch_line[1..]);
+            let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, rest);
             (1, 0)
         }
         Some(b'-') => {
-            let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, &patch_line[1..]);
+            let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, rest);
             (0, 1)
         }
         Some(b' ') => {
-            let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, &patch_line[1..]);
+            let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, rest);
             (1, 1)
         }
         _ => {

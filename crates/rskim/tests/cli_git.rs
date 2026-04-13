@@ -315,18 +315,29 @@ fn test_skim_git_show_head_commit_mode() {
          raw git show never contains this character; got: {stdout}"
     );
 
-    // Assertion 2: compressed output must not be dramatically larger than raw.
+    // Assertion 2: compressed output must not exceed raw by more than
+    // the expected annotation overhead.
     //
-    // Line numbers added in WS1 add a small per-line overhead that can push
-    // the diff body size above the raw body for commits with few changed files.
-    // The em-dash one-liner (assertion 1) already proves skim did NOT emit raw
-    // git-show output — raw output never contains U+2014. We therefore relax
-    // the byte-count check: skim output must not exceed 110% of raw output.
-    let max_allowed = (raw_bytes as f64 * 1.1) as usize;
+    // Line numbers added by the AST-aware renderer contribute a fixed per-line
+    // overhead: 1 prefix char + up to 5 digits + 1 space = ~7 bytes/line.
+    // We use 8 bytes/line as a conservative upper bound.
+    //
+    // Formula: max_allowed = raw_bytes + skim_line_count * 8
+    //
+    // This is tighter than a flat 110% multiplier for large commits (where 10%
+    // of raw_bytes >> annotation overhead) and more accurate for small commits
+    // (where annotation overhead is proportionally larger).
+    //
+    // The em-dash assertion (assertion 1) already proves skim ran — raw git
+    // show output never contains U+2014.
+    let skim_line_count = stdout.lines().count();
+    let annotation_overhead = skim_line_count * 8;
+    let max_allowed = raw_bytes + annotation_overhead;
     assert!(
         stdout.len() <= max_allowed,
-        "Expected compressed output ({} bytes) to be at most 110% of \
-         raw git show HEAD ({raw_bytes} bytes = {max_allowed} max); got: {}",
+        "Expected compressed output ({} bytes) to be at most raw ({raw_bytes}) + \
+         annotation_overhead ({annotation_overhead} = {skim_line_count} lines × 8 bytes); \
+         got: {}",
         stdout.len(),
         stdout.len()
     );
