@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ✅ **PHASE 3 COMPLETE** (100% of original roadmap)
 
 **What's Complete (Phases 1 & 2):**
-- ✅ Full Rust project with comprehensive test suite (2,223 tests passing)
+- ✅ Full Rust project with comprehensive test suite (2,482 tests passing)
 - ✅ 17 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
 - ✅ 4 transformation modes: structure, signatures, types, full
 - ✅ CLI with stdin/stdout streaming support
@@ -191,6 +191,51 @@ cargo bench                    # Criterion benchmarks
 hyperfine 'skim file.ts'       # CLI performance
 cargo flamegraph --bin skim -- file.ts  # Profile hot paths
 ```
+
+## Release Process
+
+### Pre-Release Checklist
+1. Verify all target PRs are merged to main
+2. Run `cargo test --all-features` — confirm passing count
+3. Create release branch: `git checkout -b release/vX.Y.Z main`
+
+### Version Bump (3 files, 4 edits)
+- `crates/rskim-core/Cargo.toml` — package version
+- `crates/rskim/Cargo.toml` — package version + rskim-core dependency version
+- Run `cargo check` to update Cargo.lock
+
+### Documentation Updates
+- `CHANGELOG.md` — convert [Unreleased] to [X.Y.Z] - YYYY-MM-DD, add new [Unreleased], add Version History entry
+- `README.md` — update version string (line ~591) and test count (line ~620)
+- `CLAUDE.md` — update test count (2 locations: line ~16 and line ~505)
+
+### Release Commit & Merge
+```
+git commit -m "release: vX.Y.Z — <summary>"
+git checkout main
+git merge release/vX.Y.Z --no-ff -m "Merge release/vX.Y.Z into main"
+git tag vX.Y.Z
+git push origin main --tags
+```
+
+### Automated Pipeline (triggered by tag push)
+`.github/workflows/release.yml` runs: test → build (7 targets) → GitHub Release → crates.io (rskim-core first, then rskim) → npm (7 platform pkgs + main) → Homebrew tap dispatch.
+
+**Critical:** Cargo.toml versions MUST match the tag version exactly or the build job fails.
+
+### Post-Release Verification
+- `cargo install rskim` — shows new version
+- `npx rskim --version` — shows new version
+- GitHub Release page — 7 binary assets attached
+- `brew update && brew info dean0x/tap/skim` — formula updated
+
+### Rollback (if CI fails after tag push)
+1. Delete the tag: `git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`
+2. Fix the issue on the release branch
+3. Re-merge to main, re-tag, re-push
+
+### Post-Release Cleanup
+- Delete release branch: `git branch -d release/vX.Y.Z`
 
 ## Design Constraints
 
@@ -502,7 +547,7 @@ Cross-platform builds require different GitHub Actions runners:
 5. Create test fixtures
 6. Validate AST access works
 
-**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 2,223 tests passing. See README.md for full usage guide.
+**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 2,482 tests passing. See README.md for full usage guide.
 
 ### Critical First File: `src/parser.rs`
 

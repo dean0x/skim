@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-04-14
+
+GitHub CLI compression, git subcommand completion, multi-agent handler fixes, quality improvements. 2,482 tests passing (up from 2,223 in v2.3.1).
+
 ### Added
 - `skim infra gh pr view` now always renders `draft`, `mergeable`, and `ci` items so agents observe the full merge-readiness signal set even on clean PRs. A `[DRAFT]` prefix is added to the summary when the PR is a draft. CI aggregation: `FAILURE`/`CANCELLED`/`TIMED_OUT` → `failing`; `PENDING`/`QUEUED`/`IN_PROGRESS` → `pending`; else `passing`; null/empty → `none`. (AD-9, commit 689e397, see `crates/rskim/src/cmd/infra/gh/pr_view.rs`)
 - `prettier --check`, `rustfmt --check`, `cargo fmt --check`, and `cargo fmt -- --check` are now acknowledged as already-compact (AD-11, compress-or-skip rule). `skim rewrite` echoes the original command instead of rewriting to `skim lint prettier/rustfmt`. This prevents the skim header from inflating output on clean or near-clean codebases.
@@ -713,6 +717,8 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.4.0** (2026-04-14): GitHub CLI compression, git subcommand completion, quality improvements (2,482 tests)
+- **2.3.1** (2026-04-09): Discover/rewrite alignment, rewritable gap closures, stats bar fix
 - **2.3.0** (2026-04-08): Stats dashboard v3, debug-gated warnings, git fetch compression, parse tier tracking
 - **2.2.0** (2026-04-06): File, log, infra output compression (12 new parsers), learn fix, rewrite/discover integration
 - **2.1.0** (2026-04-01): Kotlin + Swift, AST-aware git diff, lint/pkg compression, canonical output

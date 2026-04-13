@@ -588,7 +588,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.3.1 — Stable
+**Current**: v2.4.0 — Stable
 
 ✅ **Core — Code Reading (17 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
@@ -617,7 +617,7 @@ cargo bench
 
 ✅ **Distribution:**
 - cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
-- 2,223 tests passing, 14.6ms performance (3x under target)
+- 2,482 tests passing, 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
