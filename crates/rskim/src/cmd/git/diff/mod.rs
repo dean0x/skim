@@ -320,21 +320,18 @@ pub(super) fn run_diff(
                 json
             }
             OutputFormat::Text => {
-                // Apply guardrail: if compressed output is larger than raw,
-                // emit raw. Uses line-count comparison (not byte count) because
-                // line-number annotations add bytes per line without adding content.
-                // AST elision shrinks line count; annotations are metadata overhead
-                // that must not count against the compression budget.
-                // Clone `raw_diff` here; file_diffs still holds a borrow so
-                // we cannot move raw_diff until the block ends.
+                // No guardrail: `git diff` is an enhancement command, not compression.
+                // The AST-aware renderer adds structural context (full container
+                // boundaries, line numbers) that will almost always produce more lines
+                // than the raw unified diff ±3-line context window. That is the
+                // intended behaviour — more context for the agent, not less.
+                // A guardrail that falls back to raw when rendered > raw would defeat
+                // the purpose of the feature entirely.
                 // Use into_rendered() instead of to_string(): avoids a redundant
                 // Display::fmt allocation + copy of the pre-built rendered String.
                 let s = result.into_rendered();
-                let guardrail =
-                    crate::output::guardrail::apply_line_count_guardrail(raw_diff.clone(), s)?;
-                let final_output = guardrail.into_output();
-                print!("{final_output}");
-                final_output
+                print!("{s}");
+                s
             }
         }
     }; // file_diffs dropped here, raw_diff is free to move
