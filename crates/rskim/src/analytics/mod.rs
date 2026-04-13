@@ -1238,7 +1238,7 @@ mod tests {
             stored.len()
         );
         assert!(
-            stored.is_ascii() || stored.chars().all(|_| true),
+            std::str::from_utf8(stored.as_bytes()).is_ok(),
             "stored value must be valid UTF-8"
         );
     }

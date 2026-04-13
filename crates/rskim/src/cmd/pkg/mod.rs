@@ -38,16 +38,14 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let tool = tool_name.as_str();
-
     let analytics_enabled = analytics.enabled;
 
-    match tool {
+    match tool_name.as_str() {
         "npm" => npm::run(tool_args, show_stats, json_output, analytics_enabled),
         "pnpm" => pnpm::run(tool_args, show_stats, json_output, analytics_enabled),
         "pip" => pip::run(tool_args, show_stats, json_output, analytics_enabled),
         "cargo" => cargo::run(tool_args, show_stats, json_output, analytics_enabled),
-        _ => {
+        tool => {
             let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(
                 "skim pkg: unknown tool '{safe_tool}'\n\
