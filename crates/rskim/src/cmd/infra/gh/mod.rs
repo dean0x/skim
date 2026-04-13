@@ -74,6 +74,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
     let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
     let action = args.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -84,6 +85,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
+            analytics_enabled,
             issue_view::prepare_args,
             issue_view::parse_impl,
         ),
@@ -92,6 +94,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
+            analytics_enabled,
             pr_view::prepare_args,
             pr_view::parse_impl,
         ),
@@ -100,6 +103,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
+            analytics_enabled,
             pr_checks::prepare_args,
             pr_checks::parse_impl,
         ),
@@ -108,6 +112,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
+            analytics_enabled,
             run_view::prepare_args,
             run_view::parse_impl,
         ),
@@ -116,6 +121,7 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
+            analytics_enabled,
             list::prepare_args,
             parse_impl_with_auto_detect,
         ),

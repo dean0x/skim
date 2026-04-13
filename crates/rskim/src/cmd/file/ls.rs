@@ -65,6 +65,7 @@ pub(crate) fn run(
     show_stats: bool,
     json_output: bool,
     tool_name: &str,
+    analytics_enabled: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
     match tool_name {
         "tree" => run_file_tool(
@@ -72,10 +73,19 @@ pub(crate) fn run(
             args,
             show_stats,
             json_output,
+            analytics_enabled,
             prepare_tree_args,
             parse_tree,
         ),
-        _ => run_file_tool(CONFIG_LS, args, show_stats, json_output, |_| {}, parse_ls),
+        _ => run_file_tool(
+            CONFIG_LS,
+            args,
+            show_stats,
+            json_output,
+            analytics_enabled,
+            |_| {},
+            parse_ls,
+        ),
     }
 }
 

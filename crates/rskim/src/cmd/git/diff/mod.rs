@@ -141,6 +141,108 @@ fn print_diff_help() {
     println!("    skim git diff --json             JSON output");
 }
 
+/// Handle a non-zero `git diff` exit: print stderr/stdout, record analytics,
+/// and return the mapped exit code.
+///
+/// Extracted from `run_diff` to keep the happy path readable.
+fn handle_error_exit(
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    label: String,
+    show_stats: bool,
+    analytics_enabled: bool,
+    duration: std::time::Duration,
+) -> ExitCode {
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+    if !stdout.is_empty() {
+        print!("{stdout}");
+    }
+    // Record analytics even on non-zero exit so the DB reflects failed
+    // invocations (PF-018 resolution: move stdout instead of cloning).
+    super::finalize_git_output_passthrough(
+        stdout,
+        label,
+        show_stats,
+        analytics_enabled,
+        crate::analytics::CommandType::Git,
+        duration,
+        Some("passthrough"),
+    );
+    map_exit_code(exit_code)
+}
+
+/// Render a non-empty list of parsed file diffs into the requested output format.
+///
+/// Handles parallel vs. sequential dispatch, JSON vs. text output, and prints
+/// the result to stdout.  Returns the rendered string for analytics recording.
+///
+/// Extracted from `run_diff` to keep the happy-path readable.
+fn render_and_format<'a>(
+    file_diffs: Vec<types::FileDiff<'a>>,
+    global_flags: &[String],
+    git_args: &[String],
+    diff_mode: DiffMode,
+    output_format: OutputFormat,
+) -> anyhow::Result<String> {
+    let render_one = |i: usize, file_diff: &types::FileDiff<'_>| {
+        let skip_ast = i >= MAX_AST_FILE_COUNT;
+        let rendered = render_diff_file(file_diff, global_flags, git_args, diff_mode, skip_ast);
+        let entry = DiffFileEntry {
+            path: file_diff.path.clone(),
+            status: file_diff.status.clone(),
+            changed_regions: file_diff.hunks.len(),
+        };
+        (rendered, entry)
+    };
+
+    let rendered_files: Vec<(String, DiffFileEntry)> = if file_diffs.len() >= PARALLEL_THRESHOLD {
+        file_diffs
+            .par_iter()
+            .enumerate()
+            .map(|(i, file_diff)| render_one(i, file_diff))
+            .collect()
+    } else {
+        file_diffs
+            .iter()
+            .enumerate()
+            .map(|(i, file_diff)| render_one(i, file_diff))
+            .collect()
+    };
+
+    let mut rendered_output = String::new();
+    let mut diff_file_entries: Vec<DiffFileEntry> = Vec::with_capacity(rendered_files.len());
+    for (rendered, entry) in rendered_files {
+        rendered_output.push_str(&rendered);
+        diff_file_entries.push(entry);
+    }
+
+    let result = DiffResult::new(diff_file_entries, rendered_output);
+
+    let out = match output_format {
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(&result)
+                .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
+            println!("{json}");
+            json
+        }
+        OutputFormat::Text => {
+            // No guardrail: `git diff` is an enhancement command, not compression.
+            // The AST-aware renderer adds structural context (full container
+            // boundaries, line numbers) that will almost always produce more lines
+            // than the raw unified diff ±3-line context window. That is the
+            // intended behaviour — more context for the agent, not less.
+            let s = result.into_rendered();
+            print!("{s}");
+            s
+        }
+    };
+
+    Ok(out)
+}
+
 /// Run `git diff` with AST-aware pipeline (#103).
 ///
 /// Flag-aware passthrough: `--stat`, `--name-only`, `--name-status`, `--check`
@@ -191,26 +293,16 @@ pub(super) fn run_diff(
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {
-        if !output.stderr.is_empty() {
-            eprint!("{}", output.stderr);
-        }
-        if !output.stdout.is_empty() {
-            print!("{}", output.stdout);
-        }
-        let exit_code = output.exit_code;
-        // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. Move stdout: 1 allocation (clone) on the analytics
-        // path, 0 when disabled (PF-018 resolution).
-        super::finalize_git_output_passthrough(
+        let label = super::build_analytics_label("diff", args, show_stats, analytics_enabled);
+        return Ok(handle_error_exit(
             output.stdout,
-            super::build_analytics_label("diff", args, show_stats, analytics_enabled),
+            output.stderr,
+            output.exit_code,
+            label,
             show_stats,
             analytics_enabled,
-            crate::analytics::CommandType::Git,
             output.duration,
-            Some("passthrough"),
-        );
-        return Ok(map_exit_code(exit_code));
+        ));
     }
 
     // Surface git diff stderr warnings (e.g., "warning: LF will be replaced by CRLF")
@@ -242,16 +334,16 @@ pub(super) fn run_diff(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Parse and render inside a block so `file_diffs` (which borrows
-    // `raw_diff`) drops before `raw_diff` is moved into analytics.
+    // Parse unified diff, then render. The inner block ensures `file_diffs`
+    // (which borrows `raw_diff`) is dropped before `raw_diff` is moved into
+    // analytics below.
     let result_str = {
         let file_diffs = parse_unified_diff(&raw_diff);
 
         if file_diffs.is_empty() {
             eprintln!("No changes");
-            // Reuse the same lazy label built above — no second format! needed.
             // This branch is only hit when parse_unified_diff returns an empty vec
-            // despite raw_diff being non-empty (malformed diff); keep a consistent
+            // despite raw_diff being non-empty (malformed diff). Keep a consistent
             // analytics record identical to the trim-is-empty branch above.
             // Drop file_diffs first so the borrow on raw_diff ends, then move
             // raw_diff into the passthrough variant (PF-018 resolution).
@@ -268,72 +360,13 @@ pub(super) fn run_diff(
             return Ok(ExitCode::SUCCESS);
         }
 
-        // Render each file with AST-aware context.
-        // After MAX_AST_FILE_COUNT files, skip AST rendering and fall back to raw
-        // hunks to keep diff processing bounded on very large changesets.
-        //
-        // When >4 files, render in parallel via rayon. Each thread gets its own
-        // tree-sitter parser from the thread_local cache in render.rs.
-        // `par_iter().collect()` preserves the original element order, so output
-        // is deterministic regardless of thread scheduling.
-        let render_one = |i: usize, file_diff: &types::FileDiff<'_>| {
-            let skip_ast = i >= MAX_AST_FILE_COUNT;
-            let rendered =
-                render_diff_file(file_diff, global_flags, &git_args, diff_mode, skip_ast);
-            let entry = DiffFileEntry {
-                path: file_diff.path.clone(),
-                status: file_diff.status.clone(),
-                changed_regions: file_diff.hunks.len(),
-            };
-            (rendered, entry)
-        };
-
-        let rendered_files: Vec<(String, DiffFileEntry)> = if file_diffs.len() >= PARALLEL_THRESHOLD
-        {
-            file_diffs
-                .par_iter()
-                .enumerate()
-                .map(|(i, file_diff)| render_one(i, file_diff))
-                .collect()
-        } else {
-            file_diffs
-                .iter()
-                .enumerate()
-                .map(|(i, file_diff)| render_one(i, file_diff))
-                .collect()
-        };
-
-        let mut rendered_output = String::new();
-        let mut diff_file_entries: Vec<DiffFileEntry> = Vec::with_capacity(rendered_files.len());
-        for (rendered, entry) in rendered_files {
-            rendered_output.push_str(&rendered);
-            diff_file_entries.push(entry);
-        }
-
-        let result = DiffResult::new(diff_file_entries, rendered_output);
-
-        match output_format {
-            OutputFormat::Json => {
-                let json = serde_json::to_string_pretty(&result)
-                    .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-                println!("{json}");
-                json
-            }
-            OutputFormat::Text => {
-                // Apply guardrail: if compressed output is larger than raw,
-                // emit raw. Matches the guardrail applied in show.rs for commit
-                // mode, ensuring both handlers share the same safety envelope.
-                // Clone `raw_diff` here; file_diffs still holds a borrow so
-                // we cannot move raw_diff until the block ends.
-                // Use into_rendered() instead of to_string(): avoids a redundant
-                // Display::fmt allocation + copy of the pre-built rendered String.
-                let s = result.into_rendered();
-                let guardrail = crate::output::guardrail::apply_to_stderr(raw_diff.clone(), s)?;
-                let final_output = guardrail.into_output();
-                print!("{final_output}");
-                final_output
-            }
-        }
+        render_and_format(
+            file_diffs,
+            global_flags,
+            &git_args,
+            diff_mode,
+            output_format,
+        )?
     }; // file_diffs dropped here, raw_diff is free to move
 
     // Both `raw_diff` and `result_str` are owned here; use the owned variant to

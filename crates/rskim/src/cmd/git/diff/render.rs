@@ -19,6 +19,29 @@ thread_local! {
     static PARSERS: RefCell<HashMap<Language, rskim_core::Parser>> = RefCell::new(HashMap::new());
 }
 
+/// Compute the minimum column width needed to display any line number in `hunks`.
+///
+/// Returns at least 1 so empty diffs still produce a consistent format.
+///
+/// Uses integer arithmetic (`checked_ilog10`) instead of heap-allocating a
+/// `String` to count decimal digits (PF-014 perf fix).
+fn line_number_width(hunks: &[DiffHunk<'_>]) -> usize {
+    let max_line = hunks
+        .iter()
+        .map(|h| {
+            let old_end = h.old_start + h.old_count;
+            let new_end = h.new_start + h.new_count;
+            old_end.max(new_end)
+        })
+        .max()
+        .unwrap_or(0);
+    // checked_ilog10 returns None for 0; fall back to 1 in that case.
+    max_line
+        .checked_ilog10()
+        .map(|e| e as usize + 1)
+        .unwrap_or(1)
+}
+
 /// Render a single file diff with AST-aware context.
 ///
 /// For supported languages: shows changed AST nodes with full boundaries,
@@ -65,14 +88,17 @@ pub(in crate::cmd::git) fn render_diff_file(
         return output;
     }
 
+    // Compute line number column width from this file's hunks.
+    let ln_width = line_number_width(&file_diff.hunks);
+
     // Added/deleted files: show all patch lines verbatim (no AST overlay needed)
     if file_diff.status == DiffFileStatus::Deleted || file_diff.status == DiffFileStatus::Added {
-        return render_raw_hunks(file_diff, &output);
+        return render_raw_hunks(file_diff, &output, ln_width);
     }
 
     // When AST is skipped (e.g., beyond MAX_AST_FILE_COUNT), render raw hunks.
     if skip_ast {
-        return render_raw_hunks(file_diff, &output);
+        return render_raw_hunks(file_diff, &output, ln_width);
     }
 
     // Determine language for parser lookup — serde-based formats (JSON, YAML,
@@ -80,7 +106,7 @@ pub(in crate::cmd::git) fn render_diff_file(
     let Some(lang) =
         Language::from_path(Path::new(&file_diff.path)).filter(|l| !l.is_serde_based())
     else {
-        return render_raw_hunks(file_diff, &output);
+        return render_raw_hunks(file_diff, &output, ln_width);
     };
 
     // Obtain a cached parser from the thread-local pool and attempt AST rendering.
@@ -91,7 +117,7 @@ pub(in crate::cmd::git) fn render_diff_file(
             }
         }
         let parser = cache.get_mut(&lang)?;
-        try_ast_render(file_diff, global_flags, args, diff_mode, parser)
+        try_ast_render(file_diff, global_flags, args, diff_mode, parser, ln_width)
     });
 
     match ast_result {
@@ -99,7 +125,7 @@ pub(in crate::cmd::git) fn render_diff_file(
             output.push_str(&ast_output);
             output
         }
-        None => render_raw_hunks(file_diff, &output),
+        None => render_raw_hunks(file_diff, &output, ln_width),
     }
 }
 
@@ -118,6 +144,7 @@ fn try_ast_render(
     args: &[String],
     diff_mode: DiffMode,
     parser: &mut rskim_core::Parser,
+    ln_width: usize,
 ) -> Option<String> {
     let source = match get_file_source(&file_diff.path, global_flags, args) {
         Ok(s) => s,
@@ -149,6 +176,7 @@ fn try_ast_render(
             source_lines: &source_lines,
             source: &source,
             diff_mode,
+            ln_width,
         };
         render_with_unchanged_context(&mut output, &tree, &ctx, parser);
     } else {
@@ -157,6 +185,7 @@ fn try_ast_render(
             &changed_ranges,
             &file_diff.hunks,
             &source_lines,
+            ln_width,
         );
     }
 
@@ -172,6 +201,7 @@ fn render_changed_only(
     changed_ranges: &[ChangedNodeRange],
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
+    ln_width: usize,
 ) {
     // Track which parent headers we have already emitted
     let mut emitted_parent_headers: HashSet<usize> = HashSet::new();
@@ -190,12 +220,43 @@ fn render_changed_only(
         if let Some(ref ctx) = range.parent_context {
             if emitted_parent_headers.insert(ctx.header_line) {
                 if let Some(line) = source_lines.get(ctx.header_line - 1) {
-                    let _ = writeln!(output, " {line}");
+                    let _ = writeln!(output, " {:>ln_width$} {line}", ctx.header_line);
                 }
             }
         }
 
-        render_node_with_hunks(output, range.start, range.end, hunks, source_lines);
+        // Clip the render range to exclude parent boundary lines that are
+        // emitted separately (header above, close brace below).  When a
+        // grandchild node starts on the same line as the container header
+        // (e.g. a class-body node at `{` on line 1) or ends on the same
+        // line as the closing brace, render_node_with_hunks would otherwise
+        // re-emit those lines as unchanged context, producing duplicates.
+        let (effective_start, effective_end) = if let Some(ref ctx) = range.parent_context {
+            let start = if range.start == ctx.header_line {
+                range.start + 1
+            } else {
+                range.start
+            };
+            let end = if range.end == ctx.close_line {
+                range.end.saturating_sub(1)
+            } else {
+                range.end
+            };
+            (start, end)
+        } else {
+            (range.start, range.end)
+        };
+
+        if effective_start <= effective_end {
+            render_node_with_hunks(
+                output,
+                effective_start,
+                effective_end,
+                hunks,
+                source_lines,
+                ln_width,
+            );
+        }
 
         // Emit parent closing brace if this is the last child with this parent
         if let Some(ref ctx) = range.parent_context {
@@ -204,7 +265,7 @@ fn render_changed_only(
                 .is_some_and(|&last_idx| last_idx == idx);
             if is_last {
                 if let Some(line) = source_lines.get(ctx.close_line - 1) {
-                    let _ = writeln!(output, " {line}");
+                    let _ = writeln!(output, " {:>ln_width$} {line}", ctx.close_line);
                 }
             }
         }
@@ -257,7 +318,14 @@ fn render_with_unchanged_context(
                 render_container_with_mode(output, &child, ctx, parser);
             } else {
                 // Non-container changed node: render with patch
-                render_node_with_hunks(output, node_start, node_end, ctx.hunks, ctx.source_lines);
+                render_node_with_hunks(
+                    output,
+                    node_start,
+                    node_end,
+                    ctx.hunks,
+                    ctx.source_lines,
+                    ctx.ln_width,
+                );
             }
         } else {
             // Unchanged node: render at mode level
@@ -268,6 +336,7 @@ fn render_with_unchanged_context(
                 ctx.source,
                 ctx.diff_mode,
                 parser,
+                ctx.ln_width,
             );
         }
     }
@@ -282,10 +351,11 @@ fn render_container_with_mode(
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
+    let ln_width = ctx.ln_width;
 
     // Emit parent header
     if let Some(line) = ctx.source_lines.get(node_start - 1) {
-        let _ = writeln!(output, " {line}");
+        let _ = writeln!(output, " {:>ln_width$} {line}", node_start);
     }
 
     // Walk children of the container
@@ -315,7 +385,14 @@ fn render_container_with_mode(
         });
 
         if child_changed {
-            render_node_with_hunks(output, child_start, child_end, ctx.hunks, ctx.source_lines);
+            render_node_with_hunks(
+                output,
+                child_start,
+                child_end,
+                ctx.hunks,
+                ctx.source_lines,
+                ln_width,
+            );
         } else {
             render_unchanged_node(
                 output,
@@ -324,6 +401,7 @@ fn render_container_with_mode(
                 ctx.source,
                 ctx.diff_mode,
                 parser,
+                ln_width,
             );
         }
     }
@@ -331,7 +409,7 @@ fn render_container_with_mode(
     // Emit closing brace
     if node_end > node_start {
         if let Some(line) = ctx.source_lines.get(node_end - 1) {
-            let _ = writeln!(output, " {line}");
+            let _ = writeln!(output, " {:>ln_width$} {line}", node_end);
         }
     }
 }
@@ -340,6 +418,10 @@ fn render_container_with_mode(
 ///
 /// In structure mode, reuses the provided `parser` for transformation
 /// instead of creating a new parser per node.
+///
+/// Full mode renders line numbers using `ln_width` for alignment.
+/// Structure mode emits synthetic transformed text — no line numbers
+/// since the lines don't correspond 1-to-1 with source positions.
 fn render_unchanged_node(
     output: &mut String,
     node: &tree_sitter::Node<'_>,
@@ -347,21 +429,24 @@ fn render_unchanged_node(
     source: &str,
     diff_mode: DiffMode,
     parser: &mut rskim_core::Parser,
+    ln_width: usize,
 ) {
     let node_start = node.start_position().row + 1;
     let node_end = node.end_position().row + 1;
 
     match diff_mode {
         DiffMode::Full => {
-            // Show unchanged nodes in full
+            // Show unchanged nodes in full with line numbers
             for line_num in node_start..=node_end {
                 if let Some(line) = source_lines.get(line_num - 1) {
-                    let _ = writeln!(output, " {line}");
+                    let _ = writeln!(output, " {:>ln_width$} {line}", line_num);
                 }
             }
         }
         DiffMode::Structure => {
-            // Show unchanged nodes as structure (signatures)
+            // Show unchanged nodes as structure (signatures).
+            // Structure output is synthetic (transformed) text — line numbers
+            // are omitted because they don't correspond to real source lines.
             let node_text = node.utf8_text(source.as_bytes()).unwrap_or_default();
 
             // Transform using the reused parser (avoids per-node parser creation)
@@ -386,13 +471,77 @@ fn render_unchanged_node(
     }
 }
 
-/// Render a node region with hunk patch lines overlaid.
+/// Emit patch lines from a single hunk, clipped to the node's line range
+/// `[node_start, node_end]`.
+///
+/// A single git hunk can span multiple AST nodes (one `@@` block covering both
+/// an interface ending at line 8 and a class starting at line 10).  Without
+/// clipping, every node that overlaps the hunk would emit ALL of the hunk's
+/// patch lines, producing duplicate output across adjacent nodes.
+///
+/// Clipping rules:
+/// - Skip lines before `node_start`: advance counters without emitting.
+///   Removed lines (`-`, new_delta == 0) are skipped if `patch_new_line`
+///   hasn't yet reached `node_start`.
+/// - Stop after `node_end`: break once `patch_new_line > node_end`.
+///
+/// Returns the final `patch_new_line` value so the caller can advance
+/// `current_new_line` past the lines consumed by this hunk.
+fn emit_hunk_patch_lines_clipped(
+    output: &mut String,
+    hunk: &DiffHunk<'_>,
+    node_start: usize,
+    node_end: usize,
+    ln_width: usize,
+) -> usize {
+    let mut patch_new_line = hunk.new_start;
+    let mut patch_old_line = hunk.old_start;
+
+    for patch_line in &hunk.patch_lines {
+        // Stop once we've passed the node's end boundary.
+        if patch_new_line > node_end {
+            break;
+        }
+
+        let (new_delta, old_delta) = match patch_line.as_bytes().first() {
+            Some(b'+') => (1usize, 0usize),
+            Some(b'-') => (0, 1),
+            Some(b' ') => (1, 1),
+            _ => (0, 0),
+        };
+
+        // Skip lines that fall before the node's start (hunk started earlier
+        // in the file).
+        if patch_new_line < node_start {
+            patch_new_line += new_delta;
+            patch_old_line += old_delta;
+            continue;
+        }
+
+        let (nd, od) =
+            emit_patch_line(output, patch_line, patch_new_line, patch_old_line, ln_width);
+        patch_new_line += nd;
+        patch_old_line += od;
+    }
+
+    patch_new_line
+}
+
+/// Render a node region with hunk patch lines overlaid, including line numbers.
+///
+/// Line number assignment:
+/// - `+` (added) lines use the new-file line number; `current_new_line` advances.
+/// - `-` (removed) lines use the old-file line number; `current_old_line` advances.
+/// - ` ` (context) lines use the new-file line number; both counters advance.
+/// - `\` (no-newline marker) has no line number.
+/// - Unchanged source lines between hunks use the new-file line number.
 fn render_node_with_hunks(
     output: &mut String,
     node_start: usize,
     node_end: usize,
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
+    ln_width: usize,
 ) {
     // Hunks are sorted by new_start (they come from git's sequential output).
     // Use partition_point to skip hunks that end before node_start, then
@@ -404,10 +553,10 @@ fn render_node_with_hunks(
         .collect();
 
     if relevant_hunks.is_empty() {
-        // No hunks overlap — show as unchanged context
+        // No hunks overlap — show as unchanged context with new-file line numbers
         for line_num in node_start..=node_end {
             if let Some(line) = source_lines.get(line_num - 1) {
-                let _ = writeln!(output, " {line}");
+                let _ = writeln!(output, " {:>ln_width$} {line}", line_num);
             }
         }
         return;
@@ -416,44 +565,91 @@ fn render_node_with_hunks(
     let mut current_new_line = node_start;
 
     for hunk in &relevant_hunks {
-        // Output unchanged source lines before this hunk's position
+        // Output unchanged source lines before this hunk's position.
+        // Context lines: use new-file line number.
         while current_new_line < hunk.new_start && current_new_line <= node_end {
             if let Some(line) = source_lines.get(current_new_line - 1) {
-                let _ = writeln!(output, " {line}");
+                let _ = writeln!(output, " {:>ln_width$} {line}", current_new_line);
             }
             current_new_line += 1;
         }
 
-        // Output the hunk's patch lines
-        for patch_line in &hunk.patch_lines {
-            match patch_line.as_bytes().first() {
-                Some(b'+' | b' ') => {
-                    let _ = writeln!(output, "{patch_line}");
-                    current_new_line += 1;
-                }
-                Some(b'-' | b'\\') => {
-                    let _ = writeln!(output, "{patch_line}");
-                }
-                _ => {}
-            }
-        }
+        // Old-line cursor starts at the hunk boundary.
+        // The patch-line cursor starts at hunk.new_start so that skip logic
+        // correctly advances past pre-node lines when the hunk begins before
+        // node_start.
+        current_new_line =
+            emit_hunk_patch_lines_clipped(output, hunk, node_start, node_end, ln_width);
     }
 
     // Output remaining unchanged source lines to end of node
     while current_new_line <= node_end {
         if let Some(line) = source_lines.get(current_new_line - 1) {
-            let _ = writeln!(output, " {line}");
+            let _ = writeln!(output, " {:>ln_width$} {line}", current_new_line);
         }
         current_new_line += 1;
     }
 }
 
-/// Render raw diff hunks as fallback (no AST awareness).
-fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str) -> String {
+/// Emit a single patch line with its line number, updating the line counters.
+///
+/// Returns `(new_line_delta, old_line_delta)` — the amount each counter should
+/// advance after this line.  Most callers immediately add them back; splitting
+/// the counters out of this function avoids passing `&mut` through the hot path.
+///
+/// `\` (no-newline marker) and unknown prefixes are written verbatim with no
+/// line number and contribute zero delta to either counter.
+fn emit_patch_line(
+    output: &mut String,
+    patch_line: &str,
+    current_new_line: usize,
+    current_old_line: usize,
+    ln_width: usize,
+) -> (usize, usize) {
+    // Use get(1..) instead of &s[1..] for defensive byte-slice safety (PF-020).
+    // The prefixes +/-/space are single-byte ASCII so this is always correct,
+    // but get(1..) avoids a panic if the string is somehow empty.
+    let rest = patch_line.get(1..).unwrap_or("");
+    match patch_line.as_bytes().first() {
+        Some(b'+') => {
+            let _ = writeln!(output, "+{:>ln_width$} {}", current_new_line, rest);
+            (1, 0)
+        }
+        Some(b'-') => {
+            let _ = writeln!(output, "-{:>ln_width$} {}", current_old_line, rest);
+            (0, 1)
+        }
+        Some(b' ') => {
+            let _ = writeln!(output, " {:>ln_width$} {}", current_new_line, rest);
+            (1, 1)
+        }
+        _ => {
+            // `\` (no-newline marker) or unexpected prefix — emit verbatim, no line number
+            let _ = writeln!(output, "{patch_line}");
+            (0, 0)
+        }
+    }
+}
+
+/// Render raw diff hunks as fallback (no AST awareness), with line numbers.
+///
+/// Tracks old and new line counters across all hunks in the file, emitting
+/// the appropriate file line number after each prefix character.
+fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str, ln_width: usize) -> String {
     let mut output = header.to_string();
     for hunk in &file_diff.hunks {
+        let mut current_new_line = hunk.new_start;
+        let mut current_old_line = hunk.old_start;
         for line in &hunk.patch_lines {
-            let _ = writeln!(output, "{line}");
+            let (new_delta, old_delta) = emit_patch_line(
+                &mut output,
+                line,
+                current_new_line,
+                current_old_line,
+                ln_width,
+            );
+            current_new_line += new_delta;
+            current_old_line += old_delta;
         }
     }
     output
@@ -503,8 +699,13 @@ mod tests {
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("added"), "header should show 'added'");
         assert!(
-            rendered.contains("+const x = 1;"),
-            "should contain added lines"
+            rendered.contains("const x = 1;"),
+            "should contain added line content"
+        );
+        // Line numbers are prepended: format is `+{ln} {content}`
+        assert!(
+            rendered.contains("+1 const x = 1;") || rendered.contains("+ 1 const x = 1;"),
+            "added lines should have line numbers; got: {rendered}"
         );
     }
 
@@ -525,8 +726,13 @@ mod tests {
         let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
         assert!(rendered.contains("deleted"), "header should show 'deleted'");
         assert!(
-            rendered.contains("-const x = 1;"),
-            "should contain deleted lines"
+            rendered.contains("const x = 1;"),
+            "should contain deleted line content"
+        );
+        // Line numbers are prepended: format is `-{ln} {content}`
+        assert!(
+            rendered.contains("-1 const x = 1;") || rendered.contains("- 1 const x = 1;"),
+            "deleted lines should have line numbers; got: {rendered}"
         );
     }
 
@@ -632,16 +838,16 @@ mod tests {
             "first render should reference foo.ts"
         );
         assert!(
-            out_a.contains("+const FOO = 1;"),
-            "first render should contain its patch line"
+            out_a.contains("FOO = 1;"),
+            "first render should contain its patch line content"
         );
         assert!(
             out_b.contains("bar.ts"),
             "second render should reference bar.ts"
         );
         assert!(
-            out_b.contains("+const BAR = 2;"),
-            "second render should contain its patch line"
+            out_b.contains("BAR = 2;"),
+            "second render should contain its patch line content"
         );
         assert!(
             !out_a.contains("BAR"),
@@ -687,10 +893,443 @@ mod tests {
             output.contains("src/foo.rs (modified)"),
             "expected file header, got: {output}"
         );
-        // Should contain raw patch lines (not AST-processed)
+        // Should contain raw patch line content with line number prefix
         assert!(
-            output.contains("+    println!(\"hello\");"),
-            "expected raw patch line, got: {output}"
+            output.contains("println!(\"hello\");"),
+            "expected raw patch line content, got: {output}"
+        );
+        // Line number format: `+{ln} {content}`
+        assert!(
+            output.contains("+2     println!(\"hello\");")
+                || output.contains("+ 2     println!(\"hello\");"),
+            "expected line-numbered patch line, got: {output}"
+        );
+    }
+
+    // ========================================================================
+    // Line number tests (Workstream 1)
+    // ========================================================================
+
+    #[test]
+    fn test_render_raw_hunks_shows_line_numbers() {
+        // render_raw_hunks (fallback path) should prefix each line with its
+        // file line number, right-aligned to the width of the largest line.
+        let file_diff = FileDiff {
+            path: "src/old.ts".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Deleted,
+            hunks: vec![DiffHunk {
+                old_start: 10,
+                old_count: 3,
+                new_start: 0,
+                new_count: 0,
+                // Three removed lines starting at old line 10
+                patch_lines: vec!["-const a = 1;", "-const b = 2;", "-const c = 3;"],
+            }],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        // Removed lines should use old-file line numbers (10, 11, 12)
+        assert!(
+            rendered.contains("-10 const a = 1;"),
+            "first removed line should carry line 10; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-11 const b = 2;"),
+            "second removed line should carry line 11; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-12 const c = 3;"),
+            "third removed line should carry line 12; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_render_raw_hunks_multi_hunk_line_tracking() {
+        // Two hunks in a single added file — line numbers must restart from each
+        // hunk's new_start and not bleed across hunk boundaries.
+        let file_diff = FileDiff {
+            path: "src/mod.ts".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Added,
+            hunks: vec![
+                DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 2,
+                    patch_lines: vec!["+const A = 1;", "+const B = 2;"],
+                },
+                DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 10,
+                    new_count: 1,
+                    patch_lines: vec!["+const C = 3;"],
+                },
+            ],
+        };
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        // First hunk: lines 1 and 2
+        assert!(
+            rendered.contains("+1 const A = 1;") || rendered.contains("+ 1 const A = 1;"),
+            "first hunk line 1; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("+2 const B = 2;") || rendered.contains("+ 2 const B = 2;"),
+            "first hunk line 2; got:\n{rendered}"
+        );
+        // Second hunk: line 10
+        assert!(
+            rendered.contains("+10 const C = 3;") || rendered.contains("+10  const C = 3;"),
+            "second hunk line 10; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_line_number_width_helper() {
+        // Empty hunks → minimum width 1
+        assert_eq!(line_number_width(&[]), 1);
+        // Single-digit max
+        assert_eq!(
+            line_number_width(&[DiffHunk {
+                old_start: 1,
+                old_count: 3,
+                new_start: 1,
+                new_count: 3,
+                patch_lines: vec![]
+            }]),
+            1
+        );
+        // Three-digit max (old_end = 100 + 10 = 110)
+        assert_eq!(
+            line_number_width(&[DiffHunk {
+                old_start: 100,
+                old_count: 10,
+                new_start: 1,
+                new_count: 5,
+                patch_lines: vec![]
+            }]),
+            3
+        );
+    }
+
+    // ========================================================================
+    // Container header deduplication tests
+    // ========================================================================
+
+    /// When a changed child range starts on the same line as its parent
+    /// container header (e.g. a body node starting at `{` on line 1), the
+    /// parent header must appear exactly once in the rendered output.
+    ///
+    /// Without the fix, `render_changed_only` emits the header explicitly then
+    /// `render_node_with_hunks` re-emits it as an unchanged context line,
+    /// producing a duplicate `1 interface UserService {` pair.
+    #[test]
+    fn test_render_changed_only_no_duplicate_parent_header_when_range_starts_at_header() {
+        // interface UserService {        ← line 1 (parent header AND child start)
+        //   id: string;                  ← line 2 (changed)
+        //   name: string;               ← line 3
+        // }                             ← line 4 (parent close)
+        let source_lines: Vec<&str> = vec![
+            "interface UserService {",
+            "  id: string;",
+            "  name: string;",
+            "}",
+        ];
+
+        // Hunk changes line 2 (new file)
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            patch_lines: vec!["-  id: string;", "+  id: number;"],
+        }];
+
+        // Simulate AST returning a body node that starts at line 1 (same as parent),
+        // with parent_context also at line 1. This is the scenario that triggers the
+        // duplicate: the body node covers lines 1-4 with its own start == header_line.
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1, // child starts on same line as parent header
+            end: 4,
+            parent_context: Some(super::super::types::ParentContext {
+                header_line: 1,
+                close_line: 4,
+            }),
+        }];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        // Count occurrences of the header line content
+        let header_count = output
+            .lines()
+            .filter(|l| l.contains("interface UserService {"))
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "container header must appear exactly once; got {header_count}:\n{output}"
+        );
+
+        // The changed line should appear
+        assert!(
+            output.contains("id: number;"),
+            "changed line should appear in output:\n{output}"
+        );
+    }
+
+    /// When two changed child ranges share the same parent container, the
+    /// container header must appear exactly once and the close brace exactly once.
+    #[test]
+    fn test_render_changed_only_no_duplicate_header_two_children_same_parent() {
+        // interface UserService {        ← line 1 (parent header)
+        //   findById(id: string): User;  ← line 2 (changed)
+        //   createUser(): User;          ← line 3 (changed)
+        //   deleteUser(): void;          ← line 4
+        // }                             ← line 5 (parent close)
+        let source_lines: Vec<&str> = vec![
+            "interface UserService {",
+            "  findById(id: string): User;",
+            "  createUser(): User;",
+            "  deleteUser(): void;",
+            "}",
+        ];
+
+        // Two hunks, one for each changed method
+        let hunks = vec![
+            DiffHunk {
+                old_start: 2,
+                old_count: 1,
+                new_start: 2,
+                new_count: 1,
+                patch_lines: vec![
+                    "-  findById(id: string): User;",
+                    "+  findById(id: string): UserDto;",
+                ],
+            },
+            DiffHunk {
+                old_start: 3,
+                old_count: 1,
+                new_start: 3,
+                new_count: 1,
+                patch_lines: vec!["-  createUser(): User;", "+  createUser(): UserDto;"],
+            },
+        ];
+
+        // Two child ranges, both with the same parent container at lines 1-5
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 2,
+                end: 2,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+            super::super::types::ChangedNodeRange {
+                start: 3,
+                end: 3,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        let header_count = output
+            .lines()
+            .filter(|l| l.contains("interface UserService {"))
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "container header must appear exactly once; got {header_count}:\n{output}"
+        );
+
+        // Close brace is rendered as " 5 }" — ends_with(" }") counts it uniquely
+        // since none of the changed lines in this test end with " }".
+        let close_count = output.lines().filter(|l| l.ends_with(" }")).count();
+        assert_eq!(
+            close_count, 1,
+            "container close brace must appear exactly once; got {close_count}:\n{output}"
+        );
+
+        // Both changed lines should appear
+        assert!(
+            output.contains("UserDto"),
+            "changed content must appear:\n{output}"
+        );
+    }
+
+    /// When the changed range ends on the same line as the parent close brace,
+    /// the close brace must appear exactly once (not once from render_node_with_hunks
+    /// and once from the explicit is_last close brace emission).
+    #[test]
+    fn test_render_changed_only_no_duplicate_close_brace_when_range_ends_at_close() {
+        // class AuthService {   ← line 1 (parent header AND child start)
+        //   login(): void;      ← line 2 (changed)
+        // }                     ← line 3 (parent close AND child end)
+        let source_lines: Vec<&str> = vec!["class AuthService {", "  login(): void;", "}"];
+
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            patch_lines: vec!["-  login(): void;", "+  login(): Promise<void>;"],
+        }];
+
+        // Range starts at header line 1, ends at close line 3
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1,
+            end: 3,
+            parent_context: Some(super::super::types::ParentContext {
+                header_line: 1,
+                close_line: 3,
+            }),
+        }];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+
+        let header_count = output
+            .lines()
+            .filter(|l| l.contains("class AuthService {"))
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "class header must appear exactly once; got {header_count}:\n{output}"
+        );
+
+        // Close brace rendered as " 3 }" — ends_with(" }") counts it uniquely
+        let close_count = output.lines().filter(|l| l.ends_with(" }")).count();
+        assert_eq!(
+            close_count, 1,
+            "close brace must appear exactly once; got {close_count}:\n{output}"
+        );
+    }
+
+    /// When a single git hunk spans multiple AST nodes (e.g. one `@@` block covering
+    /// both an interface ending at line 8 and a class starting at line 10), patch lines
+    /// must be clipped to each node's [start, end] range.
+    ///
+    /// Without the fix, the interface node (lines 1-8) would emit patch lines for lines
+    /// 4-16+, and the class node (lines 10-20) would emit the same patch lines again.
+    #[test]
+    fn test_render_node_with_hunks_clips_to_node_boundaries_when_hunk_spans_two_nodes() {
+        // interface Foo {         ← line 1
+        //   a: string;            ← line 2
+        //   b: string;            ← line 3
+        //   c: string;            ← line 4  (changed in hunk)
+        // }                       ← line 5
+        //                         ← line 6 (blank)
+        // class Bar {             ← line 7
+        //   x: number;            ← line 8  (changed in hunk)
+        //   y: number;            ← line 9
+        // }                       ← line 10
+        let source_lines: Vec<&str> = vec![
+            "interface Foo {",
+            "  a: string;",
+            "  b: string;",
+            "  c: string;",
+            "}",
+            "",
+            "class Bar {",
+            "  x: number;",
+            "  y: number;",
+            "}",
+        ];
+
+        // Single hunk that spans both containers (lines 4-8 in the new file).
+        let hunks = vec![DiffHunk {
+            old_start: 4,
+            old_count: 5,
+            new_start: 4,
+            new_count: 5,
+            patch_lines: vec![
+                "-  c: string;",
+                "+  c: boolean;",
+                " }",
+                " ",
+                " class Bar {",
+                "-  x: number;",
+                "+  x: boolean;",
+            ],
+        }];
+
+        // Two changed ranges: interface body (lines 1-5) and class body (lines 7-10).
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 1,
+                end: 5,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+            super::super::types::ChangedNodeRange {
+                start: 7,
+                end: 10,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 7,
+                    close_line: 10,
+                }),
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 2);
+
+        // Each container header must appear exactly once.
+        let foo_count = output
+            .lines()
+            .filter(|l| l.contains("interface Foo {"))
+            .count();
+        assert_eq!(
+            foo_count, 1,
+            "interface Foo header must appear exactly once; got {foo_count}:\n{output}"
+        );
+
+        let bar_count = output.lines().filter(|l| l.contains("class Bar {")).count();
+        assert_eq!(
+            bar_count, 1,
+            "class Bar header must appear exactly once; got {bar_count}:\n{output}"
+        );
+
+        // Each changed line must appear exactly once (not duplicated across nodes).
+        let c_bool_count = output.lines().filter(|l| l.contains("c: boolean;")).count();
+        assert_eq!(
+            c_bool_count, 1,
+            "c: boolean must appear exactly once; got {c_bool_count}:\n{output}"
+        );
+
+        let x_bool_count = output.lines().filter(|l| l.contains("x: boolean;")).count();
+        assert_eq!(
+            x_bool_count, 1,
+            "x: boolean must appear exactly once; got {x_bool_count}:\n{output}"
+        );
+
+        // The class Bar change must NOT appear in the interface section and vice versa.
+        // We verify by checking that the interface node does not contain "x: boolean".
+        // (The output is a single string but we can check ordering of appearances.)
+        let foo_pos = output.find("interface Foo {").unwrap();
+        let bar_pos = output.find("class Bar {").unwrap();
+        let c_bool_pos = output.find("c: boolean").unwrap();
+        let x_bool_pos = output.find("x: boolean").unwrap();
+
+        assert!(
+            c_bool_pos < bar_pos,
+            "c: boolean must appear before class Bar section:\n{output}"
+        );
+        assert!(
+            x_bool_pos > foo_pos,
+            "x: boolean must appear after interface Foo section starts:\n{output}"
+        );
+        assert!(
+            x_bool_pos > c_bool_pos,
+            "x: boolean must appear after c: boolean (class Bar comes after interface Foo):\n{output}"
         );
     }
 }

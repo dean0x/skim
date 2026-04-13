@@ -23,7 +23,7 @@ const KNOWN_TOOLS: &[&str] = &["npm", "pnpm", "pip", "cargo"];
 /// and exits. Otherwise dispatches to the tool-specific handler.
 pub(crate) fn run(
     args: &[String],
-    _analytics: &crate::analytics::AnalyticsConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -38,14 +38,14 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let tool = tool_name.as_str();
+    let analytics_enabled = analytics.enabled;
 
-    match tool {
-        "npm" => npm::run(tool_args, show_stats, json_output),
-        "pnpm" => pnpm::run(tool_args, show_stats, json_output),
-        "pip" => pip::run(tool_args, show_stats, json_output),
-        "cargo" => cargo::run(tool_args, show_stats, json_output),
-        _ => {
+    match tool_name.as_str() {
+        "npm" => npm::run(tool_args, show_stats, json_output, analytics_enabled),
+        "pnpm" => pnpm::run(tool_args, show_stats, json_output, analytics_enabled),
+        "pip" => pip::run(tool_args, show_stats, json_output, analytics_enabled),
+        "cargo" => cargo::run(tool_args, show_stats, json_output, analytics_enabled),
+        tool => {
             let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(
                 "skim pkg: unknown tool '{safe_tool}'\n\
@@ -82,6 +82,7 @@ pub(super) fn run_pkg_subcommand<T>(
     config: PkgSubcommandConfig<'_>,
     user_args: &[String],
     show_stats: bool,
+    analytics_enabled: bool,
     inject_flags: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
@@ -104,7 +105,7 @@ where
             show_stats,
             command_type: crate::analytics::CommandType::Pkg,
             output_format: crate::cmd::OutputFormat::default(),
-            analytics_enabled: false,
+            analytics_enabled,
         },
         |output, _args| parse_fn(output),
     )

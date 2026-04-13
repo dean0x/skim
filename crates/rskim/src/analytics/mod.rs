@@ -20,6 +20,7 @@
 mod schema;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::Connection;
@@ -104,6 +105,8 @@ pub(crate) struct CommandStats {
     pub(crate) invocations: u64,
     pub(crate) tokens_saved: u64,
     pub(crate) avg_savings_pct: f64,
+    /// Average command duration in milliseconds across all invocations.
+    pub(crate) avg_duration_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -401,7 +404,7 @@ impl AnalyticsDb {
     pub(crate) fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
         let (where_clause, params) = since_clause(since);
         let sql = format!(
-            "SELECT command_type, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {where_clause} GROUP BY command_type ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
+            "SELECT command_type, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0), COALESCE(AVG(duration_ms), 0.0) FROM token_savings {where_clause} GROUP BY command_type ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -410,6 +413,7 @@ impl AnalyticsDb {
                 invocations: row.get(1)?,
                 tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
                 avg_savings_pct: row.get(3)?,
+                avg_duration_ms: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -631,6 +635,74 @@ pub(crate) fn now_unix_secs() -> i64 {
         .as_secs() as i64
 }
 
+// ============================================================================
+// Background thread registry for join-before-exit
+// ============================================================================
+
+/// Registry of analytics thread handles for join-before-exit.
+///
+/// Each spawned analytics thread is registered here so that `flush_pending()`
+/// can join them before the process exits, ensuring DB writes complete.
+static PENDING_THREADS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Register a spawned analytics thread handle.
+///
+/// Recovers from a poisoned mutex (via `into_inner()`) so that a prior
+/// analytics thread panic does not silently drop all subsequent handles.
+/// Emits a debug warning when `SKIM_DEBUG=1` if the mutex was poisoned.
+fn register_thread(handle: std::thread::JoinHandle<()>) {
+    let mut handles = match PENDING_THREADS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!("[skim:debug] analytics: PENDING_THREADS mutex was poisoned; recovering");
+            }
+            poisoned.into_inner()
+        }
+    };
+    handles.push(handle);
+}
+
+/// Join all pending analytics threads before process exit.
+///
+/// Call from `main()` before returning `ExitCode`. This ensures all
+/// background analytics DB writes complete before the process exits —
+/// without this, short-lived commands may terminate before the thread
+/// finishes writing to SQLite.
+///
+/// ## Blocking trade-off
+///
+/// This function joins every pending thread synchronously, which means it
+/// blocks until all analytics DB writes complete. On a fast local disk
+/// writes finish in <50 ms; on a slow network filesystem they could take
+/// 200 ms or more. The alternative — fire-and-forget without joining —
+/// would silently discard analytics data for short-lived commands, which
+/// defeats the purpose of the feature. The blocking exit latency is
+/// accepted as the lesser trade-off because:
+///
+/// 1. Analytics writes happen at most once per CLI invocation.
+/// 2. Exit latency is far less visible to users than startup latency.
+/// 3. `std::thread::JoinHandle` has no native timeout in Rust, so a
+///    bounded-timeout approach would require additional unsafe plumbing.
+///
+/// Recovers from a poisoned mutex (via `into_inner()`) so that a prior
+/// analytics thread panic does not cause the pending handles to leak.
+/// Emits a debug warning when `SKIM_DEBUG=1` if the mutex was poisoned.
+pub(crate) fn flush_pending() {
+    let mut handles = match PENDING_THREADS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!("[skim:debug] analytics: PENDING_THREADS mutex was poisoned during flush; recovering");
+            }
+            poisoned.into_inner()
+        }
+    };
+    for handle in handles.drain(..) {
+        let _ = handle.join();
+    }
+}
+
 /// Persist a record to the default database, with auto-pruning.
 fn persist_record(record: &TokenSavingsRecord) {
     if let Ok(db) = AnalyticsDb::open_default() {
@@ -653,7 +725,7 @@ fn record_fire_and_forget(
     project_path: String,
     parse_tier: Option<String>,
 ) {
-    std::thread::spawn(move || {
+    register_thread(std::thread::spawn(move || {
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
             return;
         };
@@ -674,7 +746,7 @@ fn record_fire_and_forget(
             parse_tier,
         };
         persist_record(&record);
-    });
+    }));
 }
 
 /// Record file operation token savings where counts are already known.
@@ -687,9 +759,9 @@ pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
     if !enabled {
         return;
     }
-    std::thread::spawn(move || {
+    register_thread(std::thread::spawn(move || {
         persist_record(&record);
-    });
+    }));
 }
 
 // ============================================================================
@@ -1166,7 +1238,7 @@ mod tests {
             stored.len()
         );
         assert!(
-            stored.is_ascii() || stored.chars().all(|_| true),
+            std::str::from_utf8(stored.as_bytes()).is_ok(),
             "stored value must be valid UTF-8"
         );
     }
@@ -1293,5 +1365,127 @@ mod tests {
         let p = PricingModel::default_pricing();
         assert_eq!(p.tier_name, "Standard");
         assert_eq!(p.input_cost_per_mtok, 3.0);
+    }
+
+    // ========================================================================
+    // Thread registry (PENDING_THREADS) tests
+    //
+    // PENDING_THREADS is a process-global static. Tests that touch it must run
+    // serially to avoid interfering with each other. `REGISTRY_TEST_LOCK`
+    // provides that serialization. Each test drains the registry on entry via
+    // `drain_registry()` so leftover handles from a prior test cannot affect
+    // the assertion counts.
+    // ========================================================================
+
+    /// Serializes tests that interact with the process-global PENDING_THREADS
+    /// registry. Acquire this lock at the start of every registry test.
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drain PENDING_THREADS and join all handles. Returns the number drained.
+    ///
+    /// Called at the start of each registry test to ensure a clean slate,
+    /// and directly verified in the flush round-trip test.
+    fn drain_registry() -> usize {
+        let mut handles = PENDING_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let count = handles.len();
+        for h in handles.drain(..) {
+            let _ = h.join();
+        }
+        count
+    }
+
+    /// `flush_pending()` on an empty registry is a no-op and does not panic.
+    #[test]
+    fn test_flush_pending_empty_is_noop() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_registry(); // ensure clean state
+
+        flush_pending(); // must not panic
+                         // registry must still be empty afterwards
+        let len = PENDING_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(
+            len, 0,
+            "registry should be empty after flush on empty input"
+        );
+    }
+
+    /// `register_thread` + `flush_pending` round-trip: registered handle is
+    /// joined and the registry is empty afterwards.
+    #[test]
+    fn test_register_and_flush_round_trip() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_registry();
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // block until the main thread signals, so we can verify the handle
+            // is actually registered before flush is called
+            let _ = rx.recv();
+        });
+        register_thread(handle);
+
+        // verify one handle is registered
+        let len = PENDING_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(
+            len, 1,
+            "one handle should be in registry after register_thread"
+        );
+
+        // unblock the spawned thread, then flush
+        drop(tx);
+        flush_pending();
+
+        // registry must be empty after flush
+        let len_after = PENDING_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(len_after, 0, "registry should be empty after flush");
+    }
+
+    /// `flush_pending()` is idempotent: calling it twice in a row does not
+    /// panic and leaves the registry empty both times.
+    #[test]
+    fn test_flush_pending_idempotent() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_registry();
+
+        // register a thread that completes immediately
+        register_thread(std::thread::spawn(|| {}));
+        flush_pending(); // first flush joins and drains
+        flush_pending(); // second flush is a no-op on an already-empty registry
+
+        let len = PENDING_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(len, 0, "registry should remain empty after double flush");
+    }
+
+    /// `register_thread` recovers from a poisoned mutex without panicking.
+    ///
+    /// We cannot actually poison PENDING_THREADS in this process (it would
+    /// affect every subsequent test), so we verify the recovery code path
+    /// compiles and the normal path continues to work correctly.
+    #[test]
+    fn test_register_thread_normal_path_succeeds() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_registry();
+
+        for _ in 0..3 {
+            register_thread(std::thread::spawn(|| {}));
+        }
+        let len = PENDING_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(len, 3, "all three handles should be registered");
+        flush_pending(); // clean up
     }
 }

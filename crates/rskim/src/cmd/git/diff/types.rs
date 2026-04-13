@@ -13,12 +13,10 @@ use crate::output::canonical::DiffFileStatus;
 #[derive(Debug, Clone)]
 pub(in crate::cmd::git) struct DiffHunk<'a> {
     /// Start line in the old file (1-indexed).
-    /// Used in tests and for hunk-to-node overlap calculations.
-    #[allow(dead_code)]
+    /// Used for line number rendering (removed lines) and hunk-to-node overlap.
     pub old_start: usize,
     /// Number of lines removed from old file.
-    /// Used in tests for validating hunk parsing.
-    #[allow(dead_code)]
+    /// Used for line number column width calculation and hunk boundary detection.
     pub old_count: usize,
     /// Start line in the new file (1-indexed)
     pub new_start: usize,
@@ -110,4 +108,7 @@ pub(super) struct ModeRenderContext<'a> {
     pub source_lines: &'a [&'a str],
     pub source: &'a str,
     pub diff_mode: DiffMode,
+    /// Width for right-aligned line number column. Derived from the maximum
+    /// line number across all hunks so columns align across the whole file.
+    pub ln_width: usize,
 }
