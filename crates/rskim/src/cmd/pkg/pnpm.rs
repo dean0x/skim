@@ -30,6 +30,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -40,9 +41,9 @@ pub(crate) fn run(
     let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
-        "install" | "i" => run_install(subcmd_args, show_stats, json_output),
-        "audit" => run_audit(subcmd_args, show_stats, json_output),
-        "outdated" => run_outdated(subcmd_args, show_stats, json_output),
+        "install" | "i" => run_install(subcmd_args, show_stats, json_output, analytics_enabled),
+        "audit" => run_audit(subcmd_args, show_stats, json_output, analytics_enabled),
+        "outdated" => run_outdated(subcmd_args, show_stats, json_output, analytics_enabled),
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
@@ -76,7 +77,12 @@ fn print_help() {
 // pnpm install (text-only, regex tier)
 // ============================================================================
 
-fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::Result<ExitCode> {
+fn run_install(
+    args: &[String],
+    show_stats: bool,
+    _json_output: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
             program: "pnpm",
@@ -86,6 +92,7 @@ fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow:
         },
         args,
         show_stats,
+        analytics_enabled,
         |_cmd_args| {},
         parse_install,
     )
@@ -147,7 +154,12 @@ fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
 // pnpm audit
 // ============================================================================
 
-fn run_audit(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Result<ExitCode> {
+fn run_audit(
+    args: &[String],
+    show_stats: bool,
+    json_output: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
             program: "pnpm",
@@ -157,6 +169,7 @@ fn run_audit(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Re
         },
         args,
         show_stats,
+        analytics_enabled,
         |cmd_args| {
             if json_output && !user_has_flag(cmd_args, &["--json"]) {
                 cmd_args.push("--json".to_string());
@@ -241,7 +254,12 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
 // pnpm outdated
 // ============================================================================
 
-fn run_outdated(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Result<ExitCode> {
+fn run_outdated(
+    args: &[String],
+    show_stats: bool,
+    json_output: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
             program: "pnpm",
@@ -251,6 +269,7 @@ fn run_outdated(args: &[String], show_stats: bool, json_output: bool) -> anyhow:
         },
         args,
         show_stats,
+        analytics_enabled,
         |cmd_args| {
             if json_output && !user_has_flag(cmd_args, &["--format"]) {
                 cmd_args.push("--format".to_string());

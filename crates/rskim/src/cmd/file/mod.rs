@@ -33,7 +33,7 @@ pub(crate) const MAX_INPUT_LINES: usize = 100_000;
 /// and exits. Otherwise dispatches to the tool-specific handler.
 pub(crate) fn run(
     args: &[String],
-    _analytics: &crate::analytics::AnalyticsConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -48,12 +48,14 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
+    let analytics_enabled = analytics.enabled;
+
     match tool_name.as_str() {
-        "find" => find::run(tool_args, show_stats, json_output),
-        "grep" => grep::run(tool_args, show_stats, json_output),
-        "ls" => ls::run(tool_args, show_stats, json_output, "ls"),
-        "rg" => rg::run(tool_args, show_stats, json_output),
-        "tree" => ls::run(tool_args, show_stats, json_output, "tree"),
+        "find" => find::run(tool_args, show_stats, json_output, analytics_enabled),
+        "grep" => grep::run(tool_args, show_stats, json_output, analytics_enabled),
+        "ls" => ls::run(tool_args, show_stats, json_output, "ls", analytics_enabled),
+        "rg" => rg::run(tool_args, show_stats, json_output, analytics_enabled),
+        "tree" => ls::run(tool_args, show_stats, json_output, "tree", analytics_enabled),
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(
@@ -111,6 +113,7 @@ pub(crate) fn run_file_tool(
     args: &[String],
     show_stats: bool,
     json_output: bool,
+    analytics_enabled: bool,
     prepare_args: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<FileResult>,
 ) -> anyhow::Result<ExitCode> {
@@ -134,7 +137,7 @@ pub(crate) fn run_file_tool(
             show_stats,
             command_type: crate::analytics::CommandType::FileOps,
             output_format,
-            analytics_enabled: true,
+            analytics_enabled,
         },
         |output, _args| parse_fn(output),
     )

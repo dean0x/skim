@@ -33,6 +33,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -43,9 +44,9 @@ pub(crate) fn run(
     let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
-        "install" => run_install(subcmd_args, show_stats, json_output),
-        "check" => run_check(subcmd_args, show_stats, json_output),
-        "list" => run_list(subcmd_args, show_stats, json_output),
+        "install" => run_install(subcmd_args, show_stats, json_output, analytics_enabled),
+        "check" => run_check(subcmd_args, show_stats, json_output, analytics_enabled),
+        "list" => run_list(subcmd_args, show_stats, json_output, analytics_enabled),
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
@@ -79,7 +80,12 @@ fn print_help() {
 // pip install (text-only, regex tier 1)
 // ============================================================================
 
-fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::Result<ExitCode> {
+fn run_install(
+    args: &[String],
+    show_stats: bool,
+    _json_output: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
             program: "pip",
@@ -89,6 +95,7 @@ fn run_install(args: &[String], show_stats: bool, _json_output: bool) -> anyhow:
         },
         args,
         show_stats,
+        analytics_enabled,
         |_cmd_args| {},
         parse_install,
     )
@@ -135,7 +142,12 @@ fn try_parse_install_regex(text: &str) -> Option<PkgResult> {
 // pip check (text-only, regex)
 // ============================================================================
 
-fn run_check(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::Result<ExitCode> {
+fn run_check(
+    args: &[String],
+    show_stats: bool,
+    _json_output: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
             program: "pip",
@@ -145,6 +157,7 @@ fn run_check(args: &[String], show_stats: bool, _json_output: bool) -> anyhow::R
         },
         args,
         show_stats,
+        analytics_enabled,
         |_cmd_args| {},
         parse_check,
     )
@@ -206,7 +219,12 @@ fn try_parse_check_regex(text: &str) -> Option<PkgResult> {
 // pip list --outdated
 // ============================================================================
 
-fn run_list(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Result<ExitCode> {
+fn run_list(
+    args: &[String],
+    show_stats: bool,
+    json_output: bool,
+    analytics_enabled: bool,
+) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
             program: "pip",
@@ -216,6 +234,7 @@ fn run_list(args: &[String], show_stats: bool, json_output: bool) -> anyhow::Res
         },
         args,
         show_stats,
+        analytics_enabled,
         |cmd_args| {
             if json_output {
                 if !user_has_flag(cmd_args, &["--outdated"]) {

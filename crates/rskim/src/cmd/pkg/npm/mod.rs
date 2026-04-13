@@ -23,6 +23,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -33,10 +34,10 @@ pub(crate) fn run(
     let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
-        "install" | "i" | "ci" => install::run_install(subcmd_args, show_stats, json_output),
-        "audit" => audit::run_audit(subcmd_args, show_stats, json_output),
-        "outdated" => outdated::run_outdated(subcmd_args, show_stats, json_output),
-        "ls" | "list" => ls::run_ls(subcmd_args, show_stats, json_output),
+        "install" | "i" | "ci" => install::run_install(subcmd_args, show_stats, json_output, analytics_enabled),
+        "audit" => audit::run_audit(subcmd_args, show_stats, json_output, analytics_enabled),
+        "outdated" => outdated::run_outdated(subcmd_args, show_stats, json_output, analytics_enabled),
+        "ls" | "list" => ls::run_ls(subcmd_args, show_stats, json_output, analytics_enabled),
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(

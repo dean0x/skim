@@ -25,9 +25,10 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
+    analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
     // find has no useful flag injections — its output format is always line-per-path
-    run_file_tool(CONFIG, args, show_stats, json_output, |_| {}, parse_impl)
+    run_file_tool(CONFIG, args, show_stats, json_output, analytics_enabled, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for find output.

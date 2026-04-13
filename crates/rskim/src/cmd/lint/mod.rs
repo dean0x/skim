@@ -28,7 +28,7 @@ const KNOWN_LINTERS: &[&str] = &["eslint", "golangci", "mypy", "prettier", "ruff
 /// and exits. Otherwise dispatches to the linter-specific handler.
 pub(crate) fn run(
     args: &[String],
-    _analytics: &crate::analytics::AnalyticsConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -45,13 +45,15 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
+    let analytics_enabled = analytics.enabled;
+
     match linter_name.as_str() {
-        "eslint" => eslint::run(linter_args, show_stats, json_output),
-        "golangci" => golangci::run(linter_args, show_stats, json_output),
-        "mypy" => mypy::run(linter_args, show_stats, json_output),
-        "prettier" => prettier::run(linter_args, show_stats, json_output),
-        "ruff" => ruff::run(linter_args, show_stats, json_output),
-        "rustfmt" => rustfmt::run(linter_args, show_stats, json_output),
+        "eslint" => eslint::run(linter_args, show_stats, json_output, analytics_enabled),
+        "golangci" => golangci::run(linter_args, show_stats, json_output, analytics_enabled),
+        "mypy" => mypy::run(linter_args, show_stats, json_output, analytics_enabled),
+        "prettier" => prettier::run(linter_args, show_stats, json_output, analytics_enabled),
+        "ruff" => ruff::run(linter_args, show_stats, json_output, analytics_enabled),
+        "rustfmt" => rustfmt::run(linter_args, show_stats, json_output, analytics_enabled),
         linter => {
             let safe_linter = crate::cmd::sanitize_for_display(linter);
             eprintln!(
@@ -122,6 +124,7 @@ pub(crate) fn run_linter(
     args: &[String],
     show_stats: bool,
     json_output: bool,
+    analytics_enabled: bool,
     prepare_args: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<LintResult>,
 ) -> anyhow::Result<ExitCode> {
@@ -145,7 +148,7 @@ pub(crate) fn run_linter(
             show_stats,
             command_type: crate::analytics::CommandType::Lint,
             output_format,
-            analytics_enabled: true,
+            analytics_enabled,
         },
         |output, _args| parse_fn(output),
     )
