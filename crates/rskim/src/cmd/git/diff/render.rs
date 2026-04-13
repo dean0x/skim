@@ -498,15 +498,54 @@ fn render_node_with_hunks(
         }
 
         // Old-line cursor starts at the hunk boundary.
-        let mut current_old_line = hunk.old_start;
+        // The patch-line cursor (patch_new_line) starts at the hunk's new_start so
+        // that skip logic can correctly advance past pre-node lines even when the
+        // hunk begins before node_start.
+        let mut patch_new_line = hunk.new_start;
+        let mut patch_old_line = hunk.old_start;
 
-        // Output the hunk's patch lines with per-prefix line tracking.
+        // Output the hunk's patch lines, clipped to [node_start, node_end].
+        //
+        // A single git hunk can span multiple AST nodes (one `@@` block covering
+        // both an interface ending at line 8 and a class starting at line 10).
+        // Without clipping, every node that overlaps the hunk would emit ALL of
+        // the hunk's patch lines — causing duplicate output across adjacent nodes.
+        //
+        // Clipping rules:
+        //   - Skip lines before node_start: advance counters without emitting.
+        //     Removed lines (`-`, new_delta == 0) are skipped if the current
+        //     new-file position (patch_new_line) hasn't yet reached node_start.
+        //   - Stop after node_end: break once patch_new_line > node_end.
         for patch_line in &hunk.patch_lines {
-            let (new_delta, old_delta) =
-                emit_patch_line(output, patch_line, current_new_line, current_old_line, ln_width);
-            current_new_line += new_delta;
-            current_old_line += old_delta;
+            // Stop once we've passed the node's end boundary.
+            if patch_new_line > node_end {
+                break;
+            }
+
+            let (new_delta, old_delta) = match patch_line.as_bytes().first() {
+                Some(b'+') => (1usize, 0usize),
+                Some(b'-') => (0, 1),
+                Some(b' ') => (1, 1),
+                _ => (0, 0),
+            };
+
+            // Skip lines that fall before the node's start (hunk started earlier
+            // in the file).
+            if patch_new_line < node_start {
+                patch_new_line += new_delta;
+                patch_old_line += old_delta;
+                continue;
+            }
+
+            let (nd, od) =
+                emit_patch_line(output, patch_line, patch_new_line, patch_old_line, ln_width);
+            patch_new_line += nd;
+            patch_old_line += od;
         }
+
+        // Advance the outer cursor past the lines consumed by this hunk so the
+        // inter-hunk context fill and trailing-lines loops stay in sync.
+        current_new_line = patch_new_line;
     }
 
     // Output remaining unchanged source lines to end of node
@@ -1118,6 +1157,125 @@ mod tests {
         assert_eq!(
             close_count, 1,
             "close brace must appear exactly once; got {close_count}:\n{output}"
+        );
+    }
+
+    /// When a single git hunk spans multiple AST nodes (e.g. one `@@` block covering
+    /// both an interface ending at line 8 and a class starting at line 10), patch lines
+    /// must be clipped to each node's [start, end] range.
+    ///
+    /// Without the fix, the interface node (lines 1-8) would emit patch lines for lines
+    /// 4-16+, and the class node (lines 10-20) would emit the same patch lines again.
+    #[test]
+    fn test_render_node_with_hunks_clips_to_node_boundaries_when_hunk_spans_two_nodes() {
+        // interface Foo {         ← line 1
+        //   a: string;            ← line 2
+        //   b: string;            ← line 3
+        //   c: string;            ← line 4  (changed in hunk)
+        // }                       ← line 5
+        //                         ← line 6 (blank)
+        // class Bar {             ← line 7
+        //   x: number;            ← line 8  (changed in hunk)
+        //   y: number;            ← line 9
+        // }                       ← line 10
+        let source_lines: Vec<&str> = vec![
+            "interface Foo {",
+            "  a: string;",
+            "  b: string;",
+            "  c: string;",
+            "}",
+            "",
+            "class Bar {",
+            "  x: number;",
+            "  y: number;",
+            "}",
+        ];
+
+        // Single hunk that spans both containers (lines 4-8 in the new file).
+        let hunks = vec![DiffHunk {
+            old_start: 4,
+            old_count: 5,
+            new_start: 4,
+            new_count: 5,
+            patch_lines: vec![
+                "-  c: string;",
+                "+  c: boolean;",
+                " }",
+                " ",
+                " class Bar {",
+                "-  x: number;",
+                "+  x: boolean;",
+            ],
+        }];
+
+        // Two changed ranges: interface body (lines 1-5) and class body (lines 7-10).
+        let changed_ranges = vec![
+            super::super::types::ChangedNodeRange {
+                start: 1,
+                end: 5,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 1,
+                    close_line: 5,
+                }),
+            },
+            super::super::types::ChangedNodeRange {
+                start: 7,
+                end: 10,
+                parent_context: Some(super::super::types::ParentContext {
+                    header_line: 7,
+                    close_line: 10,
+                }),
+            },
+        ];
+
+        let mut output = String::new();
+        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 2);
+
+        // Each container header must appear exactly once.
+        let foo_count = output.lines().filter(|l| l.contains("interface Foo {")).count();
+        assert_eq!(
+            foo_count, 1,
+            "interface Foo header must appear exactly once; got {foo_count}:\n{output}"
+        );
+
+        let bar_count = output.lines().filter(|l| l.contains("class Bar {")).count();
+        assert_eq!(
+            bar_count, 1,
+            "class Bar header must appear exactly once; got {bar_count}:\n{output}"
+        );
+
+        // Each changed line must appear exactly once (not duplicated across nodes).
+        let c_bool_count = output.lines().filter(|l| l.contains("c: boolean;")).count();
+        assert_eq!(
+            c_bool_count, 1,
+            "c: boolean must appear exactly once; got {c_bool_count}:\n{output}"
+        );
+
+        let x_bool_count = output.lines().filter(|l| l.contains("x: boolean;")).count();
+        assert_eq!(
+            x_bool_count, 1,
+            "x: boolean must appear exactly once; got {x_bool_count}:\n{output}"
+        );
+
+        // The class Bar change must NOT appear in the interface section and vice versa.
+        // We verify by checking that the interface node does not contain "x: boolean".
+        // (The output is a single string but we can check ordering of appearances.)
+        let foo_pos = output.find("interface Foo {").unwrap();
+        let bar_pos = output.find("class Bar {").unwrap();
+        let c_bool_pos = output.find("c: boolean").unwrap();
+        let x_bool_pos = output.find("x: boolean").unwrap();
+
+        assert!(
+            c_bool_pos < bar_pos,
+            "c: boolean must appear before class Bar section:\n{output}"
+        );
+        assert!(
+            x_bool_pos > foo_pos,
+            "x: boolean must appear after interface Foo section starts:\n{output}"
+        );
+        assert!(
+            x_bool_pos > c_bool_pos,
+            "x: boolean must appear after c: boolean (class Bar comes after interface Foo):\n{output}"
         );
     }
 }
