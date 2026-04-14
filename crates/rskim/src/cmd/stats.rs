@@ -846,15 +846,21 @@ mod tests {
 
     #[test]
     fn test_run_json_with_cost() {
-        // cost is always in JSON now, this test verifies the cost values
+        // Passing a custom cost_override should reflect in input_cost_per_mtok.
         let store = MockStore::with_data();
-        let output = capture(|w| run_json(w, &store, None, None));
+        let output = capture(|w| run_json(w, &store, None, Some(5.0)));
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("output should be valid JSON");
         let cost = &parsed["cost_estimate"];
         assert!(cost.is_object(), "cost_estimate should always be present");
         assert_eq!(cost["tokens_saved"], 70_000);
         assert!(cost["estimated_savings_usd"].as_f64().unwrap() > 0.0);
+        // The custom rate should appear in the output.
+        assert_eq!(
+            cost["input_cost_per_mtok"].as_f64().unwrap(),
+            5.0,
+            "cost_estimate should reflect the custom cost_override of 5.0 $/MTok"
+        );
     }
 
     #[test]
@@ -946,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_parse_value_flag_missing() {
-        let args: Vec<String> = vec!["--cost".into()];
+        let args: Vec<String> = vec!["--clear".into()];
         assert_eq!(parse_value_flag(&args, "--format"), None);
     }
 
@@ -1238,6 +1244,18 @@ mod tests {
     }
 
     #[test]
+    fn test_render_by_original_cmd_empty() {
+        // Empty slice: render should succeed and produce no output
+        let mut buf = Vec::new();
+        render_by_original_cmd(&mut buf, &[]).expect("render should not fail on empty input");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.is_empty(),
+            "render_by_original_cmd with empty input should produce no output"
+        );
+    }
+
+    #[test]
     fn test_truncate_cmd_display_short() {
         // Short commands are not truncated
         let result = truncate_cmd_display("cargo build", 30);
@@ -1265,6 +1283,46 @@ mod tests {
             std::str::from_utf8(result.as_bytes()).is_ok(),
             "truncated result must be valid UTF-8"
         );
+    }
+
+    #[test]
+    fn test_truncate_cmd_display_max_zero() {
+        // max_chars=0: no room for any visible text, return empty or "..." gracefully
+        let result = truncate_cmd_display("hello", 0);
+        // The input has 5 chars which exceeds 0, so we get "..." with 0-char prefix.
+        // Result must be valid UTF-8 and not panic.
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "result for max_chars=0 must be valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn test_truncate_cmd_display_max_two() {
+        // max_chars=2: keep = 2.saturating_sub(3) = 0, so prefix is empty, result is "..."
+        let result = truncate_cmd_display("hello", 2);
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "result for max_chars=2 must be valid UTF-8"
+        );
+        assert!(
+            result.chars().count() <= 3,
+            "result for max_chars=2 should be at most 3 chars (just the ellipsis)"
+        );
+    }
+
+    #[test]
+    fn test_truncate_cmd_display_max_three() {
+        // max_chars=3: keep = 0, a string longer than 3 chars produces "..."
+        let result = truncate_cmd_display("hello", 3);
+        assert_eq!(result, "...", "5-char input with max_chars=3 should yield '...'");
+    }
+
+    #[test]
+    fn test_truncate_cmd_display_exact_max() {
+        // Input exactly at max_chars: should not be truncated
+        let result = truncate_cmd_display("hello", 5);
+        assert_eq!(result, "hello", "input exactly at max_chars should not be truncated");
     }
 
     // ========================================================================

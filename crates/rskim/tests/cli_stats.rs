@@ -7,6 +7,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
 // ============================================================================
@@ -168,4 +169,40 @@ fn test_stats_json_always_includes_cost_estimate() {
         cost.get("tokens_saved").is_some(),
         "cost_estimate should contain 'tokens_saved' key"
     );
+}
+
+// ============================================================================
+// --verbose: Parse Quality section
+// ============================================================================
+
+#[test]
+fn test_stats_verbose_shows_parse_quality() {
+    let db = NamedTempFile::new().unwrap();
+
+    // Run skim on a real source file with analytics enabled so the DB contains
+    // at least one record.  `--show-stats` is required to populate token counts;
+    // without it `ProcessResult::original_tokens` is None and no record is saved.
+    // We deliberately do NOT set SKIM_DISABLE_ANALYTICS here.
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/typescript/simple.ts");
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(fixture.as_os_str())
+        .arg("--show-stats")
+        .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
+        .env("NO_COLOR", "1")
+        .assert()
+        .success();
+
+    // Analytics recording is fire-and-forget on a background thread; give it a
+    // brief moment to flush before querying stats.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // `skim stats --verbose` should show the "Parse Quality" section when data
+    // is present.
+    skim_stats_cmd(&db)
+        .arg("--verbose")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Parse Quality"));
 }
