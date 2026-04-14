@@ -142,7 +142,7 @@ cargo dist plan                # Preview release artifacts
 cargo run --bin skim -- file.ts           # Run with default mode
 cargo run --bin skim -- file.ts --mode=signatures
 cargo run --bin skim -- stats             # Analytics dashboard
-cargo run --bin skim -- stats --cost      # With cost estimates
+cargo run --bin skim -- stats --verbose   # With parse quality details
 cargo clippy -- -D warnings    # Lint check
 cargo fmt -- --check           # Format check
 ```
@@ -161,7 +161,7 @@ cargo fmt -- --check           # Format check
 - `log` — Log compression: JSON structured + regex plaintext deduplication, debug filtering, stack trace collapsing (`--json`, `--show-stats`)
 - `pkg` — Package manager output compression (npm, pnpm, pip, cargo)
 - `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
-- `stats` — Token analytics dashboard (`--since`, `--format json`, `--cost`, `--clear`)
+- `stats` — Token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`)
 - `test` — Test output compression (pytest, vitest, jest, go test)
 
 ### Environment Variables
