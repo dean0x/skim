@@ -588,7 +588,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.4.0 — Stable
+**Current**: v2.4.1 — Stable
 
 ✅ **Core — Code Reading (17 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML

@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-04-15
+
 ### Changed
+- **`skim stats` dashboard redesign** — weighted savings %, category grouping, column headers, by-command breakdown (top 15 commands by tokens saved), DRY render helpers, O(n) truncation
+- **`skim stats --cost` deprecated** — cost estimates are now always shown; `--cost` flag prints a deprecation warning
+- **`skim stats --verbose`** — new flag to show parse quality section
 - **`skim stats --format json` schema updated** — `cost_estimate` is now always present (previously only included when `--cost` flag was passed). The `cost_estimate` object uses a `tier` key (e.g. `"Standard"`) instead of the former `model` key. Two new top-level fields are always present: `by_original_cmd` (array of top-15 commands by tokens saved, each with `original_cmd`, `invocations`, `tokens_saved`, `avg_savings_pct`, `avg_duration_ms`) and `summary.weighted_savings_pct` (tokens-weighted savings percentage, more accurate than `avg_savings_pct` for uneven workloads). Downstream consumers of `skim stats --format json` must update to use `tier` instead of `model` in `cost_estimate`.
+
+### Fixed
+- `skim git show` test now handles guardrail passthrough correctly when compressed output exceeds raw size
+- Stats verbose test uses canonicalized fixture paths to work with `Language::from_path()` security check
 
 ## [2.4.0] - 2026-04-14
 
@@ -720,6 +729,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.4.1** (2026-04-15): Stats dashboard redesign, weighted %, by-command breakdown, --cost deprecation (2,482 tests)
 - **2.4.0** (2026-04-14): GitHub CLI compression, git subcommand completion, quality improvements (2,482 tests)
 - **2.3.1** (2026-04-09): Discover/rewrite alignment, rewritable gap closures, stats bar fix
 - **2.3.0** (2026-04-08): Stats dashboard v3, debug-gated warnings, git fetch compression, parse tier tracking
