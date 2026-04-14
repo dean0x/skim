@@ -33,7 +33,9 @@ pub(crate) fn run(
     let clear = args.iter().any(|a| a == "--clear");
     // --cost is kept as a silent no-op for backward compatibility
     let _cost_compat = args.iter().any(|a| a == "--cost");
-    let verbose = args.iter().any(|a| matches!(a.as_str(), "--verbose" | "-v"));
+    let verbose = args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--verbose" | "-v"));
     let format = parse_value_flag(args, "--format");
     let since_str = parse_value_flag(args, "--since");
 
@@ -62,12 +64,7 @@ pub(crate) fn run(
     let mut stdout = io::stdout().lock();
 
     if format.as_deref() == Some("json") {
-        return run_json(
-            &mut stdout,
-            &db,
-            since_ts,
-            analytics.input_cost_per_mtok,
-        );
+        return run_json(&mut stdout, &db, since_ts, analytics.input_cost_per_mtok);
     }
 
     run_dashboard(
@@ -270,7 +267,6 @@ fn render_bar(pct: f64, width: usize) -> String {
     }
 }
 
-
 /// Format a section header padded to 76 characters with thin horizontal lines.
 fn section_header(title: &str) -> String {
     // "── {title} " + trailing dashes to 76 chars total
@@ -444,8 +440,8 @@ fn truncate_cmd_display(cmd: &str, max_chars: usize) -> String {
     }
     // Walk char boundaries to find the safe slice point.
     let end = max_chars.saturating_sub(3); // reserve 3 for "..."
-    // Ensure we're on a char boundary (chars().count() is correct, but we need
-    // a byte index for slicing).
+                                           // Ensure we're on a char boundary (chars().count() is correct, but we need
+                                           // a byte index for slicing).
     let byte_idx = cmd
         .char_indices()
         .nth(end)
