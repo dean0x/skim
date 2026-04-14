@@ -7,6 +7,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
 // ============================================================================
@@ -40,7 +41,7 @@ fn test_stats_help() {
         .stdout(predicate::str::contains("stats"))
         .stdout(predicate::str::contains("--since"))
         .stdout(predicate::str::contains("--format"))
-        .stdout(predicate::str::contains("--cost"))
+        .stdout(predicate::str::contains("--verbose"))
         .stdout(predicate::str::contains("--clear"));
 }
 
@@ -103,6 +104,10 @@ fn test_stats_json_format() {
         json.get("tier_distribution").is_some(),
         "JSON should contain 'tier_distribution' key"
     );
+    assert!(
+        json.get("by_original_cmd").is_some(),
+        "JSON should contain 'by_original_cmd' key"
+    );
 }
 
 // ============================================================================
@@ -120,31 +125,31 @@ fn test_stats_clear() {
 }
 
 // ============================================================================
-// Cost flag — should include cost section in JSON output
+// Cost estimate — always present in JSON output
 // ============================================================================
 
 #[test]
-fn test_stats_cost_flag() {
+fn test_stats_json_always_includes_cost_estimate() {
     let db = NamedTempFile::new().unwrap();
     let output = skim_stats_cmd(&db)
-        .args(["--format", "json", "--cost"])
+        .args(["--format", "json"])
         .output()
         .unwrap();
 
     assert!(
         output.status.success(),
-        "skim stats --format json --cost should exit 0"
+        "skim stats --format json should exit 0"
     );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Expected valid JSON, got parse error: {e}\nstdout: {stdout}"));
 
-    // With --cost, the JSON should include cost_estimate section
+    // cost_estimate is always included in JSON output (no flag required)
     let cost = json.get("cost_estimate");
     assert!(
         cost.is_some(),
-        "JSON should contain 'cost_estimate' key when --cost is passed"
+        "JSON should always contain 'cost_estimate' key"
     );
 
     let cost = cost.unwrap();
@@ -164,4 +169,42 @@ fn test_stats_cost_flag() {
         cost.get("tokens_saved").is_some(),
         "cost_estimate should contain 'tokens_saved' key"
     );
+}
+
+// ============================================================================
+// --verbose: Parse Quality section
+// ============================================================================
+
+#[test]
+fn test_stats_verbose_shows_parse_quality() {
+    let db = NamedTempFile::new().unwrap();
+
+    // Run skim on a real source file with analytics enabled so the DB contains
+    // at least one record.  `--show-stats` is required to populate token counts;
+    // without it `ProcessResult::original_tokens` is None and no record is saved.
+    // We deliberately do NOT set SKIM_DISABLE_ANALYTICS here.
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/typescript/simple.ts")
+        .canonicalize()
+        .expect("fixture must exist");
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg(fixture.as_os_str())
+        .arg("--show-stats")
+        .env("SKIM_ANALYTICS_DB", db.path().as_os_str())
+        .env("NO_COLOR", "1")
+        .assert()
+        .success();
+
+    // Analytics recording is fire-and-forget on a background thread; give it a
+    // brief moment to flush before querying stats.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // `skim stats --verbose` should show the "Parse Quality" section when data
+    // is present.
+    skim_stats_cmd(&db)
+        .arg("--verbose")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Parse Quality"));
 }

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`skim stats --format json` schema updated** — `cost_estimate` is now always present (previously only included when `--cost` flag was passed). The `cost_estimate` object uses a `tier` key (e.g. `"Standard"`) instead of the former `model` key. Two new top-level fields are always present: `by_original_cmd` (array of top-15 commands by tokens saved, each with `original_cmd`, `invocations`, `tokens_saved`, `avg_savings_pct`, `avg_duration_ms`) and `summary.weighted_savings_pct` (tokens-weighted savings percentage, more accurate than `avg_savings_pct` for uneven workloads). Downstream consumers of `skim stats --format json` must update to use `tier` instead of `model` in `cost_estimate`.
+
 ## [2.4.0] - 2026-04-14
 
 GitHub CLI compression, git subcommand completion, multi-agent handler fixes, quality improvements. 2,482 tests passing (up from 2,223 in v2.3.1).
