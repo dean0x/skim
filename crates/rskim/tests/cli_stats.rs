@@ -103,6 +103,10 @@ fn test_stats_json_format() {
         json.get("tier_distribution").is_some(),
         "JSON should contain 'tier_distribution' key"
     );
+    assert!(
+        json.get("by_original_cmd").is_some(),
+        "JSON should contain 'by_original_cmd' key"
+    );
 }
 
 // ============================================================================
@@ -120,31 +124,31 @@ fn test_stats_clear() {
 }
 
 // ============================================================================
-// Cost flag — should include cost section in JSON output
+// Cost estimate — always present in JSON output
 // ============================================================================
 
 #[test]
-fn test_stats_cost_flag() {
+fn test_stats_json_always_includes_cost_estimate() {
     let db = NamedTempFile::new().unwrap();
     let output = skim_stats_cmd(&db)
-        .args(["--format", "json", "--cost"])
+        .args(["--format", "json"])
         .output()
         .unwrap();
 
     assert!(
         output.status.success(),
-        "skim stats --format json --cost should exit 0"
+        "skim stats --format json should exit 0"
     );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("Expected valid JSON, got parse error: {e}\nstdout: {stdout}"));
 
-    // With --cost, the JSON should include cost_estimate section
+    // cost_estimate is always included in JSON output (no flag required)
     let cost = json.get("cost_estimate");
     assert!(
         cost.is_some(),
-        "JSON should contain 'cost_estimate' key when --cost is passed"
+        "JSON should always contain 'cost_estimate' key"
     );
 
     let cost = cost.unwrap();

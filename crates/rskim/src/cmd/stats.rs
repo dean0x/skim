@@ -31,8 +31,6 @@ pub(crate) fn run(
 
     // Parse flags
     let clear = args.iter().any(|a| a == "--clear");
-    // --cost is kept as a silent no-op for backward compatibility
-    let _cost_compat = args.iter().any(|a| a == "--cost");
     let verbose = args
         .iter()
         .any(|a| matches!(a.as_str(), "--verbose" | "-v"));
@@ -440,8 +438,6 @@ fn truncate_cmd_display(cmd: &str, max_chars: usize) -> String {
     }
     // Walk char boundaries to find the safe slice point.
     let end = max_chars.saturating_sub(3); // reserve 3 for "..."
-                                           // Ensure we're on a char boundary (chars().count() is correct, but we need
-                                           // a byte index for slicing).
     let byte_idx = cmd
         .char_indices()
         .nth(end)
@@ -457,19 +453,18 @@ fn render_by_original_cmd(
     if by_original_cmd.is_empty() {
         return Ok(());
     }
-    const CMD_COL: usize = 30;
     writeln!(w, "{}", section_header("By Command"))?;
     writeln!(w)?;
     writeln!(
         w,
-        "  {:<CMD_COL$}  {:>COL_COUNT$}  {:>COL_SAVED$}  {:<9}  {:>COL_DUR$}",
+        "  {:<DISPLAY_CMD_LEN$}  {:>COL_COUNT$}  {:>COL_SAVED$}  {:<9}  {:>COL_DUR$}",
         "COMMAND", "CALLS", "SAVED", "REDUCTION", "AVG TIME"
     )?;
     for cmd in by_original_cmd {
         let display = truncate_cmd_display(&cmd.original_cmd, DISPLAY_CMD_LEN);
         writeln!(
             w,
-            "  {:<CMD_COL$}  {:>COL_COUNT$}  {:>COL_SAVED$}  {}  {:>COL_DUR$}",
+            "  {:<DISPLAY_CMD_LEN$}  {:>COL_COUNT$}  {:>COL_SAVED$}  {}  {:>COL_DUR$}",
             display,
             tokens::format_number(cmd.invocations as usize),
             format_tokens(cmd.tokens_saved),
@@ -811,6 +806,8 @@ mod tests {
         assert_eq!(parsed["by_command"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["by_language"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["by_mode"].as_array().unwrap().len(), 1);
+        // by_original_cmd breakdown is present
+        assert_eq!(parsed["by_original_cmd"].as_array().unwrap().len(), 1);
         // cost_estimate is always present now
         assert!(
             parsed["cost_estimate"].is_object(),
