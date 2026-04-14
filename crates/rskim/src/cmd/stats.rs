@@ -2,8 +2,8 @@
 //!
 //! Queries the analytics SQLite database and displays a summary of token
 //! savings across all skim invocations. Supports time filtering (`--since`),
-//! JSON output (`--format json`), cost estimates (`--cost`), and data clearing
-//! (`--clear`).
+//! JSON output (`--format json`), verbose parse-quality output (`--verbose`),
+//! and data clearing (`--clear`). Cost estimates are always shown.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -30,6 +30,9 @@ pub(crate) fn run(
     }
 
     // Parse flags
+    if args.iter().any(|a| a == "--cost") {
+        eprintln!("skim: --cost is deprecated; cost estimates are now always shown");
+    }
     let clear = args.iter().any(|a| a == "--clear");
     let verbose = args
         .iter()
@@ -151,11 +154,7 @@ fn run_json(
     let tier_dist = db.query_tier_distribution(since)?;
     let by_original_cmd = db.query_by_original_cmd(since)?;
 
-    let weighted_savings_pct = if summary.raw_tokens > 0 {
-        (summary.tokens_saved as f64 / summary.raw_tokens as f64) * 100.0
-    } else {
-        0.0
-    };
+    let weighted_pct = weighted_savings_pct(&summary);
 
     let pricing = PricingModel::from_cost_override(cost_override);
     let cost_savings = pricing.estimate_savings(summary.tokens_saved);
@@ -176,7 +175,7 @@ fn run_json(
             "compressed_tokens": summary.compressed_tokens,
             "tokens_saved": summary.tokens_saved,
             "avg_savings_pct": summary.avg_savings_pct,
-            "weighted_savings_pct": weighted_savings_pct,
+            "weighted_savings_pct": weighted_pct,
         },
         "daily": daily,
         "by_command": by_command,
@@ -290,6 +289,24 @@ fn command_label(stored: &str) -> &'static str {
 }
 
 // ============================================================================
+// Analytics computation helpers
+// ============================================================================
+
+/// Compute the true weighted savings percentage from a summary.
+///
+/// Unlike `avg_savings_pct` (which is the arithmetic mean of per-invocation
+/// percentages), this value is token-count-weighted: it answers "of all raw
+/// tokens ever seen, what fraction was saved?".  Returns 0.0 when
+/// `raw_tokens == 0` to prevent division by zero.
+fn weighted_savings_pct(summary: &crate::analytics::AnalyticsSummary) -> f64 {
+    if summary.raw_tokens > 0 {
+        (summary.tokens_saved as f64 / summary.raw_tokens as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
+// ============================================================================
 // Terminal dashboard — section renderers
 // ============================================================================
 
@@ -306,11 +323,7 @@ fn render_summary(
     w: &mut dyn Write,
     summary: &crate::analytics::AnalyticsSummary,
 ) -> anyhow::Result<()> {
-    let weighted_pct = if summary.raw_tokens > 0 {
-        (summary.tokens_saved as f64 / summary.raw_tokens as f64) * 100.0
-    } else {
-        0.0
-    };
+    let weighted_pct = weighted_savings_pct(summary);
 
     writeln!(w, "{}", section_header("Summary"))?;
     writeln!(w)?;
@@ -430,20 +443,34 @@ fn render_by_mode(
 }
 
 /// Truncate `cmd` to at most `max_chars` character-boundary-safe chars,
-/// appending `...` when truncated.  Mirrors the byte-boundary-safe pattern
-/// used in `AnalyticsDb::record()`.
+/// appending `...` when truncated.  Uses a single `char_indices` pass so
+/// each character is visited at most once regardless of string length.
 fn truncate_cmd_display(cmd: &str, max_chars: usize) -> String {
-    if cmd.chars().count() <= max_chars {
-        return cmd.to_string();
+    // Reserve 3 chars for the ellipsis; keep the rest for the visible prefix.
+    let keep = max_chars.saturating_sub(3);
+    // Walk char boundaries once.  If we reach `keep` characters without
+    // exhausting the string, record the byte index and continue to check
+    // whether the string is actually longer than `max_chars`.
+    let mut char_count = 0usize;
+    let mut cut_byte = cmd.len(); // default: no truncation needed
+    let mut needs_ellipsis = false;
+    for (byte_idx, _) in cmd.char_indices() {
+        if char_count == keep {
+            // We have our cut point; now check if there are more chars.
+            cut_byte = byte_idx;
+        }
+        if char_count == max_chars {
+            // There is at least one char beyond max_chars → truncate.
+            needs_ellipsis = true;
+            break;
+        }
+        char_count += 1;
     }
-    // Walk char boundaries to find the safe slice point.
-    let end = max_chars.saturating_sub(3); // reserve 3 for "..."
-    let byte_idx = cmd
-        .char_indices()
-        .nth(end)
-        .map(|(i, _)| i)
-        .unwrap_or(cmd.len());
-    format!("{}...", &cmd[..byte_idx])
+    if needs_ellipsis {
+        format!("{}...", &cmd[..cut_byte])
+    } else {
+        cmd.to_string()
+    }
 }
 
 fn render_by_original_cmd(
@@ -464,12 +491,13 @@ fn render_by_original_cmd(
         let display = truncate_cmd_display(&cmd.original_cmd, DISPLAY_CMD_LEN);
         writeln!(
             w,
-            "  {:<DISPLAY_CMD_LEN$}  {:>COL_COUNT$}  {:>COL_SAVED$}  {}  {:>COL_DUR$}",
+            "  {:<DISPLAY_CMD_LEN$}  {:>COL_COUNT$}  {:>COL_SAVED$}  {}  {:>COL_DUR$}  {}",
             display,
             tokens::format_number(cmd.invocations as usize),
             format_tokens(cmd.tokens_saved),
             color_pct(cmd.avg_savings_pct),
             format_duration_ms(cmd.avg_duration_ms),
+            render_bar(cmd.avg_savings_pct, BAR_WIDTH),
         )?;
     }
     writeln!(w)?;
