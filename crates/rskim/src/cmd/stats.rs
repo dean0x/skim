@@ -481,6 +481,7 @@ fn render_parse_quality(
     tier_dist: &crate::analytics::TierDistribution,
 ) -> anyhow::Result<()> {
     writeln!(w, "{}", section_header("Parse Quality"))?;
+    writeln!(w)?;
     if tier_dist.full_pct > 0.0 || tier_dist.degraded_pct > 0.0 || tier_dist.passthrough_pct > 0.0 {
         writeln!(w, "  Full:        {:.1}%", tier_dist.full_pct)?;
         writeln!(w, "  Degraded:    {:.1}%", tier_dist.degraded_pct)?;
