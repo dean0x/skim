@@ -1159,8 +1159,6 @@ mod tests {
     #[test]
     fn test_weighted_savings_pct_zero_raw_tokens() {
         // When raw_tokens == 0, weighted_pct should be 0.0 (no division by zero)
-        let _store = MockStore::empty();
-        // empty store → "No analytics data found", but we can test render_summary directly
         let summary = crate::analytics::AnalyticsSummary {
             invocations: 1,
             raw_tokens: 0,
