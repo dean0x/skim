@@ -132,6 +132,17 @@ pub(crate) struct TierDistribution {
     pub(crate) passthrough_pct: f64,
 }
 
+/// Per-original-command breakdown, grouping by the raw command string stored
+/// at recording time (e.g., `"cargo build 2>&1"`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct OriginalCommandStats {
+    pub(crate) original_cmd: String,
+    pub(crate) invocations: u64,
+    pub(crate) tokens_saved: u64,
+    pub(crate) avg_savings_pct: f64,
+    pub(crate) avg_duration_ms: f64,
+}
+
 // ============================================================================
 // Pricing
 // ============================================================================
@@ -269,6 +280,12 @@ pub(crate) trait AnalyticsStore {
             degraded_pct: 0.0,
             passthrough_pct: 0.0,
         })
+    }
+    fn query_by_original_cmd(
+        &self,
+        _since: Option<i64>,
+    ) -> anyhow::Result<Vec<OriginalCommandStats>> {
+        Ok(vec![])
     }
     fn clear(&self) -> anyhow::Result<()> {
         Ok(())
@@ -486,6 +503,34 @@ impl AnalyticsDb {
         Ok(row)
     }
 
+    /// Query breakdown by original command string (top 15 by tokens saved).
+    pub(crate) fn query_by_original_cmd(
+        &self,
+        since: Option<i64>,
+    ) -> anyhow::Result<Vec<OriginalCommandStats>> {
+        let (where_clause, params) = since_clause(since);
+        let sql = format!(
+            "SELECT original_cmd, COUNT(*) as cnt, \
+             SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END) as saved, \
+             AVG(savings_pct) as avg_pct, AVG(duration_ms) as avg_dur \
+             FROM token_savings {where_clause} \
+             GROUP BY original_cmd \
+             ORDER BY saved DESC \
+             LIMIT 15"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(OriginalCommandStats {
+                original_cmd: row.get(0)?,
+                invocations: row.get::<_, i64>(1)? as u64,
+                tokens_saved: row.get::<_, i64>(2)?.max(0) as u64,
+                avg_savings_pct: row.get(3)?,
+                avg_duration_ms: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Prune records older than N days.
     pub(crate) fn prune_older_than(&self, days: u64) -> anyhow::Result<usize> {
         let cutoff = std::time::SystemTime::now()
@@ -579,6 +624,12 @@ impl AnalyticsStore for AnalyticsDb {
     }
     fn query_tier_distribution(&self, since: Option<i64>) -> anyhow::Result<TierDistribution> {
         self.query_tier_distribution(since)
+    }
+    fn query_by_original_cmd(
+        &self,
+        since: Option<i64>,
+    ) -> anyhow::Result<Vec<OriginalCommandStats>> {
+        self.query_by_original_cmd(since)
     }
     fn clear(&self) -> anyhow::Result<()> {
         self.conn.execute("DELETE FROM token_savings", [])?;
@@ -1487,5 +1538,55 @@ mod tests {
             .len();
         assert_eq!(len, 3, "all three handles should be registered");
         flush_pending(); // clean up
+    }
+
+    // ========================================================================
+    // query_by_original_cmd tests
+    // ========================================================================
+
+    #[test]
+    fn test_query_by_original_cmd_grouping() {
+        let (db, _tmp) = test_db();
+
+        // Record 3 invocations of "cargo build", 1 of "go test"
+        for _ in 0..3 {
+            let mut r = sample_record();
+            r.original_cmd = "cargo build".to_string();
+            r.raw_tokens = 1000;
+            r.compressed_tokens = 100;
+            db.record(&r).unwrap();
+        }
+        let mut r2 = sample_record();
+        r2.original_cmd = "go test".to_string();
+        r2.raw_tokens = 500;
+        r2.compressed_tokens = 50;
+        db.record(&r2).unwrap();
+
+        let results = db.query_by_original_cmd(None).unwrap();
+        assert_eq!(results.len(), 2, "should have 2 distinct commands");
+        // "cargo build" has more tokens saved, should be first
+        assert_eq!(results[0].original_cmd, "cargo build");
+        assert_eq!(results[0].invocations, 3);
+        assert_eq!(results[0].tokens_saved, 2700); // 3 * (1000 - 100)
+        assert_eq!(results[1].original_cmd, "go test");
+        assert_eq!(results[1].invocations, 1);
+        assert_eq!(results[1].tokens_saved, 450); // 500 - 50
+    }
+
+    #[test]
+    fn test_query_by_original_cmd_limited_to_15() {
+        let (db, _tmp) = test_db();
+
+        // Insert 20 distinct commands
+        for i in 0..20_u64 {
+            let mut r = sample_record();
+            r.original_cmd = format!("cmd_{i:02}");
+            r.raw_tokens = 1000;
+            r.compressed_tokens = 100;
+            db.record(&r).unwrap();
+        }
+
+        let results = db.query_by_original_cmd(None).unwrap();
+        assert_eq!(results.len(), 15, "should be limited to top 15 results");
     }
 }

@@ -40,7 +40,7 @@ fn test_stats_help() {
         .stdout(predicate::str::contains("stats"))
         .stdout(predicate::str::contains("--since"))
         .stdout(predicate::str::contains("--format"))
-        .stdout(predicate::str::contains("--cost"))
+        .stdout(predicate::str::contains("--verbose"))
         .stdout(predicate::str::contains("--clear"));
 }
 
