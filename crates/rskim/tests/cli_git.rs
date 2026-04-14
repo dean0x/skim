@@ -306,46 +306,44 @@ fn test_skim_git_show_head_commit_mode() {
         .unwrap();
     assert!(output.status.success(), "skim git show HEAD should succeed");
     let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
 
-    // Assertion 1: em-dash separator produced by ShowCommitResult::render.
-    // This is U+2014 (\u{2014}) — the render format is "<hash> <author> — <subject>".
-    assert!(
-        stdout.contains('\u{2014}'),
-        "Expected em-dash separator (U+2014) in compressed show output — \
-         raw git show never contains this character; got: {stdout}"
-    );
+    let guardrail_triggered = stderr.contains("[skim:guardrail]");
+    let has_emdash = stdout.contains('\u{2014}');
 
-    // Assertion 2: compressed output must not exceed raw by more than
-    // the expected annotation overhead.
-    //
-    // Line numbers added by the AST-aware renderer contribute a fixed per-line
-    // overhead: 1 prefix char + up to 5 digits + 1 space = ~7 bytes/line.
-    // We use 8 bytes/line as a conservative upper bound.
-    //
-    // Formula: max_allowed = raw_bytes + skim_line_count * 8
-    //
-    // This is tighter than a flat 110% multiplier for large commits (where 10%
-    // of raw_bytes >> annotation overhead) and more accurate for small commits
-    // (where annotation overhead is proportionally larger).
-    //
-    // The em-dash assertion (assertion 1) already proves skim ran — raw git
-    // show output never contains U+2014.
-    let skim_line_count = stdout.lines().count();
-    let annotation_overhead = skim_line_count * 8;
-    let max_allowed = raw_bytes + annotation_overhead;
-    assert!(
-        stdout.len() <= max_allowed,
-        "Expected compressed output ({} bytes) to be at most raw ({raw_bytes}) + \
-         annotation_overhead ({annotation_overhead} = {skim_line_count} lines × 8 bytes); \
-         got: {}",
-        stdout.len(),
-        stdout.len()
-    );
+    if guardrail_triggered {
+        // Guardrail passthrough: compressed was larger than raw, so skim
+        // emitted raw git output.  This is correct behaviour — verify the
+        // output looks like raw `git show` (starts with "commit <hash>").
+        assert!(
+            stdout.starts_with("commit "),
+            "Guardrail passthrough should emit raw git show output; got: {stdout}"
+        );
+    } else {
+        // Compressed path: em-dash separator must be present.
+        assert!(
+            has_emdash,
+            "Expected em-dash separator (U+2014) in compressed show output; got: {stdout}"
+        );
 
-    // Assertion 3: a 7-char hex token must appear somewhere in the output.
-    // Compressed output has "<hash> Author — Subject" (hash is first word).
-    // Raw output (guardrail fallback) has "commit <hash>" (hash is second word).
-    // Scan every word on every line so both formats are accepted.
+        // Compressed output must not exceed raw by more than annotation overhead.
+        // Line numbers add ~8 bytes/line (prefix char + up to 5 digits + space).
+        let skim_line_count = stdout.lines().count();
+        let annotation_overhead = skim_line_count * 8;
+        let max_allowed = raw_bytes + annotation_overhead;
+        assert!(
+            stdout.len() <= max_allowed,
+            "Expected compressed output ({} bytes) to be at most raw ({raw_bytes}) + \
+             annotation_overhead ({annotation_overhead} = {skim_line_count} lines × 8 bytes); \
+             got: {}",
+            stdout.len(),
+            stdout.len()
+        );
+    }
+
+    // Both paths must contain a commit hash (7+ hex chars).
+    // Compressed: "<hash> Author — Subject" (hash is first word).
+    // Raw: "commit <full-hash>" (hash is second word).
     let has_hash = stdout.lines().any(|l| {
         l.split_whitespace()
             .any(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))

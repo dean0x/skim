@@ -184,7 +184,9 @@ fn test_stats_verbose_shows_parse_quality() {
     // without it `ProcessResult::original_tokens` is None and no record is saved.
     // We deliberately do NOT set SKIM_DISABLE_ANALYTICS here.
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/typescript/simple.ts");
+        .join("../../tests/fixtures/typescript/simple.ts")
+        .canonicalize()
+        .expect("fixture must exist");
     Command::cargo_bin("skim")
         .unwrap()
         .arg(fixture.as_os_str())

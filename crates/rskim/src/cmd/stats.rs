@@ -55,8 +55,7 @@ pub(crate) fn run(
     }
 
     let since_ts = if let Some(s) = &since_str {
-        let time = parse_duration_ago(s)?;
-        let ts = time.duration_since(UNIX_EPOCH)?.as_secs() as i64;
+        let ts = parse_duration_ago(s)?.duration_since(UNIX_EPOCH)?.as_secs() as i64;
         Some(ts)
     } else {
         None
@@ -446,31 +445,17 @@ fn render_by_mode(
 /// appending `...` when truncated.  Uses a single `char_indices` pass so
 /// each character is visited at most once regardless of string length.
 fn truncate_cmd_display(cmd: &str, max_chars: usize) -> String {
-    // Reserve 3 chars for the ellipsis; keep the rest for the visible prefix.
     let keep = max_chars.saturating_sub(3);
-    // Walk char boundaries once.  If we reach `keep` characters without
-    // exhausting the string, record the byte index and continue to check
-    // whether the string is actually longer than `max_chars`.
-    let mut char_count = 0usize;
-    let mut cut_byte = cmd.len(); // default: no truncation needed
-    let mut needs_ellipsis = false;
-    for (byte_idx, _) in cmd.char_indices() {
-        if char_count == keep {
-            // We have our cut point; now check if there are more chars.
-            cut_byte = byte_idx;
+    let mut cut_byte = None;
+    for (i, (byte_idx, _)) in cmd.char_indices().enumerate() {
+        if i == keep {
+            cut_byte = Some(byte_idx);
         }
-        if char_count == max_chars {
-            // There is at least one char beyond max_chars → truncate.
-            needs_ellipsis = true;
-            break;
+        if i == max_chars {
+            return format!("{}...", &cmd[..cut_byte.unwrap_or(0)]);
         }
-        char_count += 1;
     }
-    if needs_ellipsis {
-        format!("{}...", &cmd[..cut_byte])
-    } else {
-        cmd.to_string()
-    }
+    cmd.to_string()
 }
 
 fn render_by_original_cmd(
@@ -1174,7 +1159,7 @@ mod tests {
     #[test]
     fn test_weighted_savings_pct_zero_raw_tokens() {
         // When raw_tokens == 0, weighted_pct should be 0.0 (no division by zero)
-        let store = MockStore::empty();
+        let _store = MockStore::empty();
         // empty store → "No analytics data found", but we can test render_summary directly
         let summary = crate::analytics::AnalyticsSummary {
             invocations: 1,
@@ -1315,14 +1300,20 @@ mod tests {
     fn test_truncate_cmd_display_max_three() {
         // max_chars=3: keep = 0, a string longer than 3 chars produces "..."
         let result = truncate_cmd_display("hello", 3);
-        assert_eq!(result, "...", "5-char input with max_chars=3 should yield '...'");
+        assert_eq!(
+            result, "...",
+            "5-char input with max_chars=3 should yield '...'"
+        );
     }
 
     #[test]
     fn test_truncate_cmd_display_exact_max() {
         // Input exactly at max_chars: should not be truncated
         let result = truncate_cmd_display("hello", 5);
-        assert_eq!(result, "hello", "input exactly at max_chars should not be truncated");
+        assert_eq!(
+            result, "hello",
+            "input exactly at max_chars should not be truncated"
+        );
     }
 
     // ========================================================================
