@@ -486,10 +486,10 @@ Uses OpenAI's tiktoken (cl100k_base for GPT-3.5/GPT-4). Output to stderr for cle
 Skim automatically tracks token savings from every invocation in a local SQLite database (`~/.cache/skim/analytics.db`). View your savings with the `stats` subcommand:
 
 ```bash
-skim stats                       # All-time dashboard
+skim stats                       # All-time dashboard (cost estimates always shown)
 skim stats --since 7d            # Last 7 days
 skim stats --format json         # Machine-readable output
-skim stats --cost                # Include cost savings estimates
+skim stats --verbose             # Include parse quality details
 skim stats --clear               # Reset analytics data
 ```
 

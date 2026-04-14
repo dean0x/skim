@@ -421,7 +421,12 @@ impl AnalyticsDb {
     pub(crate) fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
         let (where_clause, params) = since_clause(since);
         let sql = format!(
-            "SELECT command_type, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0), COALESCE(AVG(duration_ms), 0.0) FROM token_savings {where_clause} GROUP BY command_type ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
+            "SELECT command_type, COUNT(*), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
+             COALESCE(AVG(savings_pct), 0), COALESCE(AVG(duration_ms), 0.0) \
+             FROM token_savings {where_clause} \
+             GROUP BY command_type \
+             ORDER BY SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -443,7 +448,12 @@ impl AnalyticsDb {
     ) -> anyhow::Result<Vec<LanguageStats>> {
         let (clause, params) = since_clause_with_extra(since, "language IS NOT NULL");
         let sql = format!(
-            "SELECT language, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {clause} GROUP BY language ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
+            "SELECT language, COUNT(*), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
+             COALESCE(AVG(savings_pct), 0) \
+             FROM token_savings {clause} \
+             GROUP BY language \
+             ORDER BY SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
@@ -461,7 +471,12 @@ impl AnalyticsDb {
     pub(crate) fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
         let (clause, params) = since_clause_with_extra(since, "mode IS NOT NULL");
         let sql = format!(
-            "SELECT mode, COUNT(*), COALESCE(SUM(raw_tokens - compressed_tokens), 0), COALESCE(AVG(savings_pct), 0) FROM token_savings {clause} GROUP BY mode ORDER BY SUM(raw_tokens - compressed_tokens) DESC"
+            "SELECT mode, COUNT(*), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
+             COALESCE(AVG(savings_pct), 0) \
+             FROM token_savings {clause} \
+             GROUP BY mode \
+             ORDER BY SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END) DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
