@@ -24,14 +24,19 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
     install_hint: "Install prettier via npm: npm install -g prettier",
 };
 
+/// AD-21 (2026-04-15) — Path-aware regex patterns: `.+\S` captures full path including
+/// spaces while excluding trailing whitespace. Replaces `\S+` which broke on paths
+/// containing spaces (e.g., `[warn] src/My Component.tsx`).
 static RE_PRETTIER_WARN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\[warn\]\s+(\S+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\[warn\]\s+(.+\S)").unwrap());
 
 static RE_PRETTIER_SUMMARY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[warn\]\s+Code style issues found").unwrap());
 
+/// AD-21 (2026-04-15) — Path-aware regex patterns: `.+` replaces `[^\s]+` so that
+/// paths with spaces (e.g., `src/My Component.ts needs formatting`) are captured.
 static RE_PRETTIER_FILE_PATH: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^([^\s]+\.[a-zA-Z]{1,6})\s+needs? formatting").unwrap());
+    LazyLock::new(|| Regex::new(r"(?m)^(.+\.[a-zA-Z]{1,6})\s+needs? formatting").unwrap());
 
 /// Run `skim lint prettier [args...]`.
 pub(crate) fn run(
@@ -254,5 +259,48 @@ mod tests {
             "Expected Degraded parse result, got {}",
             result.tier_name()
         );
+    }
+
+    /// AD-21 (2026-04-15) — Path-aware regex patterns: [warn] lines with spaces in file paths.
+    #[test]
+    fn test_tier1_prettier_spaces_in_path() {
+        let input = load_fixture("prettier_check_fail_spaces.txt");
+        let result = try_parse_structured(&input);
+        assert!(
+            result.is_some(),
+            "Expected Tier 1 structured parse to succeed on space-containing paths"
+        );
+        let result = result.unwrap();
+        assert_eq!(
+            result.warnings, 2,
+            "Expected 2 warnings for 2 space-containing paths"
+        );
+        assert!(
+            result.groups.iter().any(|g| g.rule == "formatting"),
+            "Expected formatting rule group"
+        );
+        // Verify the full path with spaces was captured
+        let all_locs: Vec<&str> = result
+            .groups
+            .iter()
+            .flat_map(|g| g.locations.iter().map(|l| l.as_str()))
+            .collect();
+        assert!(
+            all_locs.iter().any(|l| l.contains("My Component.tsx")),
+            "Expected location to contain 'My Component.tsx', got: {all_locs:?}"
+        );
+    }
+
+    /// AD-21 (2026-04-15) — Path-aware regex patterns: Tier 2 regex with spaces.
+    #[test]
+    fn test_tier2_prettier_spaces_in_path() {
+        let input = "src/My Component.ts needs formatting\nsrc/My Other File.js needs formatting\n";
+        let result = try_parse_regex(input);
+        assert!(
+            result.is_some(),
+            "Expected Tier 2 regex parse on space-containing paths"
+        );
+        let result = result.unwrap();
+        assert_eq!(result.warnings, 2);
     }
 }
