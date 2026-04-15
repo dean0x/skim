@@ -292,6 +292,280 @@ fn test_golangci_json_flag_full() {
 }
 
 // ============================================================================
+// black: Tier 1 -- Full (check mode)
+// ============================================================================
+
+#[test]
+fn test_black_tier1_check_fail() {
+    let fixture = include_str!("fixtures/cmd/lint/black_check_fail.txt");
+    skim_cmd()
+        .args(["lint", "black"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stdout(predicate::str::contains("formatting"));
+}
+
+#[test]
+fn test_black_tier1_check_pass() {
+    let fixture = include_str!("fixtures/cmd/lint/black_check_pass.txt");
+    skim_cmd()
+        .args(["lint", "black"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT OK"));
+}
+
+#[test]
+fn test_black_tier2_regex_degraded() {
+    // Plain `would reformat` without `All done!` context
+    skim_cmd()
+        .args(["--debug", "lint", "black"])
+        .write_stdin("would reformat src/main.py\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"));
+}
+
+#[test]
+fn test_black_tier3_passthrough_garbage() {
+    skim_cmd()
+        .args(["--debug", "lint", "black"])
+        .write_stdin("random garbage not black output\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("random garbage"))
+        .stderr(predicate::str::contains("[skim:notice]"));
+}
+
+#[test]
+fn test_black_json_flag_full() {
+    let fixture = include_str!("fixtures/cmd/lint/black_check_fail.txt");
+    skim_cmd()
+        .args(["lint", "--json", "black"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tool\":\"black\""))
+        .stdout(predicate::str::is_match(r#"\{.*"tool".*\}"#).unwrap());
+}
+
+// ============================================================================
+// gofmt: Tier 1 -- Full (list mode)
+// ============================================================================
+
+#[test]
+fn test_gofmt_tier1_list_fail() {
+    let fixture = include_str!("fixtures/cmd/lint/gofmt_list_fail.txt");
+    skim_cmd()
+        .args(["lint", "gofmt"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stdout(predicate::str::contains("formatting"));
+}
+
+#[test]
+fn test_gofmt_tier2_regex_degraded() {
+    let fixture = include_str!("fixtures/cmd/lint/gofmt_diff_fail.txt");
+    skim_cmd()
+        .args(["--debug", "lint", "gofmt"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stderr(predicate::str::contains("[skim:warning]"));
+}
+
+#[test]
+fn test_gofmt_tier3_passthrough_garbage() {
+    skim_cmd()
+        .args(["--debug", "lint", "gofmt"])
+        .write_stdin("random garbage not gofmt output\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("random garbage"))
+        .stderr(predicate::str::contains("[skim:notice]"));
+}
+
+#[test]
+fn test_gofmt_json_flag_full() {
+    let fixture = include_str!("fixtures/cmd/lint/gofmt_list_fail.txt");
+    skim_cmd()
+        .args(["lint", "--json", "gofmt"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tool\":\"gofmt\""));
+}
+
+// ============================================================================
+// biome: Tier 1 -- Full (JSON check mode)
+// ============================================================================
+
+#[test]
+fn test_biome_tier1_json_fail() {
+    let fixture = include_str!("fixtures/cmd/lint/biome_check_fail.json");
+    skim_cmd()
+        .args(["lint", "biome"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stdout(predicate::str::contains("1 error"));
+}
+
+#[test]
+fn test_biome_tier2_regex_degraded() {
+    let fixture = include_str!("fixtures/cmd/lint/biome_check_text.txt");
+    skim_cmd()
+        .args(["--debug", "lint", "biome"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stderr(predicate::str::contains("[skim:warning]"));
+}
+
+#[test]
+fn test_biome_tier3_passthrough_garbage() {
+    skim_cmd()
+        .args(["--debug", "lint", "biome"])
+        .write_stdin("random garbage not biome output\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("random garbage"))
+        .stderr(predicate::str::contains("[skim:notice]"));
+}
+
+#[test]
+fn test_biome_json_flag_full() {
+    let fixture = include_str!("fixtures/cmd/lint/biome_check_fail.json");
+    skim_cmd()
+        .args(["lint", "--json", "biome"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tool\":\"biome\""))
+        .stdout(predicate::str::contains("\"errors\":1"));
+}
+
+// ============================================================================
+// dprint: Tier 1 -- Full (list mode)
+// ============================================================================
+
+#[test]
+fn test_dprint_tier1_check_fail() {
+    let fixture = include_str!("fixtures/cmd/lint/dprint_check_fail.txt");
+    skim_cmd()
+        .args(["lint", "dprint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stdout(predicate::str::contains("formatting"));
+}
+
+#[test]
+fn test_dprint_tier2_regex_degraded() {
+    skim_cmd()
+        .args(["--debug", "lint", "dprint"])
+        .write_stdin("from src/main.ts:\n  | diff content\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stderr(predicate::str::contains("[skim:warning]"));
+}
+
+#[test]
+fn test_dprint_tier3_passthrough_garbage() {
+    skim_cmd()
+        .args(["--debug", "lint", "dprint"])
+        .write_stdin("random garbage not dprint output\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("random garbage"))
+        .stderr(predicate::str::contains("[skim:notice]"));
+}
+
+#[test]
+fn test_dprint_json_flag_full() {
+    let fixture = include_str!("fixtures/cmd/lint/dprint_check_fail.txt");
+    skim_cmd()
+        .args(["lint", "--json", "dprint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tool\":\"dprint\""));
+}
+
+// ============================================================================
+// oxlint: Tier 1 -- Full (JSON mode)
+// ============================================================================
+
+#[test]
+fn test_oxlint_tier1_json_fail() {
+    let fixture = include_str!("fixtures/cmd/lint/oxlint_fail.json");
+    skim_cmd()
+        .args(["lint", "oxlint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stdout(predicate::str::contains("1 error"))
+        .stdout(predicate::str::contains("2 warning"));
+}
+
+#[test]
+fn test_oxlint_tier1_json_pass() {
+    let fixture = include_str!("fixtures/cmd/lint/oxlint_pass.json");
+    skim_cmd()
+        .args(["lint", "oxlint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT OK"));
+}
+
+#[test]
+fn test_oxlint_tier2_regex_degraded() {
+    let fixture = include_str!("fixtures/cmd/lint/oxlint_text.txt");
+    skim_cmd()
+        .args(["--debug", "lint", "oxlint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LINT:"))
+        .stderr(predicate::str::contains("[skim:warning]"));
+}
+
+#[test]
+fn test_oxlint_tier3_passthrough_garbage() {
+    skim_cmd()
+        .args(["--debug", "lint", "oxlint"])
+        .write_stdin("random garbage not oxlint output\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("random garbage"))
+        .stderr(predicate::str::contains("[skim:notice]"));
+}
+
+#[test]
+fn test_oxlint_json_flag_full() {
+    let fixture = include_str!("fixtures/cmd/lint/oxlint_fail.json");
+    skim_cmd()
+        .args(["lint", "--json", "oxlint"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"tool\":\"oxlint\""))
+        .stdout(predicate::str::contains("\"errors\":1"));
+}
+
+// ============================================================================
 // Dispatcher: help and unknown linter
 // ============================================================================
 
@@ -305,7 +579,10 @@ fn test_lint_help() {
         .stdout(predicate::str::contains("eslint"))
         .stdout(predicate::str::contains("ruff"))
         .stdout(predicate::str::contains("mypy"))
-        .stdout(predicate::str::contains("golangci"));
+        .stdout(predicate::str::contains("golangci"))
+        .stdout(predicate::str::contains("black"))
+        .stdout(predicate::str::contains("biome"))
+        .stdout(predicate::str::contains("oxlint"));
 }
 
 #[test]

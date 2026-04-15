@@ -1,11 +1,17 @@
-//! Lint subcommand dispatcher (#104, #116)
+//! Lint subcommand dispatcher (#104, #116, #133)
 //!
 //! Routes `skim lint <linter> [args...]` to the appropriate linter parser.
-//! Currently supported linters: `eslint`, `golangci`, `mypy`, `prettier`, `ruff`, `rustfmt`.
+//! Currently supported linters: `biome`, `black`, `dprint`, `eslint`, `gofmt`,
+//! `golangci`, `mypy`, `oxlint`, `prettier`, `ruff`, `rustfmt`.
 
+pub(crate) mod biome;
+pub(crate) mod black;
+pub(crate) mod dprint;
 pub(crate) mod eslint;
+pub(crate) mod gofmt;
 pub(crate) mod golangci;
 pub(crate) mod mypy;
+pub(crate) mod oxlint;
 pub(crate) mod prettier;
 pub(crate) mod ruff;
 pub(crate) mod rustfmt;
@@ -20,7 +26,10 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known linters that `skim lint` can dispatch to.
-const KNOWN_LINTERS: &[&str] = &["eslint", "golangci", "mypy", "prettier", "ruff", "rustfmt"];
+const KNOWN_LINTERS: &[&str] = &[
+    "biome", "black", "dprint", "eslint", "gofmt", "golangci", "mypy", "oxlint", "prettier",
+    "ruff", "rustfmt",
+];
 
 /// Entry point for `skim lint <linter> [args...]`.
 ///
@@ -47,9 +56,14 @@ pub(crate) fn run(
     let analytics_enabled = analytics.enabled;
 
     match linter_name.as_str() {
+        "biome" => biome::run(linter_args, show_stats, json_output, analytics_enabled),
+        "black" => black::run(linter_args, show_stats, json_output, analytics_enabled),
+        "dprint" => dprint::run(linter_args, show_stats, json_output, analytics_enabled),
         "eslint" => eslint::run(linter_args, show_stats, json_output, analytics_enabled),
+        "gofmt" => gofmt::run(linter_args, show_stats, json_output, analytics_enabled),
         "golangci" => golangci::run(linter_args, show_stats, json_output, analytics_enabled),
         "mypy" => mypy::run(linter_args, show_stats, json_output, analytics_enabled),
+        "oxlint" => oxlint::run(linter_args, show_stats, json_output, analytics_enabled),
         "prettier" => prettier::run(linter_args, show_stats, json_output, analytics_enabled),
         "ruff" => ruff::run(linter_args, show_stats, json_output, analytics_enabled),
         "rustfmt" => rustfmt::run(linter_args, show_stats, json_output, analytics_enabled),
@@ -81,9 +95,14 @@ fn print_help() {
     println!("  --show-stats    Show token statistics");
     println!();
     println!("Examples:");
+    println!("  skim lint biome check .        Run biome check");
+    println!("  skim lint black src/           Run black --check");
+    println!("  skim lint dprint check .       Run dprint check");
     println!("  skim lint eslint .             Run eslint");
+    println!("  skim lint gofmt ./...          Run gofmt -l");
     println!("  skim lint golangci run ./...   Run golangci-lint");
     println!("  skim lint mypy src/            Run mypy");
+    println!("  skim lint oxlint src/          Run oxlint");
     println!("  skim lint prettier .           Run prettier --check");
     println!("  skim lint ruff check .         Run ruff check");
     println!("  skim lint rustfmt src/         Run rustfmt --check");

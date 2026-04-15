@@ -404,6 +404,119 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
     },
+    // lint — black
+    RewriteRule {
+        prefix: &["black", "--check"],
+        rewrite_to: &["skim", "lint", "black"],
+        skip_if_flag_prefix: &["--diff"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["black"],
+        rewrite_to: &["skim", "lint", "black"],
+        skip_if_flag_prefix: &["--diff"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — gofmt (longest prefix first)
+    RewriteRule {
+        prefix: &["gofmt", "-l"],
+        rewrite_to: &["skim", "lint", "gofmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["gofmt", "-d"],
+        rewrite_to: &["skim", "lint", "gofmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["gofmt"],
+        rewrite_to: &["skim", "lint", "gofmt"],
+        skip_if_flag_prefix: &["-w"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — biome (longest prefix first)
+    RewriteRule {
+        prefix: &["npx", "biome", "check"],
+        rewrite_to: &["skim", "lint", "biome", "check"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["biome", "check"],
+        rewrite_to: &["skim", "lint", "biome", "check"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["npx", "biome", "format"],
+        rewrite_to: &["skim", "lint", "biome", "format"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["biome", "format"],
+        rewrite_to: &["skim", "lint", "biome", "format"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["npx", "biome", "lint"],
+        rewrite_to: &["skim", "lint", "biome", "lint"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["biome", "lint"],
+        rewrite_to: &["skim", "lint", "biome", "lint"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["npx", "biome"],
+        rewrite_to: &["skim", "lint", "biome"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["biome"],
+        rewrite_to: &["skim", "lint", "biome"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Lint,
+    },
+    // lint — dprint (longest prefix first)
+    RewriteRule {
+        prefix: &["dprint", "check"],
+        rewrite_to: &["skim", "lint", "dprint", "check"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["dprint", "fmt"],
+        rewrite_to: &["skim", "lint", "dprint", "fmt"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["dprint"],
+        rewrite_to: &["skim", "lint", "dprint"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    // lint — oxlint
+    RewriteRule {
+        prefix: &["npx", "oxlint"],
+        rewrite_to: &["skim", "lint", "oxlint"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["oxlint"],
+        rewrite_to: &["skim", "lint", "oxlint"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Lint,
+    },
     // infra — gh (longest prefix first)
     //
     // DESIGN DECISION: --jq and --template skip because they apply custom
@@ -544,7 +657,7 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with REWRITE_RULES.
-    const EXPECTED_RULE_COUNT: usize = 75;
+    const EXPECTED_RULE_COUNT: usize = 93;
 
     #[test]
     fn test_rule_count_matches_expected() {
