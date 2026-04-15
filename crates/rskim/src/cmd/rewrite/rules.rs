@@ -178,7 +178,23 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format", "-f"],
         category: RewriteCategory::Lint,
     },
-    // lint — ruff
+    // lint — ruff (longest prefix first)
+    //
+    // AD-20 (2026-04-15): `ruff format --check` and `ruff format` (apply mode)
+    // are routed through the format-mode parse path in ruff.rs. The ruff parser
+    // detects `is_format_mode` from the first user argument (`"format"`).
+    RewriteRule {
+        prefix: &["ruff", "format", "--check"],
+        rewrite_to: &["skim", "lint", "ruff"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["ruff", "format"],
+        rewrite_to: &["skim", "lint", "ruff"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
     RewriteRule {
         prefix: &["ruff", "check"],
         rewrite_to: &["skim", "lint", "ruff"],
@@ -329,6 +345,34 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
     },
     // lint — prettier (longest prefix first: npx prettier, prettier)
+    //
+    // AD-20 (2026-04-15): `prettier --write` and `-w` are routed through the
+    // format-mode parse path in prettier.rs. `is_format_mode` detects `--write`
+    // or `-w` in the user arguments. Check-mode rules unchanged.
+    RewriteRule {
+        prefix: &["npx", "prettier", "--write"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["npx", "prettier", "-w"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["prettier", "--write"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
+    RewriteRule {
+        prefix: &["prettier", "-w"],
+        rewrite_to: &["skim", "lint", "prettier"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Lint,
+    },
     RewriteRule {
         prefix: &["npx", "prettier", "--check"],
         rewrite_to: &["skim", "lint", "prettier"],
@@ -500,7 +544,7 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with REWRITE_RULES.
-    const EXPECTED_RULE_COUNT: usize = 69;
+    const EXPECTED_RULE_COUNT: usize = 75;
 
     #[test]
     fn test_rule_count_matches_expected() {
