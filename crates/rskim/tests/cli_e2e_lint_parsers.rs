@@ -726,5 +726,44 @@ fn test_dprint_fmt_with_file_args_invokes_binary() {
     // the parse result. Since dprint is not installed in CI, we check that we
     // did NOT parse the piped "Formatted 1 files." as stdin.
     // The key invariant: output does NOT contain "files formatted" from stdin parse.
-    let _ = stdout; // accept any outcome — the unit tests in dprint.rs verify correctness
+    assert!(
+        !stdout.contains("files formatted"),
+        "stdin should not be consumed when file args are present, but output contained \
+         'files formatted': {stdout}"
+    );
+}
+
+// ============================================================================
+// Format-mode render path: biome format success and prettier --write (E2E)
+// ============================================================================
+
+/// E2E: piping `biome format` success output produces "files formatted" in rendered output.
+///
+/// `Formatted N files in Xms` is matched by `RE_BIOME_FORMAT_SUCCESS` and rendered as
+/// `LINT OK | biome (N files formatted)` via `LintResult::formatted`.
+#[test]
+fn test_biome_format_success_produces_files_formatted() {
+    let fixture = include_str!("fixtures/cmd/lint/biome_format_pass.txt");
+    skim_cmd()
+        .args(["lint", "biome", "format"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("files formatted"));
+}
+
+/// E2E: piping `prettier --write` output produces "files formatted" in rendered output.
+///
+/// `prettier --write` emits one file path per line. `parse_format_impl` matches via
+/// `RE_PRETTIER_WRITTEN_PATH` and calls `LintResult::formatted`, rendering as
+/// `LINT OK | prettier (N files formatted)`.
+#[test]
+fn test_prettier_write_output_produces_files_formatted() {
+    let fixture = include_str!("fixtures/cmd/lint/prettier_write_output.txt");
+    skim_cmd()
+        .args(["lint", "prettier", "--write"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("files formatted"));
 }

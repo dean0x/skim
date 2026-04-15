@@ -13,7 +13,7 @@
 //! Biome's first positional argument is the subcommand: `check`, `format`, or
 //! `lint`. `format` mode parses file-list output. `check` and `lint` modes
 //! both inject `--reporter=json` for structured diagnostic output (handled by
-//! the same `run_check_lint` path).
+//! the same `run_check` path).
 //!
 //! Subcommand detection:
 //! - `is_format_mode`: first arg is `"format"`
@@ -55,7 +55,7 @@ fn is_format_mode(args: &[String]) -> bool {
 ///
 /// # AD-24 (2026-04-15) — Biome dual-mode routing
 ///
-/// Dispatches to `run_format` or `run_check_lint` based on the first argument.
+/// Dispatches to `run_format` or `run_check` based on the first argument.
 /// `format` → format path. `check`, `lint`, or no subcommand → check/lint path.
 pub(crate) fn run(
     args: &[String],
@@ -66,11 +66,11 @@ pub(crate) fn run(
     if is_format_mode(args) {
         run_format(args, show_stats, json_output, analytics_enabled)
     } else {
-        run_check_lint(args, show_stats, json_output, analytics_enabled)
+        run_check(args, show_stats, json_output, analytics_enabled)
     }
 }
 
-fn run_check_lint(
+fn run_check(
     args: &[String],
     show_stats: bool,
     json_output: bool,
@@ -78,7 +78,7 @@ fn run_check_lint(
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "check" / "lint" subcommand so that stdin is detected
     // when no file args remain (e.g., `cat output.txt | skim lint biome check`).
-    // `prepare_check_lint_args` re-injects the subcommand when absent.
+    // `prepare_check_args` re-injects the subcommand when absent.
     let has_subcommand = args
         .first()
         .is_some_and(|a| matches!(a.as_str(), "check" | "lint" | "format" | "ci"));
@@ -89,13 +89,13 @@ fn run_check_lint(
         show_stats,
         json_output,
         analytics_enabled,
-        prepare_check_lint_args,
-        parse_check_lint_impl,
+        prepare_check_args,
+        parse_check_impl,
     )
 }
 
 /// Inject `check` subcommand and `--reporter=json` if not already present.
-fn prepare_check_lint_args(cmd_args: &mut Vec<String>) {
+fn prepare_check_args(cmd_args: &mut Vec<String>) {
     // Ensure a subcommand is present
     let has_subcommand = cmd_args
         .first()
@@ -111,7 +111,7 @@ fn prepare_check_lint_args(cmd_args: &mut Vec<String>) {
 }
 
 /// Three-tier parse for `biome check` / `biome lint` output.
-fn parse_check_lint_impl(output: &CommandOutput) -> ParseResult<LintResult> {
+fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     if let Some(result) = try_parse_json(&output.stdout) {
         return ParseResult::Full(result);
     }
@@ -280,9 +280,13 @@ fn try_parse_text_regex(text: &str) -> Option<LintResult> {
 /// `biome format --write` may emit `Formatted N files in Xms`.
 /// `biome format` (check mode) emits file paths followed by summary.
 fn try_parse_format_structured(text: &str) -> Option<LintResult> {
-    // Check for success pattern
-    if let Some(caps) = RE_BIOME_FORMAT_SUCCESS.captures_iter(text).next() {
-        let n: usize = caps[1].parse().unwrap_or(0);
+    // Check for success pattern line-by-line so `^` anchors to the start of each
+    // line, not the start of the full text (which may begin with a `//` comment).
+    if let Some(n) = text.lines().find_map(|line| {
+        RE_BIOME_FORMAT_SUCCESS
+            .captures(line)
+            .map(|caps| caps[1].parse::<usize>().unwrap_or(0))
+    }) {
         return Some(LintResult::formatted("biome".to_string(), n));
     }
 
@@ -415,7 +419,7 @@ mod tests {
             exit_code: Some(1),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse_check_lint_impl(&output);
+        let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
             "Expected Full tier, got {}",
@@ -432,7 +436,7 @@ mod tests {
             exit_code: Some(1),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse_check_lint_impl(&output);
+        let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
             "Expected Degraded from text input, got {}",
@@ -448,7 +452,7 @@ mod tests {
             exit_code: Some(1),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse_check_lint_impl(&output);
+        let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
             "Expected Passthrough for garbage input"
@@ -512,20 +516,20 @@ mod tests {
         assert_eq!(cmd_args[1], "src/");
     }
 
-    /// AD-26: `prepare_check_lint_args` re-injects "check" when absent.
+    /// AD-26: `prepare_check_args` re-injects "check" when absent.
     #[test]
-    fn test_prepare_check_lint_args_injects_check() {
+    fn test_prepare_check_args_injects_check() {
         let mut cmd_args: Vec<String> = vec![];
-        prepare_check_lint_args(&mut cmd_args);
+        prepare_check_args(&mut cmd_args);
         assert!(cmd_args.contains(&"check".to_string()));
         assert!(cmd_args.iter().any(|a| a.starts_with("--reporter")));
     }
 
-    /// AD-26: `prepare_check_lint_args` does not duplicate "check" when already present.
+    /// AD-26: `prepare_check_args` does not duplicate "check" when already present.
     #[test]
-    fn test_prepare_check_lint_args_no_duplicate_check() {
+    fn test_prepare_check_args_no_duplicate_check() {
         let mut cmd_args: Vec<String> = vec!["check".to_string()];
-        prepare_check_lint_args(&mut cmd_args);
+        prepare_check_args(&mut cmd_args);
         assert_eq!(cmd_args.iter().filter(|a| *a == "check").count(), 1);
     }
 }

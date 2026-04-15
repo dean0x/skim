@@ -32,9 +32,10 @@ static RE_ESLINT_LINE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// AD-21 (2026-04-15) — Path-aware regex patterns: `.+` replaces `[^\s]+` so that
 /// paths with spaces (e.g., `/home/user/my project/src/auth handler.ts`) are captured.
-/// The `$` anchor bounds the match, preventing over-matching.
+/// `.+\S` requires the path ends with a non-whitespace character, preventing
+/// over-matching of lines with trailing whitespace (mirrors `RE_PRETTIER_WARN`).
 static RE_ESLINT_FILE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(/.+|[A-Z]:\\.+)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(/.+\S|[A-Z]:\\.+\S)$").unwrap());
 
 /// Run `skim lint eslint [args...]`.
 pub(crate) fn run(

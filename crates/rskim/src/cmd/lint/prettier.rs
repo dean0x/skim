@@ -133,9 +133,17 @@ fn run_format(
     json_output: bool,
     analytics_enabled: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // Strip --write / -w so that `args.is_empty()` is true when no file targets
+    // remain, enabling stdin detection (e.g., `cat output.txt | skim lint prettier --write`).
+    // `prepare_format_args` re-injects --write for binary execution.
+    let remaining: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--write" && a.as_str() != "-w")
+        .cloned()
+        .collect();
     super::run_linter(
         CONFIG,
-        args,
+        &remaining,
         show_stats,
         json_output,
         analytics_enabled,
@@ -144,8 +152,12 @@ fn run_format(
     )
 }
 
-/// Pass args through including `--write` — no extra flags injected.
-fn prepare_format_args(_cmd_args: &mut Vec<String>) {}
+/// Re-inject `--write` stripped by `run_format` so the binary receives it during execution.
+fn prepare_format_args(cmd_args: &mut Vec<String>) {
+    if !user_has_flag(cmd_args, &["--write", "-w"]) {
+        cmd_args.insert(0, "--write".to_string());
+    }
+}
 
 /// Three-tier parse for `prettier --write` output.
 ///
