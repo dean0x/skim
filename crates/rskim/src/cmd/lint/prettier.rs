@@ -202,7 +202,6 @@ fn try_parse_format_structured(stdout: &str) -> Option<LintResult> {
     }
 
     let mut count = 0usize;
-    let mut any_match = false;
 
     for line in stdout.lines() {
         let trimmed = line.trim();
@@ -211,14 +210,13 @@ fn try_parse_format_structured(stdout: &str) -> Option<LintResult> {
         }
         if RE_PRETTIER_WRITTEN_PATH.is_match(trimmed) {
             count += 1;
-            any_match = true;
         } else {
             // Non-path line (e.g., error message) — bail out to tier 2
             return None;
         }
     }
 
-    if !any_match {
+    if count == 0 {
         return None;
     }
 

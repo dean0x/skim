@@ -63,9 +63,11 @@ fn run_check(
     // Strip the consumed "check" subcommand so that stdin is detected when no
     // file args remain (e.g., `cat output.txt | skim lint dprint check`).
     // `prepare_check_args` re-injects "check" unconditionally when absent.
-    let remaining: Vec<String> = args.iter().skip(
-        usize::from(args.first().is_some_and(|a| a == "check"))
-    ).cloned().collect();
+    let remaining: Vec<String> = args
+        .iter()
+        .skip(usize::from(args.first().is_some_and(|a| a == "check")))
+        .cloned()
+        .collect();
     super::run_linter(
         CONFIG,
         &remaining,

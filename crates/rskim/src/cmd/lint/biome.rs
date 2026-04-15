@@ -51,6 +51,11 @@ fn is_format_mode(args: &[String]) -> bool {
     args.first().is_some_and(|a| a == "format")
 }
 
+/// Returns true when `s` is a recognized biome subcommand.
+fn is_biome_subcommand(s: &str) -> bool {
+    matches!(s, "check" | "lint" | "format" | "ci")
+}
+
 /// Run `skim lint biome [args...]`.
 ///
 /// # AD-24 (2026-04-15) — Biome dual-mode routing
@@ -79,10 +84,12 @@ fn run_check(
     // Strip the consumed "check" / "lint" subcommand so that stdin is detected
     // when no file args remain (e.g., `cat output.txt | skim lint biome check`).
     // `prepare_check_args` re-injects the subcommand when absent.
-    let has_subcommand = args
-        .first()
-        .is_some_and(|a| matches!(a.as_str(), "check" | "lint" | "format" | "ci"));
-    let remaining: Vec<String> = args.iter().skip(usize::from(has_subcommand)).cloned().collect();
+    let has_subcommand = args.first().is_some_and(|a| is_biome_subcommand(a));
+    let remaining: Vec<String> = args
+        .iter()
+        .skip(if has_subcommand { 1 } else { 0 })
+        .cloned()
+        .collect();
     super::run_linter(
         CONFIG,
         &remaining,
@@ -97,10 +104,7 @@ fn run_check(
 /// Inject `check` subcommand and `--reporter=json` if not already present.
 fn prepare_check_args(cmd_args: &mut Vec<String>) {
     // Ensure a subcommand is present
-    let has_subcommand = cmd_args
-        .first()
-        .is_some_and(|a| matches!(a.as_str(), "check" | "lint" | "format" | "ci"));
-    if !has_subcommand {
+    if !cmd_args.first().is_some_and(|a| is_biome_subcommand(a)) {
         cmd_args.insert(0, "check".to_string());
     }
 

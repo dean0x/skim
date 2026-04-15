@@ -235,11 +235,9 @@ fn try_parse_check_regex(text: &str) -> Option<LintResult> {
     let issues = collect_would_reformat_issues(text);
 
     if issues.is_empty() {
-        // Check for summary line with count
-        for line in text.lines() {
-            if RE_BLACK_SUMMARY.is_match(line) {
-                return Some(group_issues("black", vec![]));
-            }
+        // Return Some only when a summary line confirms this is black output.
+        if text.lines().any(|line| RE_BLACK_SUMMARY.is_match(line)) {
+            return Some(group_issues("black", vec![]));
         }
         return None;
     }
@@ -276,10 +274,8 @@ fn try_parse_format_regex(text: &str) -> Option<LintResult> {
     if count == 0 {
         // Only return Some if there's a recognisable summary line — without it
         // we cannot distinguish "nothing to reformat" from "garbage input".
-        for line in text.lines() {
-            if RE_BLACK_SUMMARY.is_match(line) {
-                return Some(LintResult::formatted("black".to_string(), 0));
-            }
+        if text.lines().any(|line| RE_BLACK_SUMMARY.is_match(line)) {
+            return Some(LintResult::formatted("black".to_string(), 0));
         }
         return None;
     }
