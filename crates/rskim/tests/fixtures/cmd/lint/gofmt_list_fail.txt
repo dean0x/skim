@@ -1,0 +1,4 @@
+// Generated from gofmt (go1.22) on 2026-04-15
+cmd/server.go
+internal/handler.go
+pkg/utils/format.go
