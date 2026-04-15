@@ -359,12 +359,33 @@ pub(crate) struct LintGroup {
 }
 
 /// Complete lint result with summary and grouped issues
+///
+/// # AD-22 (2026-04-15) — files_formatted field for format-mode results
+///
+/// Format-mode runs (e.g., `ruff format`, `prettier --write`, `cargo fmt`) do not
+/// produce lint issues — they rewrite files. `files_formatted: Some(N)` signals that
+/// N files were reformatted; `None` means this is a check-mode result (existing
+/// behaviour unchanged).
+///
+/// # AD-23 (2026-04-15) — render() output for format-mode
+///
+/// When `files_formatted.is_some()` AND `errors == 0 && warnings == 0`:
+/// → `LINT OK | {tool} ({N} files formatted)`
+///
+/// When `files_formatted.is_some()` AND there are issues (i.e., check mode found
+/// problems while files_formatted is also set — unlikely but handled):
+/// → standard issue output, `files_formatted` ignored in render.
+///
+/// When `files_formatted.is_none()`: existing render behaviour unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LintResult {
     pub(crate) tool: String,
     pub(crate) errors: usize,
     pub(crate) warnings: usize,
     pub(crate) groups: Vec<LintGroup>,
+    /// Number of files reformatted by a format-mode run. `None` for check-mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) files_formatted: Option<usize>,
     #[serde(default)]
     rendered: String,
 }
@@ -413,19 +434,42 @@ pub(crate) struct PkgResult {
 }
 
 impl LintResult {
-    /// Create a new LintResult with pre-computed rendered output
+    /// Create a new check-mode LintResult with pre-computed rendered output.
+    ///
+    /// Pass `files_formatted: None` for all check-mode results. For format-mode
+    /// results (where files were rewritten), use `LintResult::formatted()` instead.
     pub(crate) fn new(
         tool: String,
         errors: usize,
         warnings: usize,
         groups: Vec<LintGroup>,
     ) -> Self {
-        let rendered = Self::render(&tool, errors, warnings, &groups);
+        let rendered = Self::render(&tool, errors, warnings, None, &groups);
         Self {
             tool,
             errors,
             warnings,
             groups,
+            files_formatted: None,
+            rendered,
+        }
+    }
+
+    /// Create a format-mode LintResult recording how many files were reformatted.
+    ///
+    /// # AD-22 (2026-04-15) — format-mode constructor
+    ///
+    /// Used by `ruff format`, `prettier --write`, and `rustfmt` (format mode) parsers
+    /// to signal that N files were reformatted. Rendered as
+    /// `LINT OK | {tool} ({N} files formatted)` when no issues are present.
+    pub(crate) fn formatted(tool: String, files_formatted: usize) -> Self {
+        let rendered = Self::render(&tool, 0, 0, Some(files_formatted), &[]);
+        Self {
+            tool,
+            errors: 0,
+            warnings: 0,
+            groups: vec![],
+            files_formatted: Some(files_formatted),
             rendered,
         }
     }
@@ -433,15 +477,31 @@ impl LintResult {
     /// Recompute rendered field if empty (e.g., after deserialization)
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
-            self.rendered = Self::render(&self.tool, self.errors, self.warnings, &self.groups);
+            self.rendered = Self::render(
+                &self.tool,
+                self.errors,
+                self.warnings,
+                self.files_formatted,
+                &self.groups,
+            );
         }
     }
 
-    fn render(tool: &str, errors: usize, warnings: usize, groups: &[LintGroup]) -> String {
+    fn render(
+        tool: &str,
+        errors: usize,
+        warnings: usize,
+        files_formatted: Option<usize>,
+        groups: &[LintGroup],
+    ) -> String {
         use std::fmt::Write;
 
         let total = errors + warnings;
         if total == 0 {
+            // AD-23: format-mode success includes file count
+            if let Some(n) = files_formatted {
+                return format!("LINT OK | {tool} ({n} files formatted)");
+            }
             return format!("LINT OK | {tool} | 0 issues");
         }
 
@@ -1457,11 +1517,51 @@ mod tests {
             errors: 0,
             warnings: 0,
             groups: vec![],
+            files_formatted: None,
             rendered: String::new(),
         };
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
         assert_eq!(result.as_ref(), "LINT OK | mypy | 0 issues");
+    }
+
+    /// AD-22/AD-23 (2026-04-15) — LintResult::formatted() and format-mode render.
+    #[test]
+    fn test_lint_result_formatted_zero_files() {
+        let result = LintResult::formatted("rustfmt".to_string(), 0);
+        assert_eq!(
+            format!("{result}"),
+            "LINT OK | rustfmt (0 files formatted)",
+            "Zero-file format run should render with count"
+        );
+    }
+
+    #[test]
+    fn test_lint_result_formatted_multiple_files() {
+        let result = LintResult::formatted("ruff".to_string(), 5);
+        assert_eq!(format!("{result}"), "LINT OK | ruff (5 files formatted)",);
+        assert_eq!(result.files_formatted, Some(5));
+        assert_eq!(result.errors, 0);
+        assert_eq!(result.warnings, 0);
+    }
+
+    #[test]
+    fn test_lint_result_check_mode_unaffected() {
+        // Existing check-mode callers using LintResult::new() should produce
+        // the same output as before (no files_formatted suffix).
+        let result = LintResult::new("prettier".to_string(), 0, 0, vec![]);
+        assert_eq!(format!("{result}"), "LINT OK | prettier | 0 issues");
+        assert_eq!(result.files_formatted, None);
+    }
+
+    #[test]
+    fn test_lint_result_formatted_serde_roundtrip() {
+        let original = LintResult::formatted("prettier".to_string(), 3);
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: LintResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(format!("{original}"), format!("{deserialized}"));
+        assert_eq!(deserialized.files_formatted, Some(3));
     }
 
     #[test]
