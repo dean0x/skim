@@ -76,9 +76,15 @@ fn run_check(
     json_output: bool,
     analytics_enabled: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // Strip the consumed "check" subcommand so that stdin is detected when no
+    // file args remain (e.g., `cat output.txt | skim lint ruff check`).
+    // `prepare_check_args` re-injects "check" unconditionally when absent.
+    let remaining: Vec<String> = args.iter().skip(
+        usize::from(args.first().is_some_and(|a| a == "check"))
+    ).cloned().collect();
     super::run_linter(
         CONFIG,
-        args,
+        &remaining,
         show_stats,
         json_output,
         analytics_enabled,
@@ -129,9 +135,13 @@ fn run_format(
     json_output: bool,
     analytics_enabled: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
+    // Strip the consumed "format" subcommand so that stdin is detected when no
+    // file args remain (e.g., `cat output.txt | skim lint ruff format`).
+    // `prepare_format_args` re-injects "format" for binary execution.
+    let remaining: Vec<String> = args.iter().skip(1).cloned().collect();
     super::run_linter(
         CONFIG,
-        args,
+        &remaining,
         show_stats,
         json_output,
         analytics_enabled,
@@ -140,8 +150,16 @@ fn run_format(
     )
 }
 
-/// Pass args through unchanged for `ruff format` — no extra flags injected.
-fn prepare_format_args(_cmd_args: &mut Vec<String>) {}
+/// Re-inject the `format` subcommand stripped by `run_format`.
+///
+/// When `ruff format` is executed as a binary, `format` must be the first
+/// argument. We strip it before `run_linter` to allow stdin detection, then
+/// restore it here.
+fn prepare_format_args(cmd_args: &mut Vec<String>) {
+    if cmd_args.first().is_none_or(|a| a != "format") {
+        cmd_args.insert(0, "format".to_string());
+    }
+}
 
 /// Three-tier parse for `ruff format [--check]` output.
 ///
@@ -545,5 +563,52 @@ mod tests {
             assert!(r.as_ref().contains("LINT OK"));
             assert!(r.as_ref().contains("files formatted"));
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // AD-26: stdin detection — subcommand arg stripping
+    // -------------------------------------------------------------------------
+
+    /// AD-26: `prepare_format_args` re-injects "format" when absent.
+    #[test]
+    fn test_prepare_format_args_injects_format() {
+        let mut cmd_args: Vec<String> = vec![];
+        prepare_format_args(&mut cmd_args);
+        assert_eq!(cmd_args, vec!["format".to_string()]);
+    }
+
+    /// AD-26: `prepare_format_args` does not duplicate "format" when already present.
+    #[test]
+    fn test_prepare_format_args_no_duplicate_format() {
+        let mut cmd_args: Vec<String> = vec!["format".to_string(), "--check".to_string()];
+        prepare_format_args(&mut cmd_args);
+        assert_eq!(cmd_args[0], "format");
+        assert_eq!(cmd_args.iter().filter(|a| *a == "format").count(), 1);
+    }
+
+    /// AD-26: `prepare_format_args` re-injects "format" when only file args remain.
+    #[test]
+    fn test_prepare_format_args_with_file_arg() {
+        let mut cmd_args: Vec<String> = vec!["src/".to_string()];
+        prepare_format_args(&mut cmd_args);
+        assert_eq!(cmd_args[0], "format");
+        assert_eq!(cmd_args[1], "src/");
+    }
+
+    /// AD-26: `prepare_check_args` re-injects "check" when absent.
+    #[test]
+    fn test_prepare_check_args_injects_check() {
+        let mut cmd_args: Vec<String> = vec![];
+        prepare_check_args(&mut cmd_args);
+        assert!(cmd_args.contains(&"check".to_string()));
+        assert!(cmd_args.contains(&"--output-format".to_string()));
+    }
+
+    /// AD-26: `prepare_check_args` does not duplicate "check" when already present.
+    #[test]
+    fn test_prepare_check_args_no_duplicate_check() {
+        let mut cmd_args: Vec<String> = vec!["check".to_string()];
+        prepare_check_args(&mut cmd_args);
+        assert_eq!(cmd_args.iter().filter(|a| *a == "check").count(), 1);
     }
 }
