@@ -717,6 +717,24 @@ fn test_rewrite_ruff_bare() {
 }
 
 #[test]
+fn test_rewrite_ruff_format() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "format", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff"));
+}
+
+#[test]
+fn test_rewrite_ruff_format_check() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "format", "--check", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff"));
+}
+
+#[test]
 fn test_rewrite_mypy() {
     skim_cmd()
         .args(["rewrite", "mypy", "."])
@@ -934,6 +952,24 @@ fn test_rewrite_prettier_check_acknowledged() {
         .assert()
         .success()
         .stdout(predicate::str::contains("prettier --check"));
+}
+
+#[test]
+fn test_rewrite_prettier_write() {
+    skim_cmd()
+        .args(["rewrite", "prettier", "--write", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint prettier"));
+}
+
+#[test]
+fn test_rewrite_npx_prettier_write() {
+    skim_cmd()
+        .args(["rewrite", "npx", "prettier", "--write", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint prettier"));
 }
 
 /// AD-11: `rustfmt --check` is acknowledged as already-compact.
