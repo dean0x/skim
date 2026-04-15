@@ -1,0 +1,14 @@
+// Generated from oxlint v0.3.0 on 2026-04-15
+  × no-unused-vars
+    ╭─[src/app.ts:5:7]
+  5 │ let x = 1;
+    ·       ─
+    ╰────
+
+  ⚠ eqeqeq
+    ╭─[src/app.ts:10:5]
+ 10 │ if (a == b) {}
+    ·       ──
+    ╰────
+
+Found 2 problems (1 error, 1 warning).

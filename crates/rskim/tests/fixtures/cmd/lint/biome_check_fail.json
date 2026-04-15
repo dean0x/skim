@@ -1,0 +1,1 @@
+{"diagnostics":[{"category":"lint/suspicious/noDoubleEquals","severity":"error","description":"Use === instead of ==","location":{"file":"src/app.ts","span":{"start":{"line":10,"column":5}}}},{"category":"lint/style/useConst","severity":"warning","description":"Use const instead of let","location":{"file":"src/utils.ts","span":{"start":{"line":3,"column":1}}}}]}
