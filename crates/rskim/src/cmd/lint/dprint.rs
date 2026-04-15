@@ -218,26 +218,13 @@ fn try_parse_diff_regex(text: &str) -> Option<LintResult> {
 ///
 /// `dprint fmt` emits `Formatted N files.` on success.
 fn try_parse_fmt_output(text: &str) -> Option<LintResult> {
-    let mut count = 0usize;
-    let mut found = false;
+    let count = text.lines().find_map(|line| {
+        RE_DPRINT_FORMATTED
+            .captures(line)
+            .map(|caps| caps[1].parse::<usize>().unwrap_or(0))
+    })?;
 
-    for line in text.lines() {
-        if let Some(caps) = RE_DPRINT_FORMATTED.captures(line) {
-            count = caps[1].parse().unwrap_or(0);
-            found = true;
-            break;
-        }
-    }
-
-    if !found && !text.trim().is_empty() {
-        return None;
-    }
-
-    if found {
-        Some(LintResult::formatted("dprint".to_string(), count))
-    } else {
-        None
-    }
+    Some(LintResult::formatted("dprint".to_string(), count))
 }
 
 #[cfg(test)]

@@ -146,13 +146,8 @@ fn prepare_format_args(_cmd_args: &mut Vec<String>) {}
 fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     let combined = combine_stdout_stderr(output);
 
-    // Exit 0 with no output = successful format run
-    if output.exit_code == Some(0) && combined.trim().is_empty() {
-        return ParseResult::Full(LintResult::formatted("rustfmt".to_string(), 0));
-    }
-
-    // If there is meaningful output on a successful run, still treat as formatted
-    // (rustfmt sometimes emits file names or minor notices on success)
+    // Exit 0 = successful format run (rustfmt may emit minor notices on success,
+    // but we treat any exit-0 output as formatted).
     if output.exit_code == Some(0) {
         return ParseResult::Full(LintResult::formatted("rustfmt".to_string(), 0));
     }
@@ -254,9 +249,9 @@ mod tests {
     use super::*;
 
     fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/lint");
-        path.push(name);
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cmd/lint")
+            .join(name);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
     }

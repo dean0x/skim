@@ -168,11 +168,10 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     let obj = value.as_object()?;
 
-    // Must have "diagnostics" key
+    // Must have "diagnostics" key; null is treated as empty array
     let diag_val = obj.get("diagnostics")?;
-
-    let diag_arr = match diag_val {
-        serde_json::Value::Null => &[] as &[serde_json::Value],
+    let diag_arr: &[serde_json::Value] = match diag_val {
+        serde_json::Value::Null => &[],
         serde_json::Value::Array(arr) => arr.as_slice(),
         _ => return None,
     };

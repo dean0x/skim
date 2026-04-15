@@ -172,7 +172,7 @@ fn try_parse_fancy_regex(text: &str) -> Option<LintResult> {
                         severity,
                     });
                     found_location = true;
-                    i = i + 1 + offset + 1;
+                    i += offset + 2;
                     break;
                 }
             }

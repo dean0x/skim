@@ -344,9 +344,9 @@ mod tests {
     use super::*;
 
     fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/lint");
-        path.push(name);
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cmd/lint")
+            .join(name);
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
     }
