@@ -199,6 +199,31 @@ fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     ParseResult::Passthrough(combined.into_owned())
 }
 
+// ============================================================================
+// Shared helper (format mode)
+// ============================================================================
+
+/// Collect `Would reformat: <path>` issues from `ruff format [--check]` output.
+///
+/// Shared by both Tier 1 and Tier 2 format parsers. Tier 1 guards entry with
+/// sentinel-string checks; Tier 2 calls this directly.
+fn collect_format_issues(text: &str) -> Vec<LintIssue> {
+    text.lines()
+        .filter_map(|line| RE_RUFF_FORMAT_WOULD.captures(line))
+        .map(|caps| LintIssue {
+            file: caps[1].trim().to_string(),
+            line: 0,
+            rule: "formatting".to_string(),
+            message: "would be reformatted".to_string(),
+            severity: LintSeverity::Warning,
+        })
+        .collect()
+}
+
+// ============================================================================
+// Format mode parsers
+// ============================================================================
+
 /// Tier 1: structured parse of `ruff format [--check]` output.
 fn try_parse_format_structured(text: &str) -> Option<LintResult> {
     // If there's no recognisable ruff format output, bail
@@ -211,19 +236,7 @@ fn try_parse_format_structured(text: &str) -> Option<LintResult> {
         return None;
     }
 
-    // Collect files that would be reformatted
-    let mut issues: Vec<LintIssue> = Vec::new();
-    for line in text.lines() {
-        if let Some(caps) = RE_RUFF_FORMAT_WOULD.captures(line) {
-            issues.push(LintIssue {
-                file: caps[1].trim().to_string(),
-                line: 0,
-                rule: "formatting".to_string(),
-                message: "would be reformatted".to_string(),
-                severity: LintSeverity::Warning,
-            });
-        }
-    }
+    let issues = collect_format_issues(text);
 
     // Check if this is a pure "all already formatted" pass
     if issues.is_empty() {
@@ -245,20 +258,13 @@ fn try_parse_format_structured(text: &str) -> Option<LintResult> {
 }
 
 /// Tier 2: regex fallback for `ruff format` output.
+///
+/// Defense-in-depth path: invoked only when Tier 1 sentinels are absent but
+/// `Would reformat:` lines exist (e.g., partial/truncated output). Returns 0
+/// unchanged files on a bare summary line rather than the full count, because
+/// without sentinels we cannot reliably distinguish unchanged from reformatted.
 fn try_parse_format_regex(text: &str) -> Option<LintResult> {
-    let mut issues: Vec<LintIssue> = Vec::new();
-
-    for line in text.lines() {
-        if let Some(caps) = RE_RUFF_FORMAT_WOULD.captures(line) {
-            issues.push(LintIssue {
-                file: caps[1].trim().to_string(),
-                line: 0,
-                rule: "formatting".to_string(),
-                message: "would be reformatted".to_string(),
-                severity: LintSeverity::Warning,
-            });
-        }
-    }
+    let issues = collect_format_issues(text);
 
     if issues.is_empty() {
         // Check for standalone unchanged summary

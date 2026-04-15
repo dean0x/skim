@@ -154,6 +154,55 @@ fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     ParseResult::Passthrough(combined.into_owned())
 }
 
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+/// Collect `would reformat <path>` issues from `black --check` output.
+///
+/// Shared by both Tier 1 and Tier 2 check parsers. Tier 1 guards entry with
+/// sentinel-string checks; Tier 2 calls this directly.
+fn collect_would_reformat_issues(text: &str) -> Vec<LintIssue> {
+    text.lines()
+        .filter_map(|line| RE_BLACK_WOULD.captures(line))
+        .map(|caps| LintIssue {
+            file: caps[1].trim().to_string(),
+            line: 0,
+            rule: "formatting".to_string(),
+            message: "would be reformatted".to_string(),
+            severity: LintSeverity::Warning,
+        })
+        .collect()
+}
+
+/// Count `reformatted <path>` lines in `black` format output.
+///
+/// Falls back to the summary line (`N files reformatted`) when no individual
+/// `reformatted <path>` lines are present.
+///
+/// Shared by both Tier 1 and Tier 2 format parsers. Tier 1 guards entry with
+/// sentinel-string checks; Tier 2 calls this directly.
+fn collect_reformatted_count(text: &str) -> usize {
+    let line_count = text
+        .lines()
+        .filter(|line| RE_BLACK_REFORMATTED.is_match(line))
+        .count();
+
+    if line_count > 0 {
+        return line_count;
+    }
+
+    // Fall back to summary line
+    text.lines()
+        .find_map(|line| RE_BLACK_SUMMARY.captures(line))
+        .and_then(|caps| caps[1].parse().ok())
+        .unwrap_or(0)
+}
+
+// ============================================================================
+// Check mode parsers
+// ============================================================================
+
 /// Tier 1: parse `black --check` output.
 ///
 /// Looks for `would reformat <path>` lines. `"All done!"` with `"left unchanged"` = pass.
@@ -168,19 +217,7 @@ fn try_parse_check_structured(text: &str) -> Option<LintResult> {
         return None;
     }
 
-    let mut issues: Vec<LintIssue> = Vec::new();
-
-    for line in text.lines() {
-        if let Some(caps) = RE_BLACK_WOULD.captures(line) {
-            issues.push(LintIssue {
-                file: caps[1].trim().to_string(),
-                line: 0,
-                rule: "formatting".to_string(),
-                message: "would be reformatted".to_string(),
-                severity: LintSeverity::Warning,
-            });
-        }
-    }
+    let issues = collect_would_reformat_issues(text);
 
     // Check if this is a pure pass ("All done!" with no files to reformat)
     if issues.is_empty() {
@@ -195,19 +232,7 @@ fn try_parse_check_structured(text: &str) -> Option<LintResult> {
 
 /// Tier 2: regex fallback for `black --check` output.
 fn try_parse_check_regex(text: &str) -> Option<LintResult> {
-    let mut issues: Vec<LintIssue> = Vec::new();
-
-    for line in text.lines() {
-        if let Some(caps) = RE_BLACK_WOULD.captures(line) {
-            issues.push(LintIssue {
-                file: caps[1].trim().to_string(),
-                line: 0,
-                rule: "formatting".to_string(),
-                message: "would be reformatted".to_string(),
-                severity: LintSeverity::Warning,
-            });
-        }
-    }
+    let issues = collect_would_reformat_issues(text);
 
     if issues.is_empty() {
         // Check for summary line with count
@@ -222,6 +247,10 @@ fn try_parse_check_regex(text: &str) -> Option<LintResult> {
     Some(group_issues("black", issues))
 }
 
+// ============================================================================
+// Format mode parsers
+// ============================================================================
+
 /// Tier 1: parse `black` (format/apply mode) output.
 ///
 /// Looks for `reformatted <path>` lines and counts them.
@@ -234,43 +263,22 @@ fn try_parse_format_structured(text: &str) -> Option<LintResult> {
         return None;
     }
 
-    let mut count = 0usize;
-
-    for line in text.lines() {
-        if RE_BLACK_REFORMATTED.is_match(line) {
-            count += 1;
-        }
-    }
-
-    // Try to get count from summary line if no individual lines found
-    if count == 0 {
-        for line in text.lines() {
-            if let Some(caps) = RE_BLACK_SUMMARY.captures(line) {
-                count = caps[1].parse().unwrap_or(0);
-                break;
-            }
-        }
-    }
-
-    Some(LintResult::formatted("black".to_string(), count))
+    Some(LintResult::formatted(
+        "black".to_string(),
+        collect_reformatted_count(text),
+    ))
 }
 
 /// Tier 2: regex fallback for `black` format output.
 fn try_parse_format_regex(text: &str) -> Option<LintResult> {
-    let mut count = 0usize;
-
-    for line in text.lines() {
-        if RE_BLACK_REFORMATTED.is_match(line) {
-            count += 1;
-        }
-    }
+    let count = collect_reformatted_count(text);
 
     if count == 0 {
-        // Check summary
+        // Only return Some if there's a recognisable summary line — without it
+        // we cannot distinguish "nothing to reformat" from "garbage input".
         for line in text.lines() {
-            if let Some(caps) = RE_BLACK_SUMMARY.captures(line) {
-                count = caps[1].parse().unwrap_or(0);
-                return Some(LintResult::formatted("black".to_string(), count));
+            if RE_BLACK_SUMMARY.is_match(line) {
+                return Some(LintResult::formatted("black".to_string(), 0));
             }
         }
         return None;

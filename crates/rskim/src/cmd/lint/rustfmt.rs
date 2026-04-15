@@ -8,13 +8,15 @@
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 //!
 //! # AD-20 (2026-04-15) — check/format split for rustfmt
+//! # AD-26 (2026-04-15) — safe default: check mode unless --format/-f is explicit
 //!
 //! `rustfmt --check` (or `cargo fmt --check`) produces diff output for files
 //! that need reformatting (existing behaviour, `run_check`).
 //!
 //! Bare `rustfmt` / `cargo fmt` rewrites files and produces minimal or no output
-//! on success. These are handled by `run_format`, which is active when `--check`
-//! is NOT present in the user arguments.
+//! on success. These are handled by `run_format`, which is active ONLY when the
+//! user passes `--format` or `-f`. All other invocations (including bare args with
+//! no flags) default to check mode to prevent accidental file rewrites.
 
 use std::sync::LazyLock;
 
@@ -39,9 +41,23 @@ static RE_RUSTFMT_DIFF_HEADER: LazyLock<Regex> =
 static RE_RUSTFMT_UNIFIED_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^--- (.+)").unwrap());
 
-/// Returns true when `--check` is NOT present — i.e., this is a format (apply) run.
+/// Returns true when the user explicitly passed `--format` or `-f` to indicate
+/// format (apply) mode.
+///
+/// # AD-26 (2026-04-15) — safe default for rustfmt dispatch
+///
+/// The old implementation (`!user_has_flag(args, &["--check"])`) treated bare
+/// invocation (no args) as format mode, which causes rustfmt to rewrite files in
+/// place — a destructive default.  Format mode must be explicit opt-in, not the
+/// fallback.
+///
+/// Design: require `--format` or `-f` flag for apply mode. `--check` remains
+/// optional in check mode (it is injected automatically by `prepare_check_args`
+/// when absent).  This matches the positive-signal pattern used by prettier
+/// (`--write`) and ruff (`format` subcommand), and the non-empty-args guard used
+/// by black.
 fn is_format_mode(args: &[String]) -> bool {
-    !user_has_flag(args, &["--check", "-c"])
+    user_has_flag(args, &["--format", "-f"])
 }
 
 /// Run `skim lint rustfmt [args...]`.
@@ -383,29 +399,55 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Format mode tests (AD-20)
+    // Format mode tests (AD-20, AD-26)
     // -------------------------------------------------------------------------
 
-    /// AD-20: is_format_mode returns true when --check is absent.
+    /// AD-26: bare invocation (no args) must default to check mode, not format.
+    /// Bare `skim lint rustfmt` must never rewrite files without an explicit flag.
     #[test]
-    fn test_is_format_mode_bare_args() {
+    fn test_is_format_mode_bare_args_is_false() {
         let args: Vec<String> = vec![];
         assert!(
-            is_format_mode(&args),
-            "No args (bare rustfmt) should be format mode"
+            !is_format_mode(&args),
+            "No args (bare rustfmt) must be check mode — safe default"
         );
     }
 
+    /// AD-26: file-only args (no format flag) must also default to check mode.
     #[test]
-    fn test_is_format_mode_with_files() {
+    fn test_is_format_mode_with_files_only_is_false() {
         let args: Vec<String> = vec!["src/main.rs".to_string()];
-        assert!(is_format_mode(&args));
+        assert!(
+            !is_format_mode(&args),
+            "File-only args without --format/-f must be check mode"
+        );
     }
 
+    /// AD-26: --check flag keeps check mode.
     #[test]
     fn test_is_format_mode_false_when_check_present() {
         let args: Vec<String> = vec!["--check".to_string(), "src/main.rs".to_string()];
         assert!(!is_format_mode(&args));
+    }
+
+    /// AD-26: --format flag is the explicit opt-in for format mode.
+    #[test]
+    fn test_is_format_mode_true_with_format_flag() {
+        let args: Vec<String> = vec!["--format".to_string(), "src/main.rs".to_string()];
+        assert!(
+            is_format_mode(&args),
+            "--format flag must activate format mode"
+        );
+    }
+
+    /// AD-26: -f short flag is the explicit opt-in for format mode.
+    #[test]
+    fn test_is_format_mode_true_with_short_flag() {
+        let args: Vec<String> = vec!["-f".to_string(), "src/main.rs".to_string()];
+        assert!(
+            is_format_mode(&args),
+            "-f short flag must activate format mode"
+        );
     }
 
     /// AD-20: empty output on exit 0 = successful format run.
