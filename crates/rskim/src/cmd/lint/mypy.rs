@@ -191,13 +191,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 mod tests {
     use super::*;
 
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/lint");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::lint::load_lint_fixture as load_fixture;
 
     #[test]
     fn test_tier1_mypy_fail() {

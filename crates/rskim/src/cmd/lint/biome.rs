@@ -344,13 +344,7 @@ mod tests {
     //! doc comments (no inline comments allowed in JSON).
     use super::*;
 
-    fn load_fixture(name: &str) -> String {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/cmd/lint")
-            .join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::lint::load_lint_fixture as load_fixture;
 
     /// biome_check_fail.json: generated from biome v1.7.0 on 2026-04-15.
     #[test]

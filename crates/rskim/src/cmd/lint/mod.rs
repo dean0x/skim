@@ -209,6 +209,20 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
 }
 
 // ============================================================================
+// Shared test helpers
+// ============================================================================
+
+/// Shared fixture loader for lint parser unit tests.
+#[cfg(test)]
+pub(crate) fn load_lint_fixture(name: &str) -> String {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cmd/lint")
+        .join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+}
+
+// ============================================================================
 // Unit tests
 // ============================================================================
 
