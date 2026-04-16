@@ -53,7 +53,7 @@ static RE_GO_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
-    // AD-19 (2026-04-11): `^\s*` prefix added so real vitest output like
+    // AD-TEST-19 (2026-04-11): `^\s*` prefix added so real vitest output like
     // `   × divides by zero` matches. Without `\s*` the regex anchors at
     // column 0 and silently misses all indented failure lines. The fix was
     // surfaced by scrutinizer review (commit ea4e52f).

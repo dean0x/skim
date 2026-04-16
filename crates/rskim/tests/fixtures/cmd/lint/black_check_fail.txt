@@ -1,0 +1,5 @@
+// Generated from black v24.3.0 on 2026-04-15
+would reformat src/main.py
+would reformat src/utils.py
+Oh no! 💥 💔 💥
+2 files would be reformatted, 3 files would be left unchanged.

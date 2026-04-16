@@ -1,0 +1,4 @@
+// Generated from biome v1.7.0 on 2026-04-15
+src/app.ts
+src/components/Header.tsx
+Compared 5 files in 30ms. 2 files are not formatted.

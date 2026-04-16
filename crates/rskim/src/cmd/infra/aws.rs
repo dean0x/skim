@@ -42,19 +42,9 @@ static RE_AWS_TABLE_ROW: LazyLock<Regex> =
 /// Run `skim infra aws [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_infra_tool(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    run_infra_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--output json` if not already present and subcommand supports it.

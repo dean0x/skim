@@ -6,6 +6,17 @@
 //! - **Tier 1 (Full)**: Parse `Diff in <path> at line <N>:` headers
 //! - **Tier 2 (Degraded)**: Regex on unified diff `--- <path>` headers
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
+//!
+//! # AD-LINT-20 (2026-04-15) — check/format split for rustfmt
+//! # AD-LINT-26 (2026-04-15) — safe default: check mode unless --format/-f is explicit
+//!
+//! `rustfmt --check` (or `cargo fmt --check`) produces diff output for files
+//! that need reformatting (existing behaviour, `run_check`).
+//!
+//! Bare `rustfmt` / `cargo fmt` rewrites files and produces minimal or no output
+//! on success. These are handled by `run_format`, which is active ONLY when the
+//! user passes `--format` or `-f`. All other invocations (including bare args with
+//! no flags) default to check mode to prevent accidental file rewrites.
 
 use std::sync::LazyLock;
 
@@ -30,33 +41,57 @@ static RE_RUSTFMT_DIFF_HEADER: LazyLock<Regex> =
 static RE_RUSTFMT_UNIFIED_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^--- (.+)").unwrap());
 
+/// Returns true when the user explicitly passed `--format` or `-f` to indicate
+/// format (apply) mode.
+///
+/// # AD-LINT-26 (2026-04-15) — safe default for rustfmt dispatch
+///
+/// The old implementation (`!user_has_flag(args, &["--check"])`) treated bare
+/// invocation (no args) as format mode, which causes rustfmt to rewrite files in
+/// place — a destructive default.  Format mode must be explicit opt-in, not the
+/// fallback.
+///
+/// Design: require `--format` or `-f` flag for apply mode. `--check` remains
+/// optional in check mode (it is injected automatically by `prepare_check_args`
+/// when absent).  This matches the positive-signal pattern used by prettier
+/// (`--write`) and ruff (`format` subcommand), and the non-empty-args guard used
+/// by black.
+fn is_format_mode(args: &[String]) -> bool {
+    user_has_flag(args, &["--format", "-f"])
+}
+
 /// Run `skim lint rustfmt [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    if is_format_mode(args) {
+        run_format(args, ctx)
+    } else {
+        run_check(args, ctx)
+    }
+}
+
+// ============================================================================
+// Check mode (existing behaviour, unchanged)
+// ============================================================================
+
+fn run_check(
+    args: &[String],
+    ctx: &crate::cmd::RunContext,
+) -> anyhow::Result<std::process::ExitCode> {
+    super::run_linter(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
 }
 
 /// Inject `--check` if not already present.
-fn prepare_args(cmd_args: &mut Vec<String>) {
+fn prepare_check_args(cmd_args: &mut Vec<String>) {
     if !user_has_flag(cmd_args, &["--check", "-c"]) {
         cmd_args.insert(0, "--check".to_string());
     }
 }
 
-/// Three-tier parse function for rustfmt output.
-fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
+/// Three-tier parse function for rustfmt check output.
+fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     let combined = combine_stdout_stderr(output);
 
     if let Some(result) = try_parse_structured(&combined) {
@@ -79,12 +114,49 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 }
 
 // ============================================================================
-// Tier 1: diff-header parsing
+// Format mode (AD-LINT-20)
+// ============================================================================
+
+fn run_format(
+    args: &[String],
+    ctx: &crate::cmd::RunContext,
+) -> anyhow::Result<std::process::ExitCode> {
+    super::run_linter(CONFIG, args, ctx, prepare_format_args, parse_format_impl)
+}
+
+/// Pass args through unchanged for format mode — no `--check` injection.
+fn prepare_format_args(_cmd_args: &mut Vec<String>) {}
+
+/// Parse for `rustfmt` (format/apply mode) output.
+///
+/// # AD-LINT-20 (2026-04-15) — rustfmt format mode
+///
+/// Bare `rustfmt` / `cargo fmt` rewrites files silently on success. Output is
+/// typically empty on success. On error (e.g., parse error), rustfmt emits
+/// diagnostics on stderr.
+///
+/// - Exit 0 + empty/minimal output → `LINT OK | rustfmt (0 files formatted)`
+/// - Any stderr content → treat as passthrough (unexpected error)
+fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
+    let combined = combine_stdout_stderr(output);
+
+    // Exit 0 = successful format run (rustfmt may emit minor notices on success,
+    // but we treat any exit-0 output as formatted).
+    if output.exit_code == Some(0) {
+        return ParseResult::Full(LintResult::formatted("rustfmt".to_string(), 0));
+    }
+
+    // Non-zero exit = error (e.g., syntax error in source) → passthrough
+    ParseResult::Passthrough(combined.into_owned())
+}
+
+// ============================================================================
+// Tier 1: diff-header parsing (check mode)
 // ============================================================================
 
 /// Parse rustfmt `--check` output by scanning `Diff in <path> at line <N>:` headers.
 ///
-/// # AD-17 (2026-04-11) — line-number inclusion in rustfmt location messages
+/// # AD-LINT-17 (2026-04-11) — line-number inclusion in rustfmt location messages
 ///
 /// The Tier-1 parse extracts the exact line number from the `Diff in <path> at
 /// line <N>:` header and embeds it in the message string as
@@ -127,7 +199,7 @@ fn try_parse_structured(text: &str) -> Option<LintResult> {
 }
 
 // ============================================================================
-// Tier 2: unified diff header fallback
+// Tier 2: unified diff header fallback (check mode)
 // ============================================================================
 
 /// Parse unified diff `--- <path>` headers as a fallback.
@@ -170,13 +242,11 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 mod tests {
     use super::*;
 
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/lint");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::lint::load_lint_fixture as load_fixture;
+
+    // -------------------------------------------------------------------------
+    // Check mode tests (existing, unchanged)
+    // -------------------------------------------------------------------------
 
     #[test]
     fn test_tier1_rustfmt_pass() {
@@ -186,7 +256,7 @@ mod tests {
             exit_code: Some(0),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse_impl(&output);
+        let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
             "Expected Full result for clean pass, got {}",
@@ -258,7 +328,7 @@ mod tests {
             exit_code: Some(1),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse_impl(&output);
+        let result = parse_check_impl(&output);
         assert!(
             result.is_full(),
             "Expected Full parse result, got {}",
@@ -274,7 +344,7 @@ mod tests {
             exit_code: Some(1),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse_impl(&output);
+        let result = parse_check_impl(&output);
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
@@ -292,10 +362,106 @@ mod tests {
             exit_code: Some(1),
             duration: std::time::Duration::ZERO,
         };
-        let result = parse_impl(&output);
+        let result = parse_check_impl(&output);
         assert!(
             result.is_degraded(),
             "Expected Degraded parse result, got {}",
+            result.tier_name()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Format mode tests (AD-LINT-20, AD-LINT-26)
+    // -------------------------------------------------------------------------
+
+    /// AD-LINT-26: bare invocation (no args) must default to check mode, not format.
+    /// Bare `skim lint rustfmt` must never rewrite files without an explicit flag.
+    #[test]
+    fn test_is_format_mode_bare_args_is_false() {
+        let args: Vec<String> = vec![];
+        assert!(
+            !is_format_mode(&args),
+            "No args (bare rustfmt) must be check mode — safe default"
+        );
+    }
+
+    /// AD-LINT-26: file-only args (no format flag) must also default to check mode.
+    #[test]
+    fn test_is_format_mode_with_files_only_is_false() {
+        let args: Vec<String> = vec!["src/main.rs".to_string()];
+        assert!(
+            !is_format_mode(&args),
+            "File-only args without --format/-f must be check mode"
+        );
+    }
+
+    /// AD-LINT-26: --check flag keeps check mode.
+    #[test]
+    fn test_is_format_mode_false_when_check_present() {
+        let args: Vec<String> = vec!["--check".to_string(), "src/main.rs".to_string()];
+        assert!(!is_format_mode(&args));
+    }
+
+    /// AD-LINT-26: --format flag is the explicit opt-in for format mode.
+    #[test]
+    fn test_is_format_mode_true_with_format_flag() {
+        let args: Vec<String> = vec!["--format".to_string(), "src/main.rs".to_string()];
+        assert!(
+            is_format_mode(&args),
+            "--format flag must activate format mode"
+        );
+    }
+
+    /// AD-LINT-26: -f short flag is the explicit opt-in for format mode.
+    #[test]
+    fn test_is_format_mode_true_with_short_flag() {
+        let args: Vec<String> = vec!["-f".to_string(), "src/main.rs".to_string()];
+        assert!(
+            is_format_mode(&args),
+            "-f short flag must activate format mode"
+        );
+    }
+
+    /// AD-LINT-20: empty output on exit 0 = successful format run.
+    #[test]
+    fn test_rustfmt_format_empty_output_is_pass() {
+        let output = CommandOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_format_impl(&output);
+        assert!(
+            result.is_full(),
+            "Expected Full for empty output on exit 0, got {}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(r) = result {
+            assert!(r.as_ref().contains("LINT OK"));
+            assert!(
+                r.as_ref().contains("files formatted"),
+                "Expected format-mode render, got: {}",
+                r.as_ref()
+            );
+            assert_eq!(r.files_formatted, Some(0));
+        }
+    }
+
+    /// AD-LINT-20: non-zero exit = syntax error → passthrough.
+    #[test]
+    fn test_rustfmt_format_error_is_passthrough() {
+        let output = CommandOutput {
+            stdout: String::new(),
+            stderr: "error[E0001]: unexpected token `}` in format string\n --> src/main.rs:5:1"
+                .to_string(),
+            exit_code: Some(1),
+            duration: std::time::Duration::ZERO,
+        };
+        let result = parse_format_impl(&output);
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough for error exit, got {}",
             result.tier_name()
         );
     }

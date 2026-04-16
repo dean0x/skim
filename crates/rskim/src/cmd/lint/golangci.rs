@@ -31,19 +31,9 @@ static RE_GOLANGCI_LINE: LazyLock<Regex> =
 /// Run `skim lint golangci [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Ensure "run" subcommand is present and inject `--out-format json`.
@@ -184,7 +174,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 /// Infer `LintSeverity` from message text and linter name when no explicit
 /// severity field is available (Tier-2 text format).
 ///
-/// # AD-16 (2026-04-11) — severity inference for golangci-lint text output
+/// # AD-LINT-16 (2026-04-11) — severity inference for golangci-lint text output
 ///
 /// golangci-lint's default text format does not include a severity field; the
 /// JSON format does.  In Tier-2 (text), we heuristically infer severity so that
@@ -215,13 +205,7 @@ fn infer_severity_from_text(message: &str, linter: &str) -> LintSeverity {
 mod tests {
     use super::*;
 
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/lint");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::lint::load_lint_fixture as load_fixture;
 
     #[test]
     fn test_tier1_golangci_fail() {

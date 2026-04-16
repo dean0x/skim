@@ -49,7 +49,7 @@ static RE_LOG_LEVEL_BARE: LazyLock<Regex> =
 
 /// Matches Java/Node.js/Python stack trace lines.
 ///
-/// # AD-10 (2026-04-11) — Multi-language stack trace patterns
+/// # AD-LOG-10 (2026-04-11) — Multi-language stack trace patterns
 /// - Java/Node.js: `    at <method>` (leading whitespace + "at ")
 /// - Python: `  File "...", line N` (leading whitespace + 'File "')
 ///
@@ -350,7 +350,7 @@ fn extract_json_message(obj: &Value) -> Option<String> {
 
 /// Parse regex-based log formats into a LogResult.
 ///
-/// # AD-10 (2026-04-11) — Stack trace capture and last-3-frame elision
+/// # AD-LOG-10 (2026-04-11) — Stack trace capture and last-3-frame elision
 /// Stack trace lines (Java `at …`, Python `File "…"`) are buffered in
 /// `pending_stack`. When the next log line is encountered, the accumulated
 /// frames are attached to the previous entry's message:
@@ -366,7 +366,7 @@ fn try_parse_regex_logs(input: &str, flags: &LogFlags) -> Option<LogResult> {
     let mut all_entries: Vec<(Option<String>, String)> = Vec::with_capacity(256);
     let mut total_lines = 0usize;
     let mut found_structured = false;
-    // Stack trace capture state (AD-10)
+    // Stack trace capture state (AD-LOG-10)
     let mut pending_stack: Vec<String> = Vec::new();
     let mut total_stack_frames_elided: usize = 0;
 
@@ -529,7 +529,7 @@ fn filter_debug_entries(
 
 /// Deduplicate entries by level-aware normalized key, incrementing count on collision.
 ///
-/// # AD-10 (2026-04-11) — Level-aware dedup
+/// # AD-LOG-10 (2026-04-11) — Level-aware dedup
 /// The dedup key is `"{level}|{normalized_message}"` rather than just the
 /// normalized message. Previously an ERROR and a WARN with the same text were
 /// merged into a single entry, losing the level distinction. With level-aware
@@ -548,7 +548,7 @@ fn deduplicate_entries(entries: Vec<(Option<String>, String)>, no_dedup: bool) -
     let mut key_buf = String::with_capacity(128);
 
     for (level, message) in entries {
-        // AD-10: key includes level so ERROR+WARN with same text are NOT merged.
+        // AD-LOG-10: key includes level so ERROR+WARN with same text are NOT merged.
         // Build the key in-place to avoid the two-allocation format!() pattern
         // (to_lowercase() intermediate + format! output).
         key_buf.clear();
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_stack_trace_lines_attached_to_entry() {
-        // AD-10: stack trace lines are now attached to the preceding entry, not skipped.
+        // AD-LOG-10: stack trace lines are now attached to the preceding entry, not skipped.
         let input = "ERROR: something failed\n    at main() line 5\n    at run() line 10\nINFO: continuing\n";
         let flags = make_flags();
         let result = try_parse_regex_logs(input, &flags).unwrap();
@@ -857,7 +857,7 @@ mod tests {
         );
     }
 
-    /// AD-10: ERROR and WARN entries with the same text must NOT merge.
+    /// AD-LOG-10: ERROR and WARN entries with the same text must NOT merge.
     #[test]
     fn test_log_dedup_preserves_level() {
         let input = load_fixture("dedup_error_warn.txt");
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(warn.count, 2, "WARN must appear ×2");
     }
 
-    /// AD-10: 5-frame Java trace → last 3 kept, 2 elided.
+    /// AD-LOG-10: 5-frame Java trace → last 3 kept, 2 elided.
     #[test]
     fn test_log_stack_elision_keeps_last_3() {
         let input = load_fixture("stack_trace_java.txt");
@@ -919,7 +919,7 @@ mod tests {
         );
     }
 
-    /// AD-10: elided count renders in the footer when non-zero.
+    /// AD-LOG-10: elided count renders in the footer when non-zero.
     #[test]
     fn test_log_stack_elision_footer() {
         let input = load_fixture("stack_trace_java.txt");
@@ -934,7 +934,7 @@ mod tests {
         );
     }
 
-    /// AD-10: Python `File "..."` stack traces are recognised.
+    /// AD-LOG-10: Python `File "..."` stack traces are recognised.
     #[test]
     fn test_log_python_traceback_recognised() {
         let input = load_fixture("stack_trace_python.txt");

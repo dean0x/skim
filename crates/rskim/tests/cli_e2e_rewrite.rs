@@ -717,6 +717,24 @@ fn test_rewrite_ruff_bare() {
 }
 
 #[test]
+fn test_rewrite_ruff_format() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "format", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff"));
+}
+
+#[test]
+fn test_rewrite_ruff_format_check() {
+    skim_cmd()
+        .args(["rewrite", "ruff", "format", "--check", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint ruff"));
+}
+
+#[test]
 fn test_rewrite_mypy() {
     skim_cmd()
         .args(["rewrite", "mypy", "."])
@@ -924,7 +942,7 @@ fn test_rewrite_pip3_list() {
 // Phase 8: Wave B rewrite rules (#116)
 // ============================================================================
 
-/// AD-11: `prettier --check` is acknowledged as already-compact.
+/// AD-RW-11: `prettier --check` is acknowledged as already-compact.
 /// The original command is echoed on stdout (exit 0) rather than being
 /// rewritten to `skim lint prettier`, per the compress-or-skip rule.
 #[test]
@@ -936,7 +954,25 @@ fn test_rewrite_prettier_check_acknowledged() {
         .stdout(predicate::str::contains("prettier --check"));
 }
 
-/// AD-11: `rustfmt --check` is acknowledged as already-compact.
+#[test]
+fn test_rewrite_prettier_write() {
+    skim_cmd()
+        .args(["rewrite", "prettier", "--write", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint prettier"));
+}
+
+#[test]
+fn test_rewrite_npx_prettier_write() {
+    skim_cmd()
+        .args(["rewrite", "npx", "prettier", "--write", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint prettier"));
+}
+
+/// AD-RW-11: `rustfmt --check` is acknowledged as already-compact.
 /// The original command is echoed on stdout rather than being
 /// rewritten to `skim lint rustfmt`.
 #[test]
@@ -1277,4 +1313,158 @@ fn test_rewrite_gh_run_view_log_failed_skipped() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// New lint rewrite rules: black, gofmt, biome, dprint, oxlint (#133)
+// ============================================================================
+
+#[test]
+fn test_rewrite_black_check() {
+    skim_cmd()
+        .args(["rewrite", "black", "--check", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint black"));
+}
+
+#[test]
+fn test_rewrite_black_bare() {
+    skim_cmd()
+        .args(["rewrite", "black", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint black"));
+}
+
+#[test]
+fn test_rewrite_black_diff_skipped() {
+    skim_cmd()
+        .args(["rewrite", "--suggest", "black", "--diff", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_gofmt_l() {
+    skim_cmd()
+        .args(["rewrite", "gofmt", "-l", "./..."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint gofmt"));
+}
+
+#[test]
+fn test_rewrite_gofmt_bare() {
+    skim_cmd()
+        .args(["rewrite", "gofmt", "cmd/server.go"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint gofmt"));
+}
+
+#[test]
+fn test_rewrite_gofmt_write_skipped() {
+    skim_cmd()
+        .args(["rewrite", "--suggest", "gofmt", "-w", "./..."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_biome_check() {
+    skim_cmd()
+        .args(["rewrite", "biome", "check", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint biome"));
+}
+
+#[test]
+fn test_rewrite_biome_check_reporter_skipped() {
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "biome",
+            "check",
+            "--reporter=github",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_biome_format() {
+    skim_cmd()
+        .args(["rewrite", "biome", "format", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint biome"));
+}
+
+#[test]
+fn test_rewrite_npx_biome_check() {
+    skim_cmd()
+        .args(["rewrite", "npx", "biome", "check", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint biome"));
+}
+
+#[test]
+fn test_rewrite_dprint_check() {
+    skim_cmd()
+        .args(["rewrite", "dprint", "check"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint dprint"));
+}
+
+#[test]
+fn test_rewrite_dprint_fmt() {
+    skim_cmd()
+        .args(["rewrite", "dprint", "fmt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint dprint"));
+}
+
+#[test]
+fn test_rewrite_dprint_bare() {
+    skim_cmd()
+        .args(["rewrite", "dprint"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint dprint"));
+}
+
+#[test]
+fn test_rewrite_oxlint() {
+    skim_cmd()
+        .args(["rewrite", "oxlint", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint oxlint"));
+}
+
+#[test]
+fn test_rewrite_oxlint_format_skipped() {
+    skim_cmd()
+        .args(["rewrite", "--suggest", "oxlint", "--format=github"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_npx_oxlint() {
+    skim_cmd()
+        .args(["rewrite", "npx", "oxlint", "src/"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim lint oxlint"));
 }

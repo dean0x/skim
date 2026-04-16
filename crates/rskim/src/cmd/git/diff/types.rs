@@ -5,7 +5,7 @@ use crate::output::canonical::DiffFileStatus;
 
 /// A single hunk from a unified diff.
 ///
-/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` to match
+/// DESIGN NOTE (AD-GIT-6): visibility widened to `pub(in crate::cmd::git)` to match
 /// `FileDiff` (below). `show.rs` accesses hunks transitively through `FileDiff::hunks`
 /// (not by referencing `DiffHunk` directly) when iterating `FileDiff` entries returned
 /// by `parse_unified_diff`. Widening is required at the field level so that `show.rs`
@@ -29,7 +29,7 @@ pub(in crate::cmd::git) struct DiffHunk<'a> {
 
 /// Parsed representation of a single file in a unified diff.
 ///
-/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` so that
+/// DESIGN NOTE (AD-GIT-6): visibility widened to `pub(in crate::cmd::git)` so that
 /// `show.rs` can iterate over `FileDiff` entries returned by `parse_unified_diff`
 /// without requiring a parallel data model in the show handler.
 #[derive(Debug, Clone)]

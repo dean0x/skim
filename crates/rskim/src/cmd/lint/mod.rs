@@ -1,11 +1,17 @@
-//! Lint subcommand dispatcher (#104, #116)
+//! Lint subcommand dispatcher (#104, #116, #133)
 //!
 //! Routes `skim lint <linter> [args...]` to the appropriate linter parser.
-//! Currently supported linters: `eslint`, `golangci`, `mypy`, `prettier`, `ruff`, `rustfmt`.
+//! Currently supported linters: `biome`, `black`, `dprint`, `eslint`, `gofmt`,
+//! `golangci`, `mypy`, `oxlint`, `prettier`, `ruff`, `rustfmt`.
 
+pub(crate) mod biome;
+pub(crate) mod black;
+pub(crate) mod dprint;
 pub(crate) mod eslint;
+pub(crate) mod gofmt;
 pub(crate) mod golangci;
 pub(crate) mod mypy;
+pub(crate) mod oxlint;
 pub(crate) mod prettier;
 pub(crate) mod ruff;
 pub(crate) mod rustfmt;
@@ -14,13 +20,16 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
+use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known linters that `skim lint` can dispatch to.
-const KNOWN_LINTERS: &[&str] = &["eslint", "golangci", "mypy", "prettier", "ruff", "rustfmt"];
+const KNOWN_LINTERS: &[&str] = &[
+    "biome", "black", "dprint", "eslint", "gofmt", "golangci", "mypy", "oxlint", "prettier",
+    "ruff", "rustfmt",
+];
 
 /// Entry point for `skim lint <linter> [args...]`.
 ///
@@ -44,15 +53,24 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let analytics_enabled = analytics.enabled;
+    let ctx = super::RunContext {
+        show_stats,
+        json_output,
+        analytics_enabled: analytics.enabled,
+    };
 
     match linter_name.as_str() {
-        "eslint" => eslint::run(linter_args, show_stats, json_output, analytics_enabled),
-        "golangci" => golangci::run(linter_args, show_stats, json_output, analytics_enabled),
-        "mypy" => mypy::run(linter_args, show_stats, json_output, analytics_enabled),
-        "prettier" => prettier::run(linter_args, show_stats, json_output, analytics_enabled),
-        "ruff" => ruff::run(linter_args, show_stats, json_output, analytics_enabled),
-        "rustfmt" => rustfmt::run(linter_args, show_stats, json_output, analytics_enabled),
+        "biome" => biome::run(linter_args, &ctx),
+        "black" => black::run(linter_args, &ctx),
+        "dprint" => dprint::run(linter_args, &ctx),
+        "eslint" => eslint::run(linter_args, &ctx),
+        "gofmt" => gofmt::run(linter_args, &ctx),
+        "golangci" => golangci::run(linter_args, &ctx),
+        "mypy" => mypy::run(linter_args, &ctx),
+        "oxlint" => oxlint::run(linter_args, &ctx),
+        "prettier" => prettier::run(linter_args, &ctx),
+        "ruff" => ruff::run(linter_args, &ctx),
+        "rustfmt" => rustfmt::run(linter_args, &ctx),
         linter => {
             let safe_linter = crate::cmd::sanitize_for_display(linter);
             eprintln!(
@@ -81,9 +99,14 @@ fn print_help() {
     println!("  --show-stats    Show token statistics");
     println!();
     println!("Examples:");
+    println!("  skim lint biome check .        Run biome check");
+    println!("  skim lint black src/           Run black --check");
+    println!("  skim lint dprint check .       Run dprint check");
     println!("  skim lint eslint .             Run eslint");
+    println!("  skim lint gofmt ./...          Run gofmt -l");
     println!("  skim lint golangci run ./...   Run golangci-lint");
     println!("  skim lint mypy src/            Run mypy");
+    println!("  skim lint oxlint src/          Run oxlint");
     println!("  skim lint prettier .           Run prettier --check");
     println!("  skim lint ruff check .         Run ruff check");
     println!("  skim lint rustfmt src/         Run rustfmt --check");
@@ -114,16 +137,13 @@ pub(crate) struct LinterConfig<'a> {
 ///
 /// - `config`: static linter metadata (program name, env vars, install hint)
 /// - `args`: raw user args (before prepare_args)
-/// - `show_stats`: whether to report token statistics
-/// - `json_output`: whether to emit JSON instead of text
+/// - `ctx`: cross-cutting flags (show_stats, json_output, analytics_enabled)
 /// - `prepare_args`: closure to inject linter-specific flags (e.g., `--format json`)
 /// - `parse_fn`: linter-specific three-tier parse function
 pub(crate) fn run_linter(
     config: LinterConfig<'_>,
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &super::RunContext,
     prepare_args: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<LintResult>,
 ) -> anyhow::Result<ExitCode> {
@@ -131,11 +151,6 @@ pub(crate) fn run_linter(
     prepare_args(&mut cmd_args);
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-    let output_format = if json_output {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Text
-    };
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
@@ -144,10 +159,11 @@ pub(crate) fn run_linter(
             env_overrides: config.env_overrides,
             install_hint: config.install_hint,
             use_stdin,
-            show_stats,
+            show_stats: ctx.show_stats,
             command_type: crate::analytics::CommandType::Lint,
-            output_format,
-            analytics_enabled,
+            output_format: ctx.output_format(),
+            analytics_enabled: ctx.analytics_enabled,
+            family: "lint",
         },
         |output, _args| parse_fn(output),
     )
@@ -187,6 +203,20 @@ pub(crate) fn group_issues(tool: &str, issues: Vec<LintIssue>) -> LintResult {
         warnings,
         groups.into_values().collect(),
     )
+}
+
+// ============================================================================
+// Shared test helpers
+// ============================================================================
+
+/// Shared fixture loader for lint parser unit tests.
+#[cfg(test)]
+pub(crate) fn load_lint_fixture(name: &str) -> String {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cmd/lint")
+        .join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
 }
 
 // ============================================================================

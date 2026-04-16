@@ -43,20 +43,10 @@ static RE_CURL_VERBOSE_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[*
 /// Run `skim infra curl [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for curl — flags are too varied
-    run_infra_tool(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        |_| {},
-        parse_impl,
-    )
+    run_infra_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for curl output.

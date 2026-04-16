@@ -12,7 +12,7 @@
 //! PR-only fields. We call [`issue_view::try_parse_json`] for the common
 //! items, then overlay the PR-specific items rather than duplicating code.
 //!
-//! # AD-9 (2026-04-11) — Always-render draft/mergeable/CI
+//! # AD-INFRA-9 (2026-04-11) — Always-render draft/mergeable/CI
 //!
 //! `draft`, `mergeable`, and `ci` items are rendered **always**, not only
 //! when blocking, so agents can observe the full merge-readiness signal set
@@ -34,7 +34,7 @@ use super::{
 /// JSON fields to inject for `gh pr view`.
 ///
 /// Superset of issue view fields with PR-specific additions.
-/// Includes `isDraft`, `mergeable`, and `statusCheckRollup` for AD-9 always-render.
+/// Includes `isDraft`, `mergeable`, and `statusCheckRollup` for AD-INFRA-9 always-render.
 const PR_VIEW_FIELDS: &str =
     "number,title,state,body,labels,assignees,author,headRefName,baseRefName,additions,deletions,changedFiles,comments,isDraft,mergeable,statusCheckRollup";
 
@@ -87,7 +87,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         .unwrap_or("")
         .to_lowercase();
 
-    // AD-9: Prefix summary with [DRAFT] when isDraft is true.
+    // AD-INFRA-9: Prefix summary with [DRAFT] when isDraft is true.
     let is_draft = obj
         .get("isDraft")
         .and_then(|v| v.as_bool())
@@ -124,7 +124,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         value: format!("+{additions} -{deletions} ({changed_files} files)"),
     });
 
-    // AD-9: Always-render draft, mergeable, and CI status items.
+    // AD-INFRA-9: Always-render draft, mergeable, and CI status items.
 
     // draft: always true or false
     items.push(InfraItem {
@@ -167,7 +167,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
 
 /// Aggregate `statusCheckRollup` into a single CI status string.
 ///
-/// # AD-9 (2026-04-11) — CI aggregation hierarchy
+/// # AD-INFRA-9 (2026-04-11) — CI aggregation hierarchy
 /// Deterministic: FAILURE|CANCELLED|TIMED_OUT wins over PENDING|QUEUED|IN_PROGRESS
 /// wins over SUCCESS. Returns `"none"` when the field is null, absent, or empty.
 fn aggregate_ci_status(obj: &serde_json::Value) -> String {
@@ -299,7 +299,7 @@ mod tests {
     }
 
     // ========================================================================
-    // AD-9: draft/mergeable/CI always-render tests
+    // AD-INFRA-9: draft/mergeable/CI always-render tests
     // ========================================================================
 
     #[test]

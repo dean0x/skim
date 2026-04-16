@@ -202,7 +202,7 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
     let mut low: usize = 0;
     let mut details: Vec<String> = Vec::new();
 
-    // AD-18 (2026-04-11): advisory ID extraction mirrors `cargo audit` (see npm/audit.rs).
+    // AD-PKG-18 (2026-04-11): advisory ID extraction mirrors `cargo audit` (see npm/audit.rs).
     // The pnpm audit JSON object key IS the advisory ID — it may be a GHSA string
     // (e.g. "GHSA-1234-abcd-xyz0") or a numeric string (e.g. "1234").
     // We use the key directly as the ID without transformation so that both forms
@@ -435,7 +435,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Advisory ID extraction tests (AD-18, 2026-04-11)
+    // Advisory ID extraction tests (AD-PKG-18, 2026-04-11)
     // ========================================================================
 
     #[test]

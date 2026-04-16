@@ -26,19 +26,9 @@ const CONFIG: FileToolConfig<'static> = FileToolConfig {
 /// Run `skim file rg [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_file_tool(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    run_file_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--json` unless user has conflicting flags.

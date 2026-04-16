@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use std::collections::BTreeMap;
 
-use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
+use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
 use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -48,20 +48,18 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let analytics_enabled = analytics.enabled;
+    let ctx = super::RunContext {
+        show_stats,
+        json_output,
+        analytics_enabled: analytics.enabled,
+    };
 
     match tool_name.as_str() {
-        "find" => find::run(tool_args, show_stats, json_output, analytics_enabled),
-        "grep" => grep::run(tool_args, show_stats, json_output, analytics_enabled),
-        "ls" => ls::run(tool_args, show_stats, json_output, "ls", analytics_enabled),
-        "rg" => rg::run(tool_args, show_stats, json_output, analytics_enabled),
-        "tree" => ls::run(
-            tool_args,
-            show_stats,
-            json_output,
-            "tree",
-            analytics_enabled,
-        ),
+        "find" => find::run(tool_args, &ctx),
+        "grep" => grep::run(tool_args, &ctx),
+        "ls" => ls::run(tool_args, &ctx, "ls"),
+        "rg" => rg::run(tool_args, &ctx),
+        "tree" => ls::run(tool_args, &ctx, "tree"),
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(
@@ -117,9 +115,7 @@ pub(crate) struct FileToolConfig<'a> {
 pub(crate) fn run_file_tool(
     config: FileToolConfig<'_>,
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &super::RunContext,
     prepare_args: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<FileResult>,
 ) -> anyhow::Result<ExitCode> {
@@ -127,11 +123,6 @@ pub(crate) fn run_file_tool(
     prepare_args(&mut cmd_args);
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-    let output_format = if json_output {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Text
-    };
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
@@ -140,10 +131,11 @@ pub(crate) fn run_file_tool(
             env_overrides: config.env_overrides,
             install_hint: config.install_hint,
             use_stdin,
-            show_stats,
+            show_stats: ctx.show_stats,
             command_type: crate::analytics::CommandType::FileOps,
-            output_format,
-            analytics_enabled,
+            output_format: ctx.output_format(),
+            analytics_enabled: ctx.analytics_enabled,
+            family: "file",
         },
         |output, _args| parse_fn(output),
     )

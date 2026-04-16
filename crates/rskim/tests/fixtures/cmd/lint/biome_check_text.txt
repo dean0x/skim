@@ -1,0 +1,8 @@
+// Generated from biome v1.7.0 on 2026-04-15
+src/app.ts:10:5 lint/suspicious/noDoubleEquals ━━━━━━━━━━━━━━━━━━━━━━━━
+  ✖ Use === instead of ==
+
+src/utils.ts:3:1 lint/style/useConst ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ⚠ Use const instead of let
+
+Checked 5 files in 120ms. Found 2 errors and 0 warnings.

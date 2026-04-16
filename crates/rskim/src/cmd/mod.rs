@@ -154,6 +154,28 @@ pub(crate) enum OutputFormat {
     Json,
 }
 
+/// Cross-cutting configuration for subcommand execution.
+///
+/// Bundles the three boolean flags that every family dispatcher receives
+/// identically, reducing the 4-parameter `(args, show_stats, json_output,
+/// analytics_enabled)` signature to `(args, ctx)` at every call boundary.
+pub(crate) struct RunContext {
+    pub show_stats: bool,
+    pub json_output: bool,
+    pub analytics_enabled: bool,
+}
+
+impl RunContext {
+    /// Convert `json_output` to the corresponding [`OutputFormat`].
+    pub(crate) fn output_format(&self) -> OutputFormat {
+        if self.json_output {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Text
+        }
+    }
+}
+
 /// Configuration for running an external command with parsed output.
 ///
 /// Groups the cross-cutting parameters for [`run_parsed_command_with_mode`]
@@ -168,6 +190,13 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub command_type: crate::analytics::CommandType,
     pub output_format: OutputFormat,
     pub analytics_enabled: bool,
+    /// Family name used to build analytics labels (e.g. `"lint"`, `"infra"`, `"file"`).
+    ///
+    /// Analytics labels are recorded as `"skim {family} {program} {args}"`. Without
+    /// this field the label was `"skim {program} {args}"`, which dropped the family
+    /// name and made the analytics dashboard ambiguous when multiple families share
+    /// tool names (e.g., `cargo` appears in both `build` and `pkg`). (PF-022)
+    pub family: &'a str,
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -204,6 +233,7 @@ where
         command_type,
         output_format,
         analytics_enabled,
+        family,
     } = config;
 
     let output = if use_stdin {
@@ -289,7 +319,7 @@ where
         analytics_enabled,
         output.stdout,
         compressed,
-        format!("skim {program} {}", args.join(" ")),
+        format!("skim {family} {program} {}", args.join(" ")),
         command_type,
         output.duration,
         Some(result.tier_name()),

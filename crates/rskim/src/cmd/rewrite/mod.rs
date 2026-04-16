@@ -16,7 +16,7 @@
 //! matched, and emits agent-specific hook-protocol JSON. Each agent's
 //! `format_response()` controls the response shape — see `hooks/` module.
 //!
-//! **Tri-state classification** (`classify_command`, AD-2): Exposes a richer
+//! **Tri-state classification** (`classify_command`, AD-RW-2): Exposes a richer
 //! API used by `discover` to distinguish between commands that are genuinely
 //! rewritten, commands whose output is already compact (acknowledged), and
 //! commands that are true compression gaps.
@@ -47,7 +47,7 @@ pub(super) use suggest::command;
 // Public API for other modules
 // ============================================================================
 
-/// Tri-state classification of a shell command (AD-2).
+/// Tri-state classification of a shell command (AD-RW-2).
 ///
 /// Used by `discover` and the `rewrite` CLI to distinguish genuine compression
 /// gaps from already-optimal commands.
@@ -67,7 +67,7 @@ pub(crate) enum CommandClassification {
 /// Returns `Unhandled` for empty input, already-skim commands, and bail
 /// cases (heredocs, subshells, backticks).
 ///
-/// # AD-3 CLI behavior
+/// # AD-RW-3 CLI behavior
 /// The `rewrite` CLI maps:
 /// - `Rewritten(s)` → print `s`, exit 0
 /// - `AlreadyCompact` → print original command, exit 0
@@ -104,7 +104,7 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
 /// `None` if no rewrite applies (including skim commands, empty input,
 /// unsupported shell syntax, and acknowledged-compact commands).
 ///
-/// # Mixed-compound semantics (AD-2 / regression-2)
+/// # Mixed-compound semantics (AD-RW-2 / regression-2)
 ///
 /// For compound commands containing a segment with no match, this function
 /// returns `None` — even if other segments would rewrite successfully.
@@ -190,7 +190,7 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
 
 /// Classify a compound command (segments connected by `&&`, `||`, `;`, `|`).
 ///
-/// Rules (per AD-2):
+/// Rules (per AD-RW-2):
 /// - Any `NoMatch` segment → `Unhandled` (a compression gap exists).
 /// - All `AlreadyCompact` → `AlreadyCompact`.
 /// - Mix of `Rewritten` + `AlreadyCompact` → `Rewritten(reconstructed)`.
@@ -318,7 +318,7 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
 
 /// Run the `rewrite` subcommand. Returns the process exit code.
 ///
-/// Exit code semantics (AD-3):
+/// Exit code semantics (AD-RW-3):
 /// - 0: rewrite found (printed to stdout), or AlreadyCompact (original printed to stdout)
 /// - 1: no rewrite match (Unhandled) or invalid input
 ///
@@ -362,7 +362,7 @@ pub(crate) fn run(
 /// Returns `Ok(None)` when there is nothing to classify (empty input or
 /// interactive stdin), and `Ok(Some(tokens))` otherwise.
 ///
-/// # Design decision (2026-04-11, AD-13)
+/// # Design decision (2026-04-11, AD-RW-13)
 /// Positional args are flattened via `split_whitespace` so that both shell
 /// invocation shapes produce the same token sequence:
 ///
@@ -428,7 +428,7 @@ fn collect_input_tokens(positional_args: &[&str]) -> anyhow::Result<Option<Vec<S
 ///    command or exits 1. A third "AlreadyCompact" state would change the
 ///    contract for users who rely on exit codes in shell scripts.
 /// 2. **`classify_command` is discover-only**: it was introduced to give
-///    `discover` fine-grained gap detection (AD-2). Its `AlreadyCompact`
+///    `discover` fine-grained gap detection (AD-RW-2). Its `AlreadyCompact`
 ///    variant has no meaningful mapping to CLI exit codes.
 ///
 /// If the CLI contract is ever extended (e.g. exit code 2 for AlreadyCompact),
@@ -438,18 +438,18 @@ fn run_classify_and_emit(suggest_mode: bool, tokens: &[String]) -> anyhow::Resul
     let original = tokens.join(" ");
 
     // Fast path: if no compound operator chars are present, use classify_command
-    // which also handles the AlreadyCompact case (AD-3).
+    // which also handles the AlreadyCompact case (AD-RW-3).
     if !has_compound_operators(&original) {
         let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
 
-        // Check AlreadyCompact first (acknowledged-compact commands, AD-2/AD-3).
+        // Check AlreadyCompact first (acknowledged-compact commands, AD-RW-2/AD-RW-3).
         if is_segment_ack(&token_refs) {
             if suggest_mode {
                 // AlreadyCompact is not a rewrite match — report as no-match in suggest.
                 print_suggest(&original, None, false);
                 return Ok(ExitCode::SUCCESS);
             }
-            // AD-3: print original command unchanged, exit 0.
+            // AD-RW-3: print original command unchanged, exit 0.
             println!("{original}");
             return Ok(ExitCode::SUCCESS);
         }
@@ -519,7 +519,7 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // classify_command() — tri-state API tests (AD-2)
+    // classify_command() — tri-state API tests (AD-RW-2)
     // ========================================================================
 
     #[test]
@@ -709,7 +709,7 @@ mod tests {
         );
     }
 
-    /// `git diff --stat` now rewrites (--stat removed from skip list per AD-4).
+    /// `git diff --stat` now rewrites (--stat removed from skip list per AD-RW-4).
     /// The diff handler detects --stat via user_has_flag and calls run_passthrough,
     /// so the user sees byte-identical git output.
     #[test]
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(
             result,
             Some("skim git diff --stat".to_string()),
-            "git diff --stat must rewrite after AD-4 skip-list trim"
+            "git diff --stat must rewrite after AD-RW-4 skip-list trim"
         );
     }
 
@@ -751,7 +751,7 @@ mod tests {
         );
     }
 
-    /// Regression test for mixed-compound semantics (regression-2 / AD-2).
+    /// Regression test for mixed-compound semantics (regression-2 / AD-RW-2).
     ///
     /// `would_rewrite` wraps `classify_command`, which returns `Unhandled` when
     /// ANY segment of a compound command has no match.  A compound like
@@ -873,7 +873,7 @@ mod tests {
     }
 
     // ========================================================================
-    // collect_input_tokens() — edge-case coverage (AD-13)
+    // collect_input_tokens() — edge-case coverage (AD-RW-13)
     // ========================================================================
 
     /// Helper: invoke collect_input_tokens with a set of &str positional args.
@@ -904,7 +904,7 @@ mod tests {
 
     /// Single multi-word quoted arg tokenizes the same as equivalent multi-arg form.
     ///
-    /// Regression for the AD-13 fix: `skim rewrite 'prettier --check src/'`
+    /// Regression for the AD-RW-13 fix: `skim rewrite 'prettier --check src/'`
     /// (shell passes one arg) must tokenize identically to
     /// `skim rewrite prettier --check src/` (three separate args).
     #[test]

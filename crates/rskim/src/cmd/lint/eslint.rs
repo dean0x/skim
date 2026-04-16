@@ -30,25 +30,19 @@ static RE_ESLINT_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s+(\d+):\d+\s+(error|warning)\s+(.+?)\s{2,}(\S+)\s*$").unwrap()
 });
 
+/// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: `.+` replaces `[^\s]+` so that
+/// paths with spaces (e.g., `/home/user/my project/src/auth handler.ts`) are captured.
+/// `.+\S` requires the path ends with a non-whitespace character, preventing
+/// over-matching of lines with trailing whitespace (mirrors `RE_PRETTIER_WARN`).
 static RE_ESLINT_FILE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(/[^\s]+|[A-Z]:\\[^\s]+)$").unwrap());
+    LazyLock::new(|| Regex::new(r"^(/.+\S|[A-Z]:\\.+\S)$").unwrap());
 
 /// Run `skim lint eslint [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--format json` if not already present.
@@ -191,13 +185,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 mod tests {
     use super::*;
 
-    fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/lint");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
+    use crate::cmd::lint::load_lint_fixture as load_fixture;
 
     #[test]
     fn test_tier1_eslint_pass() {
@@ -278,6 +266,30 @@ mod tests {
             result.is_passthrough(),
             "Expected Passthrough, got {}",
             result.tier_name()
+        );
+    }
+
+    /// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: file paths with spaces.
+    #[test]
+    fn test_tier2_eslint_spaces_in_path() {
+        let input = load_fixture("eslint_text_spaces.txt");
+        let result = try_parse_regex(&input);
+        assert!(
+            result.is_some(),
+            "Expected Tier 2 regex parse to succeed on space-containing paths"
+        );
+        let result = result.unwrap();
+        assert_eq!(result.errors, 2, "Expected 2 errors");
+        assert_eq!(result.warnings, 2, "Expected 2 warnings");
+        // Verify the full path with spaces was captured
+        let all_locs: Vec<&str> = result
+            .groups
+            .iter()
+            .flat_map(|g| g.locations.iter().map(|l| l.as_str()))
+            .collect();
+        assert!(
+            all_locs.iter().any(|l| l.contains("auth handler.ts")),
+            "Expected location to contain 'auth handler.ts', got: {all_locs:?}"
         );
     }
 }

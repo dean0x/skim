@@ -1,0 +1,5 @@
+// Generated from black v24.3.0 on 2026-04-15
+reformatted src/main.py
+reformatted src/utils.py
+All done! ✨ 🍰 ✨
+2 files reformatted, 3 files left unchanged.

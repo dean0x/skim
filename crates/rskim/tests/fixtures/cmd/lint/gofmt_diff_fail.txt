@@ -1,0 +1,16 @@
+// Generated from gofmt (go1.22) on 2026-04-15
+diff -u cmd/server.go.orig cmd/server.go
+--- cmd/server.go.orig
++++ cmd/server.go
+@@ -10,6 +10,6 @@
+ func main() {
+-x:=1
++	x := 1
+ }
+diff -u internal/handler.go.orig internal/handler.go
+--- internal/handler.go.orig
++++ internal/handler.go
+@@ -5,4 +5,4 @@
+-if err!=nil{
++	if err != nil {
+ }
