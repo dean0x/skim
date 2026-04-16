@@ -106,6 +106,7 @@ where
             command_type: crate::analytics::CommandType::Pkg,
             output_format: crate::cmd::OutputFormat::default(),
             analytics_enabled,
+            family: "pkg",
         },
         |output, _args| parse_fn(output),
     )

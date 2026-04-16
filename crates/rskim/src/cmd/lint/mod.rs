@@ -169,6 +169,7 @@ pub(crate) fn run_linter(
             command_type: crate::analytics::CommandType::Lint,
             output_format,
             analytics_enabled: ctx.analytics_enabled,
+            family: "lint",
         },
         |output, _args| parse_fn(output),
     )

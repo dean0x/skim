@@ -140,6 +140,7 @@ pub(crate) fn run_file_tool(
             command_type: crate::analytics::CommandType::FileOps,
             output_format,
             analytics_enabled: ctx.analytics_enabled,
+            family: "file",
         },
         |output, _args| parse_fn(output),
     )

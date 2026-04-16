@@ -82,6 +82,7 @@ pub(crate) fn run(
             command_type: crate::analytics::CommandType::Test,
             output_format: OutputFormat::default(),
             analytics_enabled,
+            family: "test",
         },
         move |output, _args| parse_impl(output, is_nextest),
     )

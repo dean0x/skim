@@ -179,6 +179,13 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub command_type: crate::analytics::CommandType,
     pub output_format: OutputFormat,
     pub analytics_enabled: bool,
+    /// Family name used to build analytics labels (e.g. `"lint"`, `"infra"`, `"file"`).
+    ///
+    /// Analytics labels are recorded as `"skim {family} {program} {args}"`. Without
+    /// this field the label was `"skim {program} {args}"`, which dropped the family
+    /// name and made the analytics dashboard ambiguous when multiple families share
+    /// tool names (e.g., `cargo` appears in both `build` and `pkg`). (PF-022)
+    pub family: &'a str,
 }
 
 /// Execute an external command, parse its output, and emit the result.
@@ -215,6 +222,7 @@ where
         command_type,
         output_format,
         analytics_enabled,
+        family,
     } = config;
 
     let output = if use_stdin {
@@ -300,7 +308,7 @@ where
         analytics_enabled,
         output.stdout,
         compressed,
-        format!("skim {program} {}", args.join(" ")),
+        format!("skim {family} {program} {}", args.join(" ")),
         command_type,
         output.duration,
         Some(result.tier_name()),

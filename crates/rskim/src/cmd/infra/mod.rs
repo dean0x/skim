@@ -141,6 +141,7 @@ pub(crate) fn run_infra_tool(
             command_type: crate::analytics::CommandType::Infra,
             output_format,
             analytics_enabled: ctx.analytics_enabled,
+            family: "infra",
         },
         |output, _args| parse_fn(output),
     )
