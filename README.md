@@ -71,7 +71,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Extracts errors, warnings, and summaries
 
 ### Lint Output Compression (`skim lint`)
-- Parses ESLint, Ruff, mypy, golangci-lint output
+- Parses ESLint, Ruff, mypy, golangci-lint, prettier, rustfmt, biome, dprint, oxlint, black, gofmt output
 - Extracts errors and warnings with severity grouping
 - Three-tier degradation from structured parse to regex fallback to passthrough
 
@@ -588,7 +588,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.4.1 — Stable
+**Current**: v2.5.0 — Stable
 
 ✅ **Core — Code Reading (17 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
@@ -617,7 +617,7 @@ cargo bench
 
 ✅ **Distribution:**
 - cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
-- 2,482 tests passing, 14.6ms performance (3x under target)
+- 2,629 tests passing, 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-04-17
+
+Formatter output compression — 8 new parsers for code formatter tools. 2,629 tests passing (up from 2,482 in v2.4.1).
+
+### Added
+- **`skim lint` formatter support** — 8 new parsers: ruff format, prettier --write, rustfmt, black, gofmt, biome, dprint, oxlint
+- `LintResult.files_formatted` field to track formatted files separately from lint errors
+- Path-aware regex patterns for files with spaces
+- Rewrite rules for formatter commands (`ruff format`, `prettier --write`, `black`, `gofmt`, `biome check --write`, `dprint fmt`, `oxlint --fix`)
+
+### Changed
+- `skim lint` dispatcher unified — formatter and linter parsers use single dispatch path
+- Tech debt consolidation: dispatch logic, canonical output helpers, file handler signatures unified across lint/file/infra/git modules
+
 ## [2.4.1] - 2026-04-15
 
 ### Changed
