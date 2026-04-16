@@ -97,14 +97,14 @@ echo "── Pre-flight checks ──"
 cd "$REPO_ROOT"
 
 echo "Running cargo fmt --check..."
-if ! cargo fmt -- --check 2>&1; then
+if ! cargo fmt -- --check; then
   echo -e "${RED}✗${RESET} cargo fmt check failed — run 'cargo fmt' and retry"
   exit 1
 fi
 echo -e "${GREEN}✓${RESET} cargo fmt"
 
 echo "Running cargo clippy..."
-if ! cargo clippy --all-features -- -D warnings 2>&1; then
+if ! cargo clippy --all-features -- -D warnings; then
   echo -e "${RED}✗${RESET} cargo clippy failed — fix warnings before releasing"
   exit 1
 fi
@@ -126,10 +126,7 @@ RAW_COUNT=$(echo "$TEST_OUTPUT" | grep -E 'PASS: [0-9]+' | tail -1 | sed 's/.*PA
 
 if [ -z "$RAW_COUNT" ]; then
   echo -e "${YELLOW}⚠${RESET}  Could not extract test count from test output — test count sync will be skipped"
-  RAW_COUNT=""
-fi
-
-if [ -n "$RAW_COUNT" ]; then
+else
   echo -e "${GREEN}✓${RESET} Test count: $RAW_COUNT"
 fi
 
@@ -157,12 +154,12 @@ if ! grep -q "rskim-core = { version = \"${OLD_VERSION}\"" "$RSKIM_TOML"; then
   exit 1
 fi
 
-# Bump rskim-core package version (first occurrence only)
-sed -i '' "0,/^version = \"${OLD_VERSION}\"/{s/^version = \"${OLD_VERSION}\"/version = \"${NEW_VERSION}\"/}" "$CORE_TOML"
+# Bump rskim-core package version (^version is unique per file — no range needed)
+sed -i '' "s/^version = \"${OLD_VERSION}\"/version = \"${NEW_VERSION}\"/" "$CORE_TOML"
 echo -e "${GREEN}✓${RESET} crates/rskim-core/Cargo.toml — package version"
 
-# Bump rskim package version (first occurrence only — line 3)
-sed -i '' "0,/^version = \"${OLD_VERSION}\"/{s/^version = \"${OLD_VERSION}\"/version = \"${NEW_VERSION}\"/}" "$RSKIM_TOML"
+# Bump rskim package version (^version is unique per file — no range needed)
+sed -i '' "s/^version = \"${OLD_VERSION}\"/version = \"${NEW_VERSION}\"/" "$RSKIM_TOML"
 echo -e "${GREEN}✓${RESET} crates/rskim/Cargo.toml — package version"
 
 # Bump rskim-core dependency version in rskim Cargo.toml
@@ -175,7 +172,7 @@ echo -e "${GREEN}✓${RESET} crates/rskim/Cargo.toml — rskim-core dependency v
 echo ""
 echo "── Updating Cargo.lock ──"
 
-if ! cargo check 2>&1; then
+if ! cargo check; then
   echo -e "${RED}✗${RESET} cargo check failed after version bump"
   exit 1
 fi
@@ -187,13 +184,13 @@ echo -e "${GREEN}✓${RESET} Cargo.lock updated"
 echo ""
 echo "── Test count sync ──"
 
+README="${REPO_ROOT}/README.md"
+CLAUDE_MD="${REPO_ROOT}/CLAUDE.md"
+
 if [ -n "$RAW_COUNT" ]; then
   # Format with comma: 2629 → 2,629
   # For numbers >= 1000, insert comma 3 chars from end
   FORMATTED_COUNT=$(echo "$RAW_COUNT" | sed 's/\([0-9]\)\([0-9]\{3\}\)$/\1,\2/')
-
-  README="${REPO_ROOT}/README.md"
-  CLAUDE_MD="${REPO_ROOT}/CLAUDE.md"
 
   # README.md: replace "N,NNN tests passing" pattern
   if grep -q '[0-9],[0-9][0-9][0-9] tests passing' "$README"; then
@@ -220,8 +217,6 @@ fi
 echo ""
 echo "── Version string sync ──"
 
-README="${REPO_ROOT}/README.md"
-
 if grep -q "\*\*Current\*\*: v${OLD_VERSION} — Stable" "$README"; then
   sed -i '' "s/\*\*Current\*\*: v${OLD_VERSION} — Stable/**Current**: v${NEW_VERSION} — Stable/" "$README"
   echo -e "${GREEN}✓${RESET} README.md — version string updated to v${NEW_VERSION}"
@@ -242,10 +237,10 @@ echo "  • crates/rskim-core/Cargo.toml — package version"
 echo "  • crates/rskim/Cargo.toml — package version + rskim-core dependency"
 echo "  • Cargo.lock — propagated by cargo check"
 if [ -n "$RAW_COUNT" ]; then
-echo "  • README.md — version string + test count (${FORMATTED_COUNT})"
-echo "  • CLAUDE.md — test count (${FORMATTED_COUNT}, 2 locations)"
+  echo "  • README.md — version string + test count (${FORMATTED_COUNT})"
+  echo "  • CLAUDE.md — test count (${FORMATTED_COUNT}, 2 locations)"
 else
-echo "  • README.md — version string"
+  echo "  • README.md — version string"
 fi
 echo ""
 echo -e "${YELLOW}Manual steps remaining:${RESET}"
