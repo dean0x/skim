@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ✅ **PHASE 3 COMPLETE** (100% of original roadmap)
 
 **What's Complete (Phases 1 & 2):**
-- ✅ Full Rust project with comprehensive test suite (2,482 tests passing)
+- ✅ Full Rust project with comprehensive test suite (2,629 tests passing)
 - ✅ 17 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
 - ✅ 4 transformation modes: structure, signatures, types, full
 - ✅ CLI with stdin/stdout streaming support
@@ -157,7 +157,7 @@ cargo fmt -- --check           # Format check
 - `infra` — Infrastructure tool compression: gh, aws, curl, wget output parsing (`--json`, `--show-stats`)
 - `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode)
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`)
-- `lint` — Lint output compression (eslint, ruff, mypy, golangci-lint)
+- `lint` — Lint and formatter output compression (eslint, ruff, mypy, golangci-lint, prettier, rustfmt, biome, dprint, oxlint, black, gofmt)
 - `log` — Log compression: JSON structured + regex plaintext deduplication, debug filtering, stack trace collapsing (`--json`, `--show-stats`)
 - `pkg` — Package manager output compression (npm, pnpm, pip, cargo)
 - `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
@@ -194,17 +194,22 @@ cargo flamegraph --bin skim -- file.ts  # Profile hot paths
 
 ## Release Process
 
+### Release Prep Script
+Run `./scripts/release-prep.sh <version>` to automate pre-flight validation, version bumps, and test count sync. The script handles Steps 1-3 below and the mechanical parts of documentation updates. You still need to write the CHANGELOG entry and update subcommand descriptions manually.
+
 ### Pre-Release Checklist
 1. Verify all target PRs are merged to main
 2. Run `cargo test --all-features` — confirm passing count
 3. Create release branch: `git checkout -b release/vX.Y.Z main`
 
 ### Version Bump (3 files, 4 edits)
+> **Automated by `release-prep.sh`** — manual steps listed for reference.
 - `crates/rskim-core/Cargo.toml` — package version
 - `crates/rskim/Cargo.toml` — package version + rskim-core dependency version
 - Run `cargo check` to update Cargo.lock
 
 ### Documentation Updates
+> **Test counts and version string automated by `release-prep.sh`** — CHANGELOG and subcommand descriptions are manual.
 - `CHANGELOG.md` — convert [Unreleased] to [X.Y.Z] - YYYY-MM-DD, add new [Unreleased], add Version History entry
 - `README.md` — update version string (line ~591) and test count (line ~620)
 - `CLAUDE.md` — update test count (2 locations: line ~16 and line ~505)
@@ -547,7 +552,7 @@ Cross-platform builds require different GitHub Actions runners:
 5. Create test fixtures
 6. Validate AST access works
 
-**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 2,482 tests passing. See README.md for full usage guide.
+**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 2,629 tests passing. See README.md for full usage guide.
 
 ### Critical First File: `src/parser.rs`
 
