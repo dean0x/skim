@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
+use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -137,8 +137,7 @@ pub(crate) struct LinterConfig<'a> {
 ///
 /// - `config`: static linter metadata (program name, env vars, install hint)
 /// - `args`: raw user args (before prepare_args)
-/// - `show_stats`: whether to report token statistics
-/// - `json_output`: whether to emit JSON instead of text
+/// - `ctx`: cross-cutting flags (show_stats, json_output, analytics_enabled)
 /// - `prepare_args`: closure to inject linter-specific flags (e.g., `--format json`)
 /// - `parse_fn`: linter-specific three-tier parse function
 pub(crate) fn run_linter(
@@ -152,11 +151,6 @@ pub(crate) fn run_linter(
     prepare_args(&mut cmd_args);
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-    let output_format = if ctx.json_output {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Text
-    };
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
@@ -167,7 +161,7 @@ pub(crate) fn run_linter(
             use_stdin,
             show_stats: ctx.show_stats,
             command_type: crate::analytics::CommandType::Lint,
-            output_format,
+            output_format: ctx.output_format(),
             analytics_enabled: ctx.analytics_enabled,
             family: "lint",
         },

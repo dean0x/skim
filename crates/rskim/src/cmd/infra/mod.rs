@@ -14,7 +14,7 @@ pub(crate) mod wget;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use super::{extract_show_stats, run_parsed_command_with_mode, OutputFormat, ParsedCommandConfig};
+use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
 use crate::output::canonical::InfraResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
@@ -124,11 +124,6 @@ pub(crate) fn run_infra_tool(
     prepare_args(&mut cmd_args);
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-    let output_format = if ctx.json_output {
-        OutputFormat::Json
-    } else {
-        OutputFormat::Text
-    };
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
@@ -139,7 +134,7 @@ pub(crate) fn run_infra_tool(
             use_stdin,
             show_stats: ctx.show_stats,
             command_type: crate::analytics::CommandType::Infra,
-            output_format,
+            output_format: ctx.output_format(),
             analytics_enabled: ctx.analytics_enabled,
             family: "infra",
         },

@@ -165,6 +165,17 @@ pub(crate) struct RunContext {
     pub analytics_enabled: bool,
 }
 
+impl RunContext {
+    /// Convert `json_output` to the corresponding [`OutputFormat`].
+    pub(crate) fn output_format(&self) -> OutputFormat {
+        if self.json_output {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Text
+        }
+    }
+}
+
 /// Configuration for running an external command with parsed output.
 ///
 /// Groups the cross-cutting parameters for [`run_parsed_command_with_mode`]
