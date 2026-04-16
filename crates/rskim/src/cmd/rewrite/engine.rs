@@ -1,7 +1,7 @@
 //! Core rewrite algorithm — table matching and custom handlers.
 
 use super::handlers::{try_rewrite_cat, try_rewrite_head, try_rewrite_tail};
-use super::rules::REWRITE_RULES;
+use super::rules;
 use super::types::RewriteResult;
 
 /// Attempt to rewrite a tokenized command. Returns `Some(RewriteResult)` on
@@ -94,7 +94,7 @@ pub(super) fn try_table_match(
     separator_and_after: &[&str],
     toolchain: Option<&str>,
 ) -> Option<RewriteResult> {
-    for rule in REWRITE_RULES {
+    for rule in rules::all_rules() {
         // Check if prefix matches
         if before_sep.len() < rule.prefix.len() {
             continue;
@@ -427,9 +427,7 @@ mod tests {
     /// closure, so it will catch regressions in `try_table_match` directly.
     #[test]
     fn test_strict_skip_no_false_prefix_collisions() {
-        use super::super::rules::REWRITE_RULES;
-
-        for rule in REWRITE_RULES {
+        for rule in super::super::rules::all_rules() {
             for &skip in rule.skip_if_flag_prefix {
                 // Build a command: rule.prefix ++ [extended_arg]
                 // where extended_arg = skip + "x" (e.g., "--stat" -> "--statx")

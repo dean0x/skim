@@ -1,11 +1,16 @@
 //! Declarative rewrite rule table.
 //!
-//! 69 rules, ordered longest-prefix-first within the same leading token.
-//! Only `engine.rs` consumes `REWRITE_RULES`.
+//! 93 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (5),
+//! LINT (38), PKG (18), INFRA (11), FILE_OPS (7).
+//! Only `engine.rs` consumes `all_rules()`.
 
 use super::types::{RewriteCategory, RewriteRule};
 
-pub(super) const REWRITE_RULES: &[RewriteRule] = &[
+// ============================================================================
+// TEST rules (10)
+// ============================================================================
+
+const TEST_RULES: &[RewriteRule] = &[
     // cargo (longest prefix first)
     RewriteRule {
         prefix: &["cargo", "nextest", "run"],
@@ -18,24 +23,6 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         rewrite_to: &["skim", "test", "cargo"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
-    },
-    RewriteRule {
-        prefix: &["cargo", "audit"],
-        rewrite_to: &["skim", "pkg", "cargo", "audit"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["cargo", "clippy"],
-        rewrite_to: &["skim", "build", "clippy"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Build,
-    },
-    RewriteRule {
-        prefix: &["cargo", "build"],
-        rewrite_to: &["skim", "build", "cargo"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Build,
     },
     // python (longest prefix first)
     RewriteRule {
@@ -63,12 +50,6 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
     },
-    RewriteRule {
-        prefix: &["npx", "tsc"],
-        rewrite_to: &["skim", "build", "tsc"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Build,
-    },
     // bare commands
     RewriteRule {
         prefix: &["pytest"],
@@ -94,7 +75,46 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
     },
-    // git
+];
+
+// ============================================================================
+// BUILD rules (4)
+// ============================================================================
+
+const BUILD_RULES: &[RewriteRule] = &[
+    RewriteRule {
+        prefix: &["cargo", "clippy"],
+        rewrite_to: &["skim", "build", "clippy"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+    RewriteRule {
+        prefix: &["cargo", "build"],
+        rewrite_to: &["skim", "build", "cargo"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+    // npx
+    RewriteRule {
+        prefix: &["npx", "tsc"],
+        rewrite_to: &["skim", "build", "tsc"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+    // tsc bare
+    RewriteRule {
+        prefix: &["tsc"],
+        rewrite_to: &["skim", "build", "tsc"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+    },
+];
+
+// ============================================================================
+// GIT rules (5)
+// ============================================================================
+
+const GIT_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["git", "status"],
         rewrite_to: &["skim", "git", "status"],
@@ -158,14 +178,14 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
-    // tsc bare
-    RewriteRule {
-        prefix: &["tsc"],
-        rewrite_to: &["skim", "build", "tsc"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Build,
-    },
-    // lint — eslint
+];
+
+// ============================================================================
+// LINT rules (38)
+// ============================================================================
+
+const LINT_RULES: &[RewriteRule] = &[
+    // eslint
     RewriteRule {
         prefix: &["npx", "eslint"],
         rewrite_to: &["skim", "lint", "eslint"],
@@ -178,7 +198,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format", "-f"],
         category: RewriteCategory::Lint,
     },
-    // lint — ruff (longest prefix first)
+    // ruff (longest prefix first)
     //
     // AD-20 (2026-04-15): `ruff format --check` and `ruff format` (apply mode)
     // are routed through the format-mode parse path in ruff.rs. The ruff parser
@@ -207,7 +227,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output-format"],
         category: RewriteCategory::Lint,
     },
-    // lint — mypy (longest prefix first: python3 -m mypy, python -m mypy, mypy)
+    // mypy (longest prefix first: python3 -m mypy, python -m mypy, mypy)
     RewriteRule {
         prefix: &["python3", "-m", "mypy"],
         rewrite_to: &["skim", "lint", "mypy"],
@@ -226,7 +246,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output"],
         category: RewriteCategory::Lint,
     },
-    // lint — golangci-lint
+    // golangci-lint
     RewriteRule {
         prefix: &["golangci-lint", "run"],
         rewrite_to: &["skim", "lint", "golangci"],
@@ -239,112 +259,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--out-format"],
         category: RewriteCategory::Lint,
     },
-    // pkg — npm (canonical + aliases)
-    RewriteRule {
-        prefix: &["npm", "audit"],
-        rewrite_to: &["skim", "pkg", "npm", "audit"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["npm", "install"],
-        rewrite_to: &["skim", "pkg", "npm", "install"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["npm", "i"],
-        rewrite_to: &["skim", "pkg", "npm", "install"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["npm", "ci"],
-        rewrite_to: &["skim", "pkg", "npm", "install"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["npm", "outdated"],
-        rewrite_to: &["skim", "pkg", "npm", "outdated"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["npm", "list"],
-        rewrite_to: &["skim", "pkg", "npm", "ls"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["npm", "ls"],
-        rewrite_to: &["skim", "pkg", "npm", "ls"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    // pkg — pnpm
-    RewriteRule {
-        prefix: &["pnpm", "audit"],
-        rewrite_to: &["skim", "pkg", "pnpm", "audit"],
-        skip_if_flag_prefix: &["--json"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pnpm", "install"],
-        rewrite_to: &["skim", "pkg", "pnpm", "install"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pnpm", "i"],
-        rewrite_to: &["skim", "pkg", "pnpm", "install"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pnpm", "outdated"],
-        rewrite_to: &["skim", "pkg", "pnpm", "outdated"],
-        skip_if_flag_prefix: &["--format"],
-        category: RewriteCategory::Pkg,
-    },
-    // pkg — pip (canonical + pip3 aliases)
-    RewriteRule {
-        prefix: &["pip", "install"],
-        rewrite_to: &["skim", "pkg", "pip", "install"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pip", "check"],
-        rewrite_to: &["skim", "pkg", "pip", "check"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pip", "list"],
-        rewrite_to: &["skim", "pkg", "pip", "list"],
-        skip_if_flag_prefix: &["--format"],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pip3", "install"],
-        rewrite_to: &["skim", "pkg", "pip", "install"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pip3", "check"],
-        rewrite_to: &["skim", "pkg", "pip", "check"],
-        skip_if_flag_prefix: &[],
-        category: RewriteCategory::Pkg,
-    },
-    RewriteRule {
-        prefix: &["pip3", "list"],
-        rewrite_to: &["skim", "pkg", "pip", "list"],
-        skip_if_flag_prefix: &["--format"],
-        category: RewriteCategory::Pkg,
-    },
-    // lint — prettier (longest prefix first: npx prettier, prettier)
+    // prettier (longest prefix first: npx prettier, prettier)
     //
     // AD-20 (2026-04-15): `prettier --write` and `-w` are routed through the
     // format-mode parse path in prettier.rs. `is_format_mode` detects `--write`
@@ -385,7 +300,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
     },
-    // lint — rustfmt (longest prefix first)
+    // rustfmt (longest prefix first)
     RewriteRule {
         prefix: &["cargo", "fmt", "--", "--check"],
         rewrite_to: &["skim", "lint", "rustfmt"],
@@ -404,7 +319,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
     },
-    // lint — black
+    // black
     RewriteRule {
         prefix: &["black", "--check"],
         rewrite_to: &["skim", "lint", "black"],
@@ -417,7 +332,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--diff"],
         category: RewriteCategory::Lint,
     },
-    // lint — gofmt (longest prefix first)
+    // gofmt (longest prefix first)
     RewriteRule {
         prefix: &["gofmt", "-l"],
         rewrite_to: &["skim", "lint", "gofmt"],
@@ -436,7 +351,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-w"],
         category: RewriteCategory::Lint,
     },
-    // lint — biome (longest prefix first)
+    // biome (longest prefix first)
     RewriteRule {
         prefix: &["npx", "biome", "check"],
         rewrite_to: &["skim", "lint", "biome", "check"],
@@ -485,7 +400,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--reporter"],
         category: RewriteCategory::Lint,
     },
-    // lint — dprint (longest prefix first)
+    // dprint (longest prefix first)
     RewriteRule {
         prefix: &["dprint", "check"],
         rewrite_to: &["skim", "lint", "dprint", "check"],
@@ -504,7 +419,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
     },
-    // lint — oxlint
+    // oxlint
     RewriteRule {
         prefix: &["npx", "oxlint"],
         rewrite_to: &["skim", "lint", "oxlint"],
@@ -517,7 +432,133 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Lint,
     },
-    // infra — gh (longest prefix first)
+];
+
+// ============================================================================
+// PKG rules (18)
+// ============================================================================
+
+const PKG_RULES: &[RewriteRule] = &[
+    // cargo
+    RewriteRule {
+        prefix: &["cargo", "audit"],
+        rewrite_to: &["skim", "pkg", "cargo", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    // npm (canonical + aliases)
+    RewriteRule {
+        prefix: &["npm", "audit"],
+        rewrite_to: &["skim", "pkg", "npm", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "install"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "i"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "ci"],
+        rewrite_to: &["skim", "pkg", "npm", "install"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "outdated"],
+        rewrite_to: &["skim", "pkg", "npm", "outdated"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "list"],
+        rewrite_to: &["skim", "pkg", "npm", "ls"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["npm", "ls"],
+        rewrite_to: &["skim", "pkg", "npm", "ls"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    // pnpm
+    RewriteRule {
+        prefix: &["pnpm", "audit"],
+        rewrite_to: &["skim", "pkg", "pnpm", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "install"],
+        rewrite_to: &["skim", "pkg", "pnpm", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "i"],
+        rewrite_to: &["skim", "pkg", "pnpm", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pnpm", "outdated"],
+        rewrite_to: &["skim", "pkg", "pnpm", "outdated"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+    },
+    // pip (canonical + pip3 aliases)
+    RewriteRule {
+        prefix: &["pip", "install"],
+        rewrite_to: &["skim", "pkg", "pip", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip", "check"],
+        rewrite_to: &["skim", "pkg", "pip", "check"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip", "list"],
+        rewrite_to: &["skim", "pkg", "pip", "list"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "install"],
+        rewrite_to: &["skim", "pkg", "pip", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "check"],
+        rewrite_to: &["skim", "pkg", "pip", "check"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+    },
+    RewriteRule {
+        prefix: &["pip3", "list"],
+        rewrite_to: &["skim", "pkg", "pip", "list"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+    },
+];
+
+// ============================================================================
+// INFRA rules (11)
+// ============================================================================
+
+const INFRA_RULES: &[RewriteRule] = &[
+    // gh (longest prefix first)
     //
     // DESIGN DECISION: --jq and --template skip because they apply custom
     // transformations to gh JSON output. Injecting --json fields would change
@@ -574,14 +615,14 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Infra,
     },
-    // infra — aws
+    // aws
     RewriteRule {
         prefix: &["aws"],
         rewrite_to: &["skim", "infra", "aws"],
         skip_if_flag_prefix: &["--output"],
         category: RewriteCategory::Infra,
     },
-    // infra — curl
+    // curl
     RewriteRule {
         prefix: &["curl"],
         rewrite_to: &["skim", "infra", "curl"],
@@ -596,21 +637,28 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         ],
         category: RewriteCategory::Infra,
     },
-    // infra — wget
+    // wget
     RewriteRule {
         prefix: &["wget"],
         rewrite_to: &["skim", "infra", "wget"],
         skip_if_flag_prefix: &["-O", "-q", "--quiet"],
         category: RewriteCategory::Infra,
     },
-    // file — find
+];
+
+// ============================================================================
+// FILE_OPS rules (7)
+// ============================================================================
+
+const FILE_OPS_RULES: &[RewriteRule] = &[
+    // find
     RewriteRule {
         prefix: &["find"],
         rewrite_to: &["skim", "file", "find"],
         skip_if_flag_prefix: &["-exec", "-delete", "-printf", "-print0"],
         category: RewriteCategory::FileOps,
     },
-    // file — ls (verbose/recursive only)
+    // ls (verbose/recursive only)
     RewriteRule {
         prefix: &["ls", "-la"],
         rewrite_to: &["skim", "file", "ls"],
@@ -623,14 +671,14 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::FileOps,
     },
-    // file — tree
+    // tree
     RewriteRule {
         prefix: &["tree"],
         rewrite_to: &["skim", "file", "tree"],
         skip_if_flag_prefix: &["-J", "--json"],
         category: RewriteCategory::FileOps,
     },
-    // file — grep (recursive only)
+    // grep (recursive only)
     RewriteRule {
         prefix: &["grep", "-rn"],
         rewrite_to: &["skim", "file", "grep"],
@@ -643,7 +691,7 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-c", "--count", "-l"],
         category: RewriteCategory::FileOps,
     },
-    // file — rg
+    // rg
     RewriteRule {
         prefix: &["rg"],
         rewrite_to: &["skim", "file", "rg"],
@@ -652,20 +700,42 @@ pub(super) const REWRITE_RULES: &[RewriteRule] = &[
     },
 ];
 
+// ============================================================================
+// Public iterator over all rules
+// ============================================================================
+
+/// Iterate over all rewrite rules in priority order: TEST → BUILD → GIT →
+/// LINT → PKG → INFRA → FILE_OPS.
+///
+/// The engine must see longer/more-specific prefixes before shorter ones
+/// within the same leading token. Each category array maintains that invariant
+/// internally; the chain order between categories does not affect correctness
+/// because rules from different categories never share a leading token.
+pub(super) fn all_rules() -> impl Iterator<Item = &'static RewriteRule> {
+    TEST_RULES
+        .iter()
+        .chain(BUILD_RULES.iter())
+        .chain(GIT_RULES.iter())
+        .chain(LINT_RULES.iter())
+        .chain(PKG_RULES.iter())
+        .chain(INFRA_RULES.iter())
+        .chain(FILE_OPS_RULES.iter())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Expected rule count — update this constant together with REWRITE_RULES.
-    const EXPECTED_RULE_COUNT: usize = 93;
+    /// Expected rule count — update this constant together with the category arrays.
+    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 5 + 38 + 18 + 11 + 7;
 
     #[test]
     fn test_rule_count_matches_expected() {
+        let count = all_rules().count();
         assert_eq!(
-            REWRITE_RULES.len(),
-            EXPECTED_RULE_COUNT,
+            count, EXPECTED_RULE_COUNT,
             "Update EXPECTED_RULE_COUNT when adding/removing rules (current: {})",
-            REWRITE_RULES.len()
+            count
         );
     }
 }
