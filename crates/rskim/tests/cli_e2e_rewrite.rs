@@ -942,7 +942,7 @@ fn test_rewrite_pip3_list() {
 // Phase 8: Wave B rewrite rules (#116)
 // ============================================================================
 
-/// AD-11: `prettier --check` is acknowledged as already-compact.
+/// AD-RW-11: `prettier --check` is acknowledged as already-compact.
 /// The original command is echoed on stdout (exit 0) rather than being
 /// rewritten to `skim lint prettier`, per the compress-or-skip rule.
 #[test]
@@ -972,7 +972,7 @@ fn test_rewrite_npx_prettier_write() {
         .stdout(predicate::str::contains("skim lint prettier"));
 }
 
-/// AD-11: `rustfmt --check` is acknowledged as already-compact.
+/// AD-RW-11: `rustfmt --check` is acknowledged as already-compact.
 /// The original command is echoed on stdout rather than being
 /// rewritten to `skim lint rustfmt`.
 #[test]

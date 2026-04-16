@@ -22,7 +22,7 @@
 //!
 //! # Design decisions
 //!
-//! **AD-7** — Dispatch-on-arg-shape.
+//! **AD-GIT-7** — Dispatch-on-arg-shape.
 //!
 //! The single entry point [`run_show`] inspects the first non-flag argument to
 //! determine which of the three modes to enter (file-content, commit, multi-ref
@@ -32,7 +32,7 @@
 //! commit-ish. All other dispatch logic (passthrough flags, `--json` rejection,
 //! annotated-tag detection) is layered on top of this primary shape test.
 //!
-//! **AD-8 (2026-04-11)** — Commit body and merge-parent preservation.
+//! **AD-GIT-8 (2026-04-11)** — Commit body and merge-parent preservation.
 //!
 //! `CommitHeader` now captures `body` (full multi-paragraph commit message
 //! below the subject line) and `parents` (the tail of `Merge: ` header lines,
@@ -234,13 +234,13 @@ struct CommitHeader {
     subject: String,
     /// Full commit message body below the subject line (may be empty).
     ///
-    /// # AD-8 (2026-04-11)
+    /// # AD-GIT-8 (2026-04-11)
     /// Multi-paragraph bodies are preserved verbatim with 4-space indent stripped.
     /// Empty when the commit has only a subject line.
     body: String,
     /// Tail of a `Merge: ` header line, when present (e.g. `"abc123 def456"`).
     ///
-    /// # AD-8 (2026-04-11)
+    /// # AD-GIT-8 (2026-04-11)
     /// Stored as a structured field rather than inlined into `body` so that
     /// `ShowCommitResult::render` can emit `Merge: {parents}` as a dedicated
     /// prefix line. Octopus merges have all parent hashes in one space-separated
@@ -256,7 +256,7 @@ struct CommitHeader {
 /// # State machine
 /// - Phase 0 (`in_body == false`): parse git trailer lines (`commit `,
 ///   `Author: `, `Date: `, `Merge: `). All other lines (gpgsig, mergetag,
-///   continuation lines starting with a space) are silently skipped per AD-8.
+///   continuation lines starting with a space) are silently skipped per AD-GIT-8.
 /// - Phase 1 (`in_body == true`, `subject_captured == false`): capture the
 ///   subject (first non-blank body line), stripping the canonical 4-space indent.
 /// - Phase 2 (`in_body == true`, `subject_captured == true`): accumulate body
@@ -279,7 +279,7 @@ fn parse_header_lines<'a>(header_region: &'a str, header: &mut CommitHeader) -> 
             if line.starts_with("commit ") {
                 header.hash = header_value(line, "commit ");
             } else if line.starts_with("Merge: ") {
-                // AD-8: capture merge parents as structured field.
+                // AD-GIT-8: capture merge parents as structured field.
                 header.parents = Some(header_value(line, "Merge: "));
             } else if line.starts_with("Author: ") {
                 header.author = header_value(line, "Author: ");
@@ -342,7 +342,7 @@ fn trim_body_blanks(body_lines: &[&str]) -> String {
 /// hand-rolled byte counter. Git outputs LF by default but users may pipe
 /// through tools that introduce CRLF.
 ///
-/// # Signature blocks (AD-8)
+/// # Signature blocks (AD-GIT-8)
 /// `gpgsig ` and `mergetag ` header lines (and their multi-line continuations
 /// that start with a space) appear between the `commit ` line and the blank
 /// separator. They are silently skipped — they are implementation artefacts,
@@ -1385,7 +1385,7 @@ mod tests {
     }
 
     // ========================================================================
-    // AD-8: body and parents parsing tests
+    // AD-GIT-8: body and parents parsing tests
     // ========================================================================
 
     #[test]

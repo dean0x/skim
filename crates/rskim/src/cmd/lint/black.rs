@@ -7,7 +7,7 @@
 //! - **Tier 2 (Degraded)**: Regex fallback on same patterns
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 //!
-//! # AD-20 (2026-04-15) — check/format split for black
+//! # AD-LINT-20 (2026-04-15) — check/format split for black
 //!
 //! `black --check` lists files that would be reformatted.
 //! Bare `black` reformats files in place and emits `reformatted <path>` lines.
@@ -30,11 +30,11 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
     install_hint: "Install black: pip install black",
 };
 
-/// AD-21 (2026-04-15) — `.+` captures paths with spaces.
+/// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
 static RE_BLACK_WOULD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^would reformat (.+)$").unwrap());
 
-/// AD-21 (2026-04-15) — `.+` captures paths with spaces.
+/// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
 static RE_BLACK_REFORMATTED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^reformatted (.+)$").unwrap());
 
@@ -263,7 +263,7 @@ fn try_parse_format_regex(text: &str) -> Option<LintResult> {
 
 #[cfg(test)]
 mod tests {
-    //! # AD-25 (2026-04-15) — fixture sourcing
+    //! # AD-LINT-25 (2026-04-15) — fixture sourcing
     //!
     //! Fixtures are loaded from `tests/fixtures/cmd/lint/` relative to the
     //! crate manifest directory. Each fixture file is prefixed with a version
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_path_with_spaces() {
-        // AD-21: paths with spaces must be captured correctly
+        // AD-LINT-21: paths with spaces must be captured correctly
         let input = "would reformat src/my file.py\n";
         let result = try_parse_check_structured(input);
         assert!(result.is_some());

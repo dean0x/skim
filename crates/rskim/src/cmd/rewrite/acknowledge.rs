@@ -1,4 +1,4 @@
-//! Already-compact command acknowledgement (AD-2).
+//! Already-compact command acknowledgement (AD-RW-2).
 //!
 //! Some commands produce inherently small, near-optimal output — rewriting
 //! them would add overhead without savings. This module maintains the
@@ -16,7 +16,7 @@
 //! a pattern `&["git", "worktree", "list"]` matches any command that *starts
 //! with* those three tokens, including `git worktree list --porcelain`.
 //!
-//! # AD-11 (2026-04-11) — prettier and rustfmt --check acknowledgement
+//! # AD-RW-11 (2026-04-11) — prettier and rustfmt --check acknowledgement
 //!
 //! `prettier --check` and `rustfmt --check` invoked without explicit file/glob
 //! arguments emit near-zero output on a clean codebase: exit 0, empty stdout.
@@ -50,19 +50,19 @@
 pub(super) const ACK_PREFIX_PATTERNS: &[&[&str]] = &[
     // `git worktree list` is a small table; no meaningful compression is possible.
     &["git", "worktree", "list"],
-    // AD-11: `prettier --check [files]` output is near-optimal (empty on clean,
+    // AD-RW-11: `prettier --check [files]` output is near-optimal (empty on clean,
     // brief file list on failure). Skim header overhead exceeds compression gain.
     &["prettier", "--check"],
-    // AD-11: `npx prettier --check [files]` — same rationale as above.
+    // AD-RW-11: `npx prettier --check [files]` — same rationale as above.
     &["npx", "prettier", "--check"],
-    // AD-11: `rustfmt --check [files]` — empty on clean, short diff headers on
+    // AD-RW-11: `rustfmt --check [files]` — empty on clean, short diff headers on
     // failure. The skim LINT OK wrapper adds tokens without reducing agent load.
     &["rustfmt", "--check"],
-    // AD-11: `cargo fmt --check` is a `rustfmt --check`-equivalent wrapper;
+    // AD-RW-11: `cargo fmt --check` is a `rustfmt --check`-equivalent wrapper;
     // same empty-on-clean contract. Both the short form and the `--` pass-through
     // form are ACKed so `skim rewrite` echoes them unchanged.
     &["cargo", "fmt", "--check"],
-    // AD-11: `cargo fmt -- --check` — pass-through variant. The `--` token is
+    // AD-RW-11: `cargo fmt -- --check` — pass-through variant. The `--` token is
     // treated literally by `is_segment_ack`; there is no compound-operator
     // splitting on bare `--` (CompoundOp only recognizes `&&|;`).
     &["cargo", "fmt", "--", "--check"],
@@ -141,7 +141,7 @@ mod tests {
         );
     }
 
-    // AD-11: prettier --check acknowledgement
+    // AD-RW-11: prettier --check acknowledgement
 
     #[test]
     fn test_is_segment_ack_prettier_check() {
@@ -201,7 +201,7 @@ mod tests {
         );
     }
 
-    // AD-11: cargo fmt --check acknowledgement (added in evaluator follow-up)
+    // AD-RW-11: cargo fmt --check acknowledgement (added in evaluator follow-up)
 
     #[test]
     fn test_is_segment_ack_cargo_fmt_check() {

@@ -224,7 +224,7 @@ pub(super) fn build_analytics_label(
 /// - `show_stats`   — Whether to print token-savings stats to stderr.
 /// - `command_type` — Analytics command-type tag (e.g., `CommandType::Git`).
 /// - `duration`     — Wall-clock duration of the underlying git command.
-/// - `parse_tier`   — Optional tier label set by the parser (AD-12).
+/// - `parse_tier`   — Optional tier label set by the parser (AD-GIT-12).
 ///
 /// Takes ownership of `raw` and `output`, moving them directly into the
 /// analytics call when analytics are enabled — zero extra allocations on
@@ -232,7 +232,7 @@ pub(super) fn build_analytics_label(
 ///
 /// Use this variant in handlers that already own their output strings
 /// (i.e. the string would be dropped immediately after the call anyway).
-/// `parse_tier` is forwarded to the analytics record (AD-12).
+/// `parse_tier` is forwarded to the analytics record (AD-GIT-12).
 ///
 /// # Note on argument count
 /// The 8 parameters are all semantically distinct: `raw`/`output` are the text
@@ -368,7 +368,7 @@ pub(super) fn run_passthrough(
 /// combined. Git fetch writes its output to stderr, so fetch uses `true`;
 /// all other subcommands use `false` (stdout only).
 ///
-/// # AD-14 (2026-04-11) — analytics recording on non-zero exit
+/// # AD-GIT-14 (2026-04-11) — analytics recording on non-zero exit
 ///
 /// Previously, a non-zero exit code caused an early return with no analytics
 /// recording, so every failed git invocation was silently absent from the DB.
@@ -444,7 +444,7 @@ where
     // use the owned variant to move them directly rather than cloning.
     // `label` is supplied by the caller from the user's original (pre-rewrite) args
     // so the analytics DB records the invocation as the user typed it.
-    // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-12).
+    // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-GIT-12).
     finalize_git_output_owned(
         raw,
         result_str,

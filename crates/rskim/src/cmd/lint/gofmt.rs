@@ -28,7 +28,7 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
     install_hint: "gofmt ships with Go: https://go.dev/dl/",
 };
 
-/// AD-21 (2026-04-15) — `.+` captures paths with spaces. Strips `.orig` suffix.
+/// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces. Strips `.orig` suffix.
 static RE_GOFMT_DIFF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^--- (.+?)(?:\.orig)?$").unwrap());
 
@@ -146,7 +146,7 @@ fn try_parse_diff_regex(text: &str) -> Option<LintResult> {
 
 #[cfg(test)]
 mod tests {
-    //! # AD-25 (2026-04-15) — fixture sourcing
+    //! # AD-LINT-25 (2026-04-15) — fixture sourcing
     //!
     //! Fixtures are loaded from `tests/fixtures/cmd/lint/` relative to the
     //! crate manifest directory. Each fixture file is prefixed with a version
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_path_with_spaces() {
-        // AD-21: paths with spaces must be captured correctly
+        // AD-LINT-21: paths with spaces must be captured correctly
         let input = "my files/server.go\n";
         let result = try_parse_list(input);
         assert!(result.is_some());

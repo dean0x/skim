@@ -577,7 +577,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
 }
 
 // ============================================================================
-// AD-8: commit body and merge parents (Commit 1, 2026-04-11)
+// AD-GIT-8: commit body and merge parents (Commit 1, 2026-04-11)
 // ============================================================================
 
 /// E2E test: git show must preserve multi-paragraph commit body.

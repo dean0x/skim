@@ -25,7 +25,7 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
 };
 
 /// Matches Rust-style location markers in oxlint fancy output.
-/// AD-21 (2026-04-15) — `.+` captures paths with spaces.
+/// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
 static RE_OXLINT_LOCATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"╭─\[(.+):(\d+):\d+\]").unwrap());
 
@@ -183,7 +183,7 @@ fn try_parse_fancy_regex(text: &str) -> Option<LintResult> {
 
 #[cfg(test)]
 mod tests {
-    //! # AD-25 (2026-04-15) — fixture sourcing
+    //! # AD-LINT-25 (2026-04-15) — fixture sourcing
     //!
     //! Fixtures are loaded from `tests/fixtures/cmd/lint/` relative to the
     //! crate manifest directory. JSON fixtures are documented in test function
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_path_with_spaces() {
-        // AD-21: location markers with spaces in paths
+        // AD-LINT-21: location markers with spaces in paths
         let input = "  × no-unused-vars\n    ╭─[src/my file.ts:5:7]\n";
         let result = try_parse_fancy_regex(input);
         assert!(result.is_some());

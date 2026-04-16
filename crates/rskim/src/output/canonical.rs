@@ -128,7 +128,7 @@ impl fmt::Display for TestResult {
 
 /// Result of a git operation
 ///
-/// # AD-12 (2026-04-11) — parse_tier propagation through git handlers
+/// # AD-GIT-12 (2026-04-11) — parse_tier propagation through git handlers
 ///
 /// Git handlers (log, status, fetch) each use a single parsing strategy
 /// (unlike lint handlers which have Full/Degraded/Passthrough tiers). To make
@@ -360,14 +360,14 @@ pub(crate) struct LintGroup {
 
 /// Complete lint result with summary and grouped issues
 ///
-/// # AD-22 (2026-04-15) — files_formatted field for format-mode results
+/// # AD-LINT-22 (2026-04-15) — files_formatted field for format-mode results
 ///
 /// Format-mode runs (e.g., `ruff format`, `prettier --write`, `cargo fmt`) do not
 /// produce lint issues — they rewrite files. `files_formatted: Some(N)` signals that
 /// N files were reformatted; `None` means this is a check-mode result (existing
 /// behaviour unchanged).
 ///
-/// # AD-23 (2026-04-15) — render() output for format-mode
+/// # AD-LINT-23 (2026-04-15) — render() output for format-mode
 ///
 /// When `files_formatted.is_some()` AND `errors == 0 && warnings == 0`:
 /// → `LINT OK | {tool} ({N} files formatted)`
@@ -457,7 +457,7 @@ impl LintResult {
 
     /// Create a format-mode LintResult recording how many files were reformatted.
     ///
-    /// # AD-22 (2026-04-15) — format-mode constructor
+    /// # AD-LINT-22 (2026-04-15) — format-mode constructor
     ///
     /// Used by `ruff format`, `prettier --write`, and `rustfmt` (format mode) parsers
     /// to signal that N files were reformatted. Rendered as
@@ -498,7 +498,7 @@ impl LintResult {
 
         let total = errors + warnings;
         if total == 0 {
-            // AD-23: format-mode success includes file count
+            // AD-LINT-23: format-mode success includes file count
             if let Some(n) = files_formatted {
                 return format!("LINT OK | {tool} ({n} files formatted)");
             }
@@ -887,7 +887,7 @@ pub(crate) struct LogResult {
     pub(crate) debug_only: bool,
     /// Number of stack frames elided from all captured traces (last 3 per trace kept).
     ///
-    /// # AD-10 (2026-04-11)
+    /// # AD-LOG-10 (2026-04-11)
     /// When non-zero, a `(+{n} stack frames elided)` footer is appended to the
     /// text render so agents know stack traces were truncated. Zero means either
     /// no traces were encountered or all frames fit within the 3-frame window.
@@ -901,7 +901,7 @@ impl LogResult {
     /// Create a new LogResult with pre-computed rendered output.
     ///
     /// `stack_frames_elided` is the total number of stack frames dropped across
-    /// all captured traces (0 when no elision occurred). See AD-10.
+    /// all captured traces (0 when no elision occurred). See AD-LOG-10.
     pub(crate) fn new(
         total_lines: usize,
         unique_messages: usize,
@@ -1016,7 +1016,7 @@ impl LogResult {
             }
         }
 
-        // AD-10: append elision footer when frames were truncated.
+        // AD-LOG-10: append elision footer when frames were truncated.
         if stack_frames_elided > 0 {
             let _ = write!(output, "\n(+{stack_frames_elided} stack frames elided)");
         }
@@ -1247,7 +1247,7 @@ mod tests {
         assert!(display.contains("abc123 feat: add feature"));
     }
 
-    /// AD-12: `GitResult::new` must default `parse_tier` to `None` so callers
+    /// AD-GIT-12: `GitResult::new` must default `parse_tier` to `None` so callers
     /// that do not set a tier do not crash and the analytics DB records NULL.
     #[test]
     fn test_git_result_parse_tier_defaults_to_none() {
@@ -1258,7 +1258,7 @@ mod tests {
         );
     }
 
-    /// AD-12: `GitResult::with_tier` must set the parse tier without affecting
+    /// AD-GIT-12: `GitResult::with_tier` must set the parse tier without affecting
     /// other fields or the rendered output.
     #[test]
     fn test_git_result_with_tier_sets_tier() {
@@ -1274,7 +1274,7 @@ mod tests {
         assert_eq!(result.summary, "5 commits");
     }
 
-    /// AD-12: `parse_tier` must be skipped during JSON serialization because it
+    /// AD-GIT-12: `parse_tier` must be skipped during JSON serialization because it
     /// is a runtime annotation, not a persistent schema field.
     #[test]
     fn test_git_result_parse_tier_skipped_in_json() {
@@ -1525,7 +1525,7 @@ mod tests {
         assert_eq!(result.as_ref(), "LINT OK | mypy | 0 issues");
     }
 
-    /// AD-22/AD-23 (2026-04-15) — LintResult::formatted() and format-mode render.
+    /// AD-LINT-22/AD-LINT-23 (2026-04-15) — LintResult::formatted() and format-mode render.
     #[test]
     fn test_lint_result_formatted_zero_files() {
         let result = LintResult::formatted("rustfmt".to_string(), 0);
@@ -2084,7 +2084,7 @@ mod tests {
         );
     }
 
-    // AD-8 tests: body and parents preservation
+    // AD-GIT-8 tests: body and parents preservation
     #[test]
     fn test_show_commit_result_body_in_render() {
         let result = ShowCommitResult::new(
@@ -2183,7 +2183,7 @@ mod tests {
 /// text render: the single-line summary (`<hash> <author> — <subject>`) is
 /// already compact; callers that need the full date should use `--json`.
 ///
-/// # AD-8 (2026-04-11) — body and parents
+/// # AD-GIT-8 (2026-04-11) — body and parents
 ///
 /// `body` stores the full multi-paragraph commit message below the subject
 /// line. It is appended to the text render only when non-empty, keeping
@@ -2202,14 +2202,14 @@ pub(crate) struct ShowCommitResult {
     pub(crate) subject: String,
     /// Full commit message body below the subject line (empty for subject-only commits).
     ///
-    /// # AD-8 (2026-04-11)
+    /// # AD-GIT-8 (2026-04-11)
     /// Preserved verbatim with 4-space indent stripped. Appended to text render
     /// as `\n\n{body}` only when non-empty.
     #[serde(default)]
     pub(crate) body: String,
     /// Merge parent hashes, when present (e.g. `"abc123 def456"`).
     ///
-    /// # AD-8 (2026-04-11)
+    /// # AD-GIT-8 (2026-04-11)
     /// Rendered as `Merge: {parents}\n` before the summary line in text output.
     /// Octopus merges store all parent hashes space-separated in one string.
     #[serde(default)]
@@ -2226,7 +2226,7 @@ pub(crate) struct ShowCommitResult {
 impl ShowCommitResult {
     /// Create a new `ShowCommitResult` with pre-computed rendered output.
     ///
-    /// # AD-8 (2026-04-11)
+    /// # AD-GIT-8 (2026-04-11)
     /// `body` and `parents` are new required parameters. `parents` renders as
     /// `Merge: {parents}\n` before the summary line. `body` renders as
     /// `\n\n{body}` after the summary only when non-empty.
@@ -2265,7 +2265,7 @@ impl ShowCommitResult {
 
     /// Render the commit result to a human-readable string.
     ///
-    /// # AD-8 (2026-04-11)
+    /// # AD-GIT-8 (2026-04-11)
     /// - `parents` (when `Some`) is prepended as `Merge: {parents}\n` before the summary.
     /// - `body` (when non-empty) is appended as `\n\n{body}` after the summary.
     /// - Empty body produces no trailing newlines, keeping subject-only commits compact.
@@ -2306,7 +2306,7 @@ impl ShowCommitResult {
     /// stripped the field).  Produces a lossy summary — file paths, statuses,
     /// and region counts — because the original diff body is not stored.
     ///
-    /// # AD-8 (2026-04-11)
+    /// # AD-GIT-8 (2026-04-11)
     /// Respects `parents` (prepends `Merge: {parents}\n`) and `body` (appends
     /// when non-empty) for consistency with `render()`.
     pub(crate) fn ensure_rendered(&mut self) {

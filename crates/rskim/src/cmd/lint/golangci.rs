@@ -174,7 +174,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 /// Infer `LintSeverity` from message text and linter name when no explicit
 /// severity field is available (Tier-2 text format).
 ///
-/// # AD-16 (2026-04-11) — severity inference for golangci-lint text output
+/// # AD-LINT-16 (2026-04-11) — severity inference for golangci-lint text output
 ///
 /// golangci-lint's default text format does not include a severity field; the
 /// JSON format does.  In Tier-2 (text), we heuristically infer severity so that

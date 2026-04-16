@@ -620,7 +620,7 @@ fn test_lint_show_stats_reports_tokens() {
 }
 
 // ============================================================================
-// Stdin detection with mode subcommand args (bugfix: AD-26)
+// Stdin detection with mode subcommand args (bugfix: AD-LINT-26)
 //
 // When a user pipes output AND specifies a mode subcommand, e.g.:
 //   cat dprint_fmt_output.txt | skim lint dprint fmt
@@ -630,7 +630,7 @@ fn test_lint_show_stats_reports_tokens() {
 // `args.is_empty()` is true when no file targets remain.
 // ============================================================================
 
-/// AD-26: `dprint fmt` subcommand does not block stdin detection.
+/// AD-LINT-26: `dprint fmt` subcommand does not block stdin detection.
 #[test]
 fn test_dprint_fmt_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/dprint_fmt_output.txt");
@@ -642,7 +642,7 @@ fn test_dprint_fmt_subcommand_with_piped_stdin() {
         .stdout(predicate::str::contains("files formatted"));
 }
 
-/// AD-26: `dprint check` subcommand does not block stdin detection.
+/// AD-LINT-26: `dprint check` subcommand does not block stdin detection.
 #[test]
 fn test_dprint_check_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/dprint_check_fail.txt");
@@ -655,7 +655,7 @@ fn test_dprint_check_subcommand_with_piped_stdin() {
         .stdout(predicate::str::contains("formatting"));
 }
 
-/// AD-26: `ruff format` subcommand does not block stdin detection.
+/// AD-LINT-26: `ruff format` subcommand does not block stdin detection.
 #[test]
 fn test_ruff_format_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_format_pass.txt");
@@ -667,7 +667,7 @@ fn test_ruff_format_subcommand_with_piped_stdin() {
         .stdout(predicate::str::contains("LINT OK"));
 }
 
-/// AD-26: `ruff check` subcommand does not block stdin detection.
+/// AD-LINT-26: `ruff check` subcommand does not block stdin detection.
 #[test]
 fn test_ruff_check_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_fail.json");
@@ -679,7 +679,7 @@ fn test_ruff_check_subcommand_with_piped_stdin() {
         .stdout(predicate::str::contains("LINT:"));
 }
 
-/// AD-26: `biome format` subcommand does not block stdin detection.
+/// AD-LINT-26: `biome format` subcommand does not block stdin detection.
 #[test]
 fn test_biome_format_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/biome_format_fail.txt");
@@ -691,7 +691,7 @@ fn test_biome_format_subcommand_with_piped_stdin() {
         .stdout(predicate::str::contains("LINT:"));
 }
 
-/// AD-26: `biome check` subcommand does not block stdin detection.
+/// AD-LINT-26: `biome check` subcommand does not block stdin detection.
 #[test]
 fn test_biome_check_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/biome_check_fail.json");
@@ -703,7 +703,7 @@ fn test_biome_check_subcommand_with_piped_stdin() {
         .stdout(predicate::str::contains("LINT:"));
 }
 
-/// AD-26: file args after a mode subcommand still trigger binary execution.
+/// AD-LINT-26: file args after a mode subcommand still trigger binary execution.
 ///
 /// `skim lint dprint fmt .` has remaining args=["."] after stripping "fmt",
 /// so `use_stdin` is false and dprint binary is invoked.

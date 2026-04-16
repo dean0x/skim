@@ -7,7 +7,7 @@
 //! - **Tier 2 (Degraded)**: Regex fallback on other output formats
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 //!
-//! # AD-20 (2026-04-15) — check/format split for prettier
+//! # AD-LINT-20 (2026-04-15) — check/format split for prettier
 //!
 //! `prettier --check` detects files that need formatting (existing behaviour).
 //! `prettier --write` (or `-w`) rewrites files and emits one file path per line
@@ -31,7 +31,7 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
     install_hint: "Install prettier via npm: npm install -g prettier",
 };
 
-/// AD-21 (2026-04-15) — Path-aware regex patterns: `.+\S` captures full path including
+/// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: `.+\S` captures full path including
 /// spaces while excluding trailing whitespace. Replaces `\S+` which broke on paths
 /// containing spaces (e.g., `[warn] src/My Component.tsx`).
 static RE_PRETTIER_WARN: LazyLock<Regex> =
@@ -40,12 +40,12 @@ static RE_PRETTIER_WARN: LazyLock<Regex> =
 static RE_PRETTIER_SUMMARY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[warn\]\s+Code style issues found").unwrap());
 
-/// AD-21 (2026-04-15) — Path-aware regex patterns: `.+` replaces `[^\s]+` so that
+/// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: `.+` replaces `[^\s]+` so that
 /// paths with spaces (e.g., `src/My Component.ts needs formatting`) are captured.
 static RE_PRETTIER_FILE_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^(.+\.[a-zA-Z]{1,6})\s+needs? formatting").unwrap());
 
-/// AD-20 (2026-04-15) — format mode: match a file path written by `prettier --write`.
+/// AD-LINT-20 (2026-04-15) — format mode: match a file path written by `prettier --write`.
 ///
 /// A written path is a line containing at least one `.` and a short extension,
 /// with no surrounding structure. We use a simple `^(.+\.[a-zA-Z]{1,6})$` anchored
@@ -112,7 +112,7 @@ fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 }
 
 // ============================================================================
-// Format mode (AD-20)
+// Format mode (AD-LINT-20)
 // ============================================================================
 
 fn run_format(
@@ -145,7 +145,7 @@ fn prepare_format_args(cmd_args: &mut Vec<String>) {
 
 /// Three-tier parse for `prettier --write` output.
 ///
-/// # AD-20 (2026-04-15) — prettier --write output parsing
+/// # AD-LINT-20 (2026-04-15) — prettier --write output parsing
 ///
 /// `prettier --write` prints one reformatted file path per line to stdout:
 /// ```text
@@ -398,7 +398,7 @@ mod tests {
         );
     }
 
-    /// AD-21 (2026-04-15) — Path-aware regex patterns: [warn] lines with spaces in file paths.
+    /// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: [warn] lines with spaces in file paths.
     #[test]
     fn test_tier1_prettier_spaces_in_path() {
         let input = load_fixture("prettier_check_fail_spaces.txt");
@@ -428,7 +428,7 @@ mod tests {
         );
     }
 
-    /// AD-21 (2026-04-15) — Path-aware regex patterns: Tier 2 regex with spaces.
+    /// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: Tier 2 regex with spaces.
     #[test]
     fn test_tier2_prettier_spaces_in_path() {
         let input = "src/My Component.ts needs formatting\nsrc/My Other File.js needs formatting\n";
@@ -442,10 +442,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Format mode tests (AD-20)
+    // Format mode tests (AD-LINT-20)
     // -------------------------------------------------------------------------
 
-    /// AD-20: is_format_mode detects --write flag.
+    /// AD-LINT-20: is_format_mode detects --write flag.
     #[test]
     fn test_is_format_mode_write() {
         let args: Vec<String> = vec!["--write".to_string(), "src/".to_string()];
@@ -464,7 +464,7 @@ mod tests {
         assert!(!is_format_mode(&args));
     }
 
-    /// AD-20: `prettier --write` output — 3 files reformatted.
+    /// AD-LINT-20: `prettier --write` output — 3 files reformatted.
     #[test]
     fn test_prettier_format_write_output_structured() {
         let input = load_fixture("prettier_write_output.txt");
@@ -484,7 +484,7 @@ mod tests {
         );
     }
 
-    /// AD-20: empty stdout on exit 0 = nothing reformatted.
+    /// AD-LINT-20: empty stdout on exit 0 = nothing reformatted.
     #[test]
     fn test_prettier_format_empty_is_pass() {
         let output = CommandOutput {
@@ -504,7 +504,7 @@ mod tests {
         }
     }
 
-    /// AD-20: parse_format_impl on fixture produces Full tier.
+    /// AD-LINT-20: parse_format_impl on fixture produces Full tier.
     #[test]
     fn test_parse_format_impl_fixture_is_full() {
         let input = load_fixture("prettier_write_output.txt");

@@ -111,7 +111,7 @@ mod tests {
         assert!(result.details.is_empty());
     }
 
-    /// AD-12: parse_tier must be propagated so analytics can bucket git log
+    /// AD-GIT-12: parse_tier must be propagated so analytics can bucket git log
     /// invocations by tier. The log parser always succeeds (no fallback tiers),
     /// so every result is tagged `"full"`.
     #[test]
@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(
             result.parse_tier,
             Some("full"),
-            "git log parser must tag parse_tier as 'full' (AD-12)"
+            "git log parser must tag parse_tier as 'full' (AD-GIT-12)"
         );
     }
 }

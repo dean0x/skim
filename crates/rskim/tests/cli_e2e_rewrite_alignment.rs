@@ -325,7 +325,7 @@ fn test_alignment_pip_install_rewrite_and_handler() {
 // Rewrite-to-handler alignment: ACK (already-compact) commands
 // ============================================================================
 
-/// AD-11: `prettier --check` is ACKed — the rewrite echoes the original command
+/// AD-RW-11: `prettier --check` is ACKed — the rewrite echoes the original command
 /// (exit 0) rather than mapping to a handler. Verify this does NOT produce a
 /// `skim lint prettier` string (which would imply a handler invocation).
 #[test]
@@ -352,7 +352,7 @@ fn test_alignment_prettier_check_acked_not_rewritten_to_handler() {
     );
 }
 
-/// AD-11: `rustfmt --check` is ACKed — same semantics as prettier above.
+/// AD-RW-11: `rustfmt --check` is ACKed — same semantics as prettier above.
 #[test]
 fn test_alignment_rustfmt_check_acked_not_rewritten_to_handler() {
     let output = skim_cmd()
@@ -372,7 +372,7 @@ fn test_alignment_rustfmt_check_acked_not_rewritten_to_handler() {
     );
 }
 
-/// AD-11: `cargo fmt --check` is ACKed — added in the evaluator follow-up.
+/// AD-RW-11: `cargo fmt --check` is ACKed — added in the evaluator follow-up.
 #[test]
 fn test_alignment_cargo_fmt_check_acked() {
     let output = skim_cmd()
@@ -392,7 +392,7 @@ fn test_alignment_cargo_fmt_check_acked() {
     );
 }
 
-/// AD-11: `cargo fmt -- --check` is ACKed — pass-through variant.
+/// AD-RW-11: `cargo fmt -- --check` is ACKed — pass-through variant.
 #[test]
 fn test_alignment_cargo_fmt_dashdash_check_acked() {
     let output = skim_cmd()
@@ -408,7 +408,7 @@ fn test_alignment_cargo_fmt_dashdash_check_acked() {
     );
 }
 
-/// AD-13 (tokenization): `skim rewrite '<full command>'` with a single quoted
+/// AD-RW-13 (tokenization): `skim rewrite '<full command>'` with a single quoted
 /// positional arg must tokenize by whitespace the same way stdin input does.
 ///
 /// Regression: previously, positional args were passed through as single
@@ -435,7 +435,7 @@ fn test_alignment_rewrite_single_quoted_string_tokenizes_correctly() {
     );
 }
 
-/// AD-13 (tokenization): same test for `cargo fmt --check` in single-arg form.
+/// AD-RW-13 (tokenization): same test for `cargo fmt --check` in single-arg form.
 #[test]
 fn test_alignment_rewrite_single_quoted_cargo_fmt() {
     let output = skim_cmd()

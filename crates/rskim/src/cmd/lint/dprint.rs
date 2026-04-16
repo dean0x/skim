@@ -7,7 +7,7 @@
 //! - **Tier 2 (Degraded)**: Regex on `from <file>:` diff headers
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 //!
-//! # AD-20 (2026-04-15) — check/format split for dprint
+//! # AD-LINT-20 (2026-04-15) — check/format split for dprint
 //!
 //! `dprint check` lists unformatted files (we inject `--list-different` for
 //! clean output). `dprint fmt` reformats files and emits a summary.
@@ -29,7 +29,7 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
     install_hint: "Install dprint: https://dprint.dev/install/",
 };
 
-/// AD-21 (2026-04-15) — `.+` captures paths with spaces.
+/// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
 static RE_DPRINT_FROM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^from (.+):$").unwrap());
 
 static RE_DPRINT_FORMATTED: LazyLock<Regex> =
@@ -238,7 +238,7 @@ fn try_parse_fmt_output(text: &str) -> Option<LintResult> {
 
 #[cfg(test)]
 mod tests {
-    //! # AD-25 (2026-04-15) — fixture sourcing
+    //! # AD-LINT-25 (2026-04-15) — fixture sourcing
     //!
     //! Fixtures are loaded from `tests/fixtures/cmd/lint/` relative to the
     //! crate manifest directory. Each fixture file is prefixed with a version
@@ -384,10 +384,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // AD-26: stdin detection — subcommand arg stripping
+    // AD-LINT-26: stdin detection — subcommand arg stripping
     // -------------------------------------------------------------------------
 
-    /// AD-26: `prepare_format_args` re-injects "fmt" when absent.
+    /// AD-LINT-26: `prepare_format_args` re-injects "fmt" when absent.
     #[test]
     fn test_prepare_format_args_injects_fmt() {
         let mut cmd_args: Vec<String> = vec![];
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(cmd_args, vec!["fmt".to_string()]);
     }
 
-    /// AD-26: `prepare_format_args` does not duplicate "fmt" when already present.
+    /// AD-LINT-26: `prepare_format_args` does not duplicate "fmt" when already present.
     #[test]
     fn test_prepare_format_args_no_duplicate_fmt() {
         let mut cmd_args: Vec<String> = vec!["fmt".to_string(), "--list-different".to_string()];
@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(cmd_args.iter().filter(|a| *a == "fmt").count(), 1);
     }
 
-    /// AD-26: `prepare_format_args` re-injects "fmt" when only file args remain
+    /// AD-LINT-26: `prepare_format_args` re-injects "fmt" when only file args remain
     /// (i.e., the subcommand was stripped and remaining=["."])
     #[test]
     fn test_prepare_format_args_with_file_arg() {
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(cmd_args[1], ".");
     }
 
-    /// AD-26: `prepare_check_args` re-injects "check" when absent.
+    /// AD-LINT-26: `prepare_check_args` re-injects "check" when absent.
     ///
     /// This covers the case where `run_check` stripped "check" from args
     /// and `remaining` is empty — `prepare_check_args` must restore it.
@@ -426,7 +426,7 @@ mod tests {
         assert!(cmd_args.contains(&"--list-different".to_string()));
     }
 
-    /// AD-26: `prepare_check_args` does not duplicate "check" when already present.
+    /// AD-LINT-26: `prepare_check_args` does not duplicate "check" when already present.
     #[test]
     fn test_prepare_check_args_no_duplicate_check() {
         let mut cmd_args: Vec<String> = vec!["check".to_string()];

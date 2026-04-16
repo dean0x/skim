@@ -7,7 +7,7 @@
 //! - **Tier 2 (Degraded)**: Regex on default text output
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 //!
-//! # AD-20 (2026-04-15) — check/format split for ruff
+//! # AD-LINT-20 (2026-04-15) — check/format split for ruff
 //!
 //! `ruff check` and `ruff format --check` produce structured check output.
 //! `ruff format` (without `--check`) reformats files and emits `Would reformat: <path>`
@@ -35,11 +35,11 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
 static RE_RUFF_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+):(\d+):\d+:\s+(\S+)\s+(.+)").unwrap());
 
-/// AD-20 (2026-04-15) — check/format split: `ruff format` "Would reformat: <path>" line.
+/// AD-LINT-20 (2026-04-15) — check/format split: `ruff format` "Would reformat: <path>" line.
 static RE_RUFF_FORMAT_WOULD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^Would reformat:\s+(.+)$").unwrap());
 
-/// AD-20 (2026-04-15) — check/format split: `ruff format` pass summary line.
+/// AD-LINT-20 (2026-04-15) — check/format split: `ruff format` pass summary line.
 ///
 /// Matches both `"5 files already formatted"` and `"3 files left unchanged"`.
 static RE_RUFF_FORMAT_UNCHANGED: LazyLock<Regex> =
@@ -123,7 +123,7 @@ fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 }
 
 // ============================================================================
-// Format mode (AD-20)
+// Format mode (AD-LINT-20)
 // ============================================================================
 
 fn run_format(
@@ -156,7 +156,7 @@ fn prepare_format_args(cmd_args: &mut Vec<String>) {
 
 /// Three-tier parse for `ruff format [--check]` output.
 ///
-/// # AD-20 (2026-04-15) — ruff format output parsing
+/// # AD-LINT-20 (2026-04-15) — ruff format output parsing
 ///
 /// `ruff format --check` prints:
 /// ```text
@@ -438,10 +438,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Format mode (AD-20)
+    // Format mode (AD-LINT-20)
     // -------------------------------------------------------------------------
 
-    /// AD-20: `ruff format --check` failure — files would be reformatted.
+    /// AD-LINT-20: `ruff format --check` failure — files would be reformatted.
     #[test]
     fn test_ruff_format_check_fail_structured() {
         let input = load_fixture("ruff_format_check_fail.txt");
@@ -459,7 +459,7 @@ mod tests {
         assert!(result.groups.iter().any(|g| g.rule == "formatting"));
     }
 
-    /// AD-20: `ruff format` pass — all files already formatted.
+    /// AD-LINT-20: `ruff format` pass — all files already formatted.
     #[test]
     fn test_ruff_format_pass_structured() {
         let input = load_fixture("ruff_format_pass.txt");
@@ -479,7 +479,7 @@ mod tests {
         );
     }
 
-    /// AD-20: empty output on exit 0 = no files reformatted.
+    /// AD-LINT-20: empty output on exit 0 = no files reformatted.
     #[test]
     fn test_ruff_format_empty_output_is_pass() {
         let output = CommandOutput {
@@ -499,7 +499,7 @@ mod tests {
         }
     }
 
-    /// AD-20: is_format_mode dispatches correctly.
+    /// AD-LINT-20: is_format_mode dispatches correctly.
     #[test]
     fn test_is_format_mode_true() {
         let args: Vec<String> = vec!["format".to_string(), "--check".to_string()];
@@ -518,7 +518,7 @@ mod tests {
         assert!(!is_format_mode(&args));
     }
 
-    /// AD-20: parse_format_impl on fixture produces Full tier.
+    /// AD-LINT-20: parse_format_impl on fixture produces Full tier.
     #[test]
     fn test_parse_format_impl_fail_fixture_is_full() {
         let input = load_fixture("ruff_format_check_fail.txt");
@@ -536,7 +536,7 @@ mod tests {
         );
     }
 
-    /// AD-20: parse_format_impl on pass fixture produces Full tier.
+    /// AD-LINT-20: parse_format_impl on pass fixture produces Full tier.
     #[test]
     fn test_parse_format_impl_pass_fixture_is_full() {
         let input = load_fixture("ruff_format_pass.txt");
@@ -559,10 +559,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // AD-26: stdin detection — subcommand arg stripping
+    // AD-LINT-26: stdin detection — subcommand arg stripping
     // -------------------------------------------------------------------------
 
-    /// AD-26: `prepare_format_args` re-injects "format" when absent.
+    /// AD-LINT-26: `prepare_format_args` re-injects "format" when absent.
     #[test]
     fn test_prepare_format_args_injects_format() {
         let mut cmd_args: Vec<String> = vec![];
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(cmd_args, vec!["format".to_string()]);
     }
 
-    /// AD-26: `prepare_format_args` does not duplicate "format" when already present.
+    /// AD-LINT-26: `prepare_format_args` does not duplicate "format" when already present.
     #[test]
     fn test_prepare_format_args_no_duplicate_format() {
         let mut cmd_args: Vec<String> = vec!["format".to_string(), "--check".to_string()];
@@ -579,7 +579,7 @@ mod tests {
         assert_eq!(cmd_args.iter().filter(|a| *a == "format").count(), 1);
     }
 
-    /// AD-26: `prepare_format_args` re-injects "format" when only file args remain.
+    /// AD-LINT-26: `prepare_format_args` re-injects "format" when only file args remain.
     #[test]
     fn test_prepare_format_args_with_file_arg() {
         let mut cmd_args: Vec<String> = vec!["src/".to_string()];
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(cmd_args[1], "src/");
     }
 
-    /// AD-26: `prepare_check_args` re-injects "check" when absent.
+    /// AD-LINT-26: `prepare_check_args` re-injects "check" when absent.
     #[test]
     fn test_prepare_check_args_injects_check() {
         let mut cmd_args: Vec<String> = vec![];
@@ -597,7 +597,7 @@ mod tests {
         assert!(cmd_args.contains(&"--output-format".to_string()));
     }
 
-    /// AD-26: `prepare_check_args` does not duplicate "check" when already present.
+    /// AD-LINT-26: `prepare_check_args` does not duplicate "check" when already present.
     #[test]
     fn test_prepare_check_args_no_duplicate_check() {
         let mut cmd_args: Vec<String> = vec!["check".to_string()];

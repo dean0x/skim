@@ -1,6 +1,6 @@
 //! npm audit parser.
 //!
-//! # AD-18 (2026-04-11) — advisory ID extraction mirrors `cargo audit`
+//! # AD-PKG-18 (2026-04-11) — advisory ID extraction mirrors `cargo audit`
 //!
 //! `cargo audit` includes GHSA/RUSTSEC IDs in its details (see `pkg/cargo.rs`).
 //! npm audit details previously omitted IDs, making it impossible to look up
@@ -314,7 +314,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Advisory ID extraction tests (AD-18, 2026-04-11)
+    // Advisory ID extraction tests (AD-PKG-18, 2026-04-11)
     // ========================================================================
 
     #[test]

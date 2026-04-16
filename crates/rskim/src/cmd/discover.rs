@@ -253,7 +253,7 @@ fn classify_bash_command(command: &str) -> Option<BashCommandInfo> {
     }
 
     // `classify_command` is the single source of truth for rewrite eligibility.
-    // Using the tri-state API (AD-2) means AlreadyCompact commands (e.g.,
+    // Using the tri-state API (AD-RW-2) means AlreadyCompact commands (e.g.,
     // `git worktree list`) are treated as "has_rewrite = true" — discover stops
     // flagging them as gaps even though no handler rewrites them.
     //
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn test_would_rewrite_lint_and_infra_tools() {
-        // AD-11: prettier --check and rustfmt --check are now acknowledged as
+        // AD-RW-11: prettier --check and rustfmt --check are now acknowledged as
         // already-compact. would_rewrite returns None (not Rewritten) for them.
         assert!(
             would_rewrite("prettier --check .").is_none(),
@@ -766,7 +766,7 @@ mod tests {
 
     /// `AlreadyCompact` commands (acknowledged as near-optimal by skim) must be
     /// reported as `has_rewrite = true` with `rewrite_target = None` so that
-    /// `discover` does not flag them as compression gaps (testing-7 / AD-2).
+    /// `discover` does not flag them as compression gaps (testing-7 / AD-RW-2).
     #[test]
     fn test_classify_bash_already_compact_commands() {
         // `git worktree list` is acknowledged compact — output is already minimal.

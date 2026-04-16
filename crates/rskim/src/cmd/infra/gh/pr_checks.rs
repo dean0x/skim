@@ -26,7 +26,7 @@
 //! X  CI / lint   1m5s   https://...
 //! ```
 //!
-//! # AD-15 (2026-04-11) — URL surfacing for failing checks
+//! # AD-INFRA-15 (2026-04-11) — URL surfacing for failing checks
 //!
 //! URLs are included in the item value **only for failing checks**
 //! (`fail`/`failure` status). Passing checks do not need a URL because

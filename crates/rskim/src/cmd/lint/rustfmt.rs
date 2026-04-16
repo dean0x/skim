@@ -7,8 +7,8 @@
 //! - **Tier 2 (Degraded)**: Regex on unified diff `--- <path>` headers
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 //!
-//! # AD-20 (2026-04-15) — check/format split for rustfmt
-//! # AD-26 (2026-04-15) — safe default: check mode unless --format/-f is explicit
+//! # AD-LINT-20 (2026-04-15) — check/format split for rustfmt
+//! # AD-LINT-26 (2026-04-15) — safe default: check mode unless --format/-f is explicit
 //!
 //! `rustfmt --check` (or `cargo fmt --check`) produces diff output for files
 //! that need reformatting (existing behaviour, `run_check`).
@@ -44,7 +44,7 @@ static RE_RUSTFMT_UNIFIED_HEADER: LazyLock<Regex> =
 /// Returns true when the user explicitly passed `--format` or `-f` to indicate
 /// format (apply) mode.
 ///
-/// # AD-26 (2026-04-15) — safe default for rustfmt dispatch
+/// # AD-LINT-26 (2026-04-15) — safe default for rustfmt dispatch
 ///
 /// The old implementation (`!user_has_flag(args, &["--check"])`) treated bare
 /// invocation (no args) as format mode, which causes rustfmt to rewrite files in
@@ -114,7 +114,7 @@ fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 }
 
 // ============================================================================
-// Format mode (AD-20)
+// Format mode (AD-LINT-20)
 // ============================================================================
 
 fn run_format(
@@ -129,7 +129,7 @@ fn prepare_format_args(_cmd_args: &mut Vec<String>) {}
 
 /// Parse for `rustfmt` (format/apply mode) output.
 ///
-/// # AD-20 (2026-04-15) — rustfmt format mode
+/// # AD-LINT-20 (2026-04-15) — rustfmt format mode
 ///
 /// Bare `rustfmt` / `cargo fmt` rewrites files silently on success. Output is
 /// typically empty on success. On error (e.g., parse error), rustfmt emits
@@ -156,7 +156,7 @@ fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 
 /// Parse rustfmt `--check` output by scanning `Diff in <path> at line <N>:` headers.
 ///
-/// # AD-17 (2026-04-11) — line-number inclusion in rustfmt location messages
+/// # AD-LINT-17 (2026-04-11) — line-number inclusion in rustfmt location messages
 ///
 /// The Tier-1 parse extracts the exact line number from the `Diff in <path> at
 /// line <N>:` header and embeds it in the message string as
@@ -371,10 +371,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Format mode tests (AD-20, AD-26)
+    // Format mode tests (AD-LINT-20, AD-LINT-26)
     // -------------------------------------------------------------------------
 
-    /// AD-26: bare invocation (no args) must default to check mode, not format.
+    /// AD-LINT-26: bare invocation (no args) must default to check mode, not format.
     /// Bare `skim lint rustfmt` must never rewrite files without an explicit flag.
     #[test]
     fn test_is_format_mode_bare_args_is_false() {
@@ -385,7 +385,7 @@ mod tests {
         );
     }
 
-    /// AD-26: file-only args (no format flag) must also default to check mode.
+    /// AD-LINT-26: file-only args (no format flag) must also default to check mode.
     #[test]
     fn test_is_format_mode_with_files_only_is_false() {
         let args: Vec<String> = vec!["src/main.rs".to_string()];
@@ -395,14 +395,14 @@ mod tests {
         );
     }
 
-    /// AD-26: --check flag keeps check mode.
+    /// AD-LINT-26: --check flag keeps check mode.
     #[test]
     fn test_is_format_mode_false_when_check_present() {
         let args: Vec<String> = vec!["--check".to_string(), "src/main.rs".to_string()];
         assert!(!is_format_mode(&args));
     }
 
-    /// AD-26: --format flag is the explicit opt-in for format mode.
+    /// AD-LINT-26: --format flag is the explicit opt-in for format mode.
     #[test]
     fn test_is_format_mode_true_with_format_flag() {
         let args: Vec<String> = vec!["--format".to_string(), "src/main.rs".to_string()];
@@ -412,7 +412,7 @@ mod tests {
         );
     }
 
-    /// AD-26: -f short flag is the explicit opt-in for format mode.
+    /// AD-LINT-26: -f short flag is the explicit opt-in for format mode.
     #[test]
     fn test_is_format_mode_true_with_short_flag() {
         let args: Vec<String> = vec!["-f".to_string(), "src/main.rs".to_string()];
@@ -422,7 +422,7 @@ mod tests {
         );
     }
 
-    /// AD-20: empty output on exit 0 = successful format run.
+    /// AD-LINT-20: empty output on exit 0 = successful format run.
     #[test]
     fn test_rustfmt_format_empty_output_is_pass() {
         let output = CommandOutput {
@@ -448,7 +448,7 @@ mod tests {
         }
     }
 
-    /// AD-20: non-zero exit = syntax error → passthrough.
+    /// AD-LINT-20: non-zero exit = syntax error → passthrough.
     #[test]
     fn test_rustfmt_format_error_is_passthrough() {
         let output = CommandOutput {

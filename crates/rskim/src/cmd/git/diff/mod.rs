@@ -11,7 +11,7 @@ mod source;
 pub(super) mod types;
 
 // Re-export for show.rs (sibling of diff/ within cmd/git/).
-// AD-6: Raising visibility to pub(in crate::cmd::git) enables show.rs to
+// AD-GIT-6: Raising visibility to pub(in crate::cmd::git) enables show.rs to
 // reuse the diff pipeline without duplicating parsing or rendering logic.
 pub(in crate::cmd::git) use parse::parse_unified_diff;
 pub(in crate::cmd::git) use render::render_diff_file;
@@ -47,7 +47,7 @@ pub(in crate::cmd::git) const PARALLEL_THRESHOLD: usize = 5;
 /// - `Structure`: Unchanged nodes are shown as signatures (`{ /* ... */ }`).
 /// - `Full`: Unchanged nodes are shown in full.
 ///
-/// DESIGN NOTE (AD-6): visibility widened to `pub(in crate::cmd::git)` so that
+/// DESIGN NOTE (AD-GIT-6): visibility widened to `pub(in crate::cmd::git)` so that
 /// `show.rs` can specify the render mode when reusing `render_diff_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::cmd::git) enum DiffMode {

@@ -121,7 +121,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
-    // DESIGN NOTE (AD-4, extended 2026-04-11): `--stat`, `--name-only` removed
+    // DESIGN NOTE (AD-RW-4, extended 2026-04-11): `--stat`, `--name-only` removed
     // from skip list. These are Group B flags (already-compact output).
     // Removing them allows `git diff --stat` and `git diff --name-only` to
     // flow through to the handler's passthrough branch. The handler's
@@ -130,7 +130,7 @@ const GIT_RULES: &[RewriteRule] = &[
     // fixes the `--staged` collision (previously eaten by loose `--stat`
     // prefix matching).
     //
-    // Extension (AD-11, see rewrite/acknowledge.rs): lint tools whose raw
+    // Extension (AD-RW-11, see rewrite/acknowledge.rs): lint tools whose raw
     // output is already minimal (`prettier --check`, `rustfmt --check`,
     // `cargo fmt --check`) are acknowledged via ACK prefix patterns in
     // acknowledge.rs and short-circuit before the rule table. The prettier
@@ -151,7 +151,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--dry-run", "-q", "--quiet"],
         category: RewriteCategory::Git,
     },
-    // DESIGN NOTE (AD-4): `--format` and `--pretty` removed from skip list.
+    // DESIGN NOTE (AD-RW-4): `--format` and `--pretty` removed from skip list.
     // The log handler (log.rs) already detects these flags and calls
     // `run_passthrough`, so users see raw git output. Removing them from
     // the skip list means the rewrite rule fires and the handler decides.
@@ -161,17 +161,17 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
     },
-    // git show — new rule (AD-5, updated 2026-04-11)
+    // git show — new rule (AD-GIT-5, updated 2026-04-11)
     //
     // Handles `git show <hash>`, `git show <hash>:<path>`, and defaults.
     // The handler (cmd/git/show.rs) dispatches to commit-mode or
     // file-content-mode based on argument shape.
     //
-    // As of AD-8 (see show.rs), the commit-mode path preserves the full
+    // As of AD-GIT-8 (see show.rs), the commit-mode path preserves the full
     // commit message body AND `Merge: p1 p2` parent lines via the structured
     // `body: String` and `parents: Option<String>` fields on `CommitHeader`.
     // Earlier versions dropped both, which was corrected in the PR that
-    // bundles this AD-5 update with the AD-8 body/parents-preservation work.
+    // bundles this AD-GIT-5 update with the AD-GIT-8 body/parents-preservation work.
     RewriteRule {
         prefix: &["git", "show"],
         rewrite_to: &["skim", "git", "show"],
@@ -200,7 +200,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     // ruff (longest prefix first)
     //
-    // AD-20 (2026-04-15): `ruff format --check` and `ruff format` (apply mode)
+    // AD-LINT-20 (2026-04-15): `ruff format --check` and `ruff format` (apply mode)
     // are routed through the format-mode parse path in ruff.rs. The ruff parser
     // detects `is_format_mode` from the first user argument (`"format"`).
     RewriteRule {
@@ -261,7 +261,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     // prettier (longest prefix first: npx prettier, prettier)
     //
-    // AD-20 (2026-04-15): `prettier --write` and `-w` are routed through the
+    // AD-LINT-20 (2026-04-15): `prettier --write` and `-w` are routed through the
     // format-mode parse path in prettier.rs. `is_format_mode` detects `--write`
     // or `-w` in the user arguments. Check-mode rules unchanged.
     RewriteRule {

@@ -109,7 +109,7 @@ pub(super) fn try_table_match(
         // Check skip_if_flag_prefix: if any middle arg exactly matches a skip flag
         // (or matches as `--flag=value`).
         //
-        // DESIGN NOTE (AD-1): We use strict matching here — `arg == flag` or
+        // DESIGN NOTE (AD-RW-1): We use strict matching here — `arg == flag` or
         // `arg.starts_with(flag) && next_byte == b'='` — which mirrors
         // `cmd::mod::user_has_flag`. The previous loose `starts_with` check
         // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
@@ -392,17 +392,17 @@ mod tests {
     }
 
     // ========================================================================
-    // Strict flag matching (AD-1 hygiene)
+    // Strict flag matching (AD-RW-1 hygiene)
     // ========================================================================
 
     /// Regression: `--staged` must NOT be eaten by a `--stat` skip prefix.
     ///
     /// With the old loose `starts_with` check, `"--staged".starts_with("--stat")`
     /// returned `true`, silently blocking the AST-aware diff pipeline for staged
-    /// changes. The strict-match fix (AD-1) resolves this.
+    /// changes. The strict-match fix (AD-RW-1) resolves this.
     #[test]
     fn test_staged_not_eaten_by_stat_prefix() {
-        // After skip-list trim (AD-4), `--stat` is no longer in the git diff
+        // After skip-list trim (AD-RW-4), `--stat` is no longer in the git diff
         // skip list, so `--staged` rewrites regardless. This test also verifies
         // that the strict engine itself would not eat `--staged` even if
         // `--stat` were still in the list.
@@ -470,10 +470,10 @@ mod tests {
     }
 
     // ========================================================================
-    // Glued short-flag behavior (regression-1 / AD-1 side effect)
+    // Glued short-flag behavior (regression-1 / AD-RW-1 side effect)
     // ========================================================================
 
-    /// Strict-match fix (AD-1) side effect: glued short flags like `-qverbose`
+    /// Strict-match fix (AD-RW-1) side effect: glued short flags like `-qverbose`
     /// do NOT match the skip prefix `-q` (strict match requires exact equality or
     /// `flag=value`).  This means `git fetch -qverbose` is NOT suppressed by the
     /// `-q` skip rule — it rewrites, passing `-qverbose` through to the skim

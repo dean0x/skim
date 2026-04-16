@@ -8,7 +8,7 @@
 //! - **Tier 2 (Degraded)**: Regex on text output (`file:line:col rule`)
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
 //!
-//! # AD-24 (2026-04-15) — Biome dual-mode routing
+//! # AD-LINT-24 (2026-04-15) — Biome dual-mode routing
 //!
 //! Biome's first positional argument is the subcommand: `check`, `format`, or
 //! `lint`. `format` mode parses file-list output. `check` and `lint` modes
@@ -36,7 +36,7 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
     install_hint: "Install biome: npm install -g @biomejs/biome",
 };
 
-/// AD-21 (2026-04-15) — `.+` captures paths with spaces.
+/// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
 static RE_BIOME_TEXT_DIAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+):(\d+):\d+\s+(\S+)").unwrap());
 
@@ -58,7 +58,7 @@ fn is_biome_subcommand(s: &str) -> bool {
 
 /// Run `skim lint biome [args...]`.
 ///
-/// # AD-24 (2026-04-15) — Biome dual-mode routing
+/// # AD-LINT-24 (2026-04-15) — Biome dual-mode routing
 ///
 /// Dispatches to `run_format` or `run_check` based on the first argument.
 /// `format` → format path. `check`, `lint`, or no subcommand → check/lint path.
@@ -327,7 +327,7 @@ fn try_parse_format_structured(text: &str) -> Option<LintResult> {
 
 #[cfg(test)]
 mod tests {
-    //! # AD-25 (2026-04-15) — fixture sourcing
+    //! # AD-LINT-25 (2026-04-15) — fixture sourcing
     //!
     //! Fixtures are loaded from `tests/fixtures/cmd/lint/` relative to the
     //! crate manifest directory. JSON fixtures are documented in test function
@@ -475,10 +475,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // AD-26: stdin detection — subcommand arg stripping
+    // AD-LINT-26: stdin detection — subcommand arg stripping
     // -------------------------------------------------------------------------
 
-    /// AD-26: `prepare_format_args` re-injects "format" when absent.
+    /// AD-LINT-26: `prepare_format_args` re-injects "format" when absent.
     #[test]
     fn test_prepare_format_args_injects_format() {
         let mut cmd_args: Vec<String> = vec![];
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(cmd_args, vec!["format".to_string()]);
     }
 
-    /// AD-26: `prepare_format_args` does not duplicate "format" when already present.
+    /// AD-LINT-26: `prepare_format_args` does not duplicate "format" when already present.
     #[test]
     fn test_prepare_format_args_no_duplicate_format() {
         let mut cmd_args: Vec<String> = vec!["format".to_string(), "--write".to_string()];
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(cmd_args.iter().filter(|a| *a == "format").count(), 1);
     }
 
-    /// AD-26: `prepare_format_args` re-injects "format" when only file args remain.
+    /// AD-LINT-26: `prepare_format_args` re-injects "format" when only file args remain.
     #[test]
     fn test_prepare_format_args_with_file_arg() {
         let mut cmd_args: Vec<String> = vec!["src/".to_string()];
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(cmd_args[1], "src/");
     }
 
-    /// AD-26: `prepare_check_args` re-injects "check" when absent.
+    /// AD-LINT-26: `prepare_check_args` re-injects "check" when absent.
     #[test]
     fn test_prepare_check_args_injects_check() {
         let mut cmd_args: Vec<String> = vec![];
@@ -513,7 +513,7 @@ mod tests {
         assert!(cmd_args.iter().any(|a| a.starts_with("--reporter")));
     }
 
-    /// AD-26: `prepare_check_args` does not duplicate "check" when already present.
+    /// AD-LINT-26: `prepare_check_args` does not duplicate "check" when already present.
     #[test]
     fn test_prepare_check_args_no_duplicate_check() {
         let mut cmd_args: Vec<String> = vec!["check".to_string()];

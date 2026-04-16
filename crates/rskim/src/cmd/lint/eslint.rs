@@ -30,7 +30,7 @@ static RE_ESLINT_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s+(\d+):\d+\s+(error|warning)\s+(.+?)\s{2,}(\S+)\s*$").unwrap()
 });
 
-/// AD-21 (2026-04-15) — Path-aware regex patterns: `.+` replaces `[^\s]+` so that
+/// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: `.+` replaces `[^\s]+` so that
 /// paths with spaces (e.g., `/home/user/my project/src/auth handler.ts`) are captured.
 /// `.+\S` requires the path ends with a non-whitespace character, preventing
 /// over-matching of lines with trailing whitespace (mirrors `RE_PRETTIER_WARN`).
@@ -269,7 +269,7 @@ mod tests {
         );
     }
 
-    /// AD-21 (2026-04-15) — Path-aware regex patterns: file paths with spaces.
+    /// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: file paths with spaces.
     #[test]
     fn test_tier2_eslint_spaces_in_path() {
         let input = load_fixture("eslint_text_spaces.txt");
