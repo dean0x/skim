@@ -339,7 +339,7 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
             .iter()
             .filter(|r| r.could_skim)
             .collect();
-        sorted_reads.sort_by(|a, b| b.result_tokens.cmp(&a.result_tokens));
+        sorted_reads.sort_by_key(|r| std::cmp::Reverse(r.result_tokens));
         println!("  Top files by token count:");
         for read in sorted_reads.iter().take(10) {
             println!("    {} ({} tokens)", read.file_path, read.result_tokens);
