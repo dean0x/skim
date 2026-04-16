@@ -22,20 +22,10 @@ const CONFIG: FileToolConfig<'static> = FileToolConfig {
 /// Run `skim file grep [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for grep -- flags are too varied
-    run_file_tool(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        |_| {},
-        parse_impl,
-    )
+    run_file_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Two-tier parse function: Tier 1 regex -> Passthrough.

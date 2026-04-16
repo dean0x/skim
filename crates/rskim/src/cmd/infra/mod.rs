@@ -43,13 +43,17 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let analytics_enabled = analytics.enabled;
+    let ctx = super::RunContext {
+        show_stats,
+        json_output,
+        analytics_enabled: analytics.enabled,
+    };
 
     match tool_name.as_str() {
-        "aws" => aws::run(tool_args, show_stats, json_output, analytics_enabled),
-        "curl" => curl::run(tool_args, show_stats, json_output, analytics_enabled),
-        "gh" => gh::run(tool_args, show_stats, json_output, analytics_enabled),
-        "wget" => wget::run(tool_args, show_stats, json_output, analytics_enabled),
+        "aws" => aws::run(tool_args, &ctx),
+        "curl" => curl::run(tool_args, &ctx),
+        "gh" => gh::run(tool_args, &ctx),
+        "wget" => wget::run(tool_args, &ctx),
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(
@@ -112,9 +116,7 @@ pub(crate) struct InfraToolConfig<'a> {
 pub(crate) fn run_infra_tool(
     config: InfraToolConfig<'_>,
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &super::RunContext,
     prepare_args: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<InfraResult>,
 ) -> anyhow::Result<ExitCode> {
@@ -122,7 +124,7 @@ pub(crate) fn run_infra_tool(
     prepare_args(&mut cmd_args);
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-    let output_format = if json_output {
+    let output_format = if ctx.json_output {
         OutputFormat::Json
     } else {
         OutputFormat::Text
@@ -135,10 +137,10 @@ pub(crate) fn run_infra_tool(
             env_overrides: config.env_overrides,
             install_hint: config.install_hint,
             use_stdin,
-            show_stats,
+            show_stats: ctx.show_stats,
             command_type: crate::analytics::CommandType::Infra,
             output_format,
-            analytics_enabled,
+            analytics_enabled: ctx.analytics_enabled,
         },
         |output, _args| parse_fn(output),
     )

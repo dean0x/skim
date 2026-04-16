@@ -72,9 +72,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
 /// Run `skim infra gh [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
     let action = args.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -83,45 +81,35 @@ pub(crate) fn run(
         ("issue", "view") => run_infra_tool(
             CONFIG,
             args,
-            show_stats,
-            json_output,
-            analytics_enabled,
+            ctx,
             issue_view::prepare_args,
             issue_view::parse_impl,
         ),
         ("pr", "view") => run_infra_tool(
             CONFIG,
             args,
-            show_stats,
-            json_output,
-            analytics_enabled,
+            ctx,
             pr_view::prepare_args,
             pr_view::parse_impl,
         ),
         ("pr", "checks") => run_infra_tool(
             CONFIG,
             args,
-            show_stats,
-            json_output,
-            analytics_enabled,
+            ctx,
             pr_checks::prepare_args,
             pr_checks::parse_impl,
         ),
         ("run", "view") => run_infra_tool(
             CONFIG,
             args,
-            show_stats,
-            json_output,
-            analytics_enabled,
+            ctx,
             run_view::prepare_args,
             run_view::parse_impl,
         ),
         _ => run_infra_tool(
             CONFIG,
             args,
-            show_stats,
-            json_output,
-            analytics_enabled,
+            ctx,
             list::prepare_args,
             parse_impl_with_auto_detect,
         ),

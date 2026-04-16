@@ -53,20 +53,24 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let analytics_enabled = analytics.enabled;
+    let ctx = super::RunContext {
+        show_stats,
+        json_output,
+        analytics_enabled: analytics.enabled,
+    };
 
     match linter_name.as_str() {
-        "biome" => biome::run(linter_args, show_stats, json_output, analytics_enabled),
-        "black" => black::run(linter_args, show_stats, json_output, analytics_enabled),
-        "dprint" => dprint::run(linter_args, show_stats, json_output, analytics_enabled),
-        "eslint" => eslint::run(linter_args, show_stats, json_output, analytics_enabled),
-        "gofmt" => gofmt::run(linter_args, show_stats, json_output, analytics_enabled),
-        "golangci" => golangci::run(linter_args, show_stats, json_output, analytics_enabled),
-        "mypy" => mypy::run(linter_args, show_stats, json_output, analytics_enabled),
-        "oxlint" => oxlint::run(linter_args, show_stats, json_output, analytics_enabled),
-        "prettier" => prettier::run(linter_args, show_stats, json_output, analytics_enabled),
-        "ruff" => ruff::run(linter_args, show_stats, json_output, analytics_enabled),
-        "rustfmt" => rustfmt::run(linter_args, show_stats, json_output, analytics_enabled),
+        "biome" => biome::run(linter_args, &ctx),
+        "black" => black::run(linter_args, &ctx),
+        "dprint" => dprint::run(linter_args, &ctx),
+        "eslint" => eslint::run(linter_args, &ctx),
+        "gofmt" => gofmt::run(linter_args, &ctx),
+        "golangci" => golangci::run(linter_args, &ctx),
+        "mypy" => mypy::run(linter_args, &ctx),
+        "oxlint" => oxlint::run(linter_args, &ctx),
+        "prettier" => prettier::run(linter_args, &ctx),
+        "ruff" => ruff::run(linter_args, &ctx),
+        "rustfmt" => rustfmt::run(linter_args, &ctx),
         linter => {
             let safe_linter = crate::cmd::sanitize_for_display(linter);
             eprintln!(
@@ -140,9 +144,7 @@ pub(crate) struct LinterConfig<'a> {
 pub(crate) fn run_linter(
     config: LinterConfig<'_>,
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &super::RunContext,
     prepare_args: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<LintResult>,
 ) -> anyhow::Result<ExitCode> {
@@ -150,7 +152,7 @@ pub(crate) fn run_linter(
     prepare_args(&mut cmd_args);
 
     let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
-    let output_format = if json_output {
+    let output_format = if ctx.json_output {
         OutputFormat::Json
     } else {
         OutputFormat::Text
@@ -163,10 +165,10 @@ pub(crate) fn run_linter(
             env_overrides: config.env_overrides,
             install_hint: config.install_hint,
             use_stdin,
-            show_stats,
+            show_stats: ctx.show_stats,
             command_type: crate::analytics::CommandType::Lint,
             output_format,
-            analytics_enabled,
+            analytics_enabled: ctx.analytics_enabled,
         },
         |output, _args| parse_fn(output),
     )

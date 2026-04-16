@@ -31,19 +31,9 @@ static RE_GOLANGCI_LINE: LazyLock<Regex> =
 /// Run `skim lint golangci [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Ensure "run" subcommand is present and inject `--out-format json`.

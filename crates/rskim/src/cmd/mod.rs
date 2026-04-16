@@ -154,6 +154,17 @@ pub(crate) enum OutputFormat {
     Json,
 }
 
+/// Cross-cutting configuration for subcommand execution.
+///
+/// Bundles the three boolean flags that every family dispatcher receives
+/// identically, reducing the 4-parameter `(args, show_stats, json_output,
+/// analytics_enabled)` signature to `(args, ctx)` at every call boundary.
+pub(crate) struct RunContext {
+    pub show_stats: bool,
+    pub json_output: bool,
+    pub analytics_enabled: bool,
+}
+
 /// Configuration for running an external command with parsed output.
 ///
 /// Groups the cross-cutting parameters for [`run_parsed_command_with_mode`]

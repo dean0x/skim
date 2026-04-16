@@ -53,32 +53,20 @@ fn is_format_mode(args: &[String]) -> bool {
 /// Run `skim lint black [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     if is_format_mode(args) {
-        run_format(args, show_stats, json_output, analytics_enabled)
+        run_format(args, ctx)
     } else {
-        run_check(args, show_stats, json_output, analytics_enabled)
+        run_check(args, ctx)
     }
 }
 
 fn run_check(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_check_args,
-        parse_check_impl,
-    )
+    super::run_linter(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
 }
 
 /// Inject `--check` if no mode flag is present.
@@ -113,19 +101,9 @@ fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 
 fn run_format(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_format_args,
-        parse_format_impl,
-    )
+    super::run_linter(CONFIG, args, ctx, prepare_format_args, parse_format_impl)
 }
 
 /// Pass args through unchanged for format mode.

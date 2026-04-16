@@ -32,19 +32,9 @@ static RE_MYPY_LINE: LazyLock<Regex> = LazyLock::new(|| {
 /// Run `skim lint mypy [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--output json` if not already present.

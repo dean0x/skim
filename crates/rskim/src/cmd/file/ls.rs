@@ -62,30 +62,12 @@ static RE_TREE_ENTRY: LazyLock<Regex> =
 /// `tool_name` is either "ls" or "tree", passed by the dispatcher.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
+    ctx: &crate::cmd::RunContext,
     tool_name: &str,
-    analytics_enabled: bool,
 ) -> anyhow::Result<std::process::ExitCode> {
     match tool_name {
-        "tree" => run_file_tool(
-            CONFIG_TREE,
-            args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            prepare_tree_args,
-            parse_tree,
-        ),
-        _ => run_file_tool(
-            CONFIG_LS,
-            args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            |_| {},
-            parse_ls,
-        ),
+        "tree" => run_file_tool(CONFIG_TREE, args, ctx, prepare_tree_args, parse_tree),
+        _ => run_file_tool(CONFIG_LS, args, ctx, |_| {}, parse_ls),
     }
 }
 

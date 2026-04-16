@@ -43,22 +43,18 @@ fn is_format_mode(args: &[String]) -> bool {
 /// Run `skim lint dprint [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     if is_format_mode(args) {
-        run_format(args, show_stats, json_output, analytics_enabled)
+        run_format(args, ctx)
     } else {
-        run_check(args, show_stats, json_output, analytics_enabled)
+        run_check(args, ctx)
     }
 }
 
 fn run_check(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "check" subcommand so that stdin is detected when no
     // file args remain (e.g., `cat output.txt | skim lint dprint check`).
@@ -71,9 +67,7 @@ fn run_check(
     super::run_linter(
         CONFIG,
         &remaining,
-        show_stats,
-        json_output,
-        analytics_enabled,
+        ctx,
         prepare_check_args,
         parse_check_impl,
     )
@@ -117,9 +111,7 @@ fn parse_check_impl(output: &CommandOutput) -> ParseResult<LintResult> {
 
 fn run_format(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "fmt" subcommand so that stdin is detected when no
     // file args remain (e.g., `cat output.txt | skim lint dprint fmt`).
@@ -128,9 +120,7 @@ fn run_format(
     super::run_linter(
         CONFIG,
         &remaining,
-        show_stats,
-        json_output,
-        analytics_enabled,
+        ctx,
         prepare_format_args,
         parse_format_impl,
     )

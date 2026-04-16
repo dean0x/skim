@@ -35,19 +35,9 @@ static RE_OXLINT_RULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^  [×⚠
 /// Run `skim lint oxlint [args...]`.
 pub(crate) fn run(
     args: &[String],
-    show_stats: bool,
-    json_output: bool,
-    analytics_enabled: bool,
+    ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(
-        CONFIG,
-        args,
-        show_stats,
-        json_output,
-        analytics_enabled,
-        prepare_args,
-        parse_impl,
-    )
+    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--format=json` if no `--format` flag is present.
