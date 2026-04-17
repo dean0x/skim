@@ -63,9 +63,15 @@ const BINARY_NON_ASCII_FRACTION: f64 = 0.30;
 // Public parse entry point
 // ============================================================================
 
-/// Placeholder `prepare_args` — `gh api` doesn't need `--json` injection.
-pub(super) fn prepare_args(_cmd_args: &mut Vec<String>) {
-    // Nothing to inject for gh api.
+/// Prepend the `api` subcommand so the spawned command is `gh api [args]`.
+///
+/// Called by `run_infra_tool` with the args slice _after_ the `"api"` token
+/// has been stripped (see the `("api", _)` arm in `gh/mod.rs`).  We insert
+/// `"api"` at position 0 so that the runner executes `gh api <endpoint>`,
+/// not `gh <endpoint>`.  Stripping `"api"` before passing args allows
+/// `run_infra_tool` to detect piped-stdin mode via `args.is_empty()`.
+pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
+    cmd_args.insert(0, "api".to_string());
 }
 
 /// Three-tier parse function for `gh api` output.
@@ -531,5 +537,68 @@ mod tests {
         assert_eq!(base64_decoded_len("aGVsbG8="), 5); // "hello"
         assert_eq!(base64_decoded_len("aGVsbG8gd29ybGQ="), 11); // "hello world"
         assert_eq!(base64_decoded_len(""), 0);
+    }
+
+    // ---- prepare_args: api subcommand prepend ----
+
+    #[test]
+    fn test_prepare_args_prepends_api_to_empty_args() {
+        // When called with an empty vec (pipe-mode: no endpoint), "api" must
+        // be prepended so that the spawned child receives `gh api`.
+        let mut args: Vec<String> = vec![];
+        prepare_args(&mut args);
+        assert_eq!(args, vec!["api".to_string()]);
+    }
+
+    #[test]
+    fn test_prepare_args_prepends_api_before_endpoint() {
+        // When an endpoint is provided, "api" must come first.
+        let mut args: Vec<String> = vec!["/repos/foo/bar".to_string()];
+        prepare_args(&mut args);
+        assert_eq!(
+            args,
+            vec!["api".to_string(), "/repos/foo/bar".to_string()]
+        );
+    }
+
+    // ---- pipe-mode parse (simulates `gh api ... | skim infra gh api`) ----
+
+    #[test]
+    fn test_parse_impl_accepts_piped_json_object() {
+        // Mirrors the Tester's scenario:
+        //   echo '{"login": "foo", "id": 42}' | skim infra gh api
+        //
+        // The dispatcher reads stdin into CommandOutput.stdout and calls
+        // parse_impl.  The result must be Full (not Passthrough) and exit 0.
+        let json = r#"{"login": "foo", "id": 42}"#;
+        let output = make_output(json);
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "piped JSON object must parse as Full, got {}",
+            result.tier_name()
+        );
+        match result {
+            ParseResult::Full(r) => {
+                assert!(
+                    r.items.iter().any(|i| i.label == "login"),
+                    "expected 'login' field in parsed output"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_impl_accepts_piped_json_array() {
+        // Validates array piped input via stdin.
+        let json = r#"[{"id": 1, "name": "repo-a"}, {"id": 2, "name": "repo-b"}]"#;
+        let output = make_output(json);
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "piped JSON array must parse as Full, got {}",
+            result.tier_name()
+        );
     }
 }

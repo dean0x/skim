@@ -642,3 +642,91 @@ fn test_subcommand_infra_gh_existing_list_unchanged() {
         "Regression: existing list fixture should produce 'gh list', got: {stdout}"
     );
 }
+
+// ============================================================================
+// Gap fixes: piped stdin for `gh run watch` and `gh api` (v2.5.1)
+// ============================================================================
+
+#[test]
+fn test_subcommand_infra_gh_run_watch_pipe_exits_clean() {
+    // Mirrors the Tester's scenario:
+    //   printf "workflow step 1\nworkflow step 2\ncompleted\n" | skim infra gh run watch
+    //
+    // None of the lines match job-status patterns, so no output is produced
+    // but the process must exit 0 (clean finalize on empty state).
+    let output = skim_cmd()
+        .args(["infra", "gh", "run", "watch"])
+        .write_stdin("workflow step 1\nworkflow step 2\ncompleted\n")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "gh run watch pipe mode must exit 0, got: {:?}",
+        output.status
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_run_watch_pipe_with_job_lines() {
+    // Validates that actual job-status lines piped to `skim infra gh run watch`
+    // produce compressed output (summaries) and exit 0.
+    let input = "  * build In progress\n  ✓ build Completed\n  X test Failed\n";
+    let output = skim_cmd()
+        .args(["infra", "gh", "run", "watch"])
+        .write_stdin(input)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "exit status: {:?}", output.status);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains('✓') || stdout.contains("FAILED"),
+        "expected job output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_api_pipe_json_object() {
+    // Mirrors the Tester's scenario:
+    //   echo '{"login": "foo", "id": 42}' | skim infra gh api
+    //
+    // Must parse the JSON object and exit 0 (previously: exit 1 with error).
+    let json = r#"{"login": "foo", "id": 42}"#;
+    let output = skim_cmd()
+        .args(["infra", "gh", "api"])
+        .write_stdin(json)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "gh api pipe mode must exit 0, got: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("login") || stdout.contains("id"),
+        "expected parsed output, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_subcommand_infra_gh_api_pipe_json_array() {
+    // Validates array input piped to `skim infra gh api` is parsed and
+    // emits compressed output rather than an error.
+    let json = r#"[{"id": 1, "name": "repo-a"}, {"id": 2, "name": "repo-b"}]"#;
+    let output = skim_cmd()
+        .args(["infra", "gh", "api"])
+        .write_stdin(json)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "gh api array pipe mode must exit 0, got: {:?}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("array") || stdout.contains("repo"),
+        "expected parsed array output, got: {stdout}"
+    );
+}

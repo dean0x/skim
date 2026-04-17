@@ -31,9 +31,10 @@
 //! reach this parser.  The parser does NOT call `strip_ansi` itself.
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use super::streaming::{run_streamed_spawned, StreamConfig, StreamTotals, StreamingParser};
+use super::streaming::{run_streamed_spawned, run_streamed_stdin, StreamConfig, StreamTotals, StreamingParser};
 
 // ============================================================================
 // Constants
@@ -49,12 +50,27 @@ pub(super) const MAX_STREAM_JOBS: usize = 64;
 // Public entry point
 // ============================================================================
 
+/// Detect whether to read from piped stdin.
+///
+/// Returns `true` when stdin is not a terminal AND `args` is empty —
+/// the same heuristic used by [`super::super::run_infra_tool`].  Shared
+/// by `run_watch` and the `gh api` dispatch arm in `gh/mod.rs` so that
+/// the detection logic lives in exactly one place per module.
+pub(super) fn should_use_stdin(args: &[String]) -> bool {
+    !std::io::stdin().is_terminal() && args.is_empty()
+}
+
 /// Run `gh run watch` with streaming compression.
 ///
-/// Spawns `gh run watch [args]` and compresses the live output.
+/// Supports two modes:
+/// - **Pipe mode** (`gh run watch | skim infra gh run watch`): when stdin is
+///   piped and no args are provided, reads from stdin via
+///   [`run_streamed_stdin`].
+/// - **Spawn mode** (`skim infra gh run watch <id>`): spawns `gh run watch
+///   [args]` as a child process via [`run_streamed_spawned`].
 ///
-/// `--exit-status` flag is propagated to `gh`; non-zero workflow exit is
-/// forwarded as the process exit code.
+/// `--exit-status` flag is propagated to `gh` in spawn mode; non-zero
+/// workflow exit is forwarded as the process exit code.
 pub(super) fn run_watch(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -72,6 +88,12 @@ pub(super) fn run_watch(
         label,
     };
 
+    // Pipe mode: stdin is piped and no run-ID args were given (AD-STR-2).
+    if should_use_stdin(args) {
+        return Ok(run_streamed_stdin(parser, cfg));
+    }
+
+    // Spawn mode: build `gh run watch [args]` and stream its output.
     let mut gh_args = vec!["run".to_string(), "watch".to_string()];
     gh_args.extend_from_slice(args);
 
@@ -354,5 +376,90 @@ mod tests {
             Box::new(p).finalize()
         });
         assert!(result.is_ok(), "finalize on empty state should not panic");
+    }
+
+    // ---- should_use_stdin helper ----
+
+    #[test]
+    fn test_should_use_stdin_returns_false_when_args_present() {
+        // When args are non-empty, stdin mode must not be selected regardless
+        // of terminal state (the tty check is moot at the unit level; we test
+        // the args gate here).
+        let args: Vec<String> = vec!["12345".to_string()];
+        // We can't mock IsTerminal in a unit test, but we can verify the
+        // logic short-circuits on args.is_empty().  The helper must return
+        // false whenever args is non-empty because the IS_TERMINAL check is
+        // AND-joined with args.is_empty().
+        // Both branches must be true for stdin mode; a non-empty args slice
+        // makes the result false regardless of terminal state.
+        //
+        // Note: `should_use_stdin` returns false in unit tests because the
+        // test binary's stdin IS a terminal (cargo test does not pipe stdin).
+        // That is the intended behaviour — no false positives in unit tests.
+        assert!(
+            !should_use_stdin(&args),
+            "non-empty args must not trigger stdin mode"
+        );
+    }
+
+    #[test]
+    fn test_should_use_stdin_args_gate_short_circuits() {
+        // Verify that any non-empty args slice always prevents stdin mode,
+        // regardless of the terminal state.  This tests the args.is_empty()
+        // gate in isolation: the AND condition means a non-empty args slice
+        // short-circuits to false before the is_terminal() check runs.
+        //
+        // We use several non-empty arg scenarios to confirm the gate.
+        let cases: &[&[&str]] = &[
+            &["12345"],
+            &["--exit-status"],
+            &["12345", "--exit-status"],
+        ];
+        for args_strs in cases {
+            let args: Vec<String> = args_strs.iter().map(|s| s.to_string()).collect();
+            assert!(
+                !should_use_stdin(&args),
+                "non-empty args {:?} must not trigger stdin mode",
+                args
+            );
+        }
+    }
+
+    // ---- Parser integration (pipe path simulation) ----
+
+    #[test]
+    fn test_parser_processes_pipe_scenario_lines() {
+        // Mirrors the Tester's scenario:
+        //   printf "workflow step 1\nworkflow step 2\ncompleted\n" | skim infra gh run watch
+        //
+        // The RunWatchParser receives these lines via on_line().  None match
+        // job-status patterns, so all are suppressed; finalize() on empty
+        // state returns None (no output, clean exit — not a crash).
+        let mut p = make_parser();
+        assert!(p.on_line("workflow step 1").is_none());
+        assert!(p.on_line("workflow step 2").is_none());
+        assert!(p.on_line("completed").is_none());
+        let summary = Box::new(p).finalize();
+        // Empty jobs map → no summary (None is valid; not an error).
+        assert!(
+            summary.is_none(),
+            "empty job state should produce no summary"
+        );
+    }
+
+    #[test]
+    fn test_parser_pipe_with_job_lines_emits_output() {
+        // Validates that the streaming parser correctly handles a mix of real
+        // job-status lines delivered via stdin (pipe path).
+        let mut p = make_parser();
+        let out1 = p.on_line("  * build In progress");
+        let out2 = p.on_line("  ✓ build Completed");
+        assert!(out1.is_some(), "in-progress line should emit output");
+        assert!(out2.is_some(), "completion line should emit output");
+        let summary = Box::new(p).finalize().unwrap();
+        assert!(
+            summary.contains("1/1 succeeded"),
+            "summary should report success: {summary}"
+        );
     }
 }

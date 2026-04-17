@@ -123,13 +123,16 @@ pub(crate) fn run(
             release_view::prepare_args,
             release_view::parse_impl,
         ),
-        ("api", _) => run_infra_tool(
-            CONFIG,
-            args,
-            ctx,
-            api::prepare_args,
-            api::parse_impl,
-        ),
+        ("api", _) => {
+            // Strip the leading "api" token so run_infra_tool sees the
+            // remaining args only.  This lets use_stdin detection fire when
+            // the user pipes `gh api ... | skim infra gh api` with no
+            // endpoint arg — args[1..] is empty → stdin is read.
+            // api::prepare_args re-inserts "api" before the spawn so the
+            // child process still receives `gh api [endpoint...]`.
+            let api_args = if args.is_empty() { &[][..] } else { &args[1..] };
+            run_infra_tool(CONFIG, api_args, ctx, api::prepare_args, api::parse_impl)
+        }
         _ => run_infra_tool(
             CONFIG,
             args,
