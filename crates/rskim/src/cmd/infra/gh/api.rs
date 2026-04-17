@@ -193,22 +193,18 @@ fn try_parse_json_array(arr: &serde_json::Value) -> Option<InfraResult> {
     let items_arr = arr.as_array()?;
     let total = items_arr.len();
 
-    let items: Vec<InfraItem> = items_arr
+    let mut items: Vec<InfraItem> = items_arr
         .iter()
         .take(50)
         .enumerate()
-        .map(|(i, v)| {
-            let summary = json_value_summary(v);
-            InfraItem {
-                label: format!("[{i}]"),
-                value: summary,
-            }
+        .map(|(i, v)| InfraItem {
+            label: format!("[{i}]"),
+            value: json_value_summary(v),
         })
         .collect();
 
-    let mut all_items = items;
     if total > 50 {
-        all_items.push(InfraItem {
+        items.push(InfraItem {
             label: "...".to_string(),
             value: format!("{} more items", total - 50),
         });
@@ -218,7 +214,7 @@ fn try_parse_json_array(arr: &serde_json::Value) -> Option<InfraResult> {
         "gh".to_string(),
         "api".to_string(),
         format!("array[{total}]"),
-        all_items,
+        items,
     ))
 }
 
@@ -308,7 +304,7 @@ fn json_value_summary(v: &serde_json::Value) -> String {
                     return format!("{key}={val}");
                 }
             }
-            format!("{{{}  fields}}", map.len())
+            format!("{{{} fields}}", map.len())
         }
         serde_json::Value::Array(arr) => format!("[{} items]", arr.len()),
         serde_json::Value::String(s) => {
@@ -327,20 +323,30 @@ fn json_value_summary(v: &serde_json::Value) -> String {
 // ============================================================================
 
 /// Returns `true` if the text indicates an authentication or HTTP error.
+///
+/// Matches only precise error signatures so that legitimate responses containing
+/// substrings like "Not Found" in a JSON value do not trigger passthrough.
+/// HTTP status patterns are anchored on the status-line form (`HTTP 4xx`,
+/// `4xx <status>`, `404 Not Found`).
 fn is_auth_error(text: &str) -> bool {
     text.contains("Bad credentials")
         || text.contains("HTTP 401")
         || text.contains("HTTP 403")
+        || text.contains("HTTP 404")
         || text.contains("401 Unauthorized")
         || text.contains("403 Forbidden")
-        || text.contains("Not Found")
+        || text.contains("404 Not Found")
 }
 
 /// Returns `true` if the data looks like binary (null bytes or >30% non-ASCII).
 ///
-/// Inspects the first `BINARY_PROBE_BYTES` bytes (AD-API-1).
+/// Inspects the first `BINARY_PROBE_BYTES` bytes (AD-API-1).  Returns `false`
+/// on empty input (division-by-zero guard).
 fn is_binary(text: &str) -> bool {
     let probe = &text.as_bytes()[..text.len().min(BINARY_PROBE_BYTES)];
+    if probe.is_empty() {
+        return false;
+    }
     if probe.contains(&0u8) {
         return true;
     }

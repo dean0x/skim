@@ -69,6 +69,21 @@ use crate::output::strip_ansi;
 pub(super) const MAX_STREAM_LINE_BYTES: usize = 64 * 1024; // 64 KiB
 
 // ============================================================================
+// Private helpers
+// ============================================================================
+
+/// Truncate a line to [`MAX_STREAM_LINE_BYTES`], appending `…` if cut (AD-STR-1).
+fn truncate_line(line: String) -> String {
+    if line.len() > MAX_STREAM_LINE_BYTES {
+        let mut truncated = line[..MAX_STREAM_LINE_BYTES].to_string();
+        truncated.push('…');
+        truncated
+    } else {
+        line
+    }
+}
+
+// ============================================================================
 // Public types
 // ============================================================================
 
@@ -165,13 +180,19 @@ impl DropGuard {
     }
 
     fn do_record(&self) {
-        // Build placeholder strings for analytics (streaming doesn't retain full text).
-        let raw = " ".repeat(self.raw_bytes.min(1));
-        let compressed = " ".repeat(self.compressed_bytes.min(1));
-        crate::analytics::try_record_command(
+        // Streaming parsers don't retain full text, so we use the byte counters
+        // tracked by the harness as token-count approximations.  Dividing bytes
+        // by 4 gives a rough estimate of GPT tokens for English-like text —
+        // close enough for analytics bucketing.  Using
+        // `try_record_command_with_counts` avoids a re-tokenization pass on an
+        // empty placeholder string (which previously collapsed to ≤1 token and
+        // silently under-reported every streaming run's savings).
+        let raw_tokens = self.raw_bytes / 4;
+        let compressed_tokens = self.compressed_bytes / 4;
+        crate::analytics::try_record_command_with_counts(
             self.analytics_enabled,
-            raw,
-            compressed,
+            raw_tokens,
+            compressed_tokens,
             self.label.clone(),
             crate::analytics::CommandType::Infra,
             self.start.elapsed(),
@@ -196,7 +217,6 @@ impl Drop for DropGuard {
 ///
 /// Reads lines from stdin, passes each to `parser.on_line()`, and writes any
 /// non-`None` return values to stdout.  Calls `parser.finalize()` at EOF.
-#[allow(dead_code)]
 ///
 /// # Exit code semantics
 ///
@@ -210,6 +230,7 @@ impl Drop for DropGuard {
 /// # Analytics
 ///
 /// Analytics are recorded at EOF via the Drop guard.
+#[allow(dead_code)]
 pub(super) fn run_streamed_stdin(
     mut parser: Box<dyn StreamingParser>,
     cfg: StreamConfig,
@@ -225,13 +246,7 @@ pub(super) fn run_streamed_stdin(
         };
 
         // Truncate over-limit lines (AD-STR-1).
-        let raw_line = if raw_line.len() > MAX_STREAM_LINE_BYTES {
-            let mut truncated = raw_line[..MAX_STREAM_LINE_BYTES].to_string();
-            truncated.push('…');
-            truncated
-        } else {
-            raw_line
-        };
+        let raw_line = truncate_line(raw_line);
 
         // Strip ANSI escape codes before passing to parser (AD-GRW-1).
         let clean = strip_ansi(&raw_line);
@@ -328,13 +343,8 @@ pub(super) fn run_streamed_spawned(
                 Err(_) => break,
             };
 
-            let raw_line = if raw_line.len() > MAX_STREAM_LINE_BYTES {
-                let mut truncated = raw_line[..MAX_STREAM_LINE_BYTES].to_string();
-                truncated.push('…');
-                truncated
-            } else {
-                raw_line
-            };
+            // Truncate over-limit lines (AD-STR-1).
+            let raw_line = truncate_line(raw_line);
 
             let clean = strip_ansi(&raw_line);
             let clean_line: &str = clean.as_ref();

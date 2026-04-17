@@ -72,11 +72,10 @@ pub(super) fn run_watch(
         label,
     };
 
-    Ok(run_streamed_spawned(parser, "gh", &{
-        let mut all_args = vec!["run".to_string(), "watch".to_string()];
-        all_args.extend_from_slice(args);
-        all_args
-    }, cfg))
+    let mut gh_args = vec!["run".to_string(), "watch".to_string()];
+    gh_args.extend_from_slice(args);
+
+    Ok(run_streamed_spawned(parser, "gh", &gh_args, cfg))
 }
 
 // ============================================================================

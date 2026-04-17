@@ -226,7 +226,10 @@ fn try_parse_text(combined: &str) -> Option<InfraResult> {
             tag = val.trim().to_string();
         } else if let Some(val) = trimmed.strip_prefix("name:") {
             name = val.trim().to_string();
-        } else if let Some(val) = trimmed.strip_prefix("published:").or_else(|| trimmed.strip_prefix("Published:")) {
+        } else if let Some(val) = trimmed
+            .strip_prefix("published:")
+            .or_else(|| trimmed.strip_prefix("Published:"))
+        {
             date = val.trim().to_string();
         }
     }

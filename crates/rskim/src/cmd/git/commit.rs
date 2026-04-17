@@ -136,17 +136,12 @@ pub(super) fn parse_commit(input: &str) -> GitResult {
 /// The scissors line is `---...--- >8 ---` (variable dashes, optional space).
 /// Everything from this line onward is discarded.
 fn terminate_at_scissors(text: &str) -> &str {
-    for (i, line) in text.lines().enumerate() {
+    let mut byte_pos = 0;
+    for line in text.lines() {
         if is_scissors_line(line) {
-            // Find the byte offset of this line start and slice off.
-            let mut byte_pos = 0;
-            for (ln, l) in text.lines().enumerate() {
-                if ln == i {
-                    return &text[..byte_pos];
-                }
-                byte_pos += l.len() + 1; // +1 for newline
-            }
+            return &text[..byte_pos];
         }
+        byte_pos += line.len() + 1; // +1 for newline
     }
     text
 }

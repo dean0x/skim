@@ -169,7 +169,8 @@ fn try_parse_porcelain(text: &str) -> Option<GitResult> {
         // Older git: ` <flag> <refs>`  (leading space, flag, space)
         let (flag, rest) = if let Some(after_tab) = line.strip_prefix('\t') {
             // Some git versions emit a leading tab before the flag.
-            if after_tab.starts_with('=') || after_tab.starts_with('*') || after_tab.starts_with('+') || after_tab.starts_with('!') || after_tab.starts_with('-') {
+            let first = after_tab.chars().next().unwrap_or(' ');
+            if matches!(first, '=' | '*' | '+' | '!' | '-') {
                 let flag = &after_tab[..1];
                 let rest = after_tab[1..].trim_start_matches('\t');
                 (flag, rest)
