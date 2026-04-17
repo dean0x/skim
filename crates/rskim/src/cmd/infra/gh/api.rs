@@ -74,7 +74,28 @@ pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
     cmd_args.insert(0, "api".to_string());
 }
 
-/// Three-tier parse function for `gh api` output.
+/// Parse `gh api` output using a two-tier contract:
+///
+/// - **Full**: JSON object or array that is parsed and compacted via
+///   `compact_json_value` / `json_value_summary`.
+/// - **Passthrough**: non-JSON, auth error (`Bad credentials`, HTTP 4xx),
+///   binary content (AD-API-1), or over-limit input forwarded unchanged.
+///
+/// Note: There is no `Degraded` tier -- `gh api` returns structured JSON or
+/// passthrough-able text; there is no meaningful text-parsing fallback.
+///
+/// # AD-API-2 -- Two-tier deviation from `three_tier_parse`
+///
+/// The shared [`three_tier_parse`] scaffold targets parsers that have a
+/// meaningful text/regex Tier 2 (e.g., issue view, pr checks). `gh api`
+/// has no such tier: every response is either JSON or opaque text that must
+/// pass through verbatim. Using `three_tier_parse` here would require
+/// supplying a `try_text` closure that always returns `None` -- adding noise
+/// without benefit. The two-tier logic also adds pre-JSON checks (binary
+/// detection, auth-error passthrough, `--paginate` size limit) that do not
+/// fit cleanly into `three_tier_parse`'s fixed scaffold. This intentional
+/// deviation is kept narrow: any future text-tier need should prompt a
+/// refactor to adopt `three_tier_parse`.
 ///
 /// # JSON gate
 ///
@@ -87,7 +108,7 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     let combined = combine_stdout_stderr(output);
     let text = combined.as_ref();
 
-    // Auth/error passthrough — don't try to parse these.
+    // Auth/error passthrough -- don't try to parse these.
     if is_auth_error(text) {
         return ParseResult::Passthrough(combined.into_owned());
     }
@@ -135,7 +156,7 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 /// Handles:
 /// - GraphQL: unwrap `.data`, prepend errors summary if `.errors` present.
 /// - Contents endpoint: replace base64 `content` field with placeholder.
-/// - Generic REST: compact to key→value items.
+/// - Generic REST: compact to key->value items.
 fn try_parse_json_object(obj: &serde_json::Value) -> Option<InfraResult> {
     // GraphQL response: has `.data` field.
     if let Some(data) = obj.get("data") {
@@ -168,15 +189,14 @@ fn try_parse_json_object(obj: &serde_json::Value) -> Option<InfraResult> {
         ));
     }
 
-    // Contents endpoint — replace base64 content field.
+    // Contents endpoint -- replace base64 content field.
     let mut patched_obj = obj.clone();
-    if let Some(content) = patched_obj.get("content") {
+    if let Some(content) = patched_obj.get_mut("content") {
         if let Some(b64) = content.as_str() {
             // Remove whitespace (base64 may have newlines from gh api).
             let clean_b64: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
             let byte_count = base64_decoded_len(&clean_b64);
-            *patched_obj.get_mut("content").unwrap() =
-                serde_json::Value::String(format!("<base64 {byte_count} bytes>"));
+            *content = serde_json::Value::String(format!("<base64 {byte_count} bytes>"));
         }
     }
 
@@ -286,7 +306,16 @@ fn compact_json_value(value: &serde_json::Value, prefix: &str, depth: usize) -> 
         }
         serde_json::Value::String(s) => {
             let val = if s.len() > MAX_STRING_LEN {
-                format!("{}… ({} chars)", &s[..MAX_STRING_LEN], s.len())
+                // Use char_indices to find a safe UTF-8 boundary (PF-020).
+                // A naive byte-slice at MAX_STRING_LEN would panic if that
+                // boundary falls mid-multibyte codepoint (emoji, CJK, etc.).
+                let boundary = s
+                    .char_indices()
+                    .take_while(|(i, _)| *i < MAX_STRING_LEN)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!("{}... ({} chars)", &s[..boundary], s.chars().count())
             } else {
                 s.clone()
             };
@@ -315,7 +344,16 @@ fn json_value_summary(v: &serde_json::Value) -> String {
         serde_json::Value::Array(arr) => format!("[{} items]", arr.len()),
         serde_json::Value::String(s) => {
             if s.len() > 80 {
-                format!("{}…", &s[..80])
+                // Use char_indices to find a safe UTF-8 boundary (PF-020).
+                // A naive byte-slice at 80 would panic if that byte falls
+                // mid-multibyte codepoint (emoji, CJK, etc.).
+                let boundary = s
+                    .char_indices()
+                    .take_while(|(i, _)| *i < 80)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                format!("{}...", &s[..boundary])
             } else {
                 s.clone()
             }
@@ -378,17 +416,8 @@ fn base64_decoded_len(b64: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::make_output;
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
 
     // ---- JSON object ----
 
@@ -512,7 +541,12 @@ mod tests {
     fn test_output_shorter_than_input() {
         // Large JSON object.
         let map: serde_json::Map<String, serde_json::Value> = (0..100)
-            .map(|i| (format!("key_{i}"), serde_json::Value::String(format!("value_{i}_with_extra_padding"))))
+            .map(|i| {
+                (
+                    format!("key_{i}"),
+                    serde_json::Value::String(format!("value_{i}_with_extra_padding")),
+                )
+            })
             .collect();
         let json = serde_json::Value::Object(map).to_string();
         let out = parse_impl(&make_output(&json));
@@ -555,10 +589,7 @@ mod tests {
         // When an endpoint is provided, "api" must come first.
         let mut args: Vec<String> = vec!["/repos/foo/bar".to_string()];
         prepare_args(&mut args);
-        assert_eq!(
-            args,
-            vec!["api".to_string(), "/repos/foo/bar".to_string()]
-        );
+        assert_eq!(args, vec!["api".to_string(), "/repos/foo/bar".to_string()]);
     }
 
     // ---- pipe-mode parse (simulates `gh api ... | skim infra gh api`) ----
@@ -598,6 +629,49 @@ mod tests {
         assert!(
             result.is_full(),
             "piped JSON array must parse as Full, got {}",
+            result.tier_name()
+        );
+    }
+
+    // ---- UTF-8 boundary safety (PF-020 regression) ----
+
+    #[test]
+    fn test_compact_json_value_no_panic_on_multibyte_at_boundary() {
+        // Build a string where a 4-byte emoji straddles the 200-byte
+        // MAX_STRING_LEN boundary.  The emoji is 4 bytes; placing it at byte
+        // 198 means bytes 198-201 are its encoding.  A naive &s[..200] would
+        // panic because byte 200 is not a char boundary.
+        let prefix = "a".repeat(198);
+        let s = format!("{}\u{1F389}extra text past 200 bytes", prefix);
+        assert!(s.len() > 200, "test string must exceed 200 bytes");
+
+        let json = serde_json::json!({ "body": s });
+        let output = make_output(&json.to_string());
+        // Must not panic.
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "expected Full parse for multibyte-at-boundary input, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_json_value_summary_no_panic_on_multibyte_at_80() {
+        // Same class of bug in json_value_summary: emoji at byte 78 straddles
+        // the 80-byte boundary.
+        let prefix = "a".repeat(78);
+        let s = format!("{}\u{1F389}more text beyond 80 bytes", prefix);
+        assert!(s.len() > 80, "test string must exceed 80 bytes");
+
+        // Exercise via a JSON array so json_value_summary is called.
+        let arr = serde_json::json!([s]);
+        let output = make_output(&arr.to_string());
+        // Must not panic.
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "expected Full parse, got {}",
             result.tier_name()
         );
     }
