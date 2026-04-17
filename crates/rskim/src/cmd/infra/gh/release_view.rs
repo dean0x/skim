@@ -36,7 +36,8 @@ pub(super) const MAX_RELEASE_BODY_LINES: usize = 200;
 pub(super) const MAX_RELEASE_ASSETS: usize = 20;
 
 /// JSON fields to inject for `gh release view`.
-const RELEASE_VIEW_FIELDS: &str = "tagName,name,body,isDraft,isPrerelease,publishedAt,assets,author,createdAt,targetCommitish";
+const RELEASE_VIEW_FIELDS: &str =
+    "tagName,name,body,isDraft,isPrerelease,publishedAt,assets,author,createdAt,targetCommitish";
 
 // ============================================================================
 // Public entry point
@@ -80,10 +81,7 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 /// - Falls through to text tier if JSON is missing required fields.
 pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
     let tag = obj.get("tagName").and_then(|v| v.as_str())?;
-    let name = obj
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(tag);
+    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or(tag);
 
     let is_draft = obj
         .get("isDraft")
@@ -99,10 +97,7 @@ pub(super) fn try_parse_json(obj: &serde_json::Value) -> Option<InfraResult> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let body_raw = obj
-        .get("body")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let body_raw = obj.get("body").and_then(|v| v.as_str()).unwrap_or("");
 
     let author = obj
         .get("author")
@@ -240,13 +235,22 @@ fn try_parse_text(combined: &str) -> Option<InfraResult> {
 
     let mut items: Vec<InfraItem> = Vec::new();
     if !tag.is_empty() {
-        items.push(InfraItem { label: "tag".to_string(), value: tag.clone() });
+        items.push(InfraItem {
+            label: "tag".to_string(),
+            value: tag.clone(),
+        });
     }
     if !name.is_empty() && name != tag {
-        items.push(InfraItem { label: "name".to_string(), value: name.clone() });
+        items.push(InfraItem {
+            label: "name".to_string(),
+            value: name.clone(),
+        });
     }
     if !date.is_empty() {
-        items.push(InfraItem { label: "published".to_string(), value: date });
+        items.push(InfraItem {
+            label: "published".to_string(),
+            value: date,
+        });
     }
 
     let summary = if !tag.is_empty() { tag } else { name };
@@ -406,7 +410,10 @@ mod tests {
 
     #[test]
     fn test_truncate_body_outside_fences_no_fence() {
-        let body = (0..300).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..300)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = truncate_body_outside_fences(&body, 200);
         let line_count = result.lines().count();
         // Should have ~200 lines + truncation marker.
@@ -445,7 +452,9 @@ mod tests {
 
     #[test]
     fn test_output_shorter_than_input() {
-        let long_body: String = (0..250).map(|i| format!("- changelog item {i}\n")).collect();
+        let long_body: String = (0..250)
+            .map(|i| format!("- changelog item {i}\n"))
+            .collect();
         let json = serde_json::json!({
             "tagName": "v3.0.0",
             "name": "Version 3.0.0",
