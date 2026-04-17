@@ -46,6 +46,12 @@ pub(super) enum CompoundSplitResult {
 pub(super) struct CommandSegment {
     pub(super) tokens: Vec<String>,
     pub(super) trailing_operator: Option<CompoundOp>,
+    /// Redirects stripped from this segment for re-emission.
+    ///
+    /// Each entry is `(original_index, redirect_token)` where `original_index`
+    /// is the position in the original token list before stripping.  Re-emitted
+    /// at their original positions so shell semantics are preserved.
+    pub(super) stripped_redirects: Vec<(usize, String)>,
 }
 
 /// Shell compound operators.

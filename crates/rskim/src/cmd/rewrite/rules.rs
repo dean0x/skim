@@ -1,8 +1,19 @@
 //! Declarative rewrite rule table.
 //!
-//! 93 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (5),
-//! LINT (38), PKG (18), INFRA (11), FILE_OPS (7).
+//! 100 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (7),
+//! LINT (38), PKG (18), INFRA (14), FILE_OPS (9).
 //! Only `engine.rs` consumes `all_rules()`.
+//!
+//! # Catch-all rules (AD-RW-2)
+//!
+//! `FILE_OPS_RULES` ends with catch-all rules for `ls` and `grep` (after the
+//! existing specific-prefix rules).  A catch-all fires for any invocation that
+//! doesn't match an earlier specific rule.  Catch-alls are guarded by
+//! `skip_if_flag_prefix` for `--help`, `--version`, and `-V` so that
+//! informational invocations pass through unmodified.
+//!
+//! Pipe exclusion (`PIPE_EXCLUDED_SOURCES` in `compound.rs`) prevents catch-alls
+//! from rewriting the source side of a pipe (`ls | head`).  SEE: AD-RW-2.
 
 use super::types::{RewriteCategory, RewriteRule};
 
@@ -111,7 +122,7 @@ const BUILD_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// GIT rules (5)
+// GIT rules (7)
 // ============================================================================
 
 const GIT_RULES: &[RewriteRule] = &[
@@ -176,6 +187,30 @@ const GIT_RULES: &[RewriteRule] = &[
         prefix: &["git", "show"],
         rewrite_to: &["skim", "git", "show"],
         skip_if_flag_prefix: &[],
+        category: RewriteCategory::Git,
+    },
+    // git commit (B.7)
+    //
+    // Parses commit output (both stdout and stderr) into a compact summary.
+    // The handler (cmd/git/commit.rs) handles --amend, --allow-empty,
+    // --no-verify, -v (verbose diff truncation), GPG-signed, merge, and root
+    // commits. See AD-GC-1, AD-GC-2.
+    RewriteRule {
+        prefix: &["git", "commit"],
+        rewrite_to: &["skim", "git", "commit"],
+        skip_if_flag_prefix: &["--help"],
+        category: RewriteCategory::Git,
+    },
+    // git push (B.8)
+    //
+    // Parses push output (stderr) into a compact summary. The handler
+    // (cmd/git/push.rs) auto-injects --porcelain, scrubs credential URLs,
+    // and handles dry-run, delete, force-with-lease, and LFS pre-push.
+    // See AD-GP-1, AD-GP-2.
+    RewriteRule {
+        prefix: &["git", "push"],
+        rewrite_to: &["skim", "git", "push"],
+        skip_if_flag_prefix: &["--help"],
         category: RewriteCategory::Git,
     },
 ];
@@ -554,7 +589,7 @@ const PKG_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// INFRA rules (11)
+// INFRA rules (14)
 // ============================================================================
 
 const INFRA_RULES: &[RewriteRule] = &[
@@ -603,16 +638,47 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--web", "--log", "--log-failed", "--jq", "--template"],
         category: RewriteCategory::Infra,
     },
+    // gh run watch (B.5) — streaming output compression
+    //
+    // Routes to the streaming parser (cmd/infra/gh/run_watch.rs).
+    // --help skips; --exit-status and --interval pass through to parser.
+    RewriteRule {
+        prefix: &["gh", "run", "watch"],
+        rewrite_to: &["skim", "infra", "gh", "run", "watch"],
+        skip_if_flag_prefix: &["--help"],
+        category: RewriteCategory::Infra,
+    },
     RewriteRule {
         prefix: &["gh", "run", "list"],
         rewrite_to: &["skim", "infra", "gh", "run", "list"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Infra,
     },
+    // gh release view (B.6) — structured release metadata
+    //
+    // Parses release body (capped at MAX_RELEASE_BODY_LINES outside fences),
+    // assets (capped at MAX_RELEASE_ASSETS). See AD-RV-1.
+    RewriteRule {
+        prefix: &["gh", "release", "view"],
+        rewrite_to: &["skim", "infra", "gh", "release", "view"],
+        skip_if_flag_prefix: &["--help", "--web", "--jq", "--template"],
+        category: RewriteCategory::Infra,
+    },
     RewriteRule {
         prefix: &["gh", "release", "list"],
         rewrite_to: &["skim", "infra", "gh", "release", "list"],
         skip_if_flag_prefix: &[],
+        category: RewriteCategory::Infra,
+    },
+    // gh api (B.4) — REST/GraphQL response compression
+    //
+    // Compacts JSON responses, handles pagination boundaries, --paginate,
+    // base64 content fields, and binary passthrough. See AD-API-1.
+    // --help skips; --jq/--template skip (user-defined transform).
+    RewriteRule {
+        prefix: &["gh", "api"],
+        rewrite_to: &["skim", "infra", "gh", "api"],
+        skip_if_flag_prefix: &["--help", "--jq", "--template"],
         category: RewriteCategory::Infra,
     },
     // aws
@@ -647,7 +713,7 @@ const INFRA_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// FILE_OPS rules (7)
+// FILE_OPS rules (9)
 // ============================================================================
 
 const FILE_OPS_RULES: &[RewriteRule] = &[
@@ -698,6 +764,32 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json", "-c", "--count", "-l", "--files"],
         category: RewriteCategory::FileOps,
     },
+    // ls catch-all (B.1) — DESIGN NOTE (AD-RW-2)
+    //
+    // Fires for any `ls` invocation not matched by a more-specific earlier rule
+    // (e.g., `ls -la`, `ls -R`).  Guards on --help/--version/-V so that
+    // informational invocations pass through unmodified.
+    //
+    // Pipe exclusion (PIPE_EXCLUDED_SOURCES in compound.rs) prevents this rule
+    // from rewriting the source side of `ls | head`.  SEE: AD-RW-2.
+    RewriteRule {
+        prefix: &["ls"],
+        rewrite_to: &["skim", "file", "ls"],
+        skip_if_flag_prefix: &["--help", "--version", "-V"],
+        category: RewriteCategory::FileOps,
+    },
+    // grep catch-all (B.2) — DESIGN NOTE (AD-RW-2)
+    //
+    // Fires for any `grep` invocation not matched by a more-specific earlier
+    // rule (e.g., `grep -rn`, `grep -r`).  Guards on --help/--version/-V.
+    //
+    // Pipe exclusion prevents `grep | head` from being rewritten.  SEE: AD-RW-2.
+    RewriteRule {
+        prefix: &["grep"],
+        rewrite_to: &["skim", "file", "grep"],
+        skip_if_flag_prefix: &["--help", "--version", "-V"],
+        category: RewriteCategory::FileOps,
+    },
 ];
 
 // ============================================================================
@@ -727,7 +819,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 5 + 38 + 18 + 11 + 7;
+    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(14) + FILE_OPS(9)
+    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 14 + 9;
 
     #[test]
     fn test_rule_count_matches_expected() {
@@ -736,6 +829,159 @@ mod tests {
             count, EXPECTED_RULE_COUNT,
             "Update EXPECTED_RULE_COUNT when adding/removing rules (current: {})",
             count
+        );
+    }
+
+    // ========================================================================
+    // Rule integrity tests (AD-RW-2)
+    // ========================================================================
+
+    /// No two rules should share an identical prefix (would cause dead code).
+    #[test]
+    fn test_no_duplicate_rule_prefixes() {
+        let rules: Vec<_> = all_rules().collect();
+        for i in 0..rules.len() {
+            for j in (i + 1)..rules.len() {
+                assert_ne!(
+                    rules[i].prefix,
+                    rules[j].prefix,
+                    "Duplicate prefix found at rule indices {} and {}: {:?}",
+                    i,
+                    j,
+                    rules[i].prefix
+                );
+            }
+        }
+    }
+
+    /// A rule's prefix must not be a strict prefix of an earlier rule's prefix
+    /// (which would shadow the later rule for all its inputs), EXCEPT for the
+    /// intentional catch-all-after-specific pattern.
+    ///
+    /// Catch-alls (`ls` and `grep`) are placed AFTER their specific counterparts
+    /// (`ls -la`, `grep -rn`, etc.), so specific rules still win via first-match.
+    #[test]
+    fn test_no_rule_shadowing() {
+        let rules: Vec<_> = all_rules().collect();
+        // Catch-all prefixes are single-token; they intentionally appear after
+        // specific prefixes for the same leading token.
+        let allowed_catch_alls: &[&[&str]] = &[&["ls"], &["grep"]];
+
+        for i in 0..rules.len() {
+            for j in (i + 1)..rules.len() {
+                let earlier = rules[i].prefix;
+                let later = rules[j].prefix;
+
+                // Skip the allowed catch-all pattern (specific before catch-all).
+                if allowed_catch_alls.contains(&later) {
+                    continue;
+                }
+
+                // Check if earlier is a strict prefix of later (would shadow later).
+                if earlier.len() < later.len() && later.starts_with(earlier) {
+                    panic!(
+                        "Rule {:?} (index {}) shadows rule {:?} (index {}) — \
+                         move more-specific rule before less-specific",
+                        earlier, i, later, j
+                    );
+                }
+            }
+        }
+    }
+
+    /// Catch-all ls rule fires for arbitrary ls flags.
+    #[test]
+    fn test_catch_all_ls_matches_all_flags() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let cases: &[&[&str]] = &[
+            &["ls"],
+            &["ls", "-1"],
+            &["ls", "--color"],
+            &["ls", "-lh", "src/"],
+        ];
+        for tokens in cases {
+            let result = try_rewrite(tokens);
+            assert!(
+                result.is_some(),
+                "Expected ls catch-all to fire for: {tokens:?}"
+            );
+            let r = result.unwrap();
+            assert!(
+                r.tokens.iter().any(|t| t == "skim"),
+                "Expected rewrite to skim for: {tokens:?}"
+            );
+        }
+    }
+
+    /// Specific ls rule wins over catch-all.
+    #[test]
+    fn test_specific_ls_still_wins() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        // `ls -la` matches the specific rule, not the catch-all.
+        let tokens: &[&str] = &["ls", "-la"];
+        let result = try_rewrite(tokens).expect("should rewrite ls -la");
+        // Both specific and catch-all rewrite to skim file ls — result is identical.
+        assert!(
+            result.tokens.contains(&"skim".to_string()),
+            "Expected skim rewrite"
+        );
+    }
+
+    /// Catch-all grep rule fires for arbitrary grep invocations.
+    #[test]
+    fn test_catch_all_grep_matches_all_flags() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        let cases: &[&[&str]] = &[
+            &["grep", "pattern", "file.txt"],
+            &["grep", "-i", "foo", "bar.rs"],
+            &["grep", "pattern", "file1", "file2", "file3"],
+        ];
+        for tokens in cases {
+            let result = try_rewrite(tokens);
+            assert!(
+                result.is_some(),
+                "Expected grep catch-all to fire for: {tokens:?}"
+            );
+        }
+    }
+
+    /// Specific grep rules win over catch-all.
+    #[test]
+    fn test_specific_grep_still_wins() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        // `grep -rn` matches the specific rule, not the catch-all.
+        let tokens: &[&str] = &["grep", "-rn", "pattern", "src/"];
+        let result = try_rewrite(tokens).expect("should rewrite grep -rn");
+        assert!(result.tokens.contains(&"skim".to_string()));
+    }
+
+    /// ls --help skips the catch-all rule (passthrough).
+    #[test]
+    fn test_ls_help_skip() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        assert!(
+            try_rewrite(&["ls", "--help"]).is_none(),
+            "ls --help should pass through"
+        );
+    }
+
+    /// ls --version skips the catch-all rule.
+    #[test]
+    fn test_ls_version_skip() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        assert!(
+            try_rewrite(&["ls", "--version"]).is_none(),
+            "ls --version should pass through"
+        );
+    }
+
+    /// grep --help skips the catch-all rule.
+    #[test]
+    fn test_grep_help_skip() {
+        use crate::cmd::rewrite::engine::try_rewrite;
+        assert!(
+            try_rewrite(&["grep", "--help"]).is_none(),
+            "grep --help should pass through"
         );
     }
 }

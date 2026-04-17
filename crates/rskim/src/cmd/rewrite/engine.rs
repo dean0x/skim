@@ -115,6 +115,10 @@ pub(super) fn try_table_match(
         // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
         // the AST-aware diff pipeline for staged changes.
         //
+        // SEE ALSO: AD-RW-2 (catch-all ls/grep rules in rules.rs + pipe exclusion
+        // in compound.rs) for the design note on catch-all rule ordering and
+        // PIPE_EXCLUDED_SOURCES guard semantics.
+        //
         // Side effect on glued short flags (e.g. `-XPOST`, `--files-with-matches`):
         // Because the strict match only triggers on exact equality or `flag=value`,
         // a glued short flag like `-XPOST` (where the skip prefix is, say, `-X`)
