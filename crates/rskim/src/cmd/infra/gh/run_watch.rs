@@ -51,16 +51,6 @@ pub(super) const MAX_STREAM_JOBS: usize = 64;
 // Public entry point
 // ============================================================================
 
-/// Detect whether to read from piped stdin.
-///
-/// Delegates to the canonical implementation in [`super::super::should_use_stdin`]
-/// (i.e. `cmd::infra::should_use_stdin`).  This thin forwarding function is kept
-/// here so that tests in this module can call it directly without traversing
-/// super-module paths.
-pub(super) fn should_use_stdin(args: &[String]) -> bool {
-    super::super::should_use_stdin(args)
-}
-
 /// Run `gh run watch` with streaming compression.
 ///
 /// Supports two modes:
@@ -87,7 +77,7 @@ pub(super) fn run_watch(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow
     };
 
     // Pipe mode: stdin is piped and no run-ID args were given (AD-STR-2).
-    if should_use_stdin(args) {
+    if super::super::should_use_stdin(args) {
         return Ok(run_streamed_stdin(parser, cfg));
     }
 
@@ -402,7 +392,7 @@ mod tests {
         // test binary's stdin IS a terminal (cargo test does not pipe stdin).
         // That is the intended behaviour — no false positives in unit tests.
         assert!(
-            !should_use_stdin(&args),
+            !crate::cmd::infra::should_use_stdin(&args),
             "non-empty args must not trigger stdin mode"
         );
     }
@@ -419,7 +409,7 @@ mod tests {
         for args_strs in cases {
             let args: Vec<String> = args_strs.iter().map(|s| s.to_string()).collect();
             assert!(
-                !should_use_stdin(&args),
+                !crate::cmd::infra::should_use_stdin(&args),
                 "non-empty args {:?} must not trigger stdin mode",
                 args
             );

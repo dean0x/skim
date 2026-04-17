@@ -318,17 +318,8 @@ fn format_size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::make_output;
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
 
     // ---- JSON tier ----
 

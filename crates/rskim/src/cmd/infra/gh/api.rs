@@ -306,15 +306,7 @@ fn compact_json_value(value: &serde_json::Value, prefix: &str, depth: usize) -> 
         }
         serde_json::Value::String(s) => {
             let val = if s.len() > MAX_STRING_LEN {
-                // Use char_indices to find a safe UTF-8 boundary (PF-020).
-                // A naive byte-slice at MAX_STRING_LEN would panic if that
-                // boundary falls mid-multibyte codepoint (emoji, CJK, etc.).
-                let boundary = s
-                    .char_indices()
-                    .take_while(|(i, _)| *i < MAX_STRING_LEN)
-                    .last()
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(0);
+                let boundary = utf8_safe_byte_end(s, MAX_STRING_LEN);
                 format!("{}... ({} chars)", &s[..boundary], s.chars().count())
             } else {
                 s.clone()
@@ -344,22 +336,31 @@ fn json_value_summary(v: &serde_json::Value) -> String {
         serde_json::Value::Array(arr) => format!("[{} items]", arr.len()),
         serde_json::Value::String(s) => {
             if s.len() > 80 {
-                // Use char_indices to find a safe UTF-8 boundary (PF-020).
-                // A naive byte-slice at 80 would panic if that byte falls
-                // mid-multibyte codepoint (emoji, CJK, etc.).
-                let boundary = s
-                    .char_indices()
-                    .take_while(|(i, _)| *i < 80)
-                    .last()
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(0);
-                format!("{}...", &s[..boundary])
+                format!("{}...", &s[..utf8_safe_byte_end(s, 80)])
             } else {
                 s.clone()
             }
         }
         other => other.to_string(),
     }
+}
+
+// ============================================================================
+// String helpers
+// ============================================================================
+
+/// Return the largest byte index in `s` that is a valid UTF-8 char boundary
+/// and is `<= max_bytes` (PF-020).
+///
+/// A direct byte-slice at `max_bytes` would panic if that offset falls
+/// mid-multibyte codepoint (emoji, CJK, etc.).  Using `char_indices` ensures
+/// we always land on a valid boundary.
+fn utf8_safe_byte_end(s: &str, max_bytes: usize) -> usize {
+    s.char_indices()
+        .take_while(|(i, _)| *i < max_bytes)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
 }
 
 // ============================================================================
