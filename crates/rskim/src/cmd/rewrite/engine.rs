@@ -163,6 +163,56 @@ pub(super) fn try_table_match(
     None
 }
 
+/// Return `true` if the first matching rule for `tokens` is a catch-all rule.
+///
+/// Used by the compound pipeline engine to suppress catch-all rewrites when the
+/// command is the *source* side of a pipe expression (e.g., `ls | head`).
+/// Replaces the former `PIPE_EXCLUDED_SOURCES` hard-coded list with a check
+/// co-located in the rule itself. SEE: AD-RW-2.
+pub(super) fn matches_catch_all_rule(tokens: &[&str]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let env_split = strip_env_vars(tokens);
+    let command_tokens = &tokens[env_split..];
+
+    if command_tokens.is_empty() {
+        return false;
+    }
+
+    let (_, match_tokens) = strip_cargo_toolchain(command_tokens);
+    let sep_pos = split_at_separator(&match_tokens);
+    let before_sep = &match_tokens[..sep_pos];
+
+    for rule in rules::all_rules() {
+        if before_sep.len() < rule.prefix.len() {
+            continue;
+        }
+        if before_sep[..rule.prefix.len()] != *rule.prefix {
+            continue;
+        }
+        // Mirror the skip-flag logic from try_table_match so we identify the
+        // first rule that would actually fire (not a rule that would be skipped).
+        let middle = &before_sep[rule.prefix.len()..];
+        let strict_skip_match = |arg: &str, flag: &str| -> bool {
+            arg == flag || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
+        };
+        if !rule.skip_if_flag_prefix.is_empty()
+            && middle.iter().any(|arg| {
+                rule.skip_if_flag_prefix
+                    .iter()
+                    .any(|skip| strict_skip_match(arg, skip))
+            })
+        {
+            continue;
+        }
+        return rule.is_catch_all;
+    }
+
+    false
+}
+
 /// Try custom handlers for cat, head, tail.
 pub(super) fn try_custom_handlers(
     env_vars: &[&str],

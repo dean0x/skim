@@ -20,6 +20,9 @@ pub(super) struct RewriteRule {
     pub(super) rewrite_to: &'static [&'static str],
     pub(super) skip_if_flag_prefix: &'static [&'static str],
     pub(super) category: RewriteCategory,
+    /// True for catch-all rules (`ls`, `grep`) that must NOT fire on pipe-source side.
+    /// SEE: AD-RW-2.
+    pub(super) is_catch_all: bool,
 }
 
 #[derive(Debug)]

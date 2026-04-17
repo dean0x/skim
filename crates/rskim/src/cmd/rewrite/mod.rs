@@ -35,7 +35,7 @@ use std::process::ExitCode;
 
 use acknowledge::is_segment_ack;
 use compound::{split_compound, try_rewrite_compound};
-use engine::try_rewrite;
+use engine::{matches_catch_all_rule, try_rewrite};
 use hook::{parse_agent_flag, run_hook_mode};
 use suggest::{print_help, print_suggest};
 use types::{CommandSegment, CompoundOp, CompoundSplitResult, RewriteCategory, RewriteResult};
@@ -188,6 +188,12 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
     }
 }
 
+/// Per-segment classification tuple used in `classify_compound`.
+///
+/// Carries the segment classification, the trailing operator, and a reference
+/// to the stripped redirects so they can be spliced back in Pass 3.
+type ClassifiedSegment<'a> = (SegmentClassification, Option<CompoundOp>, &'a [(usize, String)]);
+
 /// Classify a compound command (segments connected by `&&`, `||`, `;`, `|`).
 ///
 /// Rules (per AD-RW-2):
@@ -219,18 +225,24 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
     }
 
     // Pass 1: classify all segments.
-    let classified: Vec<(SegmentClassification, Option<CompoundOp>)> = segments
+    // The tuple carries `stripped_redirects` so Pass 3 can splice them back
+    // into the reconstructed command string (Issue #2 / AD-RW-2).
+    let classified: Vec<ClassifiedSegment<'_>> = segments
         .iter()
         .map(|seg| {
             let token_refs: Vec<&str> = seg.tokens.iter().map(|s| s.as_str()).collect();
-            (classify_segment_fine(&token_refs), seg.trailing_operator)
+            (
+                classify_segment_fine(&token_refs),
+                seg.trailing_operator,
+                seg.stripped_redirects.as_slice(),
+            )
         })
         .collect();
 
     // Pass 2: early-exit on any NoMatch.
     if classified
         .iter()
-        .any(|(c, _)| matches!(c, SegmentClassification::NoMatch))
+        .any(|(c, _, _)| matches!(c, SegmentClassification::NoMatch))
     {
         return CommandClassification::Unhandled;
     }
@@ -238,17 +250,25 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
     // Pass 3: reconstruct compound string; track whether any segment rewrote.
     let any_rewritten = classified
         .iter()
-        .any(|(c, _)| matches!(c, SegmentClassification::Rewritten(_)));
+        .any(|(c, _, _)| matches!(c, SegmentClassification::Rewritten(_)));
 
     if !any_rewritten {
         return CommandClassification::AlreadyCompact;
     }
 
     let mut parts: Vec<String> = Vec::new();
-    for (classification, op) in classified {
+    for (classification, op, redirects) in classified {
         let segment_text = match classification {
-            SegmentClassification::Rewritten(tokens)
-            | SegmentClassification::AlreadyCompact(tokens) => tokens.join(" "),
+            SegmentClassification::Rewritten(mut tokens)
+            | SegmentClassification::AlreadyCompact(mut tokens) => {
+                // Splice stripped redirects back so they are not silently lost.
+                // Mirrors the pattern in `try_rewrite_compound` / compound.rs.
+                // SEE: AD-RW-2 (Issue #2).
+                for (_idx, tok) in redirects {
+                    tokens.push(tok.clone());
+                }
+                tokens.join(" ")
+            }
             // NoMatch is unreachable here: Pass 2 already returned Unhandled if
             // any segment was NoMatch. Kept for exhaustiveness.
             SegmentClassification::NoMatch => unreachable!("NoMatch filtered in Pass 2"),
@@ -275,13 +295,12 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
     let first = &segments[0];
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
 
-    // Check exclusion list (sources like find/rg/ls whose pipe output should not
-    // be rewritten). Reuse the same logic as try_rewrite_compound_pipe.
-    let env_split = engine::strip_env_vars(&token_refs);
-    if let Some(cmd) = token_refs.get(env_split) {
-        if compound::PIPE_EXCLUDED_SOURCES.contains(cmd) {
-            return CommandClassification::Unhandled;
-        }
+    // Do not classify catch-all rules on the pipe-source side (e.g. `ls | wc -l`).
+    // Mirrors the same check in `try_rewrite_compound_pipe`.  The `is_catch_all`
+    // flag on the matching rule replaces the removed PIPE_EXCLUDED_SOURCES constant.
+    // SEE: AD-RW-2.
+    if matches_catch_all_rule(&token_refs) {
+        return CommandClassification::Unhandled;
     }
 
     let first_classification = classify_segment_fine(&token_refs);
@@ -289,8 +308,12 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
     match first_classification {
         SegmentClassification::AlreadyCompact(_) => CommandClassification::AlreadyCompact,
         SegmentClassification::NoMatch => CommandClassification::Unhandled,
-        SegmentClassification::Rewritten(rewritten_tokens) => {
+        SegmentClassification::Rewritten(mut rewritten_tokens) => {
             // Reconstruct: rewritten first segment | rest unchanged.
+            // Splice redirects back for the first segment (Issue #2 / AD-RW-2).
+            for (_idx, tok) in &first.stripped_redirects {
+                rewritten_tokens.push(tok.clone());
+            }
             let mut parts: Vec<String> = Vec::new();
             parts.push(rewritten_tokens.join(" "));
 
@@ -301,7 +324,12 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
                     }
                     continue;
                 }
-                parts.push(seg.tokens.join(" "));
+                // Restore redirects for non-rewritten pipe segments.
+                let mut seg_tokens = seg.tokens.clone();
+                for (_i, tok) in &seg.stripped_redirects {
+                    seg_tokens.push(tok.clone());
+                }
+                parts.push(seg_tokens.join(" "));
                 if let Some(op) = seg.trailing_operator {
                     parts.push(op.as_str().to_string());
                 }
@@ -629,6 +657,44 @@ mod tests {
             CommandClassification::AlreadyCompact,
             "Pipe with AlreadyCompact first segment must be AlreadyCompact"
         );
+    }
+
+    /// Stripped redirects must survive classify_compound reconstruction (Issue #2 / AD-RW-2).
+    ///
+    /// `cargo test 2>&1 && cargo build` — the `2>&1` is stripped before rule matching
+    /// and must be spliced back into the rewritten compound string so it is not
+    /// silently dropped from the discover suggestion.
+    #[test]
+    fn test_classify_compound_preserves_stripped_redirects() {
+        let result = classify_command("cargo test 2>&1 && cargo build");
+        match result {
+            CommandClassification::Rewritten(s) => {
+                assert!(
+                    s.contains("2>&1"),
+                    "Stripped redirect must be preserved in rewritten compound: {s}"
+                );
+            }
+            other => panic!("Expected Rewritten, got {other:?}"),
+        }
+    }
+
+    /// Stripped redirects must survive classify_compound_pipe reconstruction (Issue #2).
+    ///
+    /// `cargo test 2>&1 | head` — the `2>&1` is stripped before rule matching
+    /// and must be spliced back into the rewritten pipe command.
+    #[test]
+    fn test_classify_compound_pipe_preserves_stripped_redirects() {
+        let result = classify_command("cargo test 2>&1 | head");
+        match result {
+            CommandClassification::Rewritten(s) => {
+                assert!(
+                    s.contains("2>&1"),
+                    "Stripped redirect must be preserved in rewritten pipe: {s}"
+                );
+                assert!(s.contains("| head"), "Pipe consumer must be preserved: {s}");
+            }
+            other => panic!("Expected Rewritten, got {other:?}"),
+        }
     }
 
     #[test]

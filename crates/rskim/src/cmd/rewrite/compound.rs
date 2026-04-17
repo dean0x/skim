@@ -13,7 +13,7 @@
 //!
 //! SEE: AD-RW-2 — catch-all ls/grep + pipe exclusion design note.
 
-use super::engine::{strip_env_vars, try_rewrite};
+use super::engine::{matches_catch_all_rule, try_rewrite};
 use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
@@ -320,17 +320,11 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
     CompoundSplitResult::Compound(segments)
 }
 
-/// Commands that should NOT have their pipe output rewritten.
-/// These are typically output-producing tools where the pipe consumer (head, grep, etc.)
-/// is what the user actually wants to control.
-///
-/// Exposed as `pub(super)` so `mod.rs::classify_compound_pipe` can share the
-/// same exclusion logic as `try_rewrite_compound_pipe` without duplication.
-///
-/// SEE: AD-RW-2 — the catch-all `["ls"]` / `["grep"]` rewrite rules (in `rules.rs`)
-/// apply in standalone or `&&`/`||`/`;` compound segments, but not when these tools
-/// are the *source* of a `|` pipe — this constant enforces that boundary.
-pub(super) const PIPE_EXCLUDED_SOURCES: &[&str] = &["find", "fd", "ls", "rg", "grep", "ag"];
+// PIPE_EXCLUDED_SOURCES removed (AD-RW-2).
+// The pipe-source exclusion is now handled via the `is_catch_all` flag on
+// `RewriteRule` (types.rs).  `engine::matches_catch_all_rule` replaces the
+// hard-coded list, so adding a new catch-all only requires a single edit in
+// `rules.rs`.  See `try_rewrite_compound_pipe` and `mod.rs::classify_compound_pipe`.
 
 /// Attempt to rewrite a compound command expression.
 ///
@@ -405,15 +399,13 @@ fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResul
 
     let first = &segments[0];
 
-    // Skip env vars to find the actual command name, reusing the canonical
-    // strip_env_vars logic (all-uppercase key before '=').
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
-    let env_split = strip_env_vars(&token_refs);
-    let first_cmd = first.tokens.get(env_split);
-    if let Some(cmd) = first_cmd {
-        if PIPE_EXCLUDED_SOURCES.contains(&cmd.as_str()) {
-            return None;
-        }
+
+    // Do not rewrite catch-all rules on the pipe-source side (e.g. `ls | head`).
+    // The `is_catch_all` flag on the matching rule drives this check instead of
+    // the removed PIPE_EXCLUDED_SOURCES constant.  SEE: AD-RW-2.
+    if matches_catch_all_rule(&token_refs) {
+        return None;
     }
 
     let rewrite = try_rewrite(&token_refs)?;
@@ -695,5 +687,80 @@ mod tests {
     #[test]
     fn test_compound_empty_returns_none() {
         assert!(try_rewrite_compound(&[]).is_none());
+    }
+
+    /// `ls | head` must NOT be rewritten — `ls` is a catch-all rule and must not
+    /// fire on the pipe-source side (AD-RW-2).
+    #[test]
+    fn test_pipe_catch_all_ls_not_rewritten() {
+        match split_compound("ls | head") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_none(),
+                    "ls | head must not be rewritten (catch-all pipe-source exclusion): {result:?}"
+                );
+            }
+            other => panic!("Expected Compound for ls | head, got {:?}", other),
+        }
+    }
+
+    /// `grep foo file | head` must NOT be rewritten (catch-all pipe-source exclusion).
+    #[test]
+    fn test_pipe_catch_all_grep_not_rewritten() {
+        match split_compound("grep foo file | head") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_none(),
+                    "grep | head must not be rewritten (catch-all pipe-source exclusion): {result:?}"
+                );
+            }
+            other => panic!(
+                "Expected Compound for grep foo file | head, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// `cargo test 2>&1 | head` must be rewritten and preserve the redirect.
+    #[test]
+    fn test_compound_pipe_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 | head") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(result.is_some(), "cargo test 2>&1 | head must be rewritten");
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "Redirect must be preserved in rewritten pipe: {joined}"
+                );
+                assert!(
+                    joined.contains("| head"),
+                    "Pipe consumer must be preserved: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    /// `cargo test 2>&1 && cargo build` must be rewritten and preserve the redirect.
+    #[test]
+    fn test_compound_and_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 && cargo build") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_some(),
+                    "cargo test 2>&1 && cargo build must be rewritten"
+                );
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "Redirect must be preserved in rewritten compound: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
     }
 }
