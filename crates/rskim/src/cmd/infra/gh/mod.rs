@@ -37,12 +37,16 @@
 //!    be called from [`parse_impl_with_auto_detect`] — pass the `trimmed`
 //!    slice from there rather than `&output.stdout`.
 
+pub(crate) mod api;
 pub(crate) mod issue_view;
 pub(crate) mod list;
 pub(crate) mod pr_checks;
 pub(crate) mod pr_view;
+pub(crate) mod release_view;
 pub(crate) mod run_view;
+pub(crate) mod run_watch;
 pub(super) mod shared;
+pub(super) mod streaming;
 
 // Re-export everything from `shared` so that submodule `use super::…` imports
 // continue to resolve without any changes to the sub-parser files.
@@ -105,6 +109,26 @@ pub(crate) fn run(
             ctx,
             run_view::prepare_args,
             run_view::parse_impl,
+        ),
+        ("run", "watch") => {
+            // Streaming handler — does not use run_infra_tool.
+            // Passes remaining args (after "run watch") to run_watch.
+            let watch_args = if args.len() > 2 { &args[2..] } else { &[] };
+            run_watch::run_watch(watch_args, ctx)
+        }
+        ("release", "view") => run_infra_tool(
+            CONFIG,
+            args,
+            ctx,
+            release_view::prepare_args,
+            release_view::parse_impl,
+        ),
+        ("api", _) => run_infra_tool(
+            CONFIG,
+            args,
+            ctx,
+            api::prepare_args,
+            api::parse_impl,
         ),
         _ => run_infra_tool(
             CONFIG,

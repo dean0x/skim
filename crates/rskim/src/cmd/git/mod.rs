@@ -11,9 +11,12 @@
 //! `+`/`-` markers.
 
 // Private: only accessed via run() dispatch in this module
+mod commit;
 mod diff;
 mod fetch;
 mod log;
+mod push;
+pub(super) mod shared;
 mod show;
 mod status;
 
@@ -64,11 +67,13 @@ pub(crate) fn run(
         "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, analytics_enabled),
         "log" => log::run_log(&global_flags, subcmd_args, show_stats, analytics_enabled),
         "show" => show::run_show(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "commit" => commit::run_commit(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "push" => push::run_push(&global_flags, subcmd_args, show_stats, analytics_enabled),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
                 "unknown git subcommand: '{safe_other}'\n\n\
-                 Supported: status, diff, fetch, log, show\n\
+                 Supported: status, diff, fetch, log, show, commit, push\n\
                  Run 'skim git --help' for usage"
             );
         }
@@ -80,7 +85,7 @@ pub(crate) fn run(
 // ============================================================================
 
 fn print_help() {
-    println!("skim git <status|diff|fetch|log|show> [args...]");
+    println!("skim git <status|diff|fetch|log|show|commit|push> [args...]");
     println!();
     println!("  Compress git command output for LLM context windows.");
     println!();
@@ -90,6 +95,8 @@ fn print_help() {
     println!("  fetch     Show compressed fetch summary (new branches, tags, pruned)");
     println!("  log       Show compressed commit log");
     println!("  show      Show compressed commit or file content at a ref");
+    println!("  commit    Show compressed commit result (hash, subject, file stats)");
+    println!("  push      Show compressed push result (refs pushed, up-to-date, rejected)");
     println!();
     println!("Global git flags (before subcommand):");
     println!("  -C <path>    Run as if git was started in <path>");
@@ -706,6 +713,7 @@ mod tests {
     /// Takes `&str` references and clones them only when analytics are enabled.
     /// No production call site uses this; prefer `finalize_git_output_owned` or
     /// `finalize_git_output_passthrough` in handlers.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_git_output(
         raw: &str,
         output: &str,
