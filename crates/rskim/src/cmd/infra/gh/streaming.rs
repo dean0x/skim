@@ -38,20 +38,35 @@
 //!
 //! # DESIGN NOTE (AD-STR-6) — UTF-8 via from_utf8_lossy
 //!
-//! The stream reader uses `String::from_utf8_lossy` to tolerate rare invalid
-//! UTF-8 bytes that `gh run watch` may emit (e.g., from build tool output).
+//! The stream reader uses `read_until(b'\n')` followed by
+//! `String::from_utf8_lossy` to tolerate rare invalid UTF-8 bytes that
+//! `gh run watch` may emit (e.g., from build tool output).  The previous
+//! `BufRead::lines()` implementation terminated the stream on the first
+//! invalid byte; `read_until` plus `from_utf8_lossy` replaces the offending byte
+//! with U+FFFD and continues.
 //!
 //! # DESIGN NOTE (AD-STR-7) — Blocking reads, no timeouts
 //!
 //! `gh run watch` may idle for minutes between workflow steps.  Blocking reads
 //! are correct here; timeouts would cause premature stream termination.
 //!
-//! # DESIGN NOTE (AD-STR-8) — Child-spawn merges stdout+stderr
+//! # DESIGN NOTE (AD-STR-8) — Child-spawn drains stderr concurrently
 //!
-//! [`run_streamed_spawned`] creates a child process with `stdout` piped and
-//! merges stderr onto stdout so the parser sees the full output stream.
+//! [`run_streamed_spawned`] pipes both stdout and stderr.  A background thread
+//! drains stderr into a `Vec<String>` while the main thread processes stdout.
+//! After the stdout loop completes, the background thread is joined and the
+//! collected stderr lines are fed through the parser.  This prevents the pipe
+//! deadlock that would occur if the child writes more than 64 KiB to stderr
+//! while the main thread is blocked on stdout (PF-023).
+//!
+//! # DESIGN NOTE (AD-STR-9) — ChildGuard kills and reaps on drop
+//!
+//! The spawned child is wrapped in [`ChildGuard`], whose `Drop` implementation
+//! calls `kill()` followed by `wait()`.  This ensures the child is reaped when
+//! the parent exits early (SIGPIPE, SIGINT unwind, or any other panic path).
+//! `kill()` on an already-exited child is a no-op on all platforms (PF-025).
 
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -63,24 +78,53 @@ use crate::output::strip_ansi;
 
 /// Maximum line length in bytes accepted by the streaming reader.
 ///
-/// Lines longer than this limit are truncated with a `…` marker appended.
-/// This prevents unbounded allocation on pathological inputs (e.g., minified
-/// JS emitted by a build step).
+/// The `read_until` reader is capped at `MAX_STREAM_LINE_BYTES + 1` bytes per
+/// call via `Read::take`, bounding allocation before the UTF-8 decode step.
+/// A `...` marker is appended when a line is truncated.  This prevents unbounded
+/// allocation on pathological inputs (e.g., minified JS emitted by a build
+/// step) per AD-STR-1.
 pub(super) const MAX_STREAM_LINE_BYTES: usize = 64 * 1024; // 64 KiB
 
 // ============================================================================
 // Private helpers
 // ============================================================================
 
-/// Truncate a line to [`MAX_STREAM_LINE_BYTES`], appending `…` if cut (AD-STR-1).
-fn truncate_line(line: String) -> String {
-    if line.len() > MAX_STREAM_LINE_BYTES {
-        let mut truncated = line[..MAX_STREAM_LINE_BYTES].to_string();
-        truncated.push('…');
-        truncated
-    } else {
-        line
+/// Read one line from `reader` using `read_until` plus `from_utf8_lossy`.
+///
+/// Implements the AD-STR-6 contract:
+/// - Each read is bounded to `MAX_STREAM_LINE_BYTES + 1` bytes via `Read::take`
+///   so allocation is capped before the UTF-8 decode step (AD-STR-1 / PF-026).
+/// - Invalid UTF-8 bytes are replaced with U+FFFD rather than terminating the
+///   stream (AD-STR-6).
+/// - Trailing `\r` and `\n` are stripped.
+///
+/// Returns `None` at EOF (0 bytes read) or on I/O error.
+/// A line that fills the cap without a newline gets a truncation marker appended.
+fn read_line_lossy(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> Option<String> {
+    buf.clear();
+    // Cap + 1 so we can detect whether a newline was consumed or we hit the
+    // limit first.  If we read exactly MAX+1 bytes, the line was truncated.
+    let n = match reader
+        .by_ref()
+        .take((MAX_STREAM_LINE_BYTES + 1) as u64)
+        .read_until(b'\n', buf)
+    {
+        Ok(0) => return None,
+        Ok(n) => n,
+        Err(_) => return None,
+    };
+
+    // Strip trailing \r\n.
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+        buf.pop();
     }
+
+    let truncated = n > MAX_STREAM_LINE_BYTES;
+    let mut line = String::from_utf8_lossy(buf).into_owned();
+    if truncated {
+        line.push('\u{2026}'); // U+2026 HORIZONTAL ELLIPSIS
+    }
+    Some(line)
 }
 
 // ============================================================================
@@ -182,10 +226,10 @@ impl DropGuard {
     fn do_record(&self) {
         // Streaming parsers don't retain full text, so we use the byte counters
         // tracked by the harness as token-count approximations.  Dividing bytes
-        // by 4 gives a rough estimate of GPT tokens for English-like text —
+        // by 4 gives a rough estimate of GPT tokens for English-like text --
         // close enough for analytics bucketing.  Using
         // `try_record_command_with_counts` avoids a re-tokenization pass on an
-        // empty placeholder string (which previously collapsed to ≤1 token and
+        // empty placeholder string (which previously collapsed to <=1 token and
         // silently under-reported every streaming run's savings).
         let raw_tokens = self.raw_bytes / 4;
         let compressed_tokens = self.compressed_bytes / 4;
@@ -206,6 +250,28 @@ impl Drop for DropGuard {
         if !self.recorded && self.analytics_enabled {
             self.do_record();
         }
+    }
+}
+
+// ============================================================================
+// ChildGuard -- kill + reap on drop (AD-STR-9, PF-025)
+// ============================================================================
+
+/// RAII wrapper that kills and reaps a child process on drop.
+///
+/// When the parent exits early (SIGPIPE, panic, or any unwind path), the
+/// `Drop` implementation calls `kill()` followed by `wait()` to prevent the
+/// child from becoming a zombie.  `kill()` on an already-exited process is a
+/// no-op on Unix (returns `ESRCH`) and returns `InvalidInput` on Windows --
+/// both cases are explicitly ignored.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // kill() is a no-op on an already-exited child; ignore the result.
+        let _ = self.0.kill();
+        // wait() reaps the zombie; ignore result (process may already be reaped).
+        let _ = self.0.wait();
     }
 }
 
@@ -237,16 +303,16 @@ pub(super) fn run_streamed_stdin(
 ) -> ExitCode {
     let mut stdout = BufWriter::new(io::stdout());
     let stdin = io::stdin();
+    let stdin_lock = stdin.lock();
+    let mut reader = io::BufReader::new(stdin_lock);
     let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
 
-    for line_result in stdin.lock().lines() {
-        let raw_line = match line_result {
-            Ok(l) => l,
-            Err(_) => break,
+    loop {
+        let raw_line = match read_line_lossy(&mut reader, &mut buf) {
+            Some(l) => l,
+            None => break,
         };
-
-        // Truncate over-limit lines (AD-STR-1).
-        let raw_line = truncate_line(raw_line);
 
         // Strip ANSI escape codes before passing to parser (AD-GRW-1).
         let clean = strip_ansi(&raw_line);
@@ -255,18 +321,25 @@ pub(super) fn run_streamed_stdin(
         guard.update(raw_line.len() + 1, 0); // +1 for newline
 
         if let Some(output) = parser.on_line(clean_line) {
-            guard.update(0, output.len() + 1);
-            if writeln!(stdout, "{output}").is_err() {
-                // SIGPIPE — exit gracefully (AD-STR-2).
-                break;
-            }
-            if stdout.flush().is_err() {
-                break;
+            match writeln!(stdout, "{output}") {
+                Ok(()) => {
+                    // Update compressed bytes only after a successful write to
+                    // avoid over-reporting on SIGPIPE (PF-026 / AD-STR-3).
+                    guard.update(0, output.len() + 1);
+                    if stdout.flush().is_err() {
+                        // SIGPIPE -- exit gracefully (AD-STR-2).
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // SIGPIPE -- exit gracefully (AD-STR-2).
+                    break;
+                }
             }
         }
     }
 
-    // Finalize — parser is consumed here; totals are already tracked in guard.
+    // Finalize -- parser is consumed here; totals are already tracked in guard.
     if let Some(output) = parser.finalize() {
         let compressed_len = output.len() + 1;
         guard.update(0, compressed_len);
@@ -280,8 +353,11 @@ pub(super) fn run_streamed_stdin(
 
 /// Run a streaming parser over a spawned child process.
 ///
-/// Spawns `cmd` with `args`, merges stdout+stderr into a single reader, and
-/// feeds each line to `parser.on_line()`.  Calls `parser.finalize()` at EOF.
+/// Spawns `cmd` with `args`, pipes both stdout and stderr, and feeds each line
+/// to `parser.on_line()`.  Stderr is drained concurrently in a background
+/// thread to prevent the pipe-full deadlock described in PF-023.  After stdout
+/// reaches EOF the background thread is joined and the collected stderr lines
+/// are fed through the parser in order.  Calls `parser.finalize()` at EOF.
 ///
 /// # Exit code semantics
 ///
@@ -291,8 +367,9 @@ pub(super) fn run_streamed_stdin(
 ///
 /// # Signal handling
 ///
-/// SIGINT is forwarded to the child via `Child::kill()` in a Drop guard.
-/// SIGPIPE on writes causes a clean exit.
+/// The child is wrapped in [`ChildGuard`]; when the parent exits for any
+/// reason (SIGPIPE, panic, clean exit) the child is killed and reaped
+/// automatically (AD-STR-9, PF-025).  SIGPIPE on writes causes a clean exit.
 ///
 /// # Analytics
 ///
@@ -310,7 +387,7 @@ pub(super) fn run_streamed_spawned(
 ) -> ExitCode {
     use std::process::{Command, Stdio};
 
-    let mut child = match Command::new(cmd)
+    let child_proc = match Command::new(cmd)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -327,24 +404,43 @@ pub(super) fn run_streamed_spawned(
         }
     };
 
+    // Wrap in ChildGuard so the child is killed+reaped on any exit path
+    // (SIGPIPE, panic, clean exit) -- AD-STR-9, PF-025.
+    let mut child = ChildGuard(child_proc);
+
     let mut stdout = BufWriter::new(io::stdout());
     let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled);
 
-    // Merge stdout+stderr (AD-STR-8).
-    let child_stdout = child.stdout.take();
-    let child_stderr = child.stderr.take();
+    // Spawn a background thread to drain stderr concurrently (AD-STR-8, PF-023).
+    // The thread collects all stderr lines into a Vec so we can feed them through
+    // the parser after stdout is exhausted -- without risking a pipe deadlock when
+    // the child writes > 64 KiB to stderr while the main thread is blocked on
+    // stdout.
+    let stderr_handle = child.0.stderr.take().map(|err| {
+        std::thread::spawn(move || {
+            let mut reader = io::BufReader::new(err);
+            let mut buf: Vec<u8> = Vec::with_capacity(256);
+            let mut lines: Vec<String> = Vec::new();
+            loop {
+                match read_line_lossy(&mut reader, &mut buf) {
+                    Some(line) => lines.push(line),
+                    None => break,
+                }
+            }
+            lines
+        })
+    });
 
-    // Read lines from child stdout.
-    if let Some(out) = child_stdout {
-        let reader = io::BufReader::new(out);
-        for line_result in reader.lines() {
-            let raw_line = match line_result {
-                Ok(l) => l,
-                Err(_) => break,
+    // Read lines from child stdout (AD-STR-6: read_until + from_utf8_lossy).
+    if let Some(out) = child.0.stdout.take() {
+        let mut reader = io::BufReader::new(out);
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+
+        loop {
+            let raw_line = match read_line_lossy(&mut reader, &mut buf) {
+                Some(l) => l,
+                None => break,
             };
-
-            // Truncate over-limit lines (AD-STR-1).
-            let raw_line = truncate_line(raw_line);
 
             let clean = strip_ansi(&raw_line);
             let clean_line: &str = clean.as_ref();
@@ -352,34 +448,41 @@ pub(super) fn run_streamed_spawned(
             guard.update(raw_line.len() + 1, 0);
 
             if let Some(output) = parser.on_line(clean_line) {
-                guard.update(0, output.len() + 1);
-                if writeln!(stdout, "{output}").is_err() {
-                    let _ = child.kill();
-                    break;
-                }
-                if stdout.flush().is_err() {
-                    let _ = child.kill();
-                    break;
+                match writeln!(stdout, "{output}") {
+                    Ok(()) => {
+                        // Update compressed bytes only after a successful write
+                        // to avoid over-reporting on SIGPIPE (PF-026).
+                        guard.update(0, output.len() + 1);
+                        if stdout.flush().is_err() {
+                            // SIGPIPE -- kill child and exit gracefully.
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                    Err(_) => {
+                        // SIGPIPE -- kill child and exit gracefully.
+                        return ExitCode::SUCCESS;
+                    }
                 }
             }
         }
     }
 
-    // Drain stderr (merge into output).
-    if let Some(err) = child_stderr {
-        let reader = io::BufReader::new(err);
-        for line_result in reader.lines() {
-            let raw_line = match line_result {
-                Ok(l) => l,
+    // Join the stderr background thread and feed its lines through the parser.
+    let stderr_lines = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    for raw_line in stderr_lines {
+        let clean = strip_ansi(&raw_line);
+        let clean_line: &str = clean.as_ref();
+        guard.update(raw_line.len() + 1, 0);
+        if let Some(output) = parser.on_line(clean_line) {
+            match writeln!(stdout, "{output}") {
+                Ok(()) => {
+                    guard.update(0, output.len() + 1);
+                    let _ = stdout.flush();
+                }
                 Err(_) => break,
-            };
-            let clean = strip_ansi(&raw_line);
-            let clean_line: &str = clean.as_ref();
-            guard.update(raw_line.len() + 1, 0);
-            if let Some(output) = parser.on_line(clean_line) {
-                guard.update(0, output.len() + 1);
-                let _ = writeln!(stdout, "{output}");
-                let _ = stdout.flush();
             }
         }
     }
@@ -392,7 +495,7 @@ pub(super) fn run_streamed_spawned(
     }
 
     // Wait for child and propagate exit code.
-    match child.wait() {
+    match child.0.wait() {
         Ok(status) => {
             guard.record();
             match status.code() {
@@ -550,6 +653,118 @@ mod tests {
             label: "test".to_string(),
         };
         let args: Vec<String> = vec!["-c".to_string(), "echo hello".to_string()];
+        let code = run_streamed_spawned(parser, "/bin/sh", &args, cfg);
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    // ---- ChildGuard kill-on-drop contract (AD-STR-9, PF-025) ----
+
+    /// Verify that ChildGuard kills a long-running child when dropped.
+    ///
+    /// Spawns `sleep 60`, immediately drops the guard, then uses `kill -0`
+    /// to confirm the child is no longer running.
+    #[test]
+    fn test_child_guard_kills_on_drop() {
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn sleep");
+
+        let pid = child.id();
+        let guard = ChildGuard(child);
+
+        // Drop the guard: this calls kill() + wait() on the child.
+        drop(guard);
+
+        // kill -0 returns non-zero when the process does not exist.
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status();
+
+        match status {
+            Ok(s) => assert!(
+                !s.success(),
+                "process {pid} should have been killed by ChildGuard"
+            ),
+            Err(_) => {
+                // `kill` binary not found on this platform -- spawn + drop
+                // completing without panic is sufficient verification.
+            }
+        }
+    }
+
+    // ---- UTF-8-lossy stream behaviour (AD-STR-6) ----
+
+    /// Verify that `read_line_lossy` tolerates invalid UTF-8 and does not
+    /// terminate the stream early.
+    #[test]
+    fn test_read_line_lossy_tolerates_invalid_utf8() {
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"line one\n");
+        input.extend_from_slice(b"bad \xFF bytes here\n");
+        input.extend_from_slice(b"line three\n");
+
+        let mut reader = io::BufReader::new(input.as_slice());
+        let mut buf = Vec::new();
+
+        let l1 = read_line_lossy(&mut reader, &mut buf).expect("first line");
+        let l2 = read_line_lossy(&mut reader, &mut buf)
+            .expect("second line -- must not be None on invalid UTF-8");
+        let l3 = read_line_lossy(&mut reader, &mut buf).expect("third line");
+        let eof = read_line_lossy(&mut reader, &mut buf);
+
+        assert_eq!(l1, "line one");
+        // Invalid 0xFF must be replaced with U+FFFD, not terminate the stream.
+        assert!(
+            l2.contains('\u{FFFD}'),
+            "expected replacement char in: {l2:?}"
+        );
+        assert_eq!(l3, "line three");
+        assert!(eof.is_none(), "expected EOF");
+    }
+
+    /// Verify that a line exceeding `MAX_STREAM_LINE_BYTES` is truncated and
+    /// gets a truncation marker suffix, with the content portion bounded by the cap.
+    #[test]
+    fn test_read_line_lossy_truncates_overlong_line() {
+        let long_line: Vec<u8> = vec![b'A'; MAX_STREAM_LINE_BYTES + 100];
+        let mut input = long_line;
+        input.push(b'\n');
+
+        let mut reader = io::BufReader::new(input.as_slice());
+        let mut buf = Vec::new();
+
+        let result = read_line_lossy(&mut reader, &mut buf).expect("line");
+        // U+2026 is the truncation marker appended by read_line_lossy.
+        assert!(
+            result.ends_with('\u{2026}'),
+            "truncated line should end with ellipsis (U+2026)"
+        );
+        let without_marker: &str = result.trim_end_matches('\u{2026}');
+        assert!(
+            without_marker.len() <= MAX_STREAM_LINE_BYTES,
+            "content before marker must be within cap"
+        );
+    }
+
+    /// Verify that `run_streamed_spawned` handles concurrent stdout+stderr
+    /// output without deadlocking.
+    #[test]
+    fn test_run_streamed_spawned_no_deadlock_with_stderr() {
+        let parser: Box<dyn StreamingParser> = Box::new(IdentityParser::new());
+        let cfg = StreamConfig {
+            analytics_enabled: false,
+            label: "test".to_string(),
+        };
+        let script = r#"for i in $(seq 1 500); do
+    echo "stdout line $i"
+    echo "stderr line $i" >&2
+done"#;
+        let args: Vec<String> = vec!["-c".to_string(), script.to_string()];
         let code = run_streamed_spawned(parser, "/bin/sh", &args, cfg);
         assert_eq!(code, ExitCode::SUCCESS);
     }
