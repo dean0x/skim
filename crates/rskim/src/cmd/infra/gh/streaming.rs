@@ -119,7 +119,13 @@ fn read_line_lossy(reader: &mut impl BufRead, buf: &mut Vec<u8>) -> Option<Strin
         buf.pop();
     }
 
+    // `n > MAX` means the take-limit was reached before a newline — the line
+    // exceeds the cap.  Bound the decoded content to `MAX_STREAM_LINE_BYTES`
+    // before appending the marker so consumers see at most `MAX + marker`.
     let truncated = n > MAX_STREAM_LINE_BYTES;
+    if truncated {
+        buf.truncate(MAX_STREAM_LINE_BYTES);
+    }
     let mut line = String::from_utf8_lossy(buf).into_owned();
     if truncated {
         line.push('\u{2026}'); // U+2026 HORIZONTAL ELLIPSIS
@@ -308,12 +314,7 @@ pub(super) fn run_streamed_stdin(
     let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
-    loop {
-        let raw_line = match read_line_lossy(&mut reader, &mut buf) {
-            Some(l) => l,
-            None => break,
-        };
-
+    while let Some(raw_line) = read_line_lossy(&mut reader, &mut buf) {
         // Strip ANSI escape codes before passing to parser (AD-GRW-1).
         let clean = strip_ansi(&raw_line);
         let clean_line: &str = clean.as_ref();
@@ -421,11 +422,8 @@ pub(super) fn run_streamed_spawned(
             let mut reader = io::BufReader::new(err);
             let mut buf: Vec<u8> = Vec::with_capacity(256);
             let mut lines: Vec<String> = Vec::new();
-            loop {
-                match read_line_lossy(&mut reader, &mut buf) {
-                    Some(line) => lines.push(line),
-                    None => break,
-                }
+            while let Some(line) = read_line_lossy(&mut reader, &mut buf) {
+                lines.push(line);
             }
             lines
         })
@@ -436,12 +434,7 @@ pub(super) fn run_streamed_spawned(
         let mut reader = io::BufReader::new(out);
         let mut buf: Vec<u8> = Vec::with_capacity(256);
 
-        loop {
-            let raw_line = match read_line_lossy(&mut reader, &mut buf) {
-                Some(l) => l,
-                None => break,
-            };
-
+        while let Some(raw_line) = read_line_lossy(&mut reader, &mut buf) {
             let clean = strip_ansi(&raw_line);
             let clean_line: &str = clean.as_ref();
 
@@ -681,9 +674,7 @@ mod tests {
         drop(guard);
 
         // kill -0 returns non-zero when the process does not exist.
-        let status = Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status();
+        let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
 
         match status {
             Ok(s) => assert!(

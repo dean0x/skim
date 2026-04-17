@@ -754,7 +754,10 @@ mod tests {
         // Non-rewritable commands return Some with has_rewrite=false and no target.
         // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) and IS rewritable.
         let info = classify_bash_command("ls").unwrap();
-        assert!(info.has_rewrite, "bare ls should now be rewritable via catch-all B.1");
+        assert!(
+            info.has_rewrite,
+            "bare ls should now be rewritable via catch-all B.1"
+        );
         assert_eq!(info.command, "ls");
 
         let info = classify_bash_command("echo hello").unwrap();

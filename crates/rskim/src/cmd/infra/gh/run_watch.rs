@@ -33,7 +33,9 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 
-use super::streaming::{run_streamed_spawned, run_streamed_stdin, StreamConfig, StreamTotals, StreamingParser};
+use super::streaming::{
+    run_streamed_spawned, run_streamed_stdin, StreamConfig, StreamTotals, StreamingParser,
+};
 
 // ============================================================================
 // Constants
@@ -70,10 +72,7 @@ pub(super) fn should_use_stdin(args: &[String]) -> bool {
 ///
 /// `--exit-status` flag is propagated to `gh` in spawn mode; non-zero
 /// workflow exit is forwarded as the process exit code.
-pub(super) fn run_watch(
-    args: &[String],
-    ctx: &crate::cmd::RunContext,
-) -> anyhow::Result<ExitCode> {
+pub(super) fn run_watch(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
     let parser = Box::new(RunWatchParser::new());
 
     let label = if ctx.show_stats || ctx.analytics_enabled {
@@ -416,11 +415,7 @@ mod tests {
         // short-circuits to false before the is_terminal() check runs.
         //
         // We use several non-empty arg scenarios to confirm the gate.
-        let cases: &[&[&str]] = &[
-            &["12345"],
-            &["--exit-status"],
-            &["12345", "--exit-status"],
-        ];
+        let cases: &[&[&str]] = &[&["12345"], &["--exit-status"], &["12345", "--exit-status"]];
         for args_strs in cases {
             let args: Vec<String> = args_strs.iter().map(|s| s.to_string()).collect();
             assert!(
