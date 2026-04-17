@@ -108,6 +108,16 @@ pub(crate) struct InfraToolConfig<'a> {
     pub install_hint: &'a str,
 }
 
+/// Detect whether to read from piped stdin.
+///
+/// Returns `true` when stdin is not a terminal AND `args` is empty — the same
+/// heuristic used across all infra tool dispatchers.  Centralised here so that
+/// [`run_infra_tool`] and the streaming sub-commands (`gh run watch`, `gh api`)
+/// share a single implementation.
+pub(crate) fn should_use_stdin(args: &[String]) -> bool {
+    !std::io::stdin().is_terminal() && args.is_empty()
+}
+
 /// Execute an infra tool, parse its output, and emit the result.
 ///
 /// This is the single implementation shared by all infra parsers, handling both
@@ -123,7 +133,7 @@ pub(crate) fn run_infra_tool(
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let use_stdin = should_use_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {

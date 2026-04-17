@@ -31,7 +31,6 @@
 //! reach this parser.  The parser does NOT call `strip_ansi` itself.
 
 use std::collections::HashMap;
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use super::streaming::{run_streamed_spawned, run_streamed_stdin, StreamConfig, StreamTotals, StreamingParser};
@@ -52,12 +51,12 @@ pub(super) const MAX_STREAM_JOBS: usize = 64;
 
 /// Detect whether to read from piped stdin.
 ///
-/// Returns `true` when stdin is not a terminal AND `args` is empty —
-/// the same heuristic used by [`super::super::run_infra_tool`].  Shared
-/// by `run_watch` and the `gh api` dispatch arm in `gh/mod.rs` so that
-/// the detection logic lives in exactly one place per module.
+/// Delegates to the canonical implementation in [`super::super::should_use_stdin`]
+/// (i.e. `cmd::infra::should_use_stdin`).  This thin forwarding function is kept
+/// here so that tests in this module can call it directly without traversing
+/// super-module paths.
 pub(super) fn should_use_stdin(args: &[String]) -> bool {
-    !std::io::stdin().is_terminal() && args.is_empty()
+    super::super::should_use_stdin(args)
 }
 
 /// Run `gh run watch` with streaming compression.
@@ -139,45 +138,54 @@ impl RunWatchParser {
     /// - `  * build (ubuntu-latest)  In progress`
     /// - `  X test  Failed`
     ///
-    /// We extract the job name (trimming status symbols/whitespace) and derive
-    /// the new status from the trailing word.
+    /// Status detection and name extraction are kept separate:
+    /// 1. Match the leading whitespace-delimited token to determine status.
+    /// 2. Strip only the status word(s) that correspond to the detected status
+    ///    from the trailing end of the name — never strip unrelated words (e.g.
+    ///    do not strip "In progress" when the detected status is `Completed`).
+    ///    This prevents job names like `"X-ray test"` from being misclassified
+    ///    or truncated.
     fn try_parse_job_line(&self, line: &str) -> Option<(String, JobStatus)> {
         let trimmed = line.trim();
-
-        // Must be indented (job lines have leading spaces/symbols).
         if trimmed.is_empty() {
             return None;
         }
 
-        // Check for status indicators.
-        let (status, rest) = if trimmed.starts_with('✓') || trimmed.starts_with("Pass") {
-            (JobStatus::Completed, trimmed.trim_start_matches('✓').trim())
-        } else if trimmed.starts_with('✗') || trimmed.starts_with('X') || trimmed.starts_with("Fail") {
-            let rest = trimmed
-                .trim_start_matches('✗')
-                .trim_start_matches('X')
-                .trim();
-            (JobStatus::Failed, rest)
-        } else if trimmed.starts_with('*') || trimmed.contains("In progress") {
-            let rest = trimmed.trim_start_matches('*').trim();
-            (JobStatus::InProgress, rest)
-        } else if trimmed.contains("Queued") || trimmed.contains("Waiting") {
-            (JobStatus::Queued, trimmed)
-        } else {
-            return None;
+        // Match on the first whitespace-delimited token to detect the status
+        // glyph.  Using split_once prevents `trim_start_matches('X')` from
+        // eating the first character of job names that begin with 'X' (e.g.
+        // "X-ray test").
+        let (status, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some(("✓", rest)) | Some(("Pass", rest)) => (JobStatus::Completed, rest),
+            Some(("✗", rest)) | Some(("X", rest)) | Some(("Fail", rest)) => {
+                (JobStatus::Failed, rest)
+            }
+            Some(("*", rest)) => (JobStatus::InProgress, rest),
+            _ if trimmed.contains("In progress") => (JobStatus::InProgress, trimmed),
+            _ if trimmed.contains("Queued") || trimmed.contains("Waiting") => {
+                (JobStatus::Queued, trimmed)
+            }
+            _ => return None,
         };
 
-        // Extract job name: everything before the last status word.
-        let name = rest
-            .trim_end_matches("Completed")
-            .trim_end_matches("Success")
-            .trim_end_matches("Failed")
-            .trim_end_matches("Failure")
-            .trim_end_matches("In progress")
-            .trim_end_matches("Queued")
-            .trim_end_matches("Waiting")
-            .trim()
-            .to_string();
+        // Strip ONLY the status word(s) matching the detected status from the
+        // trailing end.  Unconditional stripping of all status words would
+        // mangle job names that happen to end with a different status word
+        // (e.g. a job legitimately named "build In progress" when status is
+        // Completed would have its name corrupted).
+        let status_suffixes: &[&str] = match status {
+            JobStatus::Completed => &["Completed", "Success"],
+            JobStatus::Failed => &["Failed", "Failure"],
+            JobStatus::InProgress => &["In progress"],
+            JobStatus::Queued => &["Queued", "Waiting"],
+        };
+        let mut name = rest.trim().to_string();
+        for suffix in status_suffixes {
+            if let Some(stripped) = name.strip_suffix(suffix) {
+                name = stripped.trim().to_string();
+                break;
+            }
+        }
 
         if name.is_empty() {
             return None;
@@ -372,9 +380,7 @@ mod tests {
         // An already-finished run may emit no job lines at all.
         let p = make_parser();
         // finalize on zero state should not panic.
-        let result = std::panic::catch_unwind(|| {
-            Box::new(p).finalize()
-        });
+        let result = std::panic::catch_unwind(|| Box::new(p).finalize());
         assert!(result.is_ok(), "finalize on empty state should not panic");
     }
 
@@ -423,6 +429,67 @@ mod tests {
                 args
             );
         }
+    }
+
+    // ---- try_parse_job_line regression tests (Issue #2) ----
+
+    #[test]
+    fn test_x_ray_job_name_not_truncated() {
+        // "X-ray test" starts with 'X' but "X-ray" is NOT a bare "X" token.
+        // The old code used trim_start_matches('X') which would strip the 'X'
+        // from the job name.  The new code splits on whitespace and matches
+        // only the bare token "X", so "X-ray" is not mis-classified as Failed.
+        let p = make_parser();
+        // "  ✓ X-ray test Completed" — glyph is '✓', job name is "X-ray test".
+        let result = p.try_parse_job_line("  ✓ X-ray test Completed");
+        assert!(result.is_some(), "X-ray job should be parsed");
+        let (name, status) = result.unwrap();
+        assert_eq!(status, JobStatus::Completed, "status should be Completed");
+        assert_eq!(
+            name, "X-ray test",
+            "name must not have 'X' stripped: got '{name}'"
+        );
+    }
+
+    #[test]
+    fn test_x_ray_job_failed_token_form() {
+        // When "X" is a bare token (real gh CLI glyph for failed), the job
+        // name following it should not be altered.  "X-ray test" after "X "
+        // prefix → job name is "X-ray test Failed" stripped of "Failed" suffix.
+        let p = make_parser();
+        // Bare "X " prefix → Failed; rest is "X-ray test Failed".
+        let result = p.try_parse_job_line("  X X-ray test Failed");
+        assert!(result.is_some(), "bare-X glyph should parse");
+        let (name, status) = result.unwrap();
+        assert_eq!(status, JobStatus::Failed);
+        assert_eq!(name, "X-ray test", "name: {name}");
+    }
+
+    #[test]
+    fn test_status_suffix_stripped_only_for_detected_status() {
+        // "In progress" must NOT be stripped when the detected status is
+        // Completed.  A job genuinely named "build In progress" that
+        // transitions to Completed should preserve "In progress" in its name.
+        let p = make_parser();
+        let result = p.try_parse_job_line("  ✓ build In progress Completed");
+        assert!(result.is_some(), "should parse");
+        let (name, status) = result.unwrap();
+        assert_eq!(status, JobStatus::Completed);
+        // Only "Completed" is stripped; "In progress" stays in the name.
+        assert_eq!(name, "build In progress", "name: {name}");
+    }
+
+    #[test]
+    fn test_checkmark_in_progress_completed_name_not_empty() {
+        // Validation requirement: "✓ In progress Completed" must not produce
+        // an empty name (i.e. the function must return Some, not None).
+        let p = make_parser();
+        let result = p.try_parse_job_line("  ✓ In progress Completed");
+        assert!(result.is_some(), "name must not be empty for this input");
+        let (name, status) = result.unwrap();
+        assert_eq!(status, JobStatus::Completed);
+        // "Completed" stripped, "In progress" preserved as the job name.
+        assert!(!name.is_empty(), "name must not be empty: got '{name}'");
     }
 
     // ---- Parser integration (pipe path simulation) ----
