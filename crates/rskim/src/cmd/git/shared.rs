@@ -24,7 +24,12 @@ use regex::Regex;
 
 /// Regex matching the `<user:pass@>` or `<token@>` authority prefix in a URL.
 ///
-/// Matches any sequence of non-`@` characters immediately before `@hostname`.
+/// Matches the userinfo component of a URL authority (RFC 3986 §3.2.1):
+/// any non-`@`, non-whitespace, non-`/`, non-`?`, non-`#` characters
+/// immediately before `@hostname`.  The character class `[^@\s/?#]` restricts
+/// the match to the authority component, preventing over-greedy matching when
+/// a URL appears inside a query parameter of another URL.
+///
 /// This covers:
 /// - `https://token@github.com/org/repo`
 /// - `https://user:password@gitlab.com/org/repo`
@@ -32,8 +37,17 @@ use regex::Regex;
 ///
 /// The substitution replaces only the `<auth>@` part, preserving the rest of
 /// the URL so the user still sees where the push/fetch targeted.
+///
+/// # DESIGN NOTE (AD-GP-3) — RFC 3986 authority restriction
+///
+/// The original pattern `[^@\s]+@` was over-greedy: given a callback URL in a
+/// query string like `https://host/?cb=https://user:pass@bad.com`, the regex
+/// would skip the real host and scrub from `https://` all the way through
+/// `bad.com`.  Restricting to `[^@\s/?#]+@` confines the match to the URL
+/// authority segment, preserving the primary host and only stripping credentials
+/// that appear before the first `/`, `?`, or `#`.
 static CREDENTIAL_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(https?://|git://)[^@\s]+@").expect("credential URL regex is valid")
+    Regex::new(r"(?i)(https?://|git://)[^@\s/?#]+@").expect("credential URL regex is valid")
 });
 
 /// Scrub credential tokens from a git remote URL.
@@ -71,8 +85,14 @@ mod tests {
     fn test_scrub_git_url_token_auth() {
         let input = "remote: https://ghp_supersecrettoken@github.com/org/repo.git";
         let result = scrub_git_url(input);
-        assert!(!result.contains("ghp_supersecrettoken"), "token should be scrubbed");
-        assert!(result.contains("github.com/org/repo.git"), "URL remainder preserved");
+        assert!(
+            !result.contains("ghp_supersecrettoken"),
+            "token should be scrubbed"
+        );
+        assert!(
+            result.contains("github.com/org/repo.git"),
+            "URL remainder preserved"
+        );
     }
 
     #[test]
@@ -105,5 +125,23 @@ mod tests {
         let input = "Everything up-to-date";
         let result = scrub_git_url(input);
         assert_eq!(result.as_ref(), input);
+    }
+
+    /// Regression test for AD-GP-3: the regex must not be over-greedy when a
+    /// credential-bearing URL appears inside a query parameter of another URL.
+    /// The primary host (`github.com`) must be preserved; only the nested
+    /// credentials (`user:pass`) must be stripped.
+    #[test]
+    fn test_scrub_preserves_host_when_nested_url_in_path() {
+        let input = "https://github.com/?cb=https://user:pass@bad.com";
+        let result = scrub_git_url(input);
+        assert!(
+            result.contains("github.com"),
+            "primary host must be preserved"
+        );
+        assert!(
+            !result.contains("user:pass"),
+            "nested credentials must be stripped"
+        );
     }
 }

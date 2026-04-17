@@ -207,7 +207,16 @@ pub(super) fn build_analytics_label(
     analytics_enabled: bool,
 ) -> String {
     if show_stats || analytics_enabled {
-        format!("skim git {subcmd} {}", args.join(" "))
+        // Scrub credential-bearing URLs from args before persisting in the
+        // analytics DB.  A user invoking `skim git push https://TOKEN@host/repo`
+        // would otherwise have the token written to `~/.cache/skim/analytics.db`
+        // via the `original_cmd` column.  Scrubbing here protects all current
+        // and future git handlers that go through this function.
+        let scrubbed: Vec<String> = args
+            .iter()
+            .map(|a| shared::scrub_git_url(a).into_owned())
+            .collect();
+        format!("skim git {subcmd} {}", scrubbed.join(" "))
     } else {
         String::new()
     }
@@ -400,12 +409,34 @@ where
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {
-        // On failure, pass through stderr
+        // On failure, scrub credential URLs line-by-line before forwarding to
+        // stderr/stdout (PF-024).  Git push (and fetch/clone) embeds auth tokens
+        // in remote URLs on auth failures, e.g.:
+        //   fatal: unable to access 'https://ghp_xxx@github.com/org/repo.git'
+        // Without scrubbing these appear verbatim in the terminal.  This guard
+        // applies to all git subcommands going through run_parsed_command, not
+        // just push — generic protection is safer than a subcmd-specific gate.
         if !output.stderr.is_empty() {
-            eprint!("{}", output.stderr);
+            let scrubbed_stderr: String = output
+                .stderr
+                .lines()
+                .map(|l| shared::scrub_git_url(l).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !scrubbed_stderr.is_empty() {
+                eprintln!("{scrubbed_stderr}");
+            }
         }
         if !output.stdout.is_empty() {
-            print!("{}", output.stdout);
+            let scrubbed_stdout: String = output
+                .stdout
+                .lines()
+                .map(|l| shared::scrub_git_url(l).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !scrubbed_stdout.is_empty() {
+                println!("{scrubbed_stdout}");
+            }
         }
         let exit_code = output.exit_code;
         // Record analytics even on non-zero exit so the DB reflects failed
@@ -760,6 +791,29 @@ mod tests {
             crate::analytics::CommandType::Git,
             std::time::Duration::ZERO,
             None,
+        );
+    }
+
+    // ========================================================================
+    // build_analytics_label credential scrubbing (PF-024 companion)
+    // ========================================================================
+
+    /// Verifies that build_analytics_label scrubs credential-bearing URLs from
+    /// args before composing the label that is persisted in analytics.db.
+    ///
+    /// Without scrubbing, `skim git push https://TOKEN@host/repo` would write
+    /// the token into `~/.cache/skim/analytics.db` via the `original_cmd` column.
+    #[test]
+    fn test_build_analytics_label_scrubs_credentials() {
+        let args = vec!["https://ghp_SuperSecretToken@github.com/org/repo".to_string()];
+        let label = build_analytics_label("push", &args, true, true);
+        assert!(
+            !label.contains("ghp_SuperSecretToken"),
+            "analytics label must not contain the credential token; got: {label}"
+        );
+        assert!(
+            label.contains("github.com/org/repo"),
+            "analytics label must preserve the host/path; got: {label}"
         );
     }
 }

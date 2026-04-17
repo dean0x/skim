@@ -37,8 +37,8 @@ use crate::cmd::{extract_output_format, user_has_flag};
 use crate::output::canonical::GitResult;
 use crate::output::strip_ansi;
 
-use super::{run_parsed_command, run_passthrough};
 use super::shared::scrub_git_url;
+use super::{run_parsed_command, run_passthrough};
 
 // ============================================================================
 // Public entry point
@@ -124,13 +124,16 @@ pub(super) fn parse_push(input: &str) -> GitResult {
     }
 
     // Ultimate fallback: scrub credentials and passthrough.
-    let scrubbed: Vec<String> = text
+    // Use iterator destructuring so the non-empty invariant is encoded
+    // structurally: `.next()` yields the summary and the rest become details,
+    // with no implicit reliance on `scrubbed.len() >= 1` from an early guard.
+    let mut iter = text
         .lines()
         .filter(|l: &&str| !l.trim().is_empty())
-        .map(|l| scrub_git_url(l).into_owned())
-        .collect();
-    let summary = scrubbed.first().cloned().unwrap_or_else(|| "pushed".to_string());
-    GitResult::new("push".to_string(), summary, scrubbed[1..].to_vec()).with_tier("passthrough")
+        .map(|l| scrub_git_url(l).into_owned());
+    let summary = iter.next().unwrap_or_else(|| "pushed".to_string());
+    let details: Vec<String> = iter.collect();
+    GitResult::new("push".to_string(), summary, details).with_tier("passthrough")
 }
 
 // ============================================================================
@@ -291,7 +294,10 @@ fn try_parse_text(text: &str) -> Option<GitResult> {
     }
 
     if has_signal {
-        let summary = details.first().cloned().unwrap_or_else(|| "push output".to_string());
+        let summary = details
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "push output".to_string());
         let rest = details[1..].to_vec();
         Some(GitResult::new("push".to_string(), summary, rest).with_tier("degraded"))
     } else {
@@ -339,7 +345,11 @@ mod tests {
         let input = "*\trefs/heads/feat:refs/heads/feat\t[new branch]\nDone\n";
         let result = parse_push(input);
         assert_eq!(result.operation, "push");
-        assert!(result.summary.contains("pushed"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("pushed"),
+            "summary: {}",
+            result.summary
+        );
         assert!(result.details.iter().any(|d| d.contains("feat")));
     }
 
@@ -347,14 +357,22 @@ mod tests {
     fn test_parse_porcelain_up_to_date() {
         let input = "=\trefs/heads/main:refs/heads/main\t[up to date]\nDone\n";
         let result = parse_push(input);
-        assert!(result.summary.contains("up to date"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("up to date"),
+            "summary: {}",
+            result.summary
+        );
     }
 
     #[test]
     fn test_parse_porcelain_forced_update() {
         let input = "+\trefs/heads/feat:refs/heads/feat\t[forced update]\nDone\n";
         let result = parse_push(input);
-        assert!(result.summary.contains("pushed"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("pushed"),
+            "summary: {}",
+            result.summary
+        );
         assert!(result.details.iter().any(|d| d.contains("[forced]")));
     }
 
@@ -362,7 +380,11 @@ mod tests {
     fn test_parse_porcelain_rejected() {
         let input = "!\trefs/heads/feat:refs/heads/feat\t[rejected]\nDone\n";
         let result = parse_push(input);
-        assert!(result.summary.contains("rejected"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("rejected"),
+            "summary: {}",
+            result.summary
+        );
     }
 
     // ---- Credential scrubbing ----
@@ -372,8 +394,14 @@ mod tests {
         let input = "To https://ghp_supersecrettoken@github.com/org/repo.git\nDone\n";
         let result = parse_push(input);
         let rendered = format!("{result}");
-        assert!(!rendered.contains("ghp_supersecrettoken"), "credential leaked in output");
-        assert!(rendered.contains("github.com"), "URL remainder should be preserved");
+        assert!(
+            !rendered.contains("ghp_supersecrettoken"),
+            "credential leaked in output"
+        );
+        assert!(
+            rendered.contains("github.com"),
+            "URL remainder should be preserved"
+        );
     }
 
     // ---- Text tier ----
@@ -382,7 +410,11 @@ mod tests {
     fn test_parse_text_up_to_date() {
         let input = "Everything up-to-date\n";
         let result = parse_push(input);
-        assert!(result.summary.contains("up to date"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("up to date"),
+            "summary: {}",
+            result.summary
+        );
     }
 
     // ---- Empty input ----

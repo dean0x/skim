@@ -229,7 +229,11 @@ mod tests {
         let input = "[main abc1234] feat: add widget\n 1 file changed, 10 insertions(+)\n";
         let result = parse_commit(input);
         assert_eq!(result.operation, "commit");
-        assert!(result.summary.contains("feat: add widget"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("feat: add widget"),
+            "summary: {}",
+            result.summary
+        );
         assert!(result.details.iter().any(|d| d.contains("file changed")));
     }
 
@@ -237,7 +241,11 @@ mod tests {
     fn test_parse_amend_commit() {
         let input = "[main abc1234 (amend)] fix: typo in README\n 1 file changed, 1 insertion(+), 1 deletion(-)\n";
         let result = parse_commit(input);
-        assert!(result.summary.contains("fix: typo in README"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("fix: typo in README"),
+            "summary: {}",
+            result.summary
+        );
     }
 
     #[test]
@@ -245,7 +253,11 @@ mod tests {
         let input = "On branch main\nnothing to commit, working tree clean\n";
         let result = parse_commit(input);
         assert_eq!(result.operation, "commit");
-        assert!(result.summary.contains("nothing to commit"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("nothing to commit"),
+            "summary: {}",
+            result.summary
+        );
     }
 
     #[test]
@@ -260,9 +272,16 @@ mod tests {
         );
         let result = parse_commit(input);
         // Summary should be the commit subject, diff lines should NOT appear in details.
-        assert!(result.summary.contains("refactor: cleanup"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("refactor: cleanup"),
+            "summary: {}",
+            result.summary
+        );
         let rendered = format!("{result}");
-        assert!(!rendered.contains("diff --git"), "diff should be terminated");
+        assert!(
+            !rendered.contains("diff --git"),
+            "diff should be terminated"
+        );
         assert!(!rendered.contains("@@"), "diff hunks should be stripped");
     }
 
@@ -297,7 +316,11 @@ mod tests {
         );
         let result = parse_commit(input);
         // Summary should be from the commit line, not hook noise.
-        assert!(result.summary.contains("test: add unit coverage"), "summary: {}", result.summary);
+        assert!(
+            result.summary.contains("test: add unit coverage"),
+            "summary: {}",
+            result.summary
+        );
     }
 
     #[test]
