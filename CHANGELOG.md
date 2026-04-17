@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`skim git commit`** — new parser compressing `git commit` output: extracts commit hash, subject, and changed-files summary; terminates at verbose diff scissors line (`---...>8---`, AD-GC-1); skips hook noise (pre-commit, black, ruff, eslint output)
+- **`skim git push`** — new parser compressing `git push` output: full porcelain mode (auto-injected `--porcelain`, AD-GP-2); per-ref status (`* new`, `= up to date`, `+ forced`, `! rejected`); credential URL scrubbing via `scrub_git_url` (AD-GP-1)
+- **`skim infra gh api`** — new parser compressing `gh api` / `gh api graphql` output: GraphQL `.data` unwrap + `.errors` prepend, base64 `content` field replacement, binary passthrough, depth-limited JSON compaction (AD-API-1)
+- **`skim infra gh run watch`** — new streaming parser for `gh run watch`: emits job status transitions (queued → in-progress → completed/failed), suppresses progress noise, emits `Run complete: N/M succeeded` summary (AD-GRW-1)
+- **`skim infra gh release view`** — new parser compressing `gh release view --json` output: extracts tag, name, dates, assets list (capped at 20), body truncation outside code fences (AD-RV-1)
+- **Rewrite rules for new commands** — 7 new rules (93→100): `git commit`, `git push`, `gh api`, `gh api graphql`, `gh run watch`, `gh release view` (AD-RW-2)
+- **Catch-all ls/grep rewrite rules** (B.1/B.2) — any `ls` or `grep` invocation without a more-specific match is now rewritten; `--help`/`--version` pass through; pipe sources excluded from rewriting
+- **Redirect stripping** (`strip_segment_redirects`) — per-segment redirect stripping in compound commands; redirects are restored at emission time (appended to end), preserving shell semantics
+- **Streaming primitive** (`streaming.rs`) — `StreamingParser` trait, `run_streamed_spawned`, `DropGuard` for fire-and-forget analytics on streaming commands
+- **Shared git helper** (`git/shared.rs`) — `scrub_git_url` strips credential-embedded URLs (`https://<token>@github.com/...`) using lazy regex (AD-GP-1)
+
 ## [2.5.0] - 2026-04-17
 
 Formatter output compression — 8 new parsers for code formatter tools. 2,629 tests passing (up from 2,482 in v2.4.1).

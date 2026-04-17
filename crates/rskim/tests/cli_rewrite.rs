@@ -23,12 +23,14 @@ fn test_rewrite_cargo_test_with_separator() {
 
 #[test]
 fn test_rewrite_ls_no_match() {
-    // bare `ls` without flags is not rewritten (no compression benefit)
+    // NOTE: bare `ls` now matches the catch-all rule (B.1) added in v2.5.1 and
+    // IS rewritten to `skim file ls`.  Updated from the original no-match expectation.
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "ls"])
         .assert()
-        .failure();
+        .success()
+        .stdout(predicate::str::contains("skim"));
 }
 
 #[test]
@@ -464,10 +466,11 @@ fn test_suggest_mode_match() {
 
 #[test]
 fn test_suggest_mode_no_match() {
-    // bare `ls` has no rewrite rule — confirm suggest emits match:false
+    // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) — use `echo`
+    // as a stable non-rewritable example.
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["rewrite", "--suggest", "ls"])
+        .args(["rewrite", "--suggest", "echo", "hello"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -603,11 +606,12 @@ fn test_suggest_mode_stdin_match() {
 
 #[test]
 fn test_suggest_mode_stdin_no_match() {
-    // bare `ls` has no rewrite rule — confirm suggest emits match:false via stdin
+    // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) — use `echo`
+    // as a stable non-rewritable example.
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--suggest"])
-        .write_stdin("ls\n")
+        .write_stdin("echo hello\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));

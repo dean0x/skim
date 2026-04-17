@@ -602,7 +602,8 @@ mod tests {
         assert!(would_rewrite("cat file.rs").is_some());
         // Non-rewritable commands
         assert!(would_rewrite("cat file.txt").is_none());
-        assert!(would_rewrite("ls").is_none());
+        // NOTE: bare `ls` now matches the catch-all rule (B.1) added in v2.5.1
+        assert!(would_rewrite("ls").is_some());
         assert!(would_rewrite("echo hello").is_none());
         assert!(would_rewrite("cargo run").is_none());
         // Already a skim command
@@ -651,7 +652,8 @@ mod tests {
             would_rewrite("cat file.rs"),
             Some("skim file.rs --mode=pseudo".to_string())
         );
-        assert_eq!(would_rewrite("ls"), None);
+        // bare `ls` now matches the catch-all rule (B.1) added in v2.5.1
+        assert!(would_rewrite("ls").is_some());
     }
 
     #[test]
@@ -662,14 +664,14 @@ mod tests {
         assert!(would_rewrite("tree src/").is_some());
         // rg always matches
         assert!(would_rewrite("rg fn main src/").is_some());
-        // grep -r/-rn matches; bare grep does not
+        // grep -r/-rn matches specific rule; bare grep matches catch-all (B.2, v2.5.1)
         assert!(would_rewrite("grep -r TODO src/").is_some());
         assert!(would_rewrite("grep -rn TODO src/").is_some());
-        assert!(would_rewrite("grep TODO file.rs").is_none());
-        // ls -la/-R matches; bare ls does not
+        assert!(would_rewrite("grep TODO file.rs").is_some());
+        // ls -la/-R matches specific rule; bare ls matches catch-all (B.1, v2.5.1)
         assert!(would_rewrite("ls -la").is_some());
         assert!(would_rewrite("ls -R src/").is_some());
-        assert!(would_rewrite("ls").is_none());
+        assert!(would_rewrite("ls").is_some());
     }
 
     #[test]
@@ -750,9 +752,9 @@ mod tests {
     #[test]
     fn test_classify_bash_non_rewritable_commands() {
         // Non-rewritable commands return Some with has_rewrite=false and no target.
+        // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1) and IS rewritable.
         let info = classify_bash_command("ls").unwrap();
-        assert!(!info.has_rewrite);
-        assert!(info.rewrite_target.is_none());
+        assert!(info.has_rewrite, "bare ls should now be rewritable via catch-all B.1");
         assert_eq!(info.command, "ls");
 
         let info = classify_bash_command("echo hello").unwrap();

@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ✅ **PHASE 3 COMPLETE** (100% of original roadmap)
 
 **What's Complete (Phases 1 & 2):**
-- ✅ Full Rust project with comprehensive test suite (2,629 tests passing)
+- ✅ Full Rust project with comprehensive test suite (2,700 tests passing)
 - ✅ 17 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
 - ✅ 4 transformation modes: structure, signatures, types, full
 - ✅ CLI with stdin/stdout streaming support
@@ -153,8 +153,8 @@ cargo fmt -- --check           # Format check
 - `completions` — Shell completion scripts
 - `discover` — Scan agent sessions for missed skim optimization opportunities (`--since`, `--agent`, `--json`)
 - `file` — File operations compression: find, ls, tree, grep, rg output parsing (`--json`, `--show-stats`)
-- `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch, show. All support `--json`.
-- `infra` — Infrastructure tool compression: gh, aws, curl, wget output parsing (`--json`, `--show-stats`)
+- `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch, show, commit, push. All support `--json`.
+- `infra` — Infrastructure tool compression: gh (pr/issue/run/release/api/run watch/release view), aws, curl, wget output parsing (`--json`, `--show-stats`)
 - `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode)
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`)
 - `lint` — Lint and formatter output compression (eslint, ruff, mypy, golangci-lint, prettier, rustfmt, biome, dprint, oxlint, black, gofmt)
@@ -552,7 +552,7 @@ Cross-platform builds require different GitHub Actions runners:
 5. Create test fixtures
 6. Validate AST access works
 
-**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 2,629 tests passing. See README.md for full usage guide.
+**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 2,700 tests passing. See README.md for full usage guide.
 
 ### Critical First File: `src/parser.rs`
 

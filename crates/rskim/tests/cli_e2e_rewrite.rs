@@ -253,10 +253,12 @@ fn test_rewrite_hook_passthrough_already_rewritten() {
 #[test]
 fn test_rewrite_hook_passthrough_no_match() {
     // Non-matching commands pass through silently (exit 0, no output).
-    // Use a command that has no rewrite rule (bare ls without flags is not rewritten).
+    // Use a command that has no rewrite rule (echo is never rewritten).
+    // NOTE: bare `ls` now matches the catch-all rule (B.1, v2.5.1), so it is
+    // no longer a suitable passthrough example.
     let input = serde_json::json!({
         "tool_input": {
-            "command": "ls"
+            "command": "echo hello"
         }
     });
     skim_cmd()
