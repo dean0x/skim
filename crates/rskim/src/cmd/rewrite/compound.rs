@@ -326,6 +326,10 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
 ///
 /// Exposed as `pub(super)` so `mod.rs::classify_compound_pipe` can share the
 /// same exclusion logic as `try_rewrite_compound_pipe` without duplication.
+///
+/// SEE: AD-RW-2 — the catch-all `["ls"]` / `["grep"]` rewrite rules (in `rules.rs`)
+/// apply in standalone or `&&`/`||`/`;` compound segments, but not when these tools
+/// are the *source* of a `|` pipe — this constant enforces that boundary.
 pub(super) const PIPE_EXCLUDED_SOURCES: &[&str] = &["find", "fd", "ls", "rg", "grep", "ag"];
 
 /// Attempt to rewrite a compound command expression.
