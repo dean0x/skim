@@ -603,7 +603,7 @@ mod tests {
         // Non-rewritable commands
         assert!(would_rewrite("cat file.txt").is_none());
         // NOTE: bare `ls` now matches the catch-all rule (B.1) added in v2.5.1
-        assert!(would_rewrite("ls").is_some());
+        assert_eq!(would_rewrite("ls"), Some("skim file ls".to_string()));
         assert!(would_rewrite("echo hello").is_none());
         assert!(would_rewrite("cargo run").is_none());
         // Already a skim command
@@ -653,7 +653,7 @@ mod tests {
             Some("skim file.rs --mode=pseudo".to_string())
         );
         // bare `ls` now matches the catch-all rule (B.1) added in v2.5.1
-        assert!(would_rewrite("ls").is_some());
+        assert_eq!(would_rewrite("ls"), Some("skim file ls".to_string()));
     }
 
     #[test]
@@ -671,7 +671,7 @@ mod tests {
         // ls -la/-R matches specific rule; bare ls matches catch-all (B.1, v2.5.1)
         assert!(would_rewrite("ls -la").is_some());
         assert!(would_rewrite("ls -R src/").is_some());
-        assert!(would_rewrite("ls").is_some());
+        assert_eq!(would_rewrite("ls"), Some("skim file ls".to_string()));
     }
 
     #[test]
