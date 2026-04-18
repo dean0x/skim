@@ -13,7 +13,7 @@
 //!
 //! SEE: AD-RW-2 — catch-all ls/grep + pipe exclusion design note.
 
-use super::engine::{matches_catch_all_rule, try_rewrite};
+use super::engine::{is_pipe_source_excluded, try_rewrite};
 use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
@@ -321,8 +321,8 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
 }
 
 // PIPE_EXCLUDED_SOURCES removed (AD-RW-2).
-// The pipe-source exclusion is now handled via the `is_catch_all` flag on
-// `RewriteRule` (types.rs).  `engine::matches_catch_all_rule` replaces the
+// The pipe-source exclusion is now handled via the `exclude_pipe_source` flag on
+// `RewriteRule` (types.rs).  `engine::is_pipe_source_excluded` replaces the
 // hard-coded list, so adding a new catch-all only requires a single edit in
 // `rules.rs`.  See `try_rewrite_compound_pipe` and `mod.rs::classify_compound_pipe`.
 
@@ -402,9 +402,9 @@ fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResul
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
 
     // Do not rewrite catch-all rules on the pipe-source side (e.g. `ls | head`).
-    // The `is_catch_all` flag on the matching rule drives this check instead of
+    // The `exclude_pipe_source` flag on the matching rule drives this check instead of
     // the removed PIPE_EXCLUDED_SOURCES constant.  SEE: AD-RW-2.
-    if matches_catch_all_rule(&token_refs) {
+    if is_pipe_source_excluded(&token_refs) {
         return None;
     }
 

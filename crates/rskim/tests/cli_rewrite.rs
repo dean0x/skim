@@ -641,3 +641,117 @@ fn test_rewrite_short_help() {
         .success()
         .stdout(predicate::str::contains("skim rewrite"));
 }
+
+// ============================================================================
+// Task 1 regression: find/rg pipe-source exclusion (AD-RW-2)
+// ============================================================================
+
+/// `find . | head` must NOT be rewritten on the pipe source — raw output is
+/// consumed by `head` and rewriting would break the pipeline.  (AD-RW-2)
+#[test]
+fn test_find_pipe_not_rewritten() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("find . -name foo | head\n")
+        .assert()
+        .failure(); // exit 1 = Unhandled (pipe source excluded)
+}
+
+/// `rg pattern | head` must NOT be rewritten on the pipe source. (AD-RW-2)
+#[test]
+fn test_rg_pipe_not_rewritten() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("rg pattern | head\n")
+        .assert()
+        .failure(); // exit 1 = Unhandled (pipe source excluded)
+}
+
+/// Standalone `find . -name foo` (no pipe) SHOULD still be rewritten.
+#[test]
+fn test_find_standalone_rewritten() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("find . -name foo\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file find"));
+}
+
+/// Standalone `rg pattern` (no pipe) SHOULD still be rewritten.
+#[test]
+fn test_rg_standalone_rewritten() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("rg pattern\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file rg"));
+}
+
+/// `find . || echo fail` — `||` is NOT a pipe, so `find` IS rewritten.
+/// Pipe-source exclusion only applies to `|`, not `||` or `&&`.
+#[test]
+fn test_find_or_chain_still_rewritten() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("find . || echo fail\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file find"));
+}
+
+// ============================================================================
+// Task 6a: compress-or-skip negative tests (AD-RW-2)
+// ============================================================================
+
+/// `ls --help` must NOT be rewritten — informational invocations pass through.
+#[test]
+fn test_rewrite_ls_help_passthrough() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("ls --help\n")
+        .assert()
+        .failure(); // skip_if_flag_prefix fires
+}
+
+/// `grep --version` must NOT be rewritten.
+#[test]
+fn test_rewrite_grep_version_passthrough() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("grep --version\n")
+        .assert()
+        .failure(); // skip_if_flag_prefix fires
+}
+
+/// `ls | head` — catch-all ls rule is excluded on pipe source (AD-RW-2).
+#[test]
+fn test_rewrite_ls_pipe_excluded() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("rewrite")
+        .write_stdin("ls | head\n")
+        .assert()
+        .failure(); // pipe-source excluded
+}
+
+/// Bare `ls` (renamed from test_rewrite_ls_no_match) — catch-all matches and rewrites.
+#[test]
+fn test_rewrite_ls_catch_all_matches() {
+    // NOTE: bare `ls` matches the catch-all rule (B.1) added in v2.5.1 and
+    // IS rewritten to `skim file ls` when NOT on the source side of a pipe.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["rewrite", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim file ls"));
+}

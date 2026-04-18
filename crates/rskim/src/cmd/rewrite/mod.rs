@@ -35,7 +35,7 @@ use std::process::ExitCode;
 
 use acknowledge::is_segment_ack;
 use compound::{split_compound, try_rewrite_compound};
-use engine::{matches_catch_all_rule, try_rewrite};
+use engine::{is_pipe_source_excluded, try_rewrite};
 use hook::{parse_agent_flag, run_hook_mode};
 use suggest::{print_help, print_suggest};
 use types::{CommandSegment, CompoundOp, CompoundSplitResult, RewriteCategory, RewriteResult};
@@ -300,10 +300,10 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
 
     // Do not classify catch-all rules on the pipe-source side (e.g. `ls | wc -l`).
-    // Mirrors the same check in `try_rewrite_compound_pipe`.  The `is_catch_all`
+    // Mirrors the same check in `try_rewrite_compound_pipe`.  The `exclude_pipe_source`
     // flag on the matching rule replaces the removed PIPE_EXCLUDED_SOURCES constant.
     // SEE: AD-RW-2.
-    if matches_catch_all_rule(&token_refs) {
+    if is_pipe_source_excluded(&token_refs) {
         return CommandClassification::Unhandled;
     }
 

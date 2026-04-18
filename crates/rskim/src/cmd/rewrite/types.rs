@@ -20,9 +20,14 @@ pub(super) struct RewriteRule {
     pub(super) rewrite_to: &'static [&'static str],
     pub(super) skip_if_flag_prefix: &'static [&'static str],
     pub(super) category: RewriteCategory,
-    /// True for catch-all rules (`ls`, `grep`) that must NOT fire on pipe-source side.
-    /// SEE: AD-RW-2.
-    pub(super) is_catch_all: bool,
+    /// When true, this rule is suppressed on the source side of a pipe
+    /// expression (`cmd | ...`).  Prevents rewriting commands whose raw
+    /// output is consumed by downstream pipe segments (e.g. `find . | head`
+    /// must not rewrite `find` because `head` expects raw file listings).
+    ///
+    /// Set true for: file-listing commands (`ls`, `grep`, `find`, `rg`) whose
+    /// output is commonly piped to filters.  SEE: AD-RW-2.
+    pub(super) exclude_pipe_source: bool,
 }
 
 #[derive(Debug)]

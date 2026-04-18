@@ -115,9 +115,9 @@ pub(super) fn try_table_match(
         // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
         // the AST-aware diff pipeline for staged changes.
         //
-        // SEE ALSO: AD-RW-2 (catch-all ls/grep rules in rules.rs + pipe exclusion
-        // in compound.rs) for the design note on catch-all rule ordering and
-        // PIPE_EXCLUDED_SOURCES guard semantics.
+        // SEE ALSO: AD-RW-2 (pipe exclusion via `exclude_pipe_source` flag in
+        // rules.rs + `is_pipe_source_excluded` in engine.rs) for the design note
+        // on catch-all rule ordering and pipe-source guard semantics.
         //
         // Side effect on glued short flags (e.g. `-XPOST`, `--files-with-matches`):
         // Because the strict match only triggers on exact equality or `flag=value`,
@@ -163,13 +163,14 @@ pub(super) fn try_table_match(
     None
 }
 
-/// Return `true` if the first matching rule for `tokens` is a catch-all rule.
+/// Return `true` if the first matching rule for `tokens` has `exclude_pipe_source`.
 ///
-/// Used by the compound pipeline engine to suppress catch-all rewrites when the
-/// command is the *source* side of a pipe expression (e.g., `ls | head`).
+/// Used by the compound pipeline engine to suppress pipe-source rewrites when the
+/// command is the *source* side of a pipe expression (e.g., `ls | head`,
+/// `find . | head`, `rg pat | head`).
 /// Replaces the former `PIPE_EXCLUDED_SOURCES` hard-coded list with a check
-/// co-located in the rule itself. SEE: AD-RW-2.
-pub(super) fn matches_catch_all_rule(tokens: &[&str]) -> bool {
+/// co-located in the rule itself.  SEE: AD-RW-2.
+pub(super) fn is_pipe_source_excluded(tokens: &[&str]) -> bool {
     if tokens.is_empty() {
         return false;
     }
@@ -207,7 +208,7 @@ pub(super) fn matches_catch_all_rule(tokens: &[&str]) -> bool {
         {
             continue;
         }
-        return rule.is_catch_all;
+        return rule.exclude_pipe_source;
     }
 
     false
