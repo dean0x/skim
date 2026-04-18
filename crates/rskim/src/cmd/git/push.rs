@@ -183,9 +183,22 @@ fn try_parse_porcelain(text: &str) -> Option<GitResult> {
         } else if !line.is_empty() {
             let flag_char = line.chars().next().unwrap_or(' ');
             if matches!(flag_char, '=' | '*' | '+' | '!' | '-') {
-                // Consume the flag char and an optional following tab.
                 let after_flag = &line[1..];
+                // Strip optional tab (strip_ansi_escapes removes tab bytes, so the tab
+                // may already be absent after preprocessing).
                 let rest = after_flag.trim_start_matches('\t');
+                // Require that the ref content starts with `refs/` or contains `:`
+                // (src:dst ref notation).  Lines like `! [remote rejected]` start with
+                // a space or bracket and are informational text, not ref-status lines.
+                // This guards against false-triggering on `! [remote rejected]` while
+                // preserving real porcelain lines like `!refs/heads/bad:refs/heads/bad`.
+                // SEE: AD-GP-2.
+                if !rest.starts_with("refs/") && !rest.contains(':') {
+                    if line.starts_with("remote:") || line.starts_with("To ") {
+                        remote_lines.push(line.to_string());
+                    }
+                    continue;
+                }
                 let flag = &line[..1];
                 (flag, rest)
             } else {
@@ -466,6 +479,49 @@ mod tests {
             "Compressed should be shorter: compressed={}, raw={}",
             rendered.len(),
             input.len()
+        );
+    }
+
+    /// Regression (AD-GP-2): `! [remote rejected]` is informational text, not a
+    /// porcelain ref-status line.  Without the tab-guard, the parser incorrectly
+    /// treats the `!` character as a flag and produces a rejected-ref entry.
+    #[test]
+    fn test_non_porcelain_exclamation_skipped() {
+        let input = "! [remote rejected] main -> main (declined)\nDone\n";
+        // try_parse_porcelain still returns Some because "Done" is present, but
+        // must NOT produce a rejected ref entry.
+        let result = parse_push(input);
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("rejected"),
+            "Informational ! line without tab must not produce a rejected ref: {rendered}"
+        );
+    }
+
+    /// Regression (AD-GP-2): `- Some info text` is informational, not a deleted-ref
+    /// porcelain line.
+    #[test]
+    fn test_non_porcelain_dash_skipped() {
+        let input = "- Some info text\nDone\n";
+        let result = parse_push(input);
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("deleted"),
+            "Informational - line without tab must not produce a deleted ref: {rendered}"
+        );
+    }
+
+    /// Happy-path: a real porcelain line with tab separator must still work.
+    #[test]
+    fn test_real_porcelain_with_tab_works() {
+        let input = "=\trefs/heads/main:refs/heads/main\t[up to date]\nDone\n";
+        let result = try_parse_porcelain(input);
+        assert!(result.is_some(), "Real porcelain with tab must be parsed");
+        let output = result.unwrap();
+        let rendered = format!("{output}");
+        assert!(
+            rendered.contains("up to date") || rendered.contains("main"),
+            "Parsed output should contain ref info: {rendered}"
         );
     }
 }
