@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Streaming primitive** (`streaming.rs`) — `StreamingParser` trait, `run_streamed_spawned`, `DropGuard` for fire-and-forget analytics on streaming commands
 - **Shared git helper** (`git/shared.rs`) — `scrub_git_url` strips credential-embedded URLs (`https://<token>@github.com/...`) using lazy regex (AD-GP-1)
 
+### Fixed
+- **`find` and `rg` pipe-source exclusion** — `find . | head` and `rg pattern | head` are no longer rewritten; `exclude_pipe_source: true` was missing from their rules despite having specific rule entries (regression vs. intended AD-RW-2 semantics). `is_catch_all` renamed to `exclude_pipe_source` to accurately describe the field's purpose.
+- **`try_parse_porcelain` false-trigger** — porcelain parser now ignores informational lines starting with flag characters (`!`, `-`, `=`) that don't contain a ref path (`refs/` prefix) or src:dst notation (`:`). Prevents lines like `! [remote rejected] branch (pre-receive hook declined)` from being misparsed as ref-status entries. Root cause: `strip_ansi_escapes` strips tab bytes, so tab-based guard heuristics are unreliable.
+- **Credential scrubbing on success and failure analytics paths** — `raw` (success) and `output.stdout` (failure) are now scrubbed line-by-line via `scrub_git_url` before being passed to `finalize_git_output_owned` / `finalize_git_output_passthrough`. Previously, `analytics.db` could persist credential-bearing URLs from push/fetch output (PF-024).
+- **`ssh://` credential scrubbing** — `CREDENTIAL_URL_RE` now matches `ssh://user@host/...` in addition to `https://` and `git://` (AD-GP-1). SSH-cloned repos with embedded credentials in push/fetch output are now scrubbed on the same code path.
+- **`build_streaming_label` analytics label alignment** — `gh run watch` and `gh api` streaming commands now produce analytics labels via the shared `build_streaming_label` helper, matching the `"skim {family} {program} {subcommand} {args}"` format used by non-streaming infra commands (PF-022).
+- **Rewrite engine deduplication** — `should_skip_by_flag` extracted as a named function (replacing two duplicated inline closures); `has_pipe_operator` and `reconstruct_pipe_parts` extracted to `compound.rs`; `splice_redirects_back` promoted to `pub(super)`. Dead index (`PIPE_EXCLUDED_SOURCES` slice) removed.
+
 ## [2.5.0] - 2026-04-17
 
 Formatter output compression — 8 new parsers for code formatter tools. 2,629 tests passing (up from 2,482 in v2.4.1).
