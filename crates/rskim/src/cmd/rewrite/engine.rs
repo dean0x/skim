@@ -128,6 +128,12 @@ pub(super) fn try_table_match(
         // `should_skip_by_flag` (AD-RW-1) to prevent `--staged` from being eaten
         // by a `--stat` skip prefix.
         //
+        // `return None` (not `continue`) is intentional: when a rule fires its
+        // skip condition the intent is "do not rewrite this command at all",
+        // not "try a less-specific fallback rule".  Continuing would cause
+        // `grep -rn -c=val` to fall through to the catch-all `grep` rule and
+        // emit a spurious rewrite.
+        //
         // SEE ALSO: AD-RW-2 (pipe exclusion via `exclude_pipe_source` flag in
         // rules.rs + `is_pipe_source_excluded` in engine.rs) for the design note
         // on catch-all rule ordering and pipe-source guard semantics.
@@ -188,8 +194,12 @@ pub(super) fn is_pipe_source_excluded(tokens: &[&str]) -> bool {
         if before_sep[..rule.prefix.len()] != *rule.prefix {
             continue;
         }
-        // Mirror the skip-flag logic from try_table_match so we identify the
-        // first rule that would actually fire (not a rule that would be skipped).
+        // Intentionally uses `continue` (not `return false`) when a skip flag
+        // fires.  This ensures commands like `grep -rn --count` still propagate
+        // through to the catch-all `grep` rule and are recognised as
+        // pipe-source-excluded, even though `try_table_match` would return None
+        // for them.  Without this, `grep --count | head` could be rewritten
+        // because the specific rule's skip flag prevented the catch-all check.
         let middle = &before_sep[rule.prefix.len()..];
         if should_skip_by_flag(middle, rule.skip_if_flag_prefix) {
             continue;

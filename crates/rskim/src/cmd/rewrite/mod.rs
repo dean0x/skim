@@ -182,8 +182,7 @@ fn classify_segment(tokens: &[&str]) -> CommandClassification {
 /// payload because all call sites return `Unhandled` immediately on that branch.
 fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
     if is_segment_ack(tokens) {
-        let owned: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
-        return SegmentClassification::AlreadyCompact(owned);
+        return SegmentClassification::AlreadyCompact(tokens.iter().map(|s| s.to_string()).collect());
     }
     match try_rewrite(tokens) {
         Some(r) => SegmentClassification::Rewritten(r.tokens),

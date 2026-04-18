@@ -368,12 +368,10 @@ mod tests {
     }
 
     #[test]
-    fn test_already_finished_run() {
+    fn test_already_finished_run_emits_nothing() {
         // An already-finished run may emit no job lines at all.
         let p = make_parser();
-        // finalize on zero state should not panic.
-        let result = std::panic::catch_unwind(|| Box::new(p).finalize());
-        assert!(result.is_ok(), "finalize on empty state should not panic");
+        assert!(Box::new(p).finalize().is_none(), "empty state must produce no summary");
     }
 
     // ---- should_use_stdin helper ----

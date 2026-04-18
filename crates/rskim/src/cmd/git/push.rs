@@ -293,14 +293,10 @@ fn try_parse_text(text: &str) -> Option<GitResult> {
             continue;
         }
 
-        // Remote: lines with meaningful info.
-        if line_s.starts_with("remote:") && !line_s.contains("...") {
-            details.push(line_s.to_string());
-            has_signal = true;
-        }
-
-        // "To <remote>" lines.
-        if line_s.starts_with("To ") {
+        // Remote: lines with meaningful info, or "To <remote>" lines.
+        if (line_s.starts_with("remote:") && !line_s.contains("..."))
+            || line_s.starts_with("To ")
+        {
             details.push(line_s.to_string());
             has_signal = true;
         }
