@@ -56,10 +56,11 @@ pub(super) struct CommandSegment {
     pub(super) trailing_operator: Option<CompoundOp>,
     /// Redirects stripped from this segment for re-emission.
     ///
-    /// Each entry is `(original_index, redirect_token)` where `original_index`
-    /// is the position in the original token list before stripping.  Re-emitted
-    /// at their original positions so shell semantics are preserved.
-    pub(super) stripped_redirects: Vec<(usize, String)>,
+    /// Appended at segment end at emission time via `splice_redirects_back`.
+    /// Shell semantics for trailing redirects are identical to mid-command
+    /// placement (POSIX §2.7), so append-at-end preserves correctness even
+    /// though original positions are not tracked.
+    pub(super) stripped_redirects: Vec<String>,
 }
 
 /// Shell compound operators.

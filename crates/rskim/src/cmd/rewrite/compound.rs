@@ -33,16 +33,17 @@ use super::types::{
 /// - heredocs (`<<`) — handled by bail logic
 /// - Pre-command redirects (`2>&1 cmd`) — non-standard, out of scope
 ///
-/// Returns the original `(index, token)` pairs that were stripped so they can
-/// be re-spliced at emission time.  The `tokens` vec is mutated in place.
+/// Returns the redirect tokens that were stripped so they can be re-spliced
+/// via `splice_redirects_back` at emission time.  The `tokens` vec is mutated
+/// in place.
 ///
 /// # DESIGN NOTE (AD-RW-2)
 ///
 /// Only appended/trailing redirects are handled.  Pre-command redirects
 /// (`2>&1 foo`) are non-standard and out of scope per the plan.  The redirect
 /// forms listed above cover the most common CI/agent patterns.
-pub(super) fn strip_segment_redirects(tokens: &mut Vec<String>) -> Vec<(usize, String)> {
-    let mut stripped: Vec<(usize, String)> = Vec::new();
+pub(super) fn strip_segment_redirects(tokens: &mut Vec<String>) -> Vec<String> {
+    let mut stripped: Vec<String> = Vec::new();
 
     // Two-pass: first collect indices to remove, then drain them.
     let mut remove_indices: Vec<usize> = Vec::new();
@@ -72,11 +73,11 @@ pub(super) fn strip_segment_redirects(tokens: &mut Vec<String>) -> Vec<(usize, S
     // Drain in reverse order so indices stay valid.
     for &idx in remove_indices.iter().rev() {
         let tok = tokens.remove(idx);
-        stripped.push((idx, tok));
+        stripped.push(tok);
     }
 
-    // Re-sort by original index (ascending) since we iterated in reverse.
-    stripped.sort_by_key(|(idx, _)| *idx);
+    // Reverse to restore original order (we drained in reverse).
+    stripped.reverse();
 
     stripped
 }
@@ -98,8 +99,10 @@ fn is_single_redirect(tok: &str) -> bool {
 /// token list (the original indices no longer map into the rewritten list).
 ///
 /// Used at emission time to reconstruct the shell-semantics-equivalent command.
-fn splice_redirects_back(tokens: &mut Vec<String>, redirects: &[(usize, String)]) {
-    for (_idx, tok) in redirects {
+/// Exposed as `pub(super)` so `mod.rs` can call it directly, eliminating
+/// duplicated inline loops.
+pub(super) fn splice_redirects_back(tokens: &mut Vec<String>, redirects: &[String]) {
+    for tok in redirects {
         tokens.push(tok.clone());
     }
 }
@@ -326,6 +329,13 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
 // hard-coded list, so adding a new catch-all only requires a single edit in
 // `rules.rs`.  See `try_rewrite_compound_pipe` and `mod.rs::classify_compound_pipe`.
 
+/// Return true if any segment has a trailing pipe operator.
+pub(super) fn has_pipe_operator(segments: &[CommandSegment]) -> bool {
+    segments
+        .iter()
+        .any(|s| s.trailing_operator == Some(CompoundOp::Pipe))
+}
+
 /// Attempt to rewrite a compound command expression.
 ///
 /// For `&&`/`||`/`;`: tries `try_rewrite()` on each segment independently.
@@ -336,10 +346,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
         return None;
     }
 
-    // Check if this is a pipe expression (any segment has a Pipe operator)
-    let has_pipe = segments
-        .iter()
-        .any(|s| s.trailing_operator == Some(CompoundOp::Pipe));
+    let has_pipe = has_pipe_operator(segments);
 
     if has_pipe {
         return try_rewrite_compound_pipe(segments);
@@ -391,36 +398,27 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
     })
 }
 
-/// Rewrite a pipe expression. Only the first segment (output producer) is rewritten.
-fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResult> {
-    if segments.is_empty() {
-        return None;
-    }
-
-    let first = &segments[0];
-
-    let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
-
-    // Do not rewrite catch-all rules on the pipe-source side (e.g. `ls | head`).
-    // The `exclude_pipe_source` flag on the matching rule drives this check instead of
-    // the removed PIPE_EXCLUDED_SOURCES constant.  SEE: AD-RW-2.
-    if is_pipe_source_excluded(&token_refs) {
-        return None;
-    }
-
-    let rewrite = try_rewrite(&token_refs)?;
-
-    // Reconstruct: rewritten first segment | rest unchanged
-    // Splice redirects back at their original positions for the first segment.
-    let mut first_tokens = rewrite.tokens.clone();
-    splice_redirects_back(&mut first_tokens, &first.stripped_redirects);
-
+/// Reconstruct a pipe command from segments after the first segment has been
+/// rewritten.
+///
+/// Takes the already-rewritten first segment tokens (with redirects already
+/// spliced back) and the full segments slice.  Emits: `first_joined | seg2 | seg3`.
+/// Non-first segments are preserved verbatim with their redirects re-appended.
+///
+/// # Invariants
+/// - `segments` must be non-empty (caller gates on this).
+/// - First segment's redirects must be spliced into `first_rewritten` before
+///   calling (caller responsibility).
+pub(super) fn reconstruct_pipe_parts(
+    segments: &[CommandSegment],
+    first_rewritten: Vec<String>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
-    parts.push(first_tokens.join(" "));
+    parts.push(first_rewritten.join(" "));
 
     for (idx, seg) in segments.iter().enumerate() {
         if idx == 0 {
-            // Already handled the first segment; add its operator
+            // Already handled the first segment; add its trailing operator.
             if let Some(op) = seg.trailing_operator {
                 parts.push(op.as_str().to_string());
             }
@@ -435,8 +433,36 @@ fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResul
         }
     }
 
+    parts.join(" ")
+}
+
+/// Rewrite a pipe expression. Only the first segment (output producer) is rewritten.
+fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResult> {
+    if segments.is_empty() {
+        return None;
+    }
+
+    let first = &segments[0];
+
+    let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
+
+    // Do not rewrite pipe-source-excluded commands (e.g. `ls | head`, `find . | head`).
+    // The `exclude_pipe_source` flag on the matching rule drives this check.
+    // SEE: AD-RW-2.
+    if is_pipe_source_excluded(&token_refs) {
+        return None;
+    }
+
+    let rewrite = try_rewrite(&token_refs)?;
+
+    // Splice redirects back for the first segment before handing off.
+    let mut first_tokens = rewrite.tokens.clone();
+    splice_redirects_back(&mut first_tokens, &first.stripped_redirects);
+
+    let reconstructed = reconstruct_pipe_parts(segments, first_tokens);
+
     Some(RewriteResult {
-        tokens: parts,
+        tokens: vec![reconstructed],
         category: rewrite.category,
     })
 }

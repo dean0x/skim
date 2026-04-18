@@ -4,6 +4,23 @@ use super::handlers::{try_rewrite_cat, try_rewrite_head, try_rewrite_tail};
 use super::rules;
 use super::types::RewriteResult;
 
+/// Return true if any token in `middle` matches a skip-flag prefix.
+///
+/// Uses strict matching: `arg == flag` or `arg` starts with `flag=`.
+/// Prevents loose `starts_with` from eating flags like `--staged` when
+/// matching against `--stat`.  SEE: AD-RW-1.
+fn should_skip_by_flag(middle: &[&str], skip_prefixes: &[&str]) -> bool {
+    if skip_prefixes.is_empty() {
+        return false;
+    }
+    middle.iter().any(|arg| {
+        skip_prefixes.iter().any(|flag| {
+            *arg == *flag
+                || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
+        })
+    })
+}
+
 /// Attempt to rewrite a tokenized command. Returns `Some(RewriteResult)` on
 /// match, `None` if no rewrite applies.
 pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
@@ -107,36 +124,14 @@ pub(super) fn try_table_match(
         let middle = &before_sep[rule.prefix.len()..];
 
         // Check skip_if_flag_prefix: if any middle arg exactly matches a skip flag
-        // (or matches as `--flag=value`).
-        //
-        // DESIGN NOTE (AD-RW-1): We use strict matching here — `arg == flag` or
-        // `arg.starts_with(flag) && next_byte == b'='` — which mirrors
-        // `cmd::mod::user_has_flag`. The previous loose `starts_with` check
-        // caused `--staged` to be eaten by a `--stat` skip prefix, blocking
-        // the AST-aware diff pipeline for staged changes.
+        // (or matches as `--flag=value`).  Uses strict matching via
+        // `should_skip_by_flag` (AD-RW-1) to prevent `--staged` from being eaten
+        // by a `--stat` skip prefix.
         //
         // SEE ALSO: AD-RW-2 (pipe exclusion via `exclude_pipe_source` flag in
         // rules.rs + `is_pipe_source_excluded` in engine.rs) for the design note
         // on catch-all rule ordering and pipe-source guard semantics.
-        //
-        // Side effect on glued short flags (e.g. `-XPOST`, `--files-with-matches`):
-        // Because the strict match only triggers on exact equality or `flag=value`,
-        // a glued short flag like `-XPOST` (where the skip prefix is, say, `-X`)
-        // will NOT match and therefore will NOT suppress the rewrite. This means
-        // `curl -XPOST` is rewritten, passing the flag through to the skim wrapper.
-        // This is intentional: glued short flags are passed through unmodified in
-        // the output (middle tokens are preserved verbatim), so the skim wrapper
-        // receives the correct invocation.
-        let strict_skip_match = |arg: &str, flag: &str| -> bool {
-            arg == flag || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
-        };
-        if !rule.skip_if_flag_prefix.is_empty()
-            && middle.iter().any(|arg| {
-                rule.skip_if_flag_prefix
-                    .iter()
-                    .any(|skip| strict_skip_match(arg, skip))
-            })
-        {
+        if should_skip_by_flag(middle, rule.skip_if_flag_prefix) {
             return None;
         }
 
@@ -196,16 +191,7 @@ pub(super) fn is_pipe_source_excluded(tokens: &[&str]) -> bool {
         // Mirror the skip-flag logic from try_table_match so we identify the
         // first rule that would actually fire (not a rule that would be skipped).
         let middle = &before_sep[rule.prefix.len()..];
-        let strict_skip_match = |arg: &str, flag: &str| -> bool {
-            arg == flag || (arg.starts_with(flag) && arg.as_bytes().get(flag.len()) == Some(&b'='))
-        };
-        if !rule.skip_if_flag_prefix.is_empty()
-            && middle.iter().any(|arg| {
-                rule.skip_if_flag_prefix
-                    .iter()
-                    .any(|skip| strict_skip_match(arg, skip))
-            })
-        {
+        if should_skip_by_flag(middle, rule.skip_if_flag_prefix) {
             continue;
         }
         return rule.exclude_pipe_source;

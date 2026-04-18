@@ -34,7 +34,10 @@ use std::io::{self, BufRead, IsTerminal, Read};
 use std::process::ExitCode;
 
 use acknowledge::is_segment_ack;
-use compound::{split_compound, try_rewrite_compound};
+use compound::{
+    has_pipe_operator, reconstruct_pipe_parts, splice_redirects_back, split_compound,
+    try_rewrite_compound,
+};
 use engine::{is_pipe_source_excluded, try_rewrite};
 use hook::{parse_agent_flag, run_hook_mode};
 use suggest::{print_help, print_suggest};
@@ -195,7 +198,7 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
 type ClassifiedSegment<'a> = (
     SegmentClassification,
     Option<CompoundOp>,
-    &'a [(usize, String)],
+    &'a [String],
 );
 
 /// Classify a compound command (segments connected by `&&`, `||`, `;`, `|`).
@@ -219,12 +222,7 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
         return CommandClassification::Unhandled;
     }
 
-    // Check if this is a pipe expression (any segment has a Pipe operator).
-    let has_pipe = segments
-        .iter()
-        .any(|s| s.trailing_operator == Some(CompoundOp::Pipe));
-
-    if has_pipe {
+    if has_pipe_operator(segments) {
         return classify_compound_pipe(segments);
     }
 
@@ -268,9 +266,7 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
                 // Splice stripped redirects back so they are not silently lost.
                 // Mirrors the pattern in `try_rewrite_compound` / compound.rs.
                 // SEE: AD-RW-2 (Issue #2).
-                for (_idx, tok) in redirects {
-                    tokens.push(tok.clone());
-                }
+                splice_redirects_back(&mut tokens, redirects);
                 tokens.join(" ")
             }
             // NoMatch is unreachable here: Pass 2 already returned Unhandled if
@@ -313,33 +309,11 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
         SegmentClassification::AlreadyCompact(_) => CommandClassification::AlreadyCompact,
         SegmentClassification::NoMatch => CommandClassification::Unhandled,
         SegmentClassification::Rewritten(mut rewritten_tokens) => {
-            // Reconstruct: rewritten first segment | rest unchanged.
-            // Splice redirects back for the first segment (Issue #2 / AD-RW-2).
-            for (_idx, tok) in &first.stripped_redirects {
-                rewritten_tokens.push(tok.clone());
-            }
-            let mut parts: Vec<String> = Vec::new();
-            parts.push(rewritten_tokens.join(" "));
-
-            for (idx, seg) in segments.iter().enumerate() {
-                if idx == 0 {
-                    if let Some(op) = seg.trailing_operator {
-                        parts.push(op.as_str().to_string());
-                    }
-                    continue;
-                }
-                // Restore redirects for non-rewritten pipe segments.
-                let mut seg_tokens = seg.tokens.clone();
-                for (_i, tok) in &seg.stripped_redirects {
-                    seg_tokens.push(tok.clone());
-                }
-                parts.push(seg_tokens.join(" "));
-                if let Some(op) = seg.trailing_operator {
-                    parts.push(op.as_str().to_string());
-                }
-            }
-
-            CommandClassification::Rewritten(parts.join(" "))
+            // Splice redirects back for the first segment, then delegate to
+            // the shared pipe-reconstruction helper (Issue #2 / AD-RW-2).
+            splice_redirects_back(&mut rewritten_tokens, &first.stripped_redirects);
+            let reconstructed = reconstruct_pipe_parts(segments, rewritten_tokens);
+            CommandClassification::Rewritten(reconstructed)
         }
     }
 }
