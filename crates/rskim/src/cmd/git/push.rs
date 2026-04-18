@@ -294,9 +294,7 @@ fn try_parse_text(text: &str) -> Option<GitResult> {
         }
 
         // Remote: lines with meaningful info, or "To <remote>" lines.
-        if (line_s.starts_with("remote:") && !line_s.contains("..."))
-            || line_s.starts_with("To ")
-        {
+        if (line_s.starts_with("remote:") && !line_s.contains("...")) || line_s.starts_with("To ") {
             details.push(line_s.to_string());
             has_signal = true;
         }

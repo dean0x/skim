@@ -371,7 +371,10 @@ mod tests {
     fn test_already_finished_run_emits_nothing() {
         // An already-finished run may emit no job lines at all.
         let p = make_parser();
-        assert!(Box::new(p).finalize().is_none(), "empty state must produce no summary");
+        assert!(
+            Box::new(p).finalize().is_none(),
+            "empty state must produce no summary"
+        );
     }
 
     // ---- should_use_stdin helper ----
