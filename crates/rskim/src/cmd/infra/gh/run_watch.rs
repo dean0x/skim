@@ -65,11 +65,14 @@ pub(super) const MAX_STREAM_JOBS: usize = 64;
 pub(super) fn run_watch(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
     let parser = Box::new(RunWatchParser::new());
 
-    let label = if ctx.show_stats || ctx.analytics_enabled {
-        format!("skim infra gh run watch {}", args.join(" "))
-    } else {
-        String::new()
-    };
+    let label = super::super::build_streaming_label(
+        "infra",
+        "gh",
+        "run watch",
+        args,
+        ctx.show_stats,
+        ctx.analytics_enabled,
+    );
 
     let cfg = StreamConfig {
         analytics_enabled: ctx.analytics_enabled,

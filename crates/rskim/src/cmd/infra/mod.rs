@@ -152,6 +152,31 @@ pub(crate) fn run_infra_tool(
     )
 }
 
+/// Build an analytics label for streaming infra commands.
+///
+/// Mirrors the label format in `ParsedCommandConfig`
+/// (`"skim {family} {program} {subcommand} {args}"`) for consistency across
+/// streaming and non-streaming infra commands.  Returns an empty string when
+/// analytics is disabled (avoids unnecessary formatting).  SEE: PF-022.
+pub(crate) fn build_streaming_label(
+    family: &str,
+    program: &str,
+    subcommand: &str,
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> String {
+    if !show_stats && !analytics_enabled {
+        return String::new();
+    }
+    let args_str = args.join(" ");
+    if args_str.is_empty() {
+        format!("skim {family} {program} {subcommand}")
+    } else {
+        format!("skim {family} {program} {subcommand} {args_str}")
+    }
+}
+
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
