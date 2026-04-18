@@ -439,11 +439,21 @@ where
             }
         }
         let exit_code = output.exit_code;
+        // Scrub credentials before analytics recording on the failure path (PF-024).
+        // Terminal output above is already scrubbed; this ensures the analytics DB
+        // copy is also clean.  .lines().join("\n") normalizes \r\n to \n —
+        // intentional for Unix-first CLI output.
+        let analytics_stdout: String = output
+            .stdout
+            .lines()
+            .map(|l| shared::scrub_git_url(l).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         // Record analytics even on non-zero exit so the DB reflects failed
         // invocations. Move stdout into the passthrough variant: 1 allocation
         // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
         finalize_git_output_passthrough(
-            output.stdout,
+            analytics_stdout,
             label,
             show_stats,
             analytics_enabled,
@@ -478,13 +488,22 @@ where
         }
     };
 
-    // Both `raw` and `result_str` are owned here and consumed at end-of-function;
-    // use the owned variant to move them directly rather than cloning.
+    // Scrub credentials before analytics recording on the success path (PF-024).
+    // The parser used the un-scrubbed `raw` to extract ref data; only the analytics
+    // copy needs scrubbing.  .lines().join("\n") normalizes \r\n to \n — intentional
+    // for Unix-first CLI output.
+    let analytics_raw: String = raw
+        .lines()
+        .map(|l| shared::scrub_git_url(l).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `analytics_raw` and `result_str` are owned here; move them directly.
     // `label` is supplied by the caller from the user's original (pre-rewrite) args
     // so the analytics DB records the invocation as the user typed it.
     // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-GIT-12).
     finalize_git_output_owned(
-        raw,
+        analytics_raw,
         result_str,
         label,
         show_stats,
@@ -814,6 +833,62 @@ mod tests {
         assert!(
             label.contains("github.com/org/repo"),
             "analytics label must preserve the host/path; got: {label}"
+        );
+    }
+
+    // ========================================================================
+    // Failure-path credential scrubbing (PF-024 / Task 6c)
+    // ========================================================================
+
+    /// Verifies that credentials embedded in git stderr output are scrubbed
+    /// before being written to the terminal AND before being recorded in
+    /// analytics.db on the non-zero exit path.
+    ///
+    /// We cannot drive `run_parsed_command` end-to-end in a unit test (it
+    /// shells out to a real `git` binary).  Instead we test the scrubbing
+    /// helper directly on the kind of line that git emits on auth failures:
+    ///
+    ///   fatal: unable to access 'https://ghp_xxx@github.com/org/repo.git':
+    ///     The requested URL returned error: 403
+    ///
+    /// The scrubbing logic in `run_parsed_command` calls `shared::scrub_git_url`
+    /// line-by-line on both stderr and stdout before forwarding to the terminal
+    /// and before passing to `finalize_git_output_passthrough`.
+    #[test]
+    fn test_error_path_stderr_scrubbing() {
+        use crate::cmd::git::shared::scrub_git_url;
+
+        let stderr_line =
+            "fatal: unable to access 'https://ghp_abc123@github.com/org/repo.git': 403";
+        let scrubbed = scrub_git_url(stderr_line);
+        assert!(
+            !scrubbed.contains("ghp_abc123"),
+            "credential token must be stripped from error output; got: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("github.com/org/repo.git"),
+            "host/path must be preserved in error output; got: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("403"),
+            "error details must be preserved; got: {scrubbed}"
+        );
+    }
+
+    /// ssh:// credentials on the error path are scrubbed (AD-GP-1 companion).
+    #[test]
+    fn test_error_path_stderr_scrubs_ssh_url() {
+        use crate::cmd::git::shared::scrub_git_url;
+
+        let stderr_line = "fatal: Could not read from remote repository ssh://deploy@github.com/org/repo.git";
+        let scrubbed = scrub_git_url(stderr_line);
+        assert!(
+            !scrubbed.contains("deploy@"),
+            "ssh credential must be stripped; got: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("github.com/org/repo.git"),
+            "host/path must be preserved; got: {scrubbed}"
         );
     }
 }

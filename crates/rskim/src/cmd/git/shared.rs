@@ -34,6 +34,7 @@ use regex::Regex;
 /// - `https://token@github.com/org/repo`
 /// - `https://user:password@gitlab.com/org/repo`
 /// - `git://user@bitbucket.org/org/repo`
+/// - `ssh://user:token@github.com/org/repo` (AD-GP-1)
 ///
 /// The substitution replaces only the `<auth>@` part, preserving the rest of
 /// the URL so the user still sees where the push/fetch targeted.
@@ -46,8 +47,14 @@ use regex::Regex;
 /// `bad.com`.  Restricting to `[^@\s/?#]+@` confines the match to the URL
 /// authority segment, preserving the primary host and only stripping credentials
 /// that appear before the first `/`, `?`, or `#`.
+///
+/// # DESIGN NOTE (AD-GP-1) — ssh:// coverage
+///
+/// `ssh://user:token@host/path` embeds credentials in the same authority segment
+/// as https/git.  Added `ssh://` to the scheme alternation so SSH-cloned repos
+/// with embedded credentials are scrubbed on the same code path.
 static CREDENTIAL_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(https?://|git://)[^@\s/?#]+@").expect("credential URL regex is valid")
+    Regex::new(r"(?i)(https?://|git://|ssh://)[^@\s/?#]+@").expect("credential URL regex is valid")
 });
 
 /// Scrub credential tokens from a git remote URL.
@@ -142,6 +149,25 @@ mod tests {
         assert!(
             !result.contains("user:pass"),
             "nested credentials must be stripped"
+        );
+    }
+
+    /// ssh:// URLs with embedded credentials are scrubbed (AD-GP-1).
+    #[test]
+    fn test_scrub_ssh_url() {
+        let input = "ssh://token@github.com/repo.git";
+        let result = scrub_git_url(input);
+        assert!(
+            result.contains("ssh://"),
+            "scheme should be preserved: {result}"
+        );
+        assert!(
+            !result.contains("token"),
+            "credentials should be scrubbed: {result}"
+        );
+        assert!(
+            result.contains("github.com/repo.git"),
+            "host+path should be preserved: {result}"
         );
     }
 }
