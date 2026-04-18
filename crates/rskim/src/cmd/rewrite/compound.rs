@@ -789,4 +789,162 @@ mod tests {
             other => panic!("Expected Compound, got {:?}", other),
         }
     }
+
+    // ========================================================================
+    // Redirect stripping — all single-token and two-token forms (Task 6d)
+    // ========================================================================
+
+    /// Exercise every single-token redirect form that `is_single_redirect` recognises.
+    ///
+    /// Each form must be stripped (not appear in the matched tokens) but must be
+    /// re-spliced back into the output at emission time.  We test stripping only
+    /// here; re-splicing is covered by `test_compound_pipe_rewrite_preserves_redirect`.
+    #[test]
+    fn test_strip_segment_redirects_all_single_token_forms() {
+        let forms = [
+            "2>&1",
+            ">&2",
+            "1>&2",
+            ">&1",
+            ">/dev/null",
+            "2>/dev/null",
+            "&>/dev/null",
+        ];
+        for form in forms {
+            let mut tokens: Vec<String> = vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                form.to_string(),
+            ];
+            let stripped = strip_segment_redirects(&mut tokens);
+            assert_eq!(
+                tokens,
+                vec!["cargo", "test"],
+                "redirect {form:?} must be stripped from token list"
+            );
+            assert_eq!(
+                stripped,
+                vec![form.to_string()],
+                "stripped list must contain {form:?}"
+            );
+        }
+    }
+
+    /// The whitespace-separated two-token form `["2>", "/dev/null"]` must be
+    /// stripped as a unit (both tokens removed together).
+    #[test]
+    fn test_strip_segment_redirects_two_token_form() {
+        let mut tokens: Vec<String> = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "2>".to_string(),
+            "/dev/null".to_string(),
+        ];
+        let stripped = strip_segment_redirects(&mut tokens);
+        assert_eq!(
+            tokens,
+            vec!["cargo", "test"],
+            "both tokens of the two-token form must be stripped"
+        );
+        assert_eq!(
+            stripped,
+            vec!["2>".to_string(), "/dev/null".to_string()],
+            "stripped list must contain both two-token redirect tokens"
+        );
+    }
+
+    /// `||` operator with a redirect on the left side: rewrite must preserve
+    /// the redirect and the `||` consumer.
+    #[test]
+    fn test_compound_or_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 || echo failed") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_some(),
+                    "cargo test 2>&1 || echo failed must be rewritten"
+                );
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "redirect must survive || rewrite: {joined}"
+                );
+                assert!(
+                    joined.contains("|| echo failed"),
+                    "|| consumer must be preserved: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    /// `;` operator with a redirect: `cargo test 2>&1 ; echo done` must be
+    /// rewritten with the redirect and `;` consumer preserved.
+    #[test]
+    fn test_compound_semicolon_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 ; echo done") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_some(),
+                    "cargo test 2>&1 ; echo done must be rewritten"
+                );
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "redirect must survive ; rewrite: {joined}"
+                );
+                assert!(
+                    joined.contains("; echo done") || joined.contains(";echo done"),
+                    "; consumer must be preserved: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // scan_operator regression — `>&N&&` must not confuse the `&&` scanner
+    // (Task 6e)
+    // ========================================================================
+
+    /// `foo >&1&& bar` — `>&1` immediately followed by `&&` (no space).
+    ///
+    /// The scan_operator guard `i > 0 && chars[i-1] == '>'` must prevent the
+    /// first `&` of `>&1&&` (at the `&` in `1&&`) from being misidentified as
+    /// the start of `&&`.  The command must split at the real `&&` boundary so
+    /// both segments are seen.
+    ///
+    /// We validate this by checking that `split_compound` returns `Compound`
+    /// (not `Single` or `Bail`) and that two segments are produced.
+    #[test]
+    fn test_scan_operator_redirect_before_and_and_no_space() {
+        match split_compound("foo >&1&& bar") {
+            CompoundSplitResult::Compound(segments) => {
+                assert_eq!(
+                    segments.len(),
+                    2,
+                    "foo >&1&& bar must split into 2 segments: {segments:?}"
+                );
+                // First segment should contain `foo`; redirect stripped.
+                assert!(
+                    segments[0].tokens.contains(&"foo".to_string()),
+                    "first segment must contain foo: {:?}",
+                    segments[0].tokens
+                );
+                // Second segment should contain `bar`.
+                assert!(
+                    segments[1].tokens.contains(&"bar".to_string()),
+                    "second segment must contain bar: {:?}",
+                    segments[1].tokens
+                );
+            }
+            CompoundSplitResult::Simple(_) => {
+                panic!("foo >&1&& bar should split on && but got Simple")
+            }
+            CompoundSplitResult::Bail => {
+                panic!("foo >&1&& bar should split on && but got Bail")
+            }
+        }
+    }
 }
