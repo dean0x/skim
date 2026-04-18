@@ -811,11 +811,8 @@ mod tests {
             "&>/dev/null",
         ];
         for form in forms {
-            let mut tokens: Vec<String> = vec![
-                "cargo".to_string(),
-                "test".to_string(),
-                form.to_string(),
-            ];
+            let mut tokens: Vec<String> =
+                vec!["cargo".to_string(), "test".to_string(), form.to_string()];
             let stripped = strip_segment_redirects(&mut tokens);
             assert_eq!(
                 tokens,

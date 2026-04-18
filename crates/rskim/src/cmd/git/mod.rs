@@ -880,7 +880,8 @@ mod tests {
     fn test_error_path_stderr_scrubs_ssh_url() {
         use crate::cmd::git::shared::scrub_git_url;
 
-        let stderr_line = "fatal: Could not read from remote repository ssh://deploy@github.com/org/repo.git";
+        let stderr_line =
+            "fatal: Could not read from remote repository ssh://deploy@github.com/org/repo.git";
         let scrubbed = scrub_git_url(stderr_line);
         assert!(
             !scrubbed.contains("deploy@"),

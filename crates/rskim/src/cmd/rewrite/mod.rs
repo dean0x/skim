@@ -195,11 +195,7 @@ fn classify_segment_fine(tokens: &[&str]) -> SegmentClassification {
 ///
 /// Carries the segment classification, the trailing operator, and a reference
 /// to the stripped redirects so they can be spliced back in Pass 3.
-type ClassifiedSegment<'a> = (
-    SegmentClassification,
-    Option<CompoundOp>,
-    &'a [String],
-);
+type ClassifiedSegment<'a> = (SegmentClassification, Option<CompoundOp>, &'a [String]);
 
 /// Classify a compound command (segments connected by `&&`, `||`, `;`, `|`).
 ///
