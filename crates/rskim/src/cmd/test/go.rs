@@ -95,6 +95,9 @@ pub(crate) fn run(
             let _ = parsed.emit_markers(&mut stderr);
 
             if result.summary.fail > 0 {
+                eprintln!(
+                    "[skim] compressed output (exit 1). SKIM_PASSTHROUGH=1 for full output."
+                );
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS

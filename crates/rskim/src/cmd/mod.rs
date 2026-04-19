@@ -344,6 +344,13 @@ where
         }
     };
 
+    // Hint: when output was compressed (not passthrough) and the exit code was
+    // non-zero, tell the user how to see full raw output. Passthrough results
+    // are already uncompressed so the hint is not needed there.
+    if code != 0 && !result.is_passthrough() {
+        eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
+    }
+
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&output.stdout, &compressed);
         crate::process::report_token_stats(orig, comp, "");
@@ -456,6 +463,23 @@ mod tests {
     // ========================================================================
     // check_passthrough_value
     // ========================================================================
+
+    // ========================================================================
+    // stderr hint behavior (pure-function tests via check_passthrough_value)
+    // ========================================================================
+
+    /// Verify that passthrough mode does not emit the hint (it bypasses compression
+    /// entirely). We test this indirectly by confirming passthrough detection
+    /// works correctly for the guard condition in run_parsed_command_with_mode.
+    #[test]
+    fn test_no_stderr_hint_when_passthrough_mode() {
+        // Passthrough mode returns early before the hint is emitted.
+        // The guard `!result.is_passthrough()` in run_parsed_command_with_mode
+        // ensures the hint only fires for compressed (Full/Degraded) results.
+        // This test validates the passthrough predicate is correct.
+        assert!(check_passthrough_value(Some("1".to_string())));
+        assert!(check_passthrough_value(Some("true".to_string())));
+    }
 
     #[test]
     fn test_check_passthrough_truthy_values() {

@@ -76,6 +76,9 @@ pub(crate) fn run(
             let _ = result.emit_markers(&mut handle);
 
             if test_result.summary.fail > 0 {
+                eprintln!(
+                    "[skim] compressed output (exit 1). SKIM_PASSTHROUGH=1 for full output."
+                );
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
