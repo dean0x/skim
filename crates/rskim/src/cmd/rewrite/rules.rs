@@ -16,6 +16,8 @@
 //! `--version`, and `-V` so that informational invocations pass through
 //! unmodified.  SEE: AD-RW-2.
 
+use std::sync::LazyLock;
+
 use super::types::{RewriteCategory, RewriteRule};
 
 // ============================================================================
@@ -899,14 +901,13 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
 // Public iterator over all rules
 // ============================================================================
 
-/// Iterate over all rewrite rules in priority order: TEST → BUILD → GIT →
-/// LINT → PKG → INFRA → FILE_OPS.
+/// All rules concatenated once at startup, in priority order:
+/// TEST → BUILD → GIT → LINT → PKG → INFRA → FILE_OPS.
 ///
-/// The engine must see longer/more-specific prefixes before shorter ones
-/// within the same leading token. Each category array maintains that invariant
-/// internally; the chain order between categories does not affect correctness
-/// because rules from different categories never share a leading token.
-pub(super) fn all_rules() -> impl Iterator<Item = &'static RewriteRule> {
+/// Using a `LazyLock`-backed `Vec` avoids re-chaining the seven category
+/// slices on every call to `all_rules()`, which is invoked on every rewrite
+/// attempt (potentially per-token in hook mode).
+static ALL_RULES_VEC: LazyLock<Vec<&'static RewriteRule>> = LazyLock::new(|| {
     TEST_RULES
         .iter()
         .chain(BUILD_RULES.iter())
@@ -915,6 +916,21 @@ pub(super) fn all_rules() -> impl Iterator<Item = &'static RewriteRule> {
         .chain(PKG_RULES.iter())
         .chain(INFRA_RULES.iter())
         .chain(FILE_OPS_RULES.iter())
+        .collect()
+});
+
+/// Iterate over all rewrite rules in priority order: TEST → BUILD → GIT →
+/// LINT → PKG → INFRA → FILE_OPS.
+///
+/// The engine must see longer/more-specific prefixes before shorter ones
+/// within the same leading token. Each category array maintains that invariant
+/// internally; the chain order between categories does not affect correctness
+/// because rules from different categories never share a leading token.
+///
+/// The return type is `impl Iterator` (not `&[&RewriteRule]`) to keep call sites
+/// unchanged while the backing storage is a `LazyLock<Vec<…>>`.
+pub(super) fn all_rules() -> impl Iterator<Item = &'static RewriteRule> {
+    ALL_RULES_VEC.iter().copied()
 }
 
 #[cfg(test)]

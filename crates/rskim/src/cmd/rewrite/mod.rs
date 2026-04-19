@@ -389,9 +389,9 @@ pub(super) fn collect_input_tokens(positional_args: &[&str]) -> anyhow::Result<O
         if io::stdin().is_terminal() {
             return Ok(None);
         }
-        // Read one line from stdin, capped at 4 KiB to prevent unbounded allocation.
-        // Uses take() to bound memory before reading, so even input without a newline
-        // cannot cause unbounded allocation.
+        // read_line + take(4096) reads at most 4096 bytes — one line, or the
+        // first 4096 bytes if no newline appears.  Rewrite commands are short
+        // shell strings, so this limit is generous.
         let mut line = String::new();
         io::BufReader::new(io::stdin().lock().take(4096)).read_line(&mut line)?;
         let trimmed = line.trim();
