@@ -87,7 +87,7 @@ pub(crate) fn run(
         analytics_enabled,
         cleaned,
         result.content().to_string(),
-        format!("skim test pytest {}", args.join(" ")),
+        crate::cmd::format_analytics_label("test", "pytest", &args.join(" ")),
         crate::analytics::CommandType::Test,
         output.duration,
         Some(result.tier_name()),

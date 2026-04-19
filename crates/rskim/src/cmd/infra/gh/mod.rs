@@ -37,12 +37,16 @@
 //!    be called from [`parse_impl_with_auto_detect`] — pass the `trimmed`
 //!    slice from there rather than `&output.stdout`.
 
+pub(crate) mod api;
 pub(crate) mod issue_view;
 pub(crate) mod list;
 pub(crate) mod pr_checks;
 pub(crate) mod pr_view;
+pub(crate) mod release_view;
 pub(crate) mod run_view;
+pub(crate) mod run_watch;
 pub(super) mod shared;
+pub(super) mod streaming;
 
 // Re-export everything from `shared` so that submodule `use super::…` imports
 // continue to resolve without any changes to the sub-parser files.
@@ -106,6 +110,29 @@ pub(crate) fn run(
             run_view::prepare_args,
             run_view::parse_impl,
         ),
+        ("run", "watch") => {
+            // Streaming handler — does not use run_infra_tool.
+            // Passes remaining args (after "run watch") to run_watch.
+            let watch_args = if args.len() > 2 { &args[2..] } else { &[] };
+            run_watch::run_watch(watch_args, ctx)
+        }
+        ("release", "view") => run_infra_tool(
+            CONFIG,
+            args,
+            ctx,
+            release_view::prepare_args,
+            release_view::parse_impl,
+        ),
+        ("api", _) => {
+            // Strip the leading "api" token so run_infra_tool sees the
+            // remaining args only.  This lets use_stdin detection fire when
+            // the user pipes `gh api ... | skim infra gh api` with no
+            // endpoint arg — args[1..] is empty → stdin is read.
+            // api::prepare_args re-inserts "api" before the spawn so the
+            // child process still receives `gh api [endpoint...]`.
+            let api_args = if args.is_empty() { &[][..] } else { &args[1..] };
+            run_infra_tool(CONFIG, api_args, ctx, api::prepare_args, api::parse_impl)
+        }
         _ => run_infra_tool(
             CONFIG,
             args,

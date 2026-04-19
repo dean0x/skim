@@ -2,11 +2,110 @@
 //!
 //! Handles `&&`, `||`, `;`, `|` operators using a character-by-character
 //! state machine that tracks quotes and paren depth.
+//!
+//! # Redirect stripping (AD-RW-2)
+//!
+//! Each segment may contain shell redirects (e.g., `2>&1`, `>/dev/null`).
+//! These are stripped before passing tokens to the rule engine so that
+//! `foo 2>&1` matches the same rule as `foo`.  Redirects are recorded and
+//! spliced back into the emitted token stream at their original positions,
+//! preserving shell semantics.
+//!
+//! SEE: AD-RW-2 — catch-all ls/grep + pipe exclusion design note.
 
-use super::engine::{strip_env_vars, try_rewrite};
+use super::engine::{try_rewrite, try_table_match_full};
 use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
+
+// ---- Redirect stripping (AD-RW-2) ----
+
+/// Strip shell redirect tokens from a segment's token list.
+///
+/// Recognized redirect forms (stripped):
+/// - `2>&1`, `>&2`, `1>&2`, `>&1` — stderr/stdout merge
+/// - `>/dev/null`, `2>/dev/null`, `&>/dev/null` — discard redirects
+/// - Whitespace-separated two-token form: `["2>", "/dev/null"]`
+///
+/// NOT recognized (left in token list):
+/// - `>file`, `2>file` — file redirects with arbitrary names (ambiguous)
+/// - `| tee file` — pipe-based redirection
+/// - heredocs (`<<`) — handled by bail logic
+/// - Pre-command redirects (`2>&1 cmd`) — non-standard, out of scope
+///
+/// Returns the redirect tokens that were stripped so they can be re-spliced
+/// via `splice_redirects_back` at emission time.  The `tokens` vec is mutated
+/// in place.
+///
+/// # DESIGN NOTE (AD-RW-2)
+///
+/// Only appended/trailing redirects are handled.  Pre-command redirects
+/// (`2>&1 foo`) are non-standard and out of scope per the plan.  The redirect
+/// forms listed above cover the most common CI/agent patterns.
+pub(super) fn strip_segment_redirects(tokens: &mut Vec<String>) -> Vec<String> {
+    let mut stripped: Vec<String> = Vec::new();
+
+    // Two-pass: first collect indices to remove, then drain them.
+    let mut remove_indices: Vec<usize> = Vec::new();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+
+        // Single-token redirect forms.
+        if is_single_redirect(tok) {
+            remove_indices.push(i);
+            i += 1;
+            continue;
+        }
+
+        // Whitespace-separated two-token form: `2>` followed by `/dev/null`.
+        if tok == "2>" && i + 1 < tokens.len() && tokens[i + 1] == "/dev/null" {
+            remove_indices.push(i);
+            remove_indices.push(i + 1);
+            i += 2;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    // Drain in reverse order so indices stay valid.
+    for &idx in remove_indices.iter().rev() {
+        let tok = tokens.remove(idx);
+        stripped.push(tok);
+    }
+
+    // Reverse to restore original order (we drained in reverse).
+    stripped.reverse();
+
+    stripped
+}
+
+/// Returns `true` if `tok` is a single-token shell redirect that should be
+/// stripped before rule matching.
+fn is_single_redirect(tok: &str) -> bool {
+    matches!(
+        tok,
+        "2>&1" | ">&2" | "1>&2" | ">&1" | ">/dev/null" | "2>/dev/null" | "&>/dev/null"
+    )
+}
+
+/// Splice stripped redirects back into `tokens`.
+///
+/// Redirects are appended at the END of the token list.  Shell semantics for
+/// trailing redirects are identical to mid-command placement (POSIX §2.7), and
+/// appending avoids position-mismatch after the rule engine has rewritten the
+/// token list (the original indices no longer map into the rewritten list).
+///
+/// Used at emission time to reconstruct the shell-semantics-equivalent command.
+/// Exposed as `pub(super)` so `mod.rs` can call it directly, eliminating
+/// duplicated inline loops.
+pub(super) fn splice_redirects_back(tokens: &mut Vec<String>, redirects: &[String]) {
+    for tok in redirects {
+        tokens.push(tok.clone());
+    }
+}
 
 // ---- State machine helpers ----
 
@@ -77,11 +176,14 @@ fn push_segment(
     op: Option<CompoundOp>,
 ) {
     let seg_text = &input[current_start..byte_offsets[seg_end_char_idx]];
-    let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
-    if !tokens.is_empty() {
+    let raw_tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
+    if !raw_tokens.is_empty() {
+        let mut tokens = raw_tokens;
+        let stripped_redirects = strip_segment_redirects(&mut tokens);
         segments.push(CommandSegment {
             tokens,
             trailing_operator: op,
+            stripped_redirects,
         });
     }
 }
@@ -207,24 +309,33 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
 
     // Push the final segment (after the last operator).
     let seg_text = &input[current_start..];
-    let tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
-    if !tokens.is_empty() {
+    let raw_tokens: Vec<String> = seg_text.split_whitespace().map(String::from).collect();
+    if !raw_tokens.is_empty() {
+        let mut tokens = raw_tokens;
+        let stripped_redirects = strip_segment_redirects(&mut tokens);
         segments.push(CommandSegment {
             tokens,
             trailing_operator: None,
+            stripped_redirects,
         });
     }
 
     CompoundSplitResult::Compound(segments)
 }
 
-/// Commands that should NOT have their pipe output rewritten.
-/// These are typically output-producing tools where the pipe consumer (head, grep, etc.)
-/// is what the user actually wants to control.
-///
-/// Exposed as `pub(super)` so `mod.rs::classify_compound_pipe` can share the
-/// same exclusion logic as `try_rewrite_compound_pipe` without duplication.
-pub(super) const PIPE_EXCLUDED_SOURCES: &[&str] = &["find", "fd", "ls", "rg", "grep", "ag"];
+// PIPE_EXCLUDED_SOURCES removed (AD-RW-2).
+// The pipe-source exclusion is handled via the `exclude_pipe_source` flag on
+// `RewriteRule` (types.rs).  `engine::try_table_match_full` reports both the
+// rewrite result and the pipe-exclusion flag in a single pass, so adding a new
+// catch-all only requires a single edit in `rules.rs`.
+// See `try_rewrite_compound_pipe` and `mod.rs::classify_compound_pipe`.
+
+/// Return true if any segment has a trailing pipe operator.
+pub(super) fn has_pipe_operator(segments: &[CommandSegment]) -> bool {
+    segments
+        .iter()
+        .any(|s| s.trailing_operator == Some(CompoundOp::Pipe))
+}
 
 /// Attempt to rewrite a compound command expression.
 ///
@@ -236,10 +347,7 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
         return None;
     }
 
-    // Check if this is a pipe expression (any segment has a Pipe operator)
-    let has_pipe = segments
-        .iter()
-        .any(|s| s.trailing_operator == Some(CompoundOp::Pipe));
+    let has_pipe = has_pipe_operator(segments);
 
     if has_pipe {
         return try_rewrite_compound_pipe(segments);
@@ -260,9 +368,17 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
                 if first_category.is_none() {
                     first_category = Some(r.category);
                 }
-                r.tokens.join(" ")
+                // Splice redirects back at their original positions.
+                let mut rewritten_tokens = r.tokens.clone();
+                splice_redirects_back(&mut rewritten_tokens, &seg.stripped_redirects);
+                rewritten_tokens.join(" ")
             }
-            None => seg.tokens.join(" "),
+            None => {
+                // Not rewritten — restore full original form (tokens + redirects).
+                let mut original_tokens = seg.tokens.clone();
+                splice_redirects_back(&mut original_tokens, &seg.stripped_redirects);
+                original_tokens.join(" ")
+            }
         };
 
         parts.push(segment_text);
@@ -283,6 +399,44 @@ pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<Rewrit
     })
 }
 
+/// Reconstruct a pipe command from segments after the first segment has been
+/// rewritten.
+///
+/// Takes the already-rewritten first segment tokens (with redirects already
+/// spliced back) and the full segments slice.  Emits: `first_joined | seg2 | seg3`.
+/// Non-first segments are preserved verbatim with their redirects re-appended.
+///
+/// # Invariants
+/// - `segments` must be non-empty (caller gates on this).
+/// - First segment's redirects must be spliced into `first_rewritten` before
+///   calling (caller responsibility).
+pub(super) fn reconstruct_pipe_parts(
+    segments: &[CommandSegment],
+    first_rewritten: Vec<String>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(first_rewritten.join(" "));
+
+    for (idx, seg) in segments.iter().enumerate() {
+        if idx == 0 {
+            // Already handled the first segment; add its trailing operator.
+            if let Some(op) = seg.trailing_operator {
+                parts.push(op.as_str().to_string());
+            }
+            continue;
+        }
+        // Restore redirects for non-rewritten segments.
+        let mut seg_tokens = seg.tokens.clone();
+        splice_redirects_back(&mut seg_tokens, &seg.stripped_redirects);
+        parts.push(seg_tokens.join(" "));
+        if let Some(op) = seg.trailing_operator {
+            parts.push(op.as_str().to_string());
+        }
+    }
+
+    parts.join(" ")
+}
+
 /// Rewrite a pipe expression. Only the first segment (output producer) is rewritten.
 fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResult> {
     if segments.is_empty() {
@@ -291,39 +445,26 @@ fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResul
 
     let first = &segments[0];
 
-    // Skip env vars to find the actual command name, reusing the canonical
-    // strip_env_vars logic (all-uppercase key before '=').
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
-    let env_split = strip_env_vars(&token_refs);
-    let first_cmd = first.tokens.get(env_split);
-    if let Some(cmd) = first_cmd {
-        if PIPE_EXCLUDED_SOURCES.contains(&cmd.as_str()) {
-            return None;
-        }
+
+    // Do not rewrite pipe-source-excluded commands (e.g. `ls | head`, `find . | head`).
+    // Use try_table_match_full for a single-pass check: if pipe_excluded is set,
+    // suppress the rewrite regardless of whether a rewrite would have matched.
+    // SEE: AD-RW-2.
+    let match_result = try_table_match_full(&token_refs);
+    if match_result.pipe_excluded {
+        return None;
     }
+    let rewrite = match_result.rewrite?;
 
-    let rewrite = try_rewrite(&token_refs)?;
+    // Splice redirects back for the first segment before handing off.
+    let mut first_tokens = rewrite.tokens.clone();
+    splice_redirects_back(&mut first_tokens, &first.stripped_redirects);
 
-    // Reconstruct: rewritten first segment | rest unchanged
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(rewrite.tokens.join(" "));
-
-    for (idx, seg) in segments.iter().enumerate() {
-        if idx == 0 {
-            // Already handled the first segment; add its operator
-            if let Some(op) = seg.trailing_operator {
-                parts.push(op.as_str().to_string());
-            }
-            continue;
-        }
-        parts.push(seg.tokens.join(" "));
-        if let Some(op) = seg.trailing_operator {
-            parts.push(op.as_str().to_string());
-        }
-    }
+    let reconstructed = reconstruct_pipe_parts(segments, first_tokens);
 
     Some(RewriteResult {
-        tokens: parts,
+        tokens: vec![reconstructed],
         category: rewrite.category,
     })
 }
@@ -519,10 +660,12 @@ mod tests {
             CommandSegment {
                 tokens: vec!["cargo".into(), "test".into()],
                 trailing_operator: Some(CompoundOp::And),
+                stripped_redirects: vec![],
             },
             CommandSegment {
                 tokens: vec!["cargo".into(), "build".into()],
                 trailing_operator: None,
+                stripped_redirects: vec![],
             },
         ];
         let result = try_rewrite_compound(&segments).unwrap();
@@ -538,10 +681,12 @@ mod tests {
             CommandSegment {
                 tokens: vec!["cargo".into(), "test".into()],
                 trailing_operator: Some(CompoundOp::And),
+                stripped_redirects: vec![],
             },
             CommandSegment {
                 tokens: vec!["echo".into(), "done".into()],
                 trailing_operator: None,
+                stripped_redirects: vec![],
             },
         ];
         let result = try_rewrite_compound(&segments).unwrap();
@@ -556,10 +701,12 @@ mod tests {
             CommandSegment {
                 tokens: vec!["echo".into(), "hello".into()],
                 trailing_operator: Some(CompoundOp::And),
+                stripped_redirects: vec![],
             },
             CommandSegment {
                 tokens: vec!["echo".into(), "world".into()],
                 trailing_operator: None,
+                stripped_redirects: vec![],
             },
         ];
         assert!(try_rewrite_compound(&segments).is_none());
@@ -568,5 +715,235 @@ mod tests {
     #[test]
     fn test_compound_empty_returns_none() {
         assert!(try_rewrite_compound(&[]).is_none());
+    }
+
+    /// `ls | head` must NOT be rewritten — `ls` is a catch-all rule and must not
+    /// fire on the pipe-source side (AD-RW-2).
+    #[test]
+    fn test_pipe_catch_all_ls_not_rewritten() {
+        match split_compound("ls | head") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_none(),
+                    "ls | head must not be rewritten (catch-all pipe-source exclusion): {result:?}"
+                );
+            }
+            other => panic!("Expected Compound for ls | head, got {:?}", other),
+        }
+    }
+
+    /// `grep foo file | head` must NOT be rewritten (catch-all pipe-source exclusion).
+    #[test]
+    fn test_pipe_catch_all_grep_not_rewritten() {
+        match split_compound("grep foo file | head") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_none(),
+                    "grep | head must not be rewritten (catch-all pipe-source exclusion): {result:?}"
+                );
+            }
+            other => panic!(
+                "Expected Compound for grep foo file | head, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// `cargo test 2>&1 | head` must be rewritten and preserve the redirect.
+    #[test]
+    fn test_compound_pipe_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 | head") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(result.is_some(), "cargo test 2>&1 | head must be rewritten");
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "Redirect must be preserved in rewritten pipe: {joined}"
+                );
+                assert!(
+                    joined.contains("| head"),
+                    "Pipe consumer must be preserved: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    /// `cargo test 2>&1 && cargo build` must be rewritten and preserve the redirect.
+    #[test]
+    fn test_compound_and_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 && cargo build") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_some(),
+                    "cargo test 2>&1 && cargo build must be rewritten"
+                );
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "Redirect must be preserved in rewritten compound: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // Redirect stripping — all single-token and two-token forms (Task 6d)
+    // ========================================================================
+
+    /// Exercise every single-token redirect form that `is_single_redirect` recognises.
+    ///
+    /// Each form must be stripped (not appear in the matched tokens) but must be
+    /// re-spliced back into the output at emission time.  We test stripping only
+    /// here; re-splicing is covered by `test_compound_pipe_rewrite_preserves_redirect`.
+    #[test]
+    fn test_strip_segment_redirects_all_single_token_forms() {
+        let forms = [
+            "2>&1",
+            ">&2",
+            "1>&2",
+            ">&1",
+            ">/dev/null",
+            "2>/dev/null",
+            "&>/dev/null",
+        ];
+        for form in forms {
+            let mut tokens: Vec<String> =
+                vec!["cargo".to_string(), "test".to_string(), form.to_string()];
+            let stripped = strip_segment_redirects(&mut tokens);
+            assert_eq!(
+                tokens,
+                vec!["cargo", "test"],
+                "redirect {form:?} must be stripped from token list"
+            );
+            assert_eq!(
+                stripped,
+                vec![form.to_string()],
+                "stripped list must contain {form:?}"
+            );
+        }
+    }
+
+    /// The whitespace-separated two-token form `["2>", "/dev/null"]` must be
+    /// stripped as a unit (both tokens removed together).
+    #[test]
+    fn test_strip_segment_redirects_two_token_form() {
+        let mut tokens: Vec<String> = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "2>".to_string(),
+            "/dev/null".to_string(),
+        ];
+        let stripped = strip_segment_redirects(&mut tokens);
+        assert_eq!(
+            tokens,
+            vec!["cargo", "test"],
+            "both tokens of the two-token form must be stripped"
+        );
+        assert_eq!(
+            stripped,
+            vec!["2>".to_string(), "/dev/null".to_string()],
+            "stripped list must contain both two-token redirect tokens"
+        );
+    }
+
+    /// `||` operator with a redirect on the left side: rewrite must preserve
+    /// the redirect and the `||` consumer.
+    #[test]
+    fn test_compound_or_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 || echo failed") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_some(),
+                    "cargo test 2>&1 || echo failed must be rewritten"
+                );
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "redirect must survive || rewrite: {joined}"
+                );
+                assert!(
+                    joined.contains("|| echo failed"),
+                    "|| consumer must be preserved: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    /// `;` operator with a redirect: `cargo test 2>&1 ; echo done` must be
+    /// rewritten with the redirect and `;` consumer preserved.
+    #[test]
+    fn test_compound_semicolon_rewrite_preserves_redirect() {
+        match split_compound("cargo test 2>&1 ; echo done") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                assert!(
+                    result.is_some(),
+                    "cargo test 2>&1 ; echo done must be rewritten"
+                );
+                let joined = result.unwrap().tokens.join(" ");
+                assert!(
+                    joined.contains("2>&1"),
+                    "redirect must survive ; rewrite: {joined}"
+                );
+                assert!(
+                    joined.contains("; echo done") || joined.contains(";echo done"),
+                    "; consumer must be preserved: {joined}"
+                );
+            }
+            other => panic!("Expected Compound, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // scan_operator regression — `>&N&&` must not confuse the `&&` scanner
+    // (Task 6e)
+    // ========================================================================
+
+    /// `foo >&1&& bar` — `>&1` immediately followed by `&&` (no space).
+    ///
+    /// The scan_operator guard `i > 0 && chars[i-1] == '>'` must prevent the
+    /// first `&` of `>&1&&` (at the `&` in `1&&`) from being misidentified as
+    /// the start of `&&`.  The command must split at the real `&&` boundary so
+    /// both segments are seen.
+    ///
+    /// We validate this by checking that `split_compound` returns `Compound`
+    /// (not `Single` or `Bail`) and that two segments are produced.
+    #[test]
+    fn test_scan_operator_redirect_before_and_and_no_space() {
+        match split_compound("foo >&1&& bar") {
+            CompoundSplitResult::Compound(segments) => {
+                assert_eq!(
+                    segments.len(),
+                    2,
+                    "foo >&1&& bar must split into 2 segments: {segments:?}"
+                );
+                // First segment should contain `foo`; redirect stripped.
+                assert!(
+                    segments[0].tokens.contains(&"foo".to_string()),
+                    "first segment must contain foo: {:?}",
+                    segments[0].tokens
+                );
+                // Second segment should contain `bar`.
+                assert!(
+                    segments[1].tokens.contains(&"bar".to_string()),
+                    "second segment must contain bar: {:?}",
+                    segments[1].tokens
+                );
+            }
+            CompoundSplitResult::Simple(_) => {
+                panic!("foo >&1&& bar should split on && but got Simple")
+            }
+            CompoundSplitResult::Bail => {
+                panic!("foo >&1&& bar should split on && but got Bail")
+            }
+        }
     }
 }

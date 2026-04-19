@@ -20,6 +20,14 @@ pub(super) struct RewriteRule {
     pub(super) rewrite_to: &'static [&'static str],
     pub(super) skip_if_flag_prefix: &'static [&'static str],
     pub(super) category: RewriteCategory,
+    /// When true, this rule is suppressed on the source side of a pipe
+    /// expression (`cmd | ...`).  Prevents rewriting commands whose raw
+    /// output is consumed by downstream pipe segments (e.g. `find . | head`
+    /// must not rewrite `find` because `head` expects raw file listings).
+    ///
+    /// Set true for: file-listing commands (`ls`, `grep`, `find`, `rg`) whose
+    /// output is commonly piped to filters.  SEE: AD-RW-2.
+    pub(super) exclude_pipe_source: bool,
 }
 
 #[derive(Debug)]
@@ -46,6 +54,13 @@ pub(super) enum CompoundSplitResult {
 pub(super) struct CommandSegment {
     pub(super) tokens: Vec<String>,
     pub(super) trailing_operator: Option<CompoundOp>,
+    /// Redirects stripped from this segment for re-emission.
+    ///
+    /// Appended at segment end at emission time via `splice_redirects_back`.
+    /// Shell semantics for trailing redirects are identical to mid-command
+    /// placement (POSIX §2.7), so append-at-end preserves correctness even
+    /// though original positions are not tracked.
+    pub(super) stripped_redirects: Vec<String>,
 }
 
 /// Shell compound operators.

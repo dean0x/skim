@@ -57,7 +57,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - **Parallel processing** with multi-file globs via rayon
 
 ### Command Rewriting (`skim init`)
-- PreToolUse hook rewrites `cat`, `head`, `tail`, `cargo test`, `npm test`, `git diff` into skim equivalents
+- PreToolUse hook rewrites `cat`, `head`, `tail`, `cargo test`, `vitest`, `git diff` into skim equivalents
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 
@@ -617,7 +617,7 @@ cargo bench
 
 ✅ **Distribution:**
 - cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
-- 2,629 tests passing, 14.6ms performance (3x under target)
+- 2,767 tests passing, 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 

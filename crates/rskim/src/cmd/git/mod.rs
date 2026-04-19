@@ -11,9 +11,12 @@
 //! `+`/`-` markers.
 
 // Private: only accessed via run() dispatch in this module
+mod commit;
 mod diff;
 mod fetch;
 mod log;
+mod push;
+pub(super) mod shared;
 mod show;
 mod status;
 
@@ -64,11 +67,13 @@ pub(crate) fn run(
         "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, analytics_enabled),
         "log" => log::run_log(&global_flags, subcmd_args, show_stats, analytics_enabled),
         "show" => show::run_show(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "commit" => commit::run_commit(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "push" => push::run_push(&global_flags, subcmd_args, show_stats, analytics_enabled),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
                 "unknown git subcommand: '{safe_other}'\n\n\
-                 Supported: status, diff, fetch, log, show\n\
+                 Supported: status, diff, fetch, log, show, commit, push\n\
                  Run 'skim git --help' for usage"
             );
         }
@@ -80,7 +85,7 @@ pub(crate) fn run(
 // ============================================================================
 
 fn print_help() {
-    println!("skim git <status|diff|fetch|log|show> [args...]");
+    println!("skim git <status|diff|fetch|log|show|commit|push> [args...]");
     println!();
     println!("  Compress git command output for LLM context windows.");
     println!();
@@ -90,6 +95,8 @@ fn print_help() {
     println!("  fetch     Show compressed fetch summary (new branches, tags, pruned)");
     println!("  log       Show compressed commit log");
     println!("  show      Show compressed commit or file content at a ref");
+    println!("  commit    Show compressed commit result (hash, subject, file stats)");
+    println!("  push      Show compressed push result (refs pushed, up-to-date, rejected)");
     println!();
     println!("Global git flags (before subcommand):");
     println!("  -C <path>    Run as if git was started in <path>");
@@ -200,7 +207,16 @@ pub(super) fn build_analytics_label(
     analytics_enabled: bool,
 ) -> String {
     if show_stats || analytics_enabled {
-        format!("skim git {subcmd} {}", args.join(" "))
+        // Scrub credential-bearing URLs from args before persisting in the
+        // analytics DB.  A user invoking `skim git push https://TOKEN@host/repo`
+        // would otherwise have the token written to `~/.cache/skim/analytics.db`
+        // via the `original_cmd` column.  Scrubbing here protects all current
+        // and future git handlers that go through this function.
+        let scrubbed: Vec<String> = args
+            .iter()
+            .map(|a| shared::scrub_credential_url(a).into_owned())
+            .collect();
+        crate::cmd::format_analytics_label("git", subcmd, &scrubbed.join(" "))
     } else {
         String::new()
     }
@@ -393,19 +409,27 @@ where
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {
-        // On failure, pass through stderr
-        if !output.stderr.is_empty() {
-            eprint!("{}", output.stderr);
+        // On failure, scrub credential URLs line-by-line before forwarding to
+        // stderr/stdout (PF-024).  Git push (and fetch/clone) embeds auth tokens
+        // in remote URLs on auth failures, e.g.:
+        //   fatal: unable to access 'https://ghp_xxx@github.com/org/repo.git'
+        // Without scrubbing these appear verbatim in the terminal.  This guard
+        // applies to all git subcommands going through run_parsed_command, not
+        // just push — generic protection is safer than a subcmd-specific gate.
+        let scrubbed_stderr = shared::scrub_lines(&output.stderr);
+        if !scrubbed_stderr.is_empty() {
+            eprintln!("{scrubbed_stderr}");
         }
-        if !output.stdout.is_empty() {
-            print!("{}", output.stdout);
+        // Scrub stdout once; reuse for both terminal output and analytics (PF-024).
+        let scrubbed_stdout = shared::scrub_lines(&output.stdout);
+        if !scrubbed_stdout.is_empty() {
+            println!("{scrubbed_stdout}");
         }
         let exit_code = output.exit_code;
         // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. Move stdout into the passthrough variant: 1 allocation
-        // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
+        // invocations (PF-018).
         finalize_git_output_passthrough(
-            output.stdout,
+            scrubbed_stdout,
             label,
             show_stats,
             analytics_enabled,
@@ -440,13 +464,17 @@ where
         }
     };
 
-    // Both `raw` and `result_str` are owned here and consumed at end-of-function;
-    // use the owned variant to move them directly rather than cloning.
+    // Scrub credentials before analytics recording (PF-024).  The parser used
+    // the un-scrubbed `raw` to extract ref data; only the analytics copy needs
+    // scrubbing.
+    let analytics_raw = shared::scrub_lines(&raw);
+
+    // `analytics_raw` and `result_str` are owned here; move them directly.
     // `label` is supplied by the caller from the user's original (pre-rewrite) args
     // so the analytics DB records the invocation as the user typed it.
     // `parse_tier` propagates the parser's tier annotation to the analytics DB (AD-GIT-12).
     finalize_git_output_owned(
-        raw,
+        analytics_raw,
         result_str,
         label,
         show_stats,
@@ -706,6 +734,7 @@ mod tests {
     /// Takes `&str` references and clones them only when analytics are enabled.
     /// No production call site uses this; prefer `finalize_git_output_owned` or
     /// `finalize_git_output_passthrough` in handlers.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_git_output(
         raw: &str,
         output: &str,
@@ -752,6 +781,96 @@ mod tests {
             crate::analytics::CommandType::Git,
             std::time::Duration::ZERO,
             None,
+        );
+    }
+
+    // ========================================================================
+    // build_analytics_label credential scrubbing (PF-024 companion)
+    // ========================================================================
+
+    /// Verifies that build_analytics_label scrubs credential-bearing URLs from
+    /// args before composing the label that is persisted in analytics.db.
+    ///
+    /// Without scrubbing, `skim git push https://TOKEN@host/repo` would write
+    /// the token into `~/.cache/skim/analytics.db` via the `original_cmd` column.
+    #[test]
+    fn test_build_analytics_label_scrubs_credentials() {
+        let args = vec!["https://ghp_SuperSecretToken@github.com/org/repo".to_string()];
+        let label = build_analytics_label("push", &args, true, true);
+        assert!(
+            !label.contains("ghp_SuperSecretToken"),
+            "analytics label must not contain the credential token; got: {label}"
+        );
+        assert!(
+            label.contains("github.com/org/repo"),
+            "analytics label must preserve the host/path; got: {label}"
+        );
+    }
+
+    /// No trailing space when args is empty.
+    ///
+    /// `build_analytics_label("status", &[], true, true)` must return
+    /// `"skim git status"`, not `"skim git status "`.
+    #[test]
+    fn test_build_analytics_label_no_trailing_space_when_no_args() {
+        let label = build_analytics_label("status", &[], true, true);
+        assert_eq!(label, "skim git status");
+    }
+
+    // ========================================================================
+    // Failure-path credential scrubbing (PF-024 / Task 6c)
+    // ========================================================================
+
+    /// Verifies that credentials embedded in git stderr output are scrubbed
+    /// before being written to the terminal AND before being recorded in
+    /// analytics.db on the non-zero exit path.
+    ///
+    /// We cannot drive `run_parsed_command` end-to-end in a unit test (it
+    /// shells out to a real `git` binary).  Instead we test the scrubbing
+    /// helper directly on the kind of line that git emits on auth failures:
+    ///
+    ///   fatal: unable to access 'https://ghp_xxx@github.com/org/repo.git':
+    ///     The requested URL returned error: 403
+    ///
+    /// The scrubbing logic in `run_parsed_command` calls `shared::scrub_credential_url`
+    /// line-by-line on both stderr and stdout before forwarding to the terminal
+    /// and before passing to `finalize_git_output_passthrough`.
+    #[test]
+    fn test_error_path_stderr_scrubbing() {
+        use crate::cmd::git::shared::scrub_credential_url;
+
+        let stderr_line =
+            "fatal: unable to access 'https://ghp_abc123@github.com/org/repo.git': 403";
+        let scrubbed = scrub_credential_url(stderr_line);
+        assert!(
+            !scrubbed.contains("ghp_abc123"),
+            "credential token must be stripped from error output; got: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("github.com/org/repo.git"),
+            "host/path must be preserved in error output; got: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("403"),
+            "error details must be preserved; got: {scrubbed}"
+        );
+    }
+
+    /// ssh:// credentials on the error path are scrubbed (AD-GP-1 companion).
+    #[test]
+    fn test_error_path_stderr_scrubs_ssh_url() {
+        use crate::cmd::git::shared::scrub_credential_url;
+
+        let stderr_line =
+            "fatal: Could not read from remote repository ssh://deploy@github.com/org/repo.git";
+        let scrubbed = scrub_credential_url(stderr_line);
+        assert!(
+            !scrubbed.contains("deploy@"),
+            "ssh credential must be stripped; got: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("github.com/org/repo.git"),
+            "host/path must be preserved; got: {scrubbed}"
         );
     }
 }

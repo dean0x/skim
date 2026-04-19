@@ -319,7 +319,7 @@ where
         analytics_enabled,
         output.stdout,
         compressed,
-        format!("skim {family} {program} {}", args.join(" ")),
+        format_analytics_label(family, program, &args.join(" ")),
         command_type,
         output.duration,
         Some(result.tier_name()),
@@ -368,6 +368,22 @@ pub(crate) fn dispatch(
         "test" => test::run(args, analytics),
         // Unreachable: is_known_subcommand guard above rejects unknown names
         _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
+    }
+}
+
+// ============================================================================
+// Shared analytics label helper
+// ============================================================================
+
+/// Build a standardized analytics label: `"skim {family} {program} {rest}"`.
+///
+/// Centralises the label format so streaming and non-streaming code paths
+/// cannot drift.  `rest` is the pre-joined argument string (may be empty).
+pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) -> String {
+    if rest.is_empty() {
+        format!("skim {family} {program}")
+    } else {
+        format!("skim {family} {program} {rest}")
     }
 }
 

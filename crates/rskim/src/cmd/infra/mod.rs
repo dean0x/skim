@@ -108,6 +108,16 @@ pub(crate) struct InfraToolConfig<'a> {
     pub install_hint: &'a str,
 }
 
+/// Detect whether to read from piped stdin.
+///
+/// Returns `true` when stdin is not a terminal AND `args` is empty — the same
+/// heuristic used across all infra tool dispatchers.  Centralised here so that
+/// [`run_infra_tool`] and the streaming sub-commands (`gh run watch`, `gh api`)
+/// share a single implementation.
+pub(crate) fn should_use_stdin(args: &[String]) -> bool {
+    !std::io::stdin().is_terminal() && args.is_empty()
+}
+
 /// Execute an infra tool, parse its output, and emit the result.
 ///
 /// This is the single implementation shared by all infra parsers, handling both
@@ -123,7 +133,7 @@ pub(crate) fn run_infra_tool(
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let use_stdin = should_use_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
@@ -140,6 +150,36 @@ pub(crate) fn run_infra_tool(
         },
         |output, _args| parse_fn(output),
     )
+}
+
+/// Build an analytics label for streaming infra commands.
+///
+/// Delegates to [`super::format_analytics_label`] for a consistent label format
+/// across streaming and non-streaming infra commands.  Scrubs credential-bearing
+/// URLs from args before joining so that tokens are never written to the analytics
+/// database or shown in stats output.  Returns an empty string when analytics is
+/// disabled (avoids unnecessary formatting).  SEE: PF-022.
+pub(crate) fn build_streaming_label(
+    family: &str,
+    program: &str,
+    subcommand: &str,
+    args: &[String],
+    show_stats: bool,
+    analytics_enabled: bool,
+) -> String {
+    if !show_stats && !analytics_enabled {
+        return String::new();
+    }
+    let rest = if args.is_empty() {
+        subcommand.to_string()
+    } else {
+        let scrubbed: Vec<std::borrow::Cow<'_, str>> = args
+            .iter()
+            .map(|a| crate::cmd::git::shared::scrub_credential_url(a))
+            .collect();
+        format!("{subcommand} {}", scrubbed.join(" "))
+    };
+    super::format_analytics_label(family, program, &rest)
 }
 
 /// Re-export the shared `combine_output` under the name callers expect.
@@ -200,5 +240,58 @@ mod tests {
         let long_input = "a".repeat(100);
         let sanitized = super::super::sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
+    }
+
+    // ========================================================================
+    // build_streaming_label tests (PF-022)
+    // ========================================================================
+
+    #[test]
+    fn test_build_streaming_label_with_args() {
+        let args: Vec<String> = vec!["12345".to_string()];
+        let label = super::build_streaming_label("infra", "gh", "run watch", &args, true, true);
+        assert_eq!(label, "skim infra gh run watch 12345");
+    }
+
+    #[test]
+    fn test_build_streaming_label_no_args() {
+        let args: Vec<String> = vec![];
+        let label = super::build_streaming_label("infra", "gh", "run watch", &args, true, true);
+        assert_eq!(label, "skim infra gh run watch");
+    }
+
+    #[test]
+    fn test_build_streaming_label_disabled_analytics_returns_empty() {
+        let args: Vec<String> = vec!["12345".to_string()];
+        // Both show_stats and analytics_enabled are false → empty string.
+        let label = super::build_streaming_label("infra", "gh", "run watch", &args, false, false);
+        assert_eq!(label, "");
+    }
+
+    #[test]
+    fn test_build_streaming_label_show_stats_enables_label() {
+        // show_stats=true with analytics_enabled=false still produces a label
+        // (label is used for display output as well as recording).
+        let args: Vec<String> = vec![];
+        let label = super::build_streaming_label("infra", "gh", "api", &args, true, false);
+        assert_eq!(label, "skim infra gh api");
+    }
+
+    /// Credential-bearing URLs in args must be scrubbed from the analytics label.
+    ///
+    /// A streaming command like `skim infra gh api https://token@github.com/repo`
+    /// must not write the token to the analytics DB or stats output.
+    #[test]
+    fn test_build_streaming_label_scrubs_credentials() {
+        let args: Vec<String> = vec!["https://ghp_secret@github.com/org/repo".to_string()];
+        let label = super::build_streaming_label("infra", "gh", "api", &args, true, true);
+        assert!(
+            !label.contains("ghp_secret"),
+            "credential must be scrubbed from label: {label}"
+        );
+        assert!(
+            label.contains("github.com/org/repo"),
+            "host/path must be preserved in label: {label}"
+        );
     }
 }
