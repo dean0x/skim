@@ -383,7 +383,9 @@ pub(crate) fn run(
 /// whitespace (e.g., `--format='%H %s'`). The second case is rare in
 /// rewrite-triggering commands and the passthrough path still handles it
 /// downstream.
-pub(super) fn collect_input_tokens(positional_args: &[&str]) -> anyhow::Result<Option<Vec<String>>> {
+pub(super) fn collect_input_tokens(
+    positional_args: &[&str],
+) -> anyhow::Result<Option<Vec<String>>> {
     if positional_args.is_empty() {
         // Try reading from stdin if it's piped
         if io::stdin().is_terminal() {

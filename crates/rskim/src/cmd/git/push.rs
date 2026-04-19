@@ -149,7 +149,7 @@ pub(super) fn parse_push(input: &str) -> GitResult {
 /// Returns `None` for informational lines (`remote:`, `To`, `Done`),
 /// non-flag-char lines, and lines where the flag char is not followed
 /// by ref content (`refs/` prefix or `:` notation).
-fn extract_flag_and_rest<'a>(line: &'a str) -> Option<(&'a str, &'a str)> {
+fn extract_flag_and_rest(line: &str) -> Option<(&str, &str)> {
     if let Some(after_tab) = line.strip_prefix('\t') {
         // Some git versions emit a leading tab before the flag.
         let first = after_tab.chars().next().unwrap_or(' ');
@@ -530,7 +530,10 @@ mod tests {
     fn test_deleted_ref_porcelain_happy_path() {
         let input = "-\trefs/heads/old:refs/heads/old\t[deleted]\nDone\n";
         let result = try_parse_porcelain(input);
-        assert!(result.is_some(), "Deleted-ref porcelain line must be parsed");
+        assert!(
+            result.is_some(),
+            "Deleted-ref porcelain line must be parsed"
+        );
         let output = result.unwrap();
         let rendered = format!("{output}");
         assert!(

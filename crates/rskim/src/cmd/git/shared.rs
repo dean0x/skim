@@ -183,8 +183,14 @@ mod tests {
         let input = "remote: https://ghp_abc@github.com/repo.git\nEverything up-to-date";
         let result = scrub_lines(input);
         assert!(!result.contains("ghp_abc"), "token must be stripped");
-        assert!(result.contains("github.com/repo.git"), "host/path preserved");
-        assert!(result.contains("Everything up-to-date"), "clean line preserved");
+        assert!(
+            result.contains("github.com/repo.git"),
+            "host/path preserved"
+        );
+        assert!(
+            result.contains("Everything up-to-date"),
+            "clean line preserved"
+        );
     }
 
     #[test]

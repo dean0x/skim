@@ -199,7 +199,6 @@ pub(super) fn split_at_separator(tokens: &[&str]) -> usize {
         .unwrap_or(tokens.len())
 }
 
-
 /// Try custom handlers for cat, head, tail.
 pub(super) fn try_custom_handlers(
     env_vars: &[&str],
@@ -601,7 +600,10 @@ mod tests {
             !r.pipe_excluded,
             "grep -rn without a skip flag has exclude_pipe_source=false on the specific rule"
         );
-        assert!(r.rewrite.is_some(), "grep -rn pattern must produce a rewrite");
+        assert!(
+            r.rewrite.is_some(),
+            "grep -rn pattern must produce a rewrite"
+        );
     }
 
     /// `ls` has `exclude_pipe_source: true` and produces a rewrite.
