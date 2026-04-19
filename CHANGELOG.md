@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Rewrite engine deduplication** — `should_skip_by_flag` extracted as a named function (replacing two duplicated inline closures); `has_pipe_operator` and `reconstruct_pipe_parts` extracted to `compound.rs`; `splice_redirects_back` promoted to `pub(super)`. Dead index (`PIPE_EXCLUDED_SOURCES` slice) removed.
 
 ### Testing
-- 2,750 tests passing (up from 2,712 in v2.5.0)
+- 2,762 tests passing (up from 2,712 in v2.5.0)
 - Pipe-source exclusion tests for `find` and `rg` (standalone rewritten, piped suppressed, `||` chain not suppressed)
 - Negative tests for compress-or-skip (`ls --help`, `grep --version` passthrough)
 - Redirect stripping coverage for all 7 single-token forms + two-token `2> /dev/null`
