@@ -140,6 +140,52 @@ pub(super) fn parse_push(input: &str) -> GitResult {
 // Tier 1: Porcelain parsing
 // ============================================================================
 
+/// Extract porcelain flag character and ref content from a line.
+///
+/// Handles two formats:
+/// - Tab-prefixed: `\t<flag>\t<refs>` (some git versions)
+/// - Bare flag: `<flag>\t<refs>` (standard porcelain)
+///
+/// Returns `None` for informational lines (`remote:`, `To`, `Done`),
+/// non-flag-char lines, and lines where the flag char is not followed
+/// by ref content (`refs/` prefix or `:` notation).
+fn extract_flag_and_rest<'a>(line: &'a str) -> Option<(&'a str, &'a str)> {
+    if let Some(after_tab) = line.strip_prefix('\t') {
+        // Some git versions emit a leading tab before the flag.
+        let first = after_tab.chars().next().unwrap_or(' ');
+        if matches!(first, '=' | '*' | '+' | '!' | '-') {
+            let flag = &after_tab[..1];
+            let rest = after_tab[1..].trim_start_matches('\t');
+            Some((flag, rest))
+        } else {
+            None
+        }
+    } else if !line.is_empty() {
+        let flag_char = line.chars().next().unwrap_or(' ');
+        if matches!(flag_char, '=' | '*' | '+' | '!' | '-') {
+            let after_flag = &line[1..];
+            // Strip optional tab (strip_ansi_escapes removes tab bytes, so the tab
+            // may already be absent after preprocessing).
+            let rest = after_flag.trim_start_matches('\t');
+            // Require that the ref content starts with `refs/` or contains `:`
+            // (src:dst ref notation).  Lines like `! [remote rejected]` start with
+            // a space or bracket and are informational text, not ref-status lines.
+            // This guards against false-triggering on `! [remote rejected]` while
+            // preserving real porcelain lines like `!refs/heads/bad:refs/heads/bad`.
+            // SEE: AD-GP-2.
+            if !rest.starts_with("refs/") && !rest.contains(':') {
+                return None;
+            }
+            let flag = &line[..1];
+            Some((flag, rest))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 /// Parse `git push --porcelain` output.
 ///
 /// Porcelain format per-ref lines:
@@ -170,46 +216,17 @@ fn try_parse_porcelain(text: &str) -> Option<GitResult> {
         // Porcelain status lines start with a flag char, then a tab.
         // Format: `<flag>\t<src>:<dst>\t<summary>`
         // Older git: ` <flag> <refs>`  (leading space, flag, space)
-        let (flag, rest) = if let Some(after_tab) = line.strip_prefix('\t') {
-            // Some git versions emit a leading tab before the flag.
-            let first = after_tab.chars().next().unwrap_or(' ');
-            if matches!(first, '=' | '*' | '+' | '!' | '-') {
-                let flag = &after_tab[..1];
-                let rest = after_tab[1..].trim_start_matches('\t');
-                (flag, rest)
-            } else {
-                continue;
-            }
-        } else if !line.is_empty() {
-            let flag_char = line.chars().next().unwrap_or(' ');
-            if matches!(flag_char, '=' | '*' | '+' | '!' | '-') {
-                let after_flag = &line[1..];
-                // Strip optional tab (strip_ansi_escapes removes tab bytes, so the tab
-                // may already be absent after preprocessing).
-                let rest = after_flag.trim_start_matches('\t');
-                // Require that the ref content starts with `refs/` or contains `:`
-                // (src:dst ref notation).  Lines like `! [remote rejected]` start with
-                // a space or bracket and are informational text, not ref-status lines.
-                // This guards against false-triggering on `! [remote rejected]` while
-                // preserving real porcelain lines like `!refs/heads/bad:refs/heads/bad`.
-                // SEE: AD-GP-2.
-                if !rest.starts_with("refs/") && !rest.contains(':') {
-                    if line.starts_with("remote:") || line.starts_with("To ") {
-                        remote_lines.push(line.to_string());
-                    }
-                    continue;
-                }
-                let flag = &line[..1];
-                (flag, rest)
-            } else {
-                // remote: lines and other informational text.
+        //
+        // Informational lines (remote:, To) that don't parse as flag+rest
+        // are collected in remote_lines for the details section.
+        let (flag, rest) = match extract_flag_and_rest(line) {
+            Some(pair) => pair,
+            None => {
                 if line.starts_with("remote:") || line.starts_with("To ") {
                     remote_lines.push(line.to_string());
                 }
                 continue;
             }
-        } else {
-            continue;
         };
 
         found_porcelain = true;
