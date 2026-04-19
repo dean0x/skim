@@ -137,6 +137,11 @@ pub(super) fn try_table_match(
         // SEE ALSO: AD-RW-2 (pipe exclusion via `exclude_pipe_source` flag in
         // rules.rs + `is_pipe_source_excluded` in engine.rs) for the design note
         // on catch-all rule ordering and pipe-source guard semantics.
+        //
+        // CONTRAST: `is_pipe_source_excluded` uses `continue` (not `return false`)
+        // on skip-flag match so that pipe-source detection propagates to the
+        // catch-all rule.  The asymmetry is intentional: rewriting should stop on
+        // a skip-flag hit, but pipe-source exclusion must still be resolved.
         if should_skip_by_flag(middle, rule.skip_if_flag_prefix) {
             return None;
         }
@@ -567,5 +572,45 @@ mod tests {
     fn test_env_var_with_numbers() {
         let result = try_rewrite(&["VAR_123=abc", "cargo", "test"]).unwrap();
         assert!(result.tokens.contains(&"VAR_123=abc".to_string()));
+    }
+
+    // ========================================================================
+    // is_pipe_source_excluded: skip-flag fallthrough to catch-all (AD-RW-2)
+    // ========================================================================
+
+    /// `grep --count` has no `-rn` or `-r` prefix, so it matches only the
+    /// catch-all `grep` rule which has `exclude_pipe_source: true`.
+    #[test]
+    fn test_is_pipe_source_excluded_grep_count_catch_all() {
+        assert!(
+            is_pipe_source_excluded(&["grep", "--count"]),
+            "grep --count must be pipe-source-excluded via catch-all rule"
+        );
+    }
+
+    /// `grep -rn --count` matches the specific `grep -rn` rule, which fires
+    /// its skip flag (`--count`) → `continue` in `is_pipe_source_excluded`.
+    /// The loop then reaches the catch-all `grep` rule (`exclude_pipe_source:
+    /// true`) and returns `true`.  This verifies the asymmetry between
+    /// `is_pipe_source_excluded` (uses `continue`) and `try_table_match`
+    /// (uses `return None`) on skip-flag hits.
+    #[test]
+    fn test_is_pipe_source_excluded_grep_rn_count_falls_through_to_catch_all() {
+        assert!(
+            is_pipe_source_excluded(&["grep", "-rn", "--count"]),
+            "grep -rn --count must be pipe-source-excluded: skip flag fires on specific rule, \
+             falls through to catch-all grep rule"
+        );
+    }
+
+    /// `grep -rn pattern` has no skip flag → specific rule fires and returns
+    /// its `exclude_pipe_source` value (`false`), so this invocation is NOT
+    /// excluded from pipe-source rewriting.
+    #[test]
+    fn test_is_pipe_source_excluded_grep_rn_no_skip_flag() {
+        assert!(
+            !is_pipe_source_excluded(&["grep", "-rn", "pattern"]),
+            "grep -rn without a skip flag has exclude_pipe_source=false on the specific rule"
+        );
     }
 }

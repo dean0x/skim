@@ -505,6 +505,28 @@ mod tests {
         );
     }
 
+    /// Happy-path: a real deleted-ref porcelain line produces a deleted-ref summary.
+    ///
+    /// Input uses the standard `git push --porcelain` format for a deleted ref:
+    /// `-\trefs/heads/old:refs/heads/old\t[deleted]`.
+    #[test]
+    fn test_deleted_ref_porcelain_happy_path() {
+        let input = "-\trefs/heads/old:refs/heads/old\t[deleted]\nDone\n";
+        let result = try_parse_porcelain(input);
+        assert!(result.is_some(), "Deleted-ref porcelain line must be parsed");
+        let output = result.unwrap();
+        let rendered = format!("{output}");
+        assert!(
+            rendered.contains("deleted"),
+            "Output must mention the deleted ref: {rendered}"
+        );
+        // Verify the short ref name is extracted correctly.
+        assert!(
+            rendered.contains("old"),
+            "Output must contain the ref name 'old': {rendered}"
+        );
+    }
+
     /// Happy-path: a real porcelain line with tab separator must still work.
     #[test]
     fn test_real_porcelain_with_tab_works() {

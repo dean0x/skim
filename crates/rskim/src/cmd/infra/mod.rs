@@ -236,4 +236,39 @@ mod tests {
         let sanitized = super::super::sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
     }
+
+    // ========================================================================
+    // build_streaming_label tests (PF-022)
+    // ========================================================================
+
+    #[test]
+    fn test_build_streaming_label_with_args() {
+        let args: Vec<String> = vec!["12345".to_string()];
+        let label = super::build_streaming_label("infra", "gh", "run watch", &args, true, true);
+        assert_eq!(label, "skim infra gh run watch 12345");
+    }
+
+    #[test]
+    fn test_build_streaming_label_no_args() {
+        let args: Vec<String> = vec![];
+        let label = super::build_streaming_label("infra", "gh", "run watch", &args, true, true);
+        assert_eq!(label, "skim infra gh run watch");
+    }
+
+    #[test]
+    fn test_build_streaming_label_disabled_analytics_returns_empty() {
+        let args: Vec<String> = vec!["12345".to_string()];
+        // Both show_stats and analytics_enabled are false → empty string.
+        let label = super::build_streaming_label("infra", "gh", "run watch", &args, false, false);
+        assert_eq!(label, "");
+    }
+
+    #[test]
+    fn test_build_streaming_label_show_stats_enables_label() {
+        // show_stats=true with analytics_enabled=false still produces a label
+        // (label is used for display output as well as recording).
+        let args: Vec<String> = vec![];
+        let label = super::build_streaming_label("infra", "gh", "api", &args, true, false);
+        assert_eq!(label, "skim infra gh api");
+    }
 }
