@@ -61,12 +61,11 @@ pub(super) fn run_push(
         return run_passthrough(global_flags, "push", args, show_stats, analytics_enabled);
     }
 
-    let (filtered_args, output_format) = extract_output_format(args);
+    let (mut effective_args, output_format) = extract_output_format(args);
 
     // Auto-inject --porcelain for stable parsing (AD-GP-2).
-    let mut effective_args = filtered_args.clone();
     let needs_porcelain = !user_has_flag(
-        &filtered_args,
+        &effective_args,
         &["--porcelain", "--no-porcelain", "--quiet", "-q"],
     );
     if needs_porcelain {
@@ -156,6 +155,12 @@ fn extract_flag_and_rest(line: &str) -> Option<(&str, &str)> {
         if matches!(first, '=' | '*' | '+' | '!' | '-') {
             let flag = &after_tab[..1];
             let rest = after_tab[1..].trim_start_matches('\t');
+            // Same ref-content guard as the bare-flag branch (AD-GP-2):
+            // reject lines where the content after the flag is informational
+            // text rather than a ref spec.
+            if !rest.starts_with("refs/") && !rest.contains(':') {
+                return None;
+            }
             Some((flag, rest))
         } else {
             None
@@ -558,6 +563,22 @@ mod tests {
         assert!(
             rendered.contains("up to date") || rendered.contains("main"),
             "Parsed output should contain ref info: {rendered}"
+        );
+    }
+
+    /// Tab-prefixed informational line must not be mistaken for a porcelain
+    /// ref-status line.  The ref-content guard (`refs/` or `:`) must apply
+    /// to the tab-prefixed branch too, not just the bare-flag branch.
+    #[test]
+    fn test_tab_prefixed_informational_line_skipped() {
+        // A hypothetical tab-prefixed `! [remote rejected]` line should be
+        // treated as informational, not a porcelain ref-status entry.
+        let input = "\t! [remote rejected] main -> main (declined)\nDone\n";
+        let result = parse_push(input);
+        let rendered = format!("{result}");
+        assert!(
+            !rendered.contains("rejected"),
+            "Tab-prefixed informational ! line must not produce a rejected ref: {rendered}"
         );
     }
 }

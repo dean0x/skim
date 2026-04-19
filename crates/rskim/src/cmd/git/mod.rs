@@ -216,7 +216,7 @@ pub(super) fn build_analytics_label(
             .iter()
             .map(|a| shared::scrub_credential_url(a).into_owned())
             .collect();
-        format!("skim git {subcmd} {}", scrubbed.join(" "))
+        crate::cmd::format_analytics_label("git", subcmd, &scrubbed.join(" "))
     } else {
         String::new()
     }
@@ -805,6 +805,16 @@ mod tests {
             label.contains("github.com/org/repo"),
             "analytics label must preserve the host/path; got: {label}"
         );
+    }
+
+    /// No trailing space when args is empty.
+    ///
+    /// `build_analytics_label("status", &[], true, true)` must return
+    /// `"skim git status"`, not `"skim git status "`.
+    #[test]
+    fn test_build_analytics_label_no_trailing_space_when_no_args() {
+        let label = build_analytics_label("status", &[], true, true);
+        assert_eq!(label, "skim git status");
     }
 
     // ========================================================================
