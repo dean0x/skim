@@ -417,43 +417,26 @@ where
         // applies to all git subcommands going through run_parsed_command, not
         // just push — generic protection is safer than a subcmd-specific gate.
         if !output.stderr.is_empty() {
-            let scrubbed_stderr: String = output
-                .stderr
-                .lines()
-                .map(|l| shared::scrub_git_url(l).into_owned())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let scrubbed_stderr = shared::scrub_lines(&output.stderr);
             if !scrubbed_stderr.is_empty() {
                 eprintln!("{scrubbed_stderr}");
             }
         }
-        if !output.stdout.is_empty() {
-            let scrubbed_stdout: String = output
-                .stdout
-                .lines()
-                .map(|l| shared::scrub_git_url(l).into_owned())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !scrubbed_stdout.is_empty() {
-                println!("{scrubbed_stdout}");
-            }
+        // Scrub once; reuse for both terminal output and analytics recording
+        // (PF-024).  Previously stdout was scrubbed twice — once for printing
+        // and once for analytics.  Lifting the scrub above the conditional
+        // print guard eliminates the redundant second pass.
+        let scrubbed_stdout = shared::scrub_lines(&output.stdout);
+        if !scrubbed_stdout.is_empty() {
+            println!("{scrubbed_stdout}");
         }
         let exit_code = output.exit_code;
-        // Scrub credentials before analytics recording on the failure path (PF-024).
-        // Terminal output above is already scrubbed; this ensures the analytics DB
-        // copy is also clean.  .lines().join("\n") normalizes \r\n to \n —
-        // intentional for Unix-first CLI output.
-        let analytics_stdout: String = output
-            .stdout
-            .lines()
-            .map(|l| shared::scrub_git_url(l).into_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
         // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. Move stdout into the passthrough variant: 1 allocation
-        // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
+        // invocations. Move scrubbed_stdout (already computed above) into the
+        // passthrough variant: 1 allocation (clone) on the analytics path,
+        // 0 when disabled (PF-018 resolution).
         finalize_git_output_passthrough(
-            analytics_stdout,
+            scrubbed_stdout,
             label,
             show_stats,
             analytics_enabled,
@@ -490,13 +473,9 @@ where
 
     // Scrub credentials before analytics recording on the success path (PF-024).
     // The parser used the un-scrubbed `raw` to extract ref data; only the analytics
-    // copy needs scrubbing.  .lines().join("\n") normalizes \r\n to \n — intentional
+    // copy needs scrubbing.  scrub_lines normalizes \r\n to \n — intentional
     // for Unix-first CLI output.
-    let analytics_raw: String = raw
-        .lines()
-        .map(|l| shared::scrub_git_url(l).into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let analytics_raw = shared::scrub_lines(&raw);
 
     // `analytics_raw` and `result_str` are owned here; move them directly.
     // `label` is supplied by the caller from the user's original (pre-rewrite) args

@@ -80,6 +80,27 @@ pub(super) fn scrub_git_url(s: &str) -> Cow<'_, str> {
     CREDENTIAL_URL_RE.replace_all(s, "${1}")
 }
 
+/// Scrub credential tokens from every line of a multi-line string.
+///
+/// Applies [`scrub_git_url`] line-by-line and joins with `\n` (normalising
+/// `\r\n` to `\n` — intentional for Unix-first CLI output).
+///
+/// # Allocation behaviour (PF-024)
+///
+/// [`scrub_git_url`] returns [`Cow::Borrowed`] when a line contains no
+/// credentials (the common case), producing zero per-line heap allocations
+/// for clean lines.  By collecting `Cow` items and calling `.join("\n")` once,
+/// this function avoids the N `into_owned()` calls that the previous inline
+/// pattern used — one `String` is allocated for the joined result regardless
+/// of whether any line was modified.
+pub(super) fn scrub_lines(input: &str) -> String {
+    input
+        .lines()
+        .map(scrub_git_url)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -150,6 +171,41 @@ mod tests {
             !result.contains("user:pass"),
             "nested credentials must be stripped"
         );
+    }
+
+    // ========================================================================
+    // scrub_lines tests
+    // ========================================================================
+
+    #[test]
+    fn test_scrub_lines_clean_input_returns_normalized_string() {
+        // No credentials present — each line is Cow::Borrowed.
+        // Output must equal the input (modulo \r\n normalisation).
+        let input = "Everything up-to-date\nTo https://github.com/org/repo.git";
+        let result = scrub_lines(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_scrub_lines_credentials_stripped() {
+        let input = "remote: https://ghp_abc@github.com/repo.git\nEverything up-to-date";
+        let result = scrub_lines(input);
+        assert!(!result.contains("ghp_abc"), "token must be stripped");
+        assert!(result.contains("github.com/repo.git"), "host/path preserved");
+        assert!(result.contains("Everything up-to-date"), "clean line preserved");
+    }
+
+    #[test]
+    fn test_scrub_lines_normalises_crlf() {
+        // \r\n input must be normalised to \n in the output.
+        let input = "line one\r\nline two\r\n";
+        let result = scrub_lines(input);
+        assert!(!result.contains('\r'), "\\r must be normalised away");
+    }
+
+    #[test]
+    fn test_scrub_lines_empty_input() {
+        assert_eq!(scrub_lines(""), "");
     }
 
     /// ssh:// URLs with embedded credentials are scrubbed (AD-GP-1).
