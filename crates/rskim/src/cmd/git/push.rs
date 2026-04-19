@@ -8,7 +8,7 @@
 //! `git push` output can contain credential-embedded remote URLs when callers
 //! use `https://<token>@github.com/org/repo`.  These appear verbatim on stderr
 //! in lines such as `To https://ghp_token@github.com/org/repo.git`.
-//! [`shared::scrub_git_url`] is called on every line before it is included in
+//! [`shared::scrub_credential_url`] is called on every line before it is included in
 //! any output, ensuring tokens are never forwarded to the caller's terminal or
 //! analytics database.
 //!
@@ -37,7 +37,7 @@ use crate::cmd::{extract_output_format, user_has_flag};
 use crate::output::canonical::GitResult;
 use crate::output::strip_ansi;
 
-use super::shared::scrub_git_url;
+use super::shared::scrub_credential_url;
 use super::{run_parsed_command, run_passthrough};
 
 // ============================================================================
@@ -103,7 +103,7 @@ pub(super) fn run_push(
 /// - **Full**: Text output parsed for "up-to-date", "rejected", or "Done".
 /// - **Passthrough**: Empty or unrecognized output.
 ///
-/// Credential URLs are scrubbed from all lines via [`scrub_git_url`] (AD-GP-1).
+/// Credential URLs are scrubbed from all lines via [`scrub_credential_url`] (AD-GP-1).
 pub(super) fn parse_push(input: &str) -> GitResult {
     let clean = strip_ansi(input);
     let text: &str = clean.as_ref();
@@ -130,7 +130,7 @@ pub(super) fn parse_push(input: &str) -> GitResult {
     let mut iter = text
         .lines()
         .filter(|l: &&str| !l.trim().is_empty())
-        .map(|l| scrub_git_url(l).into_owned());
+        .map(|l| scrub_credential_url(l).into_owned());
     let summary = iter.next().unwrap_or_else(|| "pushed".to_string());
     let details: Vec<String> = iter.collect();
     GitResult::new("push".to_string(), summary, details).with_tier("passthrough")
@@ -205,7 +205,7 @@ fn try_parse_porcelain(text: &str) -> Option<GitResult> {
     let mut found_porcelain = false;
 
     for raw_line in text.lines() {
-        let line = scrub_git_url(raw_line.trim());
+        let line = scrub_credential_url(raw_line.trim());
         let line = line.as_ref();
 
         if line == "Done" {
@@ -288,7 +288,7 @@ fn try_parse_text(text: &str) -> Option<GitResult> {
     let mut has_signal = false;
 
     for raw_line in text.lines() {
-        let line = scrub_git_url(raw_line.trim());
+        let line = scrub_credential_url(raw_line.trim());
         let line_s = line.as_ref();
 
         if line_s.is_empty() {

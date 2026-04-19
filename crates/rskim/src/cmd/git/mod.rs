@@ -214,7 +214,7 @@ pub(super) fn build_analytics_label(
         // and future git handlers that go through this function.
         let scrubbed: Vec<String> = args
             .iter()
-            .map(|a| shared::scrub_git_url(a).into_owned())
+            .map(|a| shared::scrub_credential_url(a).into_owned())
             .collect();
         format!("skim git {subcmd} {}", scrubbed.join(" "))
     } else {
@@ -822,16 +822,16 @@ mod tests {
     ///   fatal: unable to access 'https://ghp_xxx@github.com/org/repo.git':
     ///     The requested URL returned error: 403
     ///
-    /// The scrubbing logic in `run_parsed_command` calls `shared::scrub_git_url`
+    /// The scrubbing logic in `run_parsed_command` calls `shared::scrub_credential_url`
     /// line-by-line on both stderr and stdout before forwarding to the terminal
     /// and before passing to `finalize_git_output_passthrough`.
     #[test]
     fn test_error_path_stderr_scrubbing() {
-        use crate::cmd::git::shared::scrub_git_url;
+        use crate::cmd::git::shared::scrub_credential_url;
 
         let stderr_line =
             "fatal: unable to access 'https://ghp_abc123@github.com/org/repo.git': 403";
-        let scrubbed = scrub_git_url(stderr_line);
+        let scrubbed = scrub_credential_url(stderr_line);
         assert!(
             !scrubbed.contains("ghp_abc123"),
             "credential token must be stripped from error output; got: {scrubbed}"
@@ -849,11 +849,11 @@ mod tests {
     /// ssh:// credentials on the error path are scrubbed (AD-GP-1 companion).
     #[test]
     fn test_error_path_stderr_scrubs_ssh_url() {
-        use crate::cmd::git::shared::scrub_git_url;
+        use crate::cmd::git::shared::scrub_credential_url;
 
         let stderr_line =
             "fatal: Could not read from remote repository ssh://deploy@github.com/org/repo.git";
-        let scrubbed = scrub_git_url(stderr_line);
+        let scrubbed = scrub_credential_url(stderr_line);
         assert!(
             !scrubbed.contains("deploy@"),
             "ssh credential must be stripped; got: {scrubbed}"

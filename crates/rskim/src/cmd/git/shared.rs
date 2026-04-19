@@ -1,4 +1,4 @@
-//! Shared helpers for git subcommand parsers.
+//! Shared helpers for git subcommand parsers and infra streaming commands.
 //!
 //! # Why this module exists vs `git/mod.rs`
 //!
@@ -7,11 +7,12 @@
 //! This module provides **stateless pure helpers** that individual sub-parsers
 //! need but that have no business being in the dispatch layer:
 //!
-//! - [`scrub_git_url`] — credential URL scrubbing for push/fetch output.
+//! - [`scrub_credential_url`] — credential URL scrubbing for any remote URL output.
 //!
 //! Keeping these helpers here avoids import cycles: `push.rs` and `commit.rs`
-//! can `use super::shared::scrub_git_url` without pulling in the full mod.rs
-//! dispatch machinery.
+//! can `use super::shared::scrub_credential_url` without pulling in the full mod.rs
+//! dispatch machinery.  The `pub(crate)` visibility allows infra streaming commands
+//! (e.g. `skim infra gh run watch`) to scrub URLs from their analytics labels.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -57,18 +58,18 @@ static CREDENTIAL_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(https?://|git://|ssh://)[^@\s/?#]+@").expect("credential URL regex is valid")
 });
 
-/// Scrub credential tokens from a git remote URL.
+/// Scrub credential tokens from a remote URL.
 ///
 /// Replaces `https://<token>@host/...` with `https://host/...`, preserving the
-/// host and path so that push/fetch output remains informative without leaking
-/// credentials.
+/// host and path so that push/fetch/streaming output remains informative without
+/// leaking credentials.
 ///
 /// # DESIGN NOTE (AD-GP-1)
 ///
 /// Git push (and clone/fetch) can embed auth tokens in the remote URL when
 /// callers use `https://<token>@github.com/org/repo` for scripted pushes.
 /// These tokens appear verbatim in push output on stderr.  We scrub them so
-/// that skim-compressed push output never contains credentials.
+/// that skim-compressed output never contains credentials.
 ///
 /// We keep the URL rather than stripping it entirely because the host + path
 /// tells the caller exactly which remote was targeted — useful information.
@@ -76,18 +77,18 @@ static CREDENTIAL_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Returns a [`Cow<str>`]:
 /// - `Borrowed` when no credentials were found (zero allocation).
 /// - `Owned` when the regex matched and replacement occurred.
-pub(super) fn scrub_git_url(s: &str) -> Cow<'_, str> {
+pub(crate) fn scrub_credential_url(s: &str) -> Cow<'_, str> {
     CREDENTIAL_URL_RE.replace_all(s, "${1}")
 }
 
 /// Scrub credential tokens from every line of a multi-line string.
 ///
-/// Applies [`scrub_git_url`] line-by-line and joins with `\n` (normalising
-/// `\r\n` to `\n` — intentional for Unix-first CLI output).
-pub(super) fn scrub_lines(input: &str) -> String {
+/// Applies [`scrub_credential_url`] line-by-line and joins with `\n`
+/// (normalising `\r\n` to `\n` — intentional for Unix-first CLI output).
+pub(crate) fn scrub_lines(input: &str) -> String {
     input
         .lines()
-        .map(scrub_git_url)
+        .map(scrub_credential_url)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -101,9 +102,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scrub_git_url_token_auth() {
+    fn test_scrub_credential_url_token_auth() {
         let input = "remote: https://ghp_supersecrettoken@github.com/org/repo.git";
-        let result = scrub_git_url(input);
+        let result = scrub_credential_url(input);
         assert!(
             !result.contains("ghp_supersecrettoken"),
             "token should be scrubbed"
@@ -115,34 +116,34 @@ mod tests {
     }
 
     #[test]
-    fn test_scrub_git_url_user_password() {
+    fn test_scrub_credential_url_user_password() {
         let input = "To https://user:hunter2@gitlab.com/org/repo.git";
-        let result = scrub_git_url(input);
+        let result = scrub_credential_url(input);
         assert!(!result.contains("hunter2"), "password should be scrubbed");
         assert!(!result.contains("user:"), "username should be scrubbed");
         assert!(result.contains("gitlab.com/org/repo.git"));
     }
 
     #[test]
-    fn test_scrub_git_url_no_credentials_borrowed() {
+    fn test_scrub_credential_url_no_credentials_borrowed() {
         let input = "To https://github.com/org/repo.git";
-        let result = scrub_git_url(input);
+        let result = scrub_credential_url(input);
         // When no credentials are present, the original string is returned as Cow::Borrowed.
         assert_eq!(result.as_ref(), input);
     }
 
     #[test]
-    fn test_scrub_git_url_git_protocol() {
+    fn test_scrub_credential_url_git_protocol() {
         let input = "git://user@bitbucket.org/org/repo.git";
-        let result = scrub_git_url(input);
+        let result = scrub_credential_url(input);
         assert!(!result.contains("user@"), "user auth should be scrubbed");
         assert!(result.contains("bitbucket.org"));
     }
 
     #[test]
-    fn test_scrub_git_url_plain_text_unchanged() {
+    fn test_scrub_credential_url_plain_text_unchanged() {
         let input = "Everything up-to-date";
-        let result = scrub_git_url(input);
+        let result = scrub_credential_url(input);
         assert_eq!(result.as_ref(), input);
     }
 
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn test_scrub_preserves_host_when_nested_url_in_path() {
         let input = "https://github.com/?cb=https://user:pass@bad.com";
-        let result = scrub_git_url(input);
+        let result = scrub_credential_url(input);
         assert!(
             result.contains("github.com"),
             "primary host must be preserved"
@@ -203,7 +204,7 @@ mod tests {
     #[test]
     fn test_scrub_ssh_url() {
         let input = "ssh://token@github.com/repo.git";
-        let result = scrub_git_url(input);
+        let result = scrub_credential_url(input);
         assert!(
             result.contains("ssh://"),
             "scheme should be preserved: {result}"

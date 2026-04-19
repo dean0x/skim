@@ -154,10 +154,11 @@ pub(crate) fn run_infra_tool(
 
 /// Build an analytics label for streaming infra commands.
 ///
-/// Mirrors the label format in `ParsedCommandConfig`
-/// (`"skim {family} {program} {subcommand} {args}"`) for consistency across
-/// streaming and non-streaming infra commands.  Returns an empty string when
-/// analytics is disabled (avoids unnecessary formatting).  SEE: PF-022.
+/// Delegates to [`super::format_analytics_label`] for a consistent label format
+/// across streaming and non-streaming infra commands.  Scrubs credential-bearing
+/// URLs from args before joining so that tokens are never written to the analytics
+/// database or shown in stats output.  Returns an empty string when analytics is
+/// disabled (avoids unnecessary formatting).  SEE: PF-022.
 pub(crate) fn build_streaming_label(
     family: &str,
     program: &str,
@@ -169,12 +170,16 @@ pub(crate) fn build_streaming_label(
     if !show_stats && !analytics_enabled {
         return String::new();
     }
-    let args_str = args.join(" ");
-    if args_str.is_empty() {
-        format!("skim {family} {program} {subcommand}")
+    let rest = if args.is_empty() {
+        subcommand.to_string()
     } else {
-        format!("skim {family} {program} {subcommand} {args_str}")
-    }
+        let scrubbed: Vec<std::borrow::Cow<'_, str>> = args
+            .iter()
+            .map(|a| crate::cmd::git::shared::scrub_credential_url(a))
+            .collect();
+        format!("{subcommand} {}", scrubbed.join(" "))
+    };
+    super::format_analytics_label(family, program, &rest)
 }
 
 /// Re-export the shared `combine_output` under the name callers expect.
@@ -270,5 +275,23 @@ mod tests {
         let args: Vec<String> = vec![];
         let label = super::build_streaming_label("infra", "gh", "api", &args, true, false);
         assert_eq!(label, "skim infra gh api");
+    }
+
+    /// Credential-bearing URLs in args must be scrubbed from the analytics label.
+    ///
+    /// A streaming command like `skim infra gh api https://token@github.com/repo`
+    /// must not write the token to the analytics DB or stats output.
+    #[test]
+    fn test_build_streaming_label_scrubs_credentials() {
+        let args: Vec<String> = vec!["https://ghp_secret@github.com/org/repo".to_string()];
+        let label = super::build_streaming_label("infra", "gh", "api", &args, true, true);
+        assert!(
+            !label.contains("ghp_secret"),
+            "credential must be scrubbed from label: {label}"
+        );
+        assert!(
+            label.contains("github.com/org/repo"),
+            "host/path must be preserved in label: {label}"
+        );
     }
 }
