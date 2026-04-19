@@ -416,25 +416,18 @@ where
         // Without scrubbing these appear verbatim in the terminal.  This guard
         // applies to all git subcommands going through run_parsed_command, not
         // just push — generic protection is safer than a subcmd-specific gate.
-        if !output.stderr.is_empty() {
-            let scrubbed_stderr = shared::scrub_lines(&output.stderr);
-            if !scrubbed_stderr.is_empty() {
-                eprintln!("{scrubbed_stderr}");
-            }
+        let scrubbed_stderr = shared::scrub_lines(&output.stderr);
+        if !scrubbed_stderr.is_empty() {
+            eprintln!("{scrubbed_stderr}");
         }
-        // Scrub once; reuse for both terminal output and analytics recording
-        // (PF-024).  Previously stdout was scrubbed twice — once for printing
-        // and once for analytics.  Lifting the scrub above the conditional
-        // print guard eliminates the redundant second pass.
+        // Scrub stdout once; reuse for both terminal output and analytics (PF-024).
         let scrubbed_stdout = shared::scrub_lines(&output.stdout);
         if !scrubbed_stdout.is_empty() {
             println!("{scrubbed_stdout}");
         }
         let exit_code = output.exit_code;
         // Record analytics even on non-zero exit so the DB reflects failed
-        // invocations. Move scrubbed_stdout (already computed above) into the
-        // passthrough variant: 1 allocation (clone) on the analytics path,
-        // 0 when disabled (PF-018 resolution).
+        // invocations (PF-018).
         finalize_git_output_passthrough(
             scrubbed_stdout,
             label,
@@ -471,10 +464,9 @@ where
         }
     };
 
-    // Scrub credentials before analytics recording on the success path (PF-024).
-    // The parser used the un-scrubbed `raw` to extract ref data; only the analytics
-    // copy needs scrubbing.  scrub_lines normalizes \r\n to \n — intentional
-    // for Unix-first CLI output.
+    // Scrub credentials before analytics recording (PF-024).  The parser used
+    // the un-scrubbed `raw` to extract ref data; only the analytics copy needs
+    // scrubbing.
     let analytics_raw = shared::scrub_lines(&raw);
 
     // `analytics_raw` and `result_str` are owned here; move them directly.

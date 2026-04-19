@@ -84,15 +84,6 @@ pub(super) fn scrub_git_url(s: &str) -> Cow<'_, str> {
 ///
 /// Applies [`scrub_git_url`] line-by-line and joins with `\n` (normalising
 /// `\r\n` to `\n` — intentional for Unix-first CLI output).
-///
-/// # Allocation behaviour (PF-024)
-///
-/// [`scrub_git_url`] returns [`Cow::Borrowed`] when a line contains no
-/// credentials (the common case), producing zero per-line heap allocations
-/// for clean lines.  By collecting `Cow` items and calling `.join("\n")` once,
-/// this function avoids the N `into_owned()` calls that the previous inline
-/// pattern used — one `String` is allocated for the joined result regardless
-/// of whether any line was modified.
 pub(super) fn scrub_lines(input: &str) -> String {
     input
         .lines()
