@@ -353,3 +353,19 @@ fn test_no_stderr_hint_on_passthrough() {
         .assert()
         .stderr(predicate::str::contains("[skim] compressed output").not());
 }
+
+/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`,
+/// capture stderr, and assert it contains BOTH `[skim] compressed output`
+/// AND `SKIM_PASSTHROUGH=1`. This validates the full hint message format,
+/// not just the prefix.
+#[test]
+fn test_stderr_hint_contains_passthrough_instruction() {
+    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(fixture)
+        .assert()
+        .code(predicate::ne(0))
+        .stderr(predicate::str::contains("[skim] compressed output"))
+        .stderr(predicate::str::contains("SKIM_PASSTHROUGH=1"));
+}

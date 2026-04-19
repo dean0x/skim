@@ -309,6 +309,17 @@ mod tests {
     }
 
     #[test]
+    fn test_guidance_content_troubleshooting_has_code_example() {
+        let content = guidance_content("2.5.1");
+        // The troubleshooting section must contain a code block with the exact
+        // example command shown in the docs.
+        assert!(
+            content.contains("SKIM_PASSTHROUGH=1 npx vitest"),
+            "guidance_content troubleshooting section must include code example: SKIM_PASSTHROUGH=1 npx vitest"
+        );
+    }
+
+    #[test]
     fn test_guidance_content_mdc_has_frontmatter() {
         let content = guidance_content_mdc("2.1.0");
         assert!(
