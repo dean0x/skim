@@ -167,7 +167,7 @@ impl CommandRunner {
         env_vars: &[(&str, &str)],
     ) -> anyhow::Result<CommandOutput> {
         match self.run_with_env(program, args, env_vars) {
-            Ok(out) => return Ok(out),
+            Ok(out) => Ok(out),
             Err(original_err) => {
                 // Absolute or relative paths — no fallback; caller was explicit.
                 if program.contains('/') {
