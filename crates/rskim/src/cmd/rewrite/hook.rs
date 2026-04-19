@@ -69,6 +69,12 @@ pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode> {
     use crate::cmd::hooks::{protocol_for_agent, HookSupport};
 
+    // SKIM_PASSTHROUGH=1 disables all hook rewriting — the agent sees no hook response,
+    // which is equivalent to a passthrough (the original command runs unchanged).
+    if crate::cmd::is_passthrough_mode() {
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // Watchdog: self-terminate after HOOK_TIMEOUT_SECS to prevent hanging the agent.
     // Uses a detached thread so it doesn't interfere with normal processing.
     // On timeout: log warning, exit 0 (passthrough — agent sees empty stdout).

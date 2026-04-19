@@ -36,6 +36,27 @@ pub(crate) fn run(
     show_stats: bool,
     analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
+    // Passthrough mode: bypass compression, run the raw command and forward output.
+    if crate::cmd::is_passthrough_mode() {
+        let raw_output = if stdin_has_data() {
+            read_stdin()?
+        } else {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let runner = CommandRunner::new(None);
+            let output = runner.run(program, &arg_refs)?;
+            let mut combined = output.stdout;
+            if !output.stderr.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&output.stderr);
+            }
+            combined
+        };
+        println!("{raw_output}");
+        return Ok(ExitCode::FAILURE);
+    }
+
     let start = std::time::Instant::now();
     let raw_output = if stdin_has_data() {
         read_stdin()?

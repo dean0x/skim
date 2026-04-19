@@ -28,6 +28,22 @@ pub(crate) fn run(
     show_stats: bool,
     analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
+    // Passthrough mode: run `go test` without flag injections and forward raw output.
+    if crate::cmd::is_passthrough_mode() {
+        let mut raw_args: Vec<String> = vec!["test".to_string()];
+        raw_args.extend_from_slice(args);
+        let raw_args_ref: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
+        let runner = CommandRunner::new(None);
+        let output = runner.run("go", &raw_args_ref)?;
+        let combined = if output.stderr.is_empty() {
+            output.stdout
+        } else {
+            format!("{}\n{}", output.stdout, output.stderr)
+        };
+        println!("{combined}");
+        return Ok(ExitCode::FAILURE);
+    }
+
     let mut go_args: Vec<String> = vec!["test".to_string()];
 
     // Inject -json before any `--` separator, unless the user already specified
