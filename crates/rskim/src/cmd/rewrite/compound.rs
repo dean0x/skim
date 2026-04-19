@@ -13,7 +13,7 @@
 //!
 //! SEE: AD-RW-2 — catch-all ls/grep + pipe exclusion design note.
 
-use super::engine::{is_pipe_source_excluded, try_rewrite};
+use super::engine::{try_rewrite, try_table_match_full};
 use super::types::{
     CommandSegment, CompoundOp, CompoundSplitResult, QuoteState, RewriteCategory, RewriteResult,
 };
@@ -324,10 +324,11 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
 }
 
 // PIPE_EXCLUDED_SOURCES removed (AD-RW-2).
-// The pipe-source exclusion is now handled via the `exclude_pipe_source` flag on
-// `RewriteRule` (types.rs).  `engine::is_pipe_source_excluded` replaces the
-// hard-coded list, so adding a new catch-all only requires a single edit in
-// `rules.rs`.  See `try_rewrite_compound_pipe` and `mod.rs::classify_compound_pipe`.
+// The pipe-source exclusion is handled via the `exclude_pipe_source` flag on
+// `RewriteRule` (types.rs).  `engine::try_table_match_full` reports both the
+// rewrite result and the pipe-exclusion flag in a single pass, so adding a new
+// catch-all only requires a single edit in `rules.rs`.
+// See `try_rewrite_compound_pipe` and `mod.rs::classify_compound_pipe`.
 
 /// Return true if any segment has a trailing pipe operator.
 pub(super) fn has_pipe_operator(segments: &[CommandSegment]) -> bool {
@@ -447,13 +448,14 @@ fn try_rewrite_compound_pipe(segments: &[CommandSegment]) -> Option<RewriteResul
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
 
     // Do not rewrite pipe-source-excluded commands (e.g. `ls | head`, `find . | head`).
-    // The `exclude_pipe_source` flag on the matching rule drives this check.
+    // Use try_table_match_full for a single-pass check: if pipe_excluded is set,
+    // suppress the rewrite regardless of whether a rewrite would have matched.
     // SEE: AD-RW-2.
-    if is_pipe_source_excluded(&token_refs) {
+    let match_result = try_table_match_full(&token_refs);
+    if match_result.pipe_excluded {
         return None;
     }
-
-    let rewrite = try_rewrite(&token_refs)?;
+    let rewrite = match_result.rewrite?;
 
     // Splice redirects back for the first segment before handing off.
     let mut first_tokens = rewrite.tokens.clone();

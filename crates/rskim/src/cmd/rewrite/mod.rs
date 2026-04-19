@@ -38,7 +38,7 @@ use compound::{
     has_pipe_operator, reconstruct_pipe_parts, splice_redirects_back, split_compound,
     try_rewrite_compound,
 };
-use engine::{is_pipe_source_excluded, try_rewrite};
+use engine::{try_rewrite, try_table_match_full};
 use hook::{parse_agent_flag, run_hook_mode};
 use suggest::{print_help, print_suggest};
 use types::{CommandSegment, CompoundOp, CompoundSplitResult, RewriteCategory, RewriteResult};
@@ -293,10 +293,11 @@ fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification 
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
 
     // Do not classify catch-all rules on the pipe-source side (e.g. `ls | wc -l`).
-    // Mirrors the same check in `try_rewrite_compound_pipe`.  The `exclude_pipe_source`
-    // flag on the matching rule replaces the removed PIPE_EXCLUDED_SOURCES constant.
-    // SEE: AD-RW-2.
-    if is_pipe_source_excluded(&token_refs) {
+    // Use try_table_match_full for a single-pass check: if pipe_excluded is set,
+    // the whole pipe expression is Unhandled regardless of rewrite result.
+    // Mirrors the same check in `try_rewrite_compound_pipe`.  SEE: AD-RW-2.
+    let full_result = try_table_match_full(&token_refs);
+    if full_result.pipe_excluded {
         return CommandClassification::Unhandled;
     }
 
