@@ -727,4 +727,46 @@ mod tests {
             }
         }
     }
+
+    // ========================================================================
+    // run_with_env_node_fallback: env forwarding tests
+    // ========================================================================
+
+    /// Verify that `run_with_env_node_fallback` forwards env overrides to the
+    /// spawned process on every fallback candidate. Uses `printenv` (always in
+    /// PATH on Unix) with an injected variable to confirm forwarding.
+    #[cfg(unix)]
+    #[test]
+    fn test_node_fallback_env_vars_forwarded() {
+        let runner = CommandRunner::new(None);
+        let env_overrides = &[("SKIM_TEST_ENV_FORWARD", "hello_from_skim")];
+        // printenv KEY prints the value of KEY if set, exits 0; exits non-zero if unset.
+        let result = runner
+            .run_with_env_node_fallback("printenv", &["SKIM_TEST_ENV_FORWARD"], env_overrides)
+            .unwrap();
+        assert_eq!(
+            result.stdout.trim(),
+            "hello_from_skim",
+            "env override must be forwarded to the child process"
+        );
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    /// Verify that original args are passed unchanged to the spawned process by
+    /// `run_with_env_node_fallback`. Uses `echo` (always in PATH on Unix) with
+    /// specific arguments to confirm they appear verbatim in the output.
+    #[cfg(unix)]
+    #[test]
+    fn test_node_fallback_args_preserved() {
+        let runner = CommandRunner::new(None);
+        let result = runner
+            .run_with_env_node_fallback("echo", &["arg_one", "arg_two", "arg_three"], &[])
+            .unwrap();
+        let out = result.stdout.trim();
+        assert!(
+            out.contains("arg_one") && out.contains("arg_two") && out.contains("arg_three"),
+            "all args must be preserved in output, got: {out:?}"
+        );
+        assert_eq!(result.exit_code, Some(0));
+    }
 }

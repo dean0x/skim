@@ -307,3 +307,49 @@ fn test_vitest_passthrough_silent_without_debug() {
         .stderr(predicate::str::contains("[skim:notice]").not())
         .stderr(predicate::str::contains("[skim:warning]").not());
 }
+
+// ============================================================================
+// stderr hint on compressed failure (Fix E)
+// ============================================================================
+
+/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`,
+/// capture stderr, verify it contains `[skim] compressed output` (the hint
+/// that tells the user how to see full raw output).
+#[test]
+fn test_stderr_hint_on_compressed_failure() {
+    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(fixture)
+        .assert()
+        .code(predicate::ne(0))
+        .stderr(predicate::str::contains("[skim] compressed output"));
+}
+
+/// Pipe a passing vitest JSON fixture through stdin, capture stderr, verify
+/// it does NOT contain `[skim]` (hint must only fire on non-zero exit codes).
+#[test]
+fn test_no_stderr_hint_on_success() {
+    let fixture = include_str!("fixtures/vitest/vitest_pass.json");
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[skim]").not());
+}
+
+/// Pipe unparseable output through stdin (triggers Passthrough tier), capture
+/// stderr, verify the hint is NOT emitted. Passthrough output is uncompressed
+/// so the hint is not needed.
+#[test]
+fn test_no_stderr_hint_on_passthrough() {
+    // Unparseable input triggers tier 3 passthrough.
+    // stdin path uses synthetic exit_code Some(0), so process exits 0.
+    // The hint must NOT fire because result.is_passthrough() is true.
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin("completely unparseable garbage output that matches nothing\n")
+        .assert()
+        .stderr(predicate::str::contains("[skim] compressed output").not());
+}

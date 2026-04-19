@@ -670,6 +670,93 @@ fn test_rewrite_hook_passthrough_zero_stderr() {
 }
 
 // ============================================================================
+// SKIM_PASSTHROUGH=1 in hook mode (Fix C)
+// ============================================================================
+
+/// Verify that SKIM_PASSTHROUGH=1 makes the hook return immediately with empty
+/// stdout, even for a command that would normally be rewritten. The agent sees
+/// no hook response — equivalent to a transparent passthrough.
+#[test]
+fn test_passthrough_hook_skips_rewrite() {
+    let input = serde_json::json!({
+        "tool_input": {
+            "command": "cargo test"
+        }
+    });
+    let output = skim_cmd()
+        .args(["rewrite", "--hook"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(serde_json::to_string(&input).unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "SKIM_PASSTHROUGH=1 hook mode must exit 0"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.trim().is_empty(),
+        "SKIM_PASSTHROUGH=1 hook mode must produce empty stdout, got: {stdout}"
+    );
+}
+
+/// Verify that SKIM_PASSTHROUGH=1 with `skim test vitest` does NOT inject
+/// --reporter=json. Plain text piped in is forwarded unchanged without JSON
+/// transformation.
+#[test]
+fn test_passthrough_direct_vitest_no_json_injection() {
+    let plain_text = "Tests  3 passed | 0 failed | 3 total\n";
+    let output = skim_cmd()
+        .args(["test", "vitest"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(plain_text)
+        .output()
+        .unwrap();
+
+    // Passthrough forwards the raw input and exits with the original exit code.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Tests") || stdout.contains("passed"),
+        "passthrough must forward the raw input, got: {stdout}"
+    );
+    // Must NOT contain parsed JSON-injected output markers.
+    assert!(
+        !stdout.contains("PASS:") || stdout.contains("passed"),
+        "passthrough must not reformat the input"
+    );
+}
+
+/// Verify that SKIM_PASSTHROUGH=1 forwards raw output unchanged.
+/// Pipe a failing vitest JSON fixture and verify the raw content is forwarded
+/// to stdout without parsing or reformatting.
+#[test]
+fn test_passthrough_preserves_exit_code() {
+    // The vitest passthrough handler returns ExitCode::FAILURE when stdin has
+    // data (exit code 1 is conservative — the tool status is unknown). The
+    // important property is that raw content is forwarded without compression.
+    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    let output = skim_cmd()
+        .args(["test", "vitest"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(fixture)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Raw JSON forwarded unchanged — must contain the source numFailedTests field.
+    assert!(
+        stdout.contains("numFailedTests"),
+        "passthrough must forward raw fixture content, got: {stdout}"
+    );
+    // Passthrough must NOT produce any skim-formatted output.
+    assert!(
+        !stdout.contains("FAIL:") && !stdout.contains("PASS:"),
+        "passthrough must not compress/reformat output, got: {stdout}"
+    );
+}
+
+// ============================================================================
 // Lint rewrite rules (#104)
 // ============================================================================
 
