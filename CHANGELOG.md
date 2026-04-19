@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`skim git commit`** — new parser compressing `git commit` output: extracts commit hash, subject, and changed-files summary; terminates at verbose diff scissors line (`---...>8---`, AD-GC-1); skips hook noise (pre-commit, black, ruff, eslint output)
-- **`skim git push`** — new parser compressing `git push` output: full porcelain mode (auto-injected `--porcelain`, AD-GP-2); per-ref status (`* new`, `= up to date`, `+ forced`, `! rejected`); credential URL scrubbing via `scrub_git_url` (AD-GP-1)
+- **`skim git push`** — new parser compressing `git push` output: full porcelain mode (auto-injected `--porcelain`, AD-GP-2); per-ref status (`* new`, `= up to date`, `+ forced`, `! rejected`); credential URL scrubbing via `scrub_credential_url` (AD-GP-1)
 - **`skim infra gh api`** — new parser compressing `gh api` / `gh api graphql` output: GraphQL `.data` unwrap + `.errors` prepend, base64 `content` field replacement, binary passthrough, depth-limited JSON compaction (AD-API-1)
 - **`skim infra gh run watch`** — new streaming parser for `gh run watch`: emits job status transitions (queued → in-progress → completed/failed), suppresses progress noise, emits `Run complete: N/M succeeded` summary (AD-GRW-1)
 - **`skim infra gh release view`** — new parser compressing `gh release view --json` output: extracts tag, name, dates, assets list (capped at 20), body truncation outside code fences (AD-RV-1)
@@ -17,12 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Catch-all ls/grep rewrite rules** (B.1/B.2) — any `ls` or `grep` invocation without a more-specific match is now rewritten; `--help`/`--version` pass through; pipe sources excluded from rewriting
 - **Redirect stripping** (`strip_segment_redirects`) — per-segment redirect stripping in compound commands; redirects are restored at emission time (appended to end), preserving shell semantics
 - **Streaming primitive** (`streaming.rs`) — `StreamingParser` trait, `run_streamed_spawned`, `DropGuard` for fire-and-forget analytics on streaming commands
-- **Shared git helper** (`git/shared.rs`) — `scrub_git_url` strips credential-embedded URLs (`https://<token>@github.com/...`) using lazy regex (AD-GP-1)
+- **Shared git helper** (`git/shared.rs`) — `scrub_credential_url` strips credential-embedded URLs (`https://<token>@github.com/...`) using lazy regex (AD-GP-1)
 
 ### Fixed
 - **`find` and `rg` pipe-source exclusion** — `find . | head` and `rg pattern | head` are no longer rewritten; `exclude_pipe_source: true` was missing from their rules despite having specific rule entries (regression vs. intended AD-RW-2 semantics). `is_catch_all` renamed to `exclude_pipe_source` to accurately describe the field's purpose.
 - **`try_parse_porcelain` false-trigger** — porcelain parser now ignores informational lines starting with flag characters (`!`, `-`, `=`) that don't contain a ref path (`refs/` prefix) or src:dst notation (`:`). Prevents lines like `! [remote rejected] branch (pre-receive hook declined)` from being misparsed as ref-status entries. Root cause: `strip_ansi_escapes` strips tab bytes, so tab-based guard heuristics are unreliable.
-- **Credential scrubbing on success and failure analytics paths** — `raw` (success) and `output.stdout` (failure) are now scrubbed line-by-line via `scrub_git_url` before being passed to `finalize_git_output_owned` / `finalize_git_output_passthrough`. Previously, `analytics.db` could persist credential-bearing URLs from push/fetch output (PF-024).
+- **Credential scrubbing on success and failure analytics paths** — `raw` (success) and `output.stdout` (failure) are now scrubbed line-by-line via `scrub_credential_url` before being passed to `finalize_git_output_owned` / `finalize_git_output_passthrough`. Previously, `analytics.db` could persist credential-bearing URLs from push/fetch output (PF-024).
 - **`ssh://` credential scrubbing** — `CREDENTIAL_URL_RE` now matches `ssh://user@host/...` in addition to `https://` and `git://` (AD-GP-1). SSH-cloned repos with embedded credentials in push/fetch output are now scrubbed on the same code path.
 - **`build_streaming_label` analytics label alignment** — `gh run watch` now produces analytics labels via the shared `build_streaming_label` helper, matching the `"skim {family} {program} {subcommand} {args}"` format used by non-streaming infra commands (PF-022). `gh api` uses the standard `ParsedCommandConfig` analytics path via `run_infra_tool` and does not need the streaming helper.
 ### Changed
@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Rewrite engine deduplication** — `should_skip_by_flag` extracted as a named function (replacing two duplicated inline closures); `has_pipe_operator` and `reconstruct_pipe_parts` extracted to `compound.rs`; `splice_redirects_back` promoted to `pub(super)`. Dead index (`PIPE_EXCLUDED_SOURCES` slice) removed.
 
 ### Testing
-- 2,765 tests passing (up from 2,712 in v2.5.0)
+- 2,767 tests passing (up from 2,712 in v2.5.0)
 - Pipe-source exclusion tests for `find` and `rg` (standalone rewritten, piped suppressed, `||` chain not suppressed)
 - Negative tests for compress-or-skip (`ls --help`, `grep --version` passthrough)
 - Redirect stripping coverage for all 7 single-token forms + two-token `2> /dev/null`
