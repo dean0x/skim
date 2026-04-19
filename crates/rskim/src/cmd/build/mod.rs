@@ -180,7 +180,7 @@ pub(super) fn run_parsed_command(
         analytics_enabled,
         raw_text,
         result.content().to_string(),
-        format!("skim build {program} {}", args.join(" ")),
+        super::format_analytics_label("build", program, &args.join(" ")),
         crate::analytics::CommandType::Build,
         output.duration,
         Some(result.tier_name()),

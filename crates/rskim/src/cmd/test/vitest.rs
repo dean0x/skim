@@ -79,7 +79,7 @@ pub(crate) fn run(
         analytics_enabled,
         raw_output,
         result.content().to_string(),
-        format!("skim test {program} {}", args.join(" ")),
+        crate::cmd::format_analytics_label("test", program, &args.join(" ")),
         crate::analytics::CommandType::Test,
         start.elapsed(),
         Some(result.tier_name()),

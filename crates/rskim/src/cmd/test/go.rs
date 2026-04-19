@@ -106,7 +106,7 @@ pub(crate) fn run(
         analytics_enabled,
         combined,
         parsed.content().to_string(),
-        format!("skim test go {}", args.join(" ")),
+        crate::cmd::format_analytics_label("test", "go", &args.join(" ")),
         crate::analytics::CommandType::Test,
         output.duration,
         Some(parsed.tier_name()),
