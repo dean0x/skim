@@ -20,7 +20,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
 
-use super::shared::{scrape_failures, TestKind};
+use super::shared::{self, scrape_failures, TestKind};
 
 // ============================================================================
 // Public entry point
@@ -76,6 +76,17 @@ pub(crate) fn run(
             let _ = result.emit_markers(&mut handle);
 
             if test_result.summary.fail > 0 {
+                // Append raw failure context so the agent can see actual error
+                // messages without needing to re-run with SKIM_PASSTHROUGH=1.
+                let stripped = crate::output::strip_ansi(&raw_output);
+                let tail = shared::last_n_lines(&stripped, shared::MAX_FAILURE_CONTEXT_LINES);
+                if !tail.is_empty() {
+                    println!(
+                        "\n--- failure context (last {} lines) ---",
+                        tail.lines().count()
+                    );
+                    println!("{tail}");
+                }
                 eprintln!(
                     "[skim] compressed output (exit 1). SKIM_PASSTHROUGH=1 for full output."
                 );
