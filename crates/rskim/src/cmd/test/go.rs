@@ -35,13 +35,9 @@ pub(crate) fn run(
         let raw_args_ref: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
         let runner = CommandRunner::new(None);
         let output = runner.run("go", &raw_args_ref)?;
-        let combined = if output.stderr.is_empty() {
-            output.stdout
-        } else {
-            format!("{}\n{}", output.stdout, output.stderr)
-        };
-        println!("{combined}");
-        return Ok(ExitCode::FAILURE);
+        print!("{}", crate::cmd::combine_output(&output));
+        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+        return Ok(ExitCode::from(code));
     }
 
     let mut go_args: Vec<String> = vec!["test".to_string()];

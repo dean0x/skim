@@ -667,6 +667,19 @@ mod tests {
     #[test]
     fn test_node_fallback_local_bin_found() {
         use std::os::unix::fs::PermissionsExt;
+
+        /// RAII guard that restores the process cwd on drop, even on panic.
+        ///
+        /// `set_current_dir` is process-wide, so concurrent tests could see the
+        /// wrong cwd.  The guard ensures we always restore, preventing cascading
+        /// failures when this test panics.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
         // Create a temp directory simulating a project with ./node_modules/.bin/fake-tool
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
         let bin_dir = tmp.path().join("node_modules").join(".bin");
@@ -675,16 +688,15 @@ mod tests {
         std::fs::write(&script, b"#!/bin/sh\necho 'from-local-bin'\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Change cwd to the temp dir so the local bin path is discoverable
-        let original_dir = std::env::current_dir().unwrap();
+        // Change cwd to the temp dir so the local bin path is discoverable.
+        // The CwdGuard restores the original dir on drop (including panic unwind).
+        let _guard = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(tmp.path()).unwrap();
 
         let runner = CommandRunner::new(None);
         // `fake-tool` is not in PATH, but ./node_modules/.bin/fake-tool exists
         let result = runner.run_with_node_fallback("fake-tool", &[]).unwrap();
         assert_eq!(result.stdout.trim(), "from-local-bin");
-
-        std::env::set_current_dir(original_dir).unwrap();
     }
 
     #[cfg(unix)]

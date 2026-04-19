@@ -38,23 +38,17 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
-        let raw_output = if stdin_has_data() {
-            read_stdin()?
-        } else {
-            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let runner = CommandRunner::new(None);
-            let output = runner.run_with_node_fallback(program, &arg_refs)?;
-            let mut combined = output.stdout;
-            if !output.stderr.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str(&output.stderr);
-            }
-            combined
-        };
-        println!("{raw_output}");
-        return Ok(ExitCode::FAILURE);
+        if stdin_has_data() {
+            let raw_output = read_stdin()?;
+            println!("{raw_output}");
+            return Ok(ExitCode::FAILURE);
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let runner = CommandRunner::new(None);
+        let output = runner.run_with_node_fallback(program, &arg_refs)?;
+        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+        print!("{}", crate::cmd::combine_output(&output));
+        return Ok(ExitCode::from(code));
     }
 
     let start = std::time::Instant::now();
@@ -97,9 +91,7 @@ pub(crate) fn run(
         }
         ParseResult::Passthrough(raw) => {
             println!("{raw}");
-            let stderr = io::stderr();
-            let mut handle = stderr.lock();
-            let _ = result.emit_markers(&mut handle);
+            let _ = result.emit_markers(&mut io::stderr().lock());
             ExitCode::FAILURE
         }
     };

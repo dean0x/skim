@@ -461,16 +461,13 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // check_passthrough_value
+    // check_passthrough_value / stderr hint guard
     // ========================================================================
 
-    // ========================================================================
-    // stderr hint behavior (pure-function tests via check_passthrough_value)
-    // ========================================================================
-
-    /// Verify that passthrough mode does not emit the hint (it bypasses compression
-    /// entirely). We test this indirectly by confirming passthrough detection
-    /// works correctly for the guard condition in run_parsed_command_with_mode.
+    /// Verify that passthrough mode detection works correctly for the guard
+    /// in `run_parsed_command_with_mode`. Passthrough returns early before
+    /// the hint is emitted; the `!result.is_passthrough()` guard ensures the
+    /// hint fires only for Full/Degraded results.
     #[test]
     fn test_no_stderr_hint_when_passthrough_mode() {
         // Passthrough mode returns early before the hint is emitted.
