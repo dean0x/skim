@@ -280,7 +280,7 @@ where
         let runner = CommandRunner::new(Some(std::time::Duration::from_secs(300)));
         let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-        match runner.run_with_env(program, &args_str, env_overrides) {
+        match runner.run_with_env_node_fallback(program, &args_str, env_overrides) {
             Ok(out) => out,
             Err(e) => {
                 let msg = e.to_string();

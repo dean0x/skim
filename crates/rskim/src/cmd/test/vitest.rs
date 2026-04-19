@@ -43,7 +43,7 @@ pub(crate) fn run(
         } else {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let runner = CommandRunner::new(None);
-            let output = runner.run(program, &arg_refs)?;
+            let output = runner.run_with_node_fallback(program, &arg_refs)?;
             let mut combined = output.stdout;
             if !output.stderr.is_empty() {
                 if !combined.is_empty() {
@@ -164,10 +164,10 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
 
     let runner = CommandRunner::new(None);
-    let output = runner.run(program, &arg_refs).map_err(|e| {
+    let output = runner.run_with_node_fallback(program, &arg_refs).map_err(|e| {
         anyhow::anyhow!(
             "failed to run {program}: {e}\n\
-             Hint: Install {program} with: npm install -D {program}"
+             Hint: Install {program} locally (npm install -D {program}) or globally"
         )
     })?;
 
