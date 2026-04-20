@@ -162,12 +162,14 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
 
     let runner = CommandRunner::new(None);
-    let output = runner.run_with_node_fallback(program, &arg_refs).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to run {program}: {e}\n\
+    let output = runner
+        .run_with_node_fallback(program, &arg_refs)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to run {program}: {e}\n\
              Hint: Install {program} locally (npm install -D {program}) or globally"
-        )
-    })?;
+            )
+        })?;
 
     // Combine stdout and stderr — vitest may emit JSON to either depending on
     // version and configuration.

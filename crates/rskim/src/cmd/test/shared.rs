@@ -158,9 +158,7 @@ pub(super) fn emit_failure_context(raw_output: &str, exit_code: i32) {
         );
         println!("{tail}");
     }
-    eprintln!(
-        "[skim] compressed output (exit {exit_code}). SKIM_PASSTHROUGH=1 for full output."
-    );
+    eprintln!("[skim] compressed output (exit {exit_code}). SKIM_PASSTHROUGH=1 for full output.");
 }
 
 /// Return the last `n` lines of `text` as a `&str` slice.
@@ -327,7 +325,10 @@ mod tests {
     #[test]
     fn test_last_n_lines_exact_n() {
         // 50 lines, n=50 → full input
-        let text = (0..50).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = last_n_lines(&text, 50);
         assert_eq!(result, text);
     }

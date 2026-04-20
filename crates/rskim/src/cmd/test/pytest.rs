@@ -502,9 +502,10 @@ fn flush_failure(
 
 /// Emit the parsed result to stdout/stderr.
 ///
-/// `cleaned_output` is the ANSI-stripped combined output used to extract the
-/// failure context tail (last [`shared::MAX_FAILURE_CONTEXT_LINES`] lines).
-/// This mirrors the pattern used by go.rs and vitest.rs.
+/// When failures are present, delegates to [`shared::emit_failure_context`]
+/// to append the last [`shared::MAX_FAILURE_CONTEXT_LINES`] lines of
+/// `cleaned_output` so the agent can read error details without re-running
+/// with `SKIM_PASSTHROUGH=1`.
 fn emit_result(
     result: &ParseResult<TestResult>,
     output: &CommandOutput,
@@ -523,25 +524,10 @@ fn emit_result(
             result.emit_markers(&mut err)?;
 
             if tr.summary.fail > 0 {
-                // Append raw failure context so the agent can see actual error
-                // messages without needing to re-run with SKIM_PASSTHROUGH=1.
-                let tail =
-                    shared::last_n_lines(cleaned_output, shared::MAX_FAILURE_CONTEXT_LINES);
-                if !tail.is_empty() {
-                    writeln!(
-                        out,
-                        "\n--- failure context (last {} lines) ---",
-                        tail.lines().count()
-                    )?;
-                    writeln!(out, "{tail}")?;
-                }
-                eprintln!(
-                    "[skim] compressed output (exit 1). SKIM_PASSTHROUGH=1 for full output."
-                );
+                shared::emit_failure_context(cleaned_output, 1);
             }
         }
         ParseResult::Passthrough(raw) => {
-            // Write raw output as-is
             write!(out, "{raw}")?;
             result.emit_markers(&mut err)?;
         }

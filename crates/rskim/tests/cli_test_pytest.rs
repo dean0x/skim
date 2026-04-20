@@ -66,78 +66,42 @@ fn test_piped_all_pass() {
 #[test]
 fn test_piped_with_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Should show 2 passed, 1 failed
-    assert!(
-        stdout.contains("PASS: 2"),
-        "expected PASS: 2 in output, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("FAIL: 1"),
-        "expected FAIL: 1 in output, got: {stdout}"
-    );
-
-    // Should include the failure detail
-    assert!(
-        stdout.contains("test_divide") || stdout.contains("test_math"),
-        "expected failure test name in output, got: {stdout}"
-    );
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("PASS: 2"))
+        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("test_divide").or(predicate::str::contains("test_math")));
 }
 
 #[test]
 fn test_piped_mixed() {
     let fixture = include_str!("fixtures/cmd/test/pytest_mixed.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        stdout.contains("PASS: 4"),
-        "expected PASS: 4, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("FAIL: 1"),
-        "expected FAIL: 1, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("SKIP: 1"),
-        "expected SKIP: 1, got: {stdout}"
-    );
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("PASS: 4"))
+        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("SKIP: 1"));
 }
 
 #[test]
 fn test_piped_all_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_all_fail.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        stdout.contains("PASS: 0"),
-        "expected PASS: 0 in output, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("FAIL: 3"),
-        "expected FAIL: 3 in output, got: {stdout}"
-    );
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("PASS: 0"))
+        .stdout(predicate::str::contains("FAIL: 3"));
 }
 
 #[test]
@@ -160,27 +124,17 @@ fn test_piped_passthrough_for_garbage() {
 #[test]
 fn test_piped_passthrough_mode_skips_compression() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .env("SKIM_PASSTHROUGH", "1")
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Must forward the raw pytest output (contains the original summary line)
-    assert!(
-        stdout.contains("passed") || stdout.contains("failed"),
-        "passthrough should forward raw pytest output, got: {stdout}"
-    );
-
-    // Must NOT contain the compressed format headers
-    assert!(
-        !stdout.contains("PASS:") && !stdout.contains("FAIL:"),
-        "passthrough must not emit compressed PASS:/FAIL: counts, got: {stdout}"
-    );
+        .assert()
+        // Raw pytest output contains "passed" or "failed"
+        .stdout(predicate::str::contains("passed").or(predicate::str::contains("failed")))
+        // Compressed PASS:/FAIL: counts must not appear
+        .stdout(predicate::str::contains("PASS:").not())
+        .stdout(predicate::str::contains("FAIL:").not());
 }
 
 // ============================================================================
@@ -192,45 +146,27 @@ fn test_piped_passthrough_mode_skips_compression() {
 #[test]
 fn test_failure_context_appended_on_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Compressed header must be present
-    assert!(
-        stdout.contains("FAIL: 1"),
-        "expected FAIL: 1 in compressed output, got: {stdout}"
-    );
-
-    // Failure context separator must appear
-    assert!(
-        stdout.contains("--- failure context"),
-        "expected failure context block in output, got: {stdout}"
-    );
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("--- failure context"));
 }
 
 /// When all tests pass there must be no failure context tail.
 #[test]
 fn test_failure_context_absent_on_all_pass() {
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        !stdout.contains("--- failure context"),
-        "failure context must not appear when all tests pass, got: {stdout}"
-    );
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--- failure context").not());
 }
 
 // ============================================================================
