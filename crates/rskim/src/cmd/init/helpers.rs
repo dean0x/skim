@@ -166,6 +166,15 @@ skim <file>                    # structural overview (default)
 skim <file> --mode=signatures  # API surface only
 skim 'src/**/*.ts'             # multi-file scan
 ```
+
+### Troubleshooting
+
+If a command's output seems incomplete or too compressed, prefix with
+`SKIM_PASSTHROUGH=1` to bypass compression and see full raw output:
+
+```
+SKIM_PASSTHROUGH=1 npx vitest run tests/
+```
 <!-- skim-end -->"#,
         version = version
     )
@@ -275,6 +284,39 @@ mod tests {
         // Strong directive language
         assert!(content.contains("ALWAYS prefer"));
         assert!(content.contains("Use Read only when"));
+        // Troubleshooting section must be present
+        assert!(content.contains("SKIM_PASSTHROUGH"));
+    }
+
+    #[test]
+    fn test_guidance_content_has_troubleshooting() {
+        let content = guidance_content("2.5.1");
+        assert!(
+            content.contains("Troubleshooting"),
+            "guidance_content must include a Troubleshooting section"
+        );
+        assert!(
+            content.contains("SKIM_PASSTHROUGH=1"),
+            "guidance_content must mention SKIM_PASSTHROUGH=1"
+        );
+        // Troubleshooting section must appear before the end marker
+        let trouble_pos = content.find("Troubleshooting").unwrap();
+        let end_pos = content.find("<!-- skim-end -->").unwrap();
+        assert!(
+            trouble_pos < end_pos,
+            "Troubleshooting must appear before <!-- skim-end -->"
+        );
+    }
+
+    #[test]
+    fn test_guidance_content_troubleshooting_has_code_example() {
+        let content = guidance_content("2.5.1");
+        // The troubleshooting section must contain a code block with the exact
+        // example command shown in the docs.
+        assert!(
+            content.contains("SKIM_PASSTHROUGH=1 npx vitest"),
+            "guidance_content troubleshooting section must include code example: SKIM_PASSTHROUGH=1 npx vitest"
+        );
     }
 
     #[test]

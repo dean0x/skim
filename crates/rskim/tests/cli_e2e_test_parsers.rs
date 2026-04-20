@@ -307,3 +307,140 @@ fn test_vitest_passthrough_silent_without_debug() {
         .stderr(predicate::str::contains("[skim:notice]").not())
         .stderr(predicate::str::contains("[skim:warning]").not());
 }
+
+// ============================================================================
+// stderr hint on compressed failure (Fix E)
+// ============================================================================
+
+/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`,
+/// capture stderr, verify it contains `[skim] compressed output` (the hint
+/// that tells the user how to see full raw output).
+#[test]
+fn test_stderr_hint_on_compressed_failure() {
+    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(fixture)
+        .assert()
+        .code(predicate::ne(0))
+        .stderr(predicate::str::contains("[skim] compressed output"));
+}
+
+/// Pipe a passing vitest JSON fixture through stdin, capture stderr, verify
+/// it does NOT contain `[skim]` (hint must only fire on non-zero exit codes).
+#[test]
+fn test_no_stderr_hint_on_success() {
+    let fixture = include_str!("fixtures/vitest/vitest_pass.json");
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[skim]").not());
+}
+
+/// Pipe unparseable output through stdin (triggers Passthrough tier), capture
+/// stderr, verify the hint is NOT emitted. Passthrough output is uncompressed
+/// so the hint is not needed.
+#[test]
+fn test_no_stderr_hint_on_passthrough() {
+    // Unparseable input triggers tier 3 passthrough.
+    // stdin path uses synthetic exit_code Some(0), so process exits 0.
+    // The hint must NOT fire because result.is_passthrough() is true.
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin("completely unparseable garbage output that matches nothing\n")
+        .assert()
+        .stderr(predicate::str::contains("[skim] compressed output").not());
+}
+
+/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`,
+/// capture stderr, and assert it contains BOTH `[skim] compressed output`
+/// AND `SKIM_PASSTHROUGH=1`. This validates the full hint message format,
+/// not just the prefix.
+#[test]
+fn test_stderr_hint_contains_passthrough_instruction() {
+    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(fixture)
+        .assert()
+        .code(predicate::ne(0))
+        .stderr(predicate::str::contains("[skim] compressed output"))
+        .stderr(predicate::str::contains("SKIM_PASSTHROUGH=1"));
+}
+
+// ============================================================================
+// Go test: passthrough exec path (#49)
+// ============================================================================
+//
+// NOTE: `skim test go` does NOT read from stdin. Unlike vitest/cargo, the go
+// handler always spawns the `go` binary directly (with `-json` injection or
+// without it in SKIM_PASSTHROUGH mode). There is no stdin-reading code path.
+// The unit tests in src/cmd/test/go.rs cover the three-tier parse() function
+// exhaustively. The E2E test below verifies the passthrough exec path
+// dispatches to `go` and surfaces the install hint when `go` is absent.
+
+/// Verify that `skim test go` with SKIM_PASSTHROUGH=1 attempts to exec `go`
+/// and surfaces the install hint when the binary is not available.
+///
+/// This test is skipped when `go` is installed because the exec succeeds (or
+/// fails for a different reason — missing package args) and the install hint
+/// is not emitted. The intent is to exercise the passthrough exec code path
+/// on CI environments where `go` is not present.
+#[test]
+fn test_go_passthrough_exec_path_surfaces_install_hint() {
+    // Skip this test if `go` is installed — the exec path succeeds and the
+    // "install Go" hint is not emitted.
+    if std::process::Command::new("go")
+        .arg("version")
+        .output()
+        .is_ok()
+    {
+        return;
+    }
+
+    // With SKIM_PASSTHROUGH=1 and no `go` binary, the passthrough branch
+    // tries runner.run("go", &["test"]) which fails with "failed to execute".
+    // The go::run() function maps that error to include the install hint.
+    let output = skim_cmd()
+        .args(["test", "go"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .output()
+        .unwrap();
+
+    // Process must exit non-zero (go binary not found).
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "expected non-zero exit when go is not installed"
+    );
+
+    // The error output must contain the install hint injected by go::run().
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("https://go.dev/dl/"),
+        "expected Go install hint in error output, got: {stderr}"
+    );
+}
+
+// ============================================================================
+// Vitest: failure context banner (#49)
+// ============================================================================
+
+/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`
+/// and assert that stdout contains the `--- failure context` banner.
+///
+/// When skim compresses a failing test run, it appends raw tail lines
+/// under a banner so the agent can see the actual failure details without
+/// needing to re-run with SKIM_PASSTHROUGH=1.
+#[test]
+fn test_vitest_failure_context_banner_present() {
+    let fixture = include_str!("fixtures/vitest/vitest_fail.json");
+    skim_cmd()
+        .args(["test", "vitest"])
+        .write_stdin(fixture)
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("--- failure context"));
+}

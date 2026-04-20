@@ -141,6 +141,71 @@ impl CommandRunner {
         })
     }
 
+    /// Try to spawn `program` with cascading resolution:
+    /// 1. Direct PATH lookup (`Command::new(program)`)
+    /// 2. `./node_modules/.bin/{program}` (local Node.js install)
+    /// 3. `npx --no-install {program}` (npx local-only resolver)
+    ///
+    /// If `program` contains a `/` it is treated as an explicit path — no
+    /// fallback is attempted (the caller has a specific binary in mind).
+    ///
+    /// Returns the original spawn error when all strategies are exhausted.
+    pub(crate) fn run_with_node_fallback(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> anyhow::Result<CommandOutput> {
+        self.run_with_env_node_fallback(program, args, &[])
+    }
+
+    /// Variant of [`run_with_node_fallback`] that also forwards environment
+    /// variable overrides to every candidate.
+    pub(crate) fn run_with_env_node_fallback(
+        &self,
+        program: &str,
+        args: &[&str],
+        env_vars: &[(&str, &str)],
+    ) -> anyhow::Result<CommandOutput> {
+        match self.run_with_env(program, args, env_vars) {
+            Ok(out) => Ok(out),
+            Err(original_err) => {
+                // Only attempt Node.js fallback resolution when the program was
+                // not found on PATH (SpawnFailed). Other errors — Timeout,
+                // PipeCaptureFailed, ReaderPanicked, Io — mean the program was
+                // found and launched; retrying via npx makes no sense and could
+                // mask real failures.
+                let is_spawn_failure = original_err
+                    .downcast_ref::<RunnerError>()
+                    .map(|e| matches!(e, RunnerError::SpawnFailed { .. }))
+                    .unwrap_or(false);
+                if !is_spawn_failure {
+                    return Err(original_err);
+                }
+
+                // Absolute or relative paths — no fallback; caller was explicit.
+                if program.contains('/') {
+                    return Err(original_err);
+                }
+
+                // Strategy 2: ./node_modules/.bin/{program}
+                let local_bin = format!("./node_modules/.bin/{program}");
+                if std::path::Path::new(&local_bin).exists() {
+                    if let Ok(out) = self.run_with_env(&local_bin, args, env_vars) {
+                        return Ok(out);
+                    }
+                }
+
+                // Strategy 3: npx --no-install {program}
+                let mut npx_args: Vec<&str> = vec!["--no-install", program];
+                npx_args.extend_from_slice(args);
+                match self.run_with_env("npx", &npx_args, env_vars) {
+                    Ok(out) => Ok(out),
+                    Err(_) => Err(original_err),
+                }
+            }
+        }
+    }
+
     /// Wait for the child process, killing it if the timeout is exceeded.
     ///
     /// Uses polling with exponential backoff (1ms → 50ms cap) when a timeout
@@ -535,5 +600,179 @@ mod tests {
             "Expected 'byte limit' in error, got: {}",
             err
         );
+    }
+
+    // ========================================================================
+    // Node fallback tests
+    // ========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_node_fallback_direct_success_no_fallback() {
+        // `echo` is always in PATH — succeeds on the first attempt.
+        let runner = CommandRunner::new(None);
+        let result = runner.run_with_node_fallback("echo", &["hello"]).unwrap();
+        assert_eq!(result.stdout.trim(), "hello");
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_node_fallback_absolute_path_no_fallback() {
+        // Absolute path — no fallback should be tried (contains '/').
+        let runner = CommandRunner::new(None);
+        let err = runner
+            .run_with_node_fallback("/nonexistent-binary-1234", &[])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to execute"),
+            "Expected 'failed to execute', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_node_fallback_relative_path_no_fallback() {
+        // Relative path (contains '/') — no fallback.
+        let runner = CommandRunner::new(None);
+        let err = runner
+            .run_with_node_fallback("./nonexistent-binary-5678", &[])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to execute"),
+            "Expected 'failed to execute', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_node_fallback_all_fail_preserves_original_error() {
+        // A program not in PATH or node_modules:
+        // - Strategy 1: spawn fails (not in PATH)
+        // - Strategy 2: ./node_modules/.bin/... doesn't exist
+        // - Strategy 3: npx may or may not be available
+        //
+        // When npx is unavailable, we get the original Err(SpawnFailed).
+        // When npx is available but cannot resolve the package, we get Ok with
+        // non-zero exit code (npx ran and reported failure).
+        // Either outcome is acceptable — the key property is that the original
+        // program (__skim_nonexistent_9999__) was never successfully executed.
+        let runner = CommandRunner::new(None);
+        match runner.run_with_node_fallback("__skim_nonexistent_9999__", &[]) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("failed to execute") || msg.contains("__skim_nonexistent"),
+                    "Expected original spawn error, got: {msg}"
+                );
+            }
+            Ok(output) => {
+                // npx was found but returned non-zero — acceptable fallback behavior.
+                assert_ne!(
+                    output.exit_code,
+                    Some(0),
+                    "Unexpected success running nonexistent program via npx"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_node_fallback_local_bin_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Create a temp directory simulating a project with ./node_modules/.bin/fake-tool
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        let bin_dir = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let script = bin_dir.join("fake-tool");
+        std::fs::write(&script, b"#!/bin/sh\necho 'from-local-bin'\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // `set_current_dir` is process-wide. `#[serial]` ensures no other test
+        // runs concurrently in this process while cwd is modified. The original
+        // cwd is restored on exit so subsequent tests are unaffected.
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            let runner = CommandRunner::new(None);
+            // `fake-tool` is not in PATH, but ./node_modules/.bin/fake-tool exists
+            runner.run_with_node_fallback("fake-tool", &[]).unwrap()
+        });
+        std::env::set_current_dir(&original_dir).unwrap();
+        let output = result.expect("test panicked");
+        assert_eq!(output.stdout.trim(), "from-local-bin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_node_fallback_npx_no_install_flag() {
+        // Verify that --no-install is passed to npx.
+        // When npx is available: --no-install prevents downloading, so npx exits
+        // non-zero (package not found locally). When npx is not available, the
+        // original spawn error is returned as Err.
+        // Either way, the unknown program must never succeed (exit code != 0).
+        let runner = CommandRunner::new(None);
+        match runner.run_with_node_fallback("__skim_nonexistent_npx_test_8888__", &[]) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("failed to execute") || msg.contains("__skim_nonexistent"),
+                    "Expected spawn error, got: {msg}"
+                );
+            }
+            Ok(output) => {
+                // npx ran but returned non-zero — this is correct: --no-install
+                // prevented downloading the package.
+                assert_ne!(
+                    output.exit_code,
+                    Some(0),
+                    "--no-install should cause npx to fail for unknown packages"
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // run_with_env_node_fallback: env forwarding tests
+    // ========================================================================
+
+    /// Verify that `run_with_env_node_fallback` forwards env overrides to the
+    /// spawned process on every fallback candidate. Uses `printenv` (always in
+    /// PATH on Unix) with an injected variable to confirm forwarding.
+    #[cfg(unix)]
+    #[test]
+    fn test_node_fallback_env_vars_forwarded() {
+        let runner = CommandRunner::new(None);
+        let env_overrides = &[("SKIM_TEST_ENV_FORWARD", "hello_from_skim")];
+        // printenv KEY prints the value of KEY if set, exits 0; exits non-zero if unset.
+        let result = runner
+            .run_with_env_node_fallback("printenv", &["SKIM_TEST_ENV_FORWARD"], env_overrides)
+            .unwrap();
+        assert_eq!(
+            result.stdout.trim(),
+            "hello_from_skim",
+            "env override must be forwarded to the child process"
+        );
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    /// Verify that original args are passed unchanged to the spawned process by
+    /// `run_with_env_node_fallback`. Uses `echo` (always in PATH on Unix) with
+    /// specific arguments to confirm they appear verbatim in the output.
+    #[cfg(unix)]
+    #[test]
+    fn test_node_fallback_args_preserved() {
+        let runner = CommandRunner::new(None);
+        let result = runner
+            .run_with_env_node_fallback("echo", &["arg_one", "arg_two", "arg_three"], &[])
+            .unwrap();
+        let out = result.stdout.trim();
+        assert!(
+            out.contains("arg_one") && out.contains("arg_two") && out.contains("arg_three"),
+            "all args must be preserved in output, got: {out:?}"
+        );
+        assert_eq!(result.exit_code, Some(0));
     }
 }

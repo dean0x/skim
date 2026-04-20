@@ -32,6 +32,29 @@ use std::process::ExitCode;
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
+// ============================================================================
+// SKIM_PASSTHROUGH helpers
+// ============================================================================
+
+/// Check if `SKIM_PASSTHROUGH` is set to a truthy value (`1`, `true`, or `yes`,
+/// case-insensitive).
+///
+/// When passthrough mode is active, all compression is bypassed and raw output
+/// is forwarded unchanged. Useful for debugging or when the compressed output
+/// is too aggressive for a particular workflow.
+pub(crate) fn is_passthrough_mode() -> bool {
+    check_passthrough_value(std::env::var("SKIM_PASSTHROUGH").ok())
+}
+
+/// Pure function version of [`is_passthrough_mode`] — avoids process-wide env var
+/// mutation in tests.
+///
+/// Returns `true` for `"1"`, `"true"`, `"yes"` (case-insensitive).
+pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
+    val.map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 /// Known subcommands that the pre-parse router will recognize.
 ///
 /// IMPORTANT: Only register subcommands we will actually implement.
@@ -271,6 +294,20 @@ where
         }
     };
 
+    // Passthrough mode: bypass all compression and forward raw output.
+    let code = output.exit_code.unwrap_or(1);
+    if is_passthrough_mode() {
+        let mut out = io::stdout().lock();
+        write!(out, "{}", output.stdout)?;
+        out.flush()?;
+        if !output.stderr.is_empty() {
+            let mut err = io::stderr().lock();
+            write!(err, "{}", output.stderr)?;
+            err.flush()?;
+        }
+        return Ok(ExitCode::from(code.clamp(0, 255) as u8));
+    }
+
     // Strip ANSI escape codes from output before parsing. Even with NO_COLOR=1
     // set on the child process, some tools may still emit escape sequences.
     // This is a cheap, universally useful safety net for all parsers.
@@ -308,6 +345,13 @@ where
             content.to_string()
         }
     };
+
+    // Hint: when output was compressed (not passthrough) and the exit code was
+    // non-zero, tell the user how to see full raw output. Passthrough results
+    // are already uncompressed so the hint is not needed there.
+    if code != 0 && !result.is_passthrough() {
+        eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
+    }
 
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&output.stdout, &compressed);
@@ -417,6 +461,42 @@ pub(crate) fn sanitize_for_display(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // check_passthrough_value / stderr hint guard
+    // ========================================================================
+
+    /// Verify that passthrough mode detection works correctly for the guard
+    /// in `run_parsed_command_with_mode`. Passthrough returns early before
+    /// the hint is emitted; the `!result.is_passthrough()` guard ensures the
+    /// hint fires only for Full/Degraded results.
+    #[test]
+    fn test_no_stderr_hint_when_passthrough_mode() {
+        // Passthrough mode returns early before the hint is emitted.
+        // The guard `!result.is_passthrough()` in run_parsed_command_with_mode
+        // ensures the hint only fires for compressed (Full/Degraded) results.
+        // This test validates the passthrough predicate is correct.
+        assert!(check_passthrough_value(Some("1".to_string())));
+        assert!(check_passthrough_value(Some("true".to_string())));
+    }
+
+    #[test]
+    fn test_check_passthrough_truthy_values() {
+        for v in &["1", "true", "yes", "True", "YES", "tRuE"] {
+            assert!(
+                check_passthrough_value(Some((*v).to_string())),
+                "expected truthy for {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_passthrough_falsy_values() {
+        assert!(!check_passthrough_value(Some("0".to_string())));
+        assert!(!check_passthrough_value(Some("false".to_string())));
+        assert!(!check_passthrough_value(Some("no".to_string())));
+        assert!(!check_passthrough_value(None));
+    }
 
     #[test]
     fn test_extract_json_flag_present() {

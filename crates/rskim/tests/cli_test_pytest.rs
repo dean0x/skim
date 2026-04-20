@@ -66,78 +66,42 @@ fn test_piped_all_pass() {
 #[test]
 fn test_piped_with_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Should show 2 passed, 1 failed
-    assert!(
-        stdout.contains("PASS: 2"),
-        "expected PASS: 2 in output, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("FAIL: 1"),
-        "expected FAIL: 1 in output, got: {stdout}"
-    );
-
-    // Should include the failure detail
-    assert!(
-        stdout.contains("test_divide") || stdout.contains("test_math"),
-        "expected failure test name in output, got: {stdout}"
-    );
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("PASS: 2"))
+        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("test_divide").or(predicate::str::contains("test_math")));
 }
 
 #[test]
 fn test_piped_mixed() {
     let fixture = include_str!("fixtures/cmd/test/pytest_mixed.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        stdout.contains("PASS: 4"),
-        "expected PASS: 4, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("FAIL: 1"),
-        "expected FAIL: 1, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("SKIP: 1"),
-        "expected SKIP: 1, got: {stdout}"
-    );
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("PASS: 4"))
+        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("SKIP: 1"));
 }
 
 #[test]
 fn test_piped_all_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_all_fail.txt");
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         .args(["test", "pytest"])
         .write_stdin(fixture)
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        stdout.contains("PASS: 0"),
-        "expected PASS: 0 in output, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("FAIL: 3"),
-        "expected FAIL: 3 in output, got: {stdout}"
-    );
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("PASS: 0"))
+        .stdout(predicate::str::contains("FAIL: 3"));
 }
 
 #[test]
@@ -149,6 +113,60 @@ fn test_piped_passthrough_for_garbage() {
         .assert()
         // Passthrough: should still output something (the raw input)
         .stdout(predicate::str::contains("this is not pytest output"));
+}
+
+// ============================================================================
+// Passthrough mode (SKIM_PASSTHROUGH=1)
+// ============================================================================
+
+/// When SKIM_PASSTHROUGH=1 and input is piped, raw output is forwarded unchanged
+/// (no compression header, no PASS:/FAIL: counts).
+#[test]
+fn test_piped_passthrough_mode_skips_compression() {
+    let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["test", "pytest"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(fixture)
+        .assert()
+        // Raw pytest output contains "passed" or "failed"
+        .stdout(predicate::str::contains("passed").or(predicate::str::contains("failed")))
+        // Compressed PASS:/FAIL: counts must not appear
+        .stdout(predicate::str::contains("PASS:").not())
+        .stdout(predicate::str::contains("FAIL:").not());
+}
+
+// ============================================================================
+// Failure context
+// ============================================================================
+
+/// When pytest reports failures, the compressed output must include a raw
+/// failure context tail so the agent can diagnose failures without re-running.
+#[test]
+fn test_failure_context_appended_on_failures() {
+    let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["test", "pytest"])
+        .write_stdin(fixture)
+        .assert()
+        .code(predicate::ne(0))
+        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("--- failure context"));
+}
+
+/// When all tests pass there must be no failure context tail.
+#[test]
+fn test_failure_context_absent_on_all_pass() {
+    let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["test", "pytest"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--- failure context").not());
 }
 
 // ============================================================================

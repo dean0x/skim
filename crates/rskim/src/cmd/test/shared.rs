@@ -118,6 +118,73 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
     entries
 }
 
+// ============================================================================
+// Raw failure context helpers
+// ============================================================================
+
+/// Maximum number of raw output lines to append as failure context.
+///
+/// This gives the agent enough signal to understand why a test failed
+/// without overwhelming the context window. Full output is always
+/// available via `SKIM_PASSTHROUGH=1`.
+pub(super) const MAX_FAILURE_CONTEXT_LINES: usize = 50;
+
+/// Append raw failure context to stdout and emit a compressed-output hint to
+/// stderr.
+///
+/// Called by test-runner handlers (vitest, go, …) when `summary.fail > 0` so
+/// the agent can read the actual error messages without re-running with
+/// `SKIM_PASSTHROUGH=1`.
+///
+/// # Performance
+/// Applies [`last_n_lines`] first (zero-allocation `&str` slice) and then runs
+/// [`crate::output::strip_ansi`] only on the ~50-line tail, limiting the ANSI
+/// strip allocation to the tail rather than the full output string.
+///
+/// # Parameters
+/// - `raw_output`: the full raw output string from the test runner.
+/// - `exit_code`: the actual process exit code (e.g. `1` for test failures,
+///   `2` for compilation errors in `go test`). Used in the stderr hint so the
+///   caller knows the precise exit status to reproduce.
+pub(super) fn emit_failure_context(raw_output: &str, exit_code: i32) {
+    // Take the tail first (zero-allocation slice), then strip ANSI only on
+    // those ~50 lines instead of the entire output buffer.
+    let tail_raw = last_n_lines(raw_output, MAX_FAILURE_CONTEXT_LINES);
+    let tail = crate::output::strip_ansi(tail_raw);
+    if !tail.is_empty() {
+        println!(
+            "\n--- failure context (last {} lines) ---",
+            tail.lines().count()
+        );
+        println!("{tail}");
+    }
+    eprintln!("[skim] compressed output (exit {exit_code}). SKIM_PASSTHROUGH=1 for full output.");
+}
+
+/// Return the last `n` lines of `text` as a `&str` slice.
+///
+/// Scans backward through the bytes looking for newline characters. When the
+/// `n`-th newline from the end is found, returns everything after it. Falls
+/// back to the full input when `text` has fewer than `n` newlines.
+///
+/// The returned slice borrows from `text` — no allocation.
+pub(super) fn last_n_lines(text: &str, n: usize) -> &str {
+    if n == 0 {
+        return "";
+    }
+    let mut count = 0;
+    for (i, byte) in text.as_bytes().iter().enumerate().rev() {
+        if *byte == b'\n' {
+            count += 1;
+            if count == n {
+                return &text[i + 1..];
+            }
+        }
+    }
+    // Fewer than `n` newlines → return the whole input
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +309,76 @@ mod tests {
             entries.is_empty(),
             "no failures should return empty: {entries:?}"
         );
+    }
+
+    // ========================================================================
+    // last_n_lines tests
+    // ========================================================================
+
+    #[test]
+    fn test_last_n_lines_fewer_than_n() {
+        // 3 lines, n=50 → full input returned
+        let text = "line1\nline2\nline3";
+        assert_eq!(last_n_lines(text, 50), text);
+    }
+
+    #[test]
+    fn test_last_n_lines_exact_n() {
+        // 50 lines, n=50 → full input
+        let text = (0..50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = last_n_lines(&text, 50);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_last_n_lines_more_than_n() {
+        // 100 lines (0..99), n=50 → last 50 lines
+        let lines: Vec<String> = (0..100).map(|i| format!("line{i}")).collect();
+        let text = lines.join("\n");
+        let result = last_n_lines(&text, 50);
+        // Last 50 lines are lines 50..99
+        let expected = lines[50..].join("\n");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_last_n_lines_empty() {
+        assert_eq!(last_n_lines("", 50), "");
+    }
+
+    #[test]
+    fn test_last_n_lines_no_newlines() {
+        // Single line with no newlines → full input returned
+        let text = "single line no newlines";
+        assert_eq!(last_n_lines(text, 50), text);
+    }
+
+    #[test]
+    fn test_last_n_lines_n_zero_returns_empty() {
+        let text = "line1\nline2\nline3";
+        assert_eq!(last_n_lines(text, 0), "");
+    }
+
+    #[test]
+    fn test_last_n_lines_trailing_newline() {
+        // Text ending with newline: "line1\nline2\n" — the trailing newline means
+        // the last "line" is empty. last_n_lines(text, 1) returns everything
+        // after the first-from-the-end newline, which is "".
+        let text = "line1\nline2\n";
+        let result = last_n_lines(text, 1);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_last_n_lines_windows_line_endings() {
+        // \r\n — only \n is counted as a newline delimiter; \r is data.
+        // "line1\r\nline2\r\nline3" has 2 \n chars.
+        let text = "line1\r\nline2\r\nline3";
+        // n=2 → find 2nd \n from end, which is after "line1\r", return "line2\r\nline3"
+        let result = last_n_lines(text, 2);
+        assert_eq!(result, "line2\r\nline3");
     }
 }

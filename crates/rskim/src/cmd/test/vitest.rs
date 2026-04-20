@@ -20,7 +20,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
 
-use super::shared::{scrape_failures, TestKind};
+use super::shared::{self, scrape_failures, TestKind};
 
 // ============================================================================
 // Public entry point
@@ -36,6 +36,24 @@ pub(crate) fn run(
     show_stats: bool,
     analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
+    // Passthrough mode: bypass compression, run the raw command and forward output.
+    if crate::cmd::is_passthrough_mode() {
+        if stdin_has_data() {
+            let raw_output = read_stdin()?;
+            println!("{raw_output}");
+            // Stdin passthrough has no child process, so there is no exit code to
+            // preserve. FAILURE is the conservative default — callers who need a
+            // specific exit code should use the spawned-process path instead.
+            return Ok(ExitCode::FAILURE);
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let runner = CommandRunner::new(None);
+        let output = runner.run_with_node_fallback(program, &arg_refs)?;
+        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+        print!("{}", crate::cmd::combine_output(&output));
+        return Ok(ExitCode::from(code));
+    }
+
     let start = std::time::Instant::now();
     let raw_output = if stdin_has_data() {
         read_stdin()?
@@ -55,6 +73,9 @@ pub(crate) fn run(
             let _ = result.emit_markers(&mut handle);
 
             if test_result.summary.fail > 0 {
+                // Append raw failure context so the agent can see actual error
+                // messages without needing to re-run with SKIM_PASSTHROUGH=1.
+                shared::emit_failure_context(&raw_output, 1);
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -62,9 +83,7 @@ pub(crate) fn run(
         }
         ParseResult::Passthrough(raw) => {
             println!("{raw}");
-            let stderr = io::stderr();
-            let mut handle = stderr.lock();
-            let _ = result.emit_markers(&mut handle);
+            let _ = result.emit_markers(&mut io::stderr().lock());
             ExitCode::FAILURE
         }
     };
@@ -143,12 +162,14 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
     let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
 
     let runner = CommandRunner::new(None);
-    let output = runner.run(program, &arg_refs).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to run {program}: {e}\n\
-             Hint: Install {program} with: npm install -D {program}"
-        )
-    })?;
+    let output = runner
+        .run_with_node_fallback(program, &arg_refs)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to run {program}: {e}\n\
+             Hint: Install {program} locally (npm install -D {program}) or globally"
+            )
+        })?;
 
     // Combine stdout and stderr — vitest may emit JSON to either depending on
     // version and configuration.
