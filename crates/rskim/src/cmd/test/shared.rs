@@ -119,7 +119,7 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
 }
 
 // ============================================================================
-// Raw failure context helpers (Fix B)
+// Raw failure context helpers
 // ============================================================================
 
 /// Maximum number of raw output lines to append as failure context.
@@ -128,6 +128,40 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
 /// without overwhelming the context window. Full output is always
 /// available via `SKIM_PASSTHROUGH=1`.
 pub(super) const MAX_FAILURE_CONTEXT_LINES: usize = 50;
+
+/// Append raw failure context to stdout and emit a compressed-output hint to
+/// stderr.
+///
+/// Called by test-runner handlers (vitest, go, …) when `summary.fail > 0` so
+/// the agent can read the actual error messages without re-running with
+/// `SKIM_PASSTHROUGH=1`.
+///
+/// # Performance
+/// Applies [`last_n_lines`] first (zero-allocation `&str` slice) and then runs
+/// [`crate::output::strip_ansi`] only on the ~50-line tail, limiting the ANSI
+/// strip allocation to the tail rather than the full output string.
+///
+/// # Parameters
+/// - `raw_output`: the full raw output string from the test runner.
+/// - `exit_code`: the actual process exit code (e.g. `1` for test failures,
+///   `2` for compilation errors in `go test`). Used in the stderr hint so the
+///   caller knows the precise exit status to reproduce.
+pub(super) fn emit_failure_context(raw_output: &str, exit_code: i32) {
+    // Take the tail first (zero-allocation slice), then strip ANSI only on
+    // those ~50 lines instead of the entire output buffer.
+    let tail_raw = last_n_lines(raw_output, MAX_FAILURE_CONTEXT_LINES);
+    let tail = crate::output::strip_ansi(tail_raw);
+    if !tail.is_empty() {
+        println!(
+            "\n--- failure context (last {} lines) ---",
+            tail.lines().count()
+        );
+        println!("{tail}");
+    }
+    eprintln!(
+        "[skim] compressed output (exit {exit_code}). SKIM_PASSTHROUGH=1 for full output."
+    );
+}
 
 /// Return the last `n` lines of `text` as a `&str` slice.
 ///

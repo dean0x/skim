@@ -34,7 +34,14 @@ pub(crate) fn run(
         raw_args.extend_from_slice(args);
         let raw_args_ref: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
         let runner = CommandRunner::new(None);
-        let output = runner.run("go", &raw_args_ref)?;
+        let output = runner.run("go", &raw_args_ref).map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("failed to execute") {
+                anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", msg)
+            } else {
+                e
+            }
+        })?;
         print!("{}", crate::cmd::combine_output(&output));
         let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
         return Ok(ExitCode::from(code));
@@ -93,19 +100,11 @@ pub(crate) fn run(
             if result.summary.fail > 0 {
                 // Append raw failure context so the agent can see actual error
                 // messages without needing to re-run with SKIM_PASSTHROUGH=1.
+                // Pass the actual exit code (e.g. 2 for compilation errors) so
+                // the hint reflects the real status rather than a hardcoded 1.
                 use super::shared;
-                let stripped = crate::output::strip_ansi(&combined);
-                let tail = shared::last_n_lines(&stripped, shared::MAX_FAILURE_CONTEXT_LINES);
-                if !tail.is_empty() {
-                    println!(
-                        "\n--- failure context (last {} lines) ---",
-                        tail.lines().count()
-                    );
-                    println!("{tail}");
-                }
-                eprintln!(
-                    "[skim] compressed output (exit 1). SKIM_PASSTHROUGH=1 for full output."
-                );
+                let actual_exit = output.exit_code.unwrap_or(1);
+                shared::emit_failure_context(&combined, actual_exit);
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS

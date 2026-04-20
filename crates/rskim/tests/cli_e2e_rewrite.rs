@@ -714,16 +714,17 @@ fn test_passthrough_direct_vitest_no_json_injection() {
         .output()
         .unwrap();
 
-    // Passthrough forwards the raw input and exits with the original exit code.
+    // Passthrough forwards the raw input unchanged.
     let stdout = String::from_utf8(output.stdout).unwrap();
+    // Raw text must contain source markers from the fixture.
     assert!(
-        stdout.contains("Tests") || stdout.contains("passed"),
+        stdout.contains("Tests") && stdout.contains("passed"),
         "passthrough must forward the raw input, got: {stdout}"
     );
-    // Must NOT contain parsed JSON-injected output markers.
+    // Must NOT contain skim-structured output markers.
     assert!(
-        !stdout.contains("PASS:") || stdout.contains("passed"),
-        "passthrough must not reformat the input"
+        !stdout.contains("PASS:"),
+        "passthrough must not reformat the input into skim structured output, got: {stdout}"
     );
 }
 
@@ -731,7 +732,7 @@ fn test_passthrough_direct_vitest_no_json_injection() {
 /// Pipe a failing vitest JSON fixture and verify the raw content is forwarded
 /// to stdout without parsing or reformatting.
 #[test]
-fn test_passthrough_preserves_exit_code() {
+fn test_passthrough_forwards_raw_content() {
     // The vitest passthrough handler returns ExitCode::FAILURE when stdin has
     // data (exit code 1 is conservative — the tool status is unknown). The
     // important property is that raw content is forwarded without compression.

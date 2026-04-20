@@ -41,6 +41,9 @@ pub(crate) fn run(
         if stdin_has_data() {
             let raw_output = read_stdin()?;
             println!("{raw_output}");
+            // Stdin passthrough has no child process, so there is no exit code to
+            // preserve. FAILURE is the conservative default — callers who need a
+            // specific exit code should use the spawned-process path instead.
             return Ok(ExitCode::FAILURE);
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -72,18 +75,7 @@ pub(crate) fn run(
             if test_result.summary.fail > 0 {
                 // Append raw failure context so the agent can see actual error
                 // messages without needing to re-run with SKIM_PASSTHROUGH=1.
-                let stripped = crate::output::strip_ansi(&raw_output);
-                let tail = shared::last_n_lines(&stripped, shared::MAX_FAILURE_CONTEXT_LINES);
-                if !tail.is_empty() {
-                    println!(
-                        "\n--- failure context (last {} lines) ---",
-                        tail.lines().count()
-                    );
-                    println!("{tail}");
-                }
-                eprintln!(
-                    "[skim] compressed output (exit 1). SKIM_PASSTHROUGH=1 for full output."
-                );
+                shared::emit_failure_context(&raw_output, 1);
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
