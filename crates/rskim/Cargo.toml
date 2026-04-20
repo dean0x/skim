@@ -40,3 +40,4 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+serial_test = { workspace = true }

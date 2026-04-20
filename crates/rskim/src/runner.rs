@@ -169,6 +169,19 @@ impl CommandRunner {
         match self.run_with_env(program, args, env_vars) {
             Ok(out) => Ok(out),
             Err(original_err) => {
+                // Only attempt Node.js fallback resolution when the program was
+                // not found on PATH (SpawnFailed). Other errors — Timeout,
+                // PipeCaptureFailed, ReaderPanicked, Io — mean the program was
+                // found and launched; retrying via npx makes no sense and could
+                // mask real failures.
+                let is_spawn_failure = original_err
+                    .downcast_ref::<RunnerError>()
+                    .map(|e| matches!(e, RunnerError::SpawnFailed { .. }))
+                    .unwrap_or(false);
+                if !is_spawn_failure {
+                    return Err(original_err);
+                }
+
                 // Absolute or relative paths — no fallback; caller was explicit.
                 if program.contains('/') {
                     return Err(original_err);
@@ -665,20 +678,9 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn test_node_fallback_local_bin_found() {
         use std::os::unix::fs::PermissionsExt;
-
-        /// RAII guard that restores the process cwd on drop, even on panic.
-        ///
-        /// `set_current_dir` is process-wide, so concurrent tests could see the
-        /// wrong cwd.  The guard ensures we always restore, preventing cascading
-        /// failures when this test panics.
-        struct CwdGuard(std::path::PathBuf);
-        impl Drop for CwdGuard {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.0);
-            }
-        }
 
         // Create a temp directory simulating a project with ./node_modules/.bin/fake-tool
         let tmp = tempfile::tempdir().expect("failed to create tempdir");
@@ -688,15 +690,19 @@ mod tests {
         std::fs::write(&script, b"#!/bin/sh\necho 'from-local-bin'\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Change cwd to the temp dir so the local bin path is discoverable.
-        // The CwdGuard restores the original dir on drop (including panic unwind).
-        let _guard = CwdGuard(std::env::current_dir().unwrap());
+        // `set_current_dir` is process-wide. `#[serial]` ensures no other test
+        // runs concurrently in this process while cwd is modified. The original
+        // cwd is restored on exit so subsequent tests are unaffected.
+        let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
-
-        let runner = CommandRunner::new(None);
-        // `fake-tool` is not in PATH, but ./node_modules/.bin/fake-tool exists
-        let result = runner.run_with_node_fallback("fake-tool", &[]).unwrap();
-        assert_eq!(result.stdout.trim(), "from-local-bin");
+        let result = std::panic::catch_unwind(|| {
+            let runner = CommandRunner::new(None);
+            // `fake-tool` is not in PATH, but ./node_modules/.bin/fake-tool exists
+            runner.run_with_node_fallback("fake-tool", &[]).unwrap()
+        });
+        std::env::set_current_dir(&original_dir).unwrap();
+        let output = result.expect("test panicked");
+        assert_eq!(output.stdout.trim(), "from-local-bin");
     }
 
     #[cfg(unix)]

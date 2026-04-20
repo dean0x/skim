@@ -280,7 +280,7 @@ where
         let runner = CommandRunner::new(Some(std::time::Duration::from_secs(300)));
         let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-        match runner.run_with_env_node_fallback(program, &args_str, env_overrides) {
+        match runner.run_with_env(program, &args_str, env_overrides) {
             Ok(out) => out,
             Err(e) => {
                 let msg = e.to_string();
@@ -297,12 +297,14 @@ where
     // Passthrough mode: bypass all compression and forward raw output.
     let code = output.exit_code.unwrap_or(1);
     if is_passthrough_mode() {
-        let mut handle = io::stdout().lock();
-        write!(handle, "{}", output.stdout)?;
+        let mut out = io::stdout().lock();
+        write!(out, "{}", output.stdout)?;
+        out.flush()?;
         if !output.stderr.is_empty() {
-            write!(handle, "{}", output.stderr)?;
+            let mut err = io::stderr().lock();
+            write!(err, "{}", output.stderr)?;
+            err.flush()?;
         }
-        handle.flush()?;
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
     }
 
