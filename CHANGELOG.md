@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Testing
+
+## [2.5.1] - 2026-04-20
+
+Hook safety and command coverage gaps — SKIM_PASSTHROUGH bypass, npx fallback, tiered test compression, 5 new parsers, streaming primitive. 2,800 tests passing (up from 2,629 in v2.5.0).
+
+### Added
 - **`skim git commit`** — new parser compressing `git commit` output: extracts commit hash, subject, and changed-files summary; terminates at verbose diff scissors line (`---...>8---`, AD-GC-1); skips hook noise (pre-commit, black, ruff, eslint output)
 - **`skim git push`** — new parser compressing `git push` output: full porcelain mode (auto-injected `--porcelain`, AD-GP-2); per-ref status (`* new`, `= up to date`, `+ forced`, `! rejected`); credential URL scrubbing via `scrub_credential_url` (AD-GP-1)
 - **`skim infra gh api`** — new parser compressing `gh api` / `gh api graphql` output: GraphQL `.data` unwrap + `.errors` prepend, base64 `content` field replacement, binary passthrough, depth-limited JSON compaction (AD-API-1)
@@ -32,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ssh://` credential scrubbing** — `CREDENTIAL_URL_RE` now matches `ssh://user@host/...` in addition to `https://` and `git://` (AD-GP-1). SSH-cloned repos with embedded credentials in push/fetch output are now scrubbed on the same code path.
 - **`build_streaming_label` analytics label alignment** — `gh run watch` now produces analytics labels via the shared `build_streaming_label` helper, matching the `"skim {family} {program} {subcommand} {args}"` format used by non-streaming infra commands (PF-022). `gh api` uses the standard `ParsedCommandConfig` analytics path via `run_infra_tool` and does not need the streaming helper.
 - **Node.js spawn fallback scoped to spawn failures only** — cascading PATH → `node_modules/.bin` → `npx` fallback only triggers on spawn errors (ENOENT/permission denied), not on non-zero test exit codes; stderr is routed correctly in passthrough mode
+
 ### Changed
 - **`is_catch_all` renamed to `exclude_pipe_source`** — field semantics now describe the actual behavior (pipe-source suppression) rather than the matching strategy (AD-RW-2)
 - **Rewrite engine deduplication** — `should_skip_by_flag` extracted as a named function (replacing two duplicated inline closures); `has_pipe_operator` and `reconstruct_pipe_parts` extracted to `compound.rs`; `splice_redirects_back` promoted to `pub(super)`. Dead index (`PIPE_EXCLUDED_SOURCES` slice) removed.
