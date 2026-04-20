@@ -152,6 +152,88 @@ fn test_piped_passthrough_for_garbage() {
 }
 
 // ============================================================================
+// Passthrough mode (SKIM_PASSTHROUGH=1)
+// ============================================================================
+
+/// When SKIM_PASSTHROUGH=1 and input is piped, raw output is forwarded unchanged
+/// (no compression header, no PASS:/FAIL: counts).
+#[test]
+fn test_piped_passthrough_mode_skips_compression() {
+    let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["test", "pytest"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(fixture)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Must forward the raw pytest output (contains the original summary line)
+    assert!(
+        stdout.contains("passed") || stdout.contains("failed"),
+        "passthrough should forward raw pytest output, got: {stdout}"
+    );
+
+    // Must NOT contain the compressed format headers
+    assert!(
+        !stdout.contains("PASS:") && !stdout.contains("FAIL:"),
+        "passthrough must not emit compressed PASS:/FAIL: counts, got: {stdout}"
+    );
+}
+
+// ============================================================================
+// Failure context
+// ============================================================================
+
+/// When pytest reports failures, the compressed output must include a raw
+/// failure context tail so the agent can diagnose failures without re-running.
+#[test]
+fn test_failure_context_appended_on_failures() {
+    let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["test", "pytest"])
+        .write_stdin(fixture)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Compressed header must be present
+    assert!(
+        stdout.contains("FAIL: 1"),
+        "expected FAIL: 1 in compressed output, got: {stdout}"
+    );
+
+    // Failure context separator must appear
+    assert!(
+        stdout.contains("--- failure context"),
+        "expected failure context block in output, got: {stdout}"
+    );
+}
+
+/// When all tests pass there must be no failure context tail.
+#[test]
+fn test_failure_context_absent_on_all_pass() {
+    let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["test", "pytest"])
+        .write_stdin(fixture)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("--- failure context"),
+        "failure context must not appear when all tests pass, got: {stdout}"
+    );
+}
+
+// ============================================================================
 // Unknown runner
 // ============================================================================
 

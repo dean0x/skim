@@ -29,6 +29,8 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::{strip_ansi, ParseResult};
 use crate::runner::{CommandOutput, CommandRunner};
 
+use super::shared;
+
 // ============================================================================
 // Public entry point
 // ============================================================================
@@ -45,6 +47,23 @@ pub(crate) fn run(
     show_stats: bool,
     analytics_enabled: bool,
 ) -> anyhow::Result<ExitCode> {
+    // Passthrough mode: bypass compression and forward raw output unchanged.
+    if crate::cmd::is_passthrough_mode() {
+        if !io::stdin().is_terminal() {
+            let stdin_output = read_stdin()?;
+            if !stdin_output.stdout.trim().is_empty() {
+                print!("{}", stdin_output.stdout);
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+        let final_args = build_args(args);
+        let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
+        let output = run_pytest(&arg_refs)?;
+        print!("{}", crate::cmd::combine_output(&output));
+        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+        return Ok(ExitCode::from(code));
+    }
+
     // Intercept --help/-h: show skim's pytest help, then forward to real pytest
     // so the user sees both skim's flags and pytest's own options.
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
@@ -75,7 +94,7 @@ pub(crate) fn run(
     let cleaned = strip_ansi(&combined);
     let result = parse(&cleaned);
 
-    emit_result(&result, &output)?;
+    emit_result(&result, &output, &cleaned)?;
 
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&cleaned, result.content());
@@ -482,7 +501,15 @@ fn flush_failure(
 // ============================================================================
 
 /// Emit the parsed result to stdout/stderr.
-fn emit_result(result: &ParseResult<TestResult>, output: &CommandOutput) -> anyhow::Result<()> {
+///
+/// `cleaned_output` is the ANSI-stripped combined output used to extract the
+/// failure context tail (last [`shared::MAX_FAILURE_CONTEXT_LINES`] lines).
+/// This mirrors the pattern used by go.rs and vitest.rs.
+fn emit_result(
+    result: &ParseResult<TestResult>,
+    output: &CommandOutput,
+    cleaned_output: &str,
+) -> anyhow::Result<()> {
     use std::io::Write;
 
     let stdout = io::stdout();
@@ -491,12 +518,27 @@ fn emit_result(result: &ParseResult<TestResult>, output: &CommandOutput) -> anyh
     let mut err = stderr.lock();
 
     match result {
-        ParseResult::Full(tr) => {
-            writeln!(out, "{tr}")?;
-        }
-        ParseResult::Degraded(tr, _markers) => {
+        ParseResult::Full(tr) | ParseResult::Degraded(tr, _) => {
             writeln!(out, "{tr}")?;
             result.emit_markers(&mut err)?;
+
+            if tr.summary.fail > 0 {
+                // Append raw failure context so the agent can see actual error
+                // messages without needing to re-run with SKIM_PASSTHROUGH=1.
+                let tail =
+                    shared::last_n_lines(cleaned_output, shared::MAX_FAILURE_CONTEXT_LINES);
+                if !tail.is_empty() {
+                    writeln!(
+                        out,
+                        "\n--- failure context (last {} lines) ---",
+                        tail.lines().count()
+                    )?;
+                    writeln!(out, "{tail}")?;
+                }
+                eprintln!(
+                    "[skim] compressed output (exit 1). SKIM_PASSTHROUGH=1 for full output."
+                );
+            }
         }
         ParseResult::Passthrough(raw) => {
             // Write raw output as-is
