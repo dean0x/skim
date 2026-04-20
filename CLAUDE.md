@@ -215,7 +215,7 @@ Run `./scripts/release-prep.sh <version>` to automate pre-flight validation, ver
 > **Test counts and version string automated by `release-prep.sh`** — CHANGELOG and subcommand descriptions are manual.
 - `CHANGELOG.md` — convert [Unreleased] to [X.Y.Z] - YYYY-MM-DD, add new [Unreleased], add Version History entry
 - `README.md` — update version string (line ~591) and test count (line ~620)
-- `CLAUDE.md` — update test count (2 locations: line ~16 and line ~505)
+- `CLAUDE.md` — update test count (2 locations: line ~16 and line ~560)
 
 ### Release Commit & Merge
 ```

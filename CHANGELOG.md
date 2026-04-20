@@ -798,6 +798,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.5.1** (2026-04-20): Hook safety, SKIM_PASSTHROUGH bypass, npx fallback, 5 new parsers (2,800 tests)
 - **2.5.0** (2026-04-17): Formatter output compression, 8 new lint parsers (2,629 tests)
 - **2.4.1** (2026-04-15): Stats dashboard redesign, weighted %, by-command breakdown, --cost deprecation (2,482 tests)
 - **2.4.0** (2026-04-14): GitHub CLI compression, git subcommand completion, quality improvements (2,482 tests)
