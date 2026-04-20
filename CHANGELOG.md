@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Redirect stripping** (`strip_segment_redirects`) — per-segment redirect stripping in compound commands; redirects are restored at emission time (appended to end), preserving shell semantics
 - **Streaming primitive** (`streaming.rs`) — `StreamingParser` trait, `run_streamed_spawned`, `DropGuard` for fire-and-forget analytics on streaming commands
 - **Shared git helper** (`git/shared.rs`) — `scrub_credential_url` strips credential-embedded URLs (`https://<token>@github.com/...`) using lazy regex (AD-GP-1)
+- **`SKIM_PASSTHROUGH` env var** — universal bypass for all compression (hook, vitest, go, pytest, generic); set to `1`/`true`/`yes` to disable skim rewriting for a single invocation
+- **Cascading spawn fallback** — vitest/jest spawn attempts PATH → `./node_modules/.bin` → `npx --no-install`; prevents hook failures on projects where the binary is not globally installed
+- **Tiered test compression** — on test failure, the last 50 lines of raw output are appended so agents see the full failure context without disabling compression
+- **stderr hint on compressed test failures** — failed compressed test output includes a `SKIM_PASSTHROUGH=1` guidance hint on stderr for debugging
+- **Troubleshooting section in `skim init` guidance output** — init instructions now include a troubleshooting block with `SKIM_PASSTHROUGH=1` usage
+- **`emit_failure_context` shared helper** — DRY helper for appending raw failure context across vitest, go, pytest, and generic test handlers
 
 ### Fixed
 - **`find` and `rg` pipe-source exclusion** — `find . | head` and `rg pattern | head` are no longer rewritten; `exclude_pipe_source: true` was missing from their rules despite having specific rule entries (regression vs. intended AD-RW-2 semantics). `is_catch_all` renamed to `exclude_pipe_source` to accurately describe the field's purpose.
@@ -25,12 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Credential scrubbing on success and failure analytics paths** — `raw` (success) and `output.stdout` (failure) are now scrubbed line-by-line via `scrub_credential_url` before being passed to `finalize_git_output_owned` / `finalize_git_output_passthrough`. Previously, `analytics.db` could persist credential-bearing URLs from push/fetch output (PF-024).
 - **`ssh://` credential scrubbing** — `CREDENTIAL_URL_RE` now matches `ssh://user@host/...` in addition to `https://` and `git://` (AD-GP-1). SSH-cloned repos with embedded credentials in push/fetch output are now scrubbed on the same code path.
 - **`build_streaming_label` analytics label alignment** — `gh run watch` now produces analytics labels via the shared `build_streaming_label` helper, matching the `"skim {family} {program} {subcommand} {args}"` format used by non-streaming infra commands (PF-022). `gh api` uses the standard `ParsedCommandConfig` analytics path via `run_infra_tool` and does not need the streaming helper.
+- **Node.js spawn fallback scoped to spawn failures only** — cascading PATH → `node_modules/.bin` → `npx` fallback only triggers on spawn errors (ENOENT/permission denied), not on non-zero test exit codes; stderr is routed correctly in passthrough mode
 ### Changed
 - **`is_catch_all` renamed to `exclude_pipe_source`** — field semantics now describe the actual behavior (pipe-source suppression) rather than the matching strategy (AD-RW-2)
 - **Rewrite engine deduplication** — `should_skip_by_flag` extracted as a named function (replacing two duplicated inline closures); `has_pipe_operator` and `reconstruct_pipe_parts` extracted to `compound.rs`; `splice_redirects_back` promoted to `pub(super)`. Dead index (`PIPE_EXCLUDED_SOURCES` slice) removed.
 
 ### Testing
-- 2,767 tests passing (up from 2,712 in v2.5.0)
+- 2,800 tests passing (up from 2,629 in v2.5.0; +33 from hook safety (#149))
 - Pipe-source exclusion tests for `find` and `rg` (standalone rewritten, piped suppressed, `||` chain not suppressed)
 - Negative tests for compress-or-skip (`ls --help`, `grep --version` passthrough)
 - Redirect stripping coverage for all 7 single-token forms + two-token `2> /dev/null`
@@ -38,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Credential scrubbing error-path tests (stderr with `https://` and `ssh://` URLs)
 - Porcelain parser false-trigger regression tests (informational `!`/`-` lines without tabs)
 - Pipe/stdin E2E parsed-vs-raw compression comparison for `gh run watch` and `gh api`
+- Hook safety E2E tests: `SKIM_PASSTHROUGH` bypass, spawn fallback (PATH/node_modules/.bin/npx), tiered failure context
 
 ## [2.5.0] - 2026-04-17
 
@@ -775,6 +783,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.5.0** (2026-04-17): Formatter output compression, 8 new lint parsers (2,629 tests)
 - **2.4.1** (2026-04-15): Stats dashboard redesign, weighted %, by-command breakdown, --cost deprecation (2,482 tests)
 - **2.4.0** (2026-04-14): GitHub CLI compression, git subcommand completion, quality improvements (2,482 tests)
 - **2.3.1** (2026-04-09): Discover/rewrite alignment, rewritable gap closures, stats bar fix
