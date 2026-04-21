@@ -28,12 +28,25 @@ pub(super) struct DetectedState {
     pub(super) agent_cli_name: &'static str,
 }
 
+impl DetectedState {
+    /// Returns `true` when the installed hook is at the current version and
+    /// already uses the bare `skim` command format (no reinstall needed).
+    pub(super) fn hook_is_current(&self) -> bool {
+        self.hook_version.as_deref() == Some(&self.skim_version) && self.hook_uses_bare_command
+    }
+}
+
 pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     let skim_binary = std::env::current_exe()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
     let config_dir = resolve_config_dir_for_agent(flags.project, flags.agent)?;
     let settings_path = config_dir.join(SETTINGS_FILE);
     let settings_exists = settings_path.exists();
+
+    // Read the hook script once so both version extraction and bare-command detection
+    // can reuse the same contents rather than making two separate fs::read_to_string calls.
+    let hook_script_contents =
+        std::fs::read_to_string(config_dir.join("hooks").join(HOOK_SCRIPT_NAME)).ok();
 
     let mut hook_installed = false;
     let mut hook_version = None;
@@ -49,7 +62,11 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
             for entry in arr {
                 if has_skim_hook_entry(entry) {
                     hook_installed = true;
-                    hook_version = extract_hook_version_from_entry(entry, &config_dir);
+                    hook_version = extract_hook_version_from_entry(
+                        entry,
+                        &config_dir,
+                        hook_script_contents.as_deref(),
+                    );
                 }
             }
         }
@@ -68,8 +85,11 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags)?;
 
-    // Check if the installed hook script uses the new bare-command format
-    let hook_uses_bare_command = hook_script_uses_bare_command(&config_dir);
+    // Reuse the already-read hook script contents for bare-command detection.
+    let hook_uses_bare_command = hook_script_contents
+        .as_deref()
+        .map(uses_bare_command)
+        .unwrap_or(false);
 
     Ok(DetectedState {
         skim_binary,
@@ -87,13 +107,25 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     })
 }
 
-/// Check if the hook script uses bare `skim` command (new format) vs hardcoded binary path.
+/// Returns `true` when `contents` of a hook script use the bare `skim` command
+/// (PATH-resolved) rather than a hardcoded binary path.
+///
+/// Anchors to line-start (after optional leading whitespace) to avoid
+/// false-positives from comment lines that mention `exec skim `.
+fn uses_bare_command(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|l| l.trim_start().starts_with("exec skim "))
+}
+
+/// Check if the hook script at `config_dir/hooks/HOOK_SCRIPT_NAME` uses the
+/// bare `skim` command.  Used by tests that drive detection with a temp dir.
+#[cfg(test)]
 fn hook_script_uses_bare_command(config_dir: &Path) -> bool {
     let script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-    match std::fs::read_to_string(&script_path) {
-        Ok(contents) => contents.contains("exec skim "),
-        Err(_) => false,
-    }
+    std::fs::read_to_string(&script_path)
+        .map(|c| uses_bare_command(&c))
+        .unwrap_or(false)
 }
 
 /// Scan already-parsed settings JSON for existing non-skim Bash PreToolUse hooks.
@@ -220,12 +252,17 @@ pub(crate) fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
 
 /// Try to extract the skim version from the hook script referenced in a settings entry.
 ///
+/// `prefetched_contents` is the already-read hook script text from `detect_state`.
+/// When provided, the file read is skipped after path validation succeeds, avoiding
+/// a duplicate `fs::read_to_string` call. Pass `None` to always read from disk.
+///
 /// SECURITY: Validates that the resolved script path is within the expected
 /// `{config_dir}/hooks/` directory to prevent arbitrary file reads via
 /// attacker-controlled settings.json in `--project` mode.
 pub(super) fn extract_hook_version_from_entry(
     entry: &serde_json::Value,
     config_dir: &Path,
+    prefetched_contents: Option<&str>,
 ) -> Option<String> {
     let hooks_dir = config_dir.join("hooks");
     let hooks = entry.get("hooks")?.as_array()?;
@@ -248,14 +285,22 @@ pub(super) fn extract_hook_version_from_entry(
                 return None;
             }
 
-            if let Ok(contents) = std::fs::read_to_string(&canonical) {
-                for line in contents.lines() {
-                    if let Some(ver) = line.strip_prefix("# skim-hook v").or_else(|| {
-                        line.strip_prefix("export SKIM_HOOK_VERSION=\"")
-                            .and_then(|s| s.strip_suffix('"'))
-                    }) {
-                        return Some(ver.to_string());
-                    }
+            // Use prefetched contents when available (path validated above), otherwise
+            // fall back to reading from disk (e.g. in tests or when called standalone).
+            let owned;
+            let contents: &str = if let Some(pre) = prefetched_contents {
+                pre
+            } else {
+                owned = std::fs::read_to_string(&canonical).ok()?;
+                &owned
+            };
+
+            for line in contents.lines() {
+                if let Some(ver) = line.strip_prefix("# skim-hook v").or_else(|| {
+                    line.strip_prefix("export SKIM_HOOK_VERSION=\"")
+                        .and_then(|s| s.strip_suffix('"'))
+                }) {
+                    return Some(ver.to_string());
                 }
             }
         }

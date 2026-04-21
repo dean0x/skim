@@ -108,8 +108,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     // Already up to date check
     let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
     if state.hook_installed
-        && state.hook_version.as_deref() == Some(&state.skim_version)
-        && state.hook_uses_bare_command
+        && state.hook_is_current()
         && state.marketplace_installed
         && guidance_current
     {
@@ -131,10 +130,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     // Print summary
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     println!("  Summary:");
-    if !state.hook_installed
-        || state.hook_version.as_deref() != Some(&state.skim_version)
-        || !state.hook_uses_bare_command
-    {
+    if !state.hook_installed || !state.hook_is_current() {
         println!("    * Create hook script: {}", hook_script_path.display());
         println!(
             "    * Patch settings: {} (add PreToolUse hook)",
@@ -272,7 +268,10 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     if script_path.exists() {
         if let Ok(contents) = std::fs::read_to_string(&script_path) {
             let version_line = format!("# skim-hook v{}", state.skim_version);
-            if contents.contains(&version_line) && contents.contains("exec skim ") {
+            let has_bare_cmd = contents
+                .lines()
+                .any(|l| l.trim_start().starts_with("exec skim "));
+            if contents.contains(&version_line) && has_bare_cmd {
                 println!(
                     "  {} Skipped: {} (already v{})",
                     check_mark(true),
@@ -298,7 +297,11 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
         println!("  {} Created: {}", check_mark(true), script_path.display());
     }
 
-    let agent_flag = if state.agent_cli_name == "claude-code" {
+    // SAFETY: agent_cli_name is &'static str from AgentKind::cli_name() (enum match).
+    // version is compile-time CARGO_PKG_VERSION. Neither is user-supplied, so no
+    // shell-injection risk. If either source changes to accept user input, restore
+    // validation (see git history for validate_shell_safe_path).
+    let agent_flag = if state.agent_cli_name == AgentKind::ClaudeCode.cli_name() {
         String::new()
     } else {
         format!(" --agent {}", state.agent_cli_name)
