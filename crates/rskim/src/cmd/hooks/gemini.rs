@@ -9,7 +9,7 @@
 //! - Response: `{ "decision": "allow", "tool_input": { "command": "skim test cargo" } }`
 //!
 //! SECURITY: Zero stderr in hook mode (GRANITE #361 lesson).
-//! SECURITY: Absolute binary path in generated scripts (GRANITE #685 lesson).
+//! SECURITY: Hook scripts use PATH-resolved `skim` so users can upgrade without reinstalling.
 
 use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;

@@ -157,21 +157,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hook_support_equality() {
-        assert_eq!(HookSupport::RealHook, HookSupport::RealHook);
-        assert_ne!(HookSupport::RealHook, HookSupport::AwarenessOnly);
-    }
-
-    #[test]
-    fn test_hook_input_clone() {
-        let input = HookInput {
-            command: "cargo test".to_string(),
-        };
-        let cloned = input.clone();
-        assert_eq!(cloned.command, "cargo test");
-    }
-
-    #[test]
     fn test_parse_tool_input_command_valid() {
         let json = serde_json::json!({
             "tool_input": {

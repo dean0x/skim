@@ -11,25 +11,6 @@ use super::helpers::{
 use super::state::{detect_state, has_skim_hook_entry, DetectedState};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
-/// Resolved install options from flags.
-struct InstallOptions {
-    /// Whether to use project scope.
-    project: bool,
-    /// Whether to install the marketplace entry.
-    install_marketplace: bool,
-}
-
-/// Resolve install options from flags (install is always non-interactive).
-fn prompt_install_options(
-    flags: &InitFlags,
-    _state: &DetectedState,
-) -> anyhow::Result<InstallOptions> {
-    Ok(InstallOptions {
-        project: flags.project,
-        install_marketplace: true,
-    })
-}
-
 /// Verify that the target agent appears to be installed on this system.
 ///
 /// Checks for the expected config directory. If the agent's config dir
@@ -143,21 +124,9 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
         println!();
     }
 
-    // Prompt for options (or use defaults for --yes)
-    let options = prompt_install_options(flags, &state)?;
-
-    // Re-detect state with the resolved scope (may differ from flags if user
-    // changed scope interactively)
-    let flags_override = InitFlags {
-        project: options.project,
-        yes: flags.yes,
-        dry_run: flags.dry_run,
-        uninstall: false,
-        force: flags.force,
-        no_guidance: flags.no_guidance,
-        agent: flags.agent,
-    };
-    let state = detect_state(&flags_override)?;
+    // Install marketplace entry by default.
+    let install_marketplace = true;
+    let global = !flags.project;
 
     // Print summary
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
@@ -172,17 +141,17 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
             state.settings_path.display()
         );
     }
-    if options.install_marketplace && !state.marketplace_installed {
+    if install_marketplace && !state.marketplace_installed {
         println!("    * Register marketplace: skim (dean0x/skim)");
     }
     println!();
 
-    if flags_override.dry_run {
+    if flags.dry_run {
         print_dry_run_actions(
             &state,
-            options.install_marketplace,
-            flags_override.no_guidance,
-            !flags_override.project,
+            install_marketplace,
+            flags.no_guidance,
+            global,
             &env,
         )?;
         return Ok(std::process::ExitCode::SUCCESS);
@@ -191,22 +160,22 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     // Execute installation
     execute_install(
         &state,
-        options.install_marketplace,
-        flags_override.no_guidance,
-        !flags_override.project,
+        install_marketplace,
+        flags.no_guidance,
+        global,
         &env,
     )?;
 
     println!();
     println!(
         "  Done! skim is now active in {}.",
-        flags_override.agent.display_name()
+        flags.agent.display_name()
     );
     println!();
-    if options.install_marketplace {
+    if install_marketplace {
         println!(
             "  Next step -- install the Skimmer plugin in {}:",
-            flags_override.agent.display_name()
+            flags.agent.display_name()
         );
         println!("    /install skimmer@skim");
         println!();
@@ -726,18 +695,10 @@ pub(super) fn remove_guidance(
     // Issue 5: resolve symlinks before operating on the path
     let path = super::helpers::resolve_real_settings_path(&path)?;
 
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > MAX_INSTRUCTION_FILE_SIZE {
-            eprintln!(
-                "  warning: {} is too large ({} bytes), skipping guidance",
-                path.display(),
-                meta.len()
-            );
-            return Ok(());
-        }
-    }
-
-    let content = std::fs::read_to_string(&path)?;
+    let content = match read_existing_safely(&path)? {
+        Some(s) => s,
+        None => return Ok(()), // soft skip (too large or unreadable)
+    };
     if let Some((start, end)) = find_skim_section(&content) {
         if path.extension().is_some_and(|ext| ext == "mdc") {
             // Skim owns .mdc files entirely — delete on removal
