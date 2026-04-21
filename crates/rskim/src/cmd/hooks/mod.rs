@@ -39,7 +39,6 @@ pub(crate) struct InstallResult {
 #[derive(Debug)]
 #[allow(dead_code)] // Used in per-agent install() tests
 pub(crate) struct InstallOpts {
-    pub(crate) binary_path: std::path::PathBuf,
     pub(crate) version: String,
     pub(crate) config_dir: std::path::PathBuf,
     pub(crate) project_scope: bool,

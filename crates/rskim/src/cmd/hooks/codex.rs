@@ -79,7 +79,6 @@ mod tests {
     #[test]
     fn test_codex_install_noop() {
         let opts = InstallOpts {
-            binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
             config_dir: "/tmp/.codex".into(),
             project_scope: false,

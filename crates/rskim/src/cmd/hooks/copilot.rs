@@ -150,7 +150,6 @@ mod tests {
     #[test]
     fn test_copilot_install_default() {
         let opts = InstallOpts {
-            binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
             config_dir: "/tmp/.copilot".into(),
             project_scope: false,

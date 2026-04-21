@@ -701,13 +701,14 @@ pub(super) fn remove_guidance(
                 "{}{}",
                 content[..start].trim_end_matches('\n'),
                 &content[end..]
-            );
-            updated = updated.trim().to_string();
+            )
+            .trim()
+            .to_string();
             if !updated.is_empty() {
                 updated.push('\n');
             }
 
-            if updated.trim().is_empty() {
+            if updated.is_empty() {
                 // File was only the skim section — delete the file
                 std::fs::remove_file(&path)?;
             } else {
