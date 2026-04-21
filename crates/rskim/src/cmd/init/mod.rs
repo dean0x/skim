@@ -88,7 +88,7 @@ pub(super) fn command() -> clap::Command {
                 .long("yes")
                 .short('y')
                 .action(clap::ArgAction::SetTrue)
-                .help("Non-interactive mode (skip prompts)"),
+                .help("Skip confirmation (uninstall only; install is always non-interactive)"),
         )
         .arg(
             clap::Arg::new("dry-run")
