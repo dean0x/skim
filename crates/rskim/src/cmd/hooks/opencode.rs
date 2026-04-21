@@ -31,7 +31,7 @@ impl HookProtocol for OpenCodeHook {
         serde_json::Value::Null
     }
 
-    fn generate_script(&self, _binary_path: &str, _version: &str) -> String {
+    fn generate_script(&self, _version: &str) -> String {
         String::new()
     }
 }
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_opencode_generate_script_empty() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
+        let script = hook().generate_script("1.0.0");
         assert!(script.is_empty());
     }
 

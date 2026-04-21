@@ -38,8 +38,8 @@ impl HookProtocol for CursorHook {
         })
     }
 
-    fn generate_script(&self, binary_path: &str, version: &str) -> String {
-        super::generate_hook_script(binary_path, version, "cursor")
+    fn generate_script(&self, version: &str) -> String {
+        super::generate_hook_script(version, "cursor")
     }
 }
 
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_cursor_generate_script_bare_command() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.2.0");
+        let script = hook().generate_script("1.2.0");
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v1.2.0"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.0\""));
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn test_cursor_generate_script_zero_stderr() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
+        let script = hook().generate_script("1.0.0");
         // No eprintln or echo to stderr in generated script
         assert!(!script.contains(">&2"));
         assert!(!script.contains("echo"));
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_cursor_generate_script_init_comment() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
+        let script = hook().generate_script("1.0.0");
         assert!(script.contains("skim init --agent cursor"));
     }
 

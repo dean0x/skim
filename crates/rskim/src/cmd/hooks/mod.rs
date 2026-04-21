@@ -70,7 +70,7 @@ pub(crate) trait HookProtocol {
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value;
 
     #[allow(dead_code)] // Used in tests only
-    fn generate_script(&self, binary_path: &str, version: &str) -> String;
+    fn generate_script(&self, version: &str) -> String;
 
     /// Default no-op install. Override for agents with real hook installation.
     #[allow(dead_code)] // Used in tests only
@@ -106,12 +106,15 @@ pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookI
 /// Shared by all RealHook agents. The script sets `SKIM_HOOK_VERSION` and
 /// `exec`s PATH-resolved `skim` with `rewrite --hook --agent <agent_cli_name>`.
 ///
+/// SECURITY: Hook scripts use PATH-resolved `skim` (bare command, no absolute path)
+/// so users can upgrade skim without reinstalling hooks. An absolute binary path
+/// would pin the hook to the install-time location and silently break on upgrades.
+///
 /// # Panics
 ///
 /// Panics if `version` or `agent_cli_name` contain shell-unsafe characters.
 #[allow(dead_code)] // Called by per-agent generate_script() impls, which are test-only
 pub(crate) fn generate_hook_script(
-    _binary_path: &str,
     version: &str,
     agent_cli_name: &str,
 ) -> String {
@@ -196,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_generate_hook_script_structure() {
-        let script = generate_hook_script("/usr/local/bin/skim", "1.2.3", "test-agent");
+        let script = generate_hook_script("1.2.3", "test-agent");
         assert!(script.starts_with("#!/usr/bin/env bash\n"));
         assert!(script.contains("# skim-hook v1.2.3"));
         assert!(script.contains("skim init --agent test-agent"));
@@ -207,12 +210,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "version contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_version() {
-        generate_hook_script("/usr/local/bin/skim", "1.0.0$(evil)", "test-agent");
+        generate_hook_script("1.0.0$(evil)", "test-agent");
     }
 
     #[test]
     #[should_panic(expected = "agent_cli_name contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_agent_name() {
-        generate_hook_script("/usr/local/bin/skim", "1.0.0", "agent;rm -rf /");
+        generate_hook_script("1.0.0", "agent;rm -rf /");
     }
 }
