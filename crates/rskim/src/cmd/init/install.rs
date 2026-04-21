@@ -144,24 +144,12 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     println!();
 
     if flags.dry_run {
-        print_dry_run_actions(
-            &state,
-            install_marketplace,
-            flags.no_guidance,
-            global,
-            &env,
-        )?;
+        print_dry_run_actions(&state, install_marketplace, flags.no_guidance, global, &env)?;
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
     // Execute installation
-    execute_install(
-        &state,
-        install_marketplace,
-        flags.no_guidance,
-        global,
-        &env,
-    )?;
+    execute_install(&state, install_marketplace, flags.no_guidance, global, &env)?;
 
     println!();
     println!(
@@ -1011,5 +999,4 @@ mod tests {
 
         assert!(!path.exists(), "Empty file should be deleted");
     }
-
 }

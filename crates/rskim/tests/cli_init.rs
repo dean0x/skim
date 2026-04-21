@@ -436,12 +436,9 @@ fn test_init_non_tty_works_without_yes() {
     let config = dir.path();
 
     // Non-TTY install should succeed without --yes (non-interactive by default)
-    skim_init_cmd(config)
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("Done!").or(predicate::str::contains("Already up to date")),
-        );
+    skim_init_cmd(config).assert().success().stdout(
+        predicate::str::contains("Done!").or(predicate::str::contains("Already up to date")),
+    );
 }
 
 // ============================================================================

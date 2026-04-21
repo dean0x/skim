@@ -113,10 +113,7 @@ pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookI
 ///
 /// Panics if `version` or `agent_cli_name` contain shell-unsafe characters.
 #[allow(dead_code)] // Called by per-agent generate_script() impls, which are test-only
-pub(crate) fn generate_hook_script(
-    version: &str,
-    agent_cli_name: &str,
-) -> String {
+pub(crate) fn generate_hook_script(version: &str, agent_cli_name: &str) -> String {
     assert!(
         version
             .bytes()
