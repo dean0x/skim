@@ -372,18 +372,17 @@ fn test_init_project_yes() {
 // ============================================================================
 
 #[test]
-fn test_init_non_tty_without_yes_fails() {
+fn test_init_non_tty_works_without_yes() {
     let dir = TempDir::new().unwrap();
     let config = dir.path();
 
-    // When invoked without --yes and stdin is not a terminal (piped),
-    // should fail with a hint.
-    // Note: assert_cmd by default provides non-TTY stdin.
+    // Non-TTY install should succeed without --yes (non-interactive by default)
     skim_init_cmd(config)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("interactive terminal"))
-        .stderr(predicate::str::contains("--yes"));
+        .success()
+        .stdout(
+            predicate::str::contains("Done!").or(predicate::str::contains("Already up to date")),
+        );
 }
 
 // ============================================================================

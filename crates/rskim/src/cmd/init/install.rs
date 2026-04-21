@@ -5,74 +5,28 @@ use std::os::unix::fs::PermissionsExt;
 
 use super::flags::InitFlags;
 use super::helpers::{
-    atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings, prompt_choice,
-    resolve_real_settings_path, HOOK_SCRIPT_NAME, SETTINGS_BACKUP, SETTINGS_FILE,
+    atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
+    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, SETTINGS_FILE,
 };
 use super::state::{detect_state, has_skim_hook_entry, DetectedState};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
-/// Resolved install options from interactive prompts or --yes defaults.
+/// Resolved install options from flags.
 struct InstallOptions {
-    /// Whether to use project scope (overrides flags.project when user selects it interactively).
+    /// Whether to use project scope.
     project: bool,
     /// Whether to install the marketplace entry.
     install_marketplace: bool,
-    /// Whether confirmation was already handled by the prompting phase.
-    skip_confirmation: bool,
 }
 
-/// Prompt the user for install options (scope and marketplace).
-///
-/// In non-interactive mode (--yes), returns defaults immediately.
-/// Returns `None` if the user chose project scope interactively (requires re-detection).
+/// Resolve install options from flags (install is always non-interactive).
 fn prompt_install_options(
     flags: &InitFlags,
-    state: &DetectedState,
+    _state: &DetectedState,
 ) -> anyhow::Result<InstallOptions> {
-    if flags.yes {
-        return Ok(InstallOptions {
-            project: flags.project,
-            install_marketplace: true,
-            skip_confirmation: true,
-        });
-    }
-
-    let mut use_project = flags.project;
-    let mut skip_confirmation = false;
-
-    // Scope prompt (informational -- scope is already determined by --project flag)
-    if !flags.project {
-        println!("  ? Where should skim install the hook?");
-        println!("    [1] Global (~/.claude/settings.json)  [recommended]");
-        println!("    [2] Project (.claude/settings.json)");
-        let choice = prompt_choice("  Choice [1]: ", 1, &[1, 2])?;
-        if choice == 2 {
-            println!();
-            println!("  Tip: use `skim init --project` to skip this prompt next time.");
-            use_project = true;
-            // User already made a deliberate scope choice -- skip confirmation later
-            skip_confirmation = true;
-        }
-        println!();
-    }
-
-    // Plugin prompt
-    let install_marketplace = if !state.marketplace_installed {
-        println!("  ? Install the Skimmer plugin? (codebase orientation agent)");
-        println!("    Adds /skim command and auto-orientation for new codebases");
-        println!("    [1] Yes  [recommended]");
-        println!("    [2] No");
-        let choice = prompt_choice("  Choice [1]: ", 1, &[1, 2])?;
-        println!();
-        choice == 1
-    } else {
-        true
-    };
-
     Ok(InstallOptions {
-        project: use_project,
-        install_marketplace,
-        skip_confirmation,
+        project: flags.project,
+        install_marketplace: true,
     })
 }
 
@@ -174,6 +128,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
     if state.hook_installed
         && state.hook_version.as_deref() == Some(&state.skim_version)
+        && state.hook_uses_bare_command
         && state.marketplace_installed
         && guidance_current
     {
@@ -207,7 +162,10 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     // Print summary
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     println!("  Summary:");
-    if !state.hook_installed || state.hook_version.as_deref() != Some(&state.skim_version) {
+    if !state.hook_installed
+        || state.hook_version.as_deref() != Some(&state.skim_version)
+        || !state.hook_uses_bare_command
+    {
         println!("    * Create hook script: {}", hook_script_path.display());
         println!(
             "    * Patch settings: {} (add PreToolUse hook)",
@@ -218,12 +176,6 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
         println!("    * Register marketplace: skim (dean0x/skim)");
     }
     println!();
-
-    // Confirmation (skip if user already confirmed via scope change or --yes)
-    if !flags.yes && !options.skip_confirmation && !confirm_proceed()? {
-        println!("  Cancelled.");
-        return Ok(std::process::ExitCode::SUCCESS);
-    }
 
     if flags_override.dry_run {
         print_dry_run_actions(
@@ -333,30 +285,6 @@ fn execute_install(
 // Hook script generation (B7)
 // ============================================================================
 
-/// Validate that a path is safe to interpolate into a double-quoted bash string.
-///
-/// Rejects characters that can escape double-quote context or inject commands:
-/// - `"` (closes the quote)
-/// - `` ` `` (command substitution)
-/// - `$` (variable/command expansion)
-/// - `\` (escape sequences)
-/// - newline / null byte (command injection)
-///
-/// Paths from `current_exe()` on any mainstream OS should never contain these,
-/// so this guard only fires on adversarial or corrupted environments.
-fn validate_shell_safe_path(path: &str) -> anyhow::Result<()> {
-    const UNSAFE_CHARS: &[char] = &['"', '`', '$', '\\', '\n', '\0'];
-    if let Some(bad) = path.chars().find(|c| UNSAFE_CHARS.contains(c)) {
-        anyhow::bail!(
-            "binary path contains shell-unsafe character {:?}: {}\n\
-             hint: reinstall skim to a path without special characters",
-            bad,
-            path
-        );
-    }
-    Ok(())
-}
-
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     let hooks_dir = state.config_dir.join("hooks");
     let script_path = hooks_dir.join(HOOK_SCRIPT_NAME);
@@ -375,7 +303,7 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     if script_path.exists() {
         if let Ok(contents) = std::fs::read_to_string(&script_path) {
             let version_line = format!("# skim-hook v{}", state.skim_version);
-            if contents.contains(&version_line) {
+            if contents.contains(&version_line) && contents.contains("exec skim ") {
                 println!(
                     "  {} Skipped: {} (already v{})",
                     check_mark(true),
@@ -401,12 +329,6 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
         println!("  {} Created: {}", check_mark(true), script_path.display());
     }
 
-    // Generate script content
-    // Binary path is quoted to handle spaces, but we must also reject
-    // characters that can escape double-quote context in bash.
-    let binary_path = state.skim_binary.display().to_string();
-    validate_shell_safe_path(&binary_path)?;
-
     let agent_flag = if state.agent_cli_name == "claude-code" {
         String::new()
     } else {
@@ -417,7 +339,7 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
          # skim-hook v{version}\n\
          # Generated by: skim init -- do not edit manually\n\
          export SKIM_HOOK_VERSION=\"{version}\"\n\
-         exec \"{binary_path}\" rewrite --hook{agent_flag}\n",
+         exec skim rewrite --hook{agent_flag}\n",
         version = state.skim_version,
     );
 
@@ -989,8 +911,6 @@ mod tests {
         );
     }
 
-    // ---- Shell-safe path validation (SEC-1) ----
-
     // ---- find_skim_section unit tests ----
 
     #[test]
@@ -1137,44 +1057,4 @@ mod tests {
         assert!(!path.exists(), "Empty file should be deleted");
     }
 
-    // ---- Shell-safe path validation (SEC-1) ----
-
-    #[test]
-    fn test_validate_shell_safe_path_normal_paths() {
-        assert!(validate_shell_safe_path("/usr/local/bin/skim").is_ok());
-        assert!(validate_shell_safe_path("/home/user/.cargo/bin/skim").is_ok());
-        assert!(validate_shell_safe_path("/path/with spaces/skim").is_ok());
-    }
-
-    #[test]
-    fn test_validate_shell_safe_path_rejects_double_quote() {
-        let result = validate_shell_safe_path("/path/with\"quote/skim");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("shell-unsafe"));
-    }
-
-    #[test]
-    fn test_validate_shell_safe_path_rejects_backtick() {
-        assert!(validate_shell_safe_path("/path/with`cmd`/skim").is_err());
-    }
-
-    #[test]
-    fn test_validate_shell_safe_path_rejects_dollar() {
-        assert!(validate_shell_safe_path("/path/$HOME/skim").is_err());
-    }
-
-    #[test]
-    fn test_validate_shell_safe_path_rejects_backslash() {
-        assert!(validate_shell_safe_path("/path/with\\escape/skim").is_err());
-    }
-
-    #[test]
-    fn test_validate_shell_safe_path_rejects_newline() {
-        assert!(validate_shell_safe_path("/path/with\nnewline/skim").is_err());
-    }
-
-    #[test]
-    fn test_validate_shell_safe_path_rejects_null_byte() {
-        assert!(validate_shell_safe_path("/path/with\0null/skim").is_err());
-    }
 }

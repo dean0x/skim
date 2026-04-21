@@ -194,21 +194,6 @@ pub(super) fn guidance_content_mdc(version: &str) -> String {
 // Interactive prompt helpers
 // ============================================================================
 
-pub(super) fn prompt_choice(prompt: &str, default: u32, valid: &[u32]) -> anyhow::Result<u32> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Ok(default);
-    }
-    match trimmed.parse::<u32>() {
-        Ok(n) if valid.contains(&n) => Ok(n),
-        _ => Ok(default),
-    }
-}
-
 /// Prompt the user with "Proceed? [Y/n]" and return `true` if confirmed.
 pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
     print!("  ? Proceed? [Y/n] ");
@@ -249,7 +234,7 @@ pub(super) fn print_help() {
     println!(
         "                      Supported: claude-code, cursor, gemini, copilot, codex, opencode"
     );
-    println!("  --yes, -y           Non-interactive mode (skip prompts)");
+    println!("  --yes, -y           Skip confirmation (uninstall only; install is always non-interactive)");
     println!("  --dry-run           Print actions without writing");
     println!("  --uninstall         Remove hook and clean up");
     println!("  --no-guidance       Skip injecting guidance into agent instruction file");
@@ -257,12 +242,12 @@ pub(super) fn print_help() {
     println!("  --help, -h          Print help information");
     println!();
     println!("Examples:");
-    println!("  skim init                          Interactive Claude Code setup (recommended)");
-    println!("  skim init --yes                    Non-interactive with defaults");
-    println!("  skim init --agent cursor --yes     Install for Cursor");
-    println!("  skim init --agent gemini --yes     Install for Gemini CLI");
-    println!("  skim init --project --yes          Install project-level hook");
+    println!("  skim init                          Install for Claude Code (recommended)");
+    println!("  skim init --agent cursor           Install for Cursor");
+    println!("  skim init --agent gemini           Install for Gemini CLI");
+    println!("  skim init --project                Install project-level hook");
     println!("  skim init --uninstall              Remove skim hook");
+    println!("  skim init --uninstall --yes        Uninstall without confirmation");
     println!("  skim init --dry-run                Preview actions without writing");
 }
 

@@ -139,7 +139,7 @@ mod tests {
         assert!(script.contains("# skim-hook v2.0.0"));
         assert!(script.contains("skim init --agent copilot"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"2.0.0\""));
-        assert!(script.contains("exec \"/usr/local/bin/skim\" rewrite --hook --agent copilot"));
+        assert!(script.contains("exec skim rewrite --hook --agent copilot"));
     }
 
     #[test]

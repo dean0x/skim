@@ -128,14 +128,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_generate_script_absolute_path() {
+    fn test_cursor_generate_script_bare_command() {
         let script = hook().generate_script("/usr/local/bin/skim", "1.2.0");
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v1.2.0"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.0\""));
-        assert!(script.contains("exec \"/usr/local/bin/skim\" rewrite --hook --agent cursor"));
-        // Must use absolute path (quoted)
-        assert!(script.contains("\"/usr/local/bin/skim\""));
+        assert!(script.contains("exec skim rewrite --hook --agent cursor"));
     }
 
     #[test]

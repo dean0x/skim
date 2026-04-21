@@ -21,7 +21,6 @@ mod install;
 mod state;
 mod uninstall;
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use flags::parse_flags;
@@ -54,13 +53,6 @@ pub(crate) fn run(
 
     // Parse flags
     let flags = parse_flags(args)?;
-
-    // Non-TTY detection (B3)
-    if !flags.yes && !std::io::stdin().is_terminal() {
-        eprintln!("error: skim init requires an interactive terminal");
-        eprintln!("hint: use --yes for non-interactive mode (e.g., CI)");
-        return Ok(ExitCode::FAILURE);
-    }
 
     if flags.uninstall {
         return run_uninstall(&flags);

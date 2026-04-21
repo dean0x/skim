@@ -109,15 +109,15 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_generate_script_has_absolute_path() {
+    fn test_gemini_generate_script_uses_bare_command() {
         let script = hook().generate_script("/usr/local/bin/skim", "1.2.3");
         assert!(
-            script.contains("\"/usr/local/bin/skim\""),
-            "script must use quoted absolute binary path, got: {script}"
+            script.contains("exec skim rewrite --hook"),
+            "script must use bare skim command, got: {script}"
         );
         assert!(
-            script.contains("exec"),
-            "script must use exec to replace shell process, got: {script}"
+            !script.contains("\"/usr/local/bin/skim\""),
+            "script must NOT contain hardcoded binary path, got: {script}"
         );
     }
 

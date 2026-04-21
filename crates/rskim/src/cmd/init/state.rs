@@ -17,6 +17,8 @@ pub(super) struct DetectedState {
     pub(super) settings_exists: bool,
     pub(super) hook_installed: bool,
     pub(super) hook_version: Option<String>,
+    /// Whether the hook script uses bare `skim` (PATH-resolved) vs hardcoded binary path.
+    pub(super) hook_uses_bare_command: bool,
     pub(super) marketplace_installed: bool,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
@@ -66,6 +68,9 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags)?;
 
+    // Check if the installed hook script uses the new bare-command format
+    let hook_uses_bare_command = hook_script_uses_bare_command(&config_dir);
+
     Ok(DetectedState {
         skim_binary,
         skim_version,
@@ -74,11 +79,21 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
         settings_exists,
         hook_installed,
         hook_version,
+        hook_uses_bare_command,
         marketplace_installed,
         dual_scope_warning,
         existing_bash_hooks,
         agent_cli_name: flags.agent.cli_name(),
     })
+}
+
+/// Check if the hook script uses bare `skim` command (new format) vs hardcoded binary path.
+fn hook_script_uses_bare_command(config_dir: &Path) -> bool {
+    let script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    match std::fs::read_to_string(&script_path) {
+        Ok(contents) => contents.contains("exec skim "),
+        Err(_) => false,
+    }
 }
 
 /// Scan already-parsed settings JSON for existing non-skim Bash PreToolUse hooks.
@@ -255,6 +270,38 @@ pub(super) fn extract_hook_version_from_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hook_script_uses_bare_command_new_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join(HOOK_SCRIPT_NAME),
+            "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim rewrite --hook\n",
+        )
+        .unwrap();
+        assert!(hook_script_uses_bare_command(dir.path()));
+    }
+
+    #[test]
+    fn test_hook_script_uses_bare_command_old_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hooks_dir = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        std::fs::write(
+            hooks_dir.join(HOOK_SCRIPT_NAME),
+            "#!/usr/bin/env bash\nexec \"/usr/local/bin/skim\" rewrite --hook\n",
+        )
+        .unwrap();
+        assert!(!hook_script_uses_bare_command(dir.path()));
+    }
+
+    #[test]
+    fn test_hook_script_uses_bare_command_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!hook_script_uses_bare_command(dir.path()));
+    }
 
     #[test]
     fn test_scan_existing_bash_hooks_none_input() {
