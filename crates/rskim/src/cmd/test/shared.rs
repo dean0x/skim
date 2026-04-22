@@ -1,8 +1,11 @@
 //! Shared helpers for test parser Tier-2 fallback paths.
 //!
 //! Provides [`scrape_failures`] which extracts failing test entries from
-//! plain-text runner output when JSON parsing is unavailable.
+//! plain-text runner output when JSON parsing is unavailable, and
+//! [`should_read_stdin`] which implements the shared stdin-detection guard
+//! used by all test parsers that support piped input.
 
+use std::io::IsTerminal;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -63,6 +66,15 @@ static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     // Example real output: `   × divides by zero`.
     Regex::new(r"^\s*[✕✗×]\s+(.+?)$").expect("valid vitest fail regex")
 });
+
+/// Determine whether to read piped stdin instead of spawning the test runner.
+///
+/// The `args.is_empty()` guard is critical: without it, subprocess contexts
+/// (Claude Code, CI) where stdin is never a terminal would always read from
+/// empty stdin instead of spawning the runner.
+pub(super) fn should_read_stdin(args: &[String]) -> bool {
+    !std::io::stdin().is_terminal() && args.is_empty()
+}
 
 /// Extract failing test entries from plain-text runner output when JSON parsing
 /// is unavailable (Tier 2 fallback).

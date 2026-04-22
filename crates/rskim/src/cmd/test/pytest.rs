@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::{strip_ansi, ParseResult};
 use crate::runner::{CommandOutput, CommandRunner};
 
-use super::shared;
+use super::shared::{self, should_read_stdin};
 
 // ============================================================================
 // Public entry point
@@ -37,9 +37,9 @@ use super::shared;
 
 /// Run pytest and parse its output, or parse piped stdin.
 ///
-/// Detection logic:
-/// - If stdin is a terminal → run pytest (execution mode)
-/// - If stdin is not a terminal → attempt to read stdin; if empty, fall back
+/// Detection logic (via [`should_read_stdin`]):
+/// - If args are present OR stdin is a terminal → run pytest (execution mode)
+/// - If args are empty AND stdin is piped → read stdin; if empty, fall back
 ///   to running pytest (handles test harness environments where stdin is a
 ///   pipe with no data)
 pub(crate) fn run(
@@ -49,12 +49,13 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression and forward raw output unchanged.
     if crate::cmd::is_passthrough_mode() {
-        if !io::stdin().is_terminal() && args.is_empty() {
+        if should_read_stdin(args) {
             let stdin_output = read_stdin()?;
             if !stdin_output.stdout.trim().is_empty() {
                 print!("{}", stdin_output.stdout);
                 return Ok(ExitCode::FAILURE);
             }
+            // Empty stdin: fall through to the spawn path below.
         }
         let final_args = build_args(args);
         let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
@@ -70,13 +71,8 @@ pub(crate) fn run(
         print_pytest_help();
     }
 
-    let output = if io::stdin().is_terminal() {
-        // Terminal: always run pytest
-        let final_args = build_args(args);
-        let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-        run_pytest(&arg_refs)?
-    } else {
-        // Pipe: read stdin, fall back to execution if empty
+    let output = if should_read_stdin(args) {
+        // Piped stdin with no user args: read stdin, fall back to execution if empty.
         let stdin_output = read_stdin()?;
         if stdin_output.stdout.trim().is_empty() {
             // Empty pipe (e.g., test harness) — run pytest instead
@@ -86,6 +82,11 @@ pub(crate) fn run(
         } else {
             stdin_output
         }
+    } else {
+        // Terminal or args present: always run pytest
+        let final_args = build_args(args);
+        let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
+        run_pytest(&arg_refs)?
     };
 
     let combined = combine_output(&output);

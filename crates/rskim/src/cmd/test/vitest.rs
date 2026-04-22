@@ -9,7 +9,7 @@
 //!   parsing fails.
 //! - **Tier 3 (passthrough)**: Returns raw output unchanged when nothing parses.
 
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -20,7 +20,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
 
-use super::shared::{self, scrape_failures, TestKind};
+use super::shared::{self, scrape_failures, should_read_stdin, TestKind};
 
 // ============================================================================
 // Public entry point
@@ -120,15 +120,6 @@ pub(crate) fn run(
 // ============================================================================
 // Command execution
 // ============================================================================
-
-/// Determine whether to read piped stdin instead of spawning the test runner.
-///
-/// The `args.is_empty()` guard is critical: without it, subprocess contexts
-/// (Claude Code, CI) where stdin is never a terminal would always read from
-/// empty stdin instead of spawning vitest.
-fn should_read_stdin(args: &[String]) -> bool {
-    !io::stdin().is_terminal() && args.is_empty()
-}
 
 /// Maximum bytes we will read from stdin (64 MiB).
 ///
@@ -482,6 +473,7 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::IsTerminal;
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
