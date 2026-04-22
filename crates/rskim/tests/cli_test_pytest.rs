@@ -231,14 +231,26 @@ fn test_real_pytest_if_available() {
 
 #[test]
 fn test_pytest_with_args_does_not_read_stdin() {
-    Command::cargo_bin("skim")
+    // With args present, skim should spawn pytest instead of reading stdin.
+    // When pytest is not installed (CI), the spawn error goes to stderr
+    // (unlike vitest which has an npx fallback producing stdout). Assert
+    // on stderr to prove the spawn path was taken — the "pytest" name in
+    // the error message confirms skim attempted to exec it.
+    let output = Command::cargo_bin("skim")
         .unwrap()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
         .arg("test")
         .arg("pytest")
         .arg("-v")
-        .assert()
-        .failure()
-        .stdout(predicate::str::is_empty().not());
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let has_output = !stdout.trim().is_empty() || stderr.contains("pytest");
+    assert!(
+        has_output,
+        "spawn path should produce output (stdout or pytest error on stderr)"
+    );
 }
