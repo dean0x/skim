@@ -9,7 +9,7 @@
 //!   parsing fails.
 //! - **Tier 3 (passthrough)**: Returns raw output unchanged when nothing parses.
 
-use std::io::{self, Read};
+use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -20,7 +20,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
 
-use super::shared::{self, scrape_failures, should_read_stdin, TestKind};
+use super::shared::{self, scrape_failures, try_read_stdin, TestKind};
 
 // ============================================================================
 // Public entry point
@@ -38,16 +38,12 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
-        if should_read_stdin(args) {
-            let raw_output = read_stdin()?;
-            if !raw_output.trim().is_empty() {
-                println!("{raw_output}");
-                // Stdin passthrough has no child process, so there is no exit code to
-                // preserve. FAILURE is the conservative default — callers who need a
-                // specific exit code should use the spawned-process path instead.
-                return Ok(ExitCode::FAILURE);
-            }
-            // Empty stdin: fall through to the spawn path below.
+        if let Some(raw_output) = try_read_stdin(args)? {
+            println!("{raw_output}");
+            // Stdin passthrough has no child process, so there is no exit code to
+            // preserve. FAILURE is the conservative default — callers who need a
+            // specific exit code should use the spawned-process path instead.
+            return Ok(ExitCode::FAILURE);
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let runner = CommandRunner::new(None);
@@ -58,15 +54,11 @@ pub(crate) fn run(
     }
 
     let start = std::time::Instant::now();
-    let raw_output = if should_read_stdin(args) {
-        let stdin_content = read_stdin()?;
-        if stdin_content.trim().is_empty() {
-            // Empty piped stdin: fall through to running vitest directly so the
-            // agent gets actual test output rather than a silent empty response.
-            run_vitest(program, args)?
-        } else {
-            stdin_content
-        }
+    // try_read_stdin returns Some(content) when stdin is piped and non-empty,
+    // None when stdin is empty/whitespace-only or when args are present — in
+    // either case fall through to running vitest directly.
+    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
+        stdin_content
     } else {
         run_vitest(program, args)?
     };
@@ -120,34 +112,6 @@ pub(crate) fn run(
 // ============================================================================
 // Command execution
 // ============================================================================
-
-/// Maximum bytes we will read from stdin (64 MiB).
-///
-/// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
-/// memory growth when a large file is accidentally piped in.
-const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
-
-/// Read stdin into a String, capped at [`MAX_STDIN_BYTES`].
-///
-/// Uses chunked reads (8 KiB) instead of `read_to_string` to enforce the size
-/// limit incrementally. Non-UTF-8 input is handled via `String::from_utf8_lossy`.
-fn read_stdin() -> anyhow::Result<String> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8 * 1024];
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    loop {
-        let n = handle.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() + n > MAX_STDIN_BYTES {
-            anyhow::bail!("stdin exceeded {} byte limit", MAX_STDIN_BYTES);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
 
 /// Execute the test runner with the user's args, injecting `--reporter=json` if
 /// not already set.
@@ -473,7 +437,6 @@ fn try_parse_regex(raw: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::IsTerminal;
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -837,40 +800,4 @@ Duration: 1.5s";
         );
     }
 
-    // ========================================================================
-    // should_read_stdin
-    // ========================================================================
-
-    #[test]
-    fn test_should_read_stdin_false_when_args_present() {
-        let args = vec!["--run".to_string(), "math".to_string()];
-        assert!(
-            !should_read_stdin(&args),
-            "non-empty args must prevent stdin mode"
-        );
-    }
-
-    #[test]
-    fn test_should_read_stdin_args_gate_short_circuits() {
-        for args in [
-            vec!["run".to_string()],
-            vec!["--reporter=verbose".to_string()],
-            vec!["--reporter=verbose".to_string(), "math".to_string()],
-            vec!["src/utils.test.ts".to_string()],
-        ] {
-            assert!(
-                !should_read_stdin(&args),
-                "should_read_stdin must return false for args: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_should_read_stdin_empty_args_defers_to_terminal() {
-        let result = should_read_stdin(&[]);
-        // In `cargo test`, stdin is typically a terminal → false.
-        // The point is that empty args don't unconditionally force stdin mode;
-        // it still checks is_terminal().
-        assert_eq!(result, !std::io::stdin().is_terminal());
-    }
 }

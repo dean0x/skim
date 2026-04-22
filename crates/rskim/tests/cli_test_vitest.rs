@@ -186,6 +186,8 @@ fn test_vitest_with_args_does_not_read_stdin() {
     // is taken, producing either vitest output or an npm/runner error message.
     Command::cargo_bin("skim")
         .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
         .arg("test")
         .arg("vitest")
         .arg("run")
@@ -198,6 +200,8 @@ fn test_vitest_with_args_does_not_read_stdin() {
 fn test_jest_with_args_does_not_read_stdin() {
     Command::cargo_bin("skim")
         .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
         .arg("test")
         .arg("jest")
         .arg("run")

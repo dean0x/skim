@@ -393,6 +393,9 @@ fn test_subcommand_file_unknown_tool() {
         .failure();
 }
 
+// log uses its own stdin path (not run_parsed_command_with_mode), so empty
+// stdin is intentionally treated as success — unlike file/test subcommands
+// which fall through to spawn.
 #[test]
 fn test_subcommand_log_empty_stdin() {
     skim_cmd().arg("log").write_stdin("").assert().success();

@@ -15,7 +15,6 @@
 //! compatibility when libtest stabilizes the JSON format.
 
 use std::collections::HashSet;
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -29,7 +28,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::shared::{scrape_failures, TestKind};
+use super::shared::{scrape_failures, should_read_stdin, TestKind};
 
 // Static regex patterns compiled once via LazyLock (avoids per-call compilation).
 static RE_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());
@@ -64,12 +63,9 @@ pub(crate) fn run(
     }
 
     // Determine whether to read from stdin or execute the command.
-    // Only use stdin when:
-    // 1. stdin is not a terminal (i.e., data is being piped), AND
-    // 2. no user args were provided (bare `skim test cargo` with piped data)
-    // This prevents empty-stdin issues when test frameworks (e.g., assert_cmd)
-    // pipe stdin without providing data.
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    // Delegates to shared::should_read_stdin for the same guard used by all
+    // test parsers: stdin must be piped AND no user args provided.
+    let use_stdin = should_read_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {

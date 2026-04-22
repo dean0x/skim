@@ -224,3 +224,21 @@ fn test_real_pytest_if_available() {
         "expected FAIL: 0 from real pytest, got: {stdout}"
     );
 }
+
+// ============================================================================
+// Args prevent stdin mode (regression: subprocess stdin detection bug)
+// ============================================================================
+
+#[test]
+fn test_pytest_with_args_does_not_read_stdin() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .arg("test")
+        .arg("pytest")
+        .arg("-v")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty().not());
+}

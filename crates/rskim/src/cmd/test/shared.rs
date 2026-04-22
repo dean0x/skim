@@ -1,11 +1,13 @@
 //! Shared helpers for test parser Tier-2 fallback paths.
 //!
 //! Provides [`scrape_failures`] which extracts failing test entries from
-//! plain-text runner output when JSON parsing is unavailable, and
+//! plain-text runner output when JSON parsing is unavailable,
 //! [`should_read_stdin`] which implements the shared stdin-detection guard
-//! used by all test parsers that support piped input.
+//! used by all test parsers that support piped input, and [`try_read_stdin`]
+//! which combines the stdin guard, chunked read, and whitespace-only check
+//! into a single call.
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Read};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -74,6 +76,58 @@ static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 /// empty stdin instead of spawning the runner.
 pub(super) fn should_read_stdin(args: &[String]) -> bool {
     !std::io::stdin().is_terminal() && args.is_empty()
+}
+
+/// Maximum bytes read from stdin (64 MiB).
+///
+/// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
+/// memory growth when a large file is accidentally piped in.
+const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read stdin into a `String`, capped at [`MAX_STDIN_BYTES`].
+///
+/// Uses chunked reads (8 KiB) to enforce the size limit incrementally.
+/// Non-UTF-8 bytes are replaced via `String::from_utf8_lossy`.
+pub(super) fn read_stdin_raw() -> anyhow::Result<String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    loop {
+        let n = handle.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > MAX_STDIN_BYTES {
+            anyhow::bail!("stdin exceeded {} byte limit", MAX_STDIN_BYTES);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Try to read piped stdin, returning `Some(content)` only when there is
+/// non-whitespace data to process.
+///
+/// Combines three steps that all test parsers previously duplicated:
+/// 1. [`should_read_stdin`] guard — if false, return `Ok(None)` immediately.
+/// 2. [`read_stdin_raw`] — propagate I/O errors via `?`.
+/// 3. Whitespace check — `bytes().any(|b| !b.is_ascii_whitespace())` for
+///    short-circuit on the first non-whitespace byte; returns `Ok(None)` when
+///    the pipe is empty so callers fall through to the spawn path.
+///
+/// Returns `Ok(Some(content))` when there is content to parse, `Ok(None)` when
+/// the guard is false or the pipe is empty/whitespace-only.
+pub(super) fn try_read_stdin(args: &[String]) -> anyhow::Result<Option<String>> {
+    if !should_read_stdin(args) {
+        return Ok(None);
+    }
+    let content = read_stdin_raw()?;
+    if content.bytes().any(|b| !b.is_ascii_whitespace()) {
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Extract failing test entries from plain-text runner output when JSON parsing
@@ -392,5 +446,42 @@ mod tests {
         // n=2 → find 2nd \n from end, which is after "line1\r", return "line2\r\nline3"
         let result = last_n_lines(text, 2);
         assert_eq!(result, "line2\r\nline3");
+    }
+
+    // ========================================================================
+    // should_read_stdin tests (moved from vitest.rs — function lives here)
+    // ========================================================================
+
+    #[test]
+    fn test_should_read_stdin_false_when_args_present() {
+        let args = vec!["--run".to_string(), "math".to_string()];
+        assert!(
+            !should_read_stdin(&args),
+            "non-empty args must prevent stdin mode"
+        );
+    }
+
+    #[test]
+    fn test_should_read_stdin_args_gate_short_circuits() {
+        for args in [
+            vec!["run".to_string()],
+            vec!["--reporter=verbose".to_string()],
+            vec!["--reporter=verbose".to_string(), "math".to_string()],
+            vec!["src/utils.test.ts".to_string()],
+        ] {
+            assert!(
+                !should_read_stdin(&args),
+                "should_read_stdin must return false for args: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_read_stdin_empty_args_defers_to_terminal() {
+        let result = should_read_stdin(&[]);
+        // In `cargo test`, stdin is typically a terminal → false.
+        // The point is that empty args don't unconditionally force stdin mode;
+        // it still checks is_terminal().
+        assert_eq!(result, !std::io::stdin().is_terminal());
     }
 }
