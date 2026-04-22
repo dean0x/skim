@@ -49,7 +49,7 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression and forward raw output unchanged.
     if crate::cmd::is_passthrough_mode() {
-        if !io::stdin().is_terminal() {
+        if !io::stdin().is_terminal() && args.is_empty() {
             let stdin_output = read_stdin()?;
             if !stdin_output.stdout.trim().is_empty() {
                 print!("{}", stdin_output.stdout);
