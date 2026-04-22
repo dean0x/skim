@@ -87,7 +87,8 @@ const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
 /// Read stdin into a `String`, capped at [`MAX_STDIN_BYTES`].
 ///
 /// Uses chunked reads (8 KiB) to enforce the size limit incrementally.
-/// Non-UTF-8 bytes are replaced via `String::from_utf8_lossy`.
+/// Non-UTF-8 bytes are replaced with U+FFFD via lossy conversion
+/// (only invoked when validation fails; the common valid-UTF-8 path is zero-copy).
 fn read_stdin_raw() -> anyhow::Result<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
@@ -103,7 +104,8 @@ fn read_stdin_raw() -> anyhow::Result<String> {
         }
         buf.extend_from_slice(&chunk[..n]);
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
 }
 
 /// Try to read piped stdin, returning `Some(content)` only when there is

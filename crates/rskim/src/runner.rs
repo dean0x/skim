@@ -244,12 +244,12 @@ impl CommandRunner {
 /// unexpectedly large output.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Read a pipe into a lossy-UTF-8 String, capped at [`MAX_OUTPUT_BYTES`].
+/// Read a pipe into a UTF-8 String, capped at [`MAX_OUTPUT_BYTES`].
 ///
 /// Uses chunked reads (8 KiB) instead of `read_to_end` to enforce the size
 /// limit without requiring the OS to report exact pipe length up-front.
-/// Non-UTF-8 output (e.g., binary data from `/dev/zero`) is handled via
-/// `String::from_utf8_lossy`.
+/// Valid UTF-8 is zero-copy (`Vec<u8>` moved into `String`); non-UTF-8 output
+/// (e.g., binary data from `/dev/zero`) falls back to lossy U+FFFD replacement.
 ///
 /// Returns an `io::Error` (kind `Other`) if the output exceeds the cap.
 fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
@@ -270,7 +270,8 @@ fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
         buf.extend_from_slice(&chunk[..n]);
     }
 
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
 }
 
 #[cfg(test)]
@@ -605,6 +606,14 @@ mod tests {
     // ========================================================================
     // Node fallback tests
     // ========================================================================
+
+    #[test]
+    fn test_read_pipe_handles_invalid_utf8() {
+        let data: Vec<u8> = vec![b'O', b'K', 0xFF, 0xFE];
+        let result = read_pipe(std::io::Cursor::new(data)).unwrap();
+        assert!(result.starts_with("OK"));
+        assert!(result.contains('\u{FFFD}'));
+    }
 
     #[cfg(unix)]
     #[test]
