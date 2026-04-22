@@ -259,7 +259,12 @@ where
         family,
     } = config;
 
-    let output = if use_stdin {
+    // Two-phase stdin detection: read stdin when requested, but fall through to
+    // the spawn path if stdin turns out to be empty (e.g., test harnesses that
+    // open a pipe but write nothing). This prevents silent empty-output bugs
+    // when CI or agent environments leave stdin open as a non-terminal pipe.
+    let mut stdin_content: Option<String> = None;
+    if use_stdin {
         // Piped stdin mode: read stdin instead of executing the command.
         // Size-limited to prevent unbounded memory growth from runaway pipes.
         let mut stdin_buf = String::new();
@@ -269,14 +274,20 @@ where
         if bytes_read as u64 >= MAX_STDIN_BYTES {
             anyhow::bail!("stdin input exceeded 64 MiB limit");
         }
+        if !stdin_buf.trim().is_empty() {
+            stdin_content = Some(stdin_buf);
+        }
+    }
+
+    let output = if let Some(buf) = stdin_content {
         CommandOutput {
-            stdout: stdin_buf,
+            stdout: buf,
             stderr: String::new(),
             exit_code: Some(0),
             duration: std::time::Duration::ZERO,
         }
     } else {
-        // Execute the command
+        // Execute the command (also the fallback when stdin was empty)
         let runner = CommandRunner::new(Some(std::time::Duration::from_secs(300)));
         let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 

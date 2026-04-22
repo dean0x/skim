@@ -407,13 +407,20 @@ fn test_log_conflicting_flags() {
         .success();
 }
 
+/// Empty piped stdin now falls through to spawning find (which exits 1 on macOS
+/// with no path arg). The old test expected success because the old code
+/// returned exit_code=Some(0) for an empty CommandOutput; the new empty-stdin
+/// fallback correctly delegates to the real command and propagates its exit code.
 #[test]
-fn test_file_find_empty_stdin() {
+fn test_file_find_empty_stdin_falls_through_to_spawn() {
+    // assert_cmd supplies a non-terminal pipe with no content — exactly the
+    // scenario the empty-stdin fallback is designed for.  find(1) exits 1 on
+    // macOS when invoked with no path argument, so we assert failure here.
     skim_cmd()
         .args(["file", "find"])
         .write_stdin("")
         .assert()
-        .success();
+        .failure();
 }
 
 // ============================================================================
