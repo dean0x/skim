@@ -799,5 +799,4 @@ Duration: 1.5s";
             "should not detect --reporter when absent"
         );
     }
-
 }

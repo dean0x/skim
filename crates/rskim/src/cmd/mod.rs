@@ -222,15 +222,84 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub family: &'a str,
 }
 
+/// Obtain command output from stdin or by spawning the command.
+///
+/// Returns `None` when the program is not found (install hint already
+/// printed to stderr). The caller should return `ExitCode::FAILURE`.
+fn obtain_output(
+    program: &str,
+    args: &[String],
+    env_overrides: &[(&str, &str)],
+    install_hint: &str,
+    use_stdin: bool,
+) -> anyhow::Result<Option<CommandOutput>> {
+    const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
+
+    if use_stdin {
+        let mut stdin_buf = String::new();
+        let bytes_read = io::stdin()
+            .take(MAX_STDIN_BYTES as u64)
+            .read_to_string(&mut stdin_buf)?;
+        if bytes_read >= MAX_STDIN_BYTES {
+            anyhow::bail!("stdin input exceeded 64 MiB limit");
+        }
+        if stdin_buf.bytes().any(|b| !b.is_ascii_whitespace()) {
+            return Ok(Some(CommandOutput {
+                stdout: stdin_buf,
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration: std::time::Duration::ZERO,
+            }));
+        }
+    }
+
+    let runner = CommandRunner::new(Some(std::time::Duration::from_secs(300)));
+    let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match runner.run_with_env(program, &args_str, env_overrides) {
+        Ok(out) => Ok(Some(out)),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("failed to execute") {
+                eprintln!("error: '{program}' not found");
+                eprintln!("hint: {install_hint}");
+                return Ok(None);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Render parsed result to stdout, returning the output string for analytics.
+fn render_output<T>(result: &ParseResult<T>, output_format: OutputFormat) -> anyhow::Result<String>
+where
+    T: AsRef<str> + serde::Serialize,
+{
+    match output_format {
+        OutputFormat::Json => {
+            let json_str = result.to_json_envelope()?;
+            let mut handle = io::stdout().lock();
+            writeln!(handle, "{json_str}")?;
+            handle.flush()?;
+            Ok(json_str)
+        }
+        OutputFormat::Text => {
+            let content = result.content();
+            let mut handle = io::stdout().lock();
+            write!(handle, "{content}")?;
+            if !content.is_empty() && !content.ends_with('\n') {
+                writeln!(handle)?;
+            }
+            handle.flush()?;
+            Ok(content.to_string())
+        }
+    }
+}
+
 /// Execute an external command, parse its output, and emit the result.
 ///
 /// This is the standard entry point for subcommand parsers that follow the
-/// three-tier degradation pattern. It handles:
-/// 1. Stdin piping (when `use_stdin` is true, read stdin instead of running command)
-/// 2. Running the command with environment overrides
-/// 3. Calling the parser function on the output
-/// 4. Emitting the parsed result to stdout
-/// 5. Mapping the exit code
+/// three-tier degradation pattern. Delegates stdin/spawn to [`obtain_output`]
+/// and rendering to [`render_output`].
 ///
 /// `config.use_stdin` — when `true`, reads stdin instead of spawning the command.
 /// Callers should set this based on their own heuristics (e.g., only read
@@ -242,10 +311,6 @@ pub(crate) fn run_parsed_command_with_mode<T>(
 where
     T: AsRef<str> + serde::Serialize,
 {
-    /// Maximum bytes we will read from stdin (64 MiB), consistent with the
-    /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
-    const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
-
     let ParsedCommandConfig {
         program,
         args,
@@ -259,50 +324,8 @@ where
         family,
     } = config;
 
-    // Two-phase stdin detection: read stdin when requested, but fall through to
-    // the spawn path if stdin turns out to be empty (e.g., test harnesses that
-    // open a pipe but write nothing). This prevents silent empty-output bugs
-    // when CI or agent environments leave stdin open as a non-terminal pipe.
-    let mut stdin_content: Option<String> = None;
-    if use_stdin {
-        // Piped stdin mode: read stdin instead of executing the command.
-        // Size-limited to prevent unbounded memory growth from runaway pipes.
-        let mut stdin_buf = String::new();
-        let bytes_read = io::stdin()
-            .take(MAX_STDIN_BYTES as u64)
-            .read_to_string(&mut stdin_buf)?;
-        if bytes_read >= MAX_STDIN_BYTES {
-            anyhow::bail!("stdin input exceeded 64 MiB limit");
-        }
-        if stdin_buf.bytes().any(|b| !b.is_ascii_whitespace()) {
-            stdin_content = Some(stdin_buf);
-        }
-    }
-
-    let output = if let Some(buf) = stdin_content {
-        CommandOutput {
-            stdout: buf,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    } else {
-        // Execute the command (also the fallback when stdin was empty)
-        let runner = CommandRunner::new(Some(std::time::Duration::from_secs(300)));
-        let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        match runner.run_with_env(program, &args_str, env_overrides) {
-            Ok(out) => out,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("failed to execute") {
-                    eprintln!("error: '{program}' not found");
-                    eprintln!("hint: {install_hint}");
-                    return Ok(ExitCode::FAILURE);
-                }
-                return Err(e);
-            }
-        }
+    let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
+        return Ok(ExitCode::FAILURE);
     };
 
     // Passthrough mode: bypass all compression and forward raw output.
@@ -319,9 +342,6 @@ where
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
     }
 
-    // Strip ANSI escape codes from output before parsing. Even with NO_COLOR=1
-    // set on the child process, some tools may still emit escape sequences.
-    // This is a cheap, universally useful safety net for all parsers.
     let output = CommandOutput {
         stdout: crate::output::strip_ansi(&output.stdout),
         stderr: crate::output::strip_ansi(&output.stderr),
@@ -329,37 +349,11 @@ where
     };
 
     let result = parse(&output, args);
-
-    // Emit markers (warnings/notices) to stderr
     let _ = result.emit_markers(&mut io::stderr().lock());
-
-    // Capture exit code before moving stdout into analytics
     let code = output.exit_code.unwrap_or(1);
 
-    // Render output and capture the compressed content string for stats/analytics.
-    let compressed: String = match output_format {
-        OutputFormat::Json => {
-            let json_str = result.to_json_envelope()?;
-            let mut handle = io::stdout().lock();
-            writeln!(handle, "{json_str}")?;
-            handle.flush()?;
-            json_str
-        }
-        OutputFormat::Text => {
-            let content = result.content();
-            let mut handle = io::stdout().lock();
-            write!(handle, "{content}")?;
-            if !content.is_empty() && !content.ends_with('\n') {
-                writeln!(handle)?;
-            }
-            handle.flush()?;
-            content.to_string()
-        }
-    };
+    let compressed = render_output(&result, output_format)?;
 
-    // Hint: when output was compressed (not passthrough) and the exit code was
-    // non-zero, tell the user how to see full raw output. Passthrough results
-    // are already uncompressed so the hint is not needed there.
     if code != 0 && !result.is_passthrough() {
         eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
     }
@@ -369,7 +363,6 @@ where
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
         analytics_enabled,
         output.stdout,
@@ -380,9 +373,6 @@ where
         Some(result.tier_name()),
     );
 
-    // Map exit code: preserve full 0-255 exit code granularity from the
-    // underlying process. This maintains documented semantics (0=success,
-    // 1=error, 2=parse error, 3=unsupported language) for downstream consumers.
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
