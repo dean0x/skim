@@ -5,7 +5,10 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 fn skim_cmd() -> Command {
-    Command::cargo_bin("skim").unwrap()
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd.env_remove("SKIM_DEBUG");
+    cmd
 }
 
 /// Build a skim command with all session providers neutralized (pointing to nonexistent paths).

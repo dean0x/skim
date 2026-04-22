@@ -21,7 +21,10 @@ const GH_RUN_VIEW_FIXTURE: &str = include_str!("fixtures/cmd/infra/gh_run_view.j
 const LOG_FIXTURE: &str = include_str!("fixtures/cmd/log/plaintext_mixed.txt");
 
 fn skim_cmd() -> Command {
-    Command::cargo_bin("skim").unwrap()
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd.env_remove("SKIM_DEBUG");
+    cmd
 }
 
 // ============================================================================
