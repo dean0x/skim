@@ -244,7 +244,7 @@ where
 {
     /// Maximum bytes we will read from stdin (64 MiB), consistent with the
     /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
-    const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
 
     let ParsedCommandConfig {
         program,
@@ -269,12 +269,12 @@ where
         // Size-limited to prevent unbounded memory growth from runaway pipes.
         let mut stdin_buf = String::new();
         let bytes_read = io::stdin()
-            .take(MAX_STDIN_BYTES)
+            .take(MAX_STDIN_BYTES as u64)
             .read_to_string(&mut stdin_buf)?;
-        if bytes_read as u64 >= MAX_STDIN_BYTES {
+        if bytes_read >= MAX_STDIN_BYTES {
             anyhow::bail!("stdin input exceeded 64 MiB limit");
         }
-        if !stdin_buf.trim().is_empty() {
+        if stdin_buf.bytes().any(|b| !b.is_ascii_whitespace()) {
             stdin_content = Some(stdin_buf);
         }
     }
