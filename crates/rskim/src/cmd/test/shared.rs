@@ -88,7 +88,7 @@ const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// Uses chunked reads (8 KiB) to enforce the size limit incrementally.
 /// Non-UTF-8 bytes are replaced via `String::from_utf8_lossy`.
-pub(super) fn read_stdin_raw() -> anyhow::Result<String> {
+fn read_stdin_raw() -> anyhow::Result<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
     let stdin = io::stdin();

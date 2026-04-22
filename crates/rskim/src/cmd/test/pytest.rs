@@ -37,7 +37,7 @@ use super::shared::{self, try_read_stdin};
 
 /// Run pytest and parse its output, or parse piped stdin.
 ///
-/// Detection logic (via [`should_read_stdin`]):
+/// Detection logic (via [`try_read_stdin`]):
 /// - If args are present OR stdin is a terminal → run pytest (execution mode)
 /// - If args are empty AND stdin is piped → read stdin; if empty, fall back
 ///   to running pytest (handles test harness environments where stdin is a
