@@ -38,13 +38,16 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
-        if stdin_has_data() {
+        if should_read_stdin(args) {
             let raw_output = read_stdin()?;
-            println!("{raw_output}");
-            // Stdin passthrough has no child process, so there is no exit code to
-            // preserve. FAILURE is the conservative default — callers who need a
-            // specific exit code should use the spawned-process path instead.
-            return Ok(ExitCode::FAILURE);
+            if !raw_output.trim().is_empty() {
+                println!("{raw_output}");
+                // Stdin passthrough has no child process, so there is no exit code to
+                // preserve. FAILURE is the conservative default — callers who need a
+                // specific exit code should use the spawned-process path instead.
+                return Ok(ExitCode::FAILURE);
+            }
+            // Empty stdin: fall through to the spawn path below.
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let runner = CommandRunner::new(None);
@@ -55,8 +58,15 @@ pub(crate) fn run(
     }
 
     let start = std::time::Instant::now();
-    let raw_output = if stdin_has_data() {
-        read_stdin()?
+    let raw_output = if should_read_stdin(args) {
+        let stdin_content = read_stdin()?;
+        if stdin_content.trim().is_empty() {
+            // Empty piped stdin: fall through to running vitest directly so the
+            // agent gets actual test output rather than a silent empty response.
+            run_vitest(program, args)?
+        } else {
+            stdin_content
+        }
     } else {
         run_vitest(program, args)?
     };
@@ -111,9 +121,13 @@ pub(crate) fn run(
 // Command execution
 // ============================================================================
 
-/// Check whether stdin has piped data (not a terminal).
-fn stdin_has_data() -> bool {
-    !io::stdin().is_terminal()
+/// Determine whether to read piped stdin instead of spawning the test runner.
+///
+/// The `args.is_empty()` guard is critical: without it, subprocess contexts
+/// (Claude Code, CI) where stdin is never a terminal would always read from
+/// empty stdin instead of spawning vitest.
+fn should_read_stdin(args: &[String]) -> bool {
+    !io::stdin().is_terminal() && args.is_empty()
 }
 
 /// Maximum bytes we will read from stdin (64 MiB).
@@ -829,5 +843,42 @@ Duration: 1.5s";
             !user_has_flag(&args, &["--reporter"]),
             "should not detect --reporter when absent"
         );
+    }
+
+    // ========================================================================
+    // should_read_stdin
+    // ========================================================================
+
+    #[test]
+    fn test_should_read_stdin_false_when_args_present() {
+        let args = vec!["--run".to_string(), "math".to_string()];
+        assert!(
+            !should_read_stdin(&args),
+            "non-empty args must prevent stdin mode"
+        );
+    }
+
+    #[test]
+    fn test_should_read_stdin_args_gate_short_circuits() {
+        for args in [
+            vec!["run".to_string()],
+            vec!["--reporter=verbose".to_string()],
+            vec!["--reporter=verbose".to_string(), "math".to_string()],
+            vec!["src/utils.test.ts".to_string()],
+        ] {
+            assert!(
+                !should_read_stdin(&args),
+                "should_read_stdin must return false for args: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_read_stdin_empty_args_defers_to_terminal() {
+        let result = should_read_stdin(&[]);
+        // In `cargo test`, stdin is typically a terminal → false.
+        // The point is that empty args don't unconditionally force stdin mode;
+        // it still checks is_terminal().
+        assert_eq!(result, !std::io::stdin().is_terminal());
     }
 }
