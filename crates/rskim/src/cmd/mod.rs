@@ -73,10 +73,10 @@ pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
         if n == 0 {
             break;
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_STDIN_BYTES {
+        if buf.len() + n > MAX_STDIN_BYTES {
             anyhow::bail!("stdin input exceeded 64 MiB limit");
         }
+        buf.extend_from_slice(&chunk[..n]);
     }
     Ok(String::from_utf8(buf)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
@@ -296,7 +296,7 @@ fn obtain_output(
     }
 
     let runner = CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
-    let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let args_str: Vec<&str> = args.iter().map(String::as_str).collect();
     match runner.run_with_env(program, &args_str, env_overrides) {
         Ok(out) => Ok(Some(out)),
         Err(e) => {

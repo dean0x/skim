@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::cmd::inject_flag_before_separator;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
@@ -30,9 +31,10 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: run `go test` without flag injections and forward raw output.
     if crate::cmd::is_passthrough_mode() {
-        let mut raw_args: Vec<String> = vec!["test".to_string()];
-        raw_args.extend_from_slice(args);
-        let raw_args_ref: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
+        let raw_args: Vec<String> = std::iter::once("test".to_string())
+            .chain(args.iter().cloned())
+            .collect();
+        let raw_args_ref: Vec<&str> = raw_args.iter().map(String::as_str).collect();
         let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
         let output = runner.run("go", &raw_args_ref).map_err(|e| {
             if crate::runner::is_spawn_error(&e) {
@@ -46,29 +48,21 @@ pub(crate) fn run(
         return Ok(ExitCode::from(code));
     }
 
-    let mut go_args: Vec<String> = vec!["test".to_string()];
-
-    // Inject -json before any `--` separator, unless the user already specified
-    // -json or -v (verbose mode produces non-JSON output).
+    // Build `go test [args...]`, injecting `-json` before any `--` separator
+    // unless the user already set `-json` or `-v`.
     //
     // Go flags use `-flag=false` to explicitly disable a flag, so we use
     // go-specific detection that treats `-v=false` as NOT having `-v`.
+    let mut go_args: Vec<String> = std::iter::once("test".to_string())
+        .chain(args.iter().cloned())
+        .collect();
+
     if !go_has_flag(args, "-json") && !go_has_flag(args, "-v") {
-        // Find the position of `--` if present, and inject -json before it.
-        if let Some(sep_pos) = args.iter().position(|a| a == "--") {
-            go_args.extend_from_slice(&args[..sep_pos]);
-            go_args.push("-json".to_string());
-            go_args.extend_from_slice(&args[sep_pos..]);
-        } else {
-            go_args.push("-json".to_string());
-            go_args.extend_from_slice(args);
-        }
-    } else {
-        go_args.extend_from_slice(args);
+        inject_flag_before_separator(&mut go_args, "-json");
     }
 
     let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
-    let go_args_ref: Vec<&str> = go_args.iter().map(|s| s.as_str()).collect();
+    let go_args_ref: Vec<&str> = go_args.iter().map(String::as_str).collect();
 
     let output = runner.run("go", &go_args_ref).map_err(|e| {
         if crate::runner::is_spawn_error(&e) {
@@ -100,9 +94,8 @@ pub(crate) fn run(
                 // messages without needing to re-run with SKIM_PASSTHROUGH=1.
                 // Pass the actual exit code (e.g. 2 for compilation errors) so
                 // the hint reflects the real status rather than a hardcoded 1.
-                use super::shared;
                 let actual_exit = output.exit_code.unwrap_or(1);
-                shared::emit_failure_context(&combined, actual_exit);
+                super::shared::emit_failure_context(&combined, actual_exit);
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -151,11 +144,12 @@ pub(crate) fn run(
 /// correct `-json` injection logic. The shared version does not handle
 /// this because `=false` is not a convention outside Go tooling.
 fn go_has_flag(args: &[String], flag: &str) -> bool {
+    let prefix = format!("{flag}=");
     args.iter().any(|a| {
         if a == flag {
             return true;
         }
-        if let Some(value) = a.strip_prefix(&format!("{flag}=")) {
+        if let Some(value) = a.strip_prefix(&prefix) {
             // -v=false means the flag is NOT set
             return value != "false";
         }

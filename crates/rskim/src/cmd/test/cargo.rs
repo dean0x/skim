@@ -63,7 +63,7 @@ pub(crate) fn run(
     }
 
     // Determine whether to read from stdin or execute the command.
-    // Delegates to shared::should_read_stdin for the same guard used by all
+    // Delegates to cmd::should_read_stdin for the same guard used by all
     // test parsers: stdin must be piped AND no user args provided.
     let use_stdin = should_read_stdin(args);
 
