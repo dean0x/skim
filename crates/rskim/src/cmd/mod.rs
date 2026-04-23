@@ -28,6 +28,7 @@ mod test;
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
@@ -35,6 +36,12 @@ use crate::runner::{CommandOutput, CommandRunner};
 // ============================================================================
 // Stdin reading
 // ============================================================================
+
+/// Default timeout for command execution (5 minutes).
+///
+/// Applied to all [`CommandRunner`] sites that don't have an explicit longer
+/// timeout (build commands use 600 s because compile times can be substantial).
+pub(crate) const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Determine whether to read piped stdin instead of spawning the command.
 ///
@@ -288,7 +295,7 @@ fn obtain_output(
         }
     }
 
-    let runner = CommandRunner::new(Some(std::time::Duration::from_secs(300)));
+    let runner = CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
     let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match runner.run_with_env(program, &args_str, env_overrides) {
         Ok(out) => Ok(Some(out)),

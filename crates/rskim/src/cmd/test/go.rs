@@ -33,7 +33,7 @@ pub(crate) fn run(
         let mut raw_args: Vec<String> = vec!["test".to_string()];
         raw_args.extend_from_slice(args);
         let raw_args_ref: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
-        let runner = CommandRunner::new(None);
+        let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
         let output = runner.run("go", &raw_args_ref).map_err(|e| {
             if crate::runner::is_spawn_error(&e) {
                 anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", e)
@@ -67,7 +67,7 @@ pub(crate) fn run(
         go_args.extend_from_slice(args);
     }
 
-    let runner = CommandRunner::new(None);
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
     let go_args_ref: Vec<&str> = go_args.iter().map(|s| s.as_str()).collect();
 
     let output = runner.run("go", &go_args_ref).map_err(|e| {

@@ -41,7 +41,10 @@ pub(crate) fn run(
         return shared::run_passthrough(
             args,
             |a| a.to_vec(),
-            |arg_refs| CommandRunner::new(None).run_with_node_fallback(program, arg_refs),
+            |arg_refs| {
+                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
+                    .run_with_node_fallback(program, arg_refs)
+            },
         );
     }
 
@@ -122,7 +125,7 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
 
     let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
 
-    let runner = CommandRunner::new(None);
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
     let output = runner
         .run_with_node_fallback(program, &arg_refs)
         .map_err(|e| {
