@@ -354,7 +354,15 @@ where
 
     let compressed = render_output(&result, output_format)?;
 
-    if code != 0 && !result.is_passthrough() {
+    // Hint fires on ALL non-zero exits regardless of tier. Passthrough tier
+    // still means skim processed the command through its rewrite hook — agents
+    // need the SKIM_PASSTHROUGH=1 escape hatch surfaced since the global
+    // CLAUDE.md docs no longer mention the flag. Text says "compressed" for
+    // consistency across tiers; the message's purpose is the escape hatch, not
+    // describing what skim did. When SKIM_PASSTHROUGH=1 is active, we already
+    // returned early above (the `is_passthrough_mode()` guard), so this never
+    // double-fires.
+    if code != 0 {
         eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
     }
 
@@ -467,16 +475,13 @@ mod tests {
     // check_passthrough_value / stderr hint guard
     // ========================================================================
 
-    /// Verify that passthrough mode detection works correctly for the guard
-    /// in `run_parsed_command_with_mode`. Passthrough returns early before
-    /// the hint is emitted; the `!result.is_passthrough()` guard ensures the
-    /// hint fires only for Full/Degraded results.
+    /// Verify that `SKIM_PASSTHROUGH=1` causes early return in
+    /// `run_parsed_command_with_mode`, bypassing all compression and the
+    /// stderr hint. The hint now fires on ALL non-zero exits regardless of
+    /// parse tier — the `is_passthrough_mode()` guard is the only mechanism
+    /// that suppresses it.
     #[test]
     fn test_no_stderr_hint_when_passthrough_mode() {
-        // Passthrough mode returns early before the hint is emitted.
-        // The guard `!result.is_passthrough()` in run_parsed_command_with_mode
-        // ensures the hint only fires for compressed (Full/Degraded) results.
-        // This test validates the passthrough predicate is correct.
         assert!(check_passthrough_value(Some("1".to_string())));
         assert!(check_passthrough_value(Some("true".to_string())));
     }
