@@ -36,6 +36,17 @@ use crate::runner::{CommandOutput, CommandRunner};
 // Stdin reading
 // ============================================================================
 
+/// Determine whether to read piped stdin instead of spawning the command.
+///
+/// Returns `true` when stdin is not a terminal AND `args` is empty. The
+/// `args.is_empty()` guard is critical: without it, subprocess contexts
+/// (Claude Code, CI) where stdin is never a terminal would always read from
+/// empty stdin instead of spawning the runner.
+pub(crate) fn should_read_stdin(args: &[String]) -> bool {
+    use std::io::IsTerminal;
+    !std::io::stdin().is_terminal() && args.is_empty()
+}
+
 /// Maximum bytes read from stdin (64 MiB).
 ///
 /// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
@@ -561,5 +572,43 @@ mod tests {
         let long_input = "a".repeat(100);
         let sanitized = sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
+    }
+
+    // ========================================================================
+    // should_read_stdin tests
+    // ========================================================================
+
+    #[test]
+    fn test_should_read_stdin_false_when_args_present() {
+        let args = vec!["--run".to_string(), "math".to_string()];
+        assert!(
+            !should_read_stdin(&args),
+            "non-empty args must prevent stdin mode"
+        );
+    }
+
+    #[test]
+    fn test_should_read_stdin_args_gate_short_circuits() {
+        for args in [
+            vec!["run".to_string()],
+            vec!["--reporter=verbose".to_string()],
+            vec!["--reporter=verbose".to_string(), "math".to_string()],
+            vec!["src/utils.test.ts".to_string()],
+        ] {
+            assert!(
+                !should_read_stdin(&args),
+                "should_read_stdin must return false for args: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_read_stdin_empty_args_defers_to_terminal() {
+        use std::io::IsTerminal;
+        let result = should_read_stdin(&[]);
+        // In `cargo test`, stdin is typically a terminal → false.
+        // The point is that empty args don't unconditionally force stdin mode;
+        // it still checks is_terminal().
+        assert_eq!(result, !std::io::stdin().is_terminal());
     }
 }

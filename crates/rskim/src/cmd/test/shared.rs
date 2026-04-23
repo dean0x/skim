@@ -1,13 +1,11 @@
 //! Shared helpers for test parser Tier-2 fallback paths.
 //!
 //! Provides [`scrape_failures`] which extracts failing test entries from
-//! plain-text runner output when JSON parsing is unavailable,
-//! [`should_read_stdin`] which implements the shared stdin-detection guard
-//! used by all test parsers that support piped input, and [`try_read_stdin`]
-//! which combines the stdin guard, chunked read, and whitespace-only check
+//! plain-text runner output when JSON parsing is unavailable, and
+//! [`try_read_stdin`] which combines the stdin guard (via
+//! [`crate::cmd::should_read_stdin`]), chunked read, and whitespace-only check
 //! into a single call.
 
-use std::io::IsTerminal;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -69,15 +67,6 @@ static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*[✕✗×]\s+(.+?)$").expect("valid vitest fail regex")
 });
 
-/// Determine whether to read piped stdin instead of spawning the test runner.
-///
-/// The `args.is_empty()` guard is critical: without it, subprocess contexts
-/// (Claude Code, CI) where stdin is never a terminal would always read from
-/// empty stdin instead of spawning the runner.
-pub(super) fn should_read_stdin(args: &[String]) -> bool {
-    !std::io::stdin().is_terminal() && args.is_empty()
-}
-
 /// Try to read piped stdin, returning `Some(content)` only when there is
 /// non-whitespace data to process.
 ///
@@ -91,7 +80,7 @@ pub(super) fn should_read_stdin(args: &[String]) -> bool {
 /// Returns `Ok(Some(content))` when there is content to parse, `Ok(None)` when
 /// the guard is false or the pipe is empty/whitespace-only.
 pub(super) fn try_read_stdin(args: &[String]) -> anyhow::Result<Option<String>> {
-    if !should_read_stdin(args) {
+    if !crate::cmd::should_read_stdin(args) {
         return Ok(None);
     }
     let content = crate::cmd::read_stdin_bounded()?;
@@ -420,40 +409,4 @@ mod tests {
         assert_eq!(result, "line2\r\nline3");
     }
 
-    // ========================================================================
-    // should_read_stdin tests (moved from vitest.rs — function lives here)
-    // ========================================================================
-
-    #[test]
-    fn test_should_read_stdin_false_when_args_present() {
-        let args = vec!["--run".to_string(), "math".to_string()];
-        assert!(
-            !should_read_stdin(&args),
-            "non-empty args must prevent stdin mode"
-        );
-    }
-
-    #[test]
-    fn test_should_read_stdin_args_gate_short_circuits() {
-        for args in [
-            vec!["run".to_string()],
-            vec!["--reporter=verbose".to_string()],
-            vec!["--reporter=verbose".to_string(), "math".to_string()],
-            vec!["src/utils.test.ts".to_string()],
-        ] {
-            assert!(
-                !should_read_stdin(&args),
-                "should_read_stdin must return false for args: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_should_read_stdin_empty_args_defers_to_terminal() {
-        let result = should_read_stdin(&[]);
-        // In `cargo test`, stdin is typically a terminal → false.
-        // The point is that empty args don't unconditionally force stdin mode;
-        // it still checks is_terminal().
-        assert_eq!(result, !std::io::stdin().is_terminal());
-    }
 }

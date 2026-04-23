@@ -21,14 +21,14 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::{
-    inject_flag_before_separator, run_parsed_command_with_mode, user_has_flag, OutputFormat,
-    ParsedCommandConfig,
+    inject_flag_before_separator, run_parsed_command_with_mode, should_read_stdin, user_has_flag,
+    OutputFormat, ParsedCommandConfig,
 };
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::shared::{scrape_failures, should_read_stdin, TestKind};
+use super::shared::{scrape_failures, TestKind};
 
 // Static regex patterns compiled once via LazyLock (avoids per-call compilation).
 static RE_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());

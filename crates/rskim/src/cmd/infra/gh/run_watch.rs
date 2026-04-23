@@ -80,7 +80,7 @@ pub(super) fn run_watch(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow
     };
 
     // Pipe mode: stdin is piped and no run-ID args were given (AD-STR-2).
-    if super::super::should_use_stdin(args) {
+    if crate::cmd::should_read_stdin(args) {
         return Ok(run_streamed_stdin(parser, cfg));
     }
 
@@ -377,10 +377,10 @@ mod tests {
         );
     }
 
-    // ---- should_use_stdin helper ----
+    // ---- should_read_stdin helper (canonical location: crate::cmd) ----
 
     #[test]
-    fn test_should_use_stdin_returns_false_when_args_present() {
+    fn test_should_read_stdin_returns_false_when_args_present() {
         // When args are non-empty, stdin mode must not be selected regardless
         // of terminal state (the tty check is moot at the unit level; we test
         // the args gate here).
@@ -392,17 +392,17 @@ mod tests {
         // Both branches must be true for stdin mode; a non-empty args slice
         // makes the result false regardless of terminal state.
         //
-        // Note: `should_use_stdin` returns false in unit tests because the
+        // Note: `should_read_stdin` returns false in unit tests because the
         // test binary's stdin IS a terminal (cargo test does not pipe stdin).
         // That is the intended behaviour — no false positives in unit tests.
         assert!(
-            !crate::cmd::infra::should_use_stdin(&args),
+            !crate::cmd::should_read_stdin(&args),
             "non-empty args must not trigger stdin mode"
         );
     }
 
     #[test]
-    fn test_should_use_stdin_args_gate_short_circuits() {
+    fn test_should_read_stdin_args_gate_short_circuits() {
         // Verify that any non-empty args slice always prevents stdin mode,
         // regardless of the terminal state.  This tests the args.is_empty()
         // gate in isolation: the AND condition means a non-empty args slice
@@ -413,7 +413,7 @@ mod tests {
         for args_strs in cases {
             let args: Vec<String> = args_strs.iter().map(|s| s.to_string()).collect();
             assert!(
-                !crate::cmd::infra::should_use_stdin(&args),
+                !crate::cmd::should_read_stdin(&args),
                 "non-empty args {:?} must not trigger stdin mode",
                 args
             );
