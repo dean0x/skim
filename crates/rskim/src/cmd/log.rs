@@ -9,7 +9,7 @@
 //! - **Tier 3 (Passthrough)**: Raw output
 
 use std::collections::HashMap;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -120,7 +120,7 @@ pub(crate) fn run(
     let flags = parse_flags(args);
     // Issue 5: capture start time before reading stdin for real duration tracking.
     let start = std::time::Instant::now();
-    let stdin_buf = read_stdin()?;
+    let stdin_buf = super::read_stdin_bounded()?;
     let raw_input = stdin_buf.as_str();
     let result = compress_log(raw_input, &flags);
     let compressed = emit_result(&result, &flags)?;
@@ -142,17 +142,6 @@ pub(crate) fn run(
         result.tier_name(),
     );
     Ok(ExitCode::SUCCESS)
-}
-
-/// Read up to 64 MiB from stdin into a String.
-fn read_stdin() -> anyhow::Result<String> {
-    const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
-    let mut buf = String::new();
-    let bytes_read = io::stdin().take(MAX_STDIN_BYTES).read_to_string(&mut buf)?;
-    if bytes_read as u64 >= MAX_STDIN_BYTES {
-        anyhow::bail!("stdin input exceeded 64 MiB limit");
-    }
-    Ok(buf)
 }
 
 /// Record analytics for this command invocation (fire-and-forget).

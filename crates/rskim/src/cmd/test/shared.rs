@@ -7,7 +7,7 @@
 //! which combines the stdin guard, chunked read, and whitespace-only check
 //! into a single call.
 
-use std::io::{self, IsTerminal, Read};
+use std::io::IsTerminal;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -78,42 +78,12 @@ pub(super) fn should_read_stdin(args: &[String]) -> bool {
     !std::io::stdin().is_terminal() && args.is_empty()
 }
 
-/// Maximum bytes read from stdin (64 MiB).
-///
-/// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
-/// memory growth when a large file is accidentally piped in.
-const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
-
-/// Read stdin into a `String`, capped at [`MAX_STDIN_BYTES`].
-///
-/// Uses chunked reads (8 KiB) to enforce the size limit incrementally.
-/// Non-UTF-8 bytes are replaced with U+FFFD via lossy conversion
-/// (only invoked when validation fails; the common valid-UTF-8 path is zero-copy).
-fn read_stdin_raw() -> anyhow::Result<String> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8 * 1024];
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    loop {
-        let n = handle.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() + n > MAX_STDIN_BYTES {
-            anyhow::bail!("stdin exceeded {} byte limit", MAX_STDIN_BYTES);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(String::from_utf8(buf)
-        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
-}
-
 /// Try to read piped stdin, returning `Some(content)` only when there is
 /// non-whitespace data to process.
 ///
 /// Combines three steps that all test parsers previously duplicated:
 /// 1. [`should_read_stdin`] guard — if false, return `Ok(None)` immediately.
-/// 2. [`read_stdin_raw`] — propagate I/O errors via `?`.
+/// 2. [`crate::cmd::read_stdin_bounded`] — propagate I/O errors via `?`.
 /// 3. Whitespace check — `bytes().any(|b| !b.is_ascii_whitespace())` for
 ///    short-circuit on the first non-whitespace byte; returns `Ok(None)` when
 ///    the pipe is empty so callers fall through to the spawn path.
@@ -124,7 +94,7 @@ pub(super) fn try_read_stdin(args: &[String]) -> anyhow::Result<Option<String>> 
     if !should_read_stdin(args) {
         return Ok(None);
     }
-    let content = read_stdin_raw()?;
+    let content = crate::cmd::read_stdin_bounded()?;
     if content.bytes().any(|b| !b.is_ascii_whitespace()) {
         Ok(Some(content))
     } else {

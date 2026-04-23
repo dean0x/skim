@@ -33,6 +33,38 @@ use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
 // ============================================================================
+// Stdin reading
+// ============================================================================
+
+/// Maximum bytes read from stdin (64 MiB).
+///
+/// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
+/// memory growth when a large file is accidentally piped in.
+pub(crate) const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read all of stdin into a `String`, capped at [`MAX_STDIN_BYTES`].
+///
+/// Uses chunked 8 KiB reads and try-valid-then-lossy UTF-8 conversion
+/// (matching `read_pipe` in `runner.rs`).
+pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut stdin = io::stdin().lock();
+    loop {
+        let n = stdin.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_STDIN_BYTES {
+            anyhow::bail!("stdin input exceeded 64 MiB limit");
+        }
+    }
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+// ============================================================================
 // SKIM_PASSTHROUGH helpers
 // ============================================================================
 
@@ -233,16 +265,8 @@ fn obtain_output(
     install_hint: &str,
     use_stdin: bool,
 ) -> anyhow::Result<Option<CommandOutput>> {
-    const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
-
     if use_stdin {
-        let mut stdin_buf = String::new();
-        let bytes_read = io::stdin()
-            .take(MAX_STDIN_BYTES as u64)
-            .read_to_string(&mut stdin_buf)?;
-        if bytes_read >= MAX_STDIN_BYTES {
-            anyhow::bail!("stdin input exceeded 64 MiB limit");
-        }
+        let stdin_buf = read_stdin_bounded()?;
         if stdin_buf.bytes().any(|b| !b.is_ascii_whitespace()) {
             return Ok(Some(CommandOutput {
                 stdout: stdin_buf,
