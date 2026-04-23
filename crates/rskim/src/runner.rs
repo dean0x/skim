@@ -247,8 +247,9 @@ pub(crate) fn is_spawn_error(err: &anyhow::Error) -> bool {
 /// Maximum bytes we will read from a single pipe (64 MiB).
 ///
 /// Prevents unbounded memory growth when a child process produces
-/// unexpectedly large output.
-const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// unexpectedly large output. Shared with `cmd::MAX_STDIN_BYTES` via re-export
+/// so both limits stay in sync without a separate constant.
+pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Read a pipe into a UTF-8 String, capped at [`MAX_OUTPUT_BYTES`].
 ///
@@ -816,6 +817,25 @@ mod tests {
             timeout: Duration::from_secs(1),
         }
         .into();
+        assert!(!is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_io() {
+        let err: anyhow::Error =
+            RunnerError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")).into();
+        assert!(!is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_pipe_capture_failed() {
+        let err: anyhow::Error = RunnerError::PipeCaptureFailed { pipe: "stdout" }.into();
+        assert!(!is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_reader_panicked() {
+        let err: anyhow::Error = RunnerError::ReaderPanicked { pipe: "stderr" }.into();
         assert!(!is_spawn_error(&err));
     }
 }

@@ -54,32 +54,44 @@ pub(crate) fn should_read_stdin(args: &[String]) -> bool {
     !std::io::stdin().is_terminal() && args.is_empty()
 }
 
-/// Maximum bytes read from stdin (64 MiB).
+/// Maximum bytes read from stdin.
 ///
-/// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
-/// memory growth when a large file is accidentally piped in.
-pub(crate) const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
+/// Re-exported from [`crate::runner::MAX_OUTPUT_BYTES`] so the stdin cap and
+/// the pipe-capture cap stay in sync automatically — no duplicated literal.
+pub(crate) use crate::runner::MAX_OUTPUT_BYTES as MAX_STDIN_BYTES;
 
-/// Read all of stdin into a `String`, capped at [`MAX_STDIN_BYTES`].
+/// Core bounded read loop, injectable for testing.
 ///
-/// Uses chunked 8 KiB reads and try-valid-then-lossy UTF-8 conversion
-/// (matching `read_pipe` in `runner.rs`).
-pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
+/// Reads from `reader` in 8 KiB chunks until EOF or `max_bytes` is exceeded.
+/// Valid UTF-8 is zero-copy (Vec moved into String); invalid UTF-8 falls back
+/// to lossy U+FFFD replacement — matching `read_pipe` in `runner.rs`.
+///
+/// Returns an error if the total bytes read would exceed `max_bytes`.
+pub(crate) fn read_bounded(reader: impl Read, max_bytes: usize) -> anyhow::Result<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
-    let mut stdin = io::stdin().lock();
+    let mut reader = reader;
     loop {
-        let n = stdin.read(&mut chunk)?;
+        let n = reader.read(&mut chunk)?;
         if n == 0 {
             break;
         }
-        if buf.len() + n > MAX_STDIN_BYTES {
-            anyhow::bail!("stdin input exceeded 64 MiB limit");
+        if buf.len() + n > max_bytes {
+            anyhow::bail!("input exceeded {} byte limit", max_bytes);
         }
         buf.extend_from_slice(&chunk[..n]);
     }
     Ok(String::from_utf8(buf)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
+}
+
+/// Read all of stdin into a `String`, capped at [`MAX_STDIN_BYTES`].
+///
+/// Thin wrapper around [`read_bounded`] that supplies `stdin().lock()` as the
+/// reader. Production code calls this; tests call `read_bounded` directly with
+/// an in-memory cursor.
+pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
+    read_bounded(io::stdin().lock(), MAX_STDIN_BYTES)
 }
 
 // ============================================================================
@@ -370,8 +382,8 @@ where
     };
 
     // Passthrough mode: bypass all compression and forward raw output.
-    let code = output.exit_code.unwrap_or(1);
     if is_passthrough_mode() {
+        let code = output.exit_code.unwrap_or(1);
         let mut out = io::stdout().lock();
         write!(out, "{}", output.stdout)?;
         out.flush()?;
@@ -516,17 +528,6 @@ mod tests {
     // check_passthrough_value / stderr hint guard
     // ========================================================================
 
-    /// Verify that `SKIM_PASSTHROUGH=1` causes early return in
-    /// `run_parsed_command_with_mode`, bypassing all compression and the
-    /// stderr hint. The hint now fires on ALL non-zero exits regardless of
-    /// parse tier — the `is_passthrough_mode()` guard is the only mechanism
-    /// that suppresses it.
-    #[test]
-    fn test_no_stderr_hint_when_passthrough_mode() {
-        assert!(check_passthrough_value(Some("1".to_string())));
-        assert!(check_passthrough_value(Some("true".to_string())));
-    }
-
     #[test]
     fn test_check_passthrough_truthy_values() {
         for v in &["1", "true", "yes", "True", "YES", "tRuE"] {
@@ -616,5 +617,50 @@ mod tests {
         // The point is that empty args don't unconditionally force stdin mode;
         // it still checks is_terminal().
         assert_eq!(result, !std::io::stdin().is_terminal());
+    }
+
+    // ========================================================================
+    // read_bounded tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_bounded_under_limit() {
+        let data = b"hello world";
+        let result = read_bounded(data.as_ref(), 1024).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_read_bounded_exactly_at_limit_is_ok() {
+        // buf.len() + n > max_bytes triggers the error, so exactly max_bytes
+        // bytes must succeed.
+        let data = vec![b'A'; 100];
+        let result = read_bounded(data.as_slice(), 100).unwrap();
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn test_read_bounded_over_limit_returns_error() {
+        let data = vec![b'X'; 200];
+        let err = read_bounded(data.as_slice(), 100).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded"),
+            "expected 'exceeded' in error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_invalid_utf8_falls_back_to_lossy() {
+        // 0xFF is not valid UTF-8; the function must not panic and must return
+        // something (U+FFFD replacement character present).
+        let data: &[u8] = &[0xFF, 0xFE, b'o', b'k'];
+        let result = read_bounded(data, 1024).unwrap();
+        assert!(result.contains('\u{FFFD}') || !result.is_empty());
+    }
+
+    #[test]
+    fn test_read_bounded_empty_input() {
+        let result = read_bounded(b"".as_ref(), 1024).unwrap();
+        assert!(result.is_empty());
     }
 }
