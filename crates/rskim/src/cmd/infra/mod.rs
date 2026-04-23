@@ -36,7 +36,7 @@ pub(crate) fn run(
     }
 
     let (filtered_args, show_stats) = extract_show_stats(args);
-    let (filtered_args, json_output) = super::extract_json_flag(&filtered_args);
+    let (filtered_args, json_output) = extract_infra_json_flag(&filtered_args);
 
     let Some((tool_name, tool_args)) = filtered_args.split_first() else {
         print_help();
@@ -65,6 +65,41 @@ pub(crate) fn run(
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// Extract `--json` for skim's output format, preserving `--json <value>`
+/// pairs that belong to the underlying tool (e.g., `gh --json fields`).
+///
+/// Bare `--json` (at end of args or followed by another flag) is skim's
+/// boolean flag. `--json <value>` (followed by a non-flag token) is the
+/// tool's flag and both tokens are preserved in the output.
+///
+/// Scoped to infra rather than replacing the global [`super::extract_json_flag`]
+/// because lint tests use `["--json", "eslint"]` where the tool name follows
+/// `--json` — a value-aware heuristic would misidentify it as a `--json` value.
+/// Among infra tools, only `gh` uses `--json <value>` for field selection.
+fn extract_infra_json_flag(args: &[String]) -> (Vec<String>, bool) {
+    let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+    let mut is_json = false;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--json" {
+            let next_is_value = args
+                .get(i + 1)
+                .is_some_and(|next| !next.starts_with('-'));
+            if next_is_value {
+                filtered.push(args[i].clone());
+                i += 1;
+                filtered.push(args[i].clone());
+            } else {
+                is_json = true;
+            }
+        } else {
+            filtered.push(args[i].clone());
+        }
+        i += 1;
+    }
+    (filtered, is_json)
 }
 
 fn print_help() {
@@ -292,6 +327,73 @@ mod tests {
         assert!(
             label.contains("github.com/org/repo"),
             "host/path must be preserved in label: {label}"
+        );
+    }
+
+    // ========================================================================
+    // extract_infra_json_flag tests
+    // ========================================================================
+
+    fn s(v: &str) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn test_extract_infra_json_bare_at_end() {
+        let args = vec![s("gh"), s("run"), s("--json")];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec![s("gh"), s("run")]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_with_value_preserved() {
+        let args = vec![s("gh"), s("run"), s("--json"), s("databaseId,status")];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(
+            filtered,
+            vec![s("gh"), s("run"), s("--json"), s("databaseId,status")]
+        );
+    }
+
+    #[test]
+    fn test_extract_infra_json_before_flag_stripped() {
+        let args = vec![s("gh"), s("--json"), s("--verbose")];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec![s("gh"), s("--verbose")]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_absent() {
+        let args = vec![s("gh"), s("run"), s("list")];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(filtered, vec![s("gh"), s("run"), s("list")]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_single_field() {
+        let args = vec![s("gh"), s("run"), s("--json"), s("status")];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(
+            filtered,
+            vec![s("gh"), s("run"), s("--json"), s("status")]
+        );
+    }
+
+    #[test]
+    fn test_extract_infra_json_multiple_json_tokens() {
+        // First --json is tool's field selector (value follows), second is skim's bare flag.
+        // Expected: value pair preserved, bare flag extracted, is_json = true.
+        let args = vec![s("gh"), s("run"), s("--json"), s("fields"), s("--json")];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(
+            filtered,
+            vec![s("gh"), s("run"), s("--json"), s("fields")]
         );
     }
 }
