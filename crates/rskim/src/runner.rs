@@ -174,11 +174,7 @@ impl CommandRunner {
                 // PipeCaptureFailed, ReaderPanicked, Io — mean the program was
                 // found and launched; retrying via npx makes no sense and could
                 // mask real failures.
-                let is_spawn_failure = original_err
-                    .downcast_ref::<RunnerError>()
-                    .map(|e| matches!(e, RunnerError::SpawnFailed { .. }))
-                    .unwrap_or(false);
-                if !is_spawn_failure {
+                if !is_spawn_error(&original_err) {
                     return Err(original_err);
                 }
 
@@ -236,6 +232,16 @@ impl CommandRunner {
             }
         }
     }
+}
+
+/// Return `true` when `err` is a [`RunnerError::SpawnFailed`].
+///
+/// Use this for control-flow detection instead of `err.to_string().contains("failed to execute")`,
+/// which couples to the `Display` format and breaks silently when the message changes.
+pub(crate) fn is_spawn_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RunnerError>()
+        .map(|e| matches!(e, RunnerError::SpawnFailed { .. }))
+        .unwrap_or(false)
 }
 
 /// Maximum bytes we will read from a single pipe (64 MiB).
@@ -510,6 +516,7 @@ mod tests {
         let runner = CommandRunner::new(None);
         let err = runner.run("", &[]).unwrap_err();
         let msg = err.to_string();
+        // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
         assert!(
             msg.contains("failed to execute"),
             "Expected 'failed to execute' in error, got: {msg}"
@@ -633,6 +640,7 @@ mod tests {
             .run_with_node_fallback("/nonexistent-binary-1234", &[])
             .unwrap_err();
         let msg = err.to_string();
+        // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
         assert!(
             msg.contains("failed to execute"),
             "Expected 'failed to execute', got: {msg}"
@@ -647,6 +655,7 @@ mod tests {
             .run_with_node_fallback("./nonexistent-binary-5678", &[])
             .unwrap_err();
         let msg = err.to_string();
+        // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
         assert!(
             msg.contains("failed to execute"),
             "Expected 'failed to execute', got: {msg}"
@@ -669,6 +678,7 @@ mod tests {
         match runner.run_with_node_fallback("__skim_nonexistent_9999__", &[]) {
             Err(e) => {
                 let msg = e.to_string();
+                // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
                 assert!(
                     msg.contains("failed to execute") || msg.contains("__skim_nonexistent"),
                     "Expected original spawn error, got: {msg}"
@@ -726,6 +736,7 @@ mod tests {
         match runner.run_with_node_fallback("__skim_nonexistent_npx_test_8888__", &[]) {
             Err(e) => {
                 let msg = e.to_string();
+                // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
                 assert!(
                     msg.contains("failed to execute") || msg.contains("__skim_nonexistent"),
                     "Expected spawn error, got: {msg}"
@@ -783,5 +794,28 @@ mod tests {
             "all args must be preserved in output, got: {out:?}"
         );
         assert_eq!(result.exit_code, Some(0));
+    }
+
+    // ========================================================================
+    // is_spawn_error tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_spawn_error_true() {
+        let err: anyhow::Error = RunnerError::SpawnFailed {
+            program: "nonexistent".into(),
+            source: io::Error::new(io::ErrorKind::NotFound, "not found"),
+        }
+        .into();
+        assert!(is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_timeout() {
+        let err: anyhow::Error = RunnerError::Timeout {
+            timeout: Duration::from_secs(1),
+        }
+        .into();
+        assert!(!is_spawn_error(&err));
     }
 }

@@ -293,8 +293,7 @@ fn obtain_output(
     match runner.run_with_env(program, &args_str, env_overrides) {
         Ok(out) => Ok(Some(out)),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("failed to execute") {
+            if crate::runner::is_spawn_error(&e) {
                 eprintln!("error: '{program}' not found");
                 eprintln!("hint: {install_hint}");
                 return Ok(None);

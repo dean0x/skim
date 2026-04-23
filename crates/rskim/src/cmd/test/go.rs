@@ -35,9 +35,8 @@ pub(crate) fn run(
         let raw_args_ref: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
         let runner = CommandRunner::new(None);
         let output = runner.run("go", &raw_args_ref).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("failed to execute") {
-                anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", msg)
+            if crate::runner::is_spawn_error(&e) {
+                anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", e)
             } else {
                 e
             }
@@ -72,9 +71,8 @@ pub(crate) fn run(
     let go_args_ref: Vec<&str> = go_args.iter().map(|s| s.as_str()).collect();
 
     let output = runner.run("go", &go_args_ref).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("failed to execute") {
-            anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", msg)
+        if crate::runner::is_spawn_error(&e) {
+            anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", e)
         } else {
             e
         }

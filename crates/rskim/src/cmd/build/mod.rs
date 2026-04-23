@@ -112,8 +112,7 @@ pub(super) fn run_parsed_command(
     let output = match runner.run_with_env(program, &str_args, env_vars) {
         Ok(output) => output,
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("failed to execute") {
+            if crate::runner::is_spawn_error(&e) {
                 anyhow::bail!(
                     "{program}: command not found\n\
                      Hint: {install_hint}"
