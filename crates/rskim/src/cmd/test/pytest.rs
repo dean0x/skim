@@ -49,16 +49,7 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression and forward raw output unchanged.
     if crate::cmd::is_passthrough_mode() {
-        if let Some(raw) = try_read_stdin(args)? {
-            print!("{raw}");
-            return Ok(ExitCode::FAILURE);
-        }
-        let final_args = build_args(args);
-        let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-        let output = run_pytest(&arg_refs)?;
-        print!("{}", crate::cmd::combine_output(&output));
-        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-        return Ok(ExitCode::from(code));
+        return shared::run_passthrough(args, build_args, run_pytest);
     }
 
     // Intercept --help/-h: show skim's pytest help, then forward to real pytest

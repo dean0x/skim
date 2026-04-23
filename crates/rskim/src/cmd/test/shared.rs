@@ -6,11 +6,13 @@
 //! [`crate::cmd::should_read_stdin`]), chunked read, and whitespace-only check
 //! into a single call.
 
+use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use crate::output::canonical::{TestEntry, TestOutcome};
+use crate::runner::CommandOutput;
 
 /// Identifies which test runner produced the text being scraped.
 ///
@@ -89,6 +91,32 @@ pub(super) fn try_read_stdin(args: &[String]) -> anyhow::Result<Option<String>> 
     } else {
         Ok(None)
     }
+}
+
+/// Run the passthrough path for a test runner.
+///
+/// Handles the two sub-cases of SKIM_PASSTHROUGH mode for test runners:
+/// 1. Piped stdin — print the raw content and return FAILURE (no exit code available).
+/// 2. Spawn mode — run the command via `run_cmd` and forward the combined output.
+///
+/// `prepare_args` transforms the user args into the final argument list that
+/// `run_cmd` receives (e.g., adding `--reporter=json` or `--tb=short`).
+/// `run_cmd` receives the prepared args as `&[&str]` and returns a `CommandOutput`.
+pub(super) fn run_passthrough(
+    args: &[String],
+    prepare_args: impl FnOnce(&[String]) -> Vec<String>,
+    run_cmd: impl FnOnce(&[&str]) -> anyhow::Result<CommandOutput>,
+) -> anyhow::Result<ExitCode> {
+    if let Some(raw) = try_read_stdin(args)? {
+        print!("{raw}");
+        return Ok(ExitCode::FAILURE);
+    }
+    let final_args = prepare_args(args);
+    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
+    let output = run_cmd(&arg_refs)?;
+    print!("{}", crate::cmd::combine_output(&output));
+    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+    Ok(ExitCode::from(code))
 }
 
 /// Extract failing test entries from plain-text runner output when JSON parsing

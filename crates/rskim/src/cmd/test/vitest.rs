@@ -38,19 +38,11 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
-        if let Some(raw_output) = try_read_stdin(args)? {
-            println!("{raw_output}");
-            // Stdin passthrough has no child process, so there is no exit code to
-            // preserve. FAILURE is the conservative default — callers who need a
-            // specific exit code should use the spawned-process path instead.
-            return Ok(ExitCode::FAILURE);
-        }
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let runner = CommandRunner::new(None);
-        let output = runner.run_with_node_fallback(program, &arg_refs)?;
-        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-        print!("{}", crate::cmd::combine_output(&output));
-        return Ok(ExitCode::from(code));
+        return shared::run_passthrough(
+            args,
+            |a| a.to_vec(),
+            |arg_refs| CommandRunner::new(None).run_with_node_fallback(program, arg_refs),
+        );
     }
 
     let start = std::time::Instant::now();
