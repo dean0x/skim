@@ -242,7 +242,108 @@ pub(super) fn last_n_lines(text: &str, n: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    // ========================================================================
+    // run_passthrough tests (spawn branch)
+    //
+    // In Rust unit tests stdin is never piped (it's the test harness terminal),
+    // so `try_read_stdin` always returns Ok(None) and `run_passthrough` always
+    // takes the spawn branch. The stdin branch is covered by E2E tests in
+    // cli_e2e_test_parsers (test_vitest_passthrough_* and
+    // test_pytest_passthrough_*) which pipe stdin via `write_stdin`.
+    // ========================================================================
+
+    fn make_output(stdout: &str, stderr: &str, code: Option<i32>) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: code,
+            duration: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_exit_zero_returns_success() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("ok output\n", "", Some(0))),
+        )
+        .expect("run_passthrough should not error");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_exit_nonzero_preserves_code() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("fail output\n", "", Some(2))),
+        )
+        .expect("run_passthrough should not error");
+        // exit code 2 → ExitCode::from(2)
+        assert_eq!(code, ExitCode::from(2u8));
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_exit_none_returns_failure() {
+        // When the command is killed by a signal, exit_code is None.
+        // run_passthrough falls back to exit code 1 (FAILURE).
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("", "", None)),
+        )
+        .expect("run_passthrough should not error");
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_prepare_args_is_called() {
+        // Verify that prepare_args is invoked: inject a sentinel arg and assert
+        // run_cmd receives it.
+        let mut received_args: Vec<String> = Vec::new();
+        let code = run_passthrough(
+            &["base-arg".to_string()],
+            |a| {
+                let mut v = a.to_vec();
+                v.push("--injected".to_string());
+                v
+            },
+            |arg_refs| {
+                received_args = arg_refs.iter().map(|s| s.to_string()).collect();
+                Ok(make_output("", "", Some(0)))
+            },
+        )
+        .expect("run_passthrough should not error");
+        assert!(
+            received_args.contains(&"--injected".to_string()),
+            "prepare_args sentinel must reach run_cmd: {received_args:?}"
+        );
+        assert!(
+            received_args.contains(&"base-arg".to_string()),
+            "original args must be forwarded: {received_args:?}"
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_run_cmd_error_propagates() {
+        let result = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Err(anyhow::anyhow!("spawn failed: binary not found")),
+        );
+        assert!(result.is_err(), "error from run_cmd must propagate");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("spawn failed"),
+            "error message should contain spawn context: {msg}"
+        );
+    }
 
     #[test]
     fn test_scrape_failures_cargo_basic() {
