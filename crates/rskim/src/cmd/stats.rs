@@ -338,9 +338,8 @@ fn render_summary(
     )?;
     writeln!(
         w,
-        "  Tokens saved: {} ({})",
+        "  Tokens saved: {}",
         tokens::format_number(summary.tokens_saved as usize).green(),
-        color_pct(weighted_pct)
     )?;
     writeln!(w)?;
     writeln!(
@@ -1149,7 +1148,7 @@ mod tests {
         // raw=100_000, saved=70_000 → weighted = 70.0%
         let store = MockStore::with_data();
         let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
-        // Summary should show the weighted % (70.0%) next to "Tokens saved"
+        // Summary should show the weighted % (70.0%) on the bar line below "Tokens saved"
         assert!(
             output.contains("70.0%"),
             "summary should show weighted savings pct"
