@@ -250,6 +250,23 @@ pub(crate) fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
         })
 }
 
+/// Extract the skim hook version from the text contents of a hook script.
+///
+/// Recognises two version formats:
+/// - New format: `export SKIM_HOOK_VERSION="x.y.z"`
+/// - Legacy format: `# skim-hook vx.y.z`
+fn parse_version_from_script(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        if let Some(ver) = line.strip_prefix("# skim-hook v").or_else(|| {
+            line.strip_prefix("export SKIM_HOOK_VERSION=\"")
+                .and_then(|s| s.strip_suffix('"'))
+        }) {
+            return Some(ver.to_string());
+        }
+    }
+    None
+}
+
 /// Try to extract the skim version from the hook script referenced in a settings entry.
 ///
 /// `prefetched_contents` is the already-read hook script text from `detect_state`.
@@ -268,41 +285,38 @@ pub(super) fn extract_hook_version_from_entry(
     let hooks = entry.get("hooks")?.as_array()?;
     for hook in hooks {
         let cmd = hook.get("command")?.as_str()?;
-        if cmd.contains("skim-rewrite") {
-            // Try reading the script file
-            let script_path = if cmd.starts_with('/') || cmd.starts_with('.') {
-                PathBuf::from(cmd)
-            } else {
-                hooks_dir.join(HOOK_SCRIPT_NAME)
-            };
+        if !cmd.contains("skim-rewrite") {
+            continue;
+        }
 
-            // Validate the resolved path is within the expected hooks directory.
-            // canonicalize() resolves symlinks and ".." to get the real path.
-            let canonical = std::fs::canonicalize(&script_path).ok()?;
-            let canonical_hooks_dir = std::fs::canonicalize(&hooks_dir).ok()?;
-            if !canonical.starts_with(&canonical_hooks_dir) {
-                // Path escapes the hooks directory -- skip version extraction.
-                return None;
-            }
+        // Resolve the script path.
+        let script_path = if cmd.starts_with('/') || cmd.starts_with('.') {
+            PathBuf::from(cmd)
+        } else {
+            hooks_dir.join(HOOK_SCRIPT_NAME)
+        };
 
-            // Use prefetched contents when available (path validated above), otherwise
-            // fall back to reading from disk (e.g. in tests or when called standalone).
-            let owned;
-            let contents: &str = if let Some(pre) = prefetched_contents {
-                pre
-            } else {
-                owned = std::fs::read_to_string(&canonical).ok()?;
-                &owned
-            };
+        // Validate the resolved path is within the expected hooks directory.
+        // canonicalize() resolves symlinks and ".." to get the real path.
+        let canonical = std::fs::canonicalize(&script_path).ok()?;
+        let canonical_hooks_dir = std::fs::canonicalize(&hooks_dir).ok()?;
+        if !canonical.starts_with(&canonical_hooks_dir) {
+            // Path escapes the hooks directory -- skip version extraction.
+            return None;
+        }
 
-            for line in contents.lines() {
-                if let Some(ver) = line.strip_prefix("# skim-hook v").or_else(|| {
-                    line.strip_prefix("export SKIM_HOOK_VERSION=\"")
-                        .and_then(|s| s.strip_suffix('"'))
-                }) {
-                    return Some(ver.to_string());
-                }
-            }
+        // Use prefetched contents when available (path validated above), otherwise
+        // fall back to reading from disk (e.g. in tests or when called standalone).
+        let owned;
+        let contents: &str = if let Some(pre) = prefetched_contents {
+            pre
+        } else {
+            owned = std::fs::read_to_string(&canonical).ok()?;
+            &owned
+        };
+
+        if let Some(ver) = parse_version_from_script(contents) {
+            return Some(ver);
         }
     }
     None
@@ -408,5 +422,36 @@ mod tests {
 
         let result = scan_existing_bash_hooks(Some(&settings));
         assert!(result.is_empty(), "non-Bash matchers should be ignored");
+    }
+
+    // ---- parse_version_from_script ----
+
+    #[test]
+    fn test_parse_version_from_script_new_format() {
+        let script = "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim rewrite --hook\n";
+        assert_eq!(
+            parse_version_from_script(script),
+            Some("2.5.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_version_from_script_legacy_format() {
+        let script = "#!/usr/bin/env bash\n# skim-hook v1.3.0\nexec skim rewrite --hook\n";
+        assert_eq!(
+            parse_version_from_script(script),
+            Some("1.3.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_version_from_script_no_version() {
+        let script = "#!/usr/bin/env bash\nexec skim rewrite --hook\n";
+        assert_eq!(parse_version_from_script(script), None);
+    }
+
+    #[test]
+    fn test_parse_version_from_script_empty() {
+        assert_eq!(parse_version_from_script(""), None);
     }
 }
