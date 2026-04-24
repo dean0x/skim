@@ -886,5 +886,4 @@ mod tests {
             "expected -json (pos {json_pos}) before -- (pos {sep_pos}), got: {go_args:?}"
         );
     }
-
 }

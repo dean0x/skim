@@ -292,12 +292,8 @@ mod tests {
     fn test_run_passthrough_spawn_exit_none_returns_failure() {
         // When the command is killed by a signal, exit_code is None.
         // run_passthrough falls back to exit code 1 (FAILURE).
-        let code = run_passthrough(
-            &[],
-            |a| a.to_vec(),
-            |_| Ok(make_output("", "", None)),
-        )
-        .expect("run_passthrough should not error");
+        let code = run_passthrough(&[], |a| a.to_vec(), |_| Ok(make_output("", "", None)))
+            .expect("run_passthrough should not error");
         assert_eq!(code, ExitCode::FAILURE);
     }
 
@@ -537,5 +533,4 @@ mod tests {
         let result = last_n_lines(text, 2);
         assert_eq!(result, "line2\r\nline3");
     }
-
 }

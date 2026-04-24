@@ -428,20 +428,15 @@ mod tests {
 
     #[test]
     fn test_parse_version_from_script_new_format() {
-        let script = "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim rewrite --hook\n";
-        assert_eq!(
-            parse_version_from_script(script),
-            Some("2.5.1".to_string())
-        );
+        let script =
+            "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim rewrite --hook\n";
+        assert_eq!(parse_version_from_script(script), Some("2.5.1".to_string()));
     }
 
     #[test]
     fn test_parse_version_from_script_legacy_format() {
         let script = "#!/usr/bin/env bash\n# skim-hook v1.3.0\nexec skim rewrite --hook\n";
-        assert_eq!(
-            parse_version_from_script(script),
-            Some("1.3.0".to_string())
-        );
+        assert_eq!(parse_version_from_script(script), Some("1.3.0".to_string()));
     }
 
     #[test]

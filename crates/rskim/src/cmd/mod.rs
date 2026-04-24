@@ -659,7 +659,10 @@ mod tests {
         // conversion and include the U+FFFD replacement character.
         let data: &[u8] = &[0xFF, 0xFE, b'o', b'k'];
         let result = read_bounded(data, 1024).unwrap();
-        assert!(result.contains('\u{FFFD}'), "expected U+FFFD replacement, got: {result:?}");
+        assert!(
+            result.contains('\u{FFFD}'),
+            "expected U+FFFD replacement, got: {result:?}"
+        );
     }
 
     #[test]
