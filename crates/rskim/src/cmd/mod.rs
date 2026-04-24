@@ -67,10 +67,9 @@ pub(crate) use crate::runner::MAX_OUTPUT_BYTES as MAX_STDIN_BYTES;
 /// to lossy U+FFFD replacement — matching `read_pipe` in `runner.rs`.
 ///
 /// Returns an error if the total bytes read would exceed `max_bytes`.
-pub(crate) fn read_bounded(reader: impl Read, max_bytes: usize) -> anyhow::Result<String> {
+pub(crate) fn read_bounded(mut reader: impl Read, max_bytes: usize) -> anyhow::Result<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
-    let mut reader = reader;
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
@@ -285,6 +284,11 @@ pub(crate) struct ParsedCommandConfig<'a> {
 }
 
 /// Obtain command output from stdin or by spawning the command.
+///
+/// When `use_stdin` is `true`, reads stdin first. If stdin contains only
+/// whitespace (e.g., a CI pipe that opens but writes nothing), the function
+/// falls through silently to the spawn path so the real command runs with
+/// its actual exit code instead of producing empty output.
 ///
 /// Returns `None` when the program is not found (install hint already
 /// printed to stderr). The caller should return `ExitCode::FAILURE`.
@@ -651,11 +655,11 @@ mod tests {
 
     #[test]
     fn test_read_bounded_invalid_utf8_falls_back_to_lossy() {
-        // 0xFF is not valid UTF-8; the function must not panic and must return
-        // something (U+FFFD replacement character present).
+        // 0xFF is not valid UTF-8; the function must fall back to lossy
+        // conversion and include the U+FFFD replacement character.
         let data: &[u8] = &[0xFF, 0xFE, b'o', b'k'];
         let result = read_bounded(data, 1024).unwrap();
-        assert!(result.contains('\u{FFFD}') || !result.is_empty());
+        assert!(result.contains('\u{FFFD}'), "expected U+FFFD replacement, got: {result:?}");
     }
 
     #[test]
