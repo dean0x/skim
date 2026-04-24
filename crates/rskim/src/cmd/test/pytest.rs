@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::io::{self, IsTerminal, Read};
+use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::{strip_ansi, ParseResult};
 use crate::runner::{CommandOutput, CommandRunner};
 
-use super::shared;
+use super::shared::{self, try_read_stdin};
 
 // ============================================================================
 // Public entry point
@@ -37,9 +37,9 @@ use super::shared;
 
 /// Run pytest and parse its output, or parse piped stdin.
 ///
-/// Detection logic:
-/// - If stdin is a terminal → run pytest (execution mode)
-/// - If stdin is not a terminal → attempt to read stdin; if empty, fall back
+/// Detection logic (via [`try_read_stdin`]):
+/// - If args are present OR stdin is a terminal → run pytest (execution mode)
+/// - If args are empty AND stdin is piped → read stdin; if empty, fall back
 ///   to running pytest (handles test harness environments where stdin is a
 ///   pipe with no data)
 pub(crate) fn run(
@@ -49,19 +49,7 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression and forward raw output unchanged.
     if crate::cmd::is_passthrough_mode() {
-        if !io::stdin().is_terminal() {
-            let stdin_output = read_stdin()?;
-            if !stdin_output.stdout.trim().is_empty() {
-                print!("{}", stdin_output.stdout);
-                return Ok(ExitCode::FAILURE);
-            }
-        }
-        let final_args = build_args(args);
-        let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-        let output = run_pytest(&arg_refs)?;
-        print!("{}", crate::cmd::combine_output(&output));
-        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-        return Ok(ExitCode::from(code));
+        return shared::run_passthrough(args, build_args, run_pytest);
     }
 
     // Intercept --help/-h: show skim's pytest help, then forward to real pytest
@@ -70,22 +58,20 @@ pub(crate) fn run(
         print_pytest_help();
     }
 
-    let output = if io::stdin().is_terminal() {
-        // Terminal: always run pytest
+    let output = if let Some(raw) = try_read_stdin(args)? {
+        // Piped stdin with non-empty content: wrap in a synthetic CommandOutput
+        // so the rest of the function can treat it uniformly with spawned output.
+        CommandOutput {
+            stdout: raw,
+            stderr: String::new(),
+            exit_code: None,
+            duration: Duration::ZERO,
+        }
+    } else {
+        // Terminal, args present, or empty pipe: always run pytest.
         let final_args = build_args(args);
         let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
         run_pytest(&arg_refs)?
-    } else {
-        // Pipe: read stdin, fall back to execution if empty
-        let stdin_output = read_stdin()?;
-        if stdin_output.stdout.trim().is_empty() {
-            // Empty pipe (e.g., test harness) — run pytest instead
-            let final_args = build_args(args);
-            let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-            run_pytest(&arg_refs)?
-        } else {
-            stdin_output
-        }
     };
 
     let combined = combine_output(&output);
@@ -184,42 +170,10 @@ fn build_args(user_args: &[String]) -> Vec<String> {
 
 /// Execute pytest with the given arguments.
 fn run_pytest(args: &[&str]) -> anyhow::Result<CommandOutput> {
-    let runner = CommandRunner::new(Some(Duration::from_secs(300)));
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
     runner
         .run("pytest", args)
         .map_err(|e| anyhow::anyhow!("{e}\n\nHint: Is pytest installed? Try: pip install pytest"))
-}
-
-/// Maximum bytes we will read from stdin (64 MiB).
-///
-/// Consistent with `CommandRunner::read_pipe`'s `MAX_OUTPUT_BYTES` limit.
-const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
-
-/// Read stdin into a synthetic [`CommandOutput`], capped at [`MAX_STDIN_BYTES`].
-///
-/// Uses chunked reads (8 KiB) to enforce the size limit without requiring the
-/// OS to report exact pipe length up-front.
-fn read_stdin() -> anyhow::Result<CommandOutput> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8 * 1024];
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    loop {
-        let n = handle.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() + n > MAX_STDIN_BYTES {
-            anyhow::bail!("stdin exceeded {} byte limit", MAX_STDIN_BYTES);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(CommandOutput {
-        stdout: String::from_utf8_lossy(&buf).into_owned(),
-        stderr: String::new(),
-        exit_code: None,
-        duration: Duration::ZERO,
-    })
 }
 
 // ============================================================================

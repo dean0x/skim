@@ -15,15 +15,14 @@
 //! compatibility when libtest stabilizes the JSON format.
 
 use std::collections::HashSet;
-use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use crate::cmd::{
-    inject_flag_before_separator, run_parsed_command_with_mode, user_has_flag, OutputFormat,
-    ParsedCommandConfig,
+    inject_flag_before_separator, run_parsed_command_with_mode, should_read_stdin, user_has_flag,
+    OutputFormat, ParsedCommandConfig,
 };
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
@@ -64,12 +63,9 @@ pub(crate) fn run(
     }
 
     // Determine whether to read from stdin or execute the command.
-    // Only use stdin when:
-    // 1. stdin is not a terminal (i.e., data is being piped), AND
-    // 2. no user args were provided (bare `skim test cargo` with piped data)
-    // This prevents empty-stdin issues when test frameworks (e.g., assert_cmd)
-    // pipe stdin without providing data.
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    // Delegates to cmd::should_read_stdin for the same guard used by all
+    // test parsers: stdin must be piped AND no user args provided.
+    let use_stdin = should_read_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {

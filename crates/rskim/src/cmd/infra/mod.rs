@@ -11,7 +11,6 @@ pub(crate) mod curl;
 pub(crate) mod gh;
 pub(crate) mod wget;
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
@@ -36,7 +35,7 @@ pub(crate) fn run(
     }
 
     let (filtered_args, show_stats) = extract_show_stats(args);
-    let (filtered_args, json_output) = super::extract_json_flag(&filtered_args);
+    let (filtered_args, json_output) = extract_infra_json_flag(&filtered_args);
 
     let Some((tool_name, tool_args)) = filtered_args.split_first() else {
         print_help();
@@ -65,6 +64,47 @@ pub(crate) fn run(
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// Extract `--json` for skim's output format, preserving `--json <value>`
+/// pairs that belong to the underlying tool (e.g., `gh --json fields`).
+///
+/// Bare `--json` (at end of args or followed by another flag) is skim's
+/// boolean flag. `--json <value>` (followed by a non-flag token) is the
+/// tool's flag and both tokens are preserved in the output.
+///
+/// Scoped to infra rather than replacing the global [`super::extract_json_flag`]
+/// because lint tests use `["--json", "eslint"]` where the tool name follows
+/// `--json` — a value-aware heuristic would misidentify it as a `--json` value.
+/// Among infra tools, only `gh` uses `--json <value>` for field selection.
+///
+/// # Known limitation
+///
+/// The heuristic classifies the next token as a *value* only when it does not
+/// start with `-`. A field-selector string that begins with a dash (e.g., a
+/// hypothetical `-fieldname`) would be misidentified as a flag, causing skim
+/// to treat the `--json` as its own boolean flag rather than forwarding the
+/// pair to the underlying tool. In practice `gh --json` selectors are
+/// comma-separated identifiers (e.g., `number,title,state`) and never begin
+/// with a dash, so this edge case is not expected to occur.
+fn extract_infra_json_flag(args: &[String]) -> (Vec<String>, bool) {
+    let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+    let mut is_json = false;
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--json" {
+            let next_is_value = iter.peek().is_some_and(|next| !next.starts_with('-'));
+            if next_is_value {
+                filtered.push(arg.clone());
+                filtered.push(iter.next().unwrap().clone());
+            } else {
+                is_json = true;
+            }
+        } else {
+            filtered.push(arg.clone());
+        }
+    }
+    (filtered, is_json)
 }
 
 fn print_help() {
@@ -108,16 +148,6 @@ pub(crate) struct InfraToolConfig<'a> {
     pub install_hint: &'a str,
 }
 
-/// Detect whether to read from piped stdin.
-///
-/// Returns `true` when stdin is not a terminal AND `args` is empty — the same
-/// heuristic used across all infra tool dispatchers.  Centralised here so that
-/// [`run_infra_tool`] and the streaming sub-commands (`gh run watch`, `gh api`)
-/// share a single implementation.
-pub(crate) fn should_use_stdin(args: &[String]) -> bool {
-    !std::io::stdin().is_terminal() && args.is_empty()
-}
-
 /// Execute an infra tool, parse its output, and emit the result.
 ///
 /// This is the single implementation shared by all infra parsers, handling both
@@ -133,7 +163,7 @@ pub(crate) fn run_infra_tool(
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
 
-    let use_stdin = should_use_stdin(args);
+    let use_stdin = super::should_read_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
@@ -293,5 +323,70 @@ mod tests {
             label.contains("github.com/org/repo"),
             "host/path must be preserved in label: {label}"
         );
+    }
+
+    // ========================================================================
+    // extract_infra_json_flag tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_infra_json_bare_at_end() {
+        let args: Vec<String> = vec!["gh".into(), "run".into(), "--json".into()];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec!["gh", "run"]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_with_value_preserved() {
+        let args: Vec<String> = vec![
+            "gh".into(),
+            "run".into(),
+            "--json".into(),
+            "databaseId,status".into(),
+        ];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(filtered, vec!["gh", "run", "--json", "databaseId,status"]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_before_flag_stripped() {
+        let args: Vec<String> = vec!["gh".into(), "--json".into(), "--verbose".into()];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec!["gh", "--verbose"]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_absent() {
+        let args: Vec<String> = vec!["gh".into(), "run".into(), "list".into()];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(filtered, vec!["gh", "run", "list"]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_single_field() {
+        let args: Vec<String> = vec!["gh".into(), "run".into(), "--json".into(), "status".into()];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(!is_json);
+        assert_eq!(filtered, vec!["gh", "run", "--json", "status"]);
+    }
+
+    #[test]
+    fn test_extract_infra_json_multiple_json_tokens() {
+        // First --json is tool's field selector (value follows), second is skim's bare flag.
+        // Expected: value pair preserved, bare flag extracted, is_json = true.
+        let args: Vec<String> = vec![
+            "gh".into(),
+            "run".into(),
+            "--json".into(),
+            "fields".into(),
+            "--json".into(),
+        ];
+        let (filtered, is_json) = super::extract_infra_json_flag(&args);
+        assert!(is_json);
+        assert_eq!(filtered, vec!["gh", "run", "--json", "fields"]);
     }
 }

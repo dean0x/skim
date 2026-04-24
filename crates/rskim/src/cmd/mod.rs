@@ -28,9 +28,70 @@ mod test;
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
+
+// ============================================================================
+// Stdin reading
+// ============================================================================
+
+/// Default timeout for command execution (5 minutes).
+///
+/// Applied to all [`CommandRunner`] sites that don't have an explicit longer
+/// timeout (build commands use 600 s because compile times can be substantial).
+pub(crate) const DEFAULT_CMD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Determine whether to read piped stdin instead of spawning the command.
+///
+/// Returns `true` when stdin is not a terminal AND `args` is empty. The
+/// `args.is_empty()` guard is critical: without it, subprocess contexts
+/// (Claude Code, CI) where stdin is never a terminal would always read from
+/// empty stdin instead of spawning the runner.
+pub(crate) fn should_read_stdin(args: &[String]) -> bool {
+    use std::io::IsTerminal;
+    !std::io::stdin().is_terminal() && args.is_empty()
+}
+
+/// Maximum bytes read from stdin.
+///
+/// Re-exported from [`crate::runner::MAX_OUTPUT_BYTES`] so the stdin cap and
+/// the pipe-capture cap stay in sync automatically — no duplicated literal.
+pub(crate) use crate::runner::MAX_OUTPUT_BYTES as MAX_STDIN_BYTES;
+
+/// Core bounded read loop, injectable for testing.
+///
+/// Reads from `reader` in 8 KiB chunks until EOF or `max_bytes` is exceeded.
+/// Valid UTF-8 is zero-copy (Vec moved into String); invalid UTF-8 falls back
+/// to lossy U+FFFD replacement — matching `read_pipe` in `runner.rs`.
+///
+/// Returns an error if the total bytes read would exceed `max_bytes`.
+pub(crate) fn read_bounded(mut reader: impl Read, max_bytes: usize) -> anyhow::Result<String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > max_bytes {
+            anyhow::bail!("input exceeded {} byte limit", max_bytes);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
+}
+
+/// Read all of stdin into a `String`, capped at [`MAX_STDIN_BYTES`].
+///
+/// Thin wrapper around [`read_bounded`] that supplies `stdin().lock()` as the
+/// reader. Production code calls this; tests call `read_bounded` directly with
+/// an in-memory cursor.
+pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
+    read_bounded(io::stdin().lock(), MAX_STDIN_BYTES)
+}
 
 // ============================================================================
 // SKIM_PASSTHROUGH helpers
@@ -222,15 +283,80 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub family: &'a str,
 }
 
+/// Obtain command output from stdin or by spawning the command.
+///
+/// When `use_stdin` is `true`, reads stdin first. If stdin contains only
+/// whitespace (e.g., a CI pipe that opens but writes nothing), the function
+/// falls through silently to the spawn path so the real command runs with
+/// its actual exit code instead of producing empty output.
+///
+/// Returns `None` when the program is not found (install hint already
+/// printed to stderr). The caller should return `ExitCode::FAILURE`.
+fn obtain_output(
+    program: &str,
+    args: &[String],
+    env_overrides: &[(&str, &str)],
+    install_hint: &str,
+    use_stdin: bool,
+) -> anyhow::Result<Option<CommandOutput>> {
+    if use_stdin {
+        let stdin_buf = read_stdin_bounded()?;
+        if stdin_buf.bytes().any(|b| !b.is_ascii_whitespace()) {
+            return Ok(Some(CommandOutput {
+                stdout: stdin_buf,
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration: std::time::Duration::ZERO,
+            }));
+        }
+    }
+
+    let runner = CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+    let args_str: Vec<&str> = args.iter().map(String::as_str).collect();
+    match runner.run_with_env(program, &args_str, env_overrides) {
+        Ok(out) => Ok(Some(out)),
+        Err(e) => {
+            if crate::runner::is_spawn_error(&e) {
+                eprintln!("error: '{program}' not found");
+                eprintln!("hint: {install_hint}");
+                return Ok(None);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Render parsed result to stdout, returning the output string for analytics.
+fn render_output<T>(result: &ParseResult<T>, output_format: OutputFormat) -> anyhow::Result<String>
+where
+    T: AsRef<str> + serde::Serialize,
+{
+    match output_format {
+        OutputFormat::Json => {
+            let json_str = result.to_json_envelope()?;
+            let mut handle = io::stdout().lock();
+            writeln!(handle, "{json_str}")?;
+            handle.flush()?;
+            Ok(json_str)
+        }
+        OutputFormat::Text => {
+            let content = result.content();
+            let mut handle = io::stdout().lock();
+            write!(handle, "{content}")?;
+            if !content.is_empty() && !content.ends_with('\n') {
+                writeln!(handle)?;
+            }
+            handle.flush()?;
+            Ok(content.to_string())
+        }
+    }
+}
+
 /// Execute an external command, parse its output, and emit the result.
 ///
 /// This is the standard entry point for subcommand parsers that follow the
-/// three-tier degradation pattern. It handles:
-/// 1. Stdin piping (when `use_stdin` is true, read stdin instead of running command)
-/// 2. Running the command with environment overrides
-/// 3. Calling the parser function on the output
-/// 4. Emitting the parsed result to stdout
-/// 5. Mapping the exit code
+/// three-tier degradation pattern. Delegates stdin/spawn to [`obtain_output`]
+/// and rendering to [`render_output`].
 ///
 /// `config.use_stdin` — when `true`, reads stdin instead of spawning the command.
 /// Callers should set this based on their own heuristics (e.g., only read
@@ -242,10 +368,6 @@ pub(crate) fn run_parsed_command_with_mode<T>(
 where
     T: AsRef<str> + serde::Serialize,
 {
-    /// Maximum bytes we will read from stdin (64 MiB), consistent with the
-    /// runner's `MAX_OUTPUT_BYTES` limit for command output pipes.
-    const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
-
     let ParsedCommandConfig {
         program,
         args,
@@ -259,44 +381,13 @@ where
         family,
     } = config;
 
-    let output = if use_stdin {
-        // Piped stdin mode: read stdin instead of executing the command.
-        // Size-limited to prevent unbounded memory growth from runaway pipes.
-        let mut stdin_buf = String::new();
-        let bytes_read = io::stdin()
-            .take(MAX_STDIN_BYTES)
-            .read_to_string(&mut stdin_buf)?;
-        if bytes_read as u64 >= MAX_STDIN_BYTES {
-            anyhow::bail!("stdin input exceeded 64 MiB limit");
-        }
-        CommandOutput {
-            stdout: stdin_buf,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    } else {
-        // Execute the command
-        let runner = CommandRunner::new(Some(std::time::Duration::from_secs(300)));
-        let args_str: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        match runner.run_with_env(program, &args_str, env_overrides) {
-            Ok(out) => out,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("failed to execute") {
-                    eprintln!("error: '{program}' not found");
-                    eprintln!("hint: {install_hint}");
-                    return Ok(ExitCode::FAILURE);
-                }
-                return Err(e);
-            }
-        }
+    let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
+        return Ok(ExitCode::FAILURE);
     };
 
     // Passthrough mode: bypass all compression and forward raw output.
-    let code = output.exit_code.unwrap_or(1);
     if is_passthrough_mode() {
+        let code = output.exit_code.unwrap_or(1);
         let mut out = io::stdout().lock();
         write!(out, "{}", output.stdout)?;
         out.flush()?;
@@ -308,9 +399,6 @@ where
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
     }
 
-    // Strip ANSI escape codes from output before parsing. Even with NO_COLOR=1
-    // set on the child process, some tools may still emit escape sequences.
-    // This is a cheap, universally useful safety net for all parsers.
     let output = CommandOutput {
         stdout: crate::output::strip_ansi(&output.stdout),
         stderr: crate::output::strip_ansi(&output.stderr),
@@ -318,38 +406,20 @@ where
     };
 
     let result = parse(&output, args);
-
-    // Emit markers (warnings/notices) to stderr
     let _ = result.emit_markers(&mut io::stderr().lock());
-
-    // Capture exit code before moving stdout into analytics
     let code = output.exit_code.unwrap_or(1);
 
-    // Render output and capture the compressed content string for stats/analytics.
-    let compressed: String = match output_format {
-        OutputFormat::Json => {
-            let json_str = result.to_json_envelope()?;
-            let mut handle = io::stdout().lock();
-            writeln!(handle, "{json_str}")?;
-            handle.flush()?;
-            json_str
-        }
-        OutputFormat::Text => {
-            let content = result.content();
-            let mut handle = io::stdout().lock();
-            write!(handle, "{content}")?;
-            if !content.is_empty() && !content.ends_with('\n') {
-                writeln!(handle)?;
-            }
-            handle.flush()?;
-            content.to_string()
-        }
-    };
+    let compressed = render_output(&result, output_format)?;
 
-    // Hint: when output was compressed (not passthrough) and the exit code was
-    // non-zero, tell the user how to see full raw output. Passthrough results
-    // are already uncompressed so the hint is not needed there.
-    if code != 0 && !result.is_passthrough() {
+    // Hint fires on ALL non-zero exits regardless of tier. Passthrough tier
+    // still means skim processed the command through its rewrite hook — agents
+    // need the SKIM_PASSTHROUGH=1 escape hatch surfaced since the global
+    // CLAUDE.md docs no longer mention the flag. Text says "compressed" for
+    // consistency across tiers; the message's purpose is the escape hatch, not
+    // describing what skim did. When SKIM_PASSTHROUGH=1 is active, we already
+    // returned early above (the `is_passthrough_mode()` guard), so this never
+    // double-fires.
+    if code != 0 {
         eprintln!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.");
     }
 
@@ -358,7 +428,6 @@ where
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
         analytics_enabled,
         output.stdout,
@@ -369,9 +438,6 @@ where
         Some(result.tier_name()),
     );
 
-    // Map exit code: preserve full 0-255 exit code granularity from the
-    // underlying process. This maintains documented semantics (0=success,
-    // 1=error, 2=parse error, 3=unsupported language) for downstream consumers.
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
@@ -466,20 +532,6 @@ mod tests {
     // check_passthrough_value / stderr hint guard
     // ========================================================================
 
-    /// Verify that passthrough mode detection works correctly for the guard
-    /// in `run_parsed_command_with_mode`. Passthrough returns early before
-    /// the hint is emitted; the `!result.is_passthrough()` guard ensures the
-    /// hint fires only for Full/Degraded results.
-    #[test]
-    fn test_no_stderr_hint_when_passthrough_mode() {
-        // Passthrough mode returns early before the hint is emitted.
-        // The guard `!result.is_passthrough()` in run_parsed_command_with_mode
-        // ensures the hint only fires for compressed (Full/Degraded) results.
-        // This test validates the passthrough predicate is correct.
-        assert!(check_passthrough_value(Some("1".to_string())));
-        assert!(check_passthrough_value(Some("true".to_string())));
-    }
-
     #[test]
     fn test_check_passthrough_truthy_values() {
         for v in &["1", "true", "yes", "True", "YES", "tRuE"] {
@@ -531,5 +583,91 @@ mod tests {
         let long_input = "a".repeat(100);
         let sanitized = sanitize_for_display(&long_input);
         assert_eq!(sanitized.len(), 64);
+    }
+
+    // ========================================================================
+    // should_read_stdin tests
+    // ========================================================================
+
+    #[test]
+    fn test_should_read_stdin_false_when_args_present() {
+        let args = vec!["--run".to_string(), "math".to_string()];
+        assert!(
+            !should_read_stdin(&args),
+            "non-empty args must prevent stdin mode"
+        );
+    }
+
+    #[test]
+    fn test_should_read_stdin_args_gate_short_circuits() {
+        for args in [
+            vec!["run".to_string()],
+            vec!["--reporter=verbose".to_string()],
+            vec!["--reporter=verbose".to_string(), "math".to_string()],
+            vec!["src/utils.test.ts".to_string()],
+        ] {
+            assert!(
+                !should_read_stdin(&args),
+                "should_read_stdin must return false for args: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_read_stdin_empty_args_defers_to_terminal() {
+        use std::io::IsTerminal;
+        let result = should_read_stdin(&[]);
+        // In `cargo test`, stdin is typically a terminal → false.
+        // The point is that empty args don't unconditionally force stdin mode;
+        // it still checks is_terminal().
+        assert_eq!(result, !std::io::stdin().is_terminal());
+    }
+
+    // ========================================================================
+    // read_bounded tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_bounded_under_limit() {
+        let data = b"hello world";
+        let result = read_bounded(data.as_ref(), 1024).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_read_bounded_exactly_at_limit_is_ok() {
+        // buf.len() + n > max_bytes triggers the error, so exactly max_bytes
+        // bytes must succeed.
+        let data = vec![b'A'; 100];
+        let result = read_bounded(data.as_slice(), 100).unwrap();
+        assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn test_read_bounded_over_limit_returns_error() {
+        let data = vec![b'X'; 200];
+        let err = read_bounded(data.as_slice(), 100).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeded"),
+            "expected 'exceeded' in error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_invalid_utf8_falls_back_to_lossy() {
+        // 0xFF is not valid UTF-8; the function must fall back to lossy
+        // conversion and include the U+FFFD replacement character.
+        let data: &[u8] = &[0xFF, 0xFE, b'o', b'k'];
+        let result = read_bounded(data, 1024).unwrap();
+        assert!(
+            result.contains('\u{FFFD}'),
+            "expected U+FFFD replacement, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_empty_input() {
+        let result = read_bounded(b"".as_ref(), 1024).unwrap();
+        assert!(result.is_empty());
     }
 }

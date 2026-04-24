@@ -1,13 +1,18 @@
 //! Shared helpers for test parser Tier-2 fallback paths.
 //!
 //! Provides [`scrape_failures`] which extracts failing test entries from
-//! plain-text runner output when JSON parsing is unavailable.
+//! plain-text runner output when JSON parsing is unavailable, and
+//! [`try_read_stdin`] which combines the stdin guard (via
+//! [`crate::cmd::should_read_stdin`]), chunked read, and whitespace-only check
+//! into a single call.
 
+use std::process::ExitCode;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use crate::output::canonical::{TestEntry, TestOutcome};
+use crate::runner::CommandOutput;
 
 /// Identifies which test runner produced the text being scraped.
 ///
@@ -63,6 +68,56 @@ static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     // Example real output: `   × divides by zero`.
     Regex::new(r"^\s*[✕✗×]\s+(.+?)$").expect("valid vitest fail regex")
 });
+
+/// Try to read piped stdin, returning `Some(content)` only when there is
+/// non-whitespace data to process.
+///
+/// Combines three steps that all test parsers previously duplicated:
+/// 1. [`should_read_stdin`] guard — if false, return `Ok(None)` immediately.
+/// 2. [`crate::cmd::read_stdin_bounded`] — propagate I/O errors via `?`.
+/// 3. Whitespace check — `bytes().any(|b| !b.is_ascii_whitespace())` for
+///    short-circuit on the first non-whitespace byte; returns `Ok(None)` when
+///    the pipe is empty so callers fall through to the spawn path.
+///
+/// Returns `Ok(Some(content))` when there is content to parse, `Ok(None)` when
+/// the guard is false or the pipe is empty/whitespace-only.
+pub(super) fn try_read_stdin(args: &[String]) -> anyhow::Result<Option<String>> {
+    if !crate::cmd::should_read_stdin(args) {
+        return Ok(None);
+    }
+    let content = crate::cmd::read_stdin_bounded()?;
+    if content.bytes().any(|b| !b.is_ascii_whitespace()) {
+        Ok(Some(content))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Run the passthrough path for a test runner.
+///
+/// Handles the two sub-cases of SKIM_PASSTHROUGH mode for test runners:
+/// 1. Piped stdin — print the raw content and return FAILURE (no exit code available).
+/// 2. Spawn mode — run the command via `run_cmd` and forward the combined output.
+///
+/// `prepare_args` transforms the user args into the final argument list that
+/// `run_cmd` receives (e.g., adding `--reporter=json` or `--tb=short`).
+/// `run_cmd` receives the prepared args as `&[&str]` and returns a `CommandOutput`.
+pub(super) fn run_passthrough(
+    args: &[String],
+    prepare_args: impl FnOnce(&[String]) -> Vec<String>,
+    run_cmd: impl FnOnce(&[&str]) -> anyhow::Result<CommandOutput>,
+) -> anyhow::Result<ExitCode> {
+    if let Some(raw) = try_read_stdin(args)? {
+        print!("{raw}");
+        return Ok(ExitCode::FAILURE);
+    }
+    let final_args = prepare_args(args);
+    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
+    let output = run_cmd(&arg_refs)?;
+    print!("{}", crate::cmd::combine_output(&output));
+    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+    Ok(ExitCode::from(code))
+}
 
 /// Extract failing test entries from plain-text runner output when JSON parsing
 /// is unavailable (Tier 2 fallback).
@@ -187,7 +242,104 @@ pub(super) fn last_n_lines(text: &str, n: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    // ========================================================================
+    // run_passthrough tests (spawn branch)
+    //
+    // In Rust unit tests stdin is never piped (it's the test harness terminal),
+    // so `try_read_stdin` always returns Ok(None) and `run_passthrough` always
+    // takes the spawn branch. The stdin branch is covered by E2E tests in
+    // cli_e2e_test_parsers (test_vitest_passthrough_* and
+    // test_pytest_passthrough_*) which pipe stdin via `write_stdin`.
+    // ========================================================================
+
+    fn make_output(stdout: &str, stderr: &str, code: Option<i32>) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: code,
+            duration: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_exit_zero_returns_success() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("ok output\n", "", Some(0))),
+        )
+        .expect("run_passthrough should not error");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_exit_nonzero_preserves_code() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("fail output\n", "", Some(2))),
+        )
+        .expect("run_passthrough should not error");
+        // exit code 2 → ExitCode::from(2)
+        assert_eq!(code, ExitCode::from(2u8));
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_exit_none_returns_failure() {
+        // When the command is killed by a signal, exit_code is None.
+        // run_passthrough falls back to exit code 1 (FAILURE).
+        let code = run_passthrough(&[], |a| a.to_vec(), |_| Ok(make_output("", "", None)))
+            .expect("run_passthrough should not error");
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_prepare_args_is_called() {
+        // Verify that prepare_args is invoked: inject a sentinel arg and assert
+        // run_cmd receives it.
+        let mut received_args: Vec<String> = Vec::new();
+        let code = run_passthrough(
+            &["base-arg".to_string()],
+            |a| {
+                let mut v = a.to_vec();
+                v.push("--injected".to_string());
+                v
+            },
+            |arg_refs| {
+                received_args = arg_refs.iter().map(|s| s.to_string()).collect();
+                Ok(make_output("", "", Some(0)))
+            },
+        )
+        .expect("run_passthrough should not error");
+        assert!(
+            received_args.contains(&"--injected".to_string()),
+            "prepare_args sentinel must reach run_cmd: {received_args:?}"
+        );
+        assert!(
+            received_args.contains(&"base-arg".to_string()),
+            "original args must be forwarded: {received_args:?}"
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_run_passthrough_spawn_run_cmd_error_propagates() {
+        let result = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Err(anyhow::anyhow!("spawn failed: binary not found")),
+        );
+        assert!(result.is_err(), "error from run_cmd must propagate");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("spawn failed"),
+            "error message should contain spawn context: {msg}"
+        );
+    }
 
     #[test]
     fn test_scrape_failures_cargo_basic() {

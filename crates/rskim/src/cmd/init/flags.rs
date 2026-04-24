@@ -6,6 +6,7 @@ use crate::cmd::session::AgentKind;
 #[derive(Debug)]
 pub(super) struct InitFlags {
     pub(super) project: bool,
+    /// Accepted for backward compatibility (no-op for install, still used by uninstall).
     pub(super) yes: bool,
     pub(super) dry_run: bool,
     pub(super) uninstall: bool,

@@ -174,11 +174,7 @@ impl CommandRunner {
                 // PipeCaptureFailed, ReaderPanicked, Io — mean the program was
                 // found and launched; retrying via npx makes no sense and could
                 // mask real failures.
-                let is_spawn_failure = original_err
-                    .downcast_ref::<RunnerError>()
-                    .map(|e| matches!(e, RunnerError::SpawnFailed { .. }))
-                    .unwrap_or(false);
-                if !is_spawn_failure {
+                if !is_spawn_error(&original_err) {
                     return Err(original_err);
                 }
 
@@ -238,18 +234,29 @@ impl CommandRunner {
     }
 }
 
+/// Return `true` when `err` is a [`RunnerError::SpawnFailed`].
+///
+/// Use this for control-flow detection instead of `err.to_string().contains("failed to execute")`,
+/// which couples to the `Display` format and breaks silently when the message changes.
+pub(crate) fn is_spawn_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RunnerError>()
+        .map(|e| matches!(e, RunnerError::SpawnFailed { .. }))
+        .unwrap_or(false)
+}
+
 /// Maximum bytes we will read from a single pipe (64 MiB).
 ///
 /// Prevents unbounded memory growth when a child process produces
-/// unexpectedly large output.
-const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// unexpectedly large output. Shared with `cmd::MAX_STDIN_BYTES` via re-export
+/// so both limits stay in sync without a separate constant.
+pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Read a pipe into a lossy-UTF-8 String, capped at [`MAX_OUTPUT_BYTES`].
+/// Read a pipe into a UTF-8 String, capped at [`MAX_OUTPUT_BYTES`].
 ///
 /// Uses chunked reads (8 KiB) instead of `read_to_end` to enforce the size
 /// limit without requiring the OS to report exact pipe length up-front.
-/// Non-UTF-8 output (e.g., binary data from `/dev/zero`) is handled via
-/// `String::from_utf8_lossy`.
+/// Valid UTF-8 is zero-copy (`Vec<u8>` moved into `String`); non-UTF-8 output
+/// (e.g., binary data from `/dev/zero`) falls back to lossy U+FFFD replacement.
 ///
 /// Returns an `io::Error` (kind `Other`) if the output exceeds the cap.
 fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
@@ -270,7 +277,8 @@ fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
         buf.extend_from_slice(&chunk[..n]);
     }
 
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
 }
 
 #[cfg(test)]
@@ -509,6 +517,7 @@ mod tests {
         let runner = CommandRunner::new(None);
         let err = runner.run("", &[]).unwrap_err();
         let msg = err.to_string();
+        // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
         assert!(
             msg.contains("failed to execute"),
             "Expected 'failed to execute' in error, got: {msg}"
@@ -606,6 +615,14 @@ mod tests {
     // Node fallback tests
     // ========================================================================
 
+    #[test]
+    fn test_read_pipe_handles_invalid_utf8() {
+        let data: Vec<u8> = vec![b'O', b'K', 0xFF, 0xFE];
+        let result = read_pipe(std::io::Cursor::new(data)).unwrap();
+        assert!(result.starts_with("OK"));
+        assert!(result.contains('\u{FFFD}'));
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_node_fallback_direct_success_no_fallback() {
@@ -624,6 +641,7 @@ mod tests {
             .run_with_node_fallback("/nonexistent-binary-1234", &[])
             .unwrap_err();
         let msg = err.to_string();
+        // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
         assert!(
             msg.contains("failed to execute"),
             "Expected 'failed to execute', got: {msg}"
@@ -638,6 +656,7 @@ mod tests {
             .run_with_node_fallback("./nonexistent-binary-5678", &[])
             .unwrap_err();
         let msg = err.to_string();
+        // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
         assert!(
             msg.contains("failed to execute"),
             "Expected 'failed to execute', got: {msg}"
@@ -660,6 +679,7 @@ mod tests {
         match runner.run_with_node_fallback("__skim_nonexistent_9999__", &[]) {
             Err(e) => {
                 let msg = e.to_string();
+                // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
                 assert!(
                     msg.contains("failed to execute") || msg.contains("__skim_nonexistent"),
                     "Expected original spawn error, got: {msg}"
@@ -717,6 +737,7 @@ mod tests {
         match runner.run_with_node_fallback("__skim_nonexistent_npx_test_8888__", &[]) {
             Err(e) => {
                 let msg = e.to_string();
+                // Asserts Display format, not spawn detection — see is_spawn_error for control flow.
                 assert!(
                     msg.contains("failed to execute") || msg.contains("__skim_nonexistent"),
                     "Expected spawn error, got: {msg}"
@@ -774,5 +795,47 @@ mod tests {
             "all args must be preserved in output, got: {out:?}"
         );
         assert_eq!(result.exit_code, Some(0));
+    }
+
+    // ========================================================================
+    // is_spawn_error tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_spawn_error_true() {
+        let err: anyhow::Error = RunnerError::SpawnFailed {
+            program: "nonexistent".into(),
+            source: io::Error::new(io::ErrorKind::NotFound, "not found"),
+        }
+        .into();
+        assert!(is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_timeout() {
+        let err: anyhow::Error = RunnerError::Timeout {
+            timeout: Duration::from_secs(1),
+        }
+        .into();
+        assert!(!is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_io() {
+        let err: anyhow::Error =
+            RunnerError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")).into();
+        assert!(!is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_pipe_capture_failed() {
+        let err: anyhow::Error = RunnerError::PipeCaptureFailed { pipe: "stdout" }.into();
+        assert!(!is_spawn_error(&err));
+    }
+
+    #[test]
+    fn test_is_spawn_error_false_for_reader_panicked() {
+        let err: anyhow::Error = RunnerError::ReaderPanicked { pipe: "stderr" }.into();
+        assert!(!is_spawn_error(&err));
     }
 }

@@ -8,9 +8,6 @@
 //! - Input: `{ "tool_name": "shell", "tool_input": { "command": "cargo test" } }`
 //! - Response: `{ "decision": "allow", "tool_input": { "command": "skim test cargo" } }`
 //!
-//! SECURITY: Zero stderr in hook mode (GRANITE #361 lesson).
-//! SECURITY: Absolute binary path in generated scripts (GRANITE #685 lesson).
-
 use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
@@ -42,8 +39,8 @@ impl HookProtocol for GeminiCliHook {
         })
     }
 
-    fn generate_script(&self, binary_path: &str, version: &str) -> String {
-        super::generate_hook_script(binary_path, version, "gemini")
+    fn generate_script(&self, version: &str) -> String {
+        super::generate_hook_script(version, "gemini")
     }
 }
 
@@ -109,21 +106,21 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_generate_script_has_absolute_path() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.2.3");
+    fn test_gemini_generate_script_bare_command() {
+        let script = hook().generate_script("1.2.3");
         assert!(
-            script.contains("\"/usr/local/bin/skim\""),
-            "script must use quoted absolute binary path, got: {script}"
+            script.contains("exec skim rewrite --hook"),
+            "script must use bare skim command, got: {script}"
         );
         assert!(
-            script.contains("exec"),
-            "script must use exec to replace shell process, got: {script}"
+            !script.contains("\"/usr/local/bin/skim\""),
+            "script must NOT contain hardcoded binary path, got: {script}"
         );
     }
 
     #[test]
     fn test_gemini_generate_script_has_version() {
-        let script = hook().generate_script("/usr/local/bin/skim", "0.9.0");
+        let script = hook().generate_script("0.9.0");
         assert!(
             script.contains("SKIM_HOOK_VERSION=\"0.9.0\""),
             "script must export SKIM_HOOK_VERSION, got: {script}"
@@ -159,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_gemini_generate_script_has_agent_flag() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
+        let script = hook().generate_script("1.0.0");
         assert!(
             script.contains("--agent gemini"),
             "script must pass --agent gemini flag, got: {script}"
@@ -168,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_gemini_generate_script_has_shebang() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
+        let script = hook().generate_script("1.0.0");
         assert!(
             script.starts_with("#!/usr/bin/env bash"),
             "script must start with bash shebang, got: {script}"
@@ -178,7 +175,6 @@ mod tests {
     #[test]
     fn test_gemini_install_default() {
         let opts = InstallOpts {
-            binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
             config_dir: "/tmp/.gemini".into(),
             project_scope: false,

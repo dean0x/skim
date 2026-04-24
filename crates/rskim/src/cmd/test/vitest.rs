@@ -9,7 +9,7 @@
 //!   parsing fails.
 //! - **Tier 3 (passthrough)**: Returns raw output unchanged when nothing parses.
 
-use std::io::{self, IsTerminal, Read};
+use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -20,7 +20,7 @@ use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::CommandRunner;
 
-use super::shared::{self, scrape_failures, TestKind};
+use super::shared::{self, scrape_failures, try_read_stdin, TestKind};
 
 // ============================================================================
 // Public entry point
@@ -38,25 +38,22 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
-        if stdin_has_data() {
-            let raw_output = read_stdin()?;
-            println!("{raw_output}");
-            // Stdin passthrough has no child process, so there is no exit code to
-            // preserve. FAILURE is the conservative default — callers who need a
-            // specific exit code should use the spawned-process path instead.
-            return Ok(ExitCode::FAILURE);
-        }
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let runner = CommandRunner::new(None);
-        let output = runner.run_with_node_fallback(program, &arg_refs)?;
-        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-        print!("{}", crate::cmd::combine_output(&output));
-        return Ok(ExitCode::from(code));
+        return shared::run_passthrough(
+            args,
+            |a| a.to_vec(),
+            |arg_refs| {
+                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
+                    .run_with_node_fallback(program, arg_refs)
+            },
+        );
     }
 
     let start = std::time::Instant::now();
-    let raw_output = if stdin_has_data() {
-        read_stdin()?
+    // try_read_stdin returns Some(content) when stdin is piped and non-empty,
+    // None when stdin is empty/whitespace-only or when args are present — in
+    // either case fall through to running vitest directly.
+    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
+        stdin_content
     } else {
         run_vitest(program, args)?
     };
@@ -111,39 +108,6 @@ pub(crate) fn run(
 // Command execution
 // ============================================================================
 
-/// Check whether stdin has piped data (not a terminal).
-fn stdin_has_data() -> bool {
-    !io::stdin().is_terminal()
-}
-
-/// Maximum bytes we will read from stdin (64 MiB).
-///
-/// Mirrors the `MAX_OUTPUT_BYTES` limit in `runner.rs` to prevent unbounded
-/// memory growth when a large file is accidentally piped in.
-const MAX_STDIN_BYTES: usize = 64 * 1024 * 1024;
-
-/// Read stdin into a String, capped at [`MAX_STDIN_BYTES`].
-///
-/// Uses chunked reads (8 KiB) instead of `read_to_string` to enforce the size
-/// limit incrementally. Non-UTF-8 input is handled via `String::from_utf8_lossy`.
-fn read_stdin() -> anyhow::Result<String> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8 * 1024];
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    loop {
-        let n = handle.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        if buf.len() + n > MAX_STDIN_BYTES {
-            anyhow::bail!("stdin exceeded {} byte limit", MAX_STDIN_BYTES);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
 /// Execute the test runner with the user's args, injecting `--reporter=json` if
 /// not already set.
 ///
@@ -161,7 +125,7 @@ fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
 
     let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
 
-    let runner = CommandRunner::new(None);
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
     let output = runner
         .run_with_node_fallback(program, &arg_refs)
         .map_err(|e| {

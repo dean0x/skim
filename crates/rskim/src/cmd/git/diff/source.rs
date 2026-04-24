@@ -54,8 +54,8 @@ pub(super) fn git_show(global_flags: &[String], ref_spec: &str) -> anyhow::Resul
     // untrusted `-c` values from external sources.
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["show".to_string(), ref_spec.to_string()]);
-    let runner = CommandRunner::new(None);
-    let arg_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
     if output.exit_code != Some(0) {
         anyhow::bail!("git show {ref_spec} failed: {}", output.stderr.trim());

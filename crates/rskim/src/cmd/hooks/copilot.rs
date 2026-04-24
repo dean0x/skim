@@ -40,8 +40,8 @@ impl HookProtocol for CopilotCliHook {
         })
     }
 
-    fn generate_script(&self, binary_path: &str, version: &str) -> String {
-        super::generate_hook_script(binary_path, version, "copilot")
+    fn generate_script(&self, version: &str) -> String {
+        super::generate_hook_script(version, "copilot")
     }
 }
 
@@ -133,13 +133,13 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_generate_script() {
-        let script = hook().generate_script("/usr/local/bin/skim", "2.0.0");
+    fn test_copilot_generate_script_bare_command() {
+        let script = hook().generate_script("2.0.0");
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v2.0.0"));
         assert!(script.contains("skim init --agent copilot"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"2.0.0\""));
-        assert!(script.contains("exec \"/usr/local/bin/skim\" rewrite --hook --agent copilot"));
+        assert!(script.contains("exec skim rewrite --hook --agent copilot"));
     }
 
     #[test]
@@ -150,7 +150,6 @@ mod tests {
     #[test]
     fn test_copilot_install_default() {
         let opts = InstallOpts {
-            binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
             config_dir: "/tmp/.copilot".into(),
             project_scope: false,

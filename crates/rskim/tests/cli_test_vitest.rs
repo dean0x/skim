@@ -169,3 +169,43 @@ fn test_skim_test_jest_alias_works() {
         .success()
         .stdout(predicate::str::contains("PASS: 3"));
 }
+
+// ============================================================================
+// Args prevent stdin mode (regression: subprocess stdin detection bug)
+// ============================================================================
+
+#[test]
+fn test_vitest_with_args_does_not_read_stdin() {
+    // assert_cmd provides non-terminal stdin by default — exactly the bug
+    // scenario where `!is_terminal()` alone would incorrectly read stdin.
+    // With args present, skim should attempt to spawn vitest (and fail since
+    // it's not installed in the test environment).
+    //
+    // The key assertion: stdout must NOT be empty. Before the fix, skim would
+    // read empty stdin and produce empty stdout. After the fix, the spawn path
+    // is taken, producing either vitest output or an npm/runner error message.
+    Command::cargo_bin("skim")
+        .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .arg("test")
+        .arg("vitest")
+        .arg("run")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn test_jest_with_args_does_not_read_stdin() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .arg("test")
+        .arg("jest")
+        .arg("run")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty().not());
+}

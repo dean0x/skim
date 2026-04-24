@@ -7,12 +7,16 @@
 use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use regex::Regex;
 
+use crate::cmd::{combine_output, inject_flag_before_separator};
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
-use crate::runner::CommandRunner;
+use crate::runner::{CommandOutput, CommandRunner};
+
+use super::shared::{self, try_read_stdin};
 
 // ============================================================================
 // Public entry point
@@ -30,62 +34,39 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: run `go test` without flag injections and forward raw output.
     if crate::cmd::is_passthrough_mode() {
-        let mut raw_args: Vec<String> = vec!["test".to_string()];
-        raw_args.extend_from_slice(args);
-        let raw_args_ref: Vec<&str> = raw_args.iter().map(|s| s.as_str()).collect();
-        let runner = CommandRunner::new(None);
-        let output = runner.run("go", &raw_args_ref).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("failed to execute") {
-                anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", msg)
-            } else {
-                e
-            }
-        })?;
-        print!("{}", crate::cmd::combine_output(&output));
-        let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-        return Ok(ExitCode::from(code));
+        return shared::run_passthrough(
+            args,
+            |a| {
+                std::iter::once("test".to_string())
+                    .chain(a.iter().cloned())
+                    .collect()
+            },
+            run_go,
+        );
     }
 
-    let mut go_args: Vec<String> = vec!["test".to_string()];
-
-    // Inject -json before any `--` separator, unless the user already specified
-    // -json or -v (verbose mode produces non-JSON output).
-    //
-    // Go flags use `-flag=false` to explicitly disable a flag, so we use
-    // go-specific detection that treats `-v=false` as NOT having `-v`.
-    if !go_has_flag(args, "-json") && !go_has_flag(args, "-v") {
-        // Find the position of `--` if present, and inject -json before it.
-        if let Some(sep_pos) = args.iter().position(|a| a == "--") {
-            go_args.extend_from_slice(&args[..sep_pos]);
-            go_args.push("-json".to_string());
-            go_args.extend_from_slice(&args[sep_pos..]);
-        } else {
-            go_args.push("-json".to_string());
-            go_args.extend_from_slice(args);
+    // Piped stdin with non-empty content: wrap in a synthetic CommandOutput so
+    // the rest of the function can treat it uniformly with spawned output.
+    let output = if let Some(raw) = try_read_stdin(args)? {
+        CommandOutput {
+            stdout: raw,
+            stderr: String::new(),
+            exit_code: None,
+            duration: Duration::ZERO,
         }
     } else {
-        go_args.extend_from_slice(args);
-    }
-
-    let runner = CommandRunner::new(None);
-    let go_args_ref: Vec<&str> = go_args.iter().map(|s| s.as_str()).collect();
-
-    let output = runner.run("go", &go_args_ref).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("failed to execute") {
-            anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", msg)
-        } else {
-            e
-        }
-    })?;
+        // Build `go test [args...]`, injecting `-json` before any `--` separator
+        // unless the user already set `-json` or `-v`.
+        //
+        // Go flags use `-flag=false` to explicitly disable a flag, so we use
+        // go-specific detection that treats `-v=false` as NOT having `-v`.
+        let go_args = build_go_args(args);
+        let go_args_ref: Vec<&str> = go_args.iter().map(String::as_str).collect();
+        run_go(&go_args_ref)?
+    };
 
     // Combine stdout and stderr for parsing (go test writes to both).
-    let combined = if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    };
+    let combined: String = combine_output(&output).into_owned();
 
     let parsed = parse(&combined);
 
@@ -102,9 +83,8 @@ pub(crate) fn run(
                 // messages without needing to re-run with SKIM_PASSTHROUGH=1.
                 // Pass the actual exit code (e.g. 2 for compilation errors) so
                 // the hint reflects the real status rather than a hardcoded 1.
-                use super::shared;
                 let actual_exit = output.exit_code.unwrap_or(1);
-                shared::emit_failure_context(&combined, actual_exit);
+                super::shared::emit_failure_context(&combined, actual_exit);
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -142,6 +122,43 @@ pub(crate) fn run(
 }
 
 // ============================================================================
+// Command preparation and execution
+// ============================================================================
+
+/// Build the final argument list for `go test`, injecting `-json` before any
+/// `--` separator unless the user already set `-json` or `-v`.
+///
+/// Prepends `"test"` so the returned slice can be passed directly to
+/// `CommandRunner::run("go", ...)`.
+fn build_go_args(user_args: &[String]) -> Vec<String> {
+    let mut go_args: Vec<String> = std::iter::once("test".to_string())
+        .chain(user_args.iter().cloned())
+        .collect();
+
+    if !go_has_flag(user_args, "-json") && !go_has_flag(user_args, "-v") {
+        inject_flag_before_separator(&mut go_args, "-json");
+    }
+
+    go_args
+}
+
+/// Execute `go test` with the given arguments.
+///
+/// Returns a user-facing hint when the `go` binary is not found, so the agent
+/// can immediately suggest the install path instead of a raw OS error.
+fn run_go(args: &[&str]) -> anyhow::Result<CommandOutput> {
+    CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
+        .run("go", args)
+        .map_err(|e| {
+            if crate::runner::is_spawn_error(&e) {
+                anyhow::anyhow!("{}\nHint: install Go from https://go.dev/dl/", e)
+            } else {
+                e
+            }
+        })
+}
+
+// ============================================================================
 // Flag detection
 // ============================================================================
 
@@ -153,11 +170,12 @@ pub(crate) fn run(
 /// correct `-json` injection logic. The shared version does not handle
 /// this because `=false` is not a convention outside Go tooling.
 fn go_has_flag(args: &[String], flag: &str) -> bool {
+    let prefix = format!("{flag}=");
     args.iter().any(|a| {
         if a == flag {
             return true;
         }
-        if let Some(value) = a.strip_prefix(&format!("{flag}=")) {
+        if let Some(value) = a.strip_prefix(&prefix) {
             // -v=false means the flag is NOT set
             return value != "false";
         }
@@ -781,40 +799,6 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_separator_flag_injection() {
-        // When `--` is present, `-json` must be injected before it so the
-        // Go toolchain sees the flag, while args after `--` pass through.
-        let args = vec![
-            "./...".to_string(),
-            "--".to_string(),
-            "-run".to_string(),
-            "TestFoo".to_string(),
-        ];
-
-        let mut go_args: Vec<String> = vec!["test".to_string()];
-        if !go_has_flag(&args, "-json") && !go_has_flag(&args, "-v") {
-            if let Some(sep_pos) = args.iter().position(|a| a == "--") {
-                go_args.extend_from_slice(&args[..sep_pos]);
-                go_args.push("-json".to_string());
-                go_args.extend_from_slice(&args[sep_pos..]);
-            } else {
-                go_args.push("-json".to_string());
-                go_args.extend_from_slice(&args);
-            }
-        } else {
-            go_args.extend_from_slice(&args);
-        }
-
-        // -json should appear before `--`
-        let json_pos = go_args.iter().position(|a| a == "-json").unwrap();
-        let sep_pos = go_args.iter().position(|a| a == "--").unwrap();
-        assert!(
-            json_pos < sep_pos,
-            "expected -json (pos {json_pos}) before -- (pos {sep_pos}), got: {go_args:?}"
-        );
-    }
-
-    #[test]
     fn test_v_equals_false_still_injects_json() {
         // `-v=false` explicitly disables verbose mode, so -json should be injected.
         let args = vec!["-v=false".to_string(), "./...".to_string()];
@@ -831,6 +815,75 @@ mod tests {
         assert!(
             go_has_flag(&args, "-v"),
             "expected -v=true to be detected as -v"
+        );
+    }
+
+    // ========================================================================
+    // build_go_args tests
+    // ========================================================================
+
+    #[test]
+    fn test_build_go_args_prepends_test_subcommand() {
+        let args = vec!["./...".to_string()];
+        let go_args = build_go_args(&args);
+        assert_eq!(
+            go_args[0], "test",
+            "expected first arg to be 'test', got: {:?}",
+            go_args
+        );
+    }
+
+    #[test]
+    fn test_build_go_args_injects_json_flag() {
+        let args = vec!["./...".to_string()];
+        let go_args = build_go_args(&args);
+        assert!(
+            go_args.contains(&"-json".to_string()),
+            "expected -json to be injected, got: {go_args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_go_args_skips_json_injection_when_json_present() {
+        let args = vec!["-json".to_string(), "./...".to_string()];
+        let go_args = build_go_args(&args);
+        let json_count = go_args.iter().filter(|a| a.as_str() == "-json").count();
+        assert_eq!(
+            json_count, 1,
+            "expected exactly one -json flag, got {json_count}: {go_args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_go_args_skips_json_injection_when_v_present() {
+        let args = vec!["-v".to_string(), "./...".to_string()];
+        let go_args = build_go_args(&args);
+        assert!(
+            !go_args.contains(&"-json".to_string()),
+            "expected -json NOT to be injected when -v present, got: {go_args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_go_args_injects_json_before_separator() {
+        let args = vec![
+            "./...".to_string(),
+            "--".to_string(),
+            "-run".to_string(),
+            "TestFoo".to_string(),
+        ];
+        let go_args = build_go_args(&args);
+        let json_pos = go_args
+            .iter()
+            .position(|a| a == "-json")
+            .expect("-json must be present");
+        let sep_pos = go_args
+            .iter()
+            .position(|a| a == "--")
+            .expect("-- must be present");
+        assert!(
+            json_pos < sep_pos,
+            "expected -json (pos {json_pos}) before -- (pos {sep_pos}), got: {go_args:?}"
         );
     }
 }

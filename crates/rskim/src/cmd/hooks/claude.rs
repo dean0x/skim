@@ -34,8 +34,8 @@ impl HookProtocol for ClaudeCodeHook {
         })
     }
 
-    fn generate_script(&self, binary_path: &str, version: &str) -> String {
-        super::generate_hook_script(binary_path, version, "claude-code")
+    fn generate_script(&self, version: &str) -> String {
+        super::generate_hook_script(version, "claude-code")
     }
 }
 
@@ -106,24 +106,23 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_generate_script() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
+    fn test_claude_generate_script_bare_command() {
+        let script = hook().generate_script("1.0.0");
         assert!(script.contains("#!/usr/bin/env bash"));
         assert!(script.contains("# skim-hook v1.0.0"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.0.0\""));
-        assert!(script.contains("exec \"/usr/local/bin/skim\" rewrite --hook --agent claude-code"));
+        assert!(script.contains("exec skim rewrite --hook --agent claude-code"));
     }
 
     #[test]
     fn test_claude_generate_script_init_comment() {
-        let script = hook().generate_script("/usr/local/bin/skim", "1.0.0");
+        let script = hook().generate_script("1.0.0");
         assert!(script.contains("skim init --agent claude-code"));
     }
 
     #[test]
     fn test_claude_install_default() {
         let opts = InstallOpts {
-            binary_path: "/usr/local/bin/skim".into(),
             version: "1.0.0".into(),
             config_dir: "/tmp/.claude".into(),
             project_scope: false,

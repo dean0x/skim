@@ -10,7 +10,10 @@ use tempfile::TempDir;
 
 /// Get a command for the skim binary
 fn skim_cmd() -> Command {
-    Command::cargo_bin("skim").unwrap()
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd.env_remove("SKIM_DEBUG");
+    cmd
 }
 
 /// Resolve path to a test fixture file relative to the workspace root

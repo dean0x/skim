@@ -166,15 +166,6 @@ skim <file>                    # structural overview (default)
 skim <file> --mode=signatures  # API surface only
 skim 'src/**/*.ts'             # multi-file scan
 ```
-
-### Troubleshooting
-
-If a command's output seems incomplete or too compressed, prefix with
-`SKIM_PASSTHROUGH=1` to bypass compression and see full raw output:
-
-```
-SKIM_PASSTHROUGH=1 npx vitest run tests/
-```
 <!-- skim-end -->"#,
         version = version
     )
@@ -193,21 +184,6 @@ pub(super) fn guidance_content_mdc(version: &str) -> String {
 // ============================================================================
 // Interactive prompt helpers
 // ============================================================================
-
-pub(super) fn prompt_choice(prompt: &str, default: u32, valid: &[u32]) -> anyhow::Result<u32> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Ok(default);
-    }
-    match trimmed.parse::<u32>() {
-        Ok(n) if valid.contains(&n) => Ok(n),
-        _ => Ok(default),
-    }
-}
 
 /// Prompt the user with "Proceed? [Y/n]" and return `true` if confirmed.
 pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
@@ -249,7 +225,7 @@ pub(super) fn print_help() {
     println!(
         "                      Supported: claude-code, cursor, gemini, copilot, codex, opencode"
     );
-    println!("  --yes, -y           Non-interactive mode (skip prompts)");
+    println!("  --yes, -y           Skip confirmation (uninstall only; install is always non-interactive)");
     println!("  --dry-run           Print actions without writing");
     println!("  --uninstall         Remove hook and clean up");
     println!("  --no-guidance       Skip injecting guidance into agent instruction file");
@@ -257,12 +233,12 @@ pub(super) fn print_help() {
     println!("  --help, -h          Print help information");
     println!();
     println!("Examples:");
-    println!("  skim init                          Interactive Claude Code setup (recommended)");
-    println!("  skim init --yes                    Non-interactive with defaults");
-    println!("  skim init --agent cursor --yes     Install for Cursor");
-    println!("  skim init --agent gemini --yes     Install for Gemini CLI");
-    println!("  skim init --project --yes          Install project-level hook");
+    println!("  skim init                          Install for Claude Code (recommended)");
+    println!("  skim init --agent cursor           Install for Cursor");
+    println!("  skim init --agent gemini           Install for Gemini CLI");
+    println!("  skim init --project                Install project-level hook");
     println!("  skim init --uninstall              Remove skim hook");
+    println!("  skim init --uninstall --yes        Uninstall without confirmation");
     println!("  skim init --dry-run                Preview actions without writing");
 }
 
@@ -284,39 +260,9 @@ mod tests {
         // Strong directive language
         assert!(content.contains("ALWAYS prefer"));
         assert!(content.contains("Use Read only when"));
-        // Troubleshooting section must be present
-        assert!(content.contains("SKIM_PASSTHROUGH"));
-    }
-
-    #[test]
-    fn test_guidance_content_has_troubleshooting() {
-        let content = guidance_content("2.5.1");
-        assert!(
-            content.contains("Troubleshooting"),
-            "guidance_content must include a Troubleshooting section"
-        );
-        assert!(
-            content.contains("SKIM_PASSTHROUGH=1"),
-            "guidance_content must mention SKIM_PASSTHROUGH=1"
-        );
-        // Troubleshooting section must appear before the end marker
-        let trouble_pos = content.find("Troubleshooting").unwrap();
-        let end_pos = content.find("<!-- skim-end -->").unwrap();
-        assert!(
-            trouble_pos < end_pos,
-            "Troubleshooting must appear before <!-- skim-end -->"
-        );
-    }
-
-    #[test]
-    fn test_guidance_content_troubleshooting_has_code_example() {
-        let content = guidance_content("2.5.1");
-        // The troubleshooting section must contain a code block with the exact
-        // example command shown in the docs.
-        assert!(
-            content.contains("SKIM_PASSTHROUGH=1 npx vitest"),
-            "guidance_content troubleshooting section must include code example: SKIM_PASSTHROUGH=1 npx vitest"
-        );
+        // SKIM_PASSTHROUGH is NOT documented in guidance — agents learn about it
+        // from stderr hints emitted on compressed non-zero exits (shared.rs, mod.rs).
+        assert!(!content.contains("SKIM_PASSTHROUGH"));
     }
 
     #[test]

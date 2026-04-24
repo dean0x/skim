@@ -288,7 +288,7 @@ pub(super) fn run_diff(
     full_args.extend(["diff".to_string(), "--no-color".to_string()]);
     full_args.extend_from_slice(&git_args);
 
-    let runner = CommandRunner::new(None);
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
     let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
