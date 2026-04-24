@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use regex::Regex;
 
-use crate::cmd::inject_flag_before_separator;
+use crate::cmd::{combine_output, inject_flag_before_separator};
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
@@ -66,11 +66,7 @@ pub(crate) fn run(
     };
 
     // Combine stdout and stderr for parsing (go test writes to both).
-    let combined = if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    };
+    let combined: String = combine_output(&output).into_owned();
 
     let parsed = parse(&combined);
 
@@ -801,40 +797,6 @@ mod tests {
     // ========================================================================
     // `--` separator and flag edge cases
     // ========================================================================
-
-    #[test]
-    fn test_separator_flag_injection() {
-        // When `--` is present, `-json` must be injected before it so the
-        // Go toolchain sees the flag, while args after `--` pass through.
-        let args = vec![
-            "./...".to_string(),
-            "--".to_string(),
-            "-run".to_string(),
-            "TestFoo".to_string(),
-        ];
-
-        let mut go_args: Vec<String> = vec!["test".to_string()];
-        if !go_has_flag(&args, "-json") && !go_has_flag(&args, "-v") {
-            if let Some(sep_pos) = args.iter().position(|a| a == "--") {
-                go_args.extend_from_slice(&args[..sep_pos]);
-                go_args.push("-json".to_string());
-                go_args.extend_from_slice(&args[sep_pos..]);
-            } else {
-                go_args.push("-json".to_string());
-                go_args.extend_from_slice(&args);
-            }
-        } else {
-            go_args.extend_from_slice(&args);
-        }
-
-        // -json should appear before `--`
-        let json_pos = go_args.iter().position(|a| a == "-json").unwrap();
-        let sep_pos = go_args.iter().position(|a| a == "--").unwrap();
-        assert!(
-            json_pos < sep_pos,
-            "expected -json (pos {json_pos}) before -- (pos {sep_pos}), got: {go_args:?}"
-        );
-    }
 
     #[test]
     fn test_v_equals_false_still_injects_json() {
