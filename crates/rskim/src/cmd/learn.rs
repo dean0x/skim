@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use comfy_table::presets::UTF8_FULL_CONDENSED;
+use comfy_table::{ContentArrangement, Table};
+
 use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
 
 /// Run the learn subcommand.
@@ -790,9 +793,6 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
         if corrections.len() == 1 { "" } else { "s" }
     );
 
-    use comfy_table::presets::UTF8_FULL_CONDENSED;
-    use comfy_table::{ContentArrangement, Table};
-
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL_CONDENSED)
@@ -803,10 +803,7 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
         table.add_row(vec![
             (i + 1).to_string(),
             pair.pattern_type.label().to_string(),
-            format!(
-                "{}x",
-                pair.occurrences,
-            ),
+            format!("{}x", pair.occurrences),
             pair.failed_command.clone(),
             pair.successful_command.clone(),
         ]);

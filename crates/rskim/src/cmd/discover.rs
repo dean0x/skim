@@ -6,6 +6,9 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use comfy_table::presets::UTF8_FULL_CONDENSED;
+use comfy_table::{ContentArrangement, Table};
+
 use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
 
 /// Run the discover subcommand.
@@ -350,8 +353,6 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
         sorted_reads.sort_by_key(|r| std::cmp::Reverse(r.result_tokens));
         println!("  Top files by token count:");
         {
-            use comfy_table::presets::UTF8_FULL_CONDENSED;
-            use comfy_table::{ContentArrangement, Table};
             let mut table = Table::new();
             table
                 .load_preset(UTF8_FULL_CONDENSED)
@@ -386,8 +387,6 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
         println!("  Rewritable commands:");
         // Deduplicate by command prefix and render as a table (D5: text path only).
         let mut seen = std::collections::HashSet::new();
-        use comfy_table::presets::UTF8_FULL_CONDENSED;
-        use comfy_table::{ContentArrangement, Table};
         let mut table = Table::new();
         table
             .load_preset(UTF8_FULL_CONDENSED)

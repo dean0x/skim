@@ -202,7 +202,8 @@ pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
         .prompt()
     {
         Ok(yes) => Ok(yes),
-        Err(inquire::InquireError::OperationCanceled) => Ok(false),
+        Err(inquire::InquireError::OperationCanceled)
+        | Err(inquire::InquireError::OperationInterrupted) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
