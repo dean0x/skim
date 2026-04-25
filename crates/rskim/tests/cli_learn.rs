@@ -87,7 +87,7 @@ fn test_learn_generate_writes_file() {
         .current_dir(work_dir.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("Wrote").and(predicate::str::contains("correction")));
+        .stdout(predicate::str::is_match(r"Wrote [1-9]\d* correction").unwrap());
 
     // Verify the file was created
     let rules_file = work_dir.path().join(".claude/rules/skim-corrections.md");
@@ -273,7 +273,7 @@ fn test_learn_generate_claude_code_writes_md_file() {
         .current_dir(work_dir.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("Wrote").and(predicate::str::contains("correction")));
+        .stdout(predicate::str::is_match(r"Wrote [1-9]\d* correction").unwrap());
 
     let rules_file = work_dir.path().join(".claude/rules/skim-corrections.md");
     assert!(
@@ -366,7 +366,7 @@ fn test_learn_generate_copilot_writes_instructions_md_with_frontmatter() {
 
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("Wrote").and(predicate::str::contains("correction")));
+        .stdout(predicate::str::is_match(r"Wrote [1-9]\d* correction").unwrap());
 
     let rules_file = work_dir
         .path()
