@@ -184,7 +184,7 @@ pub(super) fn guidance_content_mdc(version: &str) -> String {
 // Interactive prompt helpers
 // ============================================================================
 
-/// Prompt the user with "Proceed with uninstall?" and return `true` if confirmed.
+/// Prompt the user with "Proceed?" and return `true` if confirmed.
 ///
 /// Uses `inquire::Confirm` when stdin is a terminal (D3) for a polished
 /// interactive prompt. Falls back to raw `read_line()` in non-TTY environments
@@ -197,7 +197,7 @@ pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
     if !std::io::stdin().is_terminal() {
         return confirm_proceed_raw();
     }
-    match inquire::Confirm::new("Proceed with uninstall?")
+    match inquire::Confirm::new("Proceed?")
         .with_default(true)
         .prompt()
     {
@@ -225,14 +225,10 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
 
 /// Return a colored status mark.
 ///
-/// Uses `colored` crate (D7: respects `NO_COLOR`), replacing the former
-/// manual `\x1b[32m+\x1b[0m` / `\x1b[31m-\x1b[0m` ANSI escape sequences.
+/// Thin wrapper around [`crate::cmd::ux::check_mark`] for use within the
+/// `init` module without qualifying the full path at every call site.
 pub(super) fn check_mark(ok: bool) -> colored::ColoredString {
-    if ok {
-        crate::cmd::ux::success_mark()
-    } else {
-        crate::cmd::ux::fail_mark()
-    }
+    crate::cmd::ux::check_mark(ok)
 }
 
 // ============================================================================

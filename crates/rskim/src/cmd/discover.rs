@@ -403,8 +403,9 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
                 table.add_row(vec![
                     prefix,
                     cmd.rewrite_target
-                        .clone()
-                        .unwrap_or_else(|| "skim equivalent".to_string()),
+                        .as_deref()
+                        .unwrap_or("skim equivalent")
+                        .to_string(),
                 ]);
             }
         }

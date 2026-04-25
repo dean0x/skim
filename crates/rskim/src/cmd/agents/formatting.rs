@@ -29,6 +29,8 @@ pub(super) fn print_text(agents: &[AgentStatus]) {
             continue;
         }
 
+        // Indent continuation lines to align past the header row:
+        // 2 leading spaces + 1 mark char + 1 space + 1 extra padding = 5.
         let indent = " ".repeat(agent.kind.display_name().len() + 5);
 
         // Sessions

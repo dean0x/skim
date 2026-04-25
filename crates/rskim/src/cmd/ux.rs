@@ -18,6 +18,15 @@ pub(crate) fn fail_mark() -> colored::ColoredString {
     "-".red()
 }
 
+/// Return a colored status mark: green `+` for success, red `-` for failure.
+///
+/// Convenience wrapper used when the caller has a boolean condition rather than
+/// separate success/failure branches. Respects `NO_COLOR` via the `colored`
+/// crate (D7).
+pub(crate) fn check_mark(ok: bool) -> colored::ColoredString {
+    if ok { success_mark() } else { fail_mark() }
+}
+
 /// Create a stderr-bound indeterminate spinner with the given message.
 ///
 /// The spinner ticks every 80 ms and writes to stderr so it does not
@@ -29,7 +38,7 @@ pub(crate) fn spinner(msg: &str) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.cyan} {msg}")
-            .unwrap(),
+            .expect("static spinner template is always valid"),
     );
     pb.set_message(msg.to_string());
     pb.enable_steady_tick(Duration::from_millis(80));
