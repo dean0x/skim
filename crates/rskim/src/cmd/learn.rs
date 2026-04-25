@@ -761,7 +761,7 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
             let correction_count = corrections_count(content);
             std::fs::write(&rules_path, content)?;
             println!(
-                "{} Wrote {} correction{} to {}",
+                "  {} Wrote {} correction{} to {}",
                 crate::cmd::ux::success_mark(),
                 correction_count,
                 if correction_count == 1 { "" } else { "s" },
@@ -797,19 +797,26 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
     table
         .load_preset(UTF8_FULL_CONDENSED)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec!["#", "Pattern", "Seen", "Failed", "Correct"]);
+        .set_header(vec!["#", "Pattern", "Seen", "Failed", "Correct", "Error"]);
 
     for (i, pair) in corrections.iter().enumerate() {
+        let index = (i + 1).to_string();
+        let seen = format!("{}x", pair.occurrences);
+        let first_error_line = pair.error_output.lines().next().unwrap_or("");
         table.add_row(vec![
-            (i + 1).to_string(),
-            pair.pattern_type.label().to_string(),
-            format!("{}x", pair.occurrences),
-            pair.failed_command.clone(),
-            pair.successful_command.clone(),
+            index.as_str(),
+            pair.pattern_type.label(),
+            seen.as_str(),
+            pair.failed_command.as_str(),
+            pair.successful_command.as_str(),
+            first_error_line,
         ]);
     }
 
-    println!("{table}");
+    // Indent the table by 4 spaces to match the surrounding output style.
+    for line in table.to_string().lines() {
+        println!("    {line}");
+    }
     println!();
 
     let target = match agent.rules_dir() {
@@ -1386,6 +1393,31 @@ mod tests {
         assert!(content.contains("Use: `cargo test`"));
         // Claude Code: no frontmatter
         assert!(!content.starts_with("---"));
+    }
+
+    // ---- corrections_count ----
+
+    #[test]
+    fn test_corrections_count_empty_string() {
+        assert_eq!(corrections_count(""), 0);
+    }
+
+    #[test]
+    fn test_corrections_count_single_correction() {
+        let content = "# CLI Corrections\n\n## Fix typo in cargo\n\nInstead of: `carg test`\nUse: `cargo test`\n";
+        assert_eq!(corrections_count(content), 1);
+    }
+
+    #[test]
+    fn test_corrections_count_multiple_corrections() {
+        let content = "# CLI Corrections\n\n## Fix typo in cargo\n\nSome details.\n\n## Add missing separator\n\nOther details.\n\n## Wrong flag\n\nMore.\n";
+        assert_eq!(corrections_count(content), 3);
+    }
+
+    #[test]
+    fn test_corrections_count_ignores_non_h2_headings() {
+        let content = "# Title (H1)\n\n### Subheading (H3)\n\n#### Deep (H4)\n\n## Only this one counts\n";
+        assert_eq!(corrections_count(content), 1);
     }
 
     // ---- parse_args ----
