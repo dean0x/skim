@@ -34,8 +34,16 @@ pub(crate) fn run(
         latest_only: false,
     };
 
-    // Collect all invocations from all providers
+    // Collect all invocations — show a spinner on TTY; JSON mode bypasses all UI (D5).
+    let spinner = if !config.json_output {
+        Some(crate::cmd::ux::spinner("Scanning agent sessions..."))
+    } else {
+        None
+    };
     let all_invocations = session::collect_invocations(&providers, &filter)?;
+    if let Some(s) = spinner {
+        s.finish_and_clear();
+    }
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -712,6 +720,14 @@ fn sanitize_command_for_rules(cmd: &str) -> String {
     sanitize_for_rules(cmd, 200)
 }
 
+/// Count correction pairs in a rules file by counting `## ` heading lines.
+fn corrections_count(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|l| l.starts_with("## "))
+        .count()
+}
+
 /// Write the rules file to the appropriate agent-specific location.
 ///
 /// For agents with a rules directory (Claude Code, Cursor, Copilot),
@@ -739,8 +755,15 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
             }
 
             std::fs::create_dir_all(rules_dir)?;
+            let correction_count = corrections_count(content);
             std::fs::write(&rules_path, content)?;
-            println!("Wrote corrections to: {}", rules_path.display());
+            println!(
+                "{} Wrote {} correction{} to {}",
+                crate::cmd::ux::success_mark(),
+                correction_count,
+                if correction_count == 1 { "" } else { "s" },
+                rules_path.display(),
+            );
         }
         None => {
             // Single-file agents: print content with instructions
@@ -767,25 +790,30 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
         if corrections.len() == 1 { "" } else { "s" }
     );
 
+    use comfy_table::presets::UTF8_FULL_CONDENSED;
+    use comfy_table::{ContentArrangement, Table};
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["#", "Pattern", "Seen", "Failed", "Correct"]);
+
     for (i, pair) in corrections.iter().enumerate() {
-        println!(
-            "{}. {} (seen {} time{})",
-            i + 1,
-            pair.pattern_type.label(),
-            pair.occurrences,
-            if pair.occurrences == 1 { "" } else { "s" },
-        );
-        println!("   Failed:  {}", pair.failed_command);
-        println!("   Correct: {}", pair.successful_command);
-        if !pair.error_output.is_empty() {
-            // Show first line of error output
-            let first_line = pair.error_output.lines().next().unwrap_or_default();
-            if !first_line.is_empty() {
-                println!("   Error:   {first_line}");
-            }
-        }
-        println!();
+        table.add_row(vec![
+            (i + 1).to_string(),
+            pair.pattern_type.label().to_string(),
+            format!(
+                "{}x",
+                pair.occurrences,
+            ),
+            pair.failed_command.clone(),
+            pair.successful_command.clone(),
+        ]);
     }
+
+    println!("{table}");
+    println!();
 
     let target = match agent.rules_dir() {
         Some(dir) => std::path::Path::new(dir)

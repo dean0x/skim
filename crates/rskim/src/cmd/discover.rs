@@ -32,8 +32,16 @@ pub(crate) fn run(
         latest_only: config.session_latest,
     };
 
-    // Collect invocations from all providers
+    // Collect invocations — show a spinner on TTY; JSON mode bypasses all UI (D5).
+    let spinner = if !config.json_output {
+        Some(crate::cmd::ux::spinner("Scanning agent sessions..."))
+    } else {
+        None
+    };
     let all_invocations = session::collect_invocations(&providers, &filter)?;
+    if let Some(s) = spinner {
+        s.finish_and_clear();
+    }
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -341,8 +349,21 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
             .collect();
         sorted_reads.sort_by_key(|r| std::cmp::Reverse(r.result_tokens));
         println!("  Top files by token count:");
-        for read in sorted_reads.iter().take(10) {
-            println!("    {} ({} tokens)", read.file_path, read.result_tokens);
+        {
+            use comfy_table::presets::UTF8_FULL_CONDENSED;
+            use comfy_table::{ContentArrangement, Table};
+            let mut table = Table::new();
+            table
+                .load_preset(UTF8_FULL_CONDENSED)
+                .set_content_arrangement(ContentArrangement::Dynamic)
+                .set_header(vec!["File", "Tokens"]);
+            for read in sorted_reads.iter().take(10) {
+                table.add_row(vec![&read.file_path, &read.result_tokens.to_string()]);
+            }
+            // Indent the table by 4 spaces to match the surrounding output style.
+            for line in table.to_string().lines() {
+                println!("    {line}");
+            }
         }
     }
     println!();
@@ -363,8 +384,15 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
     if rewritable_count > 0 {
         println!();
         println!("  Rewritable commands:");
-        // Deduplicate by command prefix
+        // Deduplicate by command prefix and render as a table (D5: text path only).
         let mut seen = std::collections::HashSet::new();
+        use comfy_table::presets::UTF8_FULL_CONDENSED;
+        use comfy_table::{ContentArrangement, Table};
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL_CONDENSED)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec!["Command", "Rewrite"]);
         for cmd in analysis.bash_commands.iter().filter(|c| c.has_rewrite) {
             let prefix: String = cmd
                 .command
@@ -373,12 +401,16 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
                 .collect::<Vec<_>>()
                 .join(" ");
             if seen.insert(prefix.clone()) {
-                println!(
-                    "    {} -> {}",
+                table.add_row(vec![
                     prefix,
-                    cmd.rewrite_target.as_deref().unwrap_or("skim equivalent"),
-                );
+                    cmd.rewrite_target
+                        .clone()
+                        .unwrap_or_else(|| "skim equivalent".to_string()),
+                ]);
             }
+        }
+        for line in table.to_string().lines() {
+            println!("    {line}");
         }
     }
 

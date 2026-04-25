@@ -20,6 +20,7 @@ mod learn;
 mod lint;
 mod log;
 mod pkg;
+pub(crate) mod ux;
 mod rewrite;
 mod session;
 mod stats;
