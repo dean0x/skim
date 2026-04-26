@@ -1,30 +1,52 @@
 //! Output formatting for the `skim agents` subcommand.
+//!
+//! Text output uses the `colored` crate for status indicators (D7: respects
+//! `NO_COLOR`). JSON output is unchanged (D5).
+//
+// No spinner: agent detection is filesystem-stat-based (<10ms).
+// A sub-second spinner degrades UX rather than improving it (D1).
+
+use colored::Colorize;
 
 use super::types::{AgentStatus, HookStatus};
 
+// Text output format is not a stable interface.
+// Use `--json` for scripting and automation (D5).
 pub(super) fn print_text(agents: &[AgentStatus]) {
     println!("Detected agents:");
     for agent in agents {
         println!();
         if agent.detected {
-            println!("  {}   detected", agent.kind.display_name());
+            // Detected: green `+` + bold name
+            println!(
+                "  {} {}",
+                crate::cmd::ux::success_mark(),
+                agent.kind.display_name().bold(),
+            );
         } else {
-            println!("  {}   not detected", agent.kind.display_name());
+            // Not detected: red `-` + dimmed label
+            println!(
+                "  {} {} {}",
+                crate::cmd::ux::fail_mark(),
+                agent.kind.display_name(),
+                "(not detected)".dimmed(),
+            );
             continue;
         }
+
+        // Indent continuation lines to align past the header row:
+        // 2 leading spaces + 1 mark char + 1 space + 1 extra padding = 5.
+        let indent = " ".repeat(agent.kind.display_name().len() + 5);
 
         // Sessions
         if let Some(ref sessions) = agent.sessions {
             println!(
-                "  {:width$}sessions: {} ({})",
-                "",
-                sessions.path,
-                sessions.detail,
-                width = agent.kind.display_name().len() + 3,
+                "{}sessions: {} ({})",
+                indent, sessions.path, sessions.detail,
             );
         }
 
-        // Hooks
+        // Hooks — color by status
         let hook_str = match &agent.hooks {
             HookStatus::Installed { version, integrity } => {
                 let ver = version
@@ -32,27 +54,31 @@ pub(super) fn print_text(agents: &[AgentStatus]) {
                     .map(|v| format!(", v{v}"))
                     .unwrap_or_default();
                 format!("installed (integrity: {integrity}{ver})")
+                    .green()
+                    .to_string()
             }
-            HookStatus::NotInstalled => "not installed".to_string(),
-            HookStatus::NotSupported { note } => format!("not supported ({note})"),
+            HookStatus::NotInstalled => {
+                let hint = format!(
+                    "\n{}  hint: run `skim init --agent {}`",
+                    indent,
+                    agent.kind.cli_name(),
+                );
+                format!("{}{}", "not installed".yellow(), hint.dimmed())
+            }
+            HookStatus::NotSupported { note } => {
+                format!("not supported ({note})").dimmed().to_string()
+            }
         };
-        println!(
-            "  {:width$}hooks: {}",
-            "",
-            hook_str,
-            width = agent.kind.display_name().len() + 3,
-        );
+        println!("{}hooks: {}", indent, hook_str);
 
         // Rules
         if let Some(ref rules) = agent.rules {
-            let status = if rules.exists { "found" } else { "not found" };
-            println!(
-                "  {:width$}rules: {} ({})",
-                "",
-                rules.path,
-                status,
-                width = agent.kind.display_name().len() + 3,
-            );
+            let status = if rules.exists {
+                "found".green().to_string()
+            } else {
+                "not found".yellow().to_string()
+            };
+            println!("{}rules: {} ({})", indent, rules.path, status);
         }
     }
 }

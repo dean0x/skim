@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use comfy_table::presets::UTF8_FULL_CONDENSED;
+use comfy_table::{ContentArrangement, Table};
+
 use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
 
 /// Run the learn subcommand.
@@ -34,8 +37,11 @@ pub(crate) fn run(
         latest_only: false,
     };
 
-    // Collect all invocations from all providers
-    let all_invocations = session::collect_invocations(&providers, &filter)?;
+    // Collect all invocations — show a spinner on TTY; JSON mode bypasses all UI (D5).
+    let all_invocations =
+        crate::cmd::ux::with_spinner(config.json_output, "Analyzing error patterns...", || {
+            session::collect_invocations(&providers, &filter)
+        })?;
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -69,7 +75,7 @@ pub(crate) fn run(
         let rules_agent = config.agent_filter.unwrap_or(AgentKind::ClaudeCode);
         if config.generate {
             let content = generate_rules_content(&corrections, rules_agent);
-            write_rules_file(&content, rules_agent, config.dry_run)?;
+            write_rules_file(&content, rules_agent, config.dry_run, corrections.len())?;
         } else {
             print_text_report(&corrections, rules_agent);
         }
@@ -712,12 +718,23 @@ fn sanitize_command_for_rules(cmd: &str) -> String {
     sanitize_for_rules(cmd, 200)
 }
 
+/// Count correction pairs in a rules file by counting `## ` heading lines.
+#[cfg(test)]
+fn corrections_count(content: &str) -> usize {
+    content.lines().filter(|l| l.starts_with("## ")).count()
+}
+
 /// Write the rules file to the appropriate agent-specific location.
 ///
 /// For agents with a rules directory (Claude Code, Cursor, Copilot),
 /// creates the file automatically. For single-file agents (Codex, Gemini,
 /// OpenCode), prints the content with instructions to paste.
-fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::Result<()> {
+fn write_rules_file(
+    content: &str,
+    agent: AgentKind,
+    dry_run: bool,
+    correction_count: usize,
+) -> anyhow::Result<()> {
     match agent.rules_dir() {
         Some(dir) => {
             // Directory-based agents: auto-create file
@@ -732,7 +749,7 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
             }
 
             if dry_run {
-                println!("Would write to: {}", rules_path.display());
+                println!("  Would write to: {}", rules_path.display());
                 println!("---");
                 print!("{content}");
                 return Ok(());
@@ -740,7 +757,13 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
 
             std::fs::create_dir_all(rules_dir)?;
             std::fs::write(&rules_path, content)?;
-            println!("Wrote corrections to: {}", rules_path.display());
+            println!(
+                "  {} Wrote {} correction{} to {}",
+                crate::cmd::ux::success_mark(),
+                correction_count,
+                if correction_count == 1 { "" } else { "s" },
+                rules_path.display(),
+            );
         }
         None => {
             // Single-file agents: print content with instructions
@@ -767,25 +790,29 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
         if corrections.len() == 1 { "" } else { "s" }
     );
 
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["#", "Pattern", "Seen", "Failed", "Correct", "Error"]);
+
     for (i, pair) in corrections.iter().enumerate() {
-        println!(
-            "{}. {} (seen {} time{})",
-            i + 1,
+        let index = (i + 1).to_string();
+        let seen = format!("{}x", pair.occurrences);
+        let first_error_line = pair.error_output.lines().next().unwrap_or("");
+        table.add_row(vec![
+            index.as_str(),
             pair.pattern_type.label(),
-            pair.occurrences,
-            if pair.occurrences == 1 { "" } else { "s" },
-        );
-        println!("   Failed:  {}", pair.failed_command);
-        println!("   Correct: {}", pair.successful_command);
-        if !pair.error_output.is_empty() {
-            // Show first line of error output
-            let first_line = pair.error_output.lines().next().unwrap_or_default();
-            if !first_line.is_empty() {
-                println!("   Error:   {first_line}");
-            }
-        }
-        println!();
+            seen.as_str(),
+            pair.failed_command.as_str(),
+            pair.successful_command.as_str(),
+            first_error_line,
+        ]);
     }
+
+    // Indent the table by 4 spaces to match the surrounding output style.
+    crate::cmd::ux::print_indented_table(&table, 4);
+    println!();
 
     let target = match agent.rules_dir() {
         Some(dir) => std::path::Path::new(dir)
@@ -1361,6 +1388,32 @@ mod tests {
         assert!(content.contains("Use: `cargo test`"));
         // Claude Code: no frontmatter
         assert!(!content.starts_with("---"));
+    }
+
+    // ---- corrections_count ----
+
+    #[test]
+    fn test_corrections_count_empty_string() {
+        assert_eq!(corrections_count(""), 0);
+    }
+
+    #[test]
+    fn test_corrections_count_single_correction() {
+        let content = "# CLI Corrections\n\n## Fix typo in cargo\n\nInstead of: `carg test`\nUse: `cargo test`\n";
+        assert_eq!(corrections_count(content), 1);
+    }
+
+    #[test]
+    fn test_corrections_count_multiple_corrections() {
+        let content = "# CLI Corrections\n\n## Fix typo in cargo\n\nSome details.\n\n## Add missing separator\n\nOther details.\n\n## Wrong flag\n\nMore.\n";
+        assert_eq!(corrections_count(content), 3);
+    }
+
+    #[test]
+    fn test_corrections_count_ignores_non_h2_headings() {
+        let content =
+            "# Title (H1)\n\n### Subheading (H3)\n\n#### Deep (H4)\n\n## Only this one counts\n";
+        assert_eq!(corrections_count(content), 1);
     }
 
     // ---- parse_args ----

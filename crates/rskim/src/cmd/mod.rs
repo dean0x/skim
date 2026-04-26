@@ -24,6 +24,7 @@ mod rewrite;
 mod session;
 mod stats;
 mod test;
+pub(crate) mod ux;
 
 use std::borrow::Cow;
 use std::io::{self, Read, Write};

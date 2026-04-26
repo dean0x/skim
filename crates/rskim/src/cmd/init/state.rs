@@ -19,7 +19,6 @@ pub(super) struct DetectedState {
     pub(super) hook_version: Option<String>,
     /// Whether the hook script uses bare `skim` (PATH-resolved) vs hardcoded binary path.
     pub(super) hook_uses_bare_command: bool,
-    pub(super) marketplace_installed: bool,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim Bash PreToolUse hooks (plugin collision detection)
@@ -50,7 +49,6 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
 
     let mut hook_installed = false;
     let mut hook_version = None;
-    let mut marketplace_installed = false;
 
     let parsed_settings = read_settings_json(&settings_path);
     if let Some(ref json) = parsed_settings {
@@ -69,13 +67,6 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
                     );
                 }
             }
-        }
-        if json
-            .get("extraKnownMarketplaces")
-            .and_then(|m| m.get("skim"))
-            .is_some()
-        {
-            marketplace_installed = true;
         }
     }
 
@@ -100,7 +91,6 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
         hook_installed,
         hook_version,
         hook_uses_bare_command,
-        marketplace_installed,
         dual_scope_warning,
         existing_bash_hooks,
         agent_cli_name: flags.agent.cli_name(),

@@ -405,37 +405,6 @@ skim src/auth/ | less
 
 📖 **[10 Detailed Use Cases →](docs/use-cases.md)**
 
-## Claude Code Plugin
-
-Skim includes a **Skimmer** plugin for Claude Code — a codebase orientation agent that maps project structure, finds task-relevant code, and generates integration plans.
-
-### Install
-
-**Option A: Via the skim marketplace**
-```
-/plugin marketplace add dean0x/skim
-/plugin install skimmer
-```
-
-**Option B: Direct from the standalone repo**
-```
-/plugin marketplace add dean0x/skimmer
-```
-
-> **Note:** `dean0x/skim` is a custom marketplace. Unlike the official Claude Code plugin directory, custom marketplaces must be added explicitly before plugins become available.
-
-### Usage
-
-```
-# Orient for a specific task
-/skim add JWT authentication
-
-# General codebase orientation
-/skim
-```
-
-The Skimmer agent uses `rskim` to extract code structure, then maps relevant files, signatures, and integration points for your task.
-
 ## Caching
 
 **Caching is enabled by default** for 40-50x faster repeated processing.

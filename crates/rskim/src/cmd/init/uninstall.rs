@@ -8,11 +8,10 @@ use super::helpers::{
 use super::state::{has_skim_hook_entry, read_settings_json};
 use crate::cmd::session::InstructionEnv;
 
-/// Remove skim hook entries and marketplace registration from a settings.json value.
+/// Remove skim hook entries from a settings.json value.
 ///
 /// 1. Removes skim entries from `hooks.PreToolUse` array
 /// 2. Cleans up empty arrays/objects
-/// 3. Removes `skim` from `extraKnownMarketplaces`
 fn remove_skim_from_settings(settings: &mut serde_json::Value) {
     let Some(obj) = settings.as_object_mut() else {
         return;
@@ -31,17 +30,6 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value) {
         }
         if hooks_obj.is_empty() {
             obj.remove("hooks");
-        }
-    }
-
-    // Remove skim from extraKnownMarketplaces; clean up if empty
-    if let Some(mkts_obj) = obj
-        .get_mut("extraKnownMarketplaces")
-        .and_then(|m| m.as_object_mut())
-    {
-        mkts_obj.remove("skim");
-        if mkts_obj.is_empty() {
-            obj.remove("extraKnownMarketplaces");
         }
     }
 }
@@ -92,7 +80,6 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
         println!();
         if settings_has_hook {
             println!("    * Remove hook entry from {}", settings_path.display());
-            println!("    * Remove skim from extraKnownMarketplaces");
         }
         if script_exists {
             println!("    * Delete {}", hook_script_path.display());
@@ -110,7 +97,6 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
                 "  [dry-run] Would remove hook entry from {}",
                 settings_path.display()
             );
-            println!("  [dry-run] Would remove skim from extraKnownMarketplaces");
         }
         if script_exists {
             println!("  [dry-run] Would delete {}", hook_script_path.display());

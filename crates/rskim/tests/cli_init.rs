@@ -303,28 +303,6 @@ fn test_init_no_permission_decision() {
 }
 
 // ============================================================================
-// Marketplace
-// ============================================================================
-
-#[test]
-fn test_init_adds_marketplace() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-
-    skim_init_cmd(config).args(["--yes"]).assert().success();
-
-    let contents = fs::read_to_string(config.join("settings.json")).unwrap();
-    let json: serde_json::Value = serde_json::from_str(&contents).unwrap();
-
-    let skim_mkt = &json["extraKnownMarketplaces"]["skim"];
-    assert!(
-        skim_mkt.is_object(),
-        "Should have extraKnownMarketplaces.skim"
-    );
-    assert_eq!(skim_mkt["source"]["repo"], "dean0x/skim");
-}
-
-// ============================================================================
 // Symlinks
 // ============================================================================
 
@@ -497,10 +475,6 @@ fn test_init_uninstall() {
     assert!(
         !contents.contains("skim-rewrite"),
         "Hook entry should be removed"
-    );
-    assert!(
-        !contents.contains("\"skim\""),
-        "Marketplace entry should be removed"
     );
 }
 
@@ -1242,5 +1216,19 @@ fn test_init_guidance_upgrade_updates_stale_version() {
     assert!(
         updated.contains(&format!("<!-- skim-start v{current_version} -->")),
         "Updated marker should reference the current binary version ({current_version})"
+    );
+}
+
+#[test]
+fn test_init_no_marketplace_in_settings() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+
+    skim_init_cmd(config).args(["--yes"]).assert().success();
+
+    let settings = fs::read_to_string(config.join("settings.json")).unwrap();
+    assert!(
+        !settings.contains("marketplace"),
+        "SECURITY: settings must never contain marketplace field"
     );
 }

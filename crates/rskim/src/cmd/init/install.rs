@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use super::flags::InitFlags;
 use super::helpers::{
     atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
-    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, SETTINGS_FILE,
+    HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
 };
 use super::state::{detect_state, has_skim_hook_entry, DetectedState};
 use crate::cmd::hooks::generate_hook_script;
@@ -77,94 +77,83 @@ fn is_guidance_current(flags: &InitFlags, skim_version: &str, env: &InstructionE
         .unwrap_or(true) // No instruction file path = guidance not applicable for this agent
 }
 
-pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let env = InstructionEnv::from_process();
-    let state = detect_state(flags)?;
-
-    // Verify agent is installed before proceeding
-    verify_agent_installed(&state, flags)?;
-
-    // Print header
+fn print_install_header(agent_name: &str) {
     println!();
-    println!(
-        "  skim init -- {} integration setup",
-        flags.agent.display_name()
-    );
+    println!("  skim init -- {} integration setup", agent_name);
     println!();
+}
 
-    // Print detected state
-    print_detected_state(&state);
-
-    // Plugin collision warning: other Bash PreToolUse hooks exist
-    if !state.existing_bash_hooks.is_empty() {
-        println!("  WARNING: Other Bash PreToolUse hooks detected:");
-        for hook_cmd in &state.existing_bash_hooks {
-            println!("    - {hook_cmd}");
-        }
-        println!("  Both hooks will fire on Bash commands. This is usually harmless");
-        println!("  but may cause unexpected behavior if the other hook also modifies commands.");
-        println!();
+fn print_collision_warning(hooks: &[String]) {
+    println!("  WARNING: Other Bash PreToolUse hooks detected:");
+    for hook_cmd in hooks {
+        println!("    - {hook_cmd}");
     }
+    println!("  Both hooks will fire on Bash commands. This is usually harmless");
+    println!("  but may cause unexpected behavior if the other hook also modifies commands.");
+    println!();
+}
 
-    // Already up to date check
-    let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
-    if state.hook_installed
-        && state.hook_is_current()
-        && state.marketplace_installed
-        && guidance_current
-    {
-        println!("  Already up to date. Nothing to do.");
-        println!();
-        return Ok(std::process::ExitCode::SUCCESS);
-    }
+fn print_already_up_to_date() {
+    println!("  Already up to date. Nothing to do.");
+    println!();
+}
 
-    // Dual-scope warning
-    if let Some(ref warning) = state.dual_scope_warning {
-        println!("  WARNING: {warning}");
-        println!();
-    }
+fn print_dual_scope_warning(warning: &str) {
+    println!("  WARNING: {warning}");
+    println!();
+}
 
-    // Install marketplace entry by default.
-    let install_marketplace = true;
-    let global = !flags.project;
-
-    // Print summary
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+fn print_install_summary(state: &DetectedState) {
     println!("  Summary:");
     if !state.hook_installed || !state.hook_is_current() {
+        let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
         println!("    * Create hook script: {}", hook_script_path.display());
         println!(
             "    * Patch settings: {} (add PreToolUse hook)",
             state.settings_path.display()
         );
     }
-    if install_marketplace && !state.marketplace_installed {
-        println!("    * Register marketplace: skim (dean0x/skim)");
-    }
     println!();
+}
 
-    if flags.dry_run {
-        print_dry_run_actions(&state, install_marketplace, flags.no_guidance, global, &env)?;
+fn print_completion_message(agent_name: &str) {
+    println!();
+    println!("  Done! skim is now active in {agent_name}.");
+    println!();
+}
+
+pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let env = InstructionEnv::from_process();
+    let state = detect_state(flags)?;
+
+    verify_agent_installed(&state, flags)?;
+    print_install_header(flags.agent.display_name());
+    print_detected_state(&state);
+
+    if !state.existing_bash_hooks.is_empty() {
+        print_collision_warning(&state.existing_bash_hooks);
+    }
+
+    let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
+    if state.hook_installed && state.hook_is_current() && guidance_current {
+        print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
-    // Execute installation
-    execute_install(&state, install_marketplace, flags.no_guidance, global, &env)?;
-
-    println!();
-    println!(
-        "  Done! skim is now active in {}.",
-        flags.agent.display_name()
-    );
-    println!();
-    if install_marketplace {
-        println!(
-            "  Next step -- install the Skimmer plugin in {}:",
-            flags.agent.display_name()
-        );
-        println!("    /install skimmer@skim");
-        println!();
+    if let Some(ref warning) = state.dual_scope_warning {
+        print_dual_scope_warning(warning);
     }
+
+    let global = !flags.project;
+    print_install_summary(&state);
+
+    if flags.dry_run {
+        print_dry_run_actions(&state, flags.no_guidance, global, &env)?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    execute_install(&state, flags.no_guidance, global, &env)?;
+    print_completion_message(flags.agent.display_name());
 
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -210,7 +199,6 @@ pub(super) fn print_detected_state(state: &DetectedState) {
 
 fn execute_install(
     state: &DetectedState,
-    install_marketplace: bool,
     no_guidance: bool,
     global: bool,
     env: &InstructionEnv,
@@ -219,7 +207,7 @@ fn execute_install(
     create_hook_script(state)?;
 
     // B8: Patch settings.json
-    patch_settings(state, install_marketplace)?;
+    patch_settings(state)?;
 
     // Inject guidance into agent instruction file
     if !no_guidance {
@@ -395,7 +383,7 @@ fn upsert_hook_entry(
     Ok(())
 }
 
-fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::Result<()> {
+fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     // Ensure config dir exists
     if !state.config_dir.exists() {
         std::fs::create_dir_all(&state.config_dir)?;
@@ -419,26 +407,6 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     upsert_hook_entry(&mut settings, &hook_script_path.display().to_string())?;
 
-    // Add marketplace (if opted in)
-    if install_marketplace {
-        let obj = settings
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("settings.json root is not an object"))?;
-
-        let marketplaces = obj
-            .entry("extraKnownMarketplaces")
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-            .as_object_mut()
-            .ok_or_else(|| {
-                anyhow::anyhow!("settings.json 'extraKnownMarketplaces' is not an object")
-            })?;
-
-        marketplaces.insert(
-            "skim".to_string(),
-            serde_json::json!({"source": {"source": "github", "repo": "dean0x/skim"}}),
-        );
-    }
-
     atomic_write_settings(&settings, &real_path)?;
 
     println!(
@@ -446,14 +414,6 @@ fn patch_settings(state: &DetectedState, install_marketplace: bool) -> anyhow::R
         check_mark(true),
         state.settings_path.display()
     );
-
-    if install_marketplace {
-        println!(
-            "  {} Registered: skim marketplace in {}",
-            check_mark(true),
-            SETTINGS_FILE
-        );
-    }
 
     Ok(())
 }
@@ -792,7 +752,6 @@ fn clean_legacy_cursorrules() -> anyhow::Result<()> {
 
 pub(super) fn print_dry_run_actions(
     state: &DetectedState,
-    install_marketplace: bool,
     no_guidance: bool,
     global: bool,
     env: &InstructionEnv,
@@ -811,12 +770,6 @@ pub(super) fn print_dry_run_actions(
         "  [dry-run] Would patch: {} (add PreToolUse hook)",
         state.settings_path.display()
     );
-    if install_marketplace {
-        println!(
-            "  [dry-run] Would register: skim marketplace in {}",
-            SETTINGS_FILE
-        );
-    }
     if !no_guidance {
         let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
             anyhow::anyhow!(

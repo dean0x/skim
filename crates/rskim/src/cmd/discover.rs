@@ -6,6 +6,9 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use comfy_table::presets::UTF8_FULL_CONDENSED;
+use comfy_table::{ContentArrangement, Table};
+
 use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
 
 /// Run the discover subcommand.
@@ -32,8 +35,11 @@ pub(crate) fn run(
         latest_only: config.session_latest,
     };
 
-    // Collect invocations from all providers
-    let all_invocations = session::collect_invocations(&providers, &filter)?;
+    // Collect invocations — show a spinner on TTY; JSON mode bypasses all UI (D5).
+    let all_invocations =
+        crate::cmd::ux::with_spinner(config.json_output, "Scanning agent sessions...", || {
+            session::collect_invocations(&providers, &filter)
+        })?;
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -322,15 +328,14 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
 
     if skimmable_count > 0 {
         println!("  Tokens consumed: {}", analysis.total_read_tokens);
+        let savings_pct = if analysis.total_read_tokens > 0 {
+            (analysis.potential_savings_tokens as f64 / analysis.total_read_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
         println!(
             "  Estimated savings with skim: ~{} tokens (~{:.0}%)",
-            analysis.potential_savings_tokens,
-            if analysis.total_read_tokens > 0 {
-                (analysis.potential_savings_tokens as f64 / analysis.total_read_tokens as f64)
-                    * 100.0
-            } else {
-                0.0
-            },
+            analysis.potential_savings_tokens, savings_pct,
         );
         println!();
 
@@ -341,9 +346,15 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
             .collect();
         sorted_reads.sort_by_key(|r| std::cmp::Reverse(r.result_tokens));
         println!("  Top files by token count:");
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL_CONDENSED)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec!["File", "Tokens"]);
         for read in sorted_reads.iter().take(10) {
-            println!("    {} ({} tokens)", read.file_path, read.result_tokens);
+            table.add_row(vec![&read.file_path, &read.result_tokens.to_string()]);
         }
+        crate::cmd::ux::print_indented_table(&table, 4);
     }
     println!();
 }
@@ -363,8 +374,13 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
     if rewritable_count > 0 {
         println!();
         println!("  Rewritable commands:");
-        // Deduplicate by command prefix
+        // Deduplicate by command prefix and render as a table (D5: text path only).
         let mut seen = std::collections::HashSet::new();
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL_CONDENSED)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec!["Command", "Rewrite"]);
         for cmd in analysis.bash_commands.iter().filter(|c| c.has_rewrite) {
             let prefix: String = cmd
                 .command
@@ -373,13 +389,16 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
                 .collect::<Vec<_>>()
                 .join(" ");
             if seen.insert(prefix.clone()) {
-                println!(
-                    "    {} -> {}",
+                table.add_row(vec![
                     prefix,
-                    cmd.rewrite_target.as_deref().unwrap_or("skim equivalent"),
-                );
+                    cmd.rewrite_target
+                        .as_deref()
+                        .unwrap_or("skim equivalent")
+                        .to_string(),
+                ]);
             }
         }
+        crate::cmd::ux::print_indented_table(&table, 4);
     }
 
     print_debug_section(analysis, debug);
@@ -891,6 +910,20 @@ mod tests {
         // --debug flag sets debug=true
         let config = parse_args(&["--debug".to_string()]).unwrap();
         assert!(config.debug);
+    }
+
+    /// Verify that the table renders without panicking when a cell value exceeds
+    /// the typical terminal width. `comfy_table` must truncate or wrap gracefully.
+    #[test]
+    fn test_table_renders_long_paths() {
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL_CONDENSED)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec!["File", "Tokens"]);
+        table.add_row(vec![&"a".repeat(300), "12345"]);
+        let output = table.to_string();
+        assert!(!output.is_empty());
     }
 
     /// Sync test: verifies that `parse_args` and `command()` accept the same flags.

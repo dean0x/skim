@@ -1,6 +1,5 @@
 //! Shared helper functions and constants for `skim init`.
 
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -185,12 +184,37 @@ pub(super) fn guidance_content_mdc(version: &str) -> String {
 // Interactive prompt helpers
 // ============================================================================
 
-/// Prompt the user with "Proceed? [Y/n]" and return `true` if confirmed.
+/// Prompt the user with "Proceed?" and return `true` if confirmed.
+///
+/// Uses `inquire::Confirm` when stdin is a terminal (D3) for a polished
+/// interactive prompt. Falls back to raw `read_line()` in non-TTY environments
+/// (CI, piped input) so automation is never broken.
+///
+/// Ctrl+C during the `inquire` prompt is treated as `Ok(false)` rather than
+/// an error (D4).
 pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
-    print!("  ? Proceed? [Y/n] ");
-    io::stdout().flush()?;
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return confirm_proceed_raw();
+    }
+    match inquire::Confirm::new("Proceed?")
+        .with_default(true)
+        .prompt()
+    {
+        Ok(yes) => Ok(yes),
+        Err(inquire::InquireError::OperationCanceled)
+        | Err(inquire::InquireError::OperationInterrupted) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Raw (non-TTY) fallback for [`confirm_proceed`].
+fn confirm_proceed_raw() -> anyhow::Result<bool> {
+    use std::io::{BufRead, Read, Write};
+    print!("Proceed? [Y/n] ");
+    std::io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    std::io::BufReader::new(std::io::stdin().lock().take(256)).read_line(&mut input)?;
     let trimmed = input.trim().to_lowercase();
     let confirmed = trimmed.is_empty() || trimmed == "y" || trimmed == "yes";
     if confirmed {
@@ -199,13 +223,8 @@ pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
     Ok(confirmed)
 }
 
-pub(super) fn check_mark(ok: bool) -> &'static str {
-    if ok {
-        "\x1b[32m+\x1b[0m"
-    } else {
-        "\x1b[31m-\x1b[0m"
-    }
-}
+/// Colored status mark re-exported for the `init` module namespace.
+pub(super) use crate::cmd::ux::check_mark;
 
 // ============================================================================
 // Help text
