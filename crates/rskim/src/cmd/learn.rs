@@ -38,15 +38,11 @@ pub(crate) fn run(
     };
 
     // Collect all invocations — show a spinner on TTY; JSON mode bypasses all UI (D5).
-    let spinner = if !config.json_output {
-        Some(crate::cmd::ux::spinner("Scanning agent sessions..."))
-    } else {
-        None
-    };
-    let all_invocations = session::collect_invocations(&providers, &filter)?;
-    if let Some(s) = spinner {
-        s.finish_and_clear();
-    }
+    let all_invocations = crate::cmd::ux::with_spinner(
+        config.json_output,
+        "Analyzing error patterns...",
+        || session::collect_invocations(&providers, &filter),
+    )?;
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -80,7 +76,7 @@ pub(crate) fn run(
         let rules_agent = config.agent_filter.unwrap_or(AgentKind::ClaudeCode);
         if config.generate {
             let content = generate_rules_content(&corrections, rules_agent);
-            write_rules_file(&content, rules_agent, config.dry_run)?;
+            write_rules_file(&content, rules_agent, config.dry_run, corrections.len())?;
         } else {
             print_text_report(&corrections, rules_agent);
         }
@@ -724,6 +720,7 @@ fn sanitize_command_for_rules(cmd: &str) -> String {
 }
 
 /// Count correction pairs in a rules file by counting `## ` heading lines.
+#[cfg(test)]
 fn corrections_count(content: &str) -> usize {
     content
         .lines()
@@ -736,7 +733,12 @@ fn corrections_count(content: &str) -> usize {
 /// For agents with a rules directory (Claude Code, Cursor, Copilot),
 /// creates the file automatically. For single-file agents (Codex, Gemini,
 /// OpenCode), prints the content with instructions to paste.
-fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::Result<()> {
+fn write_rules_file(
+    content: &str,
+    agent: AgentKind,
+    dry_run: bool,
+    correction_count: usize,
+) -> anyhow::Result<()> {
     match agent.rules_dir() {
         Some(dir) => {
             // Directory-based agents: auto-create file
@@ -758,7 +760,6 @@ fn write_rules_file(content: &str, agent: AgentKind, dry_run: bool) -> anyhow::R
             }
 
             std::fs::create_dir_all(rules_dir)?;
-            let correction_count = corrections_count(content);
             std::fs::write(&rules_path, content)?;
             println!(
                 "  {} Wrote {} correction{} to {}",
@@ -814,9 +815,7 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
     }
 
     // Indent the table by 4 spaces to match the surrounding output style.
-    for line in table.to_string().lines() {
-        println!("    {line}");
-    }
+    crate::cmd::ux::print_indented_table(&table, 4);
     println!();
 
     let target = match agent.rules_dir() {

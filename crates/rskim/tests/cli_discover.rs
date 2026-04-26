@@ -52,7 +52,9 @@ fn test_discover_with_synthetic_session() {
         .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains("tool invocations"));
+        .stdout(predicate::str::contains("tool invocations"))
+        .stdout(predicate::str::contains("File"))
+        .stdout(predicate::str::contains("Tokens"));
 }
 
 #[test]
@@ -152,7 +154,8 @@ fn test_discover_bash_commands() {
         .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains("Commands:"));
+        .stdout(predicate::str::contains("Commands:"))
+        .stdout(predicate::str::contains("Command"));
 }
 
 #[test]

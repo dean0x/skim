@@ -9,6 +9,9 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
+// Uses `Colorize` directly for value/header formatting (green numbers,
+// bold labels). The `ux` module wraps mark primitives (+/-) only;
+// arbitrary value coloring is intentionally not centralised.
 use colored::{ColoredString, Colorize};
 
 use crate::analytics::{AnalyticsDb, AnalyticsStore, OriginalCommandStats, PricingModel};

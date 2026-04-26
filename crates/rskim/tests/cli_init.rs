@@ -1218,3 +1218,17 @@ fn test_init_guidance_upgrade_updates_stale_version() {
         "Updated marker should reference the current binary version ({current_version})"
     );
 }
+
+#[test]
+fn test_init_no_marketplace_in_settings() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path();
+
+    skim_init_cmd(config).args(["--yes"]).assert().success();
+
+    let settings = fs::read_to_string(config.join("settings.json")).unwrap();
+    assert!(
+        !settings.contains("marketplace"),
+        "SECURITY: settings must never contain marketplace field"
+    );
+}

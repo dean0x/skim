@@ -77,6 +77,35 @@ fn is_guidance_current(flags: &InitFlags, skim_version: &str, env: &InstructionE
         .unwrap_or(true) // No instruction file path = guidance not applicable for this agent
 }
 
+fn print_install_header(agent_name: &str) {
+    println!();
+    println!("  skim init -- {} integration setup", agent_name);
+    println!();
+}
+
+fn print_collision_warning(hooks: &[String]) {
+    println!("  WARNING: Other Bash PreToolUse hooks detected:");
+    for hook_cmd in hooks {
+        println!("    - {hook_cmd}");
+    }
+    println!("  Both hooks will fire on Bash commands. This is usually harmless");
+    println!("  but may cause unexpected behavior if the other hook also modifies commands.");
+    println!();
+}
+
+fn print_install_summary(state: &DetectedState) {
+    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    println!("  Summary:");
+    if !state.hook_installed || !state.hook_is_current() {
+        println!("    * Create hook script: {}", hook_script_path.display());
+        println!(
+            "    * Patch settings: {} (add PreToolUse hook)",
+            state.settings_path.display()
+        );
+    }
+    println!();
+}
+
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
     let state = detect_state(flags)?;
@@ -85,25 +114,14 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     verify_agent_installed(&state, flags)?;
 
     // Print header
-    println!();
-    println!(
-        "  skim init -- {} integration setup",
-        flags.agent.display_name()
-    );
-    println!();
+    print_install_header(flags.agent.display_name());
 
     // Print detected state
     print_detected_state(&state);
 
     // Plugin collision warning: other Bash PreToolUse hooks exist
     if !state.existing_bash_hooks.is_empty() {
-        println!("  WARNING: Other Bash PreToolUse hooks detected:");
-        for hook_cmd in &state.existing_bash_hooks {
-            println!("    - {hook_cmd}");
-        }
-        println!("  Both hooks will fire on Bash commands. This is usually harmless");
-        println!("  but may cause unexpected behavior if the other hook also modifies commands.");
-        println!();
+        print_collision_warning(&state.existing_bash_hooks);
     }
 
     // Already up to date check
@@ -123,16 +141,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     let global = !flags.project;
 
     // Print summary
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-    println!("  Summary:");
-    if !state.hook_installed || !state.hook_is_current() {
-        println!("    * Create hook script: {}", hook_script_path.display());
-        println!(
-            "    * Patch settings: {} (add PreToolUse hook)",
-            state.settings_path.display()
-        );
-    }
-    println!();
+    print_install_summary(&state);
 
     if flags.dry_run {
         print_dry_run_actions(&state, flags.no_guidance, global, &env)?;

@@ -2,11 +2,16 @@
 //!
 //! Text output uses the `colored` crate for status indicators (D7: respects
 //! `NO_COLOR`). JSON output is unchanged (D5).
+//
+// No spinner: agent detection is filesystem-stat-based (<10ms).
+// A sub-second spinner degrades UX rather than improving it (D1).
 
 use colored::Colorize;
 
 use super::types::{AgentStatus, HookStatus};
 
+// Text output format is not a stable interface.
+// Use `--json` for scripting and automation (D5).
 pub(super) fn print_text(agents: &[AgentStatus]) {
     println!("Detected agents:");
     for agent in agents {

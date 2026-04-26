@@ -79,7 +79,8 @@ fn test_agents_detects_claude_code_with_fixture() {
         .success()
         .stdout(predicate::str::contains("Claude Code"))
         .stdout(predicate::str::contains("detected"))
-        .stdout(predicate::str::contains("2 files"));
+        .stdout(predicate::str::contains("2 files"))
+        .stdout(predicate::str::contains("+ Claude Code"));
 }
 
 #[test]
@@ -291,5 +292,7 @@ fn test_agents_text_not_detected_without_fixtures() {
         .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains("not detected"));
+        .stdout(predicate::str::contains("not detected"))
+        .stdout(predicate::str::contains("- "))
+        .stdout(predicate::str::contains("hint: run"));
 }

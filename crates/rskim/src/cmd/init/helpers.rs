@@ -210,11 +210,11 @@ pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
 
 /// Raw (non-TTY) fallback for [`confirm_proceed`].
 fn confirm_proceed_raw() -> anyhow::Result<bool> {
-    use std::io::Write;
-    print!("  ? Proceed? [Y/n] ");
+    use std::io::{BufRead, Read, Write};
+    print!("Proceed? [Y/n] ");
     std::io::stdout().flush()?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    std::io::BufReader::new(std::io::stdin().lock().take(256)).read_line(&mut input)?;
     let trimmed = input.trim().to_lowercase();
     let confirmed = trimmed.is_empty() || trimmed == "y" || trimmed == "yes";
     if confirmed {
@@ -223,13 +223,8 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
     Ok(confirmed)
 }
 
-/// Return a colored status mark.
-///
-/// Thin wrapper around [`crate::cmd::ux::check_mark`] for use within the
-/// `init` module without qualifying the full path at every call site.
-pub(super) fn check_mark(ok: bool) -> colored::ColoredString {
-    crate::cmd::ux::check_mark(ok)
-}
+/// Colored status mark re-exported for the `init` module namespace.
+pub(super) use crate::cmd::ux::check_mark;
 
 // ============================================================================
 // Help text
