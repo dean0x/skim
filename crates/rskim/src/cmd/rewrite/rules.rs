@@ -680,7 +680,9 @@ const INFRA_RULES: &[RewriteRule] = &[
     // what the filter operates on, breaking user-defined projections.
     // --log and --log-failed skip for gh run view because they output raw CI
     // step logs — a completely different format from structured run metadata.
-    // --web skips because it opens a browser tab, not stdout.
+    // --web skips on commands that support it (pr list/view, issue list/view,
+    // run view, release view, pr checks) because it opens a browser tab, not
+    // stdout. Note: gh run list and gh release list do NOT support --web.
     // --watch skips because it produces a streaming TUI, not parseable output.
     RewriteRule {
         prefix: &["gh", "pr", "checks"],
@@ -738,7 +740,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "run", "list"],
         rewrite_to: &["skim", "infra", "gh", "run", "list"],
-        skip_if_flag_prefix: &["--web", "--jq", "--template"],
+        skip_if_flag_prefix: &["--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
     },

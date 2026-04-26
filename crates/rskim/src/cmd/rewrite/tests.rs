@@ -579,6 +579,18 @@ fn test_gh_release_list_template_skips() {
     );
 }
 
+/// `gh release list` does NOT support `--web` (verified via `gh release list --help`).
+/// Since `--web` is not a recognized flag, it passes through as a regular argument
+/// and the rule still fires.
+#[test]
+fn test_gh_release_list_web_still_rewrites() {
+    let result = would_rewrite("gh release list --web");
+    assert!(
+        result.is_some(),
+        "gh release list --web must rewrite: --web is not a valid flag for gh release list"
+    );
+}
+
 // ========================================================================
 // SKIM_PASSTHROUGH env prefix tests
 // ========================================================================
