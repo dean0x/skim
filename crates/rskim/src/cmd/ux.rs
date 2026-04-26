@@ -55,7 +55,7 @@ pub(crate) fn with_spinner<T, E>(
     msg: &str,
     f: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
-    let pb = if !json_output { Some(spinner(msg)) } else { None };
+    let pb = (!json_output).then(|| spinner(msg));
     let result = f();
     if let Some(s) = pb {
         s.finish_and_clear();

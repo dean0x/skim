@@ -94,9 +94,9 @@ fn print_collision_warning(hooks: &[String]) {
 }
 
 fn print_install_summary(state: &DetectedState) {
-    let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
     println!("  Summary:");
     if !state.hook_installed || !state.hook_is_current() {
+        let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
         println!("    * Create hook script: {}", hook_script_path.display());
         println!(
             "    * Patch settings: {} (add PreToolUse hook)",

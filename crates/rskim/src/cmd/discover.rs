@@ -348,18 +348,15 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
             .collect();
         sorted_reads.sort_by_key(|r| std::cmp::Reverse(r.result_tokens));
         println!("  Top files by token count:");
-        {
-            let mut table = Table::new();
-            table
-                .load_preset(UTF8_FULL_CONDENSED)
-                .set_content_arrangement(ContentArrangement::Dynamic)
-                .set_header(vec!["File", "Tokens"]);
-            for read in sorted_reads.iter().take(10) {
-                table.add_row(vec![&read.file_path, &read.result_tokens.to_string()]);
-            }
-            // Indent the table by 4 spaces to match the surrounding output style.
-            crate::cmd::ux::print_indented_table(&table, 4);
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL_CONDENSED)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec!["File", "Tokens"]);
+        for read in sorted_reads.iter().take(10) {
+            table.add_row(vec![&read.file_path, &read.result_tokens.to_string()]);
         }
+        crate::cmd::ux::print_indented_table(&table, 4);
     }
     println!();
 }
