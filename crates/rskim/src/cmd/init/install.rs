@@ -93,6 +93,16 @@ fn print_collision_warning(hooks: &[String]) {
     println!();
 }
 
+fn print_already_up_to_date() {
+    println!("  Already up to date. Nothing to do.");
+    println!();
+}
+
+fn print_dual_scope_warning(warning: &str) {
+    println!("  WARNING: {warning}");
+    println!();
+}
+
 fn print_install_summary(state: &DetectedState) {
     println!("  Summary:");
     if !state.hook_installed || !state.hook_is_current() {
@@ -103,16 +113,6 @@ fn print_install_summary(state: &DetectedState) {
             state.settings_path.display()
         );
     }
-    println!();
-}
-
-fn print_already_up_to_date() {
-    println!("  Already up to date. Nothing to do.");
-    println!();
-}
-
-fn print_dual_scope_warning(warning: &str) {
-    println!("  WARNING: {warning}");
     println!();
 }
 
@@ -130,7 +130,6 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     print_install_header(flags.agent.display_name());
     print_detected_state(&state);
 
-    // Other Bash PreToolUse hooks exist alongside skim
     if !state.existing_bash_hooks.is_empty() {
         print_collision_warning(&state.existing_bash_hooks);
     }
