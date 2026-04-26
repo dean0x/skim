@@ -503,3 +503,19 @@ fn test_learn_no_cross_agent_data_leakage() {
             .or(predicate::str::contains("No tool invocations")),
     );
 }
+
+// ============================================================================
+// Responsive table truncation tests
+// ============================================================================
+
+#[test]
+fn test_learn_no_truncate_flag_accepted() {
+    // --no-truncate should not cause an error; exit 0.
+    // Use an empty dir so the command exits early without corrections.
+    let dir = TempDir::new().unwrap();
+    skim_cmd()
+        .args(["learn", "--no-truncate", "--since", "1h"])
+        .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
+        .assert()
+        .success();
+}

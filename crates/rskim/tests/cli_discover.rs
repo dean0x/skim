@@ -472,6 +472,66 @@ fn test_discover_debug_shows_non_rewritable_commands() {
     );
 }
 
+// ============================================================================
+// Responsive table truncation tests
+// ============================================================================
+
+#[test]
+fn test_discover_no_truncate_flag_accepted() {
+    // --no-truncate should not cause an error; exit 0.
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("nonexistent");
+    skim_cmd_neutralized(&nonexistent)
+        .args(["discover", "--no-truncate", "--since", "1h"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_discover_hint_shown() {
+    // Default (truncating) output should contain the --no-truncate hint.
+    // Use a real session so the text report is printed.
+    let dir = TempDir::new().unwrap();
+    let project_dir = dir.path().join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let fixture = include_str!("fixtures/cmd/session/claude_reads.jsonl");
+    std::fs::write(project_dir.join("test-session.jsonl"), fixture).unwrap();
+
+    skim_cmd()
+        .args(["discover", "--since", "7d"])
+        .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-truncate"));
+}
+
+#[test]
+fn test_discover_hint_suppressed() {
+    // When --no-truncate is passed, the hint must NOT appear.
+    let dir = TempDir::new().unwrap();
+    let project_dir = dir.path().join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let fixture = include_str!("fixtures/cmd/session/claude_reads.jsonl");
+    std::fs::write(project_dir.join("test-session.jsonl"), fixture).unwrap();
+
+    let output = skim_cmd()
+        .args(["discover", "--no-truncate", "--since", "7d"])
+        .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // The hint line specifically mentioning --no-truncate should be absent
+    // (the flag is only shown when truncation is active).
+    assert!(
+        !stdout.contains("hint: use --no-truncate for full output"),
+        "hint must not appear when --no-truncate is active, got: {stdout}"
+    );
+}
+
 #[test]
 fn test_discover_debug_json_includes_non_rewritable() {
     // --debug --json should include non_rewritable_commands in the JSON output.

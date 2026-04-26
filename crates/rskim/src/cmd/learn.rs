@@ -77,7 +77,7 @@ pub(crate) fn run(
             let content = generate_rules_content(&corrections, rules_agent);
             write_rules_file(&content, rules_agent, config.dry_run, corrections.len())?;
         } else {
-            print_text_report(&corrections, rules_agent);
+            print_text_report(&corrections, rules_agent, &config);
         }
     }
 
@@ -96,6 +96,7 @@ struct LearnConfig {
     json_output: bool,
     agent_filter: Option<AgentKind>,
     min_occurrences: usize,
+    no_truncate: bool,
 }
 
 /// Parse CLI arguments into a [`LearnConfig`].
@@ -110,6 +111,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
         json_output: false,
         agent_filter: None,
         min_occurrences: 3,
+        no_truncate: false,
     };
 
     let mut i = 0;
@@ -148,9 +150,12 @@ fn parse_args(args: &[String]) -> anyhow::Result<LearnConfig> {
                 }
                 config.min_occurrences = n;
             }
+            "--no-truncate" => {
+                config.no_truncate = true;
+            }
             other => {
                 anyhow::bail!(
-                    "unknown flag: '{other}'\n\nUsage: skim learn [--since <duration>] [--generate] [--dry-run] [--json] [--min-occurrences <N>]"
+                    "unknown flag: '{other}'\n\nUsage: skim learn [--since <duration>] [--generate] [--dry-run] [--json] [--min-occurrences <N>] [--no-truncate]"
                 );
             }
         }
@@ -783,12 +788,30 @@ fn write_rules_file(
 // Output
 // ============================================================================
 
-fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
+fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &LearnConfig) {
     println!(
         "skim learn -- {} correction{} detected\n",
         corrections.len(),
         if corrections.len() == 1 { "" } else { "s" }
     );
+
+    if !config.no_truncate {
+        println!("    hint: use --no-truncate for full output");
+        println!();
+    }
+
+    // Truncation: 6-column table with fixed-width prefix columns.
+    // Fixed columns: #(~3), Pattern(~12), Seen(~5) = ~20 chars
+    // Borders + padding for 6 columns: ~17 chars
+    // Remaining for 3 dynamic columns: terminal_width - indent(4) - 20 - 17
+    let truncate = !config.no_truncate;
+    let term_width = crate::cmd::ux::terminal_width() as usize;
+    let dynamic_budget = term_width.saturating_sub(4 + 20 + 17);
+    let col_max: usize = if truncate {
+        (dynamic_budget / 3).max(1)
+    } else {
+        usize::MAX
+    };
 
     let mut table = Table::new();
     table
@@ -800,18 +823,31 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind) {
         let index = (i + 1).to_string();
         let seen = format!("{}x", pair.occurrences);
         let first_error_line = pair.error_output.lines().next().unwrap_or("");
+        let (failed_cell, correct_cell, error_cell) = if col_max < usize::MAX {
+            (
+                crate::cmd::ux::truncate_str(&pair.failed_command, col_max),
+                crate::cmd::ux::truncate_str(&pair.successful_command, col_max),
+                crate::cmd::ux::truncate_str(first_error_line, col_max),
+            )
+        } else {
+            (
+                pair.failed_command.clone(),
+                pair.successful_command.clone(),
+                first_error_line.to_string(),
+            )
+        };
         table.add_row(vec![
             index.as_str(),
             pair.pattern_type.label(),
             seen.as_str(),
-            pair.failed_command.as_str(),
-            pair.successful_command.as_str(),
-            first_error_line,
+            failed_cell.as_str(),
+            correct_cell.as_str(),
+            error_cell.as_str(),
         ]);
     }
 
     // Indent the table by 4 spaces to match the surrounding output style.
-    crate::cmd::ux::print_indented_table(&table, 4);
+    crate::cmd::ux::print_indented_table(&mut table, 4, truncate);
     println!();
 
     let target = match agent.rules_dir() {
@@ -866,6 +902,7 @@ fn print_help() {
     println!("  --agent <name>            Only scan sessions from a specific agent");
     println!("  --min-occurrences <N>     Minimum occurrences to report [default: 3]");
     println!("  --json                    Output machine-readable JSON");
+    println!("  --no-truncate             Show full table output without truncation");
     println!("  --help, -h                Print help information");
     println!();
     println!("Examples:");
@@ -921,6 +958,12 @@ pub(super) fn command() -> clap::Command {
                 .long("min-occurrences")
                 .value_name("N")
                 .help("Minimum occurrences to report [default: 3]"),
+        )
+        .arg(
+            clap::Arg::new("no-truncate")
+                .long("no-truncate")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show full table output without truncation"),
         )
 }
 
@@ -1868,7 +1911,8 @@ mod tests {
         // Build the clap command for validation
         let cmd = command();
 
-        // Flags exercised: --since, --generate, --dry-run, --json, --agent, --min-occurrences
+        // Flags exercised: --since, --generate, --dry-run, --json, --agent,
+        //                  --min-occurrences, --no-truncate
         let all_args = [
             "--since",
             "7d",
@@ -1879,6 +1923,7 @@ mod tests {
             "claude-code",
             "--min-occurrences",
             "3",
+            "--no-truncate",
         ];
 
         // clap must accept these flags without error
@@ -1911,6 +1956,12 @@ mod tests {
         // --json: both must agree it is set
         assert!(matches.get_flag("json"), "clap should see --json as true");
 
+        // --no-truncate: both must agree it is set
+        assert!(
+            matches.get_flag("no-truncate"),
+            "clap should see --no-truncate as true"
+        );
+
         // --since: clap must surface the value
         assert_eq!(
             matches.get_one::<String>("since").map(|s| s.as_str()),
@@ -1933,5 +1984,11 @@ mod tests {
             Some("3"),
             "clap --min-occurrences value should be '3'"
         );
+    }
+
+    #[test]
+    fn test_parse_args_no_truncate() {
+        let config = parse_args(&["--no-truncate".to_string()]).unwrap();
+        assert!(config.no_truncate);
     }
 }

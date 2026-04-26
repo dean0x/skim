@@ -80,11 +80,79 @@ pub(crate) fn with_spinner<T, E>(
     f()
 }
 
+/// Return the current terminal width in columns.
+///
+/// Falls back to 80 when running outside a TTY (e.g. tests, pipes) or when
+/// detection fails. The fallback value is the traditional terminal width and
+/// produces reasonable output without hard-wrapping (D3).
+pub(crate) fn terminal_width() -> u16 {
+    crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80)
+}
+
+/// End-truncate `s` to at most `max` **characters** (Unicode scalar values),
+/// appending `…` when truncated. The `…` counts as 1 character.
+///
+/// - `max == 0`: no-op, returns `s` unchanged.
+/// - `max == 1`: returns just `…` (the ellipsis occupies the full budget).
+/// - Multi-byte characters are never split; truncation always happens on
+///   Unicode scalar value boundaries.
+pub(crate) fn truncate_str(s: &str, max: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max || max == 0 {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "\u{2026}".to_string();
+    }
+    // Take `max - 1` chars, then append `…`.
+    let prefix: String = s.chars().take(max - 1).collect();
+    format!("{}\u{2026}", prefix)
+}
+
+/// Middle-truncate a file path to at most `max` **characters** (Unicode scalar
+/// values, each counting as 1 column in a terminal table).
+///
+/// Preserves the root segment prefix and the filename (last path component),
+/// inserting `…/` between them. Falls back to end-truncation when the
+/// filename alone fills the budget.
+///
+/// - `max == 0`: no-op, returns `path` unchanged.
+/// - Path without `/`: falls back to `truncate_str`.
+pub(crate) fn truncate_path_middle(path: &str, max: usize) -> String {
+    let char_count = path.chars().count();
+    if char_count <= max || max == 0 {
+        return path.to_string();
+    }
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    // If there's no separator, treat as a plain string.
+    if !path.contains('/') {
+        return truncate_str(path, max);
+    }
+    // filename + "…/" costs filename.chars().count() + 2 columns.
+    let filename_chars = filename.chars().count();
+    if filename_chars + 2 >= max {
+        return truncate_str(filename, max);
+    }
+    let prefix_budget = max - filename_chars - 2;
+    let prefix: String = path.chars().take(prefix_budget).collect();
+    format!("{}\u{2026}/{}", prefix, filename)
+}
+
 /// Print a comfy-table to stdout with each line indented by `indent` spaces.
 ///
 /// Centralises the "indent every line of the table" pattern used by discover
 /// and learn to align table output with surrounding prose (S3).
-pub(crate) fn print_indented_table(table: &comfy_table::Table, indent: usize) {
+///
+/// When `truncate` is `true`, the table is constrained to the current
+/// terminal width minus `indent` columns; `comfy_table` will wrap or
+/// truncate long cells automatically. When `truncate` is `false` (i.e. the
+/// caller passed `--no-truncate`), no width constraint is applied and the
+/// table expands to its natural width.
+pub(crate) fn print_indented_table(table: &mut comfy_table::Table, indent: usize, truncate: bool) {
+    if truncate {
+        let available = terminal_width().saturating_sub(indent as u16);
+        table.set_width(available);
+    }
     let prefix = " ".repeat(indent);
     for line in table.to_string().lines() {
         println!("{prefix}{line}");
@@ -145,5 +213,94 @@ mod tests {
                 "Line does not start with indent: {indented:?}"
             );
         }
+    }
+
+    // --- truncate_str ---
+
+    #[test]
+    fn test_truncate_str_no_op() {
+        // String shorter than max is returned unchanged.
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_exact() {
+        // String exactly at max is returned unchanged.
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_truncates() {
+        // String longer than max ends with '…' and char count is <= max.
+        let result = truncate_str("hello world", 8);
+        assert!(result.ends_with('\u{2026}'), "must end with ellipsis");
+        assert!(
+            result.chars().count() <= 8,
+            "char count must not exceed max, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_str_max_one() {
+        // max=1 returns just the ellipsis character.
+        assert_eq!(truncate_str("hello", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn test_truncate_str_max_zero() {
+        // max=0 is a no-op; original string returned unchanged.
+        assert_eq!(truncate_str("hello", 0), "hello");
+    }
+
+    // --- truncate_path_middle ---
+
+    #[test]
+    fn test_truncate_path_middle_short() {
+        // Path shorter than max is returned unchanged.
+        assert_eq!(truncate_path_middle("/src/main.rs", 40), "/src/main.rs");
+    }
+
+    #[test]
+    fn test_truncate_path_middle_long() {
+        // Long path produces prefix…/filename format.
+        let path = "/very/long/directory/structure/that/exceeds/width/main.rs";
+        let result = truncate_path_middle(path, 30);
+        assert!(
+            result.chars().count() <= 30,
+            "char count must fit within max, got: {result:?}"
+        );
+        assert!(result.ends_with("main.rs"), "filename must be preserved");
+        assert!(result.contains('\u{2026}'), "must contain ellipsis");
+    }
+
+    #[test]
+    fn test_truncate_path_middle_no_separator() {
+        // Path without '/' falls back to end-truncation.
+        let result = truncate_path_middle("verylongfilename.rs", 10);
+        assert!(result.ends_with('\u{2026}'), "should end-truncate");
+        assert!(
+            result.chars().count() <= 10,
+            "char count must not exceed max, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_path_middle_long_filename() {
+        // Filename alone exceeds max — falls back to end-truncation of filename.
+        let path = "/short/averylongfilenamethatlonger.rs";
+        let result = truncate_path_middle(path, 10);
+        assert!(
+            result.chars().count() <= 10,
+            "char count must not exceed max, got: {result:?}"
+        );
+        assert!(result.ends_with('\u{2026}'), "must end with ellipsis");
+    }
+
+    // --- terminal_width ---
+
+    #[test]
+    fn test_terminal_width_returns_positive() {
+        // terminal_width always returns a positive value (at least the 80-col fallback).
+        assert!(terminal_width() > 0);
     }
 }
