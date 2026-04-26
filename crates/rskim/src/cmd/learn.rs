@@ -753,7 +753,7 @@ fn write_rules_file(
             }
 
             if dry_run {
-                println!("Would write to: {}", rules_path.display());
+                println!("  Would write to: {}", rules_path.display());
                 println!("---");
                 print!("{content}");
                 return Ok(());
