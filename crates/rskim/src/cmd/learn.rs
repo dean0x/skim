@@ -804,14 +804,11 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &
     // Fixed columns: #(~3), Pattern(~12), Seen(~5) = ~20 chars
     // Borders + padding for 6 columns: ~17 chars
     // Remaining for 3 dynamic columns: terminal_width - indent(4) - 20 - 17
+    // col_max == 0 means no-op (truncate_str contract).
     let truncate = !config.no_truncate;
-    let term_width = crate::cmd::ux::terminal_width() as usize;
-    let dynamic_budget = term_width.saturating_sub(4 + 20 + 17);
-    let col_max: usize = if truncate {
-        (dynamic_budget / 3).max(1)
-    } else {
-        usize::MAX
-    };
+    let dynamic_budget =
+        (crate::cmd::ux::terminal_width() as usize).saturating_sub(4 + 20 + 17);
+    let col_max: usize = if truncate { (dynamic_budget / 3).max(1) } else { 0 };
 
     let mut table = Table::new();
     table
@@ -823,26 +820,13 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &
         let index = (i + 1).to_string();
         let seen = format!("{}x", pair.occurrences);
         let first_error_line = pair.error_output.lines().next().unwrap_or("");
-        let (failed_cell, correct_cell, error_cell) = if col_max < usize::MAX {
-            (
-                crate::cmd::ux::truncate_str(&pair.failed_command, col_max),
-                crate::cmd::ux::truncate_str(&pair.successful_command, col_max),
-                crate::cmd::ux::truncate_str(first_error_line, col_max),
-            )
-        } else {
-            (
-                pair.failed_command.clone(),
-                pair.successful_command.clone(),
-                first_error_line.to_string(),
-            )
-        };
         table.add_row(vec![
             index.as_str(),
             pair.pattern_type.label(),
             seen.as_str(),
-            failed_cell.as_str(),
-            correct_cell.as_str(),
-            error_cell.as_str(),
+            crate::cmd::ux::truncate_str(&pair.failed_command, col_max).as_str(),
+            crate::cmd::ux::truncate_str(&pair.successful_command, col_max).as_str(),
+            crate::cmd::ux::truncate_str(first_error_line, col_max).as_str(),
         ]);
     }
 

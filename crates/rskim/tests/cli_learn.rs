@@ -519,3 +519,46 @@ fn test_learn_no_truncate_flag_accepted() {
         .assert()
         .success();
 }
+
+#[test]
+fn test_learn_hint_shown() {
+    // Default (truncating) output should contain the --no-truncate hint.
+    // Use a real session with errors so the text report is printed.
+    let dir = TempDir::new().unwrap();
+    let project_dir = dir.path().join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let fixture = include_str!("fixtures/cmd/session/session_errors.jsonl");
+    std::fs::write(project_dir.join("error-session.jsonl"), fixture).unwrap();
+
+    skim_cmd()
+        .args(["learn", "--since", "7d"])
+        .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-truncate"));
+}
+
+#[test]
+fn test_learn_hint_suppressed() {
+    // When --no-truncate is passed, the hint must NOT appear.
+    let dir = TempDir::new().unwrap();
+    let project_dir = dir.path().join("test-project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let fixture = include_str!("fixtures/cmd/session/session_errors.jsonl");
+    std::fs::write(project_dir.join("error-session.jsonl"), fixture).unwrap();
+
+    let output = skim_cmd()
+        .args(["learn", "--no-truncate", "--since", "7d"])
+        .env("SKIM_PROJECTS_DIR", dir.path().to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("hint: use --no-truncate for full output"),
+        "hint must not appear when --no-truncate is active, got: {stdout}"
+    );
+}

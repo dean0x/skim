@@ -357,11 +357,12 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig
 
         // Truncation: approximate available width for the path column.
         // indent(4) + borders+padding(~9) + tokens_col(~10) = ~23 overhead.
+        // path_max == 0 means no-op (truncate_path_middle contract).
         let truncate = !config.no_truncate;
         let path_max: usize = if truncate {
             (crate::cmd::ux::terminal_width() as usize).saturating_sub(23)
         } else {
-            usize::MAX
+            0
         };
 
         let mut table = Table::new();
@@ -370,11 +371,7 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_header(vec!["File", "Tokens"]);
         for read in sorted_reads.iter().take(10) {
-            let path_cell = if path_max < usize::MAX {
-                crate::cmd::ux::truncate_path_middle(&read.file_path, path_max)
-            } else {
-                read.file_path.clone()
-            };
+            let path_cell = crate::cmd::ux::truncate_path_middle(&read.file_path, path_max);
             table.add_row(vec![path_cell, read.result_tokens.to_string()]);
         }
         crate::cmd::ux::print_indented_table(&mut table, 4, truncate);
@@ -401,19 +398,11 @@ fn print_commands_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig) 
         // Truncation: approximate available content width for two columns.
         // indent(4) + borders+padding(~13) = ~17 overhead.
         // Split: 40% Command, 60% Rewrite (rewrites are typically longer).
+        // cmd_max/rewrite_max == 0 means no-op (truncate_str contract).
         let truncate = !config.no_truncate;
-        let term_width = crate::cmd::ux::terminal_width() as usize;
-        let content_width = term_width.saturating_sub(17);
-        let cmd_max: usize = if truncate {
-            (content_width * 2 / 5).max(1)
-        } else {
-            usize::MAX
-        };
-        let rewrite_max: usize = if truncate {
-            (content_width * 3 / 5).max(1)
-        } else {
-            usize::MAX
-        };
+        let content_width = (crate::cmd::ux::terminal_width() as usize).saturating_sub(17);
+        let cmd_max: usize = if truncate { (content_width * 2 / 5).max(1) } else { 0 };
+        let rewrite_max: usize = if truncate { (content_width * 3 / 5).max(1) } else { 0 };
 
         // Deduplicate by command prefix and render as a table (D5: text path only).
         let mut seen = std::collections::HashSet::new();
@@ -430,18 +419,11 @@ fn print_commands_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig) 
                 .collect::<Vec<_>>()
                 .join(" ");
             if seen.insert(prefix.clone()) {
-                let cmd_cell = if cmd_max < usize::MAX {
-                    crate::cmd::ux::truncate_str(&prefix, cmd_max)
-                } else {
-                    prefix.clone()
-                };
                 let rewrite_raw = cmd.rewrite_target.as_deref().unwrap_or("skim equivalent");
-                let rewrite_cell = if rewrite_max < usize::MAX {
-                    crate::cmd::ux::truncate_str(rewrite_raw, rewrite_max)
-                } else {
-                    rewrite_raw.to_string()
-                };
-                table.add_row(vec![cmd_cell, rewrite_cell]);
+                table.add_row(vec![
+                    crate::cmd::ux::truncate_str(&prefix, cmd_max),
+                    crate::cmd::ux::truncate_str(rewrite_raw, rewrite_max),
+                ]);
             }
         }
         crate::cmd::ux::print_indented_table(&mut table, 4, truncate);
