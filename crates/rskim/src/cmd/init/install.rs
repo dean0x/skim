@@ -106,41 +106,46 @@ fn print_install_summary(state: &DetectedState) {
     println!();
 }
 
+fn print_already_up_to_date() {
+    println!("  Already up to date. Nothing to do.");
+    println!();
+}
+
+fn print_dual_scope_warning(warning: &str) {
+    println!("  WARNING: {warning}");
+    println!();
+}
+
+fn print_completion_message(agent_name: &str) {
+    println!();
+    println!("  Done! skim is now active in {agent_name}.");
+    println!();
+}
+
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
     let state = detect_state(flags)?;
 
-    // Verify agent is installed before proceeding
     verify_agent_installed(&state, flags)?;
-
-    // Print header
     print_install_header(flags.agent.display_name());
-
-    // Print detected state
     print_detected_state(&state);
 
-    // Plugin collision warning: other Bash PreToolUse hooks exist
+    // Other Bash PreToolUse hooks exist alongside skim
     if !state.existing_bash_hooks.is_empty() {
         print_collision_warning(&state.existing_bash_hooks);
     }
 
-    // Already up to date check
     let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
     if state.hook_installed && state.hook_is_current() && guidance_current {
-        println!("  Already up to date. Nothing to do.");
-        println!();
+        print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
-    // Dual-scope warning
     if let Some(ref warning) = state.dual_scope_warning {
-        println!("  WARNING: {warning}");
-        println!();
+        print_dual_scope_warning(warning);
     }
 
     let global = !flags.project;
-
-    // Print summary
     print_install_summary(&state);
 
     if flags.dry_run {
@@ -148,15 +153,8 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
-    // Execute installation
     execute_install(&state, flags.no_guidance, global, &env)?;
-
-    println!();
-    println!(
-        "  Done! skim is now active in {}.",
-        flags.agent.display_name()
-    );
-    println!();
+    print_completion_message(flags.agent.display_name());
 
     Ok(std::process::ExitCode::SUCCESS)
 }
