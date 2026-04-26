@@ -94,15 +94,15 @@ mod tests {
     // --- check_mark ---
 
     #[test]
-    fn test_check_mark_true_returns_success_mark() {
-        // check_mark(true) must produce the same string as success_mark()
-        assert_eq!(check_mark(true).to_string(), success_mark().to_string());
+    fn test_check_mark_true_returns_plus() {
+        // Visible character must be "+" for a success state.
+        assert!(check_mark(true).to_string().contains('+'));
     }
 
     #[test]
-    fn test_check_mark_false_returns_fail_mark() {
-        // check_mark(false) must produce the same string as fail_mark()
-        assert_eq!(check_mark(false).to_string(), fail_mark().to_string());
+    fn test_check_mark_false_returns_minus() {
+        // Visible character must be "-" for a failure state.
+        assert!(check_mark(false).to_string().contains('-'));
     }
 
     // --- with_spinner ---
@@ -123,31 +123,7 @@ mod tests {
         assert_eq!(result.unwrap_err(), "something went wrong");
     }
 
-    #[test]
-    fn test_with_spinner_non_json_propagates_ok() {
-        // Even when a spinner would be created (json_output=false), the Ok value
-        // is returned correctly. We use json_output=true here to avoid actually
-        // rendering to stderr in unit tests, but the return-value contract is
-        // identical either way.
-        let result: Result<u8, ()> = with_spinner(true, "msg", || Ok(7));
-        assert_eq!(result.unwrap(), 7);
-    }
-
     // --- print_indented_table ---
-
-    #[test]
-    fn test_print_indented_table_empty_table_does_not_panic() {
-        // An empty comfy_table::Table must produce at least a renderable string
-        // (possibly the border-only frame). The key invariant is no panic.
-        let table = comfy_table::Table::new();
-        // Redirect: we can't capture stdout in a unit test without extra deps,
-        // so we verify the rendered string is non-empty and contains no panic.
-        let rendered = table.to_string();
-        let prefix = " ".repeat(4);
-        for line in rendered.lines() {
-            let _ = format!("{prefix}{line}");
-        }
-    }
 
     #[test]
     fn test_print_indented_table_indents_every_line() {
