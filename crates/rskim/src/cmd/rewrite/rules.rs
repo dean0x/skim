@@ -699,7 +699,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "pr", "list"],
         rewrite_to: &["skim", "infra", "gh", "pr", "list"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
     },
@@ -713,7 +713,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "issue", "list"],
         rewrite_to: &["skim", "infra", "gh", "issue", "list"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
     },
@@ -738,7 +738,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "run", "list"],
         rewrite_to: &["skim", "infra", "gh", "run", "list"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
     },
@@ -756,7 +756,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gh", "release", "list"],
         rewrite_to: &["skim", "infra", "gh", "release", "list"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
     },
