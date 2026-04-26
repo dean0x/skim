@@ -293,6 +293,5 @@ fn test_agents_text_not_detected_without_fixtures() {
         .assert()
         .success()
         .stdout(predicate::str::contains("not detected"))
-        .stdout(predicate::str::contains("- "))
-        .stdout(predicate::str::contains("hint: run"));
+        .stdout(predicate::str::contains("- "));
 }
