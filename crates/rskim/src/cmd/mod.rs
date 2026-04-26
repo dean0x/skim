@@ -20,11 +20,11 @@ mod learn;
 mod lint;
 mod log;
 mod pkg;
-pub(crate) mod ux;
 mod rewrite;
 mod session;
 mod stats;
 mod test;
+pub(crate) mod ux;
 
 use std::borrow::Cow;
 use std::io::{self, Read, Write};

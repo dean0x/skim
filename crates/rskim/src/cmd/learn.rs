@@ -38,11 +38,10 @@ pub(crate) fn run(
     };
 
     // Collect all invocations — show a spinner on TTY; JSON mode bypasses all UI (D5).
-    let all_invocations = crate::cmd::ux::with_spinner(
-        config.json_output,
-        "Analyzing error patterns...",
-        || session::collect_invocations(&providers, &filter),
-    )?;
+    let all_invocations =
+        crate::cmd::ux::with_spinner(config.json_output, "Analyzing error patterns...", || {
+            session::collect_invocations(&providers, &filter)
+        })?;
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -722,10 +721,7 @@ fn sanitize_command_for_rules(cmd: &str) -> String {
 /// Count correction pairs in a rules file by counting `## ` heading lines.
 #[cfg(test)]
 fn corrections_count(content: &str) -> usize {
-    content
-        .lines()
-        .filter(|l| l.starts_with("## "))
-        .count()
+    content.lines().filter(|l| l.starts_with("## ")).count()
 }
 
 /// Write the rules file to the appropriate agent-specific location.
@@ -1415,7 +1411,8 @@ mod tests {
 
     #[test]
     fn test_corrections_count_ignores_non_h2_headings() {
-        let content = "# Title (H1)\n\n### Subheading (H3)\n\n#### Deep (H4)\n\n## Only this one counts\n";
+        let content =
+            "# Title (H1)\n\n### Subheading (H3)\n\n#### Deep (H4)\n\n## Only this one counts\n";
         assert_eq!(corrections_count(content), 1);
     }
 

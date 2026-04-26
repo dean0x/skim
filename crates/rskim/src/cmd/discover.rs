@@ -36,11 +36,10 @@ pub(crate) fn run(
     };
 
     // Collect invocations — show a spinner on TTY; JSON mode bypasses all UI (D5).
-    let all_invocations = crate::cmd::ux::with_spinner(
-        config.json_output,
-        "Scanning agent sessions...",
-        || session::collect_invocations(&providers, &filter),
-    )?;
+    let all_invocations =
+        crate::cmd::ux::with_spinner(config.json_output, "Scanning agent sessions...", || {
+            session::collect_invocations(&providers, &filter)
+        })?;
 
     if all_invocations.is_empty() {
         println!("No tool invocations found in the specified time window.");
@@ -336,8 +335,7 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
         };
         println!(
             "  Estimated savings with skim: ~{} tokens (~{:.0}%)",
-            analysis.potential_savings_tokens,
-            savings_pct,
+            analysis.potential_savings_tokens, savings_pct,
         );
         println!();
 

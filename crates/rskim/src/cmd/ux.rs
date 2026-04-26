@@ -24,7 +24,11 @@ pub(crate) fn fail_mark() -> colored::ColoredString {
 /// separate success/failure branches. Respects `NO_COLOR` via the `colored`
 /// crate (D7).
 pub(crate) fn check_mark(ok: bool) -> colored::ColoredString {
-    if ok { success_mark() } else { fail_mark() }
+    if ok {
+        success_mark()
+    } else {
+        fail_mark()
+    }
 }
 
 /// Create a stderr-bound indeterminate spinner with the given message.

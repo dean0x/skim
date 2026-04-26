@@ -42,9 +42,7 @@ pub(super) fn print_text(agents: &[AgentStatus]) {
         if let Some(ref sessions) = agent.sessions {
             println!(
                 "{}sessions: {} ({})",
-                indent,
-                sessions.path,
-                sessions.detail,
+                indent, sessions.path, sessions.detail,
             );
         }
 
@@ -55,7 +53,9 @@ pub(super) fn print_text(agents: &[AgentStatus]) {
                     .as_deref()
                     .map(|v| format!(", v{v}"))
                     .unwrap_or_default();
-                format!("installed (integrity: {integrity}{ver})").green().to_string()
+                format!("installed (integrity: {integrity}{ver})")
+                    .green()
+                    .to_string()
             }
             HookStatus::NotInstalled => {
                 let hint = format!(
@@ -65,7 +65,9 @@ pub(super) fn print_text(agents: &[AgentStatus]) {
                 );
                 format!("{}{}", "not installed".yellow(), hint.dimmed())
             }
-            HookStatus::NotSupported { note } => format!("not supported ({note})").dimmed().to_string(),
+            HookStatus::NotSupported { note } => {
+                format!("not supported ({note})").dimmed().to_string()
+            }
         };
         println!("{}hooks: {}", indent, hook_str);
 
