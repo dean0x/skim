@@ -166,8 +166,8 @@ pub(crate) fn truncate_path_middle(path: &str, max: usize) -> Cow<'_, str> {
 /// ```ignore
 /// // indent=4, borders+padding=17 => overhead=21
 /// let budget = column_budget(term_width, 21);
-/// let cmd_max = (budget * 2 / 5).max(if budget > 0 { 1 } else { 0 });
-/// let rewrite_max = (budget * 3 / 5).max(if budget > 0 { 1 } else { 0 });
+/// let cmd_max = if budget > 0 { (budget * 2 / 5).max(1) } else { 0 };
+/// let rewrite_max = if budget > 0 { (budget * 3 / 5).max(1) } else { 0 };
 /// ```
 pub(crate) fn column_budget(term_width: u16, overhead: usize) -> usize {
     if term_width == 0 {

@@ -313,10 +313,8 @@ fn print_text_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
     );
     if !config.no_truncate {
         println!("    hint: use --no-truncate for full output");
-        println!();
-    } else {
-        println!();
     }
+    println!();
 
     // Compute terminal width once to avoid redundant ioctl syscalls in
     // section functions and print_indented_table. When no_truncate is set,
@@ -408,12 +406,12 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool, term_width: 
         // Split: 40% Command, 60% Rewrite (rewrites are typically longer).
         // cmd_max/rewrite_max == 0 means no-op (truncate_str contract).
         let content_width = crate::cmd::ux::column_budget(term_width, 17);
-        let cmd_max: usize = if content_width > 0 {
+        let cmd_max = if content_width > 0 {
             (content_width * 2 / 5).max(1)
         } else {
             0
         };
-        let rewrite_max: usize = if content_width > 0 {
+        let rewrite_max = if content_width > 0 {
             (content_width * 3 / 5).max(1)
         } else {
             0
