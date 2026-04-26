@@ -313,17 +313,29 @@ fn print_text_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
     );
     if !config.no_truncate {
         println!("    hint: use --no-truncate for full output");
+        println!();
+    } else {
+        println!();
     }
-    println!();
 
-    print_code_reads_section(analysis, config);
-    print_commands_section(analysis, config);
+    // Compute terminal width once to avoid redundant ioctl syscalls in
+    // section functions and print_indented_table. When no_truncate is set,
+    // pass 0 so that column_budget() and print_indented_table() treat it as
+    // a no-op sentinel.
+    let term_width: u16 = if config.no_truncate {
+        0
+    } else {
+        crate::cmd::ux::terminal_width()
+    };
+
+    print_code_reads_section(analysis, term_width);
+    print_commands_section(analysis, config.debug, term_width);
 
     println!();
     println!("hint: run `skim init` to install the PreToolUse hook for automatic optimization");
 }
 
-fn print_code_reads_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
+fn print_code_reads_section(analysis: &DiscoverAnalysis, term_width: u16) {
     let skimmable_count = analysis.code_reads.iter().filter(|r| r.could_skim).count();
     let non_skimmable_count = analysis.code_reads.iter().filter(|r| !r.could_skim).count();
 
@@ -358,12 +370,7 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig
         // Truncation: approximate available width for the path column.
         // indent(4) + borders+padding(~9) + tokens_col(~10) = ~23 overhead.
         // path_max == 0 means no-op (truncate_path_middle contract).
-        let truncate = !config.no_truncate;
-        let path_max: usize = if truncate {
-            (crate::cmd::ux::terminal_width() as usize).saturating_sub(23)
-        } else {
-            0
-        };
+        let path_max = crate::cmd::ux::column_budget(term_width, 23);
 
         let mut table = Table::new();
         table
@@ -372,14 +379,15 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig
             .set_header(vec!["File", "Tokens"]);
         for read in sorted_reads.iter().take(10) {
             let path_cell = crate::cmd::ux::truncate_path_middle(&read.file_path, path_max);
-            table.add_row(vec![path_cell, read.result_tokens.to_string()]);
+            let tokens_str = read.result_tokens.to_string();
+            table.add_row(vec![path_cell.as_ref(), tokens_str.as_str()]);
         }
-        crate::cmd::ux::print_indented_table(&mut table, 4, truncate);
+        crate::cmd::ux::print_indented_table(&mut table, 4, term_width);
     }
     println!();
 }
 
-fn print_commands_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
+fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool, term_width: u16) {
     let rewritable_count = analysis
         .bash_commands
         .iter()
@@ -399,14 +407,13 @@ fn print_commands_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig) 
         // indent(4) + borders+padding(~13) = ~17 overhead.
         // Split: 40% Command, 60% Rewrite (rewrites are typically longer).
         // cmd_max/rewrite_max == 0 means no-op (truncate_str contract).
-        let truncate = !config.no_truncate;
-        let content_width = (crate::cmd::ux::terminal_width() as usize).saturating_sub(17);
-        let cmd_max: usize = if truncate {
+        let content_width = crate::cmd::ux::column_budget(term_width, 17);
+        let cmd_max: usize = if content_width > 0 {
             (content_width * 2 / 5).max(1)
         } else {
             0
         };
-        let rewrite_max: usize = if truncate {
+        let rewrite_max: usize = if content_width > 0 {
             (content_width * 3 / 5).max(1)
         } else {
             0
@@ -434,10 +441,10 @@ fn print_commands_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig) 
                 ]);
             }
         }
-        crate::cmd::ux::print_indented_table(&mut table, 4, truncate);
+        crate::cmd::ux::print_indented_table(&mut table, 4, term_width);
     }
 
-    print_debug_section(analysis, config.debug);
+    print_debug_section(analysis, debug);
 }
 
 fn print_debug_section(analysis: &DiscoverAnalysis, debug: bool) {

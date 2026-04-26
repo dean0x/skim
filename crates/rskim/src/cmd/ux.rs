@@ -6,6 +6,7 @@
 
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::borrow::Cow;
 use std::time::Duration;
 
 /// Return a green `+` marker for success states.
@@ -92,21 +93,22 @@ pub(crate) fn terminal_width() -> u16 {
 /// End-truncate `s` to at most `max` **characters** (Unicode scalar values),
 /// appending `…` when truncated. The `…` counts as 1 character.
 ///
-/// - `max == 0`: no-op, returns `s` unchanged.
+/// - `max == 0`: no-op, returns `Cow::Borrowed(s)` (zero allocation).
 /// - `max == 1`: returns just `…` (the ellipsis occupies the full budget).
 /// - Multi-byte characters are never split; truncation always happens on
 ///   Unicode scalar value boundaries.
-pub(crate) fn truncate_str(s: &str, max: usize) -> String {
+/// - When the string already fits, returns `Cow::Borrowed(s)` (zero allocation).
+pub(crate) fn truncate_str(s: &str, max: usize) -> Cow<'_, str> {
     let char_count = s.chars().count();
     if char_count <= max || max == 0 {
-        return s.to_string();
+        return Cow::Borrowed(s);
     }
     if max <= 1 {
-        return "\u{2026}".to_string();
+        return Cow::Owned("\u{2026}".to_string());
     }
     // Take `max - 1` chars, then append `…`.
     let prefix: String = s.chars().take(max - 1).collect();
-    format!("{}\u{2026}", prefix)
+    Cow::Owned(format!("{}\u{2026}", prefix))
 }
 
 /// Middle-truncate a file path to at most `max` **characters** (Unicode scalar
@@ -116,12 +118,13 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
 /// inserting `…/` between them. Falls back to end-truncation when the
 /// filename alone fills the budget.
 ///
-/// - `max == 0`: no-op, returns `path` unchanged.
+/// - `max == 0`: no-op, returns `Cow::Borrowed(path)` (zero allocation).
+/// - When the path already fits, returns `Cow::Borrowed(path)` (zero allocation).
 /// - Path without `/`: falls back to `truncate_str`.
-pub(crate) fn truncate_path_middle(path: &str, max: usize) -> String {
+pub(crate) fn truncate_path_middle(path: &str, max: usize) -> Cow<'_, str> {
     let char_count = path.chars().count();
     if char_count <= max || max == 0 {
-        return path.to_string();
+        return Cow::Borrowed(path);
     }
     let filename = path.rsplit('/').next().unwrap_or(path);
     // If there's no separator, treat as a plain string.
@@ -135,7 +138,32 @@ pub(crate) fn truncate_path_middle(path: &str, max: usize) -> String {
     }
     let prefix_budget = max - filename_chars - 2;
     let prefix: String = path.chars().take(prefix_budget).collect();
-    format!("{}\u{2026}/{}", prefix, filename)
+    Cow::Owned(format!("{}\u{2026}/{}", prefix, filename))
+}
+
+/// Compute column budget(s) for a truncation-aware table.
+///
+/// Returns a single `usize` representing the available character budget after
+/// subtracting `overhead` from `term_width`. When `term_width == 0` (i.e. the
+/// caller determined that truncation is disabled), returns 0, which is the
+/// no-op sentinel for `truncate_str` and `truncate_path_middle`.
+///
+/// Callers that need to split the budget across multiple columns apply their
+/// own ratio arithmetic to the returned value.
+///
+/// # Example
+///
+/// ```ignore
+/// // indent=4, borders+padding=17 => overhead=21
+/// let budget = column_budget(term_width, 21);
+/// let cmd_max = (budget * 2 / 5).max(if budget > 0 { 1 } else { 0 });
+/// let rewrite_max = (budget * 3 / 5).max(if budget > 0 { 1 } else { 0 });
+/// ```
+pub(crate) fn column_budget(term_width: u16, overhead: usize) -> usize {
+    if term_width == 0 {
+        return 0;
+    }
+    (term_width as usize).saturating_sub(overhead)
 }
 
 /// Print a comfy-table to stdout with each line indented by `indent` spaces.
@@ -143,14 +171,15 @@ pub(crate) fn truncate_path_middle(path: &str, max: usize) -> String {
 /// Centralises the "indent every line of the table" pattern used by discover
 /// and learn to align table output with surrounding prose (S3).
 ///
-/// When `truncate` is `true`, the table is constrained to the current
-/// terminal width minus `indent` columns; `comfy_table` will wrap or
-/// truncate long cells automatically. When `truncate` is `false` (i.e. the
-/// caller passed `--no-truncate`), no width constraint is applied and the
-/// table expands to its natural width.
-pub(crate) fn print_indented_table(table: &mut comfy_table::Table, indent: usize, truncate: bool) {
-    if truncate {
-        let available = terminal_width().saturating_sub(indent as u16);
+/// `term_width` is the terminal width in columns, already computed by the
+/// caller (typically at the top of the enclosing print function to avoid
+/// redundant syscalls). When non-zero the table is constrained to
+/// `term_width - indent` columns so `comfy_table` wraps or truncates long
+/// cells automatically. When zero (i.e. the caller passed `--no-truncate`)
+/// no width constraint is applied and the table expands to its natural width.
+pub(crate) fn print_indented_table(table: &mut comfy_table::Table, indent: usize, term_width: u16) {
+    if term_width > 0 {
+        let available = term_width.saturating_sub(indent as u16);
         table.set_width(available);
     }
     let prefix = " ".repeat(indent);
@@ -215,7 +244,36 @@ mod tests {
         }
     }
 
+    // --- column_budget ---
+
+    #[test]
+    fn test_column_budget_zero_term_width_returns_zero() {
+        // term_width=0 signals no-truncate; budget must be the no-op sentinel 0.
+        assert_eq!(column_budget(0, 17), 0);
+    }
+
+    #[test]
+    fn test_column_budget_subtracts_overhead() {
+        // 100 columns - 20 overhead = 80 usable.
+        assert_eq!(column_budget(100, 20), 80);
+    }
+
+    #[test]
+    fn test_column_budget_overhead_exceeds_width_saturates_to_zero() {
+        // saturating_sub never underflows.
+        assert_eq!(column_budget(10, 50), 0);
+    }
+
     // --- truncate_str ---
+
+    #[test]
+    fn test_truncate_str_no_op_returns_borrowed() {
+        // String shorter than max: no allocation — must be Cow::Borrowed.
+        let s = "hello";
+        let result = truncate_str(s, 10);
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(result, "hello");
+    }
 
     #[test]
     fn test_truncate_str_no_op() {
@@ -253,6 +311,15 @@ mod tests {
     }
 
     // --- truncate_path_middle ---
+
+    #[test]
+    fn test_truncate_path_middle_short_returns_borrowed() {
+        // Path shorter than max: no allocation — must be Cow::Borrowed.
+        let path = "/src/main.rs";
+        let result = truncate_path_middle(path, 40);
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(result, "/src/main.rs");
+    }
 
     #[test]
     fn test_truncate_path_middle_short() {

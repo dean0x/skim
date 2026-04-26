@@ -800,14 +800,21 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &
         println!();
     }
 
+    // Compute terminal width once. When no_truncate is set, pass 0 so that
+    // column_budget() and print_indented_table() treat it as a no-op sentinel.
+    let term_width: u16 = if config.no_truncate {
+        0
+    } else {
+        crate::cmd::ux::terminal_width()
+    };
+
     // Truncation: 6-column table with fixed-width prefix columns.
     // Fixed columns: #(~3), Pattern(~12), Seen(~5) = ~20 chars
     // Borders + padding for 6 columns: ~17 chars
     // Remaining for 3 dynamic columns: terminal_width - indent(4) - 20 - 17
     // col_max == 0 means no-op (truncate_str contract).
-    let truncate = !config.no_truncate;
-    let dynamic_budget = (crate::cmd::ux::terminal_width() as usize).saturating_sub(4 + 20 + 17);
-    let col_max: usize = if truncate {
+    let dynamic_budget = crate::cmd::ux::column_budget(term_width, 4 + 20 + 17);
+    let col_max: usize = if dynamic_budget > 0 {
         (dynamic_budget / 3).max(1)
     } else {
         0
@@ -827,14 +834,14 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &
             index.as_str(),
             pair.pattern_type.label(),
             seen.as_str(),
-            crate::cmd::ux::truncate_str(&pair.failed_command, col_max).as_str(),
-            crate::cmd::ux::truncate_str(&pair.successful_command, col_max).as_str(),
-            crate::cmd::ux::truncate_str(first_error_line, col_max).as_str(),
+            crate::cmd::ux::truncate_str(&pair.failed_command, col_max).as_ref(),
+            crate::cmd::ux::truncate_str(&pair.successful_command, col_max).as_ref(),
+            crate::cmd::ux::truncate_str(first_error_line, col_max).as_ref(),
         ]);
     }
 
     // Indent the table by 4 spaces to match the surrounding output style.
-    crate::cmd::ux::print_indented_table(&mut table, 4, truncate);
+    crate::cmd::ux::print_indented_table(&mut table, 4, term_width);
     println!();
 
     let target = match agent.rules_dir() {
