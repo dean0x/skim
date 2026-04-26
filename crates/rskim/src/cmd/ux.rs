@@ -121,6 +121,16 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> Cow<'_, str> {
 /// - `max == 0`: no-op, returns `Cow::Borrowed(path)` (zero allocation).
 /// - When the path already fits, returns `Cow::Borrowed(path)` (zero allocation).
 /// - Path without `/`: falls back to `truncate_str`.
+///
+/// # Performance note
+///
+/// The implementation performs up to three character-level scans of the path:
+/// one `chars().count()` for the length check, one `chars().count()` on the
+/// filename component, and one `chars().take(n).collect()` to build the prefix.
+/// `rsplit` and `contains` operate on bytes, not chars. Paths are at most a few
+/// hundred characters and this function is called at most ~10 times per report
+/// render, so the repeated scans are intentionally left as-is — the clarity
+/// benefit outweighs a marginal allocation saving.
 pub(crate) fn truncate_path_middle(path: &str, max: usize) -> Cow<'_, str> {
     let char_count = path.chars().count();
     if char_count <= max || max == 0 {
@@ -242,6 +252,26 @@ mod tests {
                 "Line does not start with indent: {indented:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_print_indented_table_term_width_constrained_does_not_panic() {
+        // Exercises the term_width > 0 branch: set_width is called and the
+        // table must render without panicking.
+        let mut table = comfy_table::Table::new();
+        table.set_header(["File", "Tokens"]);
+        table.add_row(["main.rs", "120"]);
+        print_indented_table(&mut table, 4, 80);
+    }
+
+    #[test]
+    fn test_print_indented_table_no_truncate_does_not_panic() {
+        // Exercises the term_width == 0 branch (--no-truncate sentinel): no
+        // set_width call is made and the table must render without panicking.
+        let mut table = comfy_table::Table::new();
+        table.set_header(["File", "Tokens"]);
+        table.add_row(["main.rs", "120"]);
+        print_indented_table(&mut table, 4, 0);
     }
 
     // --- column_budget ---

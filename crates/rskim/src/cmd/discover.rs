@@ -750,6 +750,7 @@ mod tests {
         assert!(!config.session_latest);
         assert!(config.agent_filter.is_none());
         assert!(!config.json_output);
+        assert!(!config.no_truncate);
     }
 
     #[test]

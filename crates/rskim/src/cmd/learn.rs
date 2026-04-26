@@ -1463,6 +1463,7 @@ mod tests {
         assert!(!config.dry_run);
         assert!(!config.json_output);
         assert!(config.agent_filter.is_none());
+        assert!(!config.no_truncate);
     }
 
     #[test]
