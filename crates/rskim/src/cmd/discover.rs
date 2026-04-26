@@ -401,8 +401,16 @@ fn print_commands_section(analysis: &DiscoverAnalysis, config: &DiscoverConfig) 
         // cmd_max/rewrite_max == 0 means no-op (truncate_str contract).
         let truncate = !config.no_truncate;
         let content_width = (crate::cmd::ux::terminal_width() as usize).saturating_sub(17);
-        let cmd_max: usize = if truncate { (content_width * 2 / 5).max(1) } else { 0 };
-        let rewrite_max: usize = if truncate { (content_width * 3 / 5).max(1) } else { 0 };
+        let cmd_max: usize = if truncate {
+            (content_width * 2 / 5).max(1)
+        } else {
+            0
+        };
+        let rewrite_max: usize = if truncate {
+            (content_width * 3 / 5).max(1)
+        } else {
+            0
+        };
 
         // Deduplicate by command prefix and render as a table (D5: text path only).
         let mut seen = std::collections::HashSet::new();

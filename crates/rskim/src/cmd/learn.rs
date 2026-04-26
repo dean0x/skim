@@ -806,9 +806,12 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &
     // Remaining for 3 dynamic columns: terminal_width - indent(4) - 20 - 17
     // col_max == 0 means no-op (truncate_str contract).
     let truncate = !config.no_truncate;
-    let dynamic_budget =
-        (crate::cmd::ux::terminal_width() as usize).saturating_sub(4 + 20 + 17);
-    let col_max: usize = if truncate { (dynamic_budget / 3).max(1) } else { 0 };
+    let dynamic_budget = (crate::cmd::ux::terminal_width() as usize).saturating_sub(4 + 20 + 17);
+    let col_max: usize = if truncate {
+        (dynamic_budget / 3).max(1)
+    } else {
+        0
+    };
 
     let mut table = Table::new();
     table
