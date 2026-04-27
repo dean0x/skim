@@ -1144,6 +1144,7 @@ dependencies = [
  "clap_complete",
  "colored",
  "comfy-table",
+ "crossterm",
  "dirs",
  "globset",
  "ignore",

@@ -108,13 +108,24 @@ pub(crate) fn is_passthrough_mode() -> bool {
     check_passthrough_value(std::env::var("SKIM_PASSTHROUGH").ok())
 }
 
+/// Core truthy-value check for a `SKIM_PASSTHROUGH` value already extracted as
+/// a `&str`.
+///
+/// Returns `true` for `"1"`, `"true"`, `"yes"` (case-insensitive).
+///
+/// This is the single authoritative definition of "truthy". All other helpers
+/// delegate here so the truthy set is never duplicated.
+pub(crate) fn check_passthrough_str(val: &str) -> bool {
+    matches!(val.to_lowercase().as_str(), "1" | "true" | "yes")
+}
+
 /// Pure function version of [`is_passthrough_mode`] — avoids process-wide env var
 /// mutation in tests.
 ///
 /// Returns `true` for `"1"`, `"true"`, `"yes"` (case-insensitive).
+/// Delegates to [`check_passthrough_str`] so the truthy definition stays in one place.
 pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
-    val.map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    val.map(|v| check_passthrough_str(&v)).unwrap_or(false)
 }
 
 /// Known subcommands that the pre-parse router will recognize.
@@ -549,6 +560,21 @@ mod tests {
         assert!(!check_passthrough_value(Some("false".to_string())));
         assert!(!check_passthrough_value(Some("no".to_string())));
         assert!(!check_passthrough_value(None));
+    }
+
+    #[test]
+    fn test_check_passthrough_str_truthy_values() {
+        for v in &["1", "true", "yes", "True", "YES", "tRuE"] {
+            assert!(check_passthrough_str(v), "expected truthy for {v:?}");
+        }
+    }
+
+    #[test]
+    fn test_check_passthrough_str_falsy_values() {
+        assert!(!check_passthrough_str("0"));
+        assert!(!check_passthrough_str("false"));
+        assert!(!check_passthrough_str("no"));
+        assert!(!check_passthrough_str(""));
     }
 
     #[test]

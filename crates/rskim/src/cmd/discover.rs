@@ -69,6 +69,7 @@ struct DiscoverConfig {
     agent_filter: Option<AgentKind>,
     json_output: bool,
     debug: bool,
+    no_truncate: bool,
 }
 
 /// Parse CLI arguments into a [`DiscoverConfig`].
@@ -83,6 +84,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
         json_output: false,
         // Honor SKIM_DEBUG env var as well as the --debug flag
         debug: crate::debug::is_debug_enabled(),
+        no_truncate: false,
     };
 
     let mut i = 0;
@@ -120,9 +122,12 @@ fn parse_args(args: &[String]) -> anyhow::Result<DiscoverConfig> {
                 config.debug = true;
                 crate::debug::force_enable_debug();
             }
+            "--no-truncate" => {
+                config.no_truncate = true;
+            }
             other => {
                 anyhow::bail!(
-                    "unknown flag: '{other}'\n\nUsage: skim discover [--since <duration>] [--session latest] [--agent <name>] [--json] [--debug]"
+                    "unknown flag: '{other}'\n\nUsage: skim discover [--since <duration>] [--session latest] [--agent <name>] [--json] [--debug] [--no-truncate]"
                 );
             }
         }
@@ -306,16 +311,25 @@ fn print_text_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
         "Sessions scanned: found {} tool invocations",
         analysis.total_invocations
     );
+    if !config.no_truncate {
+        println!("    hint: use --no-truncate for full output");
+    }
     println!();
 
-    print_code_reads_section(analysis);
-    print_commands_section(analysis, config.debug);
+    // Compute terminal width once to avoid redundant ioctl syscalls in
+    // section functions and print_indented_table. Returns 0 when no_truncate
+    // is set, which is the no-op sentinel for column_budget() and
+    // print_indented_table().
+    let term_width: u16 = crate::cmd::ux::resolve_term_width(config.no_truncate);
+
+    print_code_reads_section(analysis, term_width);
+    print_commands_section(analysis, config.debug, term_width);
 
     println!();
     println!("hint: run `skim init` to install the PreToolUse hook for automatic optimization");
 }
 
-fn print_code_reads_section(analysis: &DiscoverAnalysis) {
+fn print_code_reads_section(analysis: &DiscoverAnalysis, term_width: u16) {
     let skimmable_count = analysis.code_reads.iter().filter(|r| r.could_skim).count();
     let non_skimmable_count = analysis.code_reads.iter().filter(|r| !r.could_skim).count();
 
@@ -346,20 +360,28 @@ fn print_code_reads_section(analysis: &DiscoverAnalysis) {
             .collect();
         sorted_reads.sort_by_key(|r| std::cmp::Reverse(r.result_tokens));
         println!("  Top files by token count:");
+
+        // Truncation: approximate available width for the path column.
+        // indent(4) + borders+padding(~9) + tokens_col(~10) = ~23 overhead.
+        // path_max == 0 means no-op (truncate_path_middle contract).
+        let path_max = crate::cmd::ux::column_budget(term_width, 23);
+
         let mut table = Table::new();
         table
             .load_preset(UTF8_FULL_CONDENSED)
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_header(vec!["File", "Tokens"]);
         for read in sorted_reads.iter().take(10) {
-            table.add_row(vec![&read.file_path, &read.result_tokens.to_string()]);
+            let path_cell = crate::cmd::ux::truncate_path_middle(&read.file_path, path_max);
+            let tokens_str = read.result_tokens.to_string();
+            table.add_row(vec![path_cell.as_ref(), tokens_str.as_str()]);
         }
-        crate::cmd::ux::print_indented_table(&table, 4);
+        crate::cmd::ux::print_indented_table(&mut table, 4, term_width);
     }
     println!();
 }
 
-fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
+fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool, term_width: u16) {
     let rewritable_count = analysis
         .bash_commands
         .iter()
@@ -374,6 +396,23 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
     if rewritable_count > 0 {
         println!();
         println!("  Rewritable commands:");
+
+        // Truncation: approximate available content width for two columns.
+        // indent(4) + borders+padding(~13) = ~17 overhead.
+        // Split: 40% Command, 60% Rewrite (rewrites are typically longer).
+        // cmd_max/rewrite_max == 0 means no-op (truncate_str contract).
+        let content_width = crate::cmd::ux::column_budget(term_width, 17);
+        let cmd_max = if content_width > 0 {
+            (content_width * 2 / 5).max(1)
+        } else {
+            0
+        };
+        let rewrite_max = if content_width > 0 {
+            (content_width * 3 / 5).max(1)
+        } else {
+            0
+        };
+
         // Deduplicate by command prefix and render as a table (D5: text path only).
         let mut seen = std::collections::HashSet::new();
         let mut table = Table::new();
@@ -389,16 +428,14 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool) {
                 .collect::<Vec<_>>()
                 .join(" ");
             if seen.insert(prefix.clone()) {
+                let rewrite_raw = cmd.rewrite_target.as_deref().unwrap_or("skim equivalent");
                 table.add_row(vec![
-                    prefix,
-                    cmd.rewrite_target
-                        .as_deref()
-                        .unwrap_or("skim equivalent")
-                        .to_string(),
+                    crate::cmd::ux::truncate_str(&prefix, cmd_max).as_ref(),
+                    crate::cmd::ux::truncate_str(rewrite_raw, rewrite_max).as_ref(),
                 ]);
             }
         }
-        crate::cmd::ux::print_indented_table(&table, 4);
+        crate::cmd::ux::print_indented_table(&mut table, 4, term_width);
     }
 
     print_debug_section(analysis, debug);
@@ -506,6 +543,7 @@ fn print_help() {
     println!("  --agent <name>       Only scan sessions from a specific agent");
     println!("  --json               Output machine-readable JSON");
     println!("  --debug              Show non-rewritable commands (also: SKIM_DEBUG=1)");
+    println!("  --no-truncate        Show full table output without truncation");
     println!("  --help, -h           Print help information");
     println!();
     println!("Supported agents:");
@@ -559,6 +597,12 @@ pub(super) fn command() -> clap::Command {
                 .long("debug")
                 .action(clap::ArgAction::SetTrue)
                 .help("Show non-rewritable commands (also: SKIM_DEBUG=1)"),
+        )
+        .arg(
+            clap::Arg::new("no-truncate")
+                .long("no-truncate")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show full table output without truncation"),
         )
 }
 
@@ -700,6 +744,7 @@ mod tests {
         assert!(!config.session_latest);
         assert!(config.agent_filter.is_none());
         assert!(!config.json_output);
+        assert!(!config.no_truncate);
     }
 
     #[test]
@@ -826,6 +871,7 @@ mod tests {
             agent_filter: None,
             json_output: false,
             debug: false,
+            no_truncate: false,
         }
     }
 
@@ -936,7 +982,7 @@ mod tests {
         // Build the clap command for validation
         let cmd = command();
 
-        // Flags exercised: --since, --agent, --json, --debug, --session
+        // Flags exercised: --since, --agent, --json, --debug, --session, --no-truncate
         let all_args = [
             "--since",
             "7d",
@@ -946,6 +992,7 @@ mod tests {
             "--debug",
             "--session",
             "latest",
+            "--no-truncate",
         ];
 
         // clap must accept these flags without error
@@ -969,6 +1016,12 @@ mod tests {
         // --debug: both must agree it is set
         assert!(matches.get_flag("debug"), "clap should see --debug as true");
 
+        // --no-truncate: both must agree it is set
+        assert!(
+            matches.get_flag("no-truncate"),
+            "clap should see --no-truncate as true"
+        );
+
         // --since: clap must surface the value
         assert_eq!(
             matches.get_one::<String>("since").map(|s| s.as_str()),
@@ -989,5 +1042,11 @@ mod tests {
             Some("latest"),
             "clap --session value should be 'latest'"
         );
+    }
+
+    #[test]
+    fn test_parse_args_no_truncate() {
+        let config = parse_args(&["--no-truncate".to_string()]).unwrap();
+        assert!(config.no_truncate);
     }
 }

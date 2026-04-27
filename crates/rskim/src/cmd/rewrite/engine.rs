@@ -77,6 +77,19 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
         };
     }
 
+    // Step 1b: Honor SKIM_PASSTHROUGH=<truthy> as a command prefix.
+    //
+    // When an agent runs `SKIM_PASSTHROUGH=1 gh pr list`, the hook rewrites
+    // its own env but the child inherits that env var. The env-prefix form
+    // lets callers bypass rewriting for a single invocation without setting
+    // or unsetting the global env, which is useful in scripts. SEE: AD-RW-14.
+    if env_vars_contain_passthrough(env_vars) {
+        return TableMatchResult {
+            rewrite: None,
+            pipe_excluded: false,
+        };
+    }
+
     // Step 2: Strip cargo toolchain prefix (+nightly etc.)
     let (toolchain, match_tokens) = strip_cargo_toolchain(command_tokens);
 
@@ -143,6 +156,19 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
         rewrite: custom,
         pipe_excluded: false,
     }
+}
+
+/// Return `true` if any env-var token is `SKIM_PASSTHROUGH` with a truthy value.
+///
+/// Delegates to [`crate::cmd::check_passthrough_str`] for the truthy check
+/// so the definition of "truthy" stays in one place.  SEE: AD-RW-14.
+fn env_vars_contain_passthrough(env_vars: &[&str]) -> bool {
+    env_vars.iter().any(|token| {
+        token
+            .strip_prefix("SKIM_PASSTHROUGH=")
+            .map(crate::cmd::check_passthrough_str)
+            .unwrap_or(false)
+    })
 }
 
 /// Return the index of the first non-env-var token.
@@ -630,6 +656,42 @@ mod tests {
         assert!(
             r.rewrite.is_some(),
             "catch-all grep --count should produce a rewrite (no skip flag on catch-all)"
+        );
+    }
+
+    // ========================================================================
+    // env_vars_contain_passthrough unit tests (AD-RW-14)
+    // ========================================================================
+
+    #[test]
+    fn test_env_vars_contain_passthrough_truthy() {
+        assert!(
+            env_vars_contain_passthrough(&["SKIM_PASSTHROUGH=1"]),
+            "SKIM_PASSTHROUGH=1 must be detected as truthy"
+        );
+    }
+
+    #[test]
+    fn test_env_vars_contain_passthrough_falsy() {
+        assert!(
+            !env_vars_contain_passthrough(&["SKIM_PASSTHROUGH=0"]),
+            "SKIM_PASSTHROUGH=0 must NOT be detected as truthy"
+        );
+    }
+
+    #[test]
+    fn test_env_vars_contain_passthrough_absent() {
+        assert!(
+            !env_vars_contain_passthrough(&["RUST_LOG=debug"]),
+            "Absence of SKIM_PASSTHROUGH must return false"
+        );
+    }
+
+    #[test]
+    fn test_env_vars_contain_passthrough_mixed() {
+        assert!(
+            env_vars_contain_passthrough(&["RUST_LOG=debug", "SKIM_PASSTHROUGH=1"]),
+            "SKIM_PASSTHROUGH=1 among other env vars must return true"
         );
     }
 }

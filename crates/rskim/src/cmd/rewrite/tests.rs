@@ -511,3 +511,180 @@ fn test_collect_input_tokens_all_whitespace_multi() {
         "all-whitespace multi-arg must return None (no tokens)"
     );
 }
+
+// ========================================================================
+// skip-flag tests: gh list commands (--jq, --template, --web)
+// ========================================================================
+
+#[test]
+fn test_gh_pr_list_jq_skips() {
+    assert_eq!(
+        would_rewrite("gh pr list --jq '.[0]'"),
+        None,
+        "gh pr list --jq must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_pr_list_template_skips() {
+    assert_eq!(
+        would_rewrite("gh pr list --template '{{.title}}'"),
+        None,
+        "gh pr list --template must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_pr_list_web_skips() {
+    assert_eq!(
+        would_rewrite("gh pr list --web"),
+        None,
+        "gh pr list --web must skip rewrite (opens browser)"
+    );
+}
+
+#[test]
+fn test_gh_issue_list_jq_skips() {
+    assert_eq!(
+        would_rewrite("gh issue list --jq '.[]'"),
+        None,
+        "gh issue list --jq must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_issue_list_template_skips() {
+    assert_eq!(
+        would_rewrite("gh issue list --template '{{.title}}'"),
+        None,
+        "gh issue list --template must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_issue_list_web_skips() {
+    assert_eq!(
+        would_rewrite("gh issue list --web"),
+        None,
+        "gh issue list --web must skip rewrite (opens browser, no stdout)"
+    );
+}
+
+#[test]
+fn test_gh_run_list_jq_skips() {
+    assert_eq!(
+        would_rewrite("gh run list --jq '.[]'"),
+        None,
+        "gh run list --jq must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_run_list_template_skips() {
+    assert_eq!(
+        would_rewrite("gh run list --template '{{.name}}'"),
+        None,
+        "gh run list --template must skip rewrite (user-defined transform)"
+    );
+}
+
+/// `gh run list` does NOT support `--web` (verified via `gh run list --help`).
+/// Unlike `gh pr list` and `gh issue list` which open a browser tab with `--web`,
+/// `gh run list` does not recognise this flag, so it passes through as a regular
+/// argument and the rule still fires.
+#[test]
+fn test_gh_run_list_web_still_rewrites() {
+    let result = would_rewrite("gh run list --web");
+    assert!(
+        result.is_some(),
+        "gh run list --web must rewrite: --web is not a valid flag for gh run list"
+    );
+}
+
+#[test]
+fn test_gh_release_list_jq_skips() {
+    assert_eq!(
+        would_rewrite("gh release list --jq '.[]'"),
+        None,
+        "gh release list --jq must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_release_list_template_skips() {
+    assert_eq!(
+        would_rewrite("gh release list --template '{{.name}}'"),
+        None,
+        "gh release list --template must skip rewrite (user-defined transform)"
+    );
+}
+
+/// `gh release list` does NOT support `--web` (verified via `gh release list --help`).
+/// Since `--web` is not a recognized flag, it passes through as a regular argument
+/// and the rule still fires.
+#[test]
+fn test_gh_release_list_web_still_rewrites() {
+    let result = would_rewrite("gh release list --web");
+    assert!(
+        result.is_some(),
+        "gh release list --web must rewrite: --web is not a valid flag for gh release list"
+    );
+}
+
+// ========================================================================
+// SKIM_PASSTHROUGH env prefix tests
+// ========================================================================
+
+#[test]
+fn test_passthrough_env_prefix_skips_rewrite() {
+    assert_eq!(
+        would_rewrite("SKIM_PASSTHROUGH=1 gh pr list"),
+        None,
+        "SKIM_PASSTHROUGH=1 as env prefix must suppress rewrite"
+    );
+}
+
+#[test]
+fn test_passthrough_env_prefix_true_skips() {
+    assert_eq!(
+        would_rewrite("SKIM_PASSTHROUGH=true gh pr list"),
+        None,
+        "SKIM_PASSTHROUGH=true as env prefix must suppress rewrite"
+    );
+}
+
+#[test]
+fn test_passthrough_env_prefix_yes_skips() {
+    assert_eq!(
+        would_rewrite("SKIM_PASSTHROUGH=yes cargo test"),
+        None,
+        "SKIM_PASSTHROUGH=yes as env prefix must suppress rewrite"
+    );
+}
+
+#[test]
+fn test_passthrough_env_prefix_zero_still_rewrites() {
+    let result = would_rewrite("SKIM_PASSTHROUGH=0 gh pr list");
+    assert!(
+        result.is_some(),
+        "SKIM_PASSTHROUGH=0 must not suppress rewrite (falsy value)"
+    );
+}
+
+#[test]
+fn test_passthrough_env_mixed_with_others_skips() {
+    assert_eq!(
+        would_rewrite("RUST_LOG=debug SKIM_PASSTHROUGH=1 gh pr list"),
+        None,
+        "SKIM_PASSTHROUGH=1 among other env vars must still suppress rewrite"
+    );
+}
+
+#[test]
+fn test_non_passthrough_env_still_rewrites() {
+    let result = would_rewrite("RUST_LOG=debug gh pr list");
+    assert!(
+        result.is_some(),
+        "Unrelated env var must not suppress rewrite"
+    );
+}
