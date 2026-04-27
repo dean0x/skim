@@ -553,11 +553,51 @@ fn test_gh_issue_list_jq_skips() {
 }
 
 #[test]
+fn test_gh_issue_list_template_skips() {
+    assert_eq!(
+        would_rewrite("gh issue list --template '{{.title}}'"),
+        None,
+        "gh issue list --template must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_issue_list_web_skips() {
+    assert_eq!(
+        would_rewrite("gh issue list --web"),
+        None,
+        "gh issue list --web must skip rewrite (opens browser, no stdout)"
+    );
+}
+
+#[test]
 fn test_gh_run_list_jq_skips() {
     assert_eq!(
         would_rewrite("gh run list --jq '.[]'"),
         None,
         "gh run list --jq must skip rewrite (user-defined transform)"
+    );
+}
+
+#[test]
+fn test_gh_run_list_template_skips() {
+    assert_eq!(
+        would_rewrite("gh run list --template '{{.name}}'"),
+        None,
+        "gh run list --template must skip rewrite (user-defined transform)"
+    );
+}
+
+/// `gh run list` does NOT support `--web` (verified via `gh run list --help`).
+/// Unlike `gh pr list` and `gh issue list` which open a browser tab with `--web`,
+/// `gh run list` does not recognise this flag, so it passes through as a regular
+/// argument and the rule still fires.
+#[test]
+fn test_gh_run_list_web_still_rewrites() {
+    let result = would_rewrite("gh run list --web");
+    assert!(
+        result.is_some(),
+        "gh run list --web must rewrite: --web is not a valid flag for gh run list"
     );
 }
 

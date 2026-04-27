@@ -278,6 +278,48 @@ mod tests {
     }
 
     #[test]
+    fn test_print_indented_table_term_width_constrains_rendered_width() {
+        // Verifies the set_width branch actually constrains the rendered output.
+        // Callers of print_indented_table (discover, learn) always set
+        // ContentArrangement::Dynamic so comfy-table wraps cells at word
+        // boundaries when set_width is active.  A multi-word cell that exceeds
+        // the available width must produce more rendered lines (wrapped) than
+        // the same table with no width constraint.
+        //
+        // We test this via table.to_string() directly because print_indented_table
+        // writes to stdout which cannot be captured in unit tests.  The
+        // width-constraining logic is identical whether we use the helper or call
+        // set_width ourselves — the table object carries the constraint.
+        //
+        // Use a sentence with spaces so comfy-table can wrap at word boundaries.
+        let long_cell = "word ".repeat(40).trim().to_string(); // 199 chars
+        let indent: usize = 4;
+        let term_width: u16 = 60;
+        let available = term_width.saturating_sub(u16::try_from(indent).unwrap_or(u16::MAX));
+
+        let mut table_unconstrained = comfy_table::Table::new();
+        table_unconstrained
+            .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
+            .set_header(["Command", "Rewrite"]);
+        table_unconstrained.add_row([long_cell.as_str(), "skim infra gh pr list"]);
+        let lines_unconstrained = table_unconstrained.to_string().lines().count();
+
+        let mut table_constrained = comfy_table::Table::new();
+        table_constrained
+            .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
+            .set_header(["Command", "Rewrite"]);
+        table_constrained.add_row([long_cell.as_str(), "skim infra gh pr list"]);
+        table_constrained.set_width(available);
+        let lines_constrained = table_constrained.to_string().lines().count();
+
+        assert!(
+            lines_constrained > lines_unconstrained,
+            "set_width({available}) with Dynamic arrangement should wrap long cells, \
+             producing more lines ({lines_constrained}) than unconstrained ({lines_unconstrained})"
+        );
+    }
+
+    #[test]
     fn test_print_indented_table_no_truncate_does_not_panic() {
         // Exercises the term_width == 0 branch (--no-truncate sentinel): no
         // set_width call is made and the table must render without panicking.
@@ -285,6 +327,38 @@ mod tests {
         table.set_header(["File", "Tokens"]);
         table.add_row(["main.rs", "120"]);
         print_indented_table(&mut table, 4, 0);
+    }
+
+    #[test]
+    fn test_print_indented_table_no_truncate_preserves_full_content() {
+        // Verifies the term_width == 0 branch does NOT constrain table width.
+        // With a 200-char unbreakable cell and no set_width call, the rendered
+        // string must contain the full cell content — no wrapping applied.
+        //
+        // Mirror callers by setting ContentArrangement::Dynamic; this confirms
+        // that even with Dynamic arrangement, term_width==0 leaves content intact.
+        let long_cell = "a".repeat(200);
+        let mut table = comfy_table::Table::new();
+        table
+            .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
+            .set_header(["Command", "Rewrite"]);
+        table.add_row([long_cell.as_str(), "skim infra gh pr list"]);
+
+        // term_width == 0 → no set_width call; table renders at natural width.
+        // Mirror the branch logic from print_indented_table exactly.
+        let term_width: u16 = 0;
+        if term_width > 0 {
+            let indent: usize = 4;
+            let available =
+                term_width.saturating_sub(u16::try_from(indent).unwrap_or(u16::MAX));
+            table.set_width(available);
+        }
+
+        let rendered = table.to_string();
+        assert!(
+            rendered.contains(&long_cell),
+            "no-truncate branch must preserve full 200-char cell content"
+        );
     }
 
     // --- column_budget ---
