@@ -134,35 +134,51 @@ pub(super) fn atomic_write_settings(
 
 /// Generate the skim guidance section content with version markers.
 ///
-/// This is a short (~300 token), self-contained preamble that tells agents
-/// skim is available for structural code exploration. Uses `skim` (or
-/// `rskim` as fallback) via Bash. Framed as strong directives, not soft
-/// suggestions, to maximise adoption across all agent sessions.
+/// Intent-based decision table that helps agents pick the right tool once
+/// per file, avoiding the wasteful skim-then-Read anti-pattern.
 pub(super) fn guidance_content(version: &str) -> String {
     format!(
         r#"<!-- skim-start v{version} -->
 ## Skim — Context-Optimized Code Reading
 
-**IMPORTANT**: `skim` is installed and a rewrite hook is active that automatically
-optimizes shell commands. For explicit use, call `skim` via Bash (or `rskim` if
-`skim` is not in PATH).
+`skim` is installed and a rewrite hook is active that automatically optimizes
+shell commands. For explicit use, call `skim` via Bash (or `rskim`).
 
-### Rules
+### What skim shows
 
-1. **ALWAYS prefer `skim <file>` over Read** when exploring or understanding code —
-   60-80% fewer tokens with the same structural insight.
-2. Use `skim <file> --mode=signatures` for API surfaces and interface discovery.
-3. Use `skim 'src/**/*.ts'` for scanning directories or multi-file exploration.
-4. **Use Read only when**:
-   - You need exact line content for an Edit operation
-   - You need a specific small section (< 50 lines) you will modify next
-   - The file is non-code (images, binary)
+Skim strips function/method bodies and preserves structure, signatures, types,
+and doc comments. Output has **no line numbers**. It shows *what exists* in a
+file — not *how it works*.
+
+### Choose ONE tool per file
+
+Before touching a file, decide your intent — then use the right tool once.
+
+| Intent | Tool | Why |
+|--------|------|-----|
+| **List files** — "what files exist here?" | `ls` or Glob | Cheapest — names only, no content |
+| **Survey structure** — "what's in this file?" | `skim <file>` | Structure at 60-80% fewer tokens |
+| **Find the right file** — narrowing candidates | `skim 'src/**/*.ts'` | Peeks inside each file cheaply. Use ls/Glob first if names suffice |
+| **API surface** — "what can I call?" | `skim --mode=signatures` | Function/method signatures only |
+| **Understand logic** — "how does X work?" | Read (targeted range) | Skim strips the bodies you need |
+| **Edit a file** — you will modify it | Read (section to edit) | Need exact lines + line numbers for Edit |
+| **Debug/trace** — following control flow | Read (targeted range) | Implementation details matter |
+
+### Anti-pattern: skim then Read the same file
+
+**Never skim a file and then Read the same file.** This wastes more tokens than
+either tool alone. Pick one:
+- If you might need bodies or line numbers → skip skim, go straight to Read.
+- If you only need structure/signatures → skim it and move on.
+
+The only valid skim→Read sequence is across **different files**: skim a directory
+to find the right file, then Read that one file.
 
 ### Quick Reference
 
 ```
-skim <file>                    # structural overview (default)
-skim <file> --mode=signatures  # API surface only
+skim <file>                    # structural overview (strips bodies)
+skim <file> --mode=signatures  # function/method signatures only
 skim 'src/**/*.ts'             # multi-file scan
 ```
 <!-- skim-end -->"#,
@@ -176,7 +192,7 @@ skim 'src/**/*.ts'             # multi-file scan
 pub(super) fn guidance_content_mdc(version: &str) -> String {
     let body = guidance_content(version);
     format!(
-        "---\ndescription: \"skim — ALWAYS use skim over Read for code exploration\"\nalwaysApply: true\n---\n\n{body}"
+        "---\ndescription: \"skim — context-optimized code reading for AI agents\"\nalwaysApply: true\n---\n\n{body}"
     )
 }
 
@@ -276,9 +292,9 @@ mod tests {
         assert!(content.ends_with("<!-- skim-end -->"));
         // Version appears in the skim-start marker
         assert!(content.contains("v2.1.0"));
-        // Strong directive language
-        assert!(content.contains("ALWAYS prefer"));
-        assert!(content.contains("Use Read only when"));
+        // Intent-based guidance
+        assert!(content.contains("Choose ONE tool per file"));
+        assert!(content.contains("Anti-pattern: skim then Read"));
         // SKIM_PASSTHROUGH is NOT documented in guidance — agents learn about it
         // from stderr hints emitted on compressed non-zero exits (shared.rs, mod.rs).
         assert!(!content.contains("SKIM_PASSTHROUGH"));
