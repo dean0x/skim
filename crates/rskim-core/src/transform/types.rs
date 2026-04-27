@@ -56,9 +56,31 @@ pub(crate) fn transform_types_with_spans(
     language: Language,
     _config: &crate::TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
+    let (text, spans, _line_map) = transform_types_with_spans_and_line_map(source, tree, language)?;
+    Ok((text, spans))
+}
+
+/// Transform to types-only, returning NodeSpan metadata AND a source line map.
+///
+/// The source line map maps each output line index to the 1-indexed source line
+/// where that type definition begins. Separator blank lines between definitions
+/// get source line 0 (no annotation).
+///
+/// # Design Decision (AC-18)
+/// Types mode uses `node.start_position().row + 1` to annotate each type
+/// definition with its source line. Multi-line definitions get consecutive
+/// source line numbers from their start line. Blank separator lines get 0.
+pub(crate) fn transform_types_with_spans_and_line_map(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     // ARCHITECTURE: Markdown types mode extracts ALL headers (H1-H6)
     if language == Language::Markdown {
-        return extract_markdown_headers_with_spans(source, tree, 1, 6);
+        let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 6)?;
+        let line_count = text.lines().count();
+        let line_map = (1..=line_count).collect();
+        return Ok((text, spans, line_map));
     }
 
     // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
@@ -70,8 +92,14 @@ pub(crate) fn transform_types_with_spans(
         ))
     })?;
 
-    let mut type_defs: Vec<(String, &'static str)> = Vec::new();
-    collect_type_definitions_with_kinds(tree.root_node(), source, &node_types, &mut type_defs, 0)?;
+    let mut type_defs: Vec<(String, &'static str, usize)> = Vec::new();
+    collect_type_definitions_with_kinds_and_lines(
+        tree.root_node(),
+        source,
+        &node_types,
+        &mut type_defs,
+        0,
+    )?;
 
     // Check type definition count limit
     if type_defs.len() > MAX_TYPE_DEFS {
@@ -82,36 +110,47 @@ pub(crate) fn transform_types_with_spans(
         )));
     }
 
-    // Build text and spans, tracking line offsets
+    // Build text, spans, and source line map
     // Types mode joins with \n\n (two newlines between defs)
     let type_defs_count = type_defs.len();
     let mut spans = Vec::with_capacity(type_defs_count);
-    let mut current_line = 0;
+    let mut source_line_map: Vec<usize> = Vec::new();
+    let mut current_output_line = 0;
 
     let texts: Vec<String> = type_defs
         .into_iter()
         .enumerate()
-        .map(|(idx, (def, kind))| {
+        .map(|(idx, (def, kind, source_start_line))| {
             let line_count = def.lines().count().max(1);
-            spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
-            current_line += line_count;
-            // Account for the blank line separator between defs
+            spans.push(NodeSpan::new(
+                current_output_line..current_output_line + line_count,
+                kind,
+            ));
+            // Map each output line to consecutive source lines from source_start_line
+            for i in 0..line_count {
+                source_line_map.push(source_start_line + i);
+            }
+            current_output_line += line_count;
+            // Account for the blank line separator between defs (\n\n → 1 extra blank line)
             if idx < type_defs_count - 1 {
-                current_line += 1; // \n\n adds one extra line
+                source_line_map.push(0); // blank separator line → no annotation
+                current_output_line += 1;
             }
             def
         })
         .collect();
 
-    Ok((texts.join("\n\n"), spans))
+    Ok((texts.join("\n\n"), spans, source_line_map))
 }
 
-/// Recursively collect type definitions with their node kind
-fn collect_type_definitions_with_kinds(
+/// Recursively collect type definitions with node kind AND source start line.
+///
+/// The source start line is `node.start_position().row + 1` (1-indexed).
+fn collect_type_definitions_with_kinds_and_lines(
     node: Node,
     source: &str,
     node_types: &TypeNodeTypes,
-    type_defs: &mut Vec<(String, &'static str)>,
+    type_defs: &mut Vec<(String, &'static str, usize)>,
     depth: usize,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested or malicious input
@@ -132,14 +171,22 @@ fn collect_type_definitions_with_kinds(
         }
         if let Some(type_def) = extract_type_definition(node, source, node_types)? {
             let static_kind = to_static_node_kind(kind);
-            type_defs.push((type_def, static_kind));
+            // 1-indexed source line where this type definition starts
+            let source_start_line = node.start_position().row + 1;
+            type_defs.push((type_def, static_kind, source_start_line));
         }
         return Ok(());
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_type_definitions_with_kinds(child, source, node_types, type_defs, depth + 1)?;
+        collect_type_definitions_with_kinds_and_lines(
+            child,
+            source,
+            node_types,
+            type_defs,
+            depth + 1,
+        )?;
     }
 
     Ok(())

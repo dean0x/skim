@@ -14,6 +14,7 @@ mod cache;
 mod cascade;
 mod cmd;
 mod debug;
+mod format;
 mod multi;
 mod output;
 mod process;
@@ -294,6 +295,16 @@ struct Args {
     )]
     tokens: Option<usize>,
 
+    /// Annotate output with original source line numbers.
+    ///
+    /// Each output line is prefixed with its 1-indexed source line number and a tab:
+    /// `{source_line}\t{content}`. Omission/truncation markers have no prefix.
+    ///
+    /// Useful when you need line numbers for Edit operations but want to survey
+    /// structure first: `skim file.ts -n` gives both structure AND line numbers.
+    #[arg(short = 'n', long, help = "Annotate output with original source line numbers")]
+    line_numbers: bool,
+
     /// Disable analytics recording for this invocation
     #[arg(long, help = "Disable analytics recording")]
     disable_analytics: bool,
@@ -532,6 +543,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
             last_lines: args.last_lines,
             token_budget: args.tokens,
         },
+        line_numbers: args.line_numbers,
     };
 
     if file == "-" {

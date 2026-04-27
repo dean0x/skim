@@ -93,6 +93,169 @@ fn transform_tree_with_spans(
     }
 }
 
+/// Transform AST and return text, NodeSpan metadata, AND source line map.
+///
+/// ARCHITECTURE: Extended version of `transform_tree` that additionally returns
+/// a source line map when `config.line_numbers` is true. The source line map
+/// maps each output line index (0-based) to its 1-indexed source line number.
+/// Value `0` indicates an omission/truncation marker (no line number annotation).
+///
+/// When `config.line_numbers` is false, returns `None` for the source line map
+/// (avoids unnecessary computation).
+///
+/// # Design Decision (AC-18)
+/// Line number computation is done inside the core library (rskim-core) so that
+/// the CLI layer can simply apply `format_with_line_numbers` without understanding
+/// each mode's internal structure. This keeps the CLI layer thin while the core
+/// library owns the mode-specific knowledge.
+pub(crate) fn transform_tree_with_line_map(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    config: &TransformConfig,
+) -> Result<(String, Option<Vec<usize>>)> {
+    if !config.line_numbers {
+        let text = transform_tree(source, tree, language, config)?;
+        return Ok((text, None));
+    }
+
+    // For modes that support source line maps, compute them alongside the transform.
+    let (text, spans, line_map) = match config.mode {
+        Mode::Structure => {
+            structure::transform_structure_with_spans_and_line_map(source, tree, language, config)?
+        }
+        Mode::Signatures => {
+            let (text, spans, line_map) =
+                signatures::transform_signatures_with_spans_and_line_map(source, tree, language)?;
+            (text, spans, line_map)
+        }
+        Mode::Types => {
+            let (text, spans, line_map) =
+                types::transform_types_with_spans_and_line_map(source, tree, language)?;
+            (text, spans, line_map)
+        }
+        Mode::Full => {
+            // Full mode: identity map
+            let text = source.to_string();
+            let line_count = text.lines().count();
+            let spans = vec![NodeSpan::new(0..line_count, "source_file")];
+            let line_map: Vec<usize> = (1..=line_count).collect();
+            (text, spans, line_map)
+        }
+        Mode::Minimal => {
+            // Minimal mode: identity map over output (minimal keeps most source lines)
+            let text = minimal::transform_minimal(source, tree, language, config)?;
+            let line_count = text.lines().count();
+            let spans = vec![NodeSpan::new(0..line_count, "source_file")];
+            // For minimal mode, compute the line map by text matching
+            let line_map = compute_line_map_by_text_matching(source, &text);
+            (text, spans, line_map)
+        }
+        Mode::Pseudo => {
+            // Pseudo mode: compute line map by text matching after transform
+            let (text, spans) =
+                pseudo::transform_pseudo_with_spans(source, tree, language, config)?;
+            let line_map = compute_line_map_by_text_matching(source, &text);
+            (text, spans, line_map)
+        }
+    };
+
+    // Apply max_lines truncation (adjusting the line map)
+    let (final_text, final_line_map) = if let Some(max_lines) = config.max_lines {
+        let truncated_text = truncate::truncate_to_lines(&text, &spans, language, max_lines)?;
+        // After truncation, the output has a subset of lines plus omission markers.
+        // Rebuild the line map: match output lines back to pre-truncation line map.
+        let final_line_map = reconcile_line_map_after_truncation(&text, &truncated_text, &line_map);
+        (truncated_text, final_line_map)
+    } else {
+        (text, line_map)
+    };
+
+    Ok((final_text, Some(final_line_map)))
+}
+
+/// Compute a source line map by matching output lines to source lines (text scan).
+///
+/// ARCHITECTURE: Used for Minimal and Pseudo modes where removed ranges leave
+/// verbatim sections of source in the output. Each output line is matched to
+/// the first unmatched source line with identical content.
+///
+/// This is a best-effort heuristic: if identical lines appear multiple times,
+/// the first unmatched occurrence is used. In practice this is correct for
+/// minimal/pseudo modes because lines are processed in source order.
+pub(crate) fn compute_line_map_by_text_matching(source: &str, output: &str) -> Vec<usize> {
+    let source_lines: Vec<&str> = source.lines().collect();
+    let output_lines: Vec<&str> = output.lines().collect();
+
+    // Track current position in source to maintain order
+    let mut source_pos = 0usize;
+    let mut result = Vec::with_capacity(output_lines.len());
+
+    for output_line in &output_lines {
+        // Search for this output line in source, starting from current position
+        let mut found = false;
+        for (offset, source_line) in source_lines[source_pos..].iter().enumerate() {
+            if *source_line == *output_line {
+                let source_line_num = source_pos + offset + 1; // 1-indexed
+                result.push(source_line_num);
+                source_pos = source_pos + offset + 1;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Line not found in remaining source (could be an omission marker)
+            result.push(0);
+        }
+    }
+
+    result
+}
+
+/// Reconcile source line map after AST-aware truncation.
+///
+/// After `truncate_to_lines`, the output may have omission markers inserted
+/// and some lines may be reordered or dropped. This function builds the final
+/// line map by matching each truncated output line back to the pre-truncation
+/// line map via text comparison.
+///
+/// Lines in the truncated output that match lines in the pre-truncation output
+/// get their source line from the pre-truncation map. Omission markers (not in
+/// the pre-truncation output) get source line 0.
+pub(crate) fn reconcile_line_map_after_truncation(
+    pre_trunc_text: &str,
+    truncated_text: &str,
+    pre_trunc_line_map: &[usize],
+) -> Vec<usize> {
+    let pre_lines: Vec<&str> = pre_trunc_text.lines().collect();
+    let trunc_lines: Vec<&str> = truncated_text.lines().collect();
+
+    // Build a lookup: line content -> list of (line_index, source_line_num) in pre-truncation
+    // Use a simple scan approach since truncation is rare (most files aren't truncated).
+    let mut result = Vec::with_capacity(trunc_lines.len());
+    let mut pre_used = vec![false; pre_lines.len()];
+
+    for trunc_line in &trunc_lines {
+        // Find the first unused matching line in pre-truncation output
+        let mut found = false;
+        for (idx, pre_line) in pre_lines.iter().enumerate() {
+            if !pre_used[idx] && pre_line == trunc_line {
+                let source_line = pre_trunc_line_map.get(idx).copied().unwrap_or(0);
+                result.push(source_line);
+                pre_used[idx] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Omission marker or line not in pre-truncation output
+            result.push(0);
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     // NOTE: Tests require parser implementation

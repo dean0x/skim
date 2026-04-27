@@ -63,13 +63,42 @@ pub(crate) fn transform_structure_with_spans(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &TransformConfig,
+    config: &TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
+    let (text, spans, _line_map) =
+        transform_structure_with_spans_and_line_map(source, tree, language, config)?;
+    Ok((text, spans))
+}
+
+/// Transform to structure-only, returning NodeSpan metadata AND a source line map.
+///
+/// The source line map maps each output line index to the 1-indexed source line
+/// number. For verbatim-copied regions, the source line is the original line number.
+/// The replacement `{ /* ... */ }` stays on the same line as the function signature
+/// (no newlines in the replacement), so no output line ever starts inside a
+/// replacement region — all output line starts are in verbatim-copied regions
+/// where the reverse offset mapping is exact.
+///
+/// # Design Decision (AC-18)
+/// Structure mode uses a byte-offset reverse mapping to determine which source line
+/// corresponds to each output line start byte. The `offset_map` (source_end_byte, delta)
+/// pairs allow reverse-mapping: output_byte = source_byte + delta, so
+/// source_byte = output_byte - delta. Binary search on the output byte position
+/// in the offset map gives the correct delta for any output line start.
+pub(crate) fn transform_structure_with_spans_and_line_map(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    _config: &TransformConfig,
+) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     // ARCHITECTURE: Markdown uses extraction, not replacement
     // Extract H1-H3 headers only (top-level document structure)
     if language == Language::Markdown {
         let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 3)?;
-        return Ok((text, spans));
+        let line_count = text.lines().count();
+        // For markdown, use identity map (extracted headers preserve source structure)
+        let line_map = (1..=line_count).collect();
+        return Ok((text, spans, line_map));
     }
 
     // Get language-specific node types
@@ -105,8 +134,11 @@ pub(crate) fn transform_structure_with_spans(
     sorted_replacements.sort_unstable_by_key(|(range, _)| range.0);
 
     // Track cumulative byte offset delta (output_pos - source_pos)
+    // offset_map entries: (source_end_byte, cumulative_delta)
+    // Invariant: for any output byte O in a verbatim region, source byte S = O - delta
+    //            where delta is the latest entry with source_end_byte <= S.
     let mut offset_delta: i64 = 0;
-    let mut offset_map: Vec<(usize, i64)> = Vec::new(); // (source_byte, delta)
+    let mut offset_map: Vec<(usize, i64)> = Vec::new(); // (source_byte_end, delta)
 
     for ((start, end), replacement) in sorted_replacements {
         // Validate byte ranges
@@ -166,7 +198,103 @@ pub(crate) fn transform_structure_with_spans(
     // Build NodeSpans from top-level AST children
     let spans = build_spans_from_top_level_nodes(tree, &result, &offset_map);
 
-    Ok((result, spans))
+    // Build source line map using offset_map to reverse-map output bytes to source lines
+    let source_line_map = compute_source_line_map_from_offset_map(source, &result, &offset_map);
+
+    Ok((result, spans, source_line_map))
+}
+
+/// Compute the source line map for structure mode output using the offset_map.
+///
+/// For each output line (by its start byte offset), reverse-maps to a source byte
+/// offset using the offset_map, then binary-searches source line starts to get
+/// the 1-indexed source line number.
+///
+/// # Correctness Invariant
+/// The replacement text `" { /* ... */ }"` contains no newlines. Therefore no
+/// output line ever starts inside a replacement region — all output line start
+/// bytes are in verbatim-copied regions where the reverse mapping is exact.
+pub(crate) fn compute_source_line_map_from_offset_map(
+    source: &str,
+    output: &str,
+    offset_map: &[(usize, i64)],
+) -> Vec<usize> {
+    // Pre-compute source line start byte offsets (0-indexed by line number)
+    let source_line_starts: Vec<usize> = std::iter::once(0)
+        .chain(source.char_indices().filter_map(|(i, c)| {
+            if c == '\n' {
+                Some(i + 1)
+            } else {
+                None
+            }
+        }))
+        .collect();
+
+    // Pre-compute output line start byte offsets
+    let output_line_starts: Vec<usize> = std::iter::once(0)
+        .chain(output.char_indices().filter_map(|(i, c)| {
+            if c == '\n' {
+                Some(i + 1)
+            } else {
+                None
+            }
+        }))
+        .collect();
+
+    let output_lines = output.lines().count();
+
+    // Build source_line_map: for each output line, find its 1-indexed source line
+    // We take only `output_lines` entries from output_line_starts since trailing
+    // newlines add a phantom entry.
+    output_line_starts
+        .iter()
+        .take(output_lines)
+        .map(|&output_byte| {
+            // Reverse-map: find the cumulative delta that applies at this output byte.
+            // The offset_map stores (source_end_byte, cumulative_delta_after_that_point).
+            // For a verbatim region output byte O, source byte S = O - delta.
+            // We find the last offset_map entry where the replacement has already been applied.
+            //
+            // Since output_byte = source_byte + delta (cumulative),
+            // source_byte = output_byte - delta.
+            // We need to find which delta applies at output_byte.
+            let delta = if offset_map.is_empty() {
+                0i64
+            } else {
+                // The offset_map is sorted by source_end_byte.
+                // We need the delta that applies to this output_byte region.
+                // For output bytes in the verbatim region after replacement N,
+                // delta = offset_map[N].1 (the cumulative delta after all replacements up to N).
+                // Find the last entry whose corresponding output end byte <= output_byte.
+                // The output_end_byte for entry (src_end, delta) is: src_end + delta.
+                let mut applicable_delta = 0i64;
+                for &(src_end, d) in offset_map {
+                    // The output byte corresponding to src_end is: src_end (as i64) + d
+                    // (d is the delta after this replacement, so output position of src_end
+                    //  would be src_end + d = src_end + (replacement_len - replaced_len) cumulative)
+                    // But we need to know: is this output_byte after this replacement's output end?
+                    // output_end_of_replacement = src_end (as i64) + d
+                    let output_end = src_end as i64 + d;
+                    if output_end as usize <= output_byte {
+                        applicable_delta = d;
+                    } else {
+                        break;
+                    }
+                }
+                applicable_delta
+            };
+
+            // source_byte = output_byte - delta (clamped to [0, source.len()])
+            let source_byte = (output_byte as i64 - delta).max(0) as usize;
+            let source_byte = source_byte.min(source.len());
+
+            // Binary search for the 1-indexed line number
+            match source_line_starts.binary_search(&source_byte) {
+                Ok(idx) => idx + 1,      // Exact match: this byte IS a line start
+                Err(idx) => idx.max(1),  // Inexact: line idx (1-indexed)
+            }
+        })
+        .collect()
 }
 
 /// Recursively collect body nodes that should be replaced

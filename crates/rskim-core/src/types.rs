@@ -247,6 +247,91 @@ impl Language {
 
         Ok((result, has_errors))
     }
+
+    /// Transform source code, returning `(content, has_errors, source_line_map)`.
+    ///
+    /// Extended version of `transform_source` that also returns a source line map
+    /// when `config.line_numbers` is true. The source line map maps each output
+    /// line index (0-based) to its 1-indexed source line number; value `0` indicates
+    /// an omission/truncation marker with no line number annotation.
+    ///
+    /// When `config.line_numbers` is false, `source_line_map` is `None`.
+    ///
+    /// # Serde-based languages
+    /// - Full mode: identity map
+    /// - Other modes: `None` (output is restructured, not a line-for-line mapping)
+    ///
+    /// # Passthrough (Full mode, all languages)
+    /// Always returns identity line map when `config.line_numbers` is true.
+    pub(crate) fn transform_source_with_line_map(
+        self,
+        source: &str,
+        config: &TransformConfig,
+    ) -> Result<(String, bool, Option<Vec<usize>>)> {
+        debug_assert!(
+            !(config.max_lines.is_some() && config.last_lines.is_some()),
+            "max_lines and last_lines are mutually exclusive"
+        );
+
+        // Passthrough: Full mode (all languages) or Minimal/Pseudo for
+        // serde-based and Markdown languages (no noise to strip).
+        let is_passthrough = config.mode == Mode::Full
+            || (matches!(config.mode, Mode::Minimal | Mode::Pseudo)
+                && (self.is_serde_based() || self == Self::Markdown));
+
+        if is_passthrough {
+            let text = source.to_string();
+            // Apply last_lines truncation for passthrough paths
+            let text = if let Some(n) = config.last_lines {
+                crate::transform::truncate::simple_last_line_truncate(&text, self, n)?
+            } else {
+                text
+            };
+            let line_map = if config.line_numbers {
+                // Full mode (passthrough): identity map
+                // For serde-based Minimal/Pseudo passthrough: also identity (source is output)
+                let n = text.lines().count();
+                Some((1..=n).collect::<Vec<usize>>())
+            } else {
+                None
+            };
+            return Ok((text, false, line_map));
+        }
+
+        // Serde-based non-full modes: restructured output, no meaningful source line map
+        let is_serde_non_full = self.is_serde_based() && config.mode != Mode::Full;
+        if is_serde_non_full {
+            let (result, has_errors) = self.transform_source(source, config)?;
+            return Ok((result, has_errors, None));
+        }
+
+        // Tree-sitter path (all non-serde languages in Structure/Signatures/Types/Minimal/Pseudo)
+        let mut parser = Parser::new(self)?;
+        let tree = parser.parse(source)?;
+        let parse_errors = tree.root_node().has_error();
+
+        let (result, line_map) =
+            crate::transform::transform_tree_with_line_map(source, &tree, self, config)?;
+
+        // Apply last_lines truncation as a post-processing step
+        let (result, line_map) = if let Some(n) = config.last_lines {
+            let truncated = crate::transform::truncate::simple_last_line_truncate(&result, self, n)?;
+            let final_map = if let Some(ref map) = line_map {
+                // Reconcile the line map after last_lines truncation
+                let reconciled = crate::transform::reconcile_line_map_after_truncation(
+                    &result, &truncated, map,
+                );
+                Some(reconciled)
+            } else {
+                None
+            };
+            (truncated, final_map)
+        } else {
+            (result, line_map)
+        };
+
+        Ok((result, parse_errors, line_map))
+    }
 }
 
 // ============================================================================
@@ -480,6 +565,20 @@ pub struct TransformConfig {
     ///
     /// When None, no last-lines truncation is applied.
     pub last_lines: Option<usize>,
+
+    /// Annotate output with source line numbers.
+    ///
+    /// ARCHITECTURE: Line number formatting is applied at the CLI layer (rskim binary),
+    /// not in the core library. This field is part of `TransformConfig` so it can be
+    /// included in the public API for `transform_with_line_map()`, but the core library
+    /// does NOT apply formatting — it only computes and returns the source line map.
+    ///
+    /// When `true`, `transform_with_line_map()` returns a `Some(Vec<usize>)` source line
+    /// map alongside the transformed text. The CLI applies `{line}\t{content}` formatting.
+    ///
+    /// When `false` (default), the source line map is `None` and no line number
+    /// computation is performed.
+    pub line_numbers: bool,
 }
 
 impl Default for TransformConfig {
@@ -490,6 +589,7 @@ impl Default for TransformConfig {
             cache_enabled: false,
             max_lines: None,
             last_lines: None,
+            line_numbers: false,
         }
     }
 }
@@ -530,6 +630,16 @@ impl TransformConfig {
     /// language-appropriate truncation marker.
     pub fn with_last_lines(mut self, n: usize) -> Self {
         self.last_lines = Some(n);
+        self
+    }
+
+    /// Builder: Enable source line number annotation.
+    ///
+    /// When enabled, `transform_with_line_map()` returns a source line map
+    /// alongside the transformed text. The CLI applies `{line}\t{content}`
+    /// formatting.
+    pub fn with_line_numbers(mut self, enabled: bool) -> Self {
+        self.line_numbers = enabled;
         self
     }
 }

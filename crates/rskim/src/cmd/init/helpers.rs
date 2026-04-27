@@ -147,8 +147,9 @@ shell commands. For explicit use, call `skim` via Bash (or `rskim`).
 ### What skim shows
 
 Skim strips function/method bodies and preserves structure, signatures, types,
-and doc comments. Output has **no line numbers**. It shows *what exists* in a
-file — not *how it works*.
+and doc comments. It shows *what exists* in a file — not *how it works*.
+Use `-n` / `--line-numbers` to annotate each output line with its original
+source line number (tab-separated: `{{line}}\t{{content}}`).
 
 ### Choose ONE tool per file
 
@@ -161,23 +162,25 @@ Before touching a file, decide your intent — then use the right tool once.
 | **Find the right file** — narrowing candidates | `skim 'src/**/*.ts'` | Peeks inside each file cheaply. Use ls/Glob first if names suffice |
 | **API surface** — "what can I call?" | `skim --mode=signatures` | Function/method signatures only |
 | **Understand logic** — "how does X work?" | Read (targeted range) | Skim strips the bodies you need |
-| **Edit a file** — you will modify it | Read (section to edit) | Need exact lines + line numbers for Edit |
+| **Edit a file** — you will modify it | `skim -n <file>` then Read (section) | `-n` gives source line numbers; Read only the section you need |
 | **Debug/trace** — following control flow | Read (targeted range) | Implementation details matter |
 
 ### Anti-pattern: skim then Read the same file
 
-**Never skim a file and then Read the same file.** This wastes more tokens than
-either tool alone. Pick one:
-- If you might need bodies or line numbers → skip skim, go straight to Read.
+**Avoid skimming a file and then Reading the same file** unless `-n` is involved.
+This wastes more tokens than either tool alone. Pick one:
+- If you need bodies but not line numbers → go straight to Read.
 - If you only need structure/signatures → skim it and move on.
+- If you need structure AND line numbers for editing → `skim -n <file>`, then Read only the narrow range you will modify.
 
-The only valid skim→Read sequence is across **different files**: skim a directory
-to find the right file, then Read that one file.
+The only valid skim→Read sequence without `-n` is across **different files**:
+skim a directory to find the right file, then Read that one file.
 
 ### Quick Reference
 
 ```
 skim <file>                    # structural overview (strips bodies)
+skim -n <file>                 # structural overview with source line numbers
 skim <file> --mode=signatures  # function/method signatures only
 skim 'src/**/*.ts'             # multi-file scan
 ```

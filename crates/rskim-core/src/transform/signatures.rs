@@ -55,9 +55,33 @@ pub(crate) fn transform_signatures_with_spans(
     language: Language,
     _config: &crate::TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
+    let (text, spans, _line_map) =
+        transform_signatures_with_spans_and_line_map(source, tree, language)?;
+    Ok((text, spans))
+}
+
+/// Transform to signatures-only, returning NodeSpan metadata AND a source line map.
+///
+/// The source line map maps each output line index to the 1-indexed source line
+/// where that signature begins. Multi-line signatures map all their output lines
+/// to consecutive source lines starting from the signature's start line.
+///
+/// # Design Decision (AC-18)
+/// Signatures mode uses `node.start_position().row + 1` to annotate each
+/// signature with its source line. Multi-line signatures get consecutive
+/// source line numbers from their start line.
+pub(crate) fn transform_signatures_with_spans_and_line_map(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     // ARCHITECTURE: Markdown signatures mode extracts ALL headers (H1-H6)
     if language == Language::Markdown {
-        return extract_markdown_headers_with_spans(source, tree, 1, 6);
+        let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 6)?;
+        let line_count = text.lines().count();
+        // For markdown, use identity map (headers are extracted with their source structure)
+        let line_map = (1..=line_count).collect();
+        return Ok((text, spans, line_map));
     }
 
     // ARCHITECTURE: JSON is handled by Strategy Pattern in Language::transform_source()
@@ -69,8 +93,14 @@ pub(crate) fn transform_signatures_with_spans(
         ))
     })?;
 
-    let mut signatures: Vec<(String, &'static str)> = Vec::new();
-    collect_signatures_with_kinds(tree.root_node(), source, &node_types, &mut signatures, 0)?;
+    let mut signatures: Vec<(String, &'static str, usize)> = Vec::new();
+    collect_signatures_with_kinds_and_lines(
+        tree.root_node(),
+        source,
+        &node_types,
+        &mut signatures,
+        0,
+    )?;
 
     // Check signature count limit
     if signatures.len() > MAX_SIGNATURES {
@@ -81,29 +111,39 @@ pub(crate) fn transform_signatures_with_spans(
         )));
     }
 
-    // Build text and spans, tracking line offsets
+    // Build text, spans, and source line map
     let mut spans = Vec::with_capacity(signatures.len());
-    let mut current_line = 0;
+    let mut source_line_map: Vec<usize> = Vec::new();
+    let mut current_output_line = 0;
 
     let texts: Vec<String> = signatures
         .into_iter()
-        .map(|(sig, kind)| {
+        .map(|(sig, kind, source_start_line)| {
             let line_count = sig.lines().count().max(1);
-            spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
-            current_line += line_count;
+            spans.push(NodeSpan::new(
+                current_output_line..current_output_line + line_count,
+                kind,
+            ));
+            // Map each output line to consecutive source lines from source_start_line
+            for i in 0..line_count {
+                source_line_map.push(source_start_line + i);
+            }
+            current_output_line += line_count;
             sig
         })
         .collect();
 
-    Ok((texts.join("\n"), spans))
+    Ok((texts.join("\n"), spans, source_line_map))
 }
 
-/// Recursively collect function/method signatures with their node kind
-fn collect_signatures_with_kinds(
+/// Recursively collect function/method signatures with node kind AND source start line.
+///
+/// The source start line is `node.start_position().row + 1` (1-indexed).
+fn collect_signatures_with_kinds_and_lines(
     node: Node,
     source: &str,
     node_types: &SignatureNodeTypes,
-    signatures: &mut Vec<(String, &'static str)>,
+    signatures: &mut Vec<(String, &'static str, usize)>,
     depth: usize,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested or malicious input
@@ -119,13 +159,21 @@ fn collect_signatures_with_kinds(
     if is_signature_node(kind, node_types) {
         if let Some(sig) = extract_signature(node, source, node_types)? {
             let static_kind = to_static_node_kind(kind);
-            signatures.push((sig, static_kind));
+            // 1-indexed source line where this signature starts
+            let source_start_line = node.start_position().row + 1;
+            signatures.push((sig, static_kind, source_start_line));
         }
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_signatures_with_kinds(child, source, node_types, signatures, depth + 1)?;
+        collect_signatures_with_kinds_and_lines(
+            child,
+            source,
+            node_types,
+            signatures,
+            depth + 1,
+        )?;
     }
 
     Ok(())

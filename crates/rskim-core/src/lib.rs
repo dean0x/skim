@@ -155,6 +155,54 @@ pub fn transform_with_quality(
     language.transform_source(source, config)
 }
 
+/// Transform source code and return content, parse quality flag, and source line map.
+///
+/// Like `transform_with_quality` but also returns a source line map when
+/// `config.line_numbers` is true. The source line map maps each output line index
+/// (0-based) to its 1-indexed source line number. A value of `0` in the map
+/// indicates an omission/truncation marker with no line number annotation.
+///
+/// When `config.line_numbers` is false, `source_line_map` is `None`.
+///
+/// # Source Line Map Semantics
+///
+/// - **Full mode**: identity map — output line N maps to source line N
+/// - **Structure mode**: verbatim-copied lines map to their source line;
+///   the `{ /* ... */ }` replacement stays on the function signature line
+/// - **Signatures mode**: each signature's output lines map to consecutive
+///   source lines starting from `node.start_position().row + 1`
+/// - **Types mode**: same as signatures mode
+/// - **Minimal mode**: heuristic text-matching to source lines
+/// - **Pseudo mode**: heuristic text-matching to source lines
+/// - **Serde-based (JSON/YAML/TOML) non-full modes**: `None` (restructured output)
+///
+/// # CLI Integration
+///
+/// The CLI (`rskim` binary) uses this function to obtain the line map, then formats
+/// the output as `{source_line}\t{content}` for lines with non-zero map values.
+/// See `crates/rskim/src/format.rs` for the formatting function.
+///
+/// # Examples
+///
+/// ```no_run
+/// use rskim_core::{transform_with_line_map, Language, Mode, TransformConfig};
+///
+/// let config = TransformConfig::with_mode(Mode::Full).with_line_numbers(true);
+/// let (content, has_errors, line_map) =
+///     transform_with_line_map("fn main() {}\nfn foo() {}", Language::Rust, &config)?;
+/// let map = line_map.unwrap();
+/// assert_eq!(map[0], 1); // First output line → source line 1
+/// assert_eq!(map[1], 2); // Second output line → source line 2
+/// # Ok::<(), rskim_core::SkimError>(())
+/// ```
+pub fn transform_with_line_map(
+    source: &str,
+    language: Language,
+    config: &TransformConfig,
+) -> Result<(String, bool, Option<Vec<usize>>)> {
+    language.transform_source_with_line_map(source, config)
+}
+
 /// Transform source code with automatic language detection from file path
 ///
 /// Convenience function that detects language from file extension.
