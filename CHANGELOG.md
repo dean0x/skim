@@ -17,6 +17,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+## [2.6.0] - 2026-04-27
+
+Terminal UX overhaul, non-interactive init, plugin ecosystem removal. 2,883 tests passing (up from 2,800 in v2.5.1).
+
+### Added
+- `--no-truncate` flag for `discover` and `learn` subcommands — disables terminal-width-aware table truncation (#154)
+- Terminal UX primitives (`cmd/ux.rs`): `with_spinner` closure helper, `print_indented_table`, comfy-table formatting, colored output across `discover`, `learn`, `agents`, `init` (#153)
+- Responsive table truncation — auto-detect terminal width, truncate wide columns to fit viewport, graceful fallback for non-TTY (#154)
+
+### Changed
+- `skim init` install is always non-interactive — removed scope/marketplace prompts and confirmation; `--yes` still accepted for backward compatibility (#151)
+- Hook scripts use bare `exec skim rewrite --hook` (PATH-resolved) instead of hardcoded absolute binary paths — eliminates "unknown git subcommand" failures after npm upgrades (#151)
+- Format-aware idempotency — old-format hooks with absolute paths are detected and force-regenerated even when version matches (#151)
+- Stats dashboard shows savings percentage only once (on bar line), not redundantly next to token count (#153)
+
+### Fixed
+- Hook script absolute path failures after upgrading skim via npm (#151)
+
+### Removed
+- Plugin ecosystem — `.claude-plugin/` directory, `plugins/skimmer/` directory, `.github/workflows/sync-skimmer-plugin.yml` CI workflow, marketplace registration from init state (#153)
+- `validate_shell_safe_path()`, `SHELL_UNSAFE_CHARS`, and 12 associated tests — attack surface no longer exists with bare command approach (#151)
+- `prompt_choice()` helper (dead code after non-interactive install change) (#151)
+
+### Testing
+- 2,883 tests passing (up from 2,800 in v2.5.1)
+
 ## [2.5.1] - 2026-04-20
 
 Hook safety and command coverage gaps — SKIM_PASSTHROUGH bypass, npx fallback, tiered test compression, 5 new parsers, streaming primitive. 2,800 tests passing (up from 2,629 in v2.5.0).
@@ -798,6 +824,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.6.0** (2026-04-27): Terminal UX overhaul, non-interactive init, plugin ecosystem removal (2,883 tests)
 - **2.5.1** (2026-04-20): Hook safety, SKIM_PASSTHROUGH bypass, npx fallback, 5 new parsers (2,800 tests)
 - **2.5.0** (2026-04-17): Formatter output compression, 8 new lint parsers (2,629 tests)
 - **2.4.1** (2026-04-15): Stats dashboard redesign, weighted %, by-command breakdown, --cost deprecation (2,482 tests)
