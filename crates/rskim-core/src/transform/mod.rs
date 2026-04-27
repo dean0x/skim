@@ -146,11 +146,11 @@ pub(crate) fn transform_tree_with_line_map(
             (text, spans, line_map)
         }
         Mode::Pseudo => {
-            // Pseudo mode: compute line map by text matching after transform
-            let (text, spans) =
-                pseudo::transform_pseudo_with_spans(source, tree, language, config)?;
-            let line_map = compute_line_map_by_text_matching(source, &text);
-            (text, spans, line_map)
+            // Pseudo mode: compute line map from byte-level removal ranges.
+            // Text matching fails here because pseudo mode modifies lines (e.g.,
+            // `def f(a: int) -> int:` → `def f(a):`) so the output line is not
+            // verbatim in the source.
+            pseudo::transform_pseudo_with_spans_and_line_map(source, tree, language, config)?
         }
     };
 
@@ -201,6 +201,123 @@ pub(crate) fn compute_line_map_by_text_matching(source: &str, output: &str) -> V
             // Line not found in remaining source (could be an omission marker)
             result.push(0);
         }
+    }
+
+    result
+}
+
+/// Compute a source line map from sorted byte ranges removed from source.
+///
+/// ARCHITECTURE: Used by pseudo mode where removed ranges can *partially modify*
+/// a line (e.g., `def f(a: int) -> int:` → `def f(a):`). Text matching cannot
+/// find such lines in source because their content differs.
+///
+/// This function walks the source bytes, skipping removed ranges, and for each
+/// newline that appears in the resulting output, records which source line we
+/// were on when the output line started. The first byte contributed to an output
+/// line determines its source line number (1-indexed). Source lines that are
+/// removed entirely produce no output lines.
+///
+/// The ranges must be sorted (ascending by start byte) and non-overlapping.
+pub(crate) fn compute_line_map_from_removed_ranges(
+    source: &str,
+    ranges: &[(usize, usize)],
+) -> Vec<usize> {
+    let source_bytes = source.as_bytes();
+    let total_bytes = source.len();
+
+    // Precompute 1-indexed source line number for each byte position.
+    // source_line_at[i] = line number of byte i.
+    let mut source_line_at = vec![1usize; total_bytes.saturating_add(1)];
+    let mut current_line = 1usize;
+    for (i, &b) in source_bytes.iter().enumerate() {
+        source_line_at[i] = current_line;
+        if b == b'\n' {
+            current_line += 1;
+        }
+    }
+    // Byte past end (for edge cases)
+    if let Some(last) = source_line_at.last_mut() {
+        *last = current_line;
+    }
+
+    let mut result: Vec<usize> = Vec::new();
+    // Source line number for the current (not-yet-emitted) output line.
+    // None = no bytes have been contributed to the current output line yet.
+    let mut current_output_source_line: Option<usize> = None;
+
+    let mut range_idx = 0usize;
+    let mut pos = 0usize;
+
+    while pos < total_bytes {
+        // Advance past any removed range that covers the current position.
+        while range_idx < ranges.len() && pos >= ranges[range_idx].0 {
+            let range_end = ranges[range_idx].1;
+            range_idx += 1;
+            if range_end > pos {
+                pos = range_end;
+            }
+        }
+        if pos >= total_bytes {
+            break;
+        }
+
+        let byte = source_bytes[pos];
+        let src_line = source_line_at[pos];
+
+        // Record the source line for this output line on the first byte.
+        if current_output_source_line.is_none() {
+            current_output_source_line = Some(src_line);
+        }
+
+        if byte == b'\n' {
+            // A newline in the output ends the current output line.
+            result.push(current_output_source_line.unwrap_or(src_line));
+            current_output_source_line = None;
+        }
+
+        pos += 1;
+    }
+
+    // Handle a final line with no trailing newline.
+    if let Some(src_line) = current_output_source_line {
+        result.push(src_line);
+    }
+
+    result
+}
+
+/// Normalize a line map to match `trim_and_normalize`'s blank-line dropping.
+///
+/// `trim_and_normalize` drops output lines when there are 3+ consecutive blank
+/// lines (keeping at most 2). The line map computed from byte ranges has one
+/// entry per line in the intermediate output (after `remove_ranges` and
+/// `collapse_whitespace`, before `trim_and_normalize`). This function replays
+/// the same blank-line dropping logic over the line map to keep it in sync.
+///
+/// `pre_normalized_text` is the intermediate text (after `collapse_whitespace`,
+/// before `trim_and_normalize`). `line_map` has the same length as the number
+/// of lines in `pre_normalized_text`. Returns a filtered line map that matches
+/// the final post-normalized output.
+pub(crate) fn normalize_line_map_blanks(
+    pre_normalized_text: &str,
+    line_map: Vec<usize>,
+) -> Vec<usize> {
+    let mut result = Vec::with_capacity(line_map.len());
+    let mut consecutive_blanks: usize = 0;
+
+    for (line, &src_line) in pre_normalized_text.lines().zip(line_map.iter()) {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            consecutive_blanks += 1;
+            if consecutive_blanks > 2 {
+                // trim_and_normalize drops this line — skip it in the map too.
+                continue;
+            }
+        } else {
+            consecutive_blanks = 0;
+        }
+        result.push(src_line);
     }
 
     result
@@ -380,5 +497,134 @@ mod tests {
         // "y" found at index 1 → 20, cursor advances to 2
         // "z" found at index 2 → 30
         assert_eq!(result, vec![0, 20, 30]);
+    }
+
+    // ========================================================================
+    // compute_line_map_from_removed_ranges
+    // ========================================================================
+
+    #[test]
+    fn test_from_ranges_identity_no_ranges() {
+        // No ranges removed: each output line maps to its source line.
+        let source = "aaa\nbbb\nccc\n";
+        let map = compute_line_map_from_removed_ranges(source, &[]);
+        assert_eq!(map, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_from_ranges_whole_line_removed() {
+        // Remove the middle line entirely (including its newline).
+        // source: "aaa\nbbb\nccc\n"
+        // ranges: remove bytes 4..8 ("bbb\n")
+        let source = "aaa\nbbb\nccc\n";
+        let ranges = [(4, 8)]; // removes "bbb\n"
+        let map = compute_line_map_from_removed_ranges(source, &ranges);
+        // Output: "aaa\nccc\n" → lines [aaa, ccc]
+        // "aaa" starts at source line 1; "ccc" starts at source line 3
+        assert_eq!(map, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_from_ranges_inline_range_removed() {
+        // Remove only part of a line (inline modification).
+        // source: "def foo(a: int):\n    pass\n"
+        // Remove ": int" (bytes 9..15) from the first line → "def foo(a):\n"
+        let source = "def foo(a: int):\n    pass\n";
+        let colon_int = source.find(": int").unwrap();
+        let ranges = [(colon_int, colon_int + ": int".len())];
+        let map = compute_line_map_from_removed_ranges(source, &ranges);
+        // Output: "def foo(a):\n    pass\n" → lines [def foo(a):, "    pass"]
+        // Both output lines originate from their respective source lines.
+        assert_eq!(map, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_from_ranges_modified_def_line_maps_to_correct_source_line() {
+        // Regression test for the pseudo-mode bug: a `def` line whose type
+        // annotations are stripped still maps to its original source line.
+        //
+        // source (4 lines):
+        //   1: def foo(a: int) -> str:\n
+        //   2:     return str(a)\n
+        //   3: def bar(b: str) -> int:\n
+        //   4:     return len(b)\n
+        let source = "def foo(a: int) -> str:\n    return str(a)\ndef bar(b: str) -> int:\n    return len(b)\n";
+        //
+        // Simulate removing `: int` (bytes 9..14) and ` -> str` (bytes 14..22)
+        // from the first def line, and `: str` (bytes ?) and ` -> int` from the
+        // third def line. Rather than computing exact byte offsets, use a simple
+        // helper: remove ranges [9..14] and [14..22] from line 1.
+        //
+        // For this test we just verify that the first output line maps to source
+        // line 1, even after inline removal (which text-matching would fail).
+        let source_bytes = source.as_bytes();
+        // `: int` starts after "def foo(a"
+        let a_end = 9usize; // byte after 'a'
+        let colon_int_end = a_end + ": int".len(); // 14
+        let arrow_start = colon_int_end; // " -> str" starts at 14
+        let arrow_end = arrow_start + " -> str".len(); // 21
+                                                       // ranges remove ": int" and " -> str", producing "def foo(a):"
+        let ranges = [(a_end, colon_int_end), (arrow_start, arrow_end)];
+        let _ = source_bytes; // suppress unused warning
+        let map = compute_line_map_from_removed_ranges(source, &ranges);
+        // First output line ("def foo(a):...") must map to source line 1.
+        assert_eq!(
+            map[0], 1,
+            "Modified def line must map to source line 1, not 0. Got map: {:?}",
+            map
+        );
+        // Body lines on source lines 2 and 4 must also be correct.
+        assert_eq!(
+            map[1], 2,
+            "return str(a) must map to source line 2. Got map: {:?}",
+            map
+        );
+    }
+
+    #[test]
+    fn test_from_ranges_empty_source() {
+        let map = compute_line_map_from_removed_ranges("", &[]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_from_ranges_no_trailing_newline() {
+        // Source without trailing newline: last line still gets an entry.
+        let source = "aaa\nbbb";
+        let map = compute_line_map_from_removed_ranges(source, &[]);
+        assert_eq!(map, vec![1, 2]);
+    }
+
+    // ========================================================================
+    // normalize_line_map_blanks
+    // ========================================================================
+
+    #[test]
+    fn test_normalize_line_map_no_excess_blanks() {
+        // Fast path: counts already match (no 3+ blank runs).
+        let text = "a\n\nb\n";
+        let line_map = vec![1, 2, 3];
+        let result = normalize_line_map_blanks(text, line_map.clone());
+        assert_eq!(result, line_map);
+    }
+
+    #[test]
+    fn test_normalize_line_map_drops_third_blank() {
+        // Three consecutive blank lines: the third and beyond should be dropped.
+        // pre_normalized_text has 3 blank lines in a row.
+        let text = "a\n\n\n\nb\n";
+        // line_map before normalization: a=1, blank=2, blank=3, blank=4, b=5
+        let line_map = vec![1, 2, 3, 4, 5];
+        let result = normalize_line_map_blanks(text, line_map);
+        // trim_and_normalize keeps at most 2 consecutive blanks:
+        // a(keep) blank(keep,1) blank(keep,2) blank(DROP,3) b(keep)
+        // → [1, 2, 3, 5] (source lines for kept lines)
+        assert_eq!(result, vec![1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn test_normalize_line_map_empty() {
+        let result = normalize_line_map_blanks("", vec![]);
+        assert!(result.is_empty());
     }
 }

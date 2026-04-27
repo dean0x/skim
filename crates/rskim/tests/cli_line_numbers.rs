@@ -748,6 +748,87 @@ fn test_line_numbers_pseudo_mode_gaps() {
 }
 
 // ============================================================================
+// Regression: pseudo mode `def` signature lines missing line-number prefix
+//
+// BUG: When pseudo mode strips type annotations from a Python `def` line
+// (e.g. `def f(a: int) -> int:` → `def f(a):`), the output line differs from
+// the source line. The old text-matching approach failed to find it in source
+// and returned source_line=0, which suppresses the line-number prefix.
+//
+// FIX: Use byte-range-based line mapping instead of text matching, so that
+// any modified line still maps to its originating source line number.
+// ============================================================================
+
+#[test]
+fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
+    // Four-line file: def lines are on source lines 1 and 3.
+    // Pseudo mode strips type annotations so the output `def` lines differ from
+    // source. Before the fix, source_line=0 suppressed their prefix.
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("test.py");
+    // Line 1: def foo(a: int) -> str:   (annotations stripped → `def foo(a):`)
+    // Line 2:     return str(a)
+    // Line 3: def bar(b: str) -> int:   (annotations stripped → `def bar(b):`)
+    // Line 4:     return len(b)
+    std::fs::write(
+        &file,
+        "def foo(a: int) -> str:\n    return str(a)\ndef bar(b: str) -> int:\n    return len(b)\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--line-numbers")
+        .arg("--mode=pseudo")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Helper: parse `{num}\t{content}` → Some((num, content_string)), or None.
+    let parse_annotated = |s: &str| -> Option<(usize, String)> {
+        let mut parts = s.splitn(2, '\t');
+        let num_str = parts.next()?;
+        let content = parts.next()?;
+        Some((num_str.parse::<usize>().ok()?, content.to_owned()))
+    };
+
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // Find the def lines in the output (pseudo output strips type annotations).
+    let foo_line = lines
+        .iter()
+        .find(|&&l| l.contains("def foo(a)"))
+        .copied()
+        .unwrap_or("");
+    let bar_line = lines
+        .iter()
+        .find(|&&l| l.contains("def bar(b)"))
+        .copied()
+        .unwrap_or("");
+
+    let foo_annotated = parse_annotated(foo_line);
+    let bar_annotated = parse_annotated(bar_line);
+
+    assert_eq!(
+        foo_annotated,
+        Some((1, "def foo(a):".to_owned())),
+        "`def foo(a):` must carry source line 1 prefix. \
+         Before fix it had no prefix (source_line=0). Got: {:?}",
+        foo_line
+    );
+    assert_eq!(
+        bar_annotated,
+        Some((3, "def bar(b):".to_owned())),
+        "`def bar(b):` must carry source line 3 prefix. \
+         Before fix it had no prefix (source_line=0). Got: {:?}",
+        bar_line
+    );
+}
+
+// ============================================================================
 // AC-7: Minimal mode — gaps in line numbering for removed comment lines
 // ============================================================================
 

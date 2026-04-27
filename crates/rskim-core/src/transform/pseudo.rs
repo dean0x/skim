@@ -14,6 +14,7 @@ use super::minimal::{
     adjust_range_for_line_removal, is_removable_comment, remove_ranges, trim_and_normalize,
     MAX_AST_DEPTH, MAX_AST_NODES,
 };
+use super::{compute_line_map_from_removed_ranges, normalize_line_map_blanks};
 
 /// Bundled parameters for the recursive noise walker to avoid parameter explosion
 struct NoiseWalkContext<'a> {
@@ -248,8 +249,33 @@ pub(crate) fn transform_pseudo_with_spans(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &TransformConfig,
+    config: &TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
+    let (text, spans, _line_map) =
+        transform_pseudo_with_spans_and_line_map(source, tree, language, config)?;
+    Ok((text, spans))
+}
+
+/// Transform source by stripping syntactic noise, returning NodeSpan metadata AND a source line map.
+///
+/// ARCHITECTURE: The line map is computed from the byte-level removal ranges rather
+/// than by text matching. Text matching fails for lines that are *partially* modified
+/// (e.g., `def f(a: int) -> int:` → `def f(a):`) because the output line does not
+/// appear verbatim in the source.
+///
+/// The byte-range approach works for any mutation: after all ranges are removed,
+/// each output byte can be traced back to its source byte, and therefore to its
+/// source line number. The post-processing steps (`collapse_whitespace`,
+/// `trim_and_normalize`) operate within lines without changing line-to-source
+/// correspondence — except that `trim_and_normalize` drops lines when there are
+/// 3+ consecutive blank lines. `normalize_line_map_blanks` mirrors that step on
+/// the line map.
+pub(crate) fn transform_pseudo_with_spans_and_line_map(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    _config: &TransformConfig,
+) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     let rules = get_pseudo_rules(language);
 
     // Single-pass collection: comments AND noise ranges in one AST walk
@@ -277,17 +303,32 @@ pub(crate) fn transform_pseudo_with_spans(
     // Re-sort after adjustment (line-level adjustments can change ordering)
     final_ranges.sort_unstable_by_key(|&(start, _)| start);
 
+    // Compute the source line map from the byte-level removal ranges.
+    // Must be done before remove_ranges, using the ranges themselves, so that
+    // modified lines (e.g. `def f(a: int):` → `def f(a):`) still map to their
+    // correct source line rather than getting source_line=0 from text matching.
+    let line_map_after_removal = compute_line_map_from_removed_ranges(source, &final_ranges);
+
     let result = remove_ranges(source, &final_ranges)?;
 
-    // Post-process — collapse whitespace artifacts and normalize
+    // Post-process — collapse whitespace artifacts and normalize.
+    // collapse_whitespace is line-count-preserving (works within lines only).
     let result = collapse_whitespace(&result);
-    let result = trim_and_normalize(&result);
+    // trim_and_normalize may drop lines when there are 3+ consecutive blanks.
+    // Capture the text before that step so normalize_line_map_blanks can replay
+    // the same logic to keep the line map in sync.
+    let pre_normalized = result;
+    let result = trim_and_normalize(&pre_normalized);
+
+    // Mirror trim_and_normalize's blank-line dropping on the line map so the
+    // two stay in sync (3+ consecutive blank lines → drop beyond 2).
+    let line_map = normalize_line_map_blanks(&pre_normalized, line_map_after_removal);
 
     // Build spans (single source_file span for truncation compatibility)
     let line_count = result.lines().count();
     let spans = vec![NodeSpan::new(0..line_count, "source_file")];
 
-    Ok((result, spans))
+    Ok((result, spans, line_map))
 }
 
 /// Collapse whitespace artifacts from inline removal:
