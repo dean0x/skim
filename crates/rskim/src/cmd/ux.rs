@@ -176,6 +176,19 @@ pub(crate) fn column_budget(term_width: u16, overhead: usize) -> usize {
     (term_width as usize).saturating_sub(overhead)
 }
 
+/// Resolve the terminal width for truncation-aware rendering.
+///
+/// When `no_truncate` is `true` returns `0`, which is the no-op sentinel
+/// accepted by `column_budget` and `print_indented_table`. Otherwise returns
+/// the current terminal width via `terminal_width()`.
+///
+/// Centralising this decision eliminates the duplicated
+/// `if config.no_truncate { 0 } else { terminal_width() }` pattern in
+/// discover and learn (S2).
+pub(crate) fn resolve_term_width(no_truncate: bool) -> u16 {
+    if no_truncate { 0 } else { terminal_width() }
+}
+
 /// Print a comfy-table to stdout with each line indented by `indent` spaces.
 ///
 /// Centralises the "indent every line of the table" pattern used by discover
@@ -189,7 +202,7 @@ pub(crate) fn column_budget(term_width: u16, overhead: usize) -> usize {
 /// no width constraint is applied and the table expands to its natural width.
 pub(crate) fn print_indented_table(table: &mut comfy_table::Table, indent: usize, term_width: u16) {
     if term_width > 0 {
-        let available = term_width.saturating_sub(indent as u16);
+        let available = term_width.saturating_sub(u16::try_from(indent).unwrap_or(u16::MAX));
         table.set_width(available);
     }
     let prefix = " ".repeat(indent);
@@ -399,5 +412,37 @@ mod tests {
     fn test_terminal_width_returns_positive() {
         // terminal_width always returns a positive value (at least the 80-col fallback).
         assert!(terminal_width() > 0);
+    }
+
+    // --- resolve_term_width ---
+
+    #[test]
+    fn test_resolve_term_width_no_truncate_returns_zero() {
+        // no_truncate=true must return the no-op sentinel 0.
+        assert_eq!(resolve_term_width(true), 0);
+    }
+
+    #[test]
+    fn test_resolve_term_width_truncation_enabled_returns_positive() {
+        // no_truncate=false defers to terminal_width(), which always returns > 0.
+        assert!(resolve_term_width(false) > 0);
+    }
+
+    // --- print_indented_table indent clamping ---
+
+    #[test]
+    fn test_print_indented_table_large_indent_does_not_overflow() {
+        // Indents larger than u16::MAX used to silently truncate via `as u16`.
+        // u16::try_from(indent).unwrap_or(u16::MAX) clamps instead; with a
+        // term_width of u16::MAX the result is 0 (saturating_sub), which means
+        // no width constraint — the table must render without panicking.
+        //
+        // Use u16::MAX + 1 to trigger the clamping path without
+        // allocating a prohibitively large prefix string.
+        let mut table = comfy_table::Table::new();
+        table.set_header(["A", "B"]);
+        table.add_row(["foo", "bar"]);
+        let large_indent = u16::MAX as usize + 1;
+        print_indented_table(&mut table, large_indent, u16::MAX);
     }
 }

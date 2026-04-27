@@ -800,13 +800,9 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &
         println!();
     }
 
-    // Compute terminal width once. When no_truncate is set, pass 0 so that
-    // column_budget() and print_indented_table() treat it as a no-op sentinel.
-    let term_width: u16 = if config.no_truncate {
-        0
-    } else {
-        crate::cmd::ux::terminal_width()
-    };
+    // Compute terminal width once. Returns 0 when no_truncate is set, which
+    // is the no-op sentinel for column_budget() and print_indented_table().
+    let term_width: u16 = crate::cmd::ux::resolve_term_width(config.no_truncate);
 
     // Truncation: 6-column table with fixed-width prefix columns.
     // Fixed columns: #(~3), Pattern(~12), Seen(~5) = ~20 chars

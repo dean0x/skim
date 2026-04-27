@@ -317,14 +317,10 @@ fn print_text_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) {
     println!();
 
     // Compute terminal width once to avoid redundant ioctl syscalls in
-    // section functions and print_indented_table. When no_truncate is set,
-    // pass 0 so that column_budget() and print_indented_table() treat it as
-    // a no-op sentinel.
-    let term_width: u16 = if config.no_truncate {
-        0
-    } else {
-        crate::cmd::ux::terminal_width()
-    };
+    // section functions and print_indented_table. Returns 0 when no_truncate
+    // is set, which is the no-op sentinel for column_budget() and
+    // print_indented_table().
+    let term_width: u16 = crate::cmd::ux::resolve_term_width(config.no_truncate);
 
     print_code_reads_section(analysis, term_width);
     print_commands_section(analysis, config.debug, term_width);
@@ -434,8 +430,8 @@ fn print_commands_section(analysis: &DiscoverAnalysis, debug: bool, term_width: 
             if seen.insert(prefix.clone()) {
                 let rewrite_raw = cmd.rewrite_target.as_deref().unwrap_or("skim equivalent");
                 table.add_row(vec![
-                    crate::cmd::ux::truncate_str(&prefix, cmd_max),
-                    crate::cmd::ux::truncate_str(rewrite_raw, rewrite_max),
+                    crate::cmd::ux::truncate_str(&prefix, cmd_max).as_ref(),
+                    crate::cmd::ux::truncate_str(rewrite_raw, rewrite_max).as_ref(),
                 ]);
             }
         }
