@@ -23,11 +23,7 @@ fn skim_cmd() -> Command {
 fn test_line_numbers_flag_long_form() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.ts");
-    std::fs::write(
-        &file,
-        "import { foo } from 'bar';\ntype UserId = string;\n",
-    )
-    .unwrap();
+    std::fs::write(&file, "import { foo } from 'bar';\ntype UserId = string;\n").unwrap();
 
     let output = skim_cmd()
         .arg(file.to_str().unwrap())
@@ -89,9 +85,7 @@ fn test_line_numbers_tab_separated_no_fixed_width() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.ts");
     // Write 12 lines so we can check that line 10 is not space-padded
-    let content: String = (1..=12)
-        .map(|i| format!("const x{i} = {i};\n"))
-        .collect();
+    let content: String = (1..=12).map(|i| format!("const x{i} = {i};\n")).collect();
     std::fs::write(&file, &content).unwrap();
 
     let output = skim_cmd()
@@ -190,9 +184,7 @@ fn test_line_numbers_structure_mode_skips_body_lines() {
             // The body replacement line should still have a number
             let parts: Vec<&str> = line.splitn(2, '\t').collect();
             if parts.len() == 2 {
-                let num: usize = parts[0]
-                    .parse()
-                    .expect("Line number should parse as usize");
+                let num: usize = parts[0].parse().expect("Line number should parse as usize");
                 assert!(num >= 1, "Line number should be >= 1");
             }
         }
@@ -235,9 +227,10 @@ fn test_line_numbers_signatures_mode_annotates_source_lines() {
             "Each output line should be tab-separated: {:?}",
             line
         );
-        let _num: usize = parts[0]
-            .parse()
-            .expect(&format!("Line number should parse as usize, got: {:?}", parts[0]));
+        let _num: usize = parts[0].parse().expect(&format!(
+            "Line number should parse as usize, got: {:?}",
+            parts[0]
+        ));
     }
 }
 
@@ -281,12 +274,16 @@ fn test_line_numbers_types_mode_annotates_source_lines() {
             "Non-blank output line should be tab-separated: {:?}",
             line
         );
-        let _num: usize = parts[0]
-            .parse()
-            .expect(&format!("Line number should parse as usize, got: {:?}", parts[0]));
+        let _num: usize = parts[0].parse().expect(&format!(
+            "Line number should parse as usize, got: {:?}",
+            parts[0]
+        ));
         annotated_count += 1;
     }
-    assert!(annotated_count > 0, "At least one line should be annotated with a source line number");
+    assert!(
+        annotated_count > 0,
+        "At least one line should be annotated with a source line number"
+    );
 }
 
 // ============================================================================
@@ -298,9 +295,7 @@ fn test_line_numbers_with_max_lines_omission_markers_no_prefix() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.ts");
     // 10 lines of types
-    let content: String = (1..=10)
-        .map(|i| format!("type T{i} = string;\n"))
-        .collect();
+    let content: String = (1..=10).map(|i| format!("type T{i} = string;\n")).collect();
     std::fs::write(&file, &content).unwrap();
 
     let output = skim_cmd()
@@ -340,9 +335,7 @@ fn test_line_numbers_with_max_lines_omission_markers_no_prefix() {
 fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.ts");
-    let content: String = (1..=10)
-        .map(|i| format!("type T{i} = string;\n"))
-        .collect();
+    let content: String = (1..=10).map(|i| format!("type T{i} = string;\n")).collect();
     std::fs::write(&file, &content).unwrap();
 
     let output = skim_cmd()
@@ -463,17 +456,17 @@ fn test_line_numbers_multifile_headers_no_prefix() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "Directory processing should succeed");
+    assert!(
+        output.status.success(),
+        "Directory processing should succeed"
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     // File headers look like "==> file.ts <==" or similar
     // They should NOT have line number prefixes (digits followed by tab)
     for line in stdout.lines() {
         if line.contains("==>") || line.contains("<==") {
             // Header line — should not start with a digit (line number)
-            let starts_with_digit = line
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_ascii_digit());
+            let starts_with_digit = line.chars().next().map_or(false, |c| c.is_ascii_digit());
             assert!(
                 !starts_with_digit,
                 "File headers should not have line number prefix: {:?}",
@@ -501,11 +494,7 @@ fn test_guidance_content_mentions_line_numbers_flag() {
     // The guidance content should mention -n or --line-numbers
     // We test via the library helper (not the CLI) for simplicity
     // This is an integration test that the content was updated
-    let output = skim_cmd()
-        .arg("init")
-        .arg("--help")
-        .output()
-        .unwrap();
+    let output = skim_cmd().arg("init").arg("--help").output().unwrap();
     // Just verify the command exists and works — guidance content is tested in unit tests
     assert!(output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty());
 }
@@ -621,5 +610,8 @@ fn test_line_numbers_with_token_cascade() {
         let parts: Vec<&str> = l.splitn(2, '\t').collect();
         parts.len() == 2 && parts[0].parse::<usize>().is_ok()
     });
-    assert!(has_numbered, "Token cascade output should have line numbers");
+    assert!(
+        has_numbered,
+        "Token cascade output should have line numbers"
+    );
 }

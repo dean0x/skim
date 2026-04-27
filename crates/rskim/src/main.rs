@@ -302,7 +302,11 @@ struct Args {
     ///
     /// Useful when you need line numbers for Edit operations but want to survey
     /// structure first: `skim file.ts -n` gives both structure AND line numbers.
-    #[arg(short = 'n', long, help = "Annotate output with original source line numbers")]
+    #[arg(
+        short = 'n',
+        long,
+        help = "Annotate output with original source line numbers"
+    )]
     line_numbers: bool,
 
     /// Disable analytics recording for this invocation

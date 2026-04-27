@@ -186,7 +186,13 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
     let metadata = fs::metadata(params.path)?;
     let mtime = metadata.modified()?;
 
-    let key = cache_key(params.path, mtime, params.mode, &params.trunc, params.line_numbers)?;
+    let key = cache_key(
+        params.path,
+        mtime,
+        params.mode,
+        &params.trunc,
+        params.line_numbers,
+    )?;
     let cache_file = get_cache_dir()?.join(format!("{key}.json"));
 
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();

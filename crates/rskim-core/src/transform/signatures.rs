@@ -167,13 +167,7 @@ fn collect_signatures_with_kinds_and_lines(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_signatures_with_kinds_and_lines(
-            child,
-            source,
-            node_types,
-            signatures,
-            depth + 1,
-        )?;
+        collect_signatures_with_kinds_and_lines(child, source, node_types, signatures, depth + 1)?;
     }
 
     Ok(())

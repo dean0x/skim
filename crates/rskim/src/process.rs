@@ -324,11 +324,8 @@ pub(crate) fn process_stdin(
             (output, false, line_map)
         }
         None => {
-            let config = cascade::build_config_with_opts(
-                options.mode,
-                &options.trunc,
-                options.line_numbers,
-            );
+            let config =
+                cascade::build_config_with_opts(options.mode, &options.trunc, options.line_numbers);
             let (output, has_errors, line_map) =
                 transform_with_line_map(&buffer, language, &config)?;
             (output, has_errors, line_map)

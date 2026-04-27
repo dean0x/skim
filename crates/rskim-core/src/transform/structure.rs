@@ -221,24 +221,28 @@ pub(crate) fn compute_source_line_map_from_offset_map(
 ) -> Vec<usize> {
     // Pre-compute source line start byte offsets (0-indexed by line number)
     let source_line_starts: Vec<usize> = std::iter::once(0)
-        .chain(source.char_indices().filter_map(|(i, c)| {
-            if c == '\n' {
-                Some(i + 1)
-            } else {
-                None
-            }
-        }))
+        .chain(source.char_indices().filter_map(
+            |(i, c)| {
+                if c == '\n' {
+                    Some(i + 1)
+                } else {
+                    None
+                }
+            },
+        ))
         .collect();
 
     // Pre-compute output line start byte offsets
     let output_line_starts: Vec<usize> = std::iter::once(0)
-        .chain(output.char_indices().filter_map(|(i, c)| {
-            if c == '\n' {
-                Some(i + 1)
-            } else {
-                None
-            }
-        }))
+        .chain(output.char_indices().filter_map(
+            |(i, c)| {
+                if c == '\n' {
+                    Some(i + 1)
+                } else {
+                    None
+                }
+            },
+        ))
         .collect();
 
     let output_lines = output.lines().count();
@@ -290,8 +294,8 @@ pub(crate) fn compute_source_line_map_from_offset_map(
 
             // Binary search for the 1-indexed line number
             match source_line_starts.binary_search(&source_byte) {
-                Ok(idx) => idx + 1,      // Exact match: this byte IS a line start
-                Err(idx) => idx.max(1),  // Inexact: line idx (1-indexed)
+                Ok(idx) => idx + 1,     // Exact match: this byte IS a line start
+                Err(idx) => idx.max(1), // Inexact: line idx (1-indexed)
             }
         })
         .collect()
