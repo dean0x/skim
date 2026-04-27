@@ -160,13 +160,13 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
 
 /// Return `true` if any env-var token is `SKIM_PASSTHROUGH` with a truthy value.
 ///
-/// Delegates to [`crate::cmd::check_passthrough_value`] for the truthy check
+/// Delegates to [`crate::cmd::check_passthrough_str`] for the truthy check
 /// so the definition of "truthy" stays in one place.  SEE: AD-RW-14.
 fn env_vars_contain_passthrough(env_vars: &[&str]) -> bool {
     env_vars.iter().any(|token| {
         token
             .strip_prefix("SKIM_PASSTHROUGH=")
-            .map(|v| crate::cmd::check_passthrough_value(Some(v.to_string())))
+            .map(crate::cmd::check_passthrough_str)
             .unwrap_or(false)
     })
 }
