@@ -381,8 +381,12 @@ pub(crate) fn process_stdin(
         };
 
     // Apply line number formatting AFTER guardrail, BEFORE token stats.
-    let final_output =
-        apply_line_numbers(final_output, options.line_numbers, guardrail_triggered, stdin_line_map);
+    let final_output = apply_line_numbers(
+        final_output,
+        options.line_numbers,
+        guardrail_triggered,
+        stdin_line_map,
+    );
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
@@ -428,8 +432,12 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
 
     // Apply line number formatting AFTER guardrail, BEFORE cache write and token stats.
     // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
-    let final_output =
-        apply_line_numbers(final_output, options.line_numbers, guardrail_triggered, line_map);
+    let final_output = apply_line_numbers(
+        final_output,
+        options.line_numbers,
+        guardrail_triggered,
+        line_map,
+    );
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.

@@ -127,9 +127,7 @@ pub(crate) fn transform_tree_with_line_map(
         Mode::Signatures => {
             signatures::transform_signatures_with_spans_and_line_map(source, tree, language)?
         }
-        Mode::Types => {
-            types::transform_types_with_spans_and_line_map(source, tree, language)?
-        }
+        Mode::Types => types::transform_types_with_spans_and_line_map(source, tree, language)?,
         Mode::Full => {
             // Full mode: identity map
             let text = source.to_string();
