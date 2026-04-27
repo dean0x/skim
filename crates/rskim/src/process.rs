@@ -71,6 +71,39 @@ pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool) -> &'static str {
     }
 }
 
+/// Apply line number annotations to `output` after the guardrail decision.
+///
+/// When `guardrail_triggered` is true the output is raw source, so an identity
+/// map is used.  When `computed_map` is `Some`, it is used directly.
+///
+/// When `computed_map` is `None` (serde non-full modes, or language detection
+/// failure), line numbers are **skipped** because the output is restructured
+/// and has no meaningful line-for-line correspondence with the original source.
+///
+/// AC-11: Identity map is applied when guardrail emits raw source.
+/// AC-15: Serde non-full modes skip line numbers (computed_map is None).
+pub(crate) fn apply_line_numbers(
+    output: String,
+    line_numbers: bool,
+    guardrail_triggered: bool,
+    computed_map: Option<Vec<usize>>,
+) -> String {
+    if !line_numbers {
+        return output;
+    }
+    if guardrail_triggered {
+        // Guardrail emitted raw source — use identity map
+        let map = crate::format::identity_line_map(&output);
+        return crate::format::format_with_line_numbers(&output, &map);
+    }
+    match computed_map {
+        Some(map) => crate::format::format_with_line_numbers(&output, &map),
+        // No line map available (serde non-full, language detection failure):
+        // skip annotation — restructured output has no source correspondence.
+        None => output,
+    }
+}
+
 /// Count tokens for both original and transformed text, returning `(None, None)` on failure.
 ///
 /// Centralises the paired token-counting pattern used across the processing pipeline.
@@ -347,20 +380,9 @@ pub(crate) fn process_stdin(
             (transformed, false)
         };
 
-    // Apply line number formatting AFTER guardrail.
-    // AC-11: If guardrail triggered (raw source), apply identity line map.
-    let final_output = if options.line_numbers {
-        let map = if guardrail_triggered {
-            crate::format::identity_line_map(&final_output)
-        } else if let Some(m) = stdin_line_map {
-            m
-        } else {
-            crate::format::identity_line_map(&final_output)
-        };
-        crate::format::format_with_line_numbers(&final_output, &map)
-    } else {
-        final_output
-    };
+    // Apply line number formatting AFTER guardrail, BEFORE token stats.
+    let final_output =
+        apply_line_numbers(final_output, options.line_numbers, guardrail_triggered, stdin_line_map);
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
@@ -405,22 +427,9 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         };
 
     // Apply line number formatting AFTER guardrail, BEFORE cache write and token stats.
-    // AC-11: If guardrail triggered (raw source), apply identity line map.
     // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
-    let final_output = if options.line_numbers {
-        let map = if guardrail_triggered {
-            // Guardrail emitted raw source — use identity map
-            crate::format::identity_line_map(&final_output)
-        } else if let Some(m) = line_map {
-            m
-        } else {
-            // Fallback: identity map (language detection failed or serde non-full mode)
-            crate::format::identity_line_map(&final_output)
-        };
-        crate::format::format_with_line_numbers(&final_output, &map)
-    } else {
-        final_output
-    };
+    let final_output =
+        apply_line_numbers(final_output, options.line_numbers, guardrail_triggered, line_map);
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.

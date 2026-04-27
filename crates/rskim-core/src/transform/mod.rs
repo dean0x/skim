@@ -125,14 +125,10 @@ pub(crate) fn transform_tree_with_line_map(
             structure::transform_structure_with_spans_and_line_map(source, tree, language, config)?
         }
         Mode::Signatures => {
-            let (text, spans, line_map) =
-                signatures::transform_signatures_with_spans_and_line_map(source, tree, language)?;
-            (text, spans, line_map)
+            signatures::transform_signatures_with_spans_and_line_map(source, tree, language)?
         }
         Mode::Types => {
-            let (text, spans, line_map) =
-                types::transform_types_with_spans_and_line_map(source, tree, language)?;
-            (text, spans, line_map)
+            types::transform_types_with_spans_and_line_map(source, tree, language)?
         }
         Mode::Full => {
             // Full mode: identity map
@@ -258,6 +254,89 @@ pub(crate) fn reconcile_line_map_after_truncation(
 
 #[cfg(test)]
 mod tests {
-    // NOTE: Tests require parser implementation
-    // These are schema validation only
+    use super::*;
+
+    // ========================================================================
+    // compute_line_map_by_text_matching
+    // ========================================================================
+
+    #[test]
+    fn test_text_matching_identity() {
+        let source = "line 1\nline 2\nline 3\n";
+        let output = "line 1\nline 2\nline 3\n";
+        let map = compute_line_map_by_text_matching(source, output);
+        assert_eq!(map, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_text_matching_skipped_lines() {
+        // Output has lines 1 and 3 from source (line 2 was removed)
+        let source = "aaa\nbbb\nccc\n";
+        let output = "aaa\nccc\n";
+        let map = compute_line_map_by_text_matching(source, output);
+        assert_eq!(map, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_text_matching_unmatched_line() {
+        // Output has a line not in source (e.g., omission marker)
+        let source = "aaa\nbbb\n";
+        let output = "aaa\n// ...\nbbb\n";
+        let map = compute_line_map_by_text_matching(source, output);
+        assert_eq!(map, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn test_text_matching_empty() {
+        let map = compute_line_map_by_text_matching("", "");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_text_matching_duplicate_lines() {
+        // Source has duplicates; should match in order
+        let source = "x\nx\nx\n";
+        let output = "x\nx\n";
+        let map = compute_line_map_by_text_matching(source, output);
+        assert_eq!(map, vec![1, 2]);
+    }
+
+    // ========================================================================
+    // reconcile_line_map_after_truncation
+    // ========================================================================
+
+    #[test]
+    fn test_reconcile_identity() {
+        // No truncation happened
+        let pre = "aaa\nbbb\nccc\n";
+        let trunc = "aaa\nbbb\nccc\n";
+        let pre_map = vec![1, 5, 10];
+        let result = reconcile_line_map_after_truncation(pre, trunc, &pre_map);
+        assert_eq!(result, vec![1, 5, 10]);
+    }
+
+    #[test]
+    fn test_reconcile_with_dropped_line() {
+        let pre = "aaa\nbbb\nccc\n";
+        let trunc = "aaa\nccc\n";
+        let pre_map = vec![1, 5, 10];
+        let result = reconcile_line_map_after_truncation(pre, trunc, &pre_map);
+        assert_eq!(result, vec![1, 10]);
+    }
+
+    #[test]
+    fn test_reconcile_with_omission_marker() {
+        let pre = "aaa\nbbb\nccc\n";
+        let trunc = "aaa\n/* ... */\nccc\n";
+        let pre_map = vec![1, 5, 10];
+        let result = reconcile_line_map_after_truncation(pre, trunc, &pre_map);
+        // "aaa" -> 1, "/* ... */" not in pre -> 0, "ccc" -> 10
+        assert_eq!(result, vec![1, 0, 10]);
+    }
+
+    #[test]
+    fn test_reconcile_empty() {
+        let result = reconcile_line_map_after_truncation("", "", &[]);
+        assert!(result.is_empty());
+    }
 }

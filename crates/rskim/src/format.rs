@@ -35,6 +35,8 @@
 /// Does not panic. If `source_line_map` is shorter than the number of output
 /// lines, remaining lines are treated as having source line 0 (no prefix).
 pub(crate) fn format_with_line_numbers(text: &str, source_line_map: &[usize]) -> String {
+    use std::fmt::Write;
+
     if text.is_empty() {
         return String::new();
     }
@@ -59,8 +61,8 @@ pub(crate) fn format_with_line_numbers(text: &str, source_line_map: &[usize]) ->
             result.push_str(line);
         } else {
             // Normal content line — emit with "{source_line}\t" prefix
-            result.push_str(&source_line.to_string());
-            result.push('\t');
+            // write! to String is infallible; avoid temporary String from to_string()
+            let _ = write!(result, "{}\t", source_line);
             result.push_str(line);
         }
         result.push('\n');

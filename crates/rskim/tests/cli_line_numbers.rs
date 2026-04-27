@@ -578,6 +578,36 @@ fn test_line_numbers_json_full_mode_applies_identity() {
     );
 }
 
+#[test]
+fn test_line_numbers_json_structure_mode_skips_annotation() {
+    // AC-15: Serde non-full modes skip line numbers because output is restructured
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("test.json");
+    std::fs::write(&file, r#"{"key": "value", "nested": {"a": 1}}"#).unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--line-numbers")
+        .arg("--mode=structure")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Serde structure mode: output is restructured, so no line number annotations
+    // should be applied. No tab-separated line numbers should appear.
+    let has_numbered = stdout.lines().any(|l| {
+        let parts: Vec<&str> = l.splitn(2, '\t').collect();
+        parts.len() == 2 && parts[0].parse::<usize>().is_ok()
+    });
+    assert!(
+        !has_numbered,
+        "Serde non-full mode should skip line number annotation, got: {:?}",
+        stdout
+    );
+}
+
 // ============================================================================
 // AC-10: Token cascade interaction — line numbers applied after mode selection
 // ============================================================================
