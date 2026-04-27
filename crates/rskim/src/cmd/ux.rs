@@ -186,7 +186,11 @@ pub(crate) fn column_budget(term_width: u16, overhead: usize) -> usize {
 /// `if config.no_truncate { 0 } else { terminal_width() }` pattern in
 /// discover and learn (S2).
 pub(crate) fn resolve_term_width(no_truncate: bool) -> u16 {
-    if no_truncate { 0 } else { terminal_width() }
+    if no_truncate {
+        0
+    } else {
+        terminal_width()
+    }
 }
 
 /// Print a comfy-table to stdout with each line indented by `indent` spaces.
@@ -248,24 +252,6 @@ mod tests {
     }
 
     // --- print_indented_table ---
-
-    #[test]
-    fn test_print_indented_table_indents_every_line() {
-        // Every rendered line of a table with content must start with the
-        // requested prefix when we apply the same logic as print_indented_table.
-        let mut table = comfy_table::Table::new();
-        table.set_header(["File", "Tokens"]);
-        table.add_row(["main.rs", "120"]);
-        let indent = 4;
-        let prefix = " ".repeat(indent);
-        for line in table.to_string().lines() {
-            let indented = format!("{prefix}{line}");
-            assert!(
-                indented.starts_with(&prefix),
-                "Line does not start with indent: {indented:?}"
-            );
-        }
-    }
 
     #[test]
     fn test_print_indented_table_term_width_constrained_does_not_panic() {
@@ -331,12 +317,12 @@ mod tests {
 
     #[test]
     fn test_print_indented_table_no_truncate_preserves_full_content() {
-        // Verifies the term_width == 0 branch does NOT constrain table width.
-        // With a 200-char unbreakable cell and no set_width call, the rendered
-        // string must contain the full cell content — no wrapping applied.
+        // Verifies that term_width == 0 (--no-truncate sentinel) does NOT
+        // constrain table width. A 200-char unbreakable cell must appear intact
+        // in the rendered output — no wrapping applied.
         //
-        // Mirror callers by setting ContentArrangement::Dynamic; this confirms
-        // that even with Dynamic arrangement, term_width==0 leaves content intact.
+        // Callers set ContentArrangement::Dynamic; confirm it does not interfere
+        // when no set_width call is made.
         let long_cell = "a".repeat(200);
         let mut table = comfy_table::Table::new();
         table
@@ -344,16 +330,7 @@ mod tests {
             .set_header(["Command", "Rewrite"]);
         table.add_row([long_cell.as_str(), "skim infra gh pr list"]);
 
-        // term_width == 0 → no set_width call; table renders at natural width.
-        // Mirror the branch logic from print_indented_table exactly.
-        let term_width: u16 = 0;
-        if term_width > 0 {
-            let indent: usize = 4;
-            let available =
-                term_width.saturating_sub(u16::try_from(indent).unwrap_or(u16::MAX));
-            table.set_width(available);
-        }
-
+        // term_width == 0 → no set_width call; natural width preserved.
         let rendered = table.to_string();
         assert!(
             rendered.contains(&long_cell),
@@ -390,12 +367,6 @@ mod tests {
         let result = truncate_str(s, 10);
         assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
         assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn test_truncate_str_no_op() {
-        // String shorter than max is returned unchanged.
-        assert_eq!(truncate_str("hello", 10), "hello");
     }
 
     #[test]
@@ -439,12 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_path_middle_short() {
-        // Path shorter than max is returned unchanged.
-        assert_eq!(truncate_path_middle("/src/main.rs", 40), "/src/main.rs");
-    }
-
-    #[test]
     fn test_truncate_path_middle_long() {
         // Long path produces prefix…/filename format.
         let path = "/very/long/directory/structure/that/exceeds/width/main.rs";
@@ -478,14 +443,6 @@ mod tests {
             "char count must not exceed max, got: {result:?}"
         );
         assert!(result.ends_with('\u{2026}'), "must end with ellipsis");
-    }
-
-    // --- terminal_width ---
-
-    #[test]
-    fn test_terminal_width_returns_positive() {
-        // terminal_width always returns a positive value (at least the 80-col fallback).
-        assert!(terminal_width() > 0);
     }
 
     // --- resolve_term_width ---

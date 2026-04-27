@@ -125,8 +125,7 @@ pub(crate) fn check_passthrough_str(val: &str) -> bool {
 /// Returns `true` for `"1"`, `"true"`, `"yes"` (case-insensitive).
 /// Delegates to [`check_passthrough_str`] so the truthy definition stays in one place.
 pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
-    val.map(|v| check_passthrough_str(&v))
-        .unwrap_or(false)
+    val.map(|v| check_passthrough_str(&v)).unwrap_or(false)
 }
 
 /// Known subcommands that the pre-parse router will recognize.
@@ -566,10 +565,7 @@ mod tests {
     #[test]
     fn test_check_passthrough_str_truthy_values() {
         for v in &["1", "true", "yes", "True", "YES", "tRuE"] {
-            assert!(
-                check_passthrough_str(v),
-                "expected truthy for {v:?}"
-            );
+            assert!(check_passthrough_str(v), "expected truthy for {v:?}");
         }
     }
 
