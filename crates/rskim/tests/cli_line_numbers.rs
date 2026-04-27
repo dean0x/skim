@@ -968,3 +968,92 @@ fn test_line_numbers_guardrail_identity_map() {
         "Output should have at least one numbered line (guardrail or normal path)"
     );
 }
+
+// ============================================================================
+// Bug fix: --last-lines with duplicate lines (e.g., multiple `}` closings)
+// ============================================================================
+
+#[test]
+fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
+    // Regression test: when a file has duplicate lines (e.g. multiple `}` closings)
+    // and --last-lines is used, content lines in the tail must carry their REAL source
+    // line numbers, not the line number of the first occurrence of that content.
+    //
+    // File layout (6 lines):
+    //   1: function foo() {
+    //   2:     return 1;
+    //   3: }
+    //   4: function bar() {
+    //   5:     return 2;
+    //   6: }
+    //
+    // With --last-lines 3: marker (0 annotation) + lines 5 and 6 as content.
+    // Line 6 is `}`, which also appears at line 3.  The correct annotation is 6, not 3.
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("test.ts");
+    std::fs::write(
+        &file,
+        "function foo() {\n    return 1;\n}\nfunction bar() {\n    return 2;\n}\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("-n")
+        .arg("--last-lines")
+        .arg("3")
+        .arg("--mode=full")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // Should have exactly 3 lines: marker + 2 content lines
+    assert_eq!(
+        lines.len(),
+        3,
+        "With --last-lines 3, output should have 3 lines (marker + 2 content). Got:\n{}",
+        stdout
+    );
+
+    // First line is the omission marker — no annotation prefix
+    assert!(
+        !lines[0].starts_with(|c: char| c.is_ascii_digit()),
+        "Marker line should have no numeric prefix, got: {:?}",
+        lines[0]
+    );
+
+    // Helper: extract tab-separated line number from an annotated line
+    let parse_line_num = |s: &str| -> Option<usize> {
+        let parts: Vec<&str> = s.splitn(2, '\t').collect();
+        if parts.len() == 2 {
+            parts[0].parse::<usize>().ok()
+        } else {
+            None
+        }
+    };
+
+    // Second line: source line 5 (`    return 2;`)
+    let num1 = parse_line_num(lines[1]);
+    assert_eq!(
+        num1,
+        Some(5),
+        "Content line 1 should map to source line 5, got: {:?} (full line: {:?})",
+        num1,
+        lines[1]
+    );
+
+    // Third line: source line 6 (`}`) — NOT line 3 which is also `}`
+    let num2 = parse_line_num(lines[2]);
+    assert_eq!(
+        num2,
+        Some(6),
+        "Content line 2 (closing `}}`) should map to source line 6 (its real position), \
+         not line 3 (first `}}` occurrence). Got: {:?} (full line: {:?})",
+        num2,
+        lines[2]
+    );
+}

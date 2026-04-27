@@ -216,6 +216,15 @@ pub(crate) fn compute_line_map_by_text_matching(source: &str, output: &str) -> V
 /// Lines in the truncated output that match lines in the pre-truncation output
 /// get their source line from the pre-truncation map. Omission markers (not in
 /// the pre-truncation output) get source line 0.
+///
+/// # Monotonic matching
+///
+/// Truncation preserves document order: the truncated output is always a
+/// subsequence of the pre-truncation output (with optional omission markers
+/// inserted). Therefore each matched position must be >= the previous matched
+/// position. Monotonic matching prevents duplicate lines (e.g. multiple `}`
+/// closings at different source positions) from being mapped to their first
+/// occurrence rather than the correct occurrence in the tail.
 pub(crate) fn reconcile_line_map_after_truncation(
     pre_trunc_text: &str,
     truncated_text: &str,
@@ -224,26 +233,26 @@ pub(crate) fn reconcile_line_map_after_truncation(
     let pre_lines: Vec<&str> = pre_trunc_text.lines().collect();
     let trunc_lines: Vec<&str> = truncated_text.lines().collect();
 
-    // Build a lookup: line content -> list of (line_index, source_line_num) in pre-truncation
-    // Use a simple scan approach since truncation is rare (most files aren't truncated).
+    // Use a monotonic cursor: each new match must start at or after the
+    // previous match position. This exploits document-order preservation.
     let mut result = Vec::with_capacity(trunc_lines.len());
-    let mut pre_used = vec![false; pre_lines.len()];
+    let mut cursor = 0usize; // next search starts here
 
     for trunc_line in &trunc_lines {
-        // Find the first unused matching line in pre-truncation output
-        let mut found = false;
-        for (idx, pre_line) in pre_lines.iter().enumerate() {
-            if !pre_used[idx] && pre_line == trunc_line {
-                let source_line = pre_trunc_line_map.get(idx).copied().unwrap_or(0);
-                result.push(source_line);
-                pre_used[idx] = true;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // Omission marker or line not in pre-truncation output
+        // Find the first matching line at or after cursor.
+        // Using .position() on the tail slice avoids the range-loop and
+        // mut-range-bound lints while keeping monotonic semantics.
+        let tail = &pre_lines[cursor..];
+        if let Some(offset) = tail.iter().position(|pre| pre == trunc_line) {
+            let abs_idx = cursor + offset;
+            let source_line = pre_trunc_line_map.get(abs_idx).copied().unwrap_or(0);
+            result.push(source_line);
+            cursor = abs_idx + 1; // next search must be strictly after this match
+        } else {
+            // Omission marker or line not in remaining pre-truncation output
             result.push(0);
+            // cursor does NOT advance: the next content line still searches
+            // from the same position (markers don't consume pre-trunc lines)
         }
     }
 
@@ -336,5 +345,40 @@ mod tests {
     fn test_reconcile_empty() {
         let result = reconcile_line_map_after_truncation("", "", &[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_duplicate_lines_tail_bias() {
+        // Pre-truncation text has `}` at positions 3, 5, and 7 (pre_map values 3, 5, 7).
+        // After --last-lines style truncation the tail keeps lines from position 5 onward.
+        // Monotonic matching must map the trailing `}` to position 5/7, not to 3.
+        let pre = "a\nb\n}\nc\n}\nd\n}\n";
+        // pre_map: a=1, b=2, }=3, c=4, }=5, d=6, }=7
+        let pre_map = vec![1, 2, 3, 4, 5, 6, 7];
+        // Simulated --last-lines output: marker + last 3 content lines (c, }, d, } → 4 content)
+        // Use last 4 lines (c, }, d, }) for simplicity
+        let trunc = "/* ... */\nc\n}\nd\n}\n";
+        let result = reconcile_line_map_after_truncation(pre, trunc, &pre_map);
+        // "/* ... */" not found → 0
+        // "c" → 4 (cursor advances past 4)
+        // "}" → 5 (first `}` at or after cursor=4 is index 4, pre_map[4]=5)
+        // "d" → 6
+        // "}" → 7 (next `}` at or after cursor=5 is index 6, pre_map[6]=7)
+        assert_eq!(result, vec![0, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_reconcile_omission_marker_does_not_advance_cursor() {
+        // An omission marker (not in pre text) should leave the cursor unchanged so
+        // the following content line still finds its correct pre-truncation position.
+        let pre = "x\ny\nz\n";
+        let pre_map = vec![10, 20, 30];
+        // Simulated: marker inserted before y (marker is not in pre)
+        let trunc = "/* ... */\ny\nz\n";
+        let result = reconcile_line_map_after_truncation(pre, trunc, &pre_map);
+        // "/* ... */" not found → 0, cursor stays at 0
+        // "y" found at index 1 → 20, cursor advances to 2
+        // "z" found at index 2 → 30
+        assert_eq!(result, vec![0, 20, 30]);
     }
 }

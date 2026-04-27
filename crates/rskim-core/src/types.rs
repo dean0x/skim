@@ -283,20 +283,38 @@ impl Language {
             let text = source.to_string();
 
             if let Some(n) = config.last_lines {
-                // Build identity map on the ORIGINAL source before truncation,
-                // then reconcile after truncation so content lines retain their
-                // real source line numbers and the truncation marker gets 0.
+                // ARCHITECTURE: For passthrough (identity transform), build the source
+                // line map directly from arithmetic instead of using
+                // reconcile_line_map_after_truncation. Content-based reconciliation uses
+                // forward scanning which matches duplicate lines (e.g. `}`) to their
+                // FIRST occurrence rather than the correct tail occurrence.
+                //
+                // simple_last_line_truncate produces:
+                //   - If total <= n: unchanged (identity map)
+                //   - If total > n: 1 marker line + (n-1) content lines from the tail
+                //
+                // Marker line gets source_line = 0 (no annotation).
+                // Content line i (0-indexed within content) gets source_line:
+                //   source_line_count - n_content + 1 + i  (1-indexed)
                 let source_line_count = text.lines().count();
-                let pre_trunc_map: Vec<usize> = (1..=source_line_count).collect();
                 let truncated =
                     crate::transform::truncate::simple_last_line_truncate(&text, self, n)?;
                 let line_map = if config.line_numbers {
-                    let reconciled = crate::transform::reconcile_line_map_after_truncation(
-                        &text,
-                        &truncated,
-                        &pre_trunc_map,
-                    );
-                    Some(reconciled)
+                    if source_line_count <= n {
+                        // No truncation occurred: identity map
+                        let count = truncated.lines().count();
+                        Some((1..=count).collect::<Vec<usize>>())
+                    } else {
+                        // Truncation occurred: marker + n_content tail lines
+                        let n_content = n.saturating_sub(1); // lines reserved for content
+                        let start_line = source_line_count - n_content + 1; // 1-indexed
+                        let mut map = Vec::with_capacity(1 + n_content);
+                        map.push(0_usize); // marker line has no annotation
+                        for i in 0..n_content {
+                            map.push(start_line + i);
+                        }
+                        Some(map)
+                    }
                 } else {
                     None
                 };
