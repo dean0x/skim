@@ -121,21 +121,16 @@ fn cache_key(
     let canonical_path = path.canonicalize()?;
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
-    fn fmt_opt(opt: Option<usize>) -> String {
-        match opt {
-            Some(n) => n.to_string(),
-            None => "none".to_string(),
-        }
-    }
+    let opt_str = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
 
     let hash_input = format!(
         "{}|{}|{:?}|{}|{}|{}|{}",
         canonical_path.display(),
         mtime_secs,
         mode,
-        fmt_opt(trunc.max_lines),
-        fmt_opt(trunc.last_lines),
-        fmt_opt(trunc.token_budget),
+        opt_str(trunc.max_lines),
+        opt_str(trunc.last_lines),
+        opt_str(trunc.token_budget),
         line_numbers as u8,
     );
 

@@ -281,12 +281,28 @@ impl Language {
 
         if is_passthrough {
             let text = source.to_string();
-            // Apply last_lines truncation for passthrough paths
-            let text = if let Some(n) = config.last_lines {
-                crate::transform::truncate::simple_last_line_truncate(&text, self, n)?
-            } else {
-                text
-            };
+
+            if let Some(n) = config.last_lines {
+                // Build identity map on the ORIGINAL source before truncation,
+                // then reconcile after truncation so content lines retain their
+                // real source line numbers and the truncation marker gets 0.
+                let source_line_count = text.lines().count();
+                let pre_trunc_map: Vec<usize> = (1..=source_line_count).collect();
+                let truncated =
+                    crate::transform::truncate::simple_last_line_truncate(&text, self, n)?;
+                let line_map = if config.line_numbers {
+                    let reconciled = crate::transform::reconcile_line_map_after_truncation(
+                        &text,
+                        &truncated,
+                        &pre_trunc_map,
+                    );
+                    Some(reconciled)
+                } else {
+                    None
+                };
+                return Ok((truncated, false, line_map));
+            }
+
             let line_map = if config.line_numbers {
                 // Full mode (passthrough): identity map
                 // For serde-based Minimal/Pseudo passthrough: also identity (source is output)
@@ -315,12 +331,12 @@ impl Language {
 
         // Apply last_lines truncation as a post-processing step
         let (result, line_map) = if let Some(n) = config.last_lines {
-            let truncated = crate::transform::truncate::simple_last_line_truncate(&result, self, n)?;
+            let truncated =
+                crate::transform::truncate::simple_last_line_truncate(&result, self, n)?;
             let final_map = if let Some(ref map) = line_map {
                 // Reconcile the line map after last_lines truncation
-                let reconciled = crate::transform::reconcile_line_map_after_truncation(
-                    &result, &truncated, map,
-                );
+                let reconciled =
+                    crate::transform::reconcile_line_map_after_truncation(&result, &truncated, map);
                 Some(reconciled)
             } else {
                 None
