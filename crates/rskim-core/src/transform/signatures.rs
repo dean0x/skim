@@ -4,14 +4,12 @@
 //!
 //! Token reduction target: 85-92%
 
+use crate::transform::minimal::MAX_AST_DEPTH;
 use crate::transform::structure::extract_markdown_headers_with_spans;
 use crate::transform::truncate::NodeSpan;
 use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
-use crate::{Language, Result, SkimError};
+use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
-
-/// Maximum AST recursion depth to prevent stack overflow attacks
-const MAX_AST_DEPTH: usize = 500;
 
 /// Maximum number of signatures to prevent memory exhaustion
 const MAX_SIGNATURES: usize = 10_000;
@@ -42,7 +40,7 @@ pub(crate) fn transform_signatures(
     source: &str,
     tree: &Tree,
     language: Language,
-    config: &crate::TransformConfig,
+    config: &TransformConfig,
 ) -> Result<String> {
     let (text, _spans) = transform_signatures_with_spans(source, tree, language, config)?;
     Ok(text)
@@ -53,7 +51,7 @@ pub(crate) fn transform_signatures_with_spans(
     source: &str,
     tree: &Tree,
     language: Language,
-    config: &crate::TransformConfig,
+    config: &TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
     let (text, spans, _line_map) =
         transform_signatures_with_spans_and_line_map(source, tree, language, config)?;
@@ -74,7 +72,7 @@ pub(crate) fn transform_signatures_with_spans_and_line_map(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &crate::TransformConfig,
+    _config: &TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     // ARCHITECTURE: Markdown signatures mode extracts ALL headers (H1-H6)
     if language == Language::Markdown {

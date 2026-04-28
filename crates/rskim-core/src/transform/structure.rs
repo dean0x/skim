@@ -4,20 +4,12 @@
 //!
 //! Token reduction target: 70-80%
 
+use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::transform::truncate::NodeSpan;
 use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
-
-/// Maximum AST recursion depth to prevent stack overflow attacks
-const MAX_AST_DEPTH: usize = 500;
-
-/// Maximum number of AST nodes to prevent memory exhaustion
-const MAX_AST_NODES: usize = 100_000;
-
-/// Maximum markdown traversal depth to prevent stack overflow
-const MAX_MARKDOWN_DEPTH: usize = 500;
 
 /// Maximum number of markdown headers to prevent memory exhaustion
 const MAX_MARKDOWN_HEADERS: usize = 10_000;
@@ -37,15 +29,6 @@ const MAX_MARKDOWN_HEADERS: usize = 10_000;
 /// - Function bodies → `/* ... */`
 /// - Implementation details
 /// - Non-structural comments
-///
-/// # Implementation Notes (Week 2)
-///
-/// 1. Traverse AST with TreeCursor
-/// 2. For each function/method node:
-///    - Extract signature (everything before `{`)
-///    - Replace body with `/* ... */`
-/// 3. For classes: keep structure, strip method bodies
-/// 4. Preserve indentation
 #[cfg(test)]
 #[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn transform_structure(
@@ -517,7 +500,7 @@ fn build_spans_from_top_level_nodes(
 /// Only the header lines within the specified range
 ///
 /// # Security
-/// - Enforces MAX_MARKDOWN_DEPTH to prevent stack overflow
+/// - Enforces MAX_AST_DEPTH to prevent stack overflow
 /// - Enforces MAX_MARKDOWN_HEADERS to prevent memory exhaustion
 #[cfg(test)]
 #[allow(dead_code)] // Convenience wrapper available for tests
@@ -559,10 +542,10 @@ pub(crate) fn extract_markdown_headers_with_spans(
     let mut visit_stack = vec![(0_usize, root)];
 
     while let Some((depth, node)) = visit_stack.pop() {
-        if depth > MAX_MARKDOWN_DEPTH {
+        if depth > MAX_AST_DEPTH {
             return Err(SkimError::ParseError(format!(
                 "Maximum markdown depth exceeded: {} (possible malicious input)",
-                MAX_MARKDOWN_DEPTH
+                MAX_AST_DEPTH
             )));
         }
 
