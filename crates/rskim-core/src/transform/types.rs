@@ -54,9 +54,10 @@ pub(crate) fn transform_types_with_spans(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &crate::TransformConfig,
+    config: &crate::TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
-    let (text, spans, _line_map) = transform_types_with_spans_and_line_map(source, tree, language)?;
+    let (text, spans, _line_map) =
+        transform_types_with_spans_and_line_map(source, tree, language, config)?;
     Ok((text, spans))
 }
 
@@ -74,12 +75,11 @@ pub(crate) fn transform_types_with_spans_and_line_map(
     source: &str,
     tree: &Tree,
     language: Language,
+    _config: &crate::TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     // ARCHITECTURE: Markdown types mode extracts ALL headers (H1-H6)
     if language == Language::Markdown {
-        let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 6)?;
-        let line_count = text.lines().count();
-        let line_map = (1..=line_count).collect();
+        let (text, spans, line_map) = extract_markdown_headers_with_spans(source, tree, 1, 6)?;
         return Ok((text, spans, line_map));
     }
 

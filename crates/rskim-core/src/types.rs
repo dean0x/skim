@@ -167,14 +167,9 @@ impl Language {
     /// errors in the source. For serde-based languages and passthrough paths
     /// (Mode::Full) it is always `false` on success.
     ///
-    /// ARCHITECTURE: Encapsulates language-specific parsing strategy.
-    /// - JSON: Uses serde_json parser
-    /// - YAML: Uses serde_yaml_ng parser
-    /// - TOML: Uses toml crate parser
-    /// - Serde-based + Markdown in minimal/pseudo mode: Passthrough (no noise to strip)
-    /// - All others (C, C++, etc.): Use tree-sitter parser
-    ///
-    /// This eliminates special-case conditionals in the main transform function.
+    /// ARCHITECTURE: Delegates to `transform_source_with_line_map`, discarding the
+    /// source line map. All branching logic (passthrough detection, serde delegation,
+    /// parser creation, max_lines/last_lines truncation) lives in a single place.
     ///
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
@@ -183,69 +178,9 @@ impl Language {
         source: &str,
         config: &TransformConfig,
     ) -> Result<(String, bool)> {
-        debug_assert!(
-            !(config.max_lines.is_some() && config.last_lines.is_some()),
-            "max_lines and last_lines are mutually exclusive"
-        );
-
-        // Passthrough: Full mode (all languages) or Minimal/Pseudo for
-        // serde-based and Markdown languages (no noise to strip).
-        let is_passthrough = config.mode == Mode::Full
-            || (matches!(config.mode, Mode::Minimal | Mode::Pseudo)
-                && (self.is_serde_based() || self == Self::Markdown));
-
-        let (result, tree_sitter_handled, has_errors) = if is_passthrough {
-            (source.to_string(), false, false)
-        } else {
-            // Serde-based languages use their own parsers; tree-sitter languages
-            // handle truncation inside transform_tree.
-            match self {
-                Self::Json => (
-                    crate::transform::json::transform_json(source)?,
-                    false,
-                    false,
-                ),
-                Self::Yaml => (
-                    crate::transform::yaml::transform_yaml(source)?,
-                    false,
-                    false,
-                ),
-                Self::Toml => (
-                    crate::transform::toml::transform_toml(source)?,
-                    false,
-                    false,
-                ),
-                _ => {
-                    let mut parser = Parser::new(self)?;
-                    let tree = parser.parse(source)?;
-                    let parse_errors = tree.root_node().has_error();
-                    let r = crate::transform::transform_tree(source, &tree, self, config)?;
-                    (r, true, parse_errors)
-                }
-            }
-        };
-
-        // Apply max_lines as unified post-processing for non-tree-sitter paths.
-        // Tree-sitter languages handle truncation inside transform_tree via
-        // AST-aware priority selection, so we skip them here.
-        let result = if !tree_sitter_handled {
-            if let Some(max_lines) = config.max_lines {
-                crate::transform::truncate::simple_line_truncate(&result, self, max_lines)?
-            } else {
-                result
-            }
-        } else {
-            result
-        };
-
-        // Apply last_lines truncation as a post-processing step
-        let result = if let Some(n) = config.last_lines {
-            crate::transform::truncate::simple_last_line_truncate(&result, self, n)?
-        } else {
-            result
-        };
-
-        Ok((result, has_errors))
+        let (content, has_errors, _line_map) =
+            self.transform_source_with_line_map(source, config)?;
+        Ok((content, has_errors))
     }
 
     /// Transform source code, returning `(content, has_errors, source_line_map)`.
@@ -321,6 +256,26 @@ impl Language {
                 return Ok((truncated, false, line_map));
             }
 
+            // Apply max_lines truncation for passthrough paths. Tree-sitter languages
+            // handle max_lines inside transform_tree via AST-aware priority selection,
+            // but for passthrough (Full mode or serde/Markdown Minimal/Pseudo) we must
+            // apply it here as a simple line truncation.
+            if let Some(max_lines) = config.max_lines {
+                let truncated =
+                    crate::transform::truncate::simple_line_truncate(&text, self, max_lines)?;
+                let line_map = if config.line_numbers {
+                    // After simple_line_truncate the output is a prefix of the source
+                    // (with an optional trailing truncation marker). Build the map by
+                    // matching output lines to source lines in order.
+                    let map =
+                        crate::transform::compute_line_map_by_text_matching(source, &truncated);
+                    Some(map)
+                } else {
+                    None
+                };
+                return Ok((truncated, false, line_map));
+            }
+
             let line_map = if config.line_numbers {
                 // Full mode (passthrough): identity map
                 // For serde-based Minimal/Pseudo passthrough: also identity (source is output)
@@ -332,10 +287,32 @@ impl Language {
             return Ok((text, false, line_map));
         }
 
-        // Serde-based non-full modes: restructured output, no meaningful source line map
+        // Serde-based non-full modes: restructured output, no meaningful source line map.
+        // ARCHITECTURE: The serde parsers (JSON/YAML/TOML) restructure the content so
+        // there is no per-line source correspondence. We compute the transform inline here
+        // (not via transform_source) to avoid circular delegation now that transform_source
+        // delegates to this function.
         let is_serde_non_full = self.is_serde_based() && config.mode != Mode::Full;
         if is_serde_non_full {
-            let (result, has_errors) = self.transform_source(source, config)?;
+            let (raw_result, has_errors) = match self {
+                Self::Json => (crate::transform::json::transform_json(source)?, false),
+                Self::Yaml => (crate::transform::yaml::transform_yaml(source)?, false),
+                Self::Toml => (crate::transform::toml::transform_toml(source)?, false),
+                // SAFETY: is_serde_based() returns true only for Json/Yaml/Toml.
+                _ => unreachable!("is_serde_based() must only return true for Json/Yaml/Toml"),
+            };
+            // Apply max_lines truncation (no meaningful line map for restructured output).
+            let result = if let Some(max_lines) = config.max_lines {
+                crate::transform::truncate::simple_line_truncate(&raw_result, self, max_lines)?
+            } else {
+                raw_result
+            };
+            // Apply last_lines truncation.
+            let result = if let Some(n) = config.last_lines {
+                crate::transform::truncate::simple_last_line_truncate(&result, self, n)?
+            } else {
+                result
+            };
             return Ok((result, has_errors, None));
         }
 

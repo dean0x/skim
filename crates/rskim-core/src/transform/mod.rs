@@ -124,10 +124,12 @@ pub(crate) fn transform_tree_with_line_map(
         Mode::Structure => {
             structure::transform_structure_with_spans_and_line_map(source, tree, language, config)?
         }
-        Mode::Signatures => {
-            signatures::transform_signatures_with_spans_and_line_map(source, tree, language)?
+        Mode::Signatures => signatures::transform_signatures_with_spans_and_line_map(
+            source, tree, language, config,
+        )?,
+        Mode::Types => {
+            types::transform_types_with_spans_and_line_map(source, tree, language, config)?
         }
-        Mode::Types => types::transform_types_with_spans_and_line_map(source, tree, language)?,
         Mode::Full => {
             // Full mode: identity map
             let text = source.to_string();
@@ -170,9 +172,9 @@ pub(crate) fn transform_tree_with_line_map(
 
 /// Compute a source line map by matching output lines to source lines (text scan).
 ///
-/// ARCHITECTURE: Used for Minimal and Pseudo modes where removed ranges leave
-/// verbatim sections of source in the output. Each output line is matched to
-/// the first unmatched source line with identical content.
+/// ARCHITECTURE: Used for Minimal mode where removed ranges leave verbatim
+/// sections of source in the output. Each output line is matched to the first
+/// unmatched source line with identical content.
 ///
 /// This is a best-effort heuristic: if identical lines appear multiple times,
 /// the first unmatched occurrence is used. In practice this is correct for
@@ -226,20 +228,27 @@ pub(crate) fn compute_line_map_from_removed_ranges(
     let source_bytes = source.as_bytes();
     let total_bytes = source.len();
 
-    // Precompute 1-indexed source line number for each byte position.
-    // source_line_at[i] = line number of byte i.
-    let mut source_line_at = vec![1usize; total_bytes.saturating_add(1)];
-    let mut current_line = 1usize;
-    for (i, &b) in source_bytes.iter().enumerate() {
-        source_line_at[i] = current_line;
-        if b == b'\n' {
-            current_line += 1;
+    // Precompute byte offsets of line starts for O(log n) line-number lookup.
+    // line_starts[i] = byte offset of the first byte of line (i+1).
+    // This replaces the previous dense Vec<usize> (one entry per source byte,
+    // 8 bytes/byte on 64-bit) with a much smaller Vec sized by line count.
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(source_bytes.iter().enumerate().filter_map(|(i, &b)| {
+            if b == b'\n' {
+                Some(i + 1)
+            } else {
+                None
+            }
+        }))
+        .collect();
+
+    // Returns the 1-indexed source line number for byte position `pos`.
+    let byte_to_line = |pos: usize| -> usize {
+        match line_starts.binary_search(&pos) {
+            Ok(idx) => idx + 1,
+            Err(idx) => idx, // idx is the number of line starts strictly before pos
         }
-    }
-    // Byte past end (for edge cases)
-    if let Some(last) = source_line_at.last_mut() {
-        *last = current_line;
-    }
+    };
 
     let mut result: Vec<usize> = Vec::new();
     // Source line number for the current (not-yet-emitted) output line.
@@ -263,7 +272,7 @@ pub(crate) fn compute_line_map_from_removed_ranges(
         }
 
         let byte = source_bytes[pos];
-        let src_line = source_line_at[pos];
+        let src_line = byte_to_line(pos);
 
         // Record the source line for this output line on the first byte.
         if current_output_source_line.is_none() {

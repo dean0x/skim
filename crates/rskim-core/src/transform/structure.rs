@@ -94,10 +94,7 @@ pub(crate) fn transform_structure_with_spans_and_line_map(
     // ARCHITECTURE: Markdown uses extraction, not replacement
     // Extract H1-H3 headers only (top-level document structure)
     if language == Language::Markdown {
-        let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 3)?;
-        let line_count = text.lines().count();
-        // For markdown, use identity map (extracted headers preserve source structure)
-        let line_map = (1..=line_count).collect();
+        let (text, spans, line_map) = extract_markdown_headers_with_spans(source, tree, 1, 3)?;
         return Ok((text, spans, line_map));
     }
 
@@ -523,20 +520,33 @@ pub(crate) fn extract_markdown_headers(
     min_level: u32,
     max_level: u32,
 ) -> Result<String> {
-    let (text, _spans) = extract_markdown_headers_with_spans(source, tree, min_level, max_level)?;
+    let (text, _spans, _line_map) =
+        extract_markdown_headers_with_spans(source, tree, min_level, max_level)?;
     Ok(text)
 }
 
-/// Extract markdown headers with NodeSpan metadata for truncation
+/// Extract markdown headers with NodeSpan metadata and source line map for truncation.
 ///
 /// Each header gets its own span with "atx_heading" or "setext_heading" kind.
+/// The returned `Vec<usize>` is a per-output-line source line map: each entry is the
+/// 1-indexed source line number of the corresponding output line. Multi-line headers
+/// (setext headings have 2 lines) get consecutive source line numbers from the header's
+/// start line.
+///
+/// # Design Decision (AC-18)
+/// Previously this function used an identity map `(1..=line_count).collect()`, which
+/// annotated extracted headers as sequential lines 1, 2, 3 regardless of where they
+/// actually appeared in the source. Headers at source lines 1, 15, and 42 would be
+/// mis-annotated as lines 1, 2, 3. The fix threads `node.start_position().row + 1`
+/// through extraction so each header carries its true source position.
 pub(crate) fn extract_markdown_headers_with_spans(
     source: &str,
     tree: &Tree,
     min_level: u32,
     max_level: u32,
-) -> Result<(String, Vec<NodeSpan>)> {
-    let mut headers: Vec<(String, &'static str)> = Vec::new();
+) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
+    // Headers: (text, node_kind, source_start_line_1indexed)
+    let mut headers: Vec<(String, &'static str, usize)> = Vec::new();
     let root = tree.root_node();
 
     let mut visit_stack = vec![(0_usize, root)];
@@ -577,7 +587,8 @@ pub(crate) fn extract_markdown_headers_with_spans(
                     let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
                         SkimError::ParseError(format!("UTF-8 error in header: {}", e))
                     })?;
-                    headers.push((header_text.to_string(), "atx_heading"));
+                    let source_start_line = node.start_position().row + 1;
+                    headers.push((header_text.to_string(), "atx_heading", source_start_line));
                 }
             }
         } else if node_type == "setext_heading" {
@@ -601,7 +612,8 @@ pub(crate) fn extract_markdown_headers_with_spans(
                 let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
                     SkimError::ParseError(format!("UTF-8 error in setext header: {}", e))
                 })?;
-                headers.push((header_text.to_string(), "setext_heading"));
+                let source_start_line = node.start_position().row + 1;
+                headers.push((header_text.to_string(), "setext_heading", source_start_line));
             }
         }
 
@@ -611,19 +623,28 @@ pub(crate) fn extract_markdown_headers_with_spans(
         }
     }
 
-    // Build text and spans
+    // Build text, spans, and source line map
     let mut spans = Vec::with_capacity(headers.len());
-    let mut current_line = 0;
+    let mut source_line_map: Vec<usize> = Vec::new();
+    let mut current_output_line = 0;
 
     let texts: Vec<String> = headers
         .into_iter()
-        .map(|(text, kind)| {
+        .map(|(text, kind, source_start_line)| {
             let line_count = text.lines().count().max(1);
-            spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
-            current_line += line_count;
+            spans.push(NodeSpan::new(
+                current_output_line..current_output_line + line_count,
+                kind,
+            ));
+            // Map each output line to consecutive source lines from source_start_line.
+            // ATX headings are always 1 line; setext headings span 2 lines (text + underline).
+            for i in 0..line_count {
+                source_line_map.push(source_start_line + i);
+            }
+            current_output_line += line_count;
             text
         })
         .collect();
 
-    Ok((texts.join("\n"), spans))
+    Ok((texts.join("\n"), spans, source_line_map))
 }

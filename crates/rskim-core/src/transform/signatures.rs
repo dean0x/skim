@@ -53,10 +53,10 @@ pub(crate) fn transform_signatures_with_spans(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &crate::TransformConfig,
+    config: &crate::TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
     let (text, spans, _line_map) =
-        transform_signatures_with_spans_and_line_map(source, tree, language)?;
+        transform_signatures_with_spans_and_line_map(source, tree, language, config)?;
     Ok((text, spans))
 }
 
@@ -74,13 +74,11 @@ pub(crate) fn transform_signatures_with_spans_and_line_map(
     source: &str,
     tree: &Tree,
     language: Language,
+    _config: &crate::TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     // ARCHITECTURE: Markdown signatures mode extracts ALL headers (H1-H6)
     if language == Language::Markdown {
-        let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 6)?;
-        let line_count = text.lines().count();
-        // For markdown, use identity map (headers are extracted with their source structure)
-        let line_map = (1..=line_count).collect();
+        let (text, spans, line_map) = extract_markdown_headers_with_spans(source, tree, 1, 6)?;
         return Ok((text, spans, line_map));
     }
 
