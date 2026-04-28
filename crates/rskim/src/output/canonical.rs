@@ -886,9 +886,9 @@ pub(crate) struct LogResult {
     /// Number of stack frames elided from all captured traces (last 3 per trace kept).
     ///
     /// # AD-LOG-10 (2026-04-11)
-    /// When non-zero, a `(+{n} stack frames elided)` footer is appended to the
-    /// text render so agents know stack traces were truncated. Zero means either
-    /// no traces were encountered or all frames fit within the 3-frame window.
+    /// When non-zero, a `(+{n} frames elided)` footer is appended to the text
+    /// render so agents know stack traces were truncated. Zero means either no
+    /// traces were encountered or all frames fit within the 3-frame window.
     #[serde(default)]
     pub(crate) stack_frames_elided: usize,
     #[serde(default, skip_serializing)]
