@@ -358,16 +358,13 @@ fn test_line_numbers_structure_mode_large_source_gap() {
     );
 
     // The last collapsed line belongs to gap() at source line 9.
-    let gap_annotation = collapsed_lines
-        .last()
-        .expect("at least one collapsed line");
+    let gap_annotation = collapsed_lines.last().expect("at least one collapsed line");
 
     assert_eq!(
         gap_annotation.0, 9,
         "gap() is on source line 9 but got annotation {} for {:?}. \
          An 'output index + 1' algorithm would return the output position, not 9.",
-        gap_annotation.0,
-        gap_annotation.1,
+        gap_annotation.0, gap_annotation.1,
     );
 
     // The 5 comments must be annotated with source lines 4-8, not 2-6.
@@ -387,7 +384,8 @@ fn test_line_numbers_structure_mode_large_source_gap() {
     for (i, &(src_line, _)) in comment_lines.iter().enumerate() {
         let expected = 4 + i; // source lines 4,5,6,7,8
         assert_eq!(
-            src_line, expected,
+            src_line,
+            expected,
             "comment {} should have source line {}, got {}. \
              Output position {} with source line 4 → an index-only algorithm would give {}.",
             i + 1,

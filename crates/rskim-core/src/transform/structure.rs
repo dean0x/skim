@@ -4,8 +4,8 @@
 //!
 //! Token reduction target: 70-80%
 
-use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::transform::compute_line_starts;
+use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::transform::truncate::NodeSpan;
 use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
 use crate::{Language, Result, SkimError, TransformConfig};
@@ -713,7 +713,10 @@ mod offset_map_tests {
         // Output line 2 ("// end") starts at output byte 30.
         // source_byte = output_byte - delta = 30 - (-2) = 32.
         // Source line_starts = [0, 17, 30, 32, 39]; binary_search(32) = Ok(3) → line 4.
-        assert_eq!(map[1], 4, "output line 2 ('// end') should map to source line 4");
+        assert_eq!(
+            map[1], 4,
+            "output line 2 ('// end') should map to source line 4"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1015,8 +1018,16 @@ mod markdown_line_map_tests {
              got line_map[0] = {}. A sequential-index implementation would give 1 here.",
             line_map[0]
         );
-        assert_eq!(line_map[1], 2, "## H2 is at source line 2, got {}", line_map[1]);
-        assert_eq!(line_map[2], 1, "# H1 is at source line 1, got {}", line_map[2]);
+        assert_eq!(
+            line_map[1], 2,
+            "## H2 is at source line 2, got {}",
+            line_map[1]
+        );
+        assert_eq!(
+            line_map[2], 1,
+            "# H1 is at source line 1, got {}",
+            line_map[2]
+        );
     }
 
     /// A markdown document with a single header deep in the file must map to

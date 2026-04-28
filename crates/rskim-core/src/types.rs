@@ -288,8 +288,7 @@ impl Language {
             // Content line i (0-indexed within content) gets source_line:
             //   source_line_count - n_content + 1 + i  (1-indexed)
             let source_line_count = text.lines().count();
-            let truncated =
-                crate::transform::truncate::simple_last_line_truncate(&text, self, n)?;
+            let truncated = crate::transform::truncate::simple_last_line_truncate(&text, self, n)?;
             let line_map = if config.line_numbers {
                 if source_line_count <= n {
                     // No truncation occurred: identity map
@@ -323,8 +322,7 @@ impl Language {
                 // After simple_line_truncate the output is a prefix of the source
                 // (with an optional trailing truncation marker). Build the map by
                 // matching output lines to source lines in order.
-                let map =
-                    crate::transform::compute_line_map_by_text_matching(source, &truncated);
+                let map = crate::transform::compute_line_map_by_text_matching(source, &truncated);
                 Some(map)
             } else {
                 None
