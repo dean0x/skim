@@ -214,7 +214,7 @@ pub(crate) fn compute_line_map_by_text_matching(source: &str, output: &str) -> V
             if *source_line == *output_line {
                 let source_line_num = source_pos + offset + 1; // 1-indexed
                 result.push(source_line_num);
-                source_pos = source_pos + offset + 1;
+                source_pos += offset + 1;
                 found = true;
                 break;
             }
@@ -578,15 +578,12 @@ mod tests {
         //
         // For this test we just verify that the first output line maps to source
         // line 1, even after inline removal (which text-matching would fail).
-        let source_bytes = source.as_bytes();
         // `: int` starts after "def foo(a"
         let a_end = 9usize; // byte after 'a'
         let colon_int_end = a_end + ": int".len(); // 14
-        let arrow_start = colon_int_end; // " -> str" starts at 14
-        let arrow_end = arrow_start + " -> str".len(); // 21
-                                                       // ranges remove ": int" and " -> str", producing "def foo(a):"
-        let ranges = [(a_end, colon_int_end), (arrow_start, arrow_end)];
-        let _ = source_bytes; // suppress unused warning
+        // " -> str" starts at 14; ranges remove ": int" and " -> str", producing "def foo(a):"
+        let arrow_end = colon_int_end + " -> str".len(); // 21
+        let ranges = [(a_end, colon_int_end), (colon_int_end, arrow_end)];
         let map = compute_line_map_from_removed_ranges(source, &ranges);
         // First output line ("def foo(a):...") must map to source line 1.
         assert_eq!(

@@ -216,7 +216,7 @@ pub(crate) fn compute_source_line_map_from_offset_map(
     // If the output ends with '\n', the last entry in output_line_starts is a
     // phantom "start of the next line" that has no actual content — the number of
     // real lines equals output_line_starts.len() minus that phantom entry.
-    let output_lines = if output.ends_with('\n') && !output.is_empty() {
+    let output_lines = if output.ends_with('\n') {
         output_line_starts.len().saturating_sub(1)
     } else {
         output_line_starts.len()
@@ -260,11 +260,9 @@ pub(crate) fn compute_source_line_map_from_offset_map(
                     break;
                 }
             }
-            let delta = applicable_delta;
-
             // source_byte = output_byte - delta (clamped to [0, source.len()])
-            let source_byte = (output_byte as i64 - delta).max(0) as usize;
-            let source_byte = source_byte.min(source.len());
+            let source_byte =
+                ((output_byte as i64 - applicable_delta).max(0) as usize).min(source.len());
 
             // Binary search for the 1-indexed line number
             match source_line_starts.binary_search(&source_byte) {
@@ -424,16 +422,7 @@ fn build_spans_from_top_level_nodes(
     let mut spans = Vec::new();
 
     // Pre-compute line starts in the output for byte-to-line conversion
-    let line_starts: Vec<usize> =
-        std::iter::once(0)
-            .chain(output.bytes().enumerate().filter_map(|(i, b)| {
-                if b == b'\n' {
-                    Some(i + 1)
-                } else {
-                    None
-                }
-            }))
-            .collect();
+    let line_starts = crate::transform::compute_line_starts(output.as_bytes());
 
     let byte_to_line = |byte_pos: usize| -> usize {
         match line_starts.binary_search(&byte_pos) {

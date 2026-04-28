@@ -364,19 +364,10 @@ fn test_line_numbers_structure_mode_large_source_gap() {
 
     assert_eq!(
         gap_annotation.0, 9,
-        "gap() is on source line 9 but output position {} ({}). \
-         An 'output index + 1' algorithm would return {} here, not 9.",
-        numbered
-            .iter()
-            .position(|(n, c)| *n == gap_annotation.0 && c.contains("/* ... */"))
-            .map(|p| p + 1)
-            .unwrap_or(0),
+        "gap() is on source line 9 but got annotation {} for {:?}. \
+         An 'output index + 1' algorithm would return the output position, not 9.",
+        gap_annotation.0,
         gap_annotation.1,
-        numbered
-            .iter()
-            .position(|(n, c)| *n == gap_annotation.0 && c.contains("/* ... */"))
-            .map(|p| p + 1)
-            .unwrap_or(0),
     );
 
     // The 5 comments must be annotated with source lines 4-8, not 2-6.
