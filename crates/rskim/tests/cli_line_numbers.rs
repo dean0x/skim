@@ -280,29 +280,45 @@ fn test_line_numbers_structure_mode_skips_body_lines() {
     }
 }
 
-/// AC-2 gap test: a function preceded by many blank/comment lines so that the
-/// function signature source line number is much larger than its output position.
-/// This proves the annotation reflects true source lines, not output indices.
+/// AC-2 gap test: source line numbers must diverge from output positions.
+///
+/// Source layout (11 lines):
+///   1:  "function first(): void {"   ← collapsed in structure mode
+///   2:  "  return;"                  ← hidden by collapse
+///   3:  "}"                          ← hidden by collapse
+///   4:  "// comment 1"
+///   5:  "// comment 2"
+///   6:  "// comment 3"
+///   7:  "// comment 4"
+///   8:  "// comment 5"
+///   9:  "function gap(): void {"     ← collapsed signature
+///   10: "  return;"                  ← hidden
+///   11: "}"                          ← hidden
+///
+/// Structure output (7 lines):
+///   output 1 → first() collapsed      → source line 1
+///   output 2 → "// comment 1"         → source line 4
+///   output 3 → "// comment 2"         → source line 5
+///   output 4 → "// comment 3"         → source line 6
+///   output 5 → "// comment 4"         → source line 7
+///   output 6 → "// comment 5"         → source line 8
+///   output 7 → gap() collapsed        → source line 9
+///
+/// KEY PROPERTY: output position 7 != source line 9.
+/// An algorithm that returns "output index + 1" would annotate gap() as line 7,
+/// not line 9. This test fails for that algorithm.
 #[test]
 fn test_line_numbers_structure_mode_large_source_gap() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("gap.ts");
-    // Source layout:
-    //   1:  "// line 1"
-    //   2:  "// line 2"
-    //   3:  "// line 3"
-    //   4:  "// line 4"
-    //   5:  "// line 5"
-    //   6:  "function gap(): void {"
-    //   7:  "  return;"
-    //   8:  "}"
-    // Structure output (6 lines: 5 comments + 1 collapsed signature):
-    //   output line 6 must carry source line 6, NOT output line index 6.
+
+    // Build source: collapsed preamble function, then 5 comments, then target function.
     let mut content = String::new();
+    content.push_str("function first(): void {\n  return;\n}\n"); // lines 1-3 (collapsed)
     for i in 1..=5 {
-        content.push_str(&format!("// line {}\n", i));
+        content.push_str(&format!("// comment {}\n", i)); // lines 4-8
     }
-    content.push_str("function gap(): void {\n  return;\n}\n");
+    content.push_str("function gap(): void {\n  return;\n}\n"); // lines 9-11
     std::fs::write(&file, &content).unwrap();
 
     let output = skim_cmd()
@@ -327,27 +343,75 @@ fn test_line_numbers_structure_mode_large_source_gap() {
         })
         .collect();
 
-    // Find the collapsed signature line
-    let collapsed = numbered
+    // The second collapsed function is at source line 9.
+    // Collect all collapsed lines and find the one for gap().
+    let collapsed_lines: Vec<(usize, &str)> = numbered
         .iter()
-        .find(|(_, c)| c.contains("/* ... */"))
-        .expect("Must have a collapsed body line");
+        .filter(|(_, c)| c.contains("/* ... */"))
+        .copied()
+        .collect();
 
-    assert_eq!(
-        collapsed.0, 6,
-        "Function on source line 6 must be annotated as line 6, got {}. \
-         If this returns the output position (also 6 here) it still passes — \
-         but the 5 comment lines above have source lines 1-5, which equals \
-         their output positions, so if the algorithm just uses output indices \
-         all these assertions pass trivially. The real proof is in AC-2b/AC-2c.",
-        collapsed.0
+    assert!(
+        collapsed_lines.len() >= 2,
+        "Expected at least 2 collapsed function signatures, got {:?}",
+        collapsed_lines
     );
 
-    // Verify none of the body lines (7-8) appear in the output
+    // The last collapsed line belongs to gap() at source line 9.
+    let gap_annotation = collapsed_lines
+        .last()
+        .expect("at least one collapsed line");
+
+    assert_eq!(
+        gap_annotation.0, 9,
+        "gap() is on source line 9 but output position {} ({}). \
+         An 'output index + 1' algorithm would return {} here, not 9.",
+        numbered
+            .iter()
+            .position(|(n, c)| *n == gap_annotation.0 && c.contains("/* ... */"))
+            .map(|p| p + 1)
+            .unwrap_or(0),
+        gap_annotation.1,
+        numbered
+            .iter()
+            .position(|(n, c)| *n == gap_annotation.0 && c.contains("/* ... */"))
+            .map(|p| p + 1)
+            .unwrap_or(0),
+    );
+
+    // The 5 comments must be annotated with source lines 4-8, not 2-6.
+    let comment_lines: Vec<(usize, &str)> = numbered
+        .iter()
+        .filter(|(_, c)| c.contains("// comment"))
+        .copied()
+        .collect();
+
+    assert_eq!(
+        comment_lines.len(),
+        5,
+        "Expected 5 comment lines in output, got {:?}",
+        comment_lines
+    );
+
+    for (i, &(src_line, _)) in comment_lines.iter().enumerate() {
+        let expected = 4 + i; // source lines 4,5,6,7,8
+        assert_eq!(
+            src_line, expected,
+            "comment {} should have source line {}, got {}. \
+             Output position {} with source line 4 → an index-only algorithm would give {}.",
+            i + 1,
+            expected,
+            src_line,
+            i + 2, // output position (first() is output line 1)
+            i + 2,
+        );
+    }
+
+    // Body lines (10-11) must not appear in structure output.
     for &(num, _) in &numbered {
         assert!(
-            num != 7 && num != 8,
-            "Body lines 7 and 8 should not appear in structure output, but got line {}",
+            num != 10 && num != 11,
+            "Body lines 10 and 11 should not appear in structure output, but got source line {}",
             num
         );
     }

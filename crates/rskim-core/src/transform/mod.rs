@@ -648,4 +648,32 @@ mod tests {
         let result = normalize_line_map_blanks("", vec![]);
         assert!(result.is_empty());
     }
+
+    // ========================================================================
+    // byte_to_line boundary: newline byte sits on the line it terminates
+    // ========================================================================
+
+    /// When a removed range includes only the newline byte between two lines,
+    /// the two lines are joined in the output. Verify the output line maps to
+    /// source line 1 (the line whose bytes appear first in the output).
+    ///
+    /// source = "ab\ncd\n" (bytes: a=0, b=1, \n=2, c=3, d=4, \n=5)
+    /// Remove bytes 2..3 (the first newline) → output = "abcd\n"
+    /// The only output line starts with bytes from source line 1, so the map
+    /// must be [1].  This exercises binary_search hitting Err(1) for pos=2
+    /// (the newline byte itself), which must return source line 1, not 2.
+    #[test]
+    fn test_from_ranges_newline_byte_boundary() {
+        let source = "ab\ncd\n";
+        // Remove bytes 2..3 (the '\n' at the end of "ab")
+        let ranges = [(2usize, 3usize)];
+        let map = compute_line_map_from_removed_ranges(source, &ranges);
+        // Output: "abcd\n" — one line whose first byte ('a') is on source line 1.
+        assert_eq!(
+            map,
+            vec![1],
+            "Joining two lines by removing only the newline must map output line to source line 1, got {:?}",
+            map
+        );
+    }
 }

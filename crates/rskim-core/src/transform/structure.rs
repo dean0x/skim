@@ -918,3 +918,136 @@ mod offset_map_tests {
         );
     }
 }
+
+// ============================================================================
+// Unit tests for extract_markdown_headers_with_spans line map
+// ============================================================================
+
+#[cfg(test)]
+mod markdown_line_map_tests {
+    use super::extract_markdown_headers_with_spans;
+    use crate::{Language, Parser};
+
+    /// Parse markdown with tree-sitter and return the source line map from
+    /// `extract_markdown_headers_with_spans`.
+    fn parse_and_extract_line_map(source: &str) -> Vec<usize> {
+        let mut parser = Parser::new(Language::Markdown).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let (_text, _spans, line_map) =
+            extract_markdown_headers_with_spans(source, &tree, 1, 6).unwrap();
+        line_map
+    }
+
+    /// Headers at non-contiguous source lines: the returned line map must
+    /// contain actual 1-indexed source line numbers, NOT sequential output
+    /// positions (1, 2, 3, ...).
+    ///
+    /// Source (9 lines + trailing newline):
+    ///   1: "# Title"
+    ///   2: ""
+    ///   3: "Some text."
+    ///   4: ""
+    ///   5: "## Section"
+    ///   6: ""
+    ///   7: "More text."
+    ///   8: ""
+    ///   9: "### Sub"
+    ///
+    /// The function uses a DFS stack that pops children in reverse order, so
+    /// headers are collected as [### Sub (line 9), ## Section (line 5), # Title (line 1)].
+    /// The line map is therefore [9, 5, 1] — all values are true source line numbers,
+    /// and none equals the sequential output positions 1, 2, 3.
+    ///
+    /// KEY: each map[i] must equal the source row of that header node (tree-sitter
+    /// `node.start_position().row + 1`). A broken implementation that uses
+    /// sequential output positions would yield [1, 2, 3] and fail here.
+    #[test]
+    fn test_markdown_line_map_non_contiguous_headers() {
+        let source = "# Title\n\nSome text.\n\n## Section\n\nMore text.\n\n### Sub\n";
+        let line_map = parse_and_extract_line_map(source);
+
+        assert_eq!(
+            line_map.len(),
+            3,
+            "expected 3 output lines (one per header), got {:?}",
+            line_map
+        );
+
+        // All three values must be real source lines (1, 5, 9), not positions (1, 2, 3).
+        // The DFS stack reversal means they appear in reverse order [9, 5, 1].
+        let mut sorted = line_map.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![1, 5, 9],
+            "line map must contain source lines {{1, 5, 9}}, got {:?}",
+            line_map
+        );
+
+        // Verify no map entry equals a sequential output position (1, 2, 3).
+        // If the implementation incorrectly uses output-position indexing, all three
+        // entries would be 1, 2, or 3. Source line 9 cannot equal any of those.
+        assert!(
+            line_map.contains(&9),
+            "### Sub is at source line 9 — must appear in line map, got {:?}",
+            line_map
+        );
+        assert!(
+            line_map.contains(&5),
+            "## Section is at source line 5 — must appear in line map, got {:?}",
+            line_map
+        );
+        assert!(
+            line_map.contains(&1),
+            "# Title is at source line 1 — must appear in line map, got {:?}",
+            line_map
+        );
+    }
+
+    /// Source with headers on consecutive lines (no interleaved prose).
+    /// Because the DFS stack reverses child order, the map is [3, 2, 1] —
+    /// this still confirms real source lines, not sequential output positions
+    /// (which would also be [1, 2, 3], indistinguishable from correct forward order).
+    ///
+    /// The key invariant: map[0] = 3 (source line of ### H3), not 1.
+    #[test]
+    fn test_markdown_line_map_consecutive_headers() {
+        let source = "# H1\n## H2\n### H3\n";
+        let line_map = parse_and_extract_line_map(source);
+
+        assert_eq!(line_map.len(), 3, "expected 3 headers, got {:?}", line_map);
+
+        // DFS stack reversal: first popped is ### H3 (source line 3).
+        // A sequential-output-position implementation would give map[0] == 1.
+        // The real source-line implementation gives map[0] == 3.
+        assert_eq!(
+            line_map[0], 3,
+            "### H3 is at source line 3 and is collected first (DFS stack reversal), \
+             got line_map[0] = {}. A sequential-index implementation would give 1 here.",
+            line_map[0]
+        );
+        assert_eq!(line_map[1], 2, "## H2 is at source line 2, got {}", line_map[1]);
+        assert_eq!(line_map[2], 1, "# H1 is at source line 1, got {}", line_map[2]);
+    }
+
+    /// A markdown document with a single header deep in the file must map to
+    /// the correct source line, not to output position 1.
+    ///
+    /// # Deep Header is at source line 5. A broken sequential-position
+    /// implementation would map it to output line 1 (always 1 for a single header).
+    /// Since source line 5 != output position 1, this test catches that regression.
+    #[test]
+    fn test_markdown_line_map_single_deep_header() {
+        // Header at source line 5 (after 4 lines of prose)
+        let source = "Intro line.\n\nAnother para.\n\n# Deep Header\n\nTrailing text.\n";
+        let line_map = parse_and_extract_line_map(source);
+
+        assert_eq!(line_map.len(), 1, "expected 1 header, got {:?}", line_map);
+        assert_eq!(
+            line_map[0], 5,
+            "# Deep Header is on source line 5, got {}. \
+             A sequential-position implementation would give 1, not 5.",
+            line_map[0]
+        );
+    }
+}
