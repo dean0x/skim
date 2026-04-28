@@ -2207,7 +2207,7 @@ pub(crate) struct ShowCommitResult {
     ///
     /// # AD-GIT-8 (2026-04-11)
     /// Preserved verbatim with 4-space indent stripped. Appended to text render
-    /// as `\n\n{body}` only when non-empty.
+    /// as `\n{body}` only when non-empty.
     #[serde(default)]
     pub(crate) body: String,
     /// Merge parent hashes, when present (e.g. `"abc123 def456"`).
@@ -2232,7 +2232,7 @@ impl ShowCommitResult {
     /// # AD-GIT-8 (2026-04-11)
     /// `body` and `parents` are new required parameters. `parents` renders as
     /// `Merge: {parents}\n` before the summary line. `body` renders as
-    /// `\n\n{body}` after the summary only when non-empty.
+    /// `\n{body}` after the summary only when non-empty.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         hash: String,
@@ -2270,7 +2270,7 @@ impl ShowCommitResult {
     ///
     /// # AD-GIT-8 (2026-04-11)
     /// - `parents` (when `Some`) is prepended as `Merge: {parents}\n` before the summary.
-    /// - `body` (when non-empty) is appended as `\n\n{body}` after the summary.
+    /// - `body` (when non-empty) is appended as `\n{body}` after the summary.
     /// - Empty body produces no trailing newlines, keeping subject-only commits compact.
     fn render(
         hash: &str,
@@ -2328,12 +2328,12 @@ impl ShowCommitResult {
             for file in &self.files {
                 let _ = write!(
                     output,
-                    "\n  {} ({}, {} regions)",
+                    "\n {} ({}, {} regions)",
                     file.path, file.status, file.changed_regions
                 );
             }
             if !self.body.is_empty() {
-                let _ = write!(output, "\n\n{}", self.body);
+                let _ = write!(output, "\n{}", self.body);
             }
             self.rendered = output;
         }
