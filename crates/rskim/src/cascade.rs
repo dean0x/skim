@@ -25,9 +25,23 @@ pub(crate) struct TruncationOptions {
 const NO_OUTPUT_MSG: &str = "Token budget cascade: no transformation mode produced output. \
     Ensure the file is in a supported language or specify --language.";
 
-/// Build a `TransformConfig` from mode and truncation options.
+/// Build a `TransformConfig` from mode, truncation options, and line number flag.
+///
+/// The `line_numbers` parameter controls whether the config requests a source line
+/// map from `transform_with_line_map`. When building configs for token-budget cascade
+/// mode selection, `line_numbers` should be `false` (line numbers are applied after
+/// mode selection is complete).
 pub(crate) fn build_config(mode: Mode, trunc: &TruncationOptions) -> TransformConfig {
-    let mut config = TransformConfig::with_mode(mode);
+    build_config_with_opts(mode, trunc, false)
+}
+
+/// Build a `TransformConfig` with explicit line_numbers flag.
+pub(crate) fn build_config_with_opts(
+    mode: Mode,
+    trunc: &TruncationOptions,
+    line_numbers: bool,
+) -> TransformConfig {
+    let mut config = TransformConfig::with_mode(mode).with_line_numbers(line_numbers);
     if let Some(n) = trunc.max_lines {
         config = config.with_max_lines(n);
     }

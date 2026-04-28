@@ -4,20 +4,13 @@
 //!
 //! Token reduction target: 70-80%
 
+use crate::transform::compute_line_starts;
+use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::transform::truncate::NodeSpan;
 use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
-
-/// Maximum AST recursion depth to prevent stack overflow attacks
-const MAX_AST_DEPTH: usize = 500;
-
-/// Maximum number of AST nodes to prevent memory exhaustion
-const MAX_AST_NODES: usize = 100_000;
-
-/// Maximum markdown traversal depth to prevent stack overflow
-const MAX_MARKDOWN_DEPTH: usize = 500;
 
 /// Maximum number of markdown headers to prevent memory exhaustion
 const MAX_MARKDOWN_HEADERS: usize = 10_000;
@@ -37,15 +30,6 @@ const MAX_MARKDOWN_HEADERS: usize = 10_000;
 /// - Function bodies → `/* ... */`
 /// - Implementation details
 /// - Non-structural comments
-///
-/// # Implementation Notes (Week 2)
-///
-/// 1. Traverse AST with TreeCursor
-/// 2. For each function/method node:
-///    - Extract signature (everything before `{`)
-///    - Replace body with `/* ... */`
-/// 3. For classes: keep structure, strip method bodies
-/// 4. Preserve indentation
 #[cfg(test)]
 #[allow(dead_code)] // Convenience wrapper available for tests
 pub(crate) fn transform_structure(
@@ -63,13 +47,39 @@ pub(crate) fn transform_structure_with_spans(
     source: &str,
     tree: &Tree,
     language: Language,
-    _config: &TransformConfig,
+    config: &TransformConfig,
 ) -> Result<(String, Vec<NodeSpan>)> {
+    let (text, spans, _line_map) =
+        transform_structure_with_spans_and_line_map(source, tree, language, config)?;
+    Ok((text, spans))
+}
+
+/// Transform to structure-only, returning NodeSpan metadata AND a source line map.
+///
+/// The source line map maps each output line index to the 1-indexed source line
+/// number. For verbatim-copied regions, the source line is the original line number.
+/// The replacement `{ /* ... */ }` stays on the same line as the function signature
+/// (no newlines in the replacement), so no output line ever starts inside a
+/// replacement region — all output line starts are in verbatim-copied regions
+/// where the reverse offset mapping is exact.
+///
+/// # Design Decision (AC-18)
+/// Structure mode uses a byte-offset reverse mapping to determine which source line
+/// corresponds to each output line start byte. The `offset_map` (source_end_byte, delta)
+/// pairs allow reverse-mapping: output_byte = source_byte + delta, so
+/// source_byte = output_byte - delta. Binary search on the output byte position
+/// in the offset map gives the correct delta for any output line start.
+pub(crate) fn transform_structure_with_spans_and_line_map(
+    source: &str,
+    tree: &Tree,
+    language: Language,
+    _config: &TransformConfig,
+) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     // ARCHITECTURE: Markdown uses extraction, not replacement
     // Extract H1-H3 headers only (top-level document structure)
     if language == Language::Markdown {
-        let (text, spans) = extract_markdown_headers_with_spans(source, tree, 1, 3)?;
-        return Ok((text, spans));
+        let (text, spans, line_map) = extract_markdown_headers_with_spans(source, tree, 1, 3)?;
+        return Ok((text, spans, line_map));
     }
 
     // Get language-specific node types
@@ -105,8 +115,11 @@ pub(crate) fn transform_structure_with_spans(
     sorted_replacements.sort_unstable_by_key(|(range, _)| range.0);
 
     // Track cumulative byte offset delta (output_pos - source_pos)
+    // offset_map entries: (source_end_byte, cumulative_delta)
+    // Invariant: for any output byte O in a verbatim region, source byte S = O - delta
+    //            where delta is the latest entry with source_end_byte <= S.
     let mut offset_delta: i64 = 0;
-    let mut offset_map: Vec<(usize, i64)> = Vec::new(); // (source_byte, delta)
+    let mut offset_map: Vec<(usize, i64)> = Vec::new(); // (source_byte_end, delta)
 
     for ((start, end), replacement) in sorted_replacements {
         // Validate byte ranges
@@ -166,7 +179,98 @@ pub(crate) fn transform_structure_with_spans(
     // Build NodeSpans from top-level AST children
     let spans = build_spans_from_top_level_nodes(tree, &result, &offset_map);
 
-    Ok((result, spans))
+    // Build source line map using offset_map to reverse-map output bytes to source lines
+    let source_line_map = compute_source_line_map_from_offset_map(source, &result, &offset_map);
+
+    Ok((result, spans, source_line_map))
+}
+
+/// Compute the source line map for structure mode output using the offset_map.
+///
+/// For each output line (by its start byte offset), reverse-maps to a source byte
+/// offset using the offset_map, then binary-searches source line starts to get
+/// the 1-indexed source line number.
+///
+/// # Correctness Invariant
+/// The replacement text `" { /* ... */ }"` contains no newlines. Therefore no
+/// output line ever starts inside a replacement region — all output line start
+/// bytes are in verbatim-copied regions where the reverse mapping is exact.
+pub(crate) fn compute_source_line_map_from_offset_map(
+    source: &str,
+    output: &str,
+    offset_map: &[(usize, i64)],
+) -> Vec<usize> {
+    // Empty output produces no output lines — return early before computing starts.
+    if output.is_empty() {
+        return Vec::new();
+    }
+
+    // Pre-compute source and output line start byte offsets.
+    // Newlines are always ASCII (single byte); see `compute_line_starts` for details.
+    let source_line_starts: Vec<usize> = compute_line_starts(source.as_bytes());
+    let output_line_starts: Vec<usize> = compute_line_starts(output.as_bytes());
+
+    // Derive the output line count from the already-computed starts vector rather
+    // than calling output.lines().count() again (avoids a second full scan).
+    // output_line_starts always has at least 1 entry (the leading 0 for line 1).
+    // If the output ends with '\n', the last entry in output_line_starts is a
+    // phantom "start of the next line" that has no actual content — the number of
+    // real lines equals output_line_starts.len() minus that phantom entry.
+    let output_lines = if output.ends_with('\n') {
+        output_line_starts.len().saturating_sub(1)
+    } else {
+        output_line_starts.len()
+    };
+
+    // Build source_line_map: for each output line, find its 1-indexed source line.
+    // We take only `output_lines` entries from output_line_starts since trailing
+    // newlines add a phantom entry.
+    //
+    // The offset_map is sorted by source_end_byte and output positions are visited
+    // in ascending order, so we use a monotonic cursor instead of scanning from the
+    // start for every output line. This reduces complexity from O(L*R) to O(L+R).
+    let mut cursor_idx = 0usize; // monotonic cursor into offset_map
+    let mut applicable_delta = 0i64; // delta valid for the current cursor position
+
+    output_line_starts
+        .iter()
+        .take(output_lines)
+        .map(|&output_byte| {
+            // Advance the monotonic cursor while the next offset_map entry's output
+            // end byte is still <= output_byte.  Since output bytes are visited in
+            // non-decreasing order we never need to reset the cursor.
+            //
+            // For entry (src_end, d), the output position of that boundary is:
+            //   output_end = src_end as i64 + d
+            // Guard: if output_end < 0 the replacement shrank output past zero —
+            // skip the entry rather than wrapping a usize cast.
+            while cursor_idx < offset_map.len() {
+                let (src_end, d) = offset_map[cursor_idx];
+                let output_end = src_end as i64 + d;
+                if output_end < 0 {
+                    // Invariant violation: replacement cannot produce negative output
+                    // position. Skip safely.
+                    cursor_idx += 1;
+                    continue;
+                }
+                if output_end as usize <= output_byte {
+                    applicable_delta = d;
+                    cursor_idx += 1;
+                } else {
+                    break;
+                }
+            }
+            // source_byte = output_byte - delta (clamped to [0, source.len()])
+            let source_byte =
+                ((output_byte as i64 - applicable_delta).max(0) as usize).min(source.len());
+
+            // Binary search for the 1-indexed line number
+            match source_line_starts.binary_search(&source_byte) {
+                Ok(idx) => idx + 1,     // Exact match: this byte IS a line start
+                Err(idx) => idx.max(1), // Inexact: line idx (1-indexed)
+            }
+        })
+        .collect()
 }
 
 /// Recursively collect body nodes that should be replaced
@@ -318,16 +422,7 @@ fn build_spans_from_top_level_nodes(
     let mut spans = Vec::new();
 
     // Pre-compute line starts in the output for byte-to-line conversion
-    let line_starts: Vec<usize> =
-        std::iter::once(0)
-            .chain(output.bytes().enumerate().filter_map(|(i, b)| {
-                if b == b'\n' {
-                    Some(i + 1)
-                } else {
-                    None
-                }
-            }))
-            .collect();
+    let line_starts = crate::transform::compute_line_starts(output.as_bytes());
 
     let byte_to_line = |byte_pos: usize| -> usize {
         match line_starts.binary_search(&byte_pos) {
@@ -381,7 +476,7 @@ fn build_spans_from_top_level_nodes(
 /// Only the header lines within the specified range
 ///
 /// # Security
-/// - Enforces MAX_MARKDOWN_DEPTH to prevent stack overflow
+/// - Enforces MAX_AST_DEPTH to prevent stack overflow
 /// - Enforces MAX_MARKDOWN_HEADERS to prevent memory exhaustion
 #[cfg(test)]
 #[allow(dead_code)] // Convenience wrapper available for tests
@@ -391,29 +486,42 @@ pub(crate) fn extract_markdown_headers(
     min_level: u32,
     max_level: u32,
 ) -> Result<String> {
-    let (text, _spans) = extract_markdown_headers_with_spans(source, tree, min_level, max_level)?;
+    let (text, _spans, _line_map) =
+        extract_markdown_headers_with_spans(source, tree, min_level, max_level)?;
     Ok(text)
 }
 
-/// Extract markdown headers with NodeSpan metadata for truncation
+/// Extract markdown headers with NodeSpan metadata and source line map for truncation.
 ///
 /// Each header gets its own span with "atx_heading" or "setext_heading" kind.
+/// The returned `Vec<usize>` is a per-output-line source line map: each entry is the
+/// 1-indexed source line number of the corresponding output line. Multi-line headers
+/// (setext headings have 2 lines) get consecutive source line numbers from the header's
+/// start line.
+///
+/// # Design Decision (AC-18)
+/// Previously this function used an identity map `(1..=line_count).collect()`, which
+/// annotated extracted headers as sequential lines 1, 2, 3 regardless of where they
+/// actually appeared in the source. Headers at source lines 1, 15, and 42 would be
+/// mis-annotated as lines 1, 2, 3. The fix threads `node.start_position().row + 1`
+/// through extraction so each header carries its true source position.
 pub(crate) fn extract_markdown_headers_with_spans(
     source: &str,
     tree: &Tree,
     min_level: u32,
     max_level: u32,
-) -> Result<(String, Vec<NodeSpan>)> {
-    let mut headers: Vec<(String, &'static str)> = Vec::new();
+) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
+    // Headers: (text, node_kind, source_start_line_1indexed)
+    let mut headers: Vec<(String, &'static str, usize)> = Vec::new();
     let root = tree.root_node();
 
     let mut visit_stack = vec![(0_usize, root)];
 
     while let Some((depth, node)) = visit_stack.pop() {
-        if depth > MAX_MARKDOWN_DEPTH {
+        if depth > MAX_AST_DEPTH {
             return Err(SkimError::ParseError(format!(
                 "Maximum markdown depth exceeded: {} (possible malicious input)",
-                MAX_MARKDOWN_DEPTH
+                MAX_AST_DEPTH
             )));
         }
 
@@ -445,7 +553,8 @@ pub(crate) fn extract_markdown_headers_with_spans(
                     let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
                         SkimError::ParseError(format!("UTF-8 error in header: {}", e))
                     })?;
-                    headers.push((header_text.to_string(), "atx_heading"));
+                    let source_start_line = node.start_position().row + 1;
+                    headers.push((header_text.to_string(), "atx_heading", source_start_line));
                 }
             }
         } else if node_type == "setext_heading" {
@@ -469,7 +578,8 @@ pub(crate) fn extract_markdown_headers_with_spans(
                 let header_text = node.utf8_text(source.as_bytes()).map_err(|e| {
                     SkimError::ParseError(format!("UTF-8 error in setext header: {}", e))
                 })?;
-                headers.push((header_text.to_string(), "setext_heading"));
+                let source_start_line = node.start_position().row + 1;
+                headers.push((header_text.to_string(), "setext_heading", source_start_line));
             }
         }
 
@@ -479,19 +589,465 @@ pub(crate) fn extract_markdown_headers_with_spans(
         }
     }
 
-    // Build text and spans
+    // Build text, spans, and source line map
     let mut spans = Vec::with_capacity(headers.len());
-    let mut current_line = 0;
+    let mut source_line_map: Vec<usize> = Vec::new();
+    let mut current_output_line = 0;
 
     let texts: Vec<String> = headers
         .into_iter()
-        .map(|(text, kind)| {
+        .map(|(text, kind, source_start_line)| {
             let line_count = text.lines().count().max(1);
-            spans.push(NodeSpan::new(current_line..current_line + line_count, kind));
-            current_line += line_count;
+            spans.push(NodeSpan::new(
+                current_output_line..current_output_line + line_count,
+                kind,
+            ));
+            // Map each output line to consecutive source lines from source_start_line.
+            // ATX headings are always 1 line; setext headings span 2 lines (text + underline).
+            for i in 0..line_count {
+                source_line_map.push(source_start_line + i);
+            }
+            current_output_line += line_count;
             text
         })
         .collect();
 
-    Ok((texts.join("\n"), spans))
+    Ok((texts.join("\n"), spans, source_line_map))
+}
+
+// ============================================================================
+// Unit tests for compute_source_line_map_from_offset_map
+// ============================================================================
+
+#[cfg(test)]
+mod offset_map_tests {
+    use super::compute_source_line_map_from_offset_map;
+
+    // -----------------------------------------------------------------------
+    // Helper: count '\n' bytes in a string up to `end` (exclusive)
+    // -----------------------------------------------------------------------
+    fn newlines_before(s: &str, end: usize) -> usize {
+        s[..end].bytes().filter(|&b| b == b'\n').count()
+    }
+
+    // -----------------------------------------------------------------------
+    // AC-11a: Identity case — no replacements
+    // -----------------------------------------------------------------------
+
+    /// Identity case: no replacements — output equals source, line map is 1-indexed identity.
+    #[test]
+    fn test_no_replacements_identity() {
+        let source = "line one\nline two\nline three\n";
+        let output = "line one\nline two\nline three\n";
+        let offset_map: Vec<(usize, i64)> = vec![];
+
+        let map = compute_source_line_map_from_offset_map(source, output, &offset_map);
+
+        assert_eq!(map.len(), 3, "expected 3 output lines");
+        assert_eq!(map[0], 1, "output line 1 -> source line 1");
+        assert_eq!(map[1], 2, "output line 2 -> source line 2");
+        assert_eq!(map[2], 3, "output line 3 -> source line 3");
+    }
+
+    // -----------------------------------------------------------------------
+    // AC-11b: Single replacement that shrinks output
+    // -----------------------------------------------------------------------
+
+    /// Source has a function spanning 3 lines; after body collapse the output
+    /// is 2 lines.  The trailing comment "// end" must resolve to source line 4.
+    ///
+    /// Source (4 lines + trailing newline):
+    ///   1: "function foo() {"
+    ///   2: "  return 42;"
+    ///   3: "}"
+    ///   4: "// end"
+    ///
+    /// Structure-mode output (2 lines):
+    ///   1: "function foo() { /* ... */ }"
+    ///   2: "// end"
+    ///
+    /// offset_map: [(src_end, delta)] where src_end is the byte after '}' (the
+    /// newline before "// end") and delta = len(" { /* ... */ }") - replaced_len.
+    #[test]
+    fn test_single_replacement_shrinks_output() {
+        // Source bytes (verified by enumeration):
+        //   "function foo() {\n  return 42;\n}\n// end\n"
+        //    0123456789...  15 16           29 30 31    38
+        //    '{' is at 15, '\n' at 16, '}' at 30, '\n' at 31
+        // body node bytes (tree-sitter would give): start=15 ('{'), end=31 ('\n' after '}')
+        // i.e. source[15..31] = "{\n  return 42;\n}"  (16 bytes)
+        // The replacement " { /* ... */ }" is 14 bytes; delta = 14 - 16 = -2.
+        let source = "function foo() {\n  return 42;\n}\n// end\n";
+        //                             ^15            ^30^31     ^38
+        let body_start: usize = 15; // start of '{'
+        let body_end: usize = 31; // first byte after '}': the '\n' before "// end"
+
+        assert_eq!(
+            &source[body_start..body_end],
+            "{\n  return 42;\n}",
+            "sanity-check body slice"
+        );
+
+        let repl = " { /* ... */ }"; // 14 bytes
+        let delta: i64 = repl.len() as i64 - (body_end - body_start) as i64; // 14 - 16 = -2
+
+        // output = "function foo() " + repl + "\n// end\n"
+        let output = format!("{}{}{}", &source[..body_start], repl, &source[body_end..]);
+        // output = "function foo()  { /* ... */ }\n// end\n"
+        //           bytes 0-14 (15) + bytes 15-28 (14) = '\n' at 29; "// end" starts at 30
+        assert_eq!(
+            output.lines().count(),
+            2,
+            "output should have 2 lines, got: {:?}",
+            output
+        );
+
+        let offset_map = vec![(body_end, delta)];
+        let map = compute_source_line_map_from_offset_map(source, &output, &offset_map);
+
+        assert_eq!(map.len(), 2, "expected 2 output lines, got {}", map.len());
+
+        // Output line 1 (byte 0) maps to source line 1.
+        assert_eq!(map[0], 1, "output line 1 should map to source line 1");
+
+        // Output line 2 ("// end") starts at output byte 30.
+        // source_byte = output_byte - delta = 30 - (-2) = 32.
+        // Source line_starts = [0, 17, 30, 32, 39]; binary_search(32) = Ok(3) → line 4.
+        assert_eq!(
+            map[1], 4,
+            "output line 2 ('// end') should map to source line 4"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC-11c: Multiple replacements
+    // -----------------------------------------------------------------------
+
+    /// Two function bodies collapsed; content after each replacement must map to
+    /// the correct source line skipping over the collapsed lines.
+    #[test]
+    fn test_multiple_replacements() {
+        // Source:
+        //   1: "function a() {"    -- body start byte = len("function a() ")
+        //   2: "  return 1;"
+        //   3: "}"
+        //   4: "function b() {"
+        //   5: "  return 2;"
+        //   6: "}"
+        //   7: "// done"
+        //
+        // We place the replacement tokens directly so byte positions are exact.
+        let source = "function a() {\n  return 1;\n}\nfunction b() {\n  return 2;\n}\n// done\n";
+        let repl = " { /* ... */ }"; // 14 bytes
+
+        // body of a(): source[13..28] = "{\n  return 1;\n}"  (15 bytes)
+        let a_body_start = "function a() ".len(); // 13
+        let a_body_end = a_body_start + "{\n  return 1;\n}".len(); // 13 + 15 = 28
+        assert_eq!(
+            &source[a_body_start..a_body_end],
+            "{\n  return 1;\n}",
+            "sanity-check a body"
+        );
+        let delta1: i64 = repl.len() as i64 - (a_body_end - a_body_start) as i64;
+
+        // body of b(): starts at source[a_body_end + 1 + len("function b() ")]
+        // source[28] = '\n', then "function b() " starts at 29
+        let b_sig_start = a_body_end + 1; // 29 — start of "function b() {"
+        let b_body_start = b_sig_start + "function b() ".len(); // 29 + 13 = 42
+        let b_body_end = b_body_start + "{\n  return 2;\n}".len(); // 42 + 15 = 57
+        assert_eq!(
+            &source[b_body_start..b_body_end],
+            "{\n  return 2;\n}",
+            "sanity-check b body"
+        );
+        let delta2: i64 = delta1 + repl.len() as i64 - (b_body_end - b_body_start) as i64;
+
+        let output = format!(
+            "{}{}{}{}{}",
+            &source[..a_body_start],
+            repl,
+            &source[a_body_end..b_body_start],
+            repl,
+            &source[b_body_end..]
+        );
+        // output lines: "function a() ...", "function b() ...", "// done"
+        assert_eq!(
+            output.lines().count(),
+            3,
+            "output should have 3 lines, got: {:?}",
+            output
+        );
+
+        let offset_map = vec![(a_body_end, delta1), (b_body_end, delta2)];
+        let map = compute_source_line_map_from_offset_map(source, &output, &offset_map);
+
+        assert_eq!(map.len(), 3, "expected 3 output lines, got {}", map.len());
+        assert_eq!(map[0], 1, "first function -> source line 1");
+        assert_eq!(map[1], 4, "second function -> source line 4");
+
+        // "// done" is source line 7: 6 '\n' before it
+        let done_src_line = newlines_before(source, source.find("// done").unwrap()) + 1;
+        assert_eq!(
+            done_src_line, 7,
+            "sanity: '// done' should be source line 7"
+        );
+        assert_eq!(
+            map[2], done_src_line,
+            "'// done' should map to source line {}, got {}",
+            done_src_line, map[2]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC-11d: Replacement at file start
+    // -----------------------------------------------------------------------
+
+    /// When the first replacement spans from byte 0, output bytes before the
+    /// replacement's output-end all map back to source line 1.  Content after
+    /// the replacement maps to its correct later source line.
+    #[test]
+    fn test_replacement_at_file_start() {
+        // Source:
+        //   1: "/**"
+        //   2: " * docs"
+        //   3: " */"
+        //   4: "export const X = 1;"
+        let source = "/**\n * docs\n */\nexport const X = 1;\n";
+        // We fake a replacement of the first 3 lines (bytes 0..15) with "/* ... */".
+        // source[0..15] = "/**\n * docs\n */"  (15 bytes)
+        let block_end: usize = "/**\n * docs\n */".len(); // 15
+        assert_eq!(&source[..block_end], "/**\n * docs\n */");
+
+        let repl = "/* ... */"; // 9 bytes
+        let delta: i64 = repl.len() as i64 - block_end as i64; // 9 - 15 = -6
+
+        // output: "/* ... */\nexport const X = 1;\n"  (2 content lines)
+        let output = format!("{}{}", repl, &source[block_end..]);
+        assert_eq!(output.lines().count(), 2, "output should have 2 lines");
+
+        let offset_map = vec![(block_end, delta)];
+        let map = compute_source_line_map_from_offset_map(source, &output, &offset_map);
+
+        assert_eq!(map.len(), 2, "expected 2 output lines, got {}", map.len());
+        assert_eq!(map[0], 1, "replacement-at-start -> source line 1");
+
+        // "export const X = 1;" is source line 4
+        let export_src_line = newlines_before(source, source.find("export").unwrap()) + 1;
+        assert_eq!(export_src_line, 4, "sanity: export is source line 4");
+        assert_eq!(
+            map[1], export_src_line,
+            "'export const X = 1;' should map to source line {}, got {}",
+            export_src_line, map[1]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC-11e: Multi-line signature (parameters on separate lines)
+    // -----------------------------------------------------------------------
+
+    /// When the function signature itself spans multiple source lines, all verbatim
+    /// output lines before the collapsed body must carry correct source line numbers.
+    #[test]
+    fn test_multiline_signature_line_numbers() {
+        // Source:
+        //   1: "function complex("
+        //   2: "  a: number,"
+        //   3: "  b: string"
+        //   4: ") {"
+        //   5: "  return a;"
+        //   6: "}"
+        //   7: "const x = 1;"
+        let source =
+            "function complex(\n  a: number,\n  b: string\n) {\n  return a;\n}\nconst x = 1;\n";
+
+        let repl = " { /* ... */ }"; // 14 bytes
+
+        // body: ") {" — we replace from '{' on line 4 through '}' on line 6.
+        // "function complex(\n  a: number,\n  b: string\n) {" = 46 bytes; '{' is at 44
+        let prefix = "function complex(\n  a: number,\n  b: string\n) ";
+        let body_start = prefix.len(); // 45, the '{' on line 4
+
+        // body ends after '}': "{\n  return a;\n}" = 15 bytes → body_end = 45 + 15 = 60
+        let body_len = "{\n  return a;\n}".len(); // 15
+        let body_end = body_start + body_len; // 60
+
+        assert_eq!(
+            &source[body_start..body_end],
+            "{\n  return a;\n}",
+            "sanity-check body slice"
+        );
+
+        let delta: i64 = repl.len() as i64 - body_len as i64; // 14 - 15 = -1
+
+        let output = format!("{}{}{}", &source[..body_start], repl, &source[body_end..]);
+
+        // Output:
+        //   1: "function complex("
+        //   2: "  a: number,"
+        //   3: "  b: string"
+        //   4: ") { /* ... */ }"
+        //   5: "const x = 1;"
+        assert_eq!(output.lines().count(), 5, "output should have 5 lines");
+
+        let offset_map = vec![(body_end, delta)];
+        let map = compute_source_line_map_from_offset_map(source, &output, &offset_map);
+
+        assert_eq!(map.len(), 5, "expected 5 output lines, got {}", map.len());
+
+        // Lines 1-4 are verbatim from source lines 1-4
+        assert_eq!(map[0], 1, "output line 1 -> source line 1");
+        assert_eq!(map[1], 2, "output line 2 -> source line 2");
+        assert_eq!(map[2], 3, "output line 3 -> source line 3");
+        assert_eq!(map[3], 4, "output line 4 (collapsed body) -> source line 4");
+
+        // "const x = 1;" is source line 7
+        let const_src_line = newlines_before(source, source.find("const x").unwrap()) + 1;
+        assert_eq!(const_src_line, 7, "sanity: 'const x' is source line 7");
+        assert_eq!(
+            map[4], const_src_line,
+            "'const x = 1;' should map to source line {}, got {}",
+            const_src_line, map[4]
+        );
+    }
+}
+
+// ============================================================================
+// Unit tests for extract_markdown_headers_with_spans line map
+// ============================================================================
+
+#[cfg(test)]
+mod markdown_line_map_tests {
+    use super::extract_markdown_headers_with_spans;
+    use crate::{Language, Parser};
+
+    /// Parse markdown with tree-sitter and return the source line map from
+    /// `extract_markdown_headers_with_spans`.
+    fn parse_and_extract_line_map(source: &str) -> Vec<usize> {
+        let mut parser = Parser::new(Language::Markdown).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let (_text, _spans, line_map) =
+            extract_markdown_headers_with_spans(source, &tree, 1, 6).unwrap();
+        line_map
+    }
+
+    /// Headers at non-contiguous source lines: the returned line map must
+    /// contain actual 1-indexed source line numbers, NOT sequential output
+    /// positions (1, 2, 3, ...).
+    ///
+    /// Source (9 lines + trailing newline):
+    ///   1: "# Title"
+    ///   2: ""
+    ///   3: "Some text."
+    ///   4: ""
+    ///   5: "## Section"
+    ///   6: ""
+    ///   7: "More text."
+    ///   8: ""
+    ///   9: "### Sub"
+    ///
+    /// The function uses a DFS stack that pops children in reverse order, so
+    /// headers are collected as [### Sub (line 9), ## Section (line 5), # Title (line 1)].
+    /// The line map is therefore [9, 5, 1] — all values are true source line numbers,
+    /// and none equals the sequential output positions 1, 2, 3.
+    ///
+    /// KEY: each map[i] must equal the source row of that header node (tree-sitter
+    /// `node.start_position().row + 1`). A broken implementation that uses
+    /// sequential output positions would yield [1, 2, 3] and fail here.
+    #[test]
+    fn test_markdown_line_map_non_contiguous_headers() {
+        let source = "# Title\n\nSome text.\n\n## Section\n\nMore text.\n\n### Sub\n";
+        let line_map = parse_and_extract_line_map(source);
+
+        assert_eq!(
+            line_map.len(),
+            3,
+            "expected 3 output lines (one per header), got {:?}",
+            line_map
+        );
+
+        // All three values must be real source lines (1, 5, 9), not positions (1, 2, 3).
+        // The DFS stack reversal means they appear in reverse order [9, 5, 1].
+        let mut sorted = line_map.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![1, 5, 9],
+            "line map must contain source lines {{1, 5, 9}}, got {:?}",
+            line_map
+        );
+
+        // Verify no map entry equals a sequential output position (1, 2, 3).
+        // If the implementation incorrectly uses output-position indexing, all three
+        // entries would be 1, 2, or 3. Source line 9 cannot equal any of those.
+        assert!(
+            line_map.contains(&9),
+            "### Sub is at source line 9 — must appear in line map, got {:?}",
+            line_map
+        );
+        assert!(
+            line_map.contains(&5),
+            "## Section is at source line 5 — must appear in line map, got {:?}",
+            line_map
+        );
+        assert!(
+            line_map.contains(&1),
+            "# Title is at source line 1 — must appear in line map, got {:?}",
+            line_map
+        );
+    }
+
+    /// Source with headers on consecutive lines (no interleaved prose).
+    /// Because the DFS stack reverses child order, the map is [3, 2, 1] —
+    /// this still confirms real source lines, not sequential output positions
+    /// (which would also be [1, 2, 3], indistinguishable from correct forward order).
+    ///
+    /// The key invariant: map[0] = 3 (source line of ### H3), not 1.
+    #[test]
+    fn test_markdown_line_map_consecutive_headers() {
+        let source = "# H1\n## H2\n### H3\n";
+        let line_map = parse_and_extract_line_map(source);
+
+        assert_eq!(line_map.len(), 3, "expected 3 headers, got {:?}", line_map);
+
+        // DFS stack reversal: first popped is ### H3 (source line 3).
+        // A sequential-output-position implementation would give map[0] == 1.
+        // The real source-line implementation gives map[0] == 3.
+        assert_eq!(
+            line_map[0], 3,
+            "### H3 is at source line 3 and is collected first (DFS stack reversal), \
+             got line_map[0] = {}. A sequential-index implementation would give 1 here.",
+            line_map[0]
+        );
+        assert_eq!(
+            line_map[1], 2,
+            "## H2 is at source line 2, got {}",
+            line_map[1]
+        );
+        assert_eq!(
+            line_map[2], 1,
+            "# H1 is at source line 1, got {}",
+            line_map[2]
+        );
+    }
+
+    /// A markdown document with a single header deep in the file must map to
+    /// the correct source line, not to output position 1.
+    ///
+    /// # Deep Header is at source line 5. A broken sequential-position
+    /// implementation would map it to output line 1 (always 1 for a single header).
+    /// Since source line 5 != output position 1, this test catches that regression.
+    #[test]
+    fn test_markdown_line_map_single_deep_header() {
+        // Header at source line 5 (after 4 lines of prose)
+        let source = "Intro line.\n\nAnother para.\n\n# Deep Header\n\nTrailing text.\n";
+        let line_map = parse_and_extract_line_map(source);
+
+        assert_eq!(line_map.len(), 1, "expected 1 header, got {:?}", line_map);
+        assert_eq!(
+            line_map[0], 5,
+            "# Deep Header is on source line 5, got {}. \
+             A sequential-position implementation would give 1, not 5.",
+            line_map[0]
+        );
+    }
 }

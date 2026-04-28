@@ -9,7 +9,7 @@ use std::path::Path;
 
 use rskim_core::{
     detect_language_from_path, transform_auto_with_config, transform_with_config,
-    transform_with_quality, Language, Mode, TransformConfig,
+    transform_with_line_map, Language, Mode, TransformConfig,
 };
 
 use crate::{cache, cascade, cascade::TruncationOptions, tokens};
@@ -30,6 +30,8 @@ pub(crate) struct ProcessOptions {
     pub(crate) show_stats: bool,
     /// Truncation options (max_lines, last_lines, token_budget)
     pub(crate) trunc: TruncationOptions,
+    /// Whether to annotate output with source line numbers (`--line-numbers` / `-n`)
+    pub(crate) line_numbers: bool,
 }
 
 /// Result of processing a file
@@ -66,6 +68,39 @@ pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool) -> &'static str {
         "degraded"
     } else {
         "full"
+    }
+}
+
+/// Apply line number annotations to `output` after the guardrail decision.
+///
+/// When `guardrail_triggered` is true the output is raw source, so an identity
+/// map is used.  When `computed_map` is `Some`, it is used directly.
+///
+/// When `computed_map` is `None` (serde non-full modes, or language detection
+/// failure), line numbers are **skipped** because the output is restructured
+/// and has no meaningful line-for-line correspondence with the original source.
+///
+/// AC-11: Identity map is applied when guardrail emits raw source.
+/// AC-15: Serde non-full modes skip line numbers (computed_map is None).
+pub(crate) fn apply_line_numbers(
+    output: String,
+    line_numbers: bool,
+    guardrail_triggered: bool,
+    computed_map: Option<Vec<usize>>,
+) -> String {
+    if !line_numbers {
+        return output;
+    }
+    if guardrail_triggered {
+        // Guardrail emitted raw source — use identity map
+        let map = crate::format::identity_line_map(&output);
+        return crate::format::format_with_line_numbers(&output, &map);
+    }
+    match computed_map {
+        Some(map) => crate::format::format_with_line_numbers(&output, &map),
+        // No line map available (serde non-full, language detection failure):
+        // skip annotation — restructured output has no source correspondence.
+        None => output,
     }
 }
 
@@ -130,7 +165,8 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some(hit) = cache::read_cache(path, options.mode, &options.trunc) else {
+    let Some(hit) = cache::read_cache(path, options.mode, &options.trunc, options.line_numbers)
+    else {
         return Ok(None);
     };
 
@@ -172,16 +208,20 @@ fn read_and_validate(path: &Path) -> anyhow::Result<String> {
 /// Transform file contents, trying auto-detection first and falling back to
 /// `explicit_lang` when provided.
 ///
-/// Returns `(transformed_output, mode_used, has_errors)` where `has_errors`
-/// reflects whether the parser encountered syntax errors. For cascade paths
-/// (token_budget is set) `has_errors` is always `false` because the cascade
-/// does not have access to per-mode quality signals.
+/// Returns `(transformed_output, mode_used, has_errors, source_line_map)` where:
+/// - `has_errors` reflects whether the parser encountered syntax errors
+/// - `source_line_map` is `Some(map)` when `options.line_numbers` is true and the
+///   transform produced a meaningful source line map; `None` otherwise
+///
+/// For cascade paths (token_budget is set) `has_errors` is always `false` and
+/// line numbers are applied after mode selection.
 fn run_transform(
     contents: &str,
     path: &Path,
     options: &ProcessOptions,
-) -> anyhow::Result<(String, Mode, bool)> {
+) -> anyhow::Result<(String, Mode, bool, Option<Vec<usize>>)> {
     let explicit_lang = options.explicit_lang;
+    // Non-line-number transform closure (used for cascade mode selection)
     let transform_file = |config: &TransformConfig| -> anyhow::Result<Option<String>> {
         // Try auto-detection first; fall back to explicit language if provided.
         let auto_result = transform_auto_with_config(contents, path, config);
@@ -206,6 +246,8 @@ fn run_transform(
                     Language::TypeScript
                 });
 
+            // AC-10: Token counting for mode selection does NOT include line number annotations.
+            // Run cascade WITHOUT line_numbers to select the best mode.
             let (output, mode) = cascade::cascade_for_token_budget(
                 options.mode,
                 &options.trunc,
@@ -213,24 +255,41 @@ fn run_transform(
                 language,
                 transform_file,
             )?;
-            // Cascade selects the best-fitting mode; has_errors is not tracked
-            // per-mode during cascade (mode escalation already handles degraded output).
-            Ok((output, mode, false))
+
+            // If line numbers requested, re-run the selected mode WITH line_numbers.
+            // Use the re-run output directly as the final output (avoids double transform).
+            let (final_output, line_map) = if options.line_numbers {
+                let config = cascade::build_config_with_opts(mode, &options.trunc, true);
+                let (rerun_output, _has_errors, map) =
+                    transform_with_line_map(contents, language, &config)?;
+                (rerun_output, map)
+            } else {
+                (output, None)
+            };
+
+            Ok((final_output, mode, false, line_map))
         }
         None => {
             let language = explicit_lang.or_else(|| detect_language_from_path(path));
-            let config = cascade::build_config(options.mode, &options.trunc);
 
-            // Use transform_with_quality when we can identify the language to get has_errors.
+            // Use transform_with_line_map when we can identify the language
             if let Some(lang) = language {
-                let (output, has_errors) = transform_with_quality(contents, lang, &config)?;
-                Ok((output, options.mode, has_errors))
+                let config = cascade::build_config_with_opts(
+                    options.mode,
+                    &options.trunc,
+                    options.line_numbers,
+                );
+                let (output, has_errors, line_map) =
+                    transform_with_line_map(contents, lang, &config)?;
+                Ok((output, options.mode, has_errors, line_map))
             } else {
                 // Language detection failed — try auto-detect via path extension.
+                // Can't get line map without a known language.
+                let config = cascade::build_config(options.mode, &options.trunc);
                 let output = transform_file(&config)?.ok_or_else(|| {
                     anyhow::anyhow!("Language detection failed and no --language specified")
                 })?;
-                Ok((output, options.mode, false))
+                Ok((output, options.mode, false, None))
             }
         }
     }
@@ -279,22 +338,32 @@ pub(crate) fn process_stdin(
         }
     })?;
 
-    let (transformed, stdin_has_errors) = match options.trunc.token_budget {
+    let (transformed, stdin_has_errors, stdin_line_map) = match options.trunc.token_budget {
         Some(budget) => {
-            let (output, _mode) = cascade::cascade_for_token_budget(
+            // AC-10: Cascade mode selection without line numbers, then re-run with line numbers
+            let (output, mode) = cascade::cascade_for_token_budget(
                 options.mode,
                 &options.trunc,
                 budget,
                 language,
                 |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
             )?;
-            // Cascade path does not track per-mode has_errors (mode escalation handles it).
-            (output, false)
+            // Use the re-run output directly as the final output (avoids double transform).
+            let (cascade_output, line_map) = if options.line_numbers {
+                let config = cascade::build_config_with_opts(mode, &options.trunc, true);
+                let (rerun, _errs, map) = transform_with_line_map(&buffer, language, &config)?;
+                (rerun, map)
+            } else {
+                (output, None)
+            };
+            (cascade_output, false, line_map)
         }
         None => {
-            let config = cascade::build_config(options.mode, &options.trunc);
-            let (output, has_errors) = transform_with_quality(&buffer, language, &config)?;
-            (output, has_errors)
+            let config =
+                cascade::build_config_with_opts(options.mode, &options.trunc, options.line_numbers);
+            let (output, has_errors, line_map) =
+                transform_with_line_map(&buffer, language, &config)?;
+            (output, has_errors, line_map)
         }
     };
 
@@ -303,7 +372,7 @@ pub(crate) fn process_stdin(
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Same protection as process_file; token counting happens after so stats reflect
-    // the final output.
+    // the final output. Guardrail comparison uses UN-annotated output.
     let (final_output, guardrail_triggered) =
         if options.mode != Mode::Full && options.trunc.token_budget.is_none() {
             let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
@@ -312,6 +381,14 @@ pub(crate) fn process_stdin(
         } else {
             (transformed, false)
         };
+
+    // Apply line number formatting AFTER guardrail, BEFORE token stats.
+    let final_output = apply_line_numbers(
+        final_output,
+        options.line_numbers,
+        guardrail_triggered,
+        stdin_line_map,
+    );
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
@@ -337,7 +414,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     }
 
     let contents = read_and_validate(path)?;
-    let (result, mode_used, has_errors) = run_transform(&contents, path, &options)?;
+    let (result, mode_used, has_errors, line_map) = run_transform(&contents, path, &options)?;
 
     // Determine parse quality tier before guardrail (guardrail may swap output,
     // but the parse tier reflects the transformation, not the final selection).
@@ -345,6 +422,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
 
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Token counting happens AFTER this decision so stats reflect the final output.
+    // Guardrail comparison uses UN-annotated output (before line number formatting).
     let (final_output, guardrail_triggered) =
         if options.mode != Mode::Full && options.trunc.token_budget.is_none() {
             let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
@@ -354,6 +432,15 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             (result, false)
         };
 
+    // Apply line number formatting AFTER guardrail, BEFORE cache write and token stats.
+    // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
+    let final_output = apply_line_numbers(
+        final_output,
+        options.line_numbers,
+        guardrail_triggered,
+        line_map,
+    );
+
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
     let (orig_tokens, trans_tokens) = if options.show_stats {
@@ -362,8 +449,8 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         (None, None)
     };
 
-    // Cache the transform result (post-guardrail). Cache write failures are
-    // non-fatal; don't fail the transformation.
+    // Cache the transform result (post-guardrail, post-line-number-formatting).
+    // Cache write failures are non-fatal; don't fail the transformation.
     if options.use_cache {
         let effective_mode = (mode_used != options.mode).then_some(mode_used);
         let _ = cache::write_cache(&cache::CacheWriteParams {
@@ -375,6 +462,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             trunc: options.trunc,
             effective_mode,
             parse_tier: parse_tier.map(str::to_string),
+            line_numbers: options.line_numbers,
         });
     }
 
@@ -470,5 +558,78 @@ mod tests {
         assert_eq!(parse_tier_from(Mode::Structure, false), "full");
         assert_eq!(parse_tier_from(Mode::Signatures, false), "full");
         assert_eq!(parse_tier_from(Mode::Types, false), "full");
+    }
+
+    // ========================================================================
+    // apply_line_numbers tests
+    // ========================================================================
+
+    /// Branch: line_numbers disabled — output is returned unchanged regardless of
+    /// guardrail_triggered or computed_map.
+    #[test]
+    fn apply_line_numbers_disabled_returns_output_unchanged() {
+        let output = "fn foo() {}\nfn bar() {}\n".to_string();
+        let result = apply_line_numbers(output.clone(), false, false, Some(vec![1, 2]));
+        assert_eq!(
+            result, output,
+            "disabled line numbers must not modify output"
+        );
+
+        let result2 = apply_line_numbers(output.clone(), false, true, None);
+        assert_eq!(
+            result2, output,
+            "disabled line numbers must not modify output even when guardrail triggered"
+        );
+    }
+
+    /// Branch: guardrail_triggered — identity map is applied regardless of computed_map.
+    #[test]
+    fn apply_line_numbers_guardrail_uses_identity_map() {
+        let output = "line one\nline two\n".to_string();
+        // computed_map is None here; the guardrail path must build its own identity map.
+        let result = apply_line_numbers(output.clone(), true, true, None);
+        // Identity map annotates each line with its 1-based output line number.
+        // format_with_line_numbers uses "<n>\t<content>" format.
+        assert!(
+            result.contains("1\t") && result.contains("2\t"),
+            "guardrail path must annotate both output lines; got: {result:?}"
+        );
+        // The raw content must still be present.
+        assert!(
+            result.contains("line one"),
+            "output text must survive annotation"
+        );
+    }
+
+    /// Branch: computed_map is None (serde non-full modes or language detection failure) —
+    /// output is returned unannotated even when line_numbers is true.
+    #[test]
+    fn apply_line_numbers_none_map_skips_annotation() {
+        let output = "key: value\n".to_string();
+        let result = apply_line_numbers(output.clone(), true, false, None);
+        assert_eq!(
+            result, output,
+            "None computed_map must skip line-number annotation"
+        );
+    }
+
+    /// Branch: computed_map is Some — the provided map is forwarded to
+    /// format_with_line_numbers to produce annotated output.
+    #[test]
+    fn apply_line_numbers_some_map_annotates_output() {
+        // Simulate a 2-line transform output that maps to source lines 1 and 5.
+        let output = "fn foo() {}\nfn bar() {}\n".to_string();
+        let map = vec![1usize, 5];
+        let result = apply_line_numbers(output.clone(), true, false, Some(map));
+        // The annotation must include the source line numbers from the provided map.
+        // format_with_line_numbers uses "<n>\t<content>" format.
+        assert!(
+            result.contains("1\t") && result.contains("5\t"),
+            "provided map line numbers must appear in output; got: {result:?}"
+        );
+        assert!(
+            result.contains("fn foo()"),
+            "content must survive annotation"
+        );
     }
 }
