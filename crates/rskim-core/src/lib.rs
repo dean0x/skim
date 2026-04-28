@@ -23,7 +23,7 @@
 //! let source = "function add(a: number, b: number) { return a + b; }";
 //! let result = transform(source, Language::TypeScript, Mode::Structure)?;
 //!
-//! // Result: "function add(a: number, b: number) { /* ... */ }"
+//! // Result: "function add(a: number, b: number) {...}"
 //! # Ok::<(), rskim_core::SkimError>(())
 //! ```
 //!
@@ -168,7 +168,7 @@ pub fn transform_with_quality(
 ///
 /// - **Full mode**: identity map — output line N maps to source line N
 /// - **Structure mode**: verbatim-copied lines map to their source line;
-///   the `{ /* ... */ }` replacement stays on the function signature line
+///   the `{...}` replacement stays on the function signature line
 /// - **Signatures mode**: each signature's output lines map to consecutive
 ///   source lines starting from `node.start_position().row + 1`
 /// - **Types mode**: same as signatures mode

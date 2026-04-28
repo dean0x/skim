@@ -525,7 +525,7 @@ fn test_line_numbers_with_max_lines_omission_markers_no_prefix() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     // Omission markers should have no line number prefix
-    // They look like "// ..." or "/* ... */" etc.
+    // They look like "// ..." or "{...}" etc.
     // Lines with numbers should parse fine; omission marker lines should not start with a number\t
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(!lines.is_empty());
@@ -1213,7 +1213,7 @@ fn test_line_numbers_guardrail_identity_map() {
     // The guardrail triggers when the compressed output is larger than the raw input.
     // In that case, skim falls back to the raw source (identity map).
     // A very small file (e.g., single assignment) is likely to trigger the guardrail
-    // because the structure mode adds overhead (e.g., "/* ... */") for minimal code.
+    // because the structure mode adds overhead (e.g., "{...}") for minimal code.
     // We verify that when -n is used and guardrail triggers, identity line numbers apply.
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.py");
