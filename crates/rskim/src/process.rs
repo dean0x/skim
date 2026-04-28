@@ -257,16 +257,17 @@ fn run_transform(
             )?;
 
             // If line numbers requested, re-run the selected mode WITH line_numbers.
-            let line_map = if options.line_numbers {
+            // Use the re-run output directly as the final output (avoids double transform).
+            let (final_output, line_map) = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
-                let (_rerun_output, _has_errors, map) =
+                let (rerun_output, _has_errors, map) =
                     transform_with_line_map(contents, language, &config)?;
-                map
+                (rerun_output, map)
             } else {
-                None
+                (output, None)
             };
 
-            Ok((output, mode, false, line_map))
+            Ok((final_output, mode, false, line_map))
         }
         None => {
             let language = explicit_lang.or_else(|| detect_language_from_path(path));
@@ -347,14 +348,15 @@ pub(crate) fn process_stdin(
                 language,
                 |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
             )?;
-            let line_map = if options.line_numbers {
+            // Use the re-run output directly as the final output (avoids double transform).
+            let (cascade_output, line_map) = if options.line_numbers {
                 let config = cascade::build_config_with_opts(mode, &options.trunc, true);
-                let (_rerun, _errs, map) = transform_with_line_map(&buffer, language, &config)?;
-                map
+                let (rerun, _errs, map) = transform_with_line_map(&buffer, language, &config)?;
+                (rerun, map)
             } else {
-                None
+                (output, None)
             };
-            (output, false, line_map)
+            (cascade_output, false, line_map)
         }
         None => {
             let config =
@@ -556,5 +558,78 @@ mod tests {
         assert_eq!(parse_tier_from(Mode::Structure, false), "full");
         assert_eq!(parse_tier_from(Mode::Signatures, false), "full");
         assert_eq!(parse_tier_from(Mode::Types, false), "full");
+    }
+
+    // ========================================================================
+    // apply_line_numbers tests
+    // ========================================================================
+
+    /// Branch: line_numbers disabled — output is returned unchanged regardless of
+    /// guardrail_triggered or computed_map.
+    #[test]
+    fn apply_line_numbers_disabled_returns_output_unchanged() {
+        let output = "fn foo() {}\nfn bar() {}\n".to_string();
+        let result = apply_line_numbers(output.clone(), false, false, Some(vec![1, 2]));
+        assert_eq!(
+            result, output,
+            "disabled line numbers must not modify output"
+        );
+
+        let result2 = apply_line_numbers(output.clone(), false, true, None);
+        assert_eq!(
+            result2, output,
+            "disabled line numbers must not modify output even when guardrail triggered"
+        );
+    }
+
+    /// Branch: guardrail_triggered — identity map is applied regardless of computed_map.
+    #[test]
+    fn apply_line_numbers_guardrail_uses_identity_map() {
+        let output = "line one\nline two\n".to_string();
+        // computed_map is None here; the guardrail path must build its own identity map.
+        let result = apply_line_numbers(output.clone(), true, true, None);
+        // Identity map annotates each line with its 1-based output line number.
+        // format_with_line_numbers uses "<n>\t<content>" format.
+        assert!(
+            result.contains("1\t") && result.contains("2\t"),
+            "guardrail path must annotate both output lines; got: {result:?}"
+        );
+        // The raw content must still be present.
+        assert!(
+            result.contains("line one"),
+            "output text must survive annotation"
+        );
+    }
+
+    /// Branch: computed_map is None (serde non-full modes or language detection failure) —
+    /// output is returned unannotated even when line_numbers is true.
+    #[test]
+    fn apply_line_numbers_none_map_skips_annotation() {
+        let output = "key: value\n".to_string();
+        let result = apply_line_numbers(output.clone(), true, false, None);
+        assert_eq!(
+            result, output,
+            "None computed_map must skip line-number annotation"
+        );
+    }
+
+    /// Branch: computed_map is Some — the provided map is forwarded to
+    /// format_with_line_numbers to produce annotated output.
+    #[test]
+    fn apply_line_numbers_some_map_annotates_output() {
+        // Simulate a 2-line transform output that maps to source lines 1 and 5.
+        let output = "fn foo() {}\nfn bar() {}\n".to_string();
+        let map = vec![1usize, 5];
+        let result = apply_line_numbers(output.clone(), true, false, Some(map));
+        // The annotation must include the source line numbers from the provided map.
+        // format_with_line_numbers uses "<n>\t<content>" format.
+        assert!(
+            result.contains("1\t") && result.contains("5\t"),
+            "provided map line numbers must appear in output; got: {result:?}"
+        );
+        assert!(
+            result.contains("fn foo()"),
+            "content must survive annotation"
+        );
     }
 }
