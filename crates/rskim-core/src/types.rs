@@ -171,6 +171,12 @@ impl Language {
     /// source line map. All branching logic (passthrough detection, serde delegation,
     /// parser creation, max_lines/last_lines truncation) lives in a single place.
     ///
+    /// Line-map computation is gated behind `config.line_numbers`: when that flag is
+    /// `false`, the delegate skips all line-map allocation and returns `None` at zero
+    /// extra cost. Any new line-map logic added to `transform_source_with_line_map`
+    /// MUST therefore be placed inside a `if config.line_numbers { … }` guard so that
+    /// callers that do not need line numbers (i.e. this function) pay no overhead.
+    ///
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
     pub(crate) fn transform_source(
@@ -215,105 +221,12 @@ impl Language {
                 && (self.is_serde_based() || self == Self::Markdown));
 
         if is_passthrough {
-            let text = source.to_string();
-
-            if let Some(n) = config.last_lines {
-                // ARCHITECTURE: For passthrough (identity transform), build the source
-                // line map directly from arithmetic instead of using
-                // reconcile_line_map_after_truncation. Content-based reconciliation uses
-                // forward scanning which matches duplicate lines (e.g. `}`) to their
-                // FIRST occurrence rather than the correct tail occurrence.
-                //
-                // simple_last_line_truncate produces:
-                //   - If total <= n: unchanged (identity map)
-                //   - If total > n: 1 marker line + (n-1) content lines from the tail
-                //
-                // Marker line gets source_line = 0 (no annotation).
-                // Content line i (0-indexed within content) gets source_line:
-                //   source_line_count - n_content + 1 + i  (1-indexed)
-                let source_line_count = text.lines().count();
-                let truncated =
-                    crate::transform::truncate::simple_last_line_truncate(&text, self, n)?;
-                let line_map = if config.line_numbers {
-                    if source_line_count <= n {
-                        // No truncation occurred: identity map
-                        let count = truncated.lines().count();
-                        Some((1..=count).collect::<Vec<usize>>())
-                    } else {
-                        // Truncation occurred: marker + n_content tail lines
-                        let n_content = n.saturating_sub(1); // lines reserved for content
-                        let start_line = source_line_count - n_content + 1; // 1-indexed
-                        let mut map = Vec::with_capacity(1 + n_content);
-                        map.push(0_usize); // marker line has no annotation
-                        for i in 0..n_content {
-                            map.push(start_line + i);
-                        }
-                        Some(map)
-                    }
-                } else {
-                    None
-                };
-                return Ok((truncated, false, line_map));
-            }
-
-            // Apply max_lines truncation for passthrough paths. Tree-sitter languages
-            // handle max_lines inside transform_tree via AST-aware priority selection,
-            // but for passthrough (Full mode or serde/Markdown Minimal/Pseudo) we must
-            // apply it here as a simple line truncation.
-            if let Some(max_lines) = config.max_lines {
-                let truncated =
-                    crate::transform::truncate::simple_line_truncate(&text, self, max_lines)?;
-                let line_map = if config.line_numbers {
-                    // After simple_line_truncate the output is a prefix of the source
-                    // (with an optional trailing truncation marker). Build the map by
-                    // matching output lines to source lines in order.
-                    let map =
-                        crate::transform::compute_line_map_by_text_matching(source, &truncated);
-                    Some(map)
-                } else {
-                    None
-                };
-                return Ok((truncated, false, line_map));
-            }
-
-            let line_map = if config.line_numbers {
-                // Full mode (passthrough): identity map
-                // For serde-based Minimal/Pseudo passthrough: also identity (source is output)
-                let n = text.lines().count();
-                Some((1..=n).collect::<Vec<usize>>())
-            } else {
-                None
-            };
-            return Ok((text, false, line_map));
+            return self.transform_passthrough_with_line_map(source, config);
         }
 
         // Serde-based non-full modes: restructured output, no meaningful source line map.
-        // ARCHITECTURE: The serde parsers (JSON/YAML/TOML) restructure the content so
-        // there is no per-line source correspondence. We compute the transform inline here
-        // (not via transform_source) to avoid circular delegation now that transform_source
-        // delegates to this function.
-        let is_serde_non_full = self.is_serde_based() && config.mode != Mode::Full;
-        if is_serde_non_full {
-            let (raw_result, has_errors) = match self {
-                Self::Json => (crate::transform::json::transform_json(source)?, false),
-                Self::Yaml => (crate::transform::yaml::transform_yaml(source)?, false),
-                Self::Toml => (crate::transform::toml::transform_toml(source)?, false),
-                // SAFETY: is_serde_based() returns true only for Json/Yaml/Toml.
-                _ => unreachable!("is_serde_based() must only return true for Json/Yaml/Toml"),
-            };
-            // Apply max_lines truncation (no meaningful line map for restructured output).
-            let result = if let Some(max_lines) = config.max_lines {
-                crate::transform::truncate::simple_line_truncate(&raw_result, self, max_lines)?
-            } else {
-                raw_result
-            };
-            // Apply last_lines truncation.
-            let result = if let Some(n) = config.last_lines {
-                crate::transform::truncate::simple_last_line_truncate(&result, self, n)?
-            } else {
-                result
-            };
-            return Ok((result, has_errors, None));
+        if self.is_serde_based() {
+            return self.transform_serde_with_line_map(source, config);
         }
 
         // Tree-sitter path (all non-serde languages in Structure/Signatures/Types/Minimal/Pseudo)
@@ -342,6 +255,128 @@ impl Language {
         };
 
         Ok((result, parse_errors, line_map))
+    }
+
+    /// Passthrough branch of `transform_source_with_line_map`.
+    ///
+    /// Handles Full mode (all languages) and Minimal/Pseudo mode for serde-based /
+    /// Markdown languages where there is nothing structural to strip. The source
+    /// is returned verbatim (subject to `max_lines` / `last_lines` truncation).
+    ///
+    /// Line maps are built arithmetically from source line counts rather than via
+    /// content-based matching to avoid duplicate-line mis-attribution (e.g. `}` matching
+    /// its first occurrence instead of the tail occurrence).
+    fn transform_passthrough_with_line_map(
+        self,
+        source: &str,
+        config: &TransformConfig,
+    ) -> Result<(String, bool, Option<Vec<usize>>)> {
+        let text = source.to_string();
+
+        if let Some(n) = config.last_lines {
+            // ARCHITECTURE: For passthrough (identity transform), build the source
+            // line map directly from arithmetic instead of using
+            // reconcile_line_map_after_truncation. Content-based reconciliation uses
+            // forward scanning which matches duplicate lines (e.g. `}`) to their
+            // FIRST occurrence rather than the correct tail occurrence.
+            //
+            // simple_last_line_truncate produces:
+            //   - If total <= n: unchanged (identity map)
+            //   - If total > n: 1 marker line + (n-1) content lines from the tail
+            //
+            // Marker line gets source_line = 0 (no annotation).
+            // Content line i (0-indexed within content) gets source_line:
+            //   source_line_count - n_content + 1 + i  (1-indexed)
+            let source_line_count = text.lines().count();
+            let truncated =
+                crate::transform::truncate::simple_last_line_truncate(&text, self, n)?;
+            let line_map = if config.line_numbers {
+                if source_line_count <= n {
+                    // No truncation occurred: identity map
+                    let count = truncated.lines().count();
+                    Some((1..=count).collect::<Vec<usize>>())
+                } else {
+                    // Truncation occurred: marker + n_content tail lines
+                    let n_content = n.saturating_sub(1); // lines reserved for content
+                    let start_line = source_line_count - n_content + 1; // 1-indexed
+                    let mut map = Vec::with_capacity(1 + n_content);
+                    map.push(0_usize); // marker line has no annotation
+                    for i in 0..n_content {
+                        map.push(start_line + i);
+                    }
+                    Some(map)
+                }
+            } else {
+                None
+            };
+            return Ok((truncated, false, line_map));
+        }
+
+        // Apply max_lines truncation for passthrough paths. Tree-sitter languages
+        // handle max_lines inside transform_tree via AST-aware priority selection,
+        // but for passthrough (Full mode or serde/Markdown Minimal/Pseudo) we must
+        // apply it here as a simple line truncation.
+        if let Some(max_lines) = config.max_lines {
+            let truncated =
+                crate::transform::truncate::simple_line_truncate(&text, self, max_lines)?;
+            let line_map = if config.line_numbers {
+                // After simple_line_truncate the output is a prefix of the source
+                // (with an optional trailing truncation marker). Build the map by
+                // matching output lines to source lines in order.
+                let map =
+                    crate::transform::compute_line_map_by_text_matching(source, &truncated);
+                Some(map)
+            } else {
+                None
+            };
+            return Ok((truncated, false, line_map));
+        }
+
+        let line_map = if config.line_numbers {
+            // Full mode (passthrough): identity map
+            // For serde-based Minimal/Pseudo passthrough: also identity (source is output)
+            let n = text.lines().count();
+            Some((1..=n).collect::<Vec<usize>>())
+        } else {
+            None
+        };
+        Ok((text, false, line_map))
+    }
+
+    /// Serde branch of `transform_source_with_line_map`.
+    ///
+    /// Handles JSON/YAML/TOML in non-Full modes. The serde parsers restructure
+    /// the content so there is no per-line source correspondence; this function
+    /// always returns `None` for the source line map.
+    ///
+    /// ARCHITECTURE: We call the serde transforms directly here rather than
+    /// re-entering `transform_source` to avoid circular delegation (since
+    /// `transform_source` now delegates to `transform_source_with_line_map`).
+    fn transform_serde_with_line_map(
+        self,
+        source: &str,
+        config: &TransformConfig,
+    ) -> Result<(String, bool, Option<Vec<usize>>)> {
+        let (raw_result, has_errors) = match self {
+            Self::Json => (crate::transform::json::transform_json(source)?, false),
+            Self::Yaml => (crate::transform::yaml::transform_yaml(source)?, false),
+            Self::Toml => (crate::transform::toml::transform_toml(source)?, false),
+            // SAFETY: callers must only invoke this for is_serde_based() languages.
+            _ => unreachable!("transform_serde_with_line_map called for non-serde language"),
+        };
+        // Apply max_lines truncation (no meaningful line map for restructured output).
+        let result = if let Some(max_lines) = config.max_lines {
+            crate::transform::truncate::simple_line_truncate(&raw_result, self, max_lines)?
+        } else {
+            raw_result
+        };
+        // Apply last_lines truncation.
+        let result = if let Some(n) = config.last_lines {
+            crate::transform::truncate::simple_last_line_truncate(&result, self, n)?
+        } else {
+            result
+        };
+        Ok((result, has_errors, None))
     }
 }
 
