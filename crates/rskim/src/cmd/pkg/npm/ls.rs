@@ -145,7 +145,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG LIST | npm"));
+        assert!(display.contains("npm list"));
         assert!(display.contains("4 total"));
         assert!(display.contains("1 flagged"));
         assert!(display.contains("debug@4.3.4"));

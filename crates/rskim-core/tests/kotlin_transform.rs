@@ -35,9 +35,9 @@ fn test_kotlin_language_detection() {
 #[test]
 fn test_kotlin_structure_strips_function_bodies() {
     let result = transform(SIMPLE_KT, Language::Kotlin, Mode::Structure).unwrap();
-    // Function bodies should be replaced with /* ... */
+    // Function bodies should be replaced with {...}
     assert!(
-        result.contains("/* ... */"),
+        result.contains("{...}"),
         "function bodies should be replaced, got:\n{result}"
     );
     // Function names should be preserved

@@ -307,7 +307,7 @@ mod tests {
         let result = parse_check_impl(&output);
         assert!(result.is_full(), "Expected Full for empty output");
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 

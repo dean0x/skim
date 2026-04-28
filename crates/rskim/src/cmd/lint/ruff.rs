@@ -383,7 +383,7 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.errors, 0);
         assert_eq!(result.warnings, 0);
-        assert!(result.as_ref().contains("LINT OK"));
+        assert!(result.as_ref().contains(" OK"));
     }
 
     #[test]
@@ -471,7 +471,7 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.errors, 0);
         assert_eq!(result.warnings, 0);
-        assert!(result.as_ref().contains("LINT OK"));
+        assert!(result.as_ref().contains(" OK"));
         assert!(
             result.as_ref().contains("files formatted"),
             "Expected format-mode render, got: {}",
@@ -495,7 +495,7 @@ mod tests {
             result.tier_name()
         );
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 
@@ -553,7 +553,7 @@ mod tests {
             result.tier_name()
         );
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
             assert!(r.as_ref().contains("files formatted"));
         }
     }

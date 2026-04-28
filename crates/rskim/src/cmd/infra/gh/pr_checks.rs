@@ -301,7 +301,7 @@ mod tests {
         assert!(result.is_some(), "Expected tab text parse to succeed");
         let result = result.unwrap();
         assert!(
-            result.as_ref().contains("INFRA: gh pr checks"),
+            result.as_ref().contains("gh "),
             "got: {}",
             result.as_ref()
         );
@@ -319,7 +319,7 @@ mod tests {
         assert!(result.is_some(), "Expected symbol text parse to succeed");
         let result = result.unwrap();
         assert!(
-            result.as_ref().contains("INFRA: gh pr checks"),
+            result.as_ref().contains("gh "),
             "got: {}",
             result.as_ref()
         );

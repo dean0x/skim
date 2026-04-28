@@ -319,7 +319,7 @@ mod tests {
         );
         if let crate::output::ParseResult::Full(r) = result {
             assert_eq!(r.warnings, 0);
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 
@@ -500,7 +500,7 @@ mod tests {
             result.tier_name()
         );
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 

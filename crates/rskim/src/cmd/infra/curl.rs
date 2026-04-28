@@ -270,7 +270,7 @@ mod tests {
         let result = try_parse_json(&input, Some("200 OK"));
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
-        assert!(result.as_ref().contains("INFRA: curl response"));
+        assert!(result.as_ref().contains("curl "));
     }
 
     #[test]

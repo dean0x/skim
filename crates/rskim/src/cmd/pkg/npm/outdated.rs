@@ -145,7 +145,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG OUTDATED | npm | 3 packages"));
+        assert!(display.contains("npm outdated 3 packages"));
         assert!(display.contains("lodash 4.17.20 -> 4.17.21"));
     }
 

@@ -229,7 +229,7 @@ mod tests {
         let result = try_parse_json_list(input.trim());
         assert!(result.is_some(), "Expected Tier 1 JSON parse to succeed");
         let result = result.unwrap();
-        assert!(result.as_ref().contains("INFRA: gh list"));
+        assert!(result.as_ref().contains("gh "));
         assert_eq!(result.items.len(), 3);
     }
 

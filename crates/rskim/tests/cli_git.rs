@@ -47,7 +47,7 @@ fn test_skim_git_status_in_repo() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("[status]")
+            predicate::str::contains("status")
                 .and(predicate::str::contains("branch").or(predicate::str::contains("clean"))),
         );
 }
@@ -62,7 +62,7 @@ fn test_skim_git_status_porcelain_compresses() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("[status]")
+            predicate::str::contains("status")
                 .and(predicate::str::contains("branch").or(predicate::str::contains("clean"))),
         );
 }
@@ -76,7 +76,7 @@ fn test_skim_git_status_short_compresses() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("[status]")
+            predicate::str::contains("status")
                 .and(predicate::str::contains("branch").or(predicate::str::contains("clean"))),
         );
 }
@@ -115,7 +115,7 @@ fn test_skim_git_log_in_repo() {
         .args(["git", "log"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[log]").and(predicate::str::contains("commit")));
+        .stdout(predicate::str::contains("log").and(predicate::str::contains("commit")));
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn test_skim_git_log_with_limit() {
         .args(["git", "log", "-n", "3"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[log]"));
+        .stdout(predicate::str::contains("log"));
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn test_skim_git_log_oneline_compresses() {
         .args(["git", "log", "--oneline", "-n", "3"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[log]").and(predicate::str::contains("commit")));
+        .stdout(predicate::str::contains("log").and(predicate::str::contains("commit")));
 }
 
 // ============================================================================
@@ -154,7 +154,7 @@ fn test_skim_git_fetch_in_repo() {
         .args(["git", "fetch"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[fetch]").or(predicate::str::contains("up to date")));
+        .stdout(predicate::str::contains("fetch").or(predicate::str::contains("up to date")));
 }
 
 // ============================================================================
@@ -184,7 +184,7 @@ fn test_skim_git_status_with_short_flag_compresses() {
         .args(["git", "status", "-s"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[status]"));
+        .stdout(predicate::str::contains("status"));
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn test_skim_git_status_with_porcelain_flag_compresses() {
         .args(["git", "status", "--porcelain"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[status]"));
+        .stdout(predicate::str::contains("status"));
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn test_skim_git_status_with_short_long_flag_compresses() {
         .args(["git", "status", "--short"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[status]"));
+        .stdout(predicate::str::contains("status"));
 }
 
 // ============================================================================
@@ -222,7 +222,7 @@ fn test_skim_git_log_oneline_flag_compresses() {
         .args(["git", "log", "--oneline", "-5"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[log]").and(predicate::str::contains("commit")));
+        .stdout(predicate::str::contains("log").and(predicate::str::contains("commit")));
 }
 
 #[test]
@@ -237,11 +237,11 @@ fn test_skim_git_log_contains_hashes() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     // git log format is "%h %s (%cr) <%an>" — first word is the short hash
     assert!(
-        stdout.contains("[log]"),
-        "Expected [log] prefix in output, got: {stdout}"
+        stdout.starts_with("log "),
+        "Expected 'log ' prefix in output, got: {stdout}"
     );
     // Verify at least one line looks like a commit (7-char hex prefix)
-    let has_hash = stdout.lines().filter(|l| !l.starts_with('[')).any(|l| {
+    let has_hash = stdout.lines().skip(1).any(|l| {
         l.split_whitespace()
             .next()
             .is_some_and(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
@@ -526,7 +526,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
         .args(["git", "status"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[status]"));
+        .stdout(predicate::str::contains("status"));
 
     // ---- log ----
     // The log handler prefixes output with "[log]".
@@ -535,7 +535,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
         .args(["git", "log", "-n", "1"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[log]"));
+        .stdout(predicate::str::contains("log"));
 
     // ---- show ----
     // The show handler (commit mode, --json) produces a JSON object —
@@ -573,7 +573,7 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
         .args(["git", "fetch"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[fetch]").or(predicate::str::contains("up to date")));
+        .stdout(predicate::str::contains("fetch").or(predicate::str::contains("up to date")));
 }
 
 // ============================================================================

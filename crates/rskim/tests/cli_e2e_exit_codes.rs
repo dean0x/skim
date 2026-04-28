@@ -55,7 +55,7 @@ fn test_exit_code_cargo_fail_json() {
         .assert()
         .code(0)
         // Verify the output correctly shows failures even though exit code is 0
-        .stdout(predicate::str::contains("FAIL: 1"));
+        .stdout(predicate::str::contains("fail: 1"));
 }
 
 #[test]

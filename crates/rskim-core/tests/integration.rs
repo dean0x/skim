@@ -26,7 +26,7 @@ fn test_typescript_structure() {
 
     // Should NOT contain implementation
     assert!(!result.contains("return a + b"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn test_python_structure() {
 
     // Should NOT contain implementation
     assert!(!result.contains("result = a + b"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_rust_structure() {
 
     // Should NOT contain implementation
     assert!(!result.contains("a + b"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn test_go_structure() {
 
     // Should NOT contain implementation
     assert!(!result.contains("return a + b"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn test_java_structure() {
 
     // Should NOT contain implementation
     assert!(!result.contains("return a + b"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]
@@ -428,7 +428,7 @@ fn test_unicode_support() {
 
     // Should handle UTF-8 correctly
     assert!(result.contains("function greet"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]
@@ -455,7 +455,7 @@ function outer() {
 
     // Should handle nested functions without panic
     assert!(result.contains("function outer"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 // ============================================================================
@@ -1949,7 +1949,7 @@ fn test_c_structure() {
 
     // Should NOT contain implementation
     assert!(!result.contains("return a + b"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]
@@ -2078,7 +2078,7 @@ fn test_cpp_structure() {
 
     // Should NOT contain implementation
     assert!(!result.contains("return a + b"));
-    assert!(result.contains("{ /* ... */ }"));
+    assert!(result.contains("{...}"));
 }
 
 #[test]

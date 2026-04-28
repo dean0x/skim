@@ -215,7 +215,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
                     if idx > 0 {
                         writeln!(writer)?;
                     }
-                    writeln!(writer, "// === {} ===", path.display())?;
+                    writeln!(writer, "// {}", path.display())?;
                 }
 
                 write!(writer, "{}", process_result.output)?;

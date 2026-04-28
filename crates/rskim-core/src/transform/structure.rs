@@ -27,7 +27,7 @@ const MAX_MARKDOWN_HEADERS: usize = 10_000;
 ///
 /// # What to Remove
 ///
-/// - Function bodies → `/* ... */`
+/// - Function bodies → `{...}`
 /// - Implementation details
 /// - Non-structural comments
 #[cfg(test)]
@@ -58,7 +58,7 @@ pub(crate) fn transform_structure_with_spans(
 ///
 /// The source line map maps each output line index to the 1-indexed source line
 /// number. For verbatim-copied regions, the source line is the original line number.
-/// The replacement `{ /* ... */ }` stays on the same line as the function signature
+/// The replacement `{...}` stays on the same line as the function signature
 /// (no newlines in the replacement), so no output line ever starts inside a
 /// replacement region — all output line starts are in verbatim-copied regions
 /// where the reverse offset mapping is exact.
@@ -192,7 +192,7 @@ pub(crate) fn transform_structure_with_spans_and_line_map(
 /// the 1-indexed source line number.
 ///
 /// # Correctness Invariant
-/// The replacement text `" { /* ... */ }"` contains no newlines. Therefore no
+/// The replacement text `" {...}"` contains no newlines. Therefore no
 /// output line ever starts inside a replacement region — all output line start
 /// bytes are in verbatim-copied regions where the reverse mapping is exact.
 pub(crate) fn compute_source_line_map_from_offset_map(
@@ -299,7 +299,7 @@ fn collect_body_replacements(
         if let Some(body) = find_body_node(node) {
             let start = body.start_byte();
             let end = body.end_byte();
-            replacements.insert((start, end), " { /* ... */ }");
+            replacements.insert((start, end), " {...}");
         }
     }
 
@@ -663,11 +663,11 @@ mod offset_map_tests {
     ///   4: "// end"
     ///
     /// Structure-mode output (2 lines):
-    ///   1: "function foo() { /* ... */ }"
+    ///   1: "function foo() {...}"
     ///   2: "// end"
     ///
     /// offset_map: [(src_end, delta)] where src_end is the byte after '}' (the
-    /// newline before "// end") and delta = len(" { /* ... */ }") - replaced_len.
+    /// newline before "// end") and delta = len(" {...}") - replaced_len.
     #[test]
     fn test_single_replacement_shrinks_output() {
         // Source bytes (verified by enumeration):
@@ -676,7 +676,7 @@ mod offset_map_tests {
         //    '{' is at 15, '\n' at 16, '}' at 30, '\n' at 31
         // body node bytes (tree-sitter would give): start=15 ('{'), end=31 ('\n' after '}')
         // i.e. source[15..31] = "{\n  return 42;\n}"  (16 bytes)
-        // The replacement " { /* ... */ }" is 14 bytes; delta = 14 - 16 = -2.
+        // The replacement " {...}" is 6 bytes; delta = 6 - 16 = -10.
         let source = "function foo() {\n  return 42;\n}\n// end\n";
         //                             ^15            ^30^31     ^38
         let body_start: usize = 15; // start of '{'
@@ -688,13 +688,13 @@ mod offset_map_tests {
             "sanity-check body slice"
         );
 
-        let repl = " { /* ... */ }"; // 14 bytes
-        let delta: i64 = repl.len() as i64 - (body_end - body_start) as i64; // 14 - 16 = -2
+        let repl = " {...}"; // 6 bytes
+        let delta: i64 = repl.len() as i64 - (body_end - body_start) as i64; // 6 - 16 = -10
 
         // output = "function foo() " + repl + "\n// end\n"
         let output = format!("{}{}{}", &source[..body_start], repl, &source[body_end..]);
-        // output = "function foo()  { /* ... */ }\n// end\n"
-        //           bytes 0-14 (15) + bytes 15-28 (14) = '\n' at 29; "// end" starts at 30
+        // output = "function foo() {...}\n// end\n"
+        //           bytes 0-14 (15) + bytes 15-20 (6) = '\n' at 21; "// end" starts at 22
         assert_eq!(
             output.lines().count(),
             2,
@@ -710,8 +710,8 @@ mod offset_map_tests {
         // Output line 1 (byte 0) maps to source line 1.
         assert_eq!(map[0], 1, "output line 1 should map to source line 1");
 
-        // Output line 2 ("// end") starts at output byte 30.
-        // source_byte = output_byte - delta = 30 - (-2) = 32.
+        // Output line 2 ("// end") starts at output byte 22.
+        // source_byte = output_byte - delta = 22 - (-10) = 32.
         // Source line_starts = [0, 17, 30, 32, 39]; binary_search(32) = Ok(3) → line 4.
         assert_eq!(
             map[1], 4,
@@ -738,7 +738,7 @@ mod offset_map_tests {
         //
         // We place the replacement tokens directly so byte positions are exact.
         let source = "function a() {\n  return 1;\n}\nfunction b() {\n  return 2;\n}\n// done\n";
-        let repl = " { /* ... */ }"; // 14 bytes
+        let repl = " {...}"; // 6 bytes
 
         // body of a(): source[13..28] = "{\n  return 1;\n}"  (15 bytes)
         let a_body_start = "function a() ".len(); // 13
@@ -860,7 +860,7 @@ mod offset_map_tests {
         let source =
             "function complex(\n  a: number,\n  b: string\n) {\n  return a;\n}\nconst x = 1;\n";
 
-        let repl = " { /* ... */ }"; // 14 bytes
+        let repl = " {...}"; // 6 bytes
 
         // body: ") {" — we replace from '{' on line 4 through '}' on line 6.
         // "function complex(\n  a: number,\n  b: string\n) {" = 46 bytes; '{' is at 44
@@ -877,7 +877,7 @@ mod offset_map_tests {
             "sanity-check body slice"
         );
 
-        let delta: i64 = repl.len() as i64 - body_len as i64; // 14 - 15 = -1
+        let delta: i64 = repl.len() as i64 - body_len as i64; // 6 - 15 = -9
 
         let output = format!("{}{}{}", &source[..body_start], repl, &source[body_end..]);
 
@@ -885,7 +885,7 @@ mod offset_map_tests {
         //   1: "function complex("
         //   2: "  a: number,"
         //   3: "  b: string"
-        //   4: ") { /* ... */ }"
+        //   4: ") {...}"
         //   5: "const x = 1;"
         assert_eq!(output.lines().count(), 5, "output should have 5 lines");
 

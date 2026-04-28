@@ -59,8 +59,8 @@ fn test_skim_test_vitest_stdin_pass() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 3"))
-        .stdout(predicate::str::contains("FAIL: 0"));
+        .stdout(predicate::str::contains("pass: 3"))
+        .stdout(predicate::str::contains("fail: 0"));
 }
 
 #[test]
@@ -74,9 +74,9 @@ fn test_skim_test_vitest_stdin_fail() {
         .write_stdin(fixture)
         .assert()
         .failure()
-        .stdout(predicate::str::contains("PASS: 1"))
-        .stdout(predicate::str::contains("FAIL: 1"))
-        .stdout(predicate::str::contains("SKIP: 1"))
+        .stdout(predicate::str::contains("pass: 1"))
+        .stdout(predicate::str::contains("fail: 1"))
+        .stdout(predicate::str::contains("skip: 1"))
         .stdout(predicate::str::contains("math > divides"));
 }
 
@@ -91,8 +91,8 @@ fn test_skim_test_vitest_stdin_pnpm_prefix() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 2"))
-        .stdout(predicate::str::contains("FAIL: 0"));
+        .stdout(predicate::str::contains("pass: 2"))
+        .stdout(predicate::str::contains("fail: 0"));
 }
 
 // ============================================================================
@@ -111,8 +111,8 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
         .write_stdin(input)
         .assert()
         .failure() // fail > 0
-        .stdout(predicate::str::contains("PASS: 5"))
-        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("pass: 5"))
+        .stdout(predicate::str::contains("fail: 1"))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -167,7 +167,7 @@ fn test_skim_test_jest_alias_works() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 3"));
+        .stdout(predicate::str::contains("pass: 3"));
 }
 
 // ============================================================================

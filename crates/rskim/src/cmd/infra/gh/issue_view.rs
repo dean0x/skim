@@ -209,7 +209,7 @@ mod tests {
         assert!(result.is_some(), "Expected JSON parse to succeed");
         let result = result.unwrap();
         assert!(
-            result.as_ref().contains("INFRA: gh issue view"),
+            result.as_ref().contains("gh "),
             "got: {}",
             result.as_ref()
         );

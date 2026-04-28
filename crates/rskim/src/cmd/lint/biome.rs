@@ -355,7 +355,7 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.errors, 0);
         assert_eq!(result.warnings, 0);
-        assert!(result.as_ref().contains("LINT OK"));
+        assert!(result.as_ref().contains(" OK"));
     }
 
     #[test]
@@ -470,7 +470,7 @@ mod tests {
         let result = parse_format_impl(&output);
         assert!(result.is_full(), "Expected Full for empty exit 0");
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 

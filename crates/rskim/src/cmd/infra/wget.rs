@@ -212,7 +212,7 @@ mod tests {
         let result = try_parse_structured(&input);
         assert!(result.is_some(), "Expected Tier 1 parse to succeed");
         let result = result.unwrap();
-        assert!(result.as_ref().contains("INFRA: wget download"));
+        assert!(result.as_ref().contains("wget "));
         assert!(result.items.iter().any(|i| i.label == "status"));
     }
 

@@ -59,8 +59,8 @@ fn test_piped_all_pass() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 5"))
-        .stdout(predicate::str::contains("FAIL: 0"));
+        .stdout(predicate::str::contains("pass: 5"))
+        .stdout(predicate::str::contains("fail: 0"));
 }
 
 #[test]
@@ -72,8 +72,8 @@ fn test_piped_with_failures() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("PASS: 2"))
-        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("pass: 2"))
+        .stdout(predicate::str::contains("fail: 1"))
         .stdout(predicate::str::contains("test_divide").or(predicate::str::contains("test_math")));
 }
 
@@ -86,9 +86,9 @@ fn test_piped_mixed() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("PASS: 4"))
-        .stdout(predicate::str::contains("FAIL: 1"))
-        .stdout(predicate::str::contains("SKIP: 1"));
+        .stdout(predicate::str::contains("pass: 4"))
+        .stdout(predicate::str::contains("fail: 1"))
+        .stdout(predicate::str::contains("skip: 1"));
 }
 
 #[test]
@@ -100,8 +100,8 @@ fn test_piped_all_failures() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("PASS: 0"))
-        .stdout(predicate::str::contains("FAIL: 3"));
+        .stdout(predicate::str::contains("pass: 0"))
+        .stdout(predicate::str::contains("fail: 3"));
 }
 
 #[test]
@@ -132,9 +132,9 @@ fn test_piped_passthrough_mode_skips_compression() {
         .assert()
         // Raw pytest output contains "passed" or "failed"
         .stdout(predicate::str::contains("passed").or(predicate::str::contains("failed")))
-        // Compressed PASS:/FAIL: counts must not appear
-        .stdout(predicate::str::contains("PASS:").not())
-        .stdout(predicate::str::contains("FAIL:").not());
+        // Compressed pass:/fail: counts must not appear
+        .stdout(predicate::str::contains("pass:").not())
+        .stdout(predicate::str::contains("fail:").not());
 }
 
 // ============================================================================
@@ -152,7 +152,7 @@ fn test_failure_context_appended_on_failures() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("fail: 1"))
         .stdout(predicate::str::contains("--- failure context"));
 }
 
@@ -216,12 +216,12 @@ fn test_real_pytest_if_available() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
-        stdout.contains("PASS: 2"),
-        "expected PASS: 2 from real pytest, got: {stdout}"
+        stdout.contains("pass: 2"),
+        "expected pass: 2 from real pytest, got: {stdout}"
     );
     assert!(
-        stdout.contains("FAIL: 0"),
-        "expected FAIL: 0 from real pytest, got: {stdout}"
+        stdout.contains("fail: 0"),
+        "expected fail: 0 from real pytest, got: {stdout}"
     );
 }
 

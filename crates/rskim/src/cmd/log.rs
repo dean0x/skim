@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(result.stack_frames_elided, 2, "Should elide 2 of 5 frames");
         let display = result.as_ref();
         assert!(
-            display.contains("+2 stack frames elided"),
+            display.contains("+2 frames elided"),
             "Footer must appear when frames are elided: {display}"
         );
     }
@@ -1097,7 +1097,7 @@ mod tests {
 
         // Rendered output must surface the elision count.
         assert!(
-            display.contains("+17 stack frames elided"),
+            display.contains("+17 frames elided"),
             "Output must contain elision summary; got: {display}"
         );
 

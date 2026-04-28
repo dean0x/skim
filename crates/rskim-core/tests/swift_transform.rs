@@ -30,9 +30,9 @@ fn test_swift_language_detection() {
 #[test]
 fn test_swift_structure_strips_function_bodies() {
     let result = transform(SIMPLE_SWIFT, Language::Swift, Mode::Structure).unwrap();
-    // Function bodies should be replaced with /* ... */
+    // Function bodies should be replaced with {...}
     assert!(
-        result.contains("/* ... */"),
+        result.contains("{...}"),
         "function bodies should be replaced, got:\n{result}"
     );
     // Function names should be preserved

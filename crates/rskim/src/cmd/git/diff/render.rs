@@ -66,13 +66,13 @@ pub(in crate::cmd::git) fn render_diff_file(
     if let (DiffFileStatus::Renamed, Some(old)) = (&file_diff.status, &file_diff.old_path) {
         let _ = writeln!(
             output,
-            "\u{2500}\u{2500} {} \u{2192} {} ({}) \u{2500}\u{2500}",
+            "{} \u{2192} {} ({})",
             old, file_diff.path, file_diff.status
         );
     } else {
         let _ = writeln!(
             output,
-            "\u{2500}\u{2500} {} ({}) \u{2500}\u{2500}",
+            "{} ({})",
             file_diff.path, file_diff.status
         );
     }
