@@ -5,6 +5,7 @@
 //! Token reduction target: 70-80%
 
 use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
+use crate::transform::compute_line_starts;
 use crate::transform::truncate::NodeSpan;
 use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
 use crate::{Language, Result, SkimError, TransformConfig};
@@ -199,29 +200,15 @@ pub(crate) fn compute_source_line_map_from_offset_map(
     output: &str,
     offset_map: &[(usize, i64)],
 ) -> Vec<usize> {
-    // Pre-compute source line start byte offsets (0-indexed by line number).
-    // Newlines are always ASCII (single byte), so byte-level iteration avoids
-    // unnecessary UTF-8 decoding overhead.
-    let source_line_starts: Vec<usize> = std::iter::once(0)
-        .chain(source.as_bytes().iter().enumerate().filter_map(|(i, &b)| {
-            if b == b'\n' {
-                Some(i + 1)
-            } else {
-                None
-            }
-        }))
-        .collect();
+    // Empty output produces no output lines — return early before computing starts.
+    if output.is_empty() {
+        return Vec::new();
+    }
 
-    // Pre-compute output line start byte offsets (byte-level, same rationale).
-    let output_line_starts: Vec<usize> = std::iter::once(0)
-        .chain(output.as_bytes().iter().enumerate().filter_map(|(i, &b)| {
-            if b == b'\n' {
-                Some(i + 1)
-            } else {
-                None
-            }
-        }))
-        .collect();
+    // Pre-compute source and output line start byte offsets.
+    // Newlines are always ASCII (single byte); see `compute_line_starts` for details.
+    let source_line_starts: Vec<usize> = compute_line_starts(source.as_bytes());
+    let output_line_starts: Vec<usize> = compute_line_starts(output.as_bytes());
 
     // Derive the output line count from the already-computed starts vector rather
     // than calling output.lines().count() again (avoids a second full scan).
@@ -713,12 +700,12 @@ mod offset_map_tests {
         );
 
         let repl = " { /* ... */ }"; // 14 bytes
-        let delta: i64 = repl.len() as i64 - (body_end - body_start) as i64; // -1
+        let delta: i64 = repl.len() as i64 - (body_end - body_start) as i64; // 14 - 16 = -2
 
-        // output = "function foo()" + repl + "\n// end\n"
+        // output = "function foo() " + repl + "\n// end\n"
         let output = format!("{}{}{}", &source[..body_start], repl, &source[body_end..]);
         // output = "function foo()  { /* ... */ }\n// end\n"
-        //          ^0                             ^29     ^36
+        //           bytes 0-14 (15) + bytes 15-28 (14) = '\n' at 29; "// end" starts at 30
         assert_eq!(
             output.lines().count(),
             2,
@@ -731,95 +718,13 @@ mod offset_map_tests {
 
         assert_eq!(map.len(), 2, "expected 2 output lines, got {}", map.len());
 
-        // Output line 1 starts at byte 0 — maps to source line 1
+        // Output line 1 (byte 0) maps to source line 1.
         assert_eq!(map[0], 1, "output line 1 should map to source line 1");
 
         // Output line 2 ("// end") starts at output byte 30.
-        // source_byte = output_byte - delta = 30 - (-1) = 31.
-        // source[31] is '\n'; source[32] is 'e' (start of "// end").
-        // source line starts: 0, 17, 30, 32. Binary search for 31 gives Err(3) -> 3.
-        // Clamped: max(3, 1) = 3. But "// end" is actually source line 4.
-        // The source byte for output line 2 start: output_line_2_start = 29 (after the '\n' in output).
-        // Wait — let's just compute the expected value from what the function itself should return.
-        // source line 4 starts at byte 32 ("// end"). source_byte = 29 - (-1) = 30.
-        // source[30] = '\n' (separating '}' and "// end"). binary_search(30) = Err(3) -> 3.
-        // source line 3 starts at byte 30 (after the '\n' on line 2: "  return 42;\n" ends at 29,
-        // the '\n' is at 29, so line 3 starts at 30). So source_byte 30 is exactly line 3.
-        // Hmm — let me count precisely.
-        // source: "function foo() {\n  return 42;\n}\n// end\n"
-        //   line 1 starts at 0:  "function foo() {"
-        //   '\n' at 16 → line 2 starts at 17
-        //   line 2: "  return 42;"
-        //   '\n' at 29 → line 3 starts at 30
-        //   line 3: "}"
-        //   '\n' at 30 → wait, '}' is at 30, '\n' at 31 → line 4 starts at 32
-        // Correction:
-        //   source[0..16]  = "function foo() "  (chars 0-15, 16 chars)
-        //   source[16]     = '{'
-        //   source[17]     = '\n'
-        //   source[18..29] = "  return 42;"
-        //   source[29]     = '\n'  => line 3 starts at 30
-        //   source[30]     = '}'
-        //   source[31]     = '\n'  => line 4 starts at 32
-        //   source[32..38] = "// end"
-        //   source[38]     = '\n'
-        //
-        // output: "function foo() { /* ... */ }\n// end\n"
-        //                              ^ 14 bytes ^ +14 after byte 16
-        // Wait: source[..16] = "function foo() " (15 chars including space before {)
-        // source[..body_start] = source[..16] = "function foo() " (15 bytes, not 16)
-        // No: body_start=16, so source[..16] is bytes 0..16 = "function foo() {" without the '{'?
-        // source[0] = 'f', source[15] = ' ', source[16] = '{'.
-        // source[..16] = "function foo() " — 16 bytes: f,u,n,c,t,i,o,n,' ','f','o','o','(',')',' ',' '
-        // Hmm: "function foo() " — 'f'=0,'u'=1,'n'=2,'c'=3,'t'=4,'i'=5,'o'=6,'n'=7,' '=8,
-        //  'f'=9,'o'=10,'o'=11,'('=12,')'=13,' '=14,' '=15  → only 16 chars
-        // Wait: "function foo() {" — that's 17 chars: f,u,n,c,t,i,o,n,' ',f,o,o,'(',')',' ','{' = 16
-        // and source[16] = '{'. But I said body_start=16 points to '{'. Let me re-examine.
-        // "function foo() {" has 17 chars (including '{' at index 16)?
-        // f(0)u(1)n(2)c(3)t(4)i(5)o(6)n(7) (8)f(9)o(10)o(11)((12))(13) (14){(15)\n(16)
-        // Ah — "function foo() {" is 16 bytes: indices 0-15, with '{' at 15 and '\n' at 16!
-        // So body_start should be 15 for the '{', not 16.
-        // Let me recalculate with the actual string.
-
-        // This shows the tests need accurate byte positions. Since we asserted the slice above,
-        // the assertion passed, so our byte positions ARE correct. Let's trust the assertion.
-        // The function result for output line 2 is what matters — let's derive the expected
-        // source line number from what the algorithm will compute.
-        let output_line2_start_byte = output
-            .as_bytes()
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|i| i + 1)
-            .unwrap();
-
-        let output_end_for_entry = body_end as i64 + delta; // should be >= 0
-        let applicable = if output_end_for_entry >= 0
-            && output_end_for_entry as usize <= output_line2_start_byte
-        {
-            delta
-        } else {
-            0i64
-        };
-        let source_byte = (output_line2_start_byte as i64 - applicable).max(0) as usize;
-        let source_byte = source_byte.min(source.len());
-        let src_line_starts: Vec<usize> = std::iter::once(0)
-            .chain(source.as_bytes().iter().enumerate().filter_map(|(i, &b)| {
-                if b == b'\n' {
-                    Some(i + 1)
-                } else {
-                    None
-                }
-            }))
-            .collect();
-        let expected = match src_line_starts.binary_search(&source_byte) {
-            Ok(idx) => idx + 1,
-            Err(idx) => idx.max(1),
-        };
-        assert_eq!(
-            map[1], expected,
-            "output line 2 ('// end') should map to source line {}, got {}",
-            expected, map[1]
-        );
+        // source_byte = output_byte - delta = 30 - (-2) = 32.
+        // Source line_starts = [0, 17, 30, 32, 39]; binary_search(32) = Ok(3) → line 4.
+        assert_eq!(map[1], 4, "output line 2 ('// end') should map to source line 4");
     }
 
     // -----------------------------------------------------------------------

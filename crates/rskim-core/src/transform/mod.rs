@@ -170,6 +170,26 @@ pub(crate) fn transform_tree_with_line_map(
     Ok((final_text, Some(final_line_map)))
 }
 
+/// Compute byte offsets of line starts for a UTF-8 string's raw bytes.
+///
+/// Returns a `Vec` where `result[i]` is the byte offset of the first byte of
+/// line `i + 1` (1-indexed). The first entry is always `0`. Each subsequent
+/// entry is the byte immediately after a `'\n'`.
+///
+/// Newlines are always single-byte ASCII, so iterating over raw bytes is both
+/// correct and avoids unnecessary UTF-8 decoding overhead.
+pub(crate) fn compute_line_starts(bytes: &[u8]) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(bytes.iter().enumerate().filter_map(|(i, &b)| {
+            if b == b'\n' {
+                Some(i + 1)
+            } else {
+                None
+            }
+        }))
+        .collect()
+}
+
 /// Compute a source line map by matching output lines to source lines (text scan).
 ///
 /// ARCHITECTURE: Used for Minimal mode where removed ranges leave verbatim
@@ -232,21 +252,13 @@ pub(crate) fn compute_line_map_from_removed_ranges(
     // line_starts[i] = byte offset of the first byte of line (i+1).
     // This replaces the previous dense Vec<usize> (one entry per source byte,
     // 8 bytes/byte on 64-bit) with a much smaller Vec sized by line count.
-    let line_starts: Vec<usize> = std::iter::once(0)
-        .chain(source_bytes.iter().enumerate().filter_map(|(i, &b)| {
-            if b == b'\n' {
-                Some(i + 1)
-            } else {
-                None
-            }
-        }))
-        .collect();
+    let line_starts: Vec<usize> = compute_line_starts(source_bytes);
 
     // Returns the 1-indexed source line number for byte position `pos`.
     let byte_to_line = |pos: usize| -> usize {
         match line_starts.binary_search(&pos) {
             Ok(idx) => idx + 1,
-            Err(idx) => idx, // idx is the number of line starts strictly before pos
+            Err(idx) => idx.max(1), // idx is the number of line starts strictly before pos
         }
     };
 
