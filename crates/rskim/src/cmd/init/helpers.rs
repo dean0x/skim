@@ -162,18 +162,18 @@ Before touching a file, decide your intent — then use the right tool once.
 | **Find the right file** — narrowing candidates | `skim 'src/**/*.ts'` | Peeks inside each file cheaply. Use ls/Glob first if names suffice |
 | **API surface** — "what can I call?" | `skim --mode=signatures` | Function/method signatures only |
 | **Understand logic** — "how does X work?" | Read (targeted range) | Skim strips the bodies you need |
-| **Edit a file** — you will modify it | `skim -n <file>` then Read (section) | `-n` gives source line numbers; Read only the section you need |
+| **Edit a file** — you will modify it | `skim --line-numbers <file>` then Read (section) | `--line-numbers` gives source line numbers; Read only the section you need |
 | **Debug/trace** — following control flow | Read (targeted range) | Implementation details matter |
 
 ### Anti-pattern: skim then Read the same file
 
-**Avoid skimming a file and then Reading the same file** unless `-n` is involved.
+**Avoid skimming a file and then Reading the same file** unless `--line-numbers` is involved.
 This wastes more tokens than either tool alone. Pick one:
 - If you need bodies but not line numbers → go straight to Read.
 - If you only need structure/signatures → skim it and move on.
-- If you need structure AND line numbers for editing → `skim -n <file>`, then Read only the narrow range you will modify.
+- If you need structure AND line numbers for editing → `skim --line-numbers <file>`, then Read only the narrow range you will modify.
 
-The only valid skim→Read sequence without `-n` is across **different files**:
+The only valid skim→Read sequence without `--line-numbers` is across **different files**:
 skim a directory to find the right file, then Read that one file.
 
 ### Quick Reference
