@@ -18,10 +18,10 @@ fn test_skim_git_help() {
         .args(["git", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("status "))
         .stdout(predicate::str::contains("diff"))
-        .stdout(predicate::str::contains("fetch"))
-        .stdout(predicate::str::contains("log"));
+        .stdout(predicate::str::contains("fetch "))
+        .stdout(predicate::str::contains("log "));
 }
 
 #[test]
@@ -31,7 +31,7 @@ fn test_skim_git_no_args_shows_help() {
         .arg("git")
         .assert()
         .success()
-        .stdout(predicate::str::contains("status"));
+        .stdout(predicate::str::contains("status "));
 }
 
 // ============================================================================
@@ -47,7 +47,7 @@ fn test_skim_git_status_in_repo() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("status")
+            predicate::str::contains("status ")
                 .and(predicate::str::contains("branch").or(predicate::str::contains("clean"))),
         );
 }
@@ -55,14 +55,14 @@ fn test_skim_git_status_in_repo() {
 #[test]
 fn test_skim_git_status_porcelain_compresses() {
     // --porcelain is now stripped by the handler; output is still compressed.
-    // The [status] prefix confirms the handler ran (not raw passthrough).
+    // The `status ` prefix confirms the handler ran (not raw passthrough).
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "status", "--porcelain"])
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("status")
+            predicate::str::contains("status ")
                 .and(predicate::str::contains("branch").or(predicate::str::contains("clean"))),
         );
 }
@@ -76,7 +76,7 @@ fn test_skim_git_status_short_compresses() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("status")
+            predicate::str::contains("status ")
                 .and(predicate::str::contains("branch").or(predicate::str::contains("clean"))),
         );
 }
@@ -115,7 +115,7 @@ fn test_skim_git_log_in_repo() {
         .args(["git", "log"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("log").and(predicate::str::contains("commit")));
+        .stdout(predicate::str::contains("log ").and(predicate::str::contains("commit")));
 }
 
 #[test]
@@ -125,19 +125,19 @@ fn test_skim_git_log_with_limit() {
         .args(["git", "log", "-n", "3"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("log"));
+        .stdout(predicate::str::contains("log "));
 }
 
 #[test]
 fn test_skim_git_log_oneline_compresses() {
     // --oneline is now stripped by the handler; the log is still compressed.
-    // The [log] prefix confirms the handler ran (not raw passthrough).
+    // The `log ` prefix confirms the handler ran (not raw passthrough).
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "log", "--oneline", "-n", "3"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("log").and(predicate::str::contains("commit")));
+        .stdout(predicate::str::contains("log ").and(predicate::str::contains("commit")));
 }
 
 // ============================================================================
@@ -145,8 +145,8 @@ fn test_skim_git_log_oneline_compresses() {
 // ============================================================================
 
 /// Run `skim git fetch` against the skim repo. Since skim may have no
-/// configured remotes or may be up-to-date, we accept either "[fetch]" output
-/// or "up to date".
+/// configured remotes or may be up-to-date, we accept either `fetch up to date`
+/// output or the `fetch ` prefix (indicating a remote update was found).
 #[test]
 fn test_skim_git_fetch_in_repo() {
     Command::cargo_bin("skim")
@@ -154,7 +154,7 @@ fn test_skim_git_fetch_in_repo() {
         .args(["git", "fetch"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("fetch").or(predicate::str::contains("up to date")));
+        .stdout(predicate::str::contains("fetch ").or(predicate::str::contains("up to date")));
 }
 
 // ============================================================================
@@ -184,7 +184,7 @@ fn test_skim_git_status_with_short_flag_compresses() {
         .args(["git", "status", "-s"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("status"));
+        .stdout(predicate::str::contains("status "));
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn test_skim_git_status_with_porcelain_flag_compresses() {
         .args(["git", "status", "--porcelain"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("status"));
+        .stdout(predicate::str::contains("status "));
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn test_skim_git_status_with_short_long_flag_compresses() {
         .args(["git", "status", "--short"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("status"));
+        .stdout(predicate::str::contains("status "));
 }
 
 // ============================================================================
@@ -222,7 +222,7 @@ fn test_skim_git_log_oneline_flag_compresses() {
         .args(["git", "log", "--oneline", "-5"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("log").and(predicate::str::contains("commit")));
+        .stdout(predicate::str::contains("log ").and(predicate::str::contains("commit")));
 }
 
 #[test]
@@ -520,22 +520,22 @@ fn test_skim_git_show_file_content_unsupported_ext_passthrough() {
 #[test]
 fn test_skim_git_dispatcher_routes_all_subcommands() {
     // ---- status ----
-    // The status handler always prefixes output with "[status]".
+    // The status handler prefixes output with `status ` (operation + space).
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "status"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("status"));
+        .stdout(predicate::str::contains("status "));
 
     // ---- log ----
-    // The log handler prefixes output with "[log]".
+    // The log handler prefixes output with `log ` (operation + space).
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "log", "-n", "1"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("log"));
+        .stdout(predicate::str::contains("log "));
 
     // ---- show ----
     // The show handler (commit mode, --json) produces a JSON object —
@@ -566,14 +566,13 @@ fn test_skim_git_dispatcher_routes_all_subcommands() {
         .success();
 
     // ---- fetch ----
-    // The fetch handler always prefixes output with "[fetch]" (even when
-    // there is nothing to fetch).
+    // The fetch handler prefixes output with `fetch ` (operation + space).
     Command::cargo_bin("skim")
         .unwrap()
         .args(["git", "fetch"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("fetch").or(predicate::str::contains("up to date")));
+        .stdout(predicate::str::contains("fetch ").or(predicate::str::contains("up to date")));
 }
 
 // ============================================================================
