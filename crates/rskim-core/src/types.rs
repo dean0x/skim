@@ -399,7 +399,7 @@ pub enum Mode {
     /// - Imports/exports
     ///
     /// Removes:
-    /// - Function bodies (replaced with `/* ... */`)
+    /// - Function bodies (replaced with `{...}`)
     /// - Implementation details
     Structure,
 

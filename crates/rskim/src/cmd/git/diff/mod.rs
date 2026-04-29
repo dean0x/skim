@@ -44,7 +44,7 @@ pub(in crate::cmd::git) const PARALLEL_THRESHOLD: usize = 5;
 /// Controls how unchanged AST nodes are rendered alongside changed nodes.
 ///
 /// - `Default`: Only changed nodes are shown (no unchanged context).
-/// - `Structure`: Unchanged nodes are shown as signatures (`{ /* ... */ }`).
+/// - `Structure`: Unchanged nodes are shown as signatures (`{...}`).
 /// - `Full`: Unchanged nodes are shown in full.
 ///
 /// DESIGN NOTE (AD-GIT-6): visibility widened to `pub(in crate::cmd::git)` so that

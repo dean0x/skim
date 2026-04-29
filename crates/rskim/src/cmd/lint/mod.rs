@@ -261,7 +261,7 @@ mod tests {
         assert_eq!(result.errors, 0);
         assert_eq!(result.warnings, 0);
         assert!(result.groups.is_empty());
-        assert!(result.as_ref().contains("LINT OK"));
+        assert!(result.as_ref().contains(" OK"));
     }
 
     #[test]

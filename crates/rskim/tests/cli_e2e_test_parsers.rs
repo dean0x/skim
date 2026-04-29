@@ -30,8 +30,8 @@ fn test_cargo_tier1_json_pass_structured_output() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS:"))
-        .stdout(predicate::str::contains("FAIL: 0"));
+        .stdout(predicate::str::contains("pass:"))
+        .stdout(predicate::str::contains("fail: 0"));
 }
 
 #[test]
@@ -44,8 +44,8 @@ fn test_cargo_tier1_json_fail_structured_output() {
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("FAIL: 1"))
-        .stdout(predicate::str::contains("PASS: 1"));
+        .stdout(predicate::str::contains("fail: 1"))
+        .stdout(predicate::str::contains("pass: 1"));
 }
 
 // ============================================================================
@@ -100,7 +100,7 @@ fn test_cargo_tier2_regex_degraded() {
         .write_stdin(text_input)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 5"))
+        .stdout(predicate::str::contains("pass: 5"))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -144,8 +144,8 @@ fn test_vitest_tier1_json_pass() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 3"))
-        .stdout(predicate::str::contains("FAIL: 0"));
+        .stdout(predicate::str::contains("pass: 3"))
+        .stdout(predicate::str::contains("fail: 0"));
 }
 
 #[test]
@@ -156,8 +156,8 @@ fn test_vitest_tier1_json_fail_with_detail() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("FAIL: 1"))
-        .stdout(predicate::str::contains("PASS: 1"));
+        .stdout(predicate::str::contains("fail: 1"))
+        .stdout(predicate::str::contains("pass: 1"));
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn test_vitest_tier1_pnpm_prefix() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 2"));
+        .stdout(predicate::str::contains("pass: 2"));
 }
 
 // ============================================================================
@@ -184,7 +184,7 @@ fn test_vitest_tier2_regex_pipe_format() {
         .write_stdin(input)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 3"))
+        .stdout(predicate::str::contains("pass: 3"))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -196,7 +196,7 @@ fn test_vitest_tier2_regex_fail_fixture() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("FAIL: 1"))
+        .stdout(predicate::str::contains("fail: 1"))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -225,8 +225,8 @@ fn test_pytest_tier1_pass() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 5"))
-        .stdout(predicate::str::contains("FAIL: 0"));
+        .stdout(predicate::str::contains("pass: 5"))
+        .stdout(predicate::str::contains("fail: 0"));
 }
 
 #[test]
@@ -237,8 +237,8 @@ fn test_pytest_tier1_fail_with_detail() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("FAIL: 1"))
-        .stdout(predicate::str::contains("PASS: 2"));
+        .stdout(predicate::str::contains("fail: 1"))
+        .stdout(predicate::str::contains("pass: 2"));
 }
 
 #[test]
@@ -249,9 +249,9 @@ fn test_pytest_tier1_mixed() {
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
-        .stdout(predicate::str::contains("PASS: 4"))
-        .stdout(predicate::str::contains("FAIL: 1"))
-        .stdout(predicate::str::contains("SKIP: 1"));
+        .stdout(predicate::str::contains("pass: 4"))
+        .stdout(predicate::str::contains("fail: 1"))
+        .stdout(predicate::str::contains("skip: 1"));
 }
 
 // ============================================================================
@@ -294,7 +294,7 @@ fn test_vitest_degraded_silent_without_debug() {
         .write_stdin(input)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 3"))
+        .stdout(predicate::str::contains("pass: 3"))
         // No --debug flag: stderr must contain no skim markers
         .stderr(predicate::str::contains("[skim:warning]").not())
         .stderr(predicate::str::contains("[skim:notice]").not());

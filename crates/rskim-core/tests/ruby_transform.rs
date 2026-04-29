@@ -30,9 +30,9 @@ fn test_ruby_language_detection() {
 #[test]
 fn test_ruby_structure_strips_method_bodies() {
     let result = transform(SIMPLE_RB, Language::Ruby, Mode::Structure).unwrap();
-    // Method bodies should be replaced with /* ... */
+    // Method bodies should be replaced with {...}
     assert!(
-        result.contains("/* ... */"),
+        result.contains("{...}"),
         "method bodies should be replaced, got:\n{result}"
     );
     // Method names should be preserved

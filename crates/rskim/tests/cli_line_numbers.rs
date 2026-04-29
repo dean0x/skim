@@ -165,7 +165,7 @@ fn test_line_numbers_structure_mode_skips_body_lines() {
     //   5: "  return;"
     //   6: "}"
     // Structure mode collapses the body (lines 3-6: the "{...}") into
-    // " { /* ... */ }" on the same line as the signature. The output therefore
+    // " {...}" on the same line as the signature. The output therefore
     // has 3 lines, annotated with source lines 1, 2, 3 (not 1, 2, 3 sequentially
     // — the annotation for the signature must be 3, not 4 or 5 or 6).
     std::fs::write(
@@ -237,10 +237,10 @@ fn test_line_numbers_structure_mode_skips_body_lines() {
     // the type alias (source line 2) must skip to line 3, not increment by 1.
     let collapsed_line = numbered
         .iter()
-        .find(|(_, content)| content.contains("/* ... */"));
+        .find(|(_, content)| content.contains("{...}"));
     assert!(
         collapsed_line.is_some(),
-        "Structure mode output must contain a '/* ... */' collapsed body line"
+        "Structure mode output must contain a '{{...}}' collapsed body line"
     );
     let (sig_num, _) = collapsed_line.unwrap();
     assert_eq!(
@@ -347,7 +347,7 @@ fn test_line_numbers_structure_mode_large_source_gap() {
     // Collect all collapsed lines and find the one for gap().
     let collapsed_lines: Vec<(usize, &str)> = numbered
         .iter()
-        .filter(|(_, c)| c.contains("/* ... */"))
+        .filter(|(_, c)| c.contains("{...}"))
         .copied()
         .collect();
 
@@ -525,7 +525,7 @@ fn test_line_numbers_with_max_lines_omission_markers_no_prefix() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     // Omission markers should have no line number prefix
-    // They look like "// ..." or "/* ... */" etc.
+    // They look like "// ..." or "{...}" etc.
     // Lines with numbers should parse fine; omission marker lines should not start with a number\t
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(!lines.is_empty());
@@ -1213,7 +1213,7 @@ fn test_line_numbers_guardrail_identity_map() {
     // The guardrail triggers when the compressed output is larger than the raw input.
     // In that case, skim falls back to the raw source (identity map).
     // A very small file (e.g., single assignment) is likely to trigger the guardrail
-    // because the structure mode adds overhead (e.g., "/* ... */") for minimal code.
+    // because the structure mode adds overhead (e.g., "{...}") for minimal code.
     // We verify that when -n is used and guardrail triggers, identity line numbers apply.
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.py");

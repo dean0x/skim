@@ -294,7 +294,7 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.errors, 0);
         assert_eq!(result.warnings, 0);
-        assert!(result.as_ref().contains("LINT OK"));
+        assert!(result.as_ref().contains(" OK"));
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
         assert!(result.is_some(), "Expected Tier 1 format parse to succeed");
         let result = result.unwrap();
         assert_eq!(result.files_formatted, Some(2));
-        assert!(result.as_ref().contains("LINT OK"));
+        assert!(result.as_ref().contains(" OK"));
         assert!(result.as_ref().contains("files formatted"));
     }
 
@@ -351,7 +351,7 @@ mod tests {
             result.tier_name()
         );
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 

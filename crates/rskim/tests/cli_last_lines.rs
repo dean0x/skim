@@ -209,10 +209,18 @@ fn test_last_lines_with_glob_pattern() {
 
     let stdout = String::from_utf8(output.stdout).unwrap();
 
-    // Each file section in multi-file output gets a header line (// === file.ts ===)
+    // Each file section in multi-file output gets a header line (// file.ts)
     // followed by the per-file output. Verify that per-file content respects the
     // last-lines limit by checking each section individually.
-    let sections: Vec<&str> = stdout.split("// === ").filter(|s| !s.is_empty()).collect();
+    //
+    // Split on "\n// " (newline-anchored) to avoid splitting on inline comment
+    // lines inside file content. Prepend "\n" so the first header is also
+    // preceded by a newline and the split pattern matches uniformly.
+    let normalized = format!("\n{stdout}");
+    let sections: Vec<&str> = normalized
+        .split("\n// ")
+        .filter(|s| !s.is_empty())
+        .collect();
     assert!(
         sections.len() >= 2,
         "Should have at least 2 file sections in glob output, got {}: {:?}",
@@ -221,11 +229,11 @@ fn test_last_lines_with_glob_pattern() {
     );
 
     for section in &sections {
-        // Each section starts with "filename.ts ===\n" header, then content lines.
+        // Each section starts with "filename.ts\n" header, then content lines.
         // Trailing empty lines are file separators, not content, so trim them.
         let content_lines: Vec<&str> = section
             .lines()
-            .skip(1) // skip the header line (e.g., "file1.ts ===")
+            .skip(1) // skip the header line (e.g., "file1.ts")
             .collect::<Vec<_>>();
         let content_count = content_lines
             .iter()

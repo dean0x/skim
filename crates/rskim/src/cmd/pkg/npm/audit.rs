@@ -265,7 +265,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG AUDIT | npm"));
+        assert!(display.contains("npm audit"));
         assert!(display.contains("critical: 1"));
         assert!(display.contains("high: 1"));
         assert!(display.contains("moderate: 1"));

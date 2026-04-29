@@ -36,7 +36,7 @@ impl GuardrailOutcome {
 /// Minimum raw content size (bytes) for the guardrail to activate.
 ///
 /// Tiny files naturally have higher overhead from transformation markers
-/// (e.g., `/* ... */`), which is expected and not a sign of a problem.
+/// (e.g., `{...}`), which is expected and not a sign of a problem.
 /// The guardrail only applies to files large enough that compression
 /// should genuinely reduce size.
 const MIN_RAW_SIZE_FOR_GUARDRAIL: usize = 256;

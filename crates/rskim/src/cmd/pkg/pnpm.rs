@@ -352,7 +352,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG INSTALL | pnpm"));
+        assert!(display.contains("pnpm install"));
         assert!(display.contains("added: 127"));
         assert!(display.contains("removed: 3"));
     }
@@ -368,7 +368,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG AUDIT | pnpm"));
+        assert!(display.contains("pnpm audit"));
         assert!(display.contains("critical: 1"));
         assert!(display.contains("high: 1"));
         assert!(display.contains("total: 2"));
@@ -385,7 +385,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG OUTDATED | pnpm | 2 packages"));
+        assert!(display.contains("pnpm outdated 2 packages"));
     }
 
     #[test]

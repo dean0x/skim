@@ -301,7 +301,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG AUDIT | cargo"));
+        assert!(display.contains("cargo audit"));
         assert!(display.contains("critical: 1"));
         assert!(display.contains("high: 1"));
         assert!(display.contains("total: 2"));

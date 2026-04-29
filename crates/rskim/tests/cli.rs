@@ -57,7 +57,7 @@ fn test_cli_structure_mode() {
         .assert()
         .success()
         .stdout(predicate::str::contains("function add"))
-        .stdout(predicate::str::contains("{ /* ... */ }"))
+        .stdout(predicate::str::contains("{...}"))
         .stdout(predicate::str::contains("return a + b").not());
 }
 
@@ -254,7 +254,7 @@ fn test_cli_all_languages_structure() {
         .arg(&ts_file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 
     // Python
     let py_file = temp_dir.path().join("test.py");
@@ -264,7 +264,7 @@ fn test_cli_all_languages_structure() {
         .arg(&py_file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 
     // Rust
     let rs_file = temp_dir.path().join("test.rs");
@@ -274,7 +274,7 @@ fn test_cli_all_languages_structure() {
         .arg(&rs_file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 
     // Go
     let go_file = temp_dir.path().join("test.go");
@@ -284,7 +284,7 @@ fn test_cli_all_languages_structure() {
         .arg(&go_file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 
     // Java
     let java_file = temp_dir.path().join("Test.java");
@@ -294,7 +294,7 @@ fn test_cli_all_languages_structure() {
         .arg(&java_file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 }
 
 // ============================================================================
@@ -518,7 +518,7 @@ fn test_cli_lang_alias_with_file() {
         .assert()
         .success()
         .stdout(predicate::str::contains("function add"))
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 }
 
 // ============================================================================
@@ -535,7 +535,7 @@ fn test_cli_filename_detects_rust() {
         .assert()
         .success()
         .stdout(predicate::str::contains("fn hello()"))
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 }
 
 #[test]
@@ -572,7 +572,7 @@ fn test_cli_filename_detects_go() {
         .assert()
         .success()
         .stdout(predicate::str::contains("func hello()"))
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 }
 
 #[test]
@@ -585,7 +585,7 @@ fn test_cli_filename_detects_java() {
         .assert()
         .success()
         .stdout(predicate::str::contains("class Main"))
-        .stdout(predicate::str::contains("{ /* ... */ }"));
+        .stdout(predicate::str::contains("{...}"));
 }
 
 #[test]
@@ -775,7 +775,7 @@ fn test_cli_stdin_large_input_streaming() {
 
     // Verify bodies are stripped (structure mode is default)
     assert!(
-        output_str.contains("{ /* ... */ }"),
+        output_str.contains("{...}"),
         "Function bodies should be replaced with placeholder"
     );
     assert!(

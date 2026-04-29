@@ -61,7 +61,7 @@ fn test_npm_install_tier1_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG INSTALL | npm"))
+        .stdout(predicate::str::contains("npm install"))
         .stdout(predicate::str::contains("added: 127"))
         .stdout(predicate::str::contains("removed: 3"));
 }
@@ -78,7 +78,7 @@ fn test_npm_install_tier2_regex() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG INSTALL | npm"))
+        .stdout(predicate::str::contains("npm install"))
         .stdout(predicate::str::contains("added: 127"))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
@@ -110,7 +110,7 @@ fn test_npm_audit_tier1_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG AUDIT | npm"))
+        .stdout(predicate::str::contains("npm audit"))
         .stdout(predicate::str::contains("critical: 1"))
         .stdout(predicate::str::contains("total: 3"));
 }
@@ -138,7 +138,7 @@ fn test_npm_outdated_tier1_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG OUTDATED | npm"))
+        .stdout(predicate::str::contains("npm outdated"))
         .stdout(predicate::str::contains("3 packages"));
 }
 
@@ -154,7 +154,7 @@ fn test_npm_ls_tier1_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG LIST | npm"))
+        .stdout(predicate::str::contains("npm list"))
         .stdout(predicate::str::contains("4 total"))
         .stdout(predicate::str::contains("1 flagged"));
 }
@@ -186,7 +186,7 @@ fn test_pip_install_tier1_regex() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG INSTALL | pip"))
+        .stdout(predicate::str::contains("pip install"))
         .stdout(predicate::str::contains("added: 3"));
 }
 
@@ -202,7 +202,7 @@ fn test_pip_check_clean() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG CHECK | pip"))
+        .stdout(predicate::str::contains("pip check"))
         .stdout(predicate::str::contains("0 issues"));
 }
 
@@ -218,7 +218,7 @@ fn test_pip_check_issues() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG CHECK | pip"))
+        .stdout(predicate::str::contains("pip check"))
         .stdout(predicate::str::contains("2 issues"));
 }
 
@@ -234,7 +234,7 @@ fn test_pip_list_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG OUTDATED | pip"))
+        .stdout(predicate::str::contains("pip outdated"))
         .stdout(predicate::str::contains("2 packages"));
 }
 
@@ -250,7 +250,7 @@ fn test_pnpm_install_regex() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG INSTALL | pnpm"))
+        .stdout(predicate::str::contains("pnpm install"))
         .stdout(predicate::str::contains("added: 127"));
 }
 
@@ -266,7 +266,7 @@ fn test_pnpm_audit_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG AUDIT | pnpm"))
+        .stdout(predicate::str::contains("pnpm audit"))
         .stdout(predicate::str::contains("total: 2"));
 }
 
@@ -282,7 +282,7 @@ fn test_pnpm_outdated_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG OUTDATED | pnpm"))
+        .stdout(predicate::str::contains("pnpm outdated"))
         .stdout(predicate::str::contains("2 packages"));
 }
 
@@ -298,7 +298,7 @@ fn test_cargo_audit_json() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG AUDIT | cargo"))
+        .stdout(predicate::str::contains("cargo audit"))
         .stdout(predicate::str::contains("critical: 1"))
         .stdout(predicate::str::contains("total: 2"));
 }
@@ -326,7 +326,7 @@ fn test_cargo_audit_tier2_regex() {
         .write_stdin(text)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PKG AUDIT | cargo"))
+        .stdout(predicate::str::contains("cargo audit"))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 

@@ -53,11 +53,11 @@ impl fmt::Display for TestSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "PASS: {} | FAIL: {} | SKIP: {}",
+            "pass: {} fail: {} skip: {}",
             self.pass, self.fail, self.skip
         )?;
         if let Some(ms) = self.duration_ms {
-            write!(f, " | Duration: {}ms", format_with_commas(ms))?;
+            write!(f, " {}ms", format_with_commas(ms))?;
         }
         Ok(())
     }
@@ -68,7 +68,7 @@ impl fmt::Display for TestSummary {
 pub(crate) struct TestResult {
     pub(crate) summary: TestSummary,
     pub(crate) entries: Vec<TestEntry>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -98,9 +98,9 @@ impl TestResult {
         if summary.fail > 0 {
             for entry in entries {
                 if entry.outcome == TestOutcome::Fail {
-                    let _ = write!(output, "\n  FAIL: {}", entry.name);
+                    let _ = write!(output, "\n FAIL: {}", entry.name);
                     if let Some(detail) = &entry.detail {
-                        let _ = write!(output, "\n        {detail}");
+                        let _ = write!(output, "\n  {detail}");
                     }
                 }
             }
@@ -165,7 +165,7 @@ pub(crate) struct GitResult {
     pub(crate) operation: String,
     pub(crate) summary: String,
     pub(crate) details: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
     /// Parse tier label (e.g., `"full"`, `"degraded"`, `"passthrough"`).
     ///
@@ -210,9 +210,9 @@ impl GitResult {
     fn render(operation: &str, summary: &str, details: &[String]) -> String {
         use std::fmt::Write;
 
-        let mut output = format!("[{operation}] {summary}");
+        let mut output = format!("{operation} {summary}");
         for detail in details {
-            let _ = write!(output, "\n  {detail}");
+            let _ = write!(output, "\n {detail}");
         }
         output
     }
@@ -243,7 +243,7 @@ pub(crate) struct BuildResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) duration_ms: Option<u64>,
     pub(crate) error_messages: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -289,15 +289,15 @@ impl BuildResult {
     ) -> String {
         use std::fmt::Write;
 
-        let status = if success { "BUILD OK" } else { "BUILD FAILED" };
-        let mut output = format!("{status} | warnings: {warnings} | errors: {errors}");
+        let status = if success { "OK" } else { "FAILED" };
+        let mut output = format!("{status} warnings: {warnings} errors: {errors}");
         if let Some(ms) = duration_ms {
-            let _ = write!(output, " | {}ms", format_with_commas(ms));
+            let _ = write!(output, " {}ms", format_with_commas(ms));
         }
 
         if !success {
             for msg in error_messages {
-                let _ = write!(output, "\n  {msg}");
+                let _ = write!(output, "\n {msg}");
             }
         }
 
@@ -370,7 +370,7 @@ pub(crate) struct LintGroup {
 /// # AD-LINT-23 (2026-04-15) — render() output for format-mode
 ///
 /// When `files_formatted.is_some()` AND `errors == 0 && warnings == 0`:
-/// → `LINT OK | {tool} ({N} files formatted)`
+/// → `{tool} OK ({N} files formatted)`
 ///
 /// When `files_formatted.is_some()` AND there are issues (i.e., check mode found
 /// problems while files_formatted is also set — unlikely but handled):
@@ -386,7 +386,7 @@ pub(crate) struct LintResult {
     /// Number of files reformatted by a format-mode run. `None` for check-mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) files_formatted: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -429,7 +429,7 @@ pub(crate) struct PkgResult {
     pub(crate) operation: PkgOperation,
     pub(crate) success: bool,
     pub(crate) details: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -461,7 +461,7 @@ impl LintResult {
     ///
     /// Used by `ruff format`, `prettier --write`, and `rustfmt` (format mode) parsers
     /// to signal that N files were reformatted. Rendered as
-    /// `LINT OK | {tool} ({N} files formatted)` when no issues are present.
+    /// `{tool} OK ({N} files formatted)` when no issues are present.
     pub(crate) fn formatted(tool: String, files_formatted: usize) -> Self {
         let rendered = Self::render(&tool, 0, 0, Some(files_formatted), &[]);
         Self {
@@ -500,21 +500,21 @@ impl LintResult {
         if total == 0 {
             // AD-LINT-23: format-mode success includes file count
             if let Some(n) = files_formatted {
-                return format!("LINT OK | {tool} ({n} files formatted)");
+                return format!("{tool} OK ({n} files formatted)");
             }
-            return format!("LINT OK | {tool} | 0 issues");
+            return format!("{tool} OK 0 issues");
         }
 
-        let mut output = format!("LINT: {errors} errors, {warnings} warnings | {tool}");
+        let mut output = format!("{tool} {errors} errors, {warnings} warnings");
         for group in groups {
             let suffix = if group.count == 1 { "" } else { "s" };
             let _ = write!(
                 output,
-                "\n  {} ({} {}{suffix}):",
+                "\n {} ({} {}{suffix}):",
                 group.rule, group.count, group.severity
             );
             for loc in &group.locations {
-                let _ = write!(output, "\n    {loc}");
+                let _ = write!(output, "\n  {loc}");
             }
         }
 
@@ -558,7 +558,7 @@ impl PkgResult {
                 warnings,
             } => {
                 format!(
-                    "PKG INSTALL | {tool} | added: {added} | removed: {removed} | changed: {changed} | warnings: {warnings}"
+                    "{tool} install added: {added} removed: {removed} changed: {changed} warnings: {warnings}"
                 )
             }
             PkgOperation::Audit {
@@ -569,22 +569,22 @@ impl PkgResult {
                 total,
             } => {
                 format!(
-                    "PKG AUDIT | {tool} | critical: {critical} | high: {high} | moderate: {moderate} | low: {low} | total: {total}"
+                    "{tool} audit critical: {critical} high: {high} moderate: {moderate} low: {low} total: {total}"
                 )
             }
             PkgOperation::Outdated { count } => {
-                format!("PKG OUTDATED | {tool} | {count} packages")
+                format!("{tool} outdated {count} packages")
             }
             PkgOperation::Check { issues } => {
-                format!("PKG CHECK | {tool} | {issues} issues")
+                format!("{tool} check {issues} issues")
             }
             PkgOperation::List { total, flagged } => {
-                format!("PKG LIST | {tool} | {total} total | {flagged} flagged")
+                format!("{tool} list {total} total {flagged} flagged")
             }
         };
 
         for detail in details {
-            let _ = write!(output, "\n  {detail}");
+            let _ = write!(output, "\n {detail}");
         }
 
         output
@@ -626,7 +626,7 @@ pub(crate) struct InfraResult {
     pub(crate) operation: String,
     pub(crate) summary: String,
     pub(crate) items: Vec<InfraItem>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -663,9 +663,9 @@ impl InfraResult {
 
     fn render(tool: &str, operation: &str, summary: &str, items: &[InfraItem]) -> String {
         use std::fmt::Write;
-        let mut output = format!("INFRA: {tool} {operation} | {summary}");
+        let mut output = format!("{tool} {operation} {summary}");
         for item in items {
-            let _ = write!(output, "\n  {}: {}", item.label, item.value);
+            let _ = write!(output, "\n {}: {}", item.label, item.value);
         }
         output
     }
@@ -723,7 +723,7 @@ pub(crate) struct DiffResult {
     #[serde(default)]
     pub(crate) files_changed: usize,
     pub(crate) files: Vec<DiffFileEntry>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -752,11 +752,11 @@ impl DiffResult {
         if self.rendered.is_empty() {
             // Re-render from file entries as a summary fallback
             use std::fmt::Write;
-            let mut output = format!("[diff] {} files changed", self.files_changed);
+            let mut output = format!("{} files changed", self.files_changed);
             for file in &self.files {
                 let _ = write!(
                     output,
-                    "\n  {} ({}, {} regions)",
+                    "\n {} ({}, {} regions)",
                     file.path, file.status, file.changed_regions
                 );
             }
@@ -790,7 +790,7 @@ pub(crate) struct FileResult {
     pub(crate) entries: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) footer: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -836,14 +836,12 @@ impl FileResult {
     ) -> String {
         use std::fmt::Write;
 
-        let tool_upper = tool.to_uppercase();
-        let mut output =
-            format!("{tool_upper}: {tool} | {total_count} entries (showing {shown_count})");
+        let mut output = format!("{tool} {shown_count}/{total_count}");
         for entry in entries {
-            let _ = write!(output, "\n  {entry}");
+            let _ = write!(output, "\n {entry}");
         }
         if let Some(f) = footer {
-            let _ = write!(output, "\n  {f}");
+            let _ = write!(output, "\n {f}");
         }
         output
     }
@@ -888,12 +886,12 @@ pub(crate) struct LogResult {
     /// Number of stack frames elided from all captured traces (last 3 per trace kept).
     ///
     /// # AD-LOG-10 (2026-04-11)
-    /// When non-zero, a `(+{n} stack frames elided)` footer is appended to the
-    /// text render so agents know stack traces were truncated. Zero means either
-    /// no traces were encountered or all frames fit within the 3-frame window.
+    /// When non-zero, a `(+{n} frames elided)` footer is appended to the text
+    /// render so agents know stack traces were truncated. Zero means either no
+    /// traces were encountered or all frames fit within the 3-frame window.
     #[serde(default)]
     pub(crate) stack_frames_elided: usize,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -979,17 +977,17 @@ impl LogResult {
         use std::fmt::Write;
 
         let mut output = if debug_only {
-            format!("LOG DEBUG: {debug_hidden} debug lines")
+            format!("debug: {debug_hidden} lines")
         } else {
             format!(
-                "LOG: {total_lines} lines \u{2192} {unique_messages} unique ({deduplicated_count} duplicates removed)"
+                "{total_lines} lines \u{2192} {unique_messages} unique ({deduplicated_count} duplicates removed)"
             )
         };
 
         if !debug_only && debug_hidden > 0 {
             let _ = write!(
                 output,
-                "\n[notice] {debug_hidden} DEBUG lines hidden. To see debug output: skim log --debug-only"
+                "\n{debug_hidden} debug lines hidden (skim log --debug-only)"
             );
         }
 
@@ -999,18 +997,18 @@ impl LogResult {
                     if entry.count > 1 {
                         let _ = write!(
                             output,
-                            "\n  [{level}] {} (\u{d7}{})",
+                            "\n {level}: {} (\u{d7}{})",
                             entry.message, entry.count
                         );
                     } else {
-                        let _ = write!(output, "\n  [{level}] {}", entry.message);
+                        let _ = write!(output, "\n {level}: {}", entry.message);
                     }
                 }
                 None => {
                     if entry.count > 1 {
-                        let _ = write!(output, "\n  {} (\u{d7}{})", entry.message, entry.count);
+                        let _ = write!(output, "\n {} (\u{d7}{})", entry.message, entry.count);
                     } else {
-                        let _ = write!(output, "\n  {}", entry.message);
+                        let _ = write!(output, "\n {}", entry.message);
                     }
                 }
             }
@@ -1018,7 +1016,7 @@ impl LogResult {
 
         // AD-LOG-10: append elision footer when frames were truncated.
         if stack_frames_elided > 0 {
-            let _ = write!(output, "\n(+{stack_frames_elided} stack frames elided)");
+            let _ = write!(output, "\n(+{stack_frames_elided} frames elided)");
         }
 
         output
@@ -1068,7 +1066,7 @@ mod tests {
             skip: 3,
             duration_ms: None,
         };
-        assert_eq!(format!("{summary}"), "PASS: 42 | FAIL: 0 | SKIP: 3");
+        assert_eq!(format!("{summary}"), "pass: 42 fail: 0 skip: 3");
     }
 
     #[test]
@@ -1079,10 +1077,7 @@ mod tests {
             skip: 3,
             duration_ms: Some(1234),
         };
-        assert_eq!(
-            format!("{summary}"),
-            "PASS: 42 | FAIL: 0 | SKIP: 3 | Duration: 1,234ms"
-        );
+        assert_eq!(format!("{summary}"), "pass: 42 fail: 0 skip: 3 1,234ms");
     }
 
     // ========================================================================
@@ -1116,10 +1111,7 @@ mod tests {
         ];
         let result = TestResult::new(summary, entries);
         // Compact on success: summary only
-        assert_eq!(
-            format!("{result}"),
-            "PASS: 3 | FAIL: 0 | SKIP: 0 | Duration: 100ms"
-        );
+        assert_eq!(format!("{result}"), "pass: 3 fail: 0 skip: 0 100ms");
     }
 
     #[test]
@@ -1149,7 +1141,7 @@ mod tests {
         ];
         let result = TestResult::new(summary, entries);
         let display = format!("{result}");
-        assert!(display.contains("PASS: 1 | FAIL: 2 | SKIP: 0"));
+        assert!(display.contains("pass: 1 fail: 2 skip: 0"));
         assert!(display.contains("FAIL: test_b"));
         assert!(display.contains("expected 2, got 3"));
         assert!(display.contains("FAIL: test_c"));
@@ -1227,7 +1219,7 @@ mod tests {
         };
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
-        assert_eq!(result.as_ref(), "PASS: 1 | FAIL: 0 | SKIP: 0");
+        assert_eq!(result.as_ref(), "pass: 1 fail: 0 skip: 0");
     }
 
     // ========================================================================
@@ -1242,7 +1234,7 @@ mod tests {
             vec!["abc123 feat: add feature".to_string()],
         );
         let display = format!("{result}");
-        assert!(display.contains("[push]"));
+        assert!(display.contains("push"));
         assert!(display.contains("pushed to origin/main"));
         assert!(display.contains("abc123 feat: add feature"));
     }
@@ -1295,7 +1287,7 @@ mod tests {
     fn test_build_result_display_success() {
         let result = BuildResult::new(true, 2, 0, Some(1500), vec![]);
         let display = format!("{result}");
-        assert!(display.contains("BUILD OK"));
+        assert!(display.contains("OK"));
         assert!(display.contains("warnings: 2"));
         assert!(display.contains("errors: 0"));
         assert!(display.contains("1,500ms"));
@@ -1316,7 +1308,7 @@ mod tests {
             ],
         );
         let display = format!("{result}");
-        assert!(display.contains("BUILD FAILED"));
+        assert!(display.contains("FAILED"));
         assert!(display.contains("error: type mismatch"));
         assert!(display.contains("error: unused variable"));
     }
@@ -1351,7 +1343,7 @@ mod tests {
     #[test]
     fn test_lint_result_display_clean() {
         let result = LintResult::new("eslint".to_string(), 0, 0, vec![]);
-        assert_eq!(format!("{result}"), "LINT OK | eslint | 0 issues");
+        assert_eq!(format!("{result}"), "eslint OK 0 issues");
     }
 
     #[test]
@@ -1379,7 +1371,7 @@ mod tests {
         ];
         let result = LintResult::new("eslint".to_string(), 2, 3, groups);
         let display = format!("{result}");
-        assert!(display.contains("LINT: 2 errors, 3 warnings | eslint"));
+        assert!(display.contains("eslint 2 errors, 3 warnings"));
         assert!(display.contains("no-unused-vars (3 warnings):"));
         assert!(display.contains("src/api/auth.ts:12"));
         assert!(display.contains("@typescript-eslint/no-explicit-any (2 errors):"));
@@ -1419,7 +1411,7 @@ mod tests {
             vec![],
         );
         let display = format!("{result}");
-        assert!(display.contains("PKG INSTALL | npm"));
+        assert!(display.contains("npm install"));
         assert!(display.contains("added: 5"));
         assert!(display.contains("removed: 1"));
         assert!(display.contains("changed: 2"));
@@ -1441,7 +1433,7 @@ mod tests {
             vec!["lodash: Prototype Pollution (high)".to_string()],
         );
         let display = format!("{result}");
-        assert!(display.contains("PKG AUDIT | npm"));
+        assert!(display.contains("npm audit"));
         assert!(display.contains("critical: 0"));
         assert!(display.contains("high: 2"));
         assert!(display.contains("total: 6"));
@@ -1457,7 +1449,7 @@ mod tests {
             vec!["lodash 4.17.20 -> 4.17.21".to_string()],
         );
         let display = format!("{result}");
-        assert!(display.contains("PKG OUTDATED | npm | 4 packages"));
+        assert!(display.contains("npm outdated 4 packages"));
         assert!(display.contains("lodash 4.17.20 -> 4.17.21"));
     }
 
@@ -1470,7 +1462,7 @@ mod tests {
             vec!["flask requires werkzeug>=3.0.1".to_string()],
         );
         let display = format!("{result}");
-        assert!(display.contains("PKG CHECK | pip | 3 issues"));
+        assert!(display.contains("pip check 3 issues"));
         assert!(display.contains("flask requires werkzeug>=3.0.1"));
     }
 
@@ -1486,7 +1478,7 @@ mod tests {
             vec!["debug@4.3.4: invalid".to_string()],
         );
         let display = format!("{result}");
-        assert!(display.contains("PKG LIST | npm | 42 total | 2 flagged"));
+        assert!(display.contains("npm list 42 total 2 flagged"));
         assert!(display.contains("debug@4.3.4: invalid"));
     }
 
@@ -1522,7 +1514,7 @@ mod tests {
         };
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
-        assert_eq!(result.as_ref(), "LINT OK | mypy | 0 issues");
+        assert_eq!(result.as_ref(), "mypy OK 0 issues");
     }
 
     /// AD-LINT-22/AD-LINT-23 (2026-04-15) — LintResult::formatted() and format-mode render.
@@ -1531,7 +1523,7 @@ mod tests {
         let result = LintResult::formatted("rustfmt".to_string(), 0);
         assert_eq!(
             format!("{result}"),
-            "LINT OK | rustfmt (0 files formatted)",
+            "rustfmt OK (0 files formatted)",
             "Zero-file format run should render with count"
         );
     }
@@ -1539,7 +1531,7 @@ mod tests {
     #[test]
     fn test_lint_result_formatted_multiple_files() {
         let result = LintResult::formatted("ruff".to_string(), 5);
-        assert_eq!(format!("{result}"), "LINT OK | ruff (5 files formatted)",);
+        assert_eq!(format!("{result}"), "ruff OK (5 files formatted)",);
         assert_eq!(result.files_formatted, Some(5));
         assert_eq!(result.errors, 0);
         assert_eq!(result.warnings, 0);
@@ -1550,7 +1542,7 @@ mod tests {
         // Existing check-mode callers using LintResult::new() should produce
         // the same output as before (no files_formatted suffix).
         let result = LintResult::new("prettier".to_string(), 0, 0, vec![]);
-        assert_eq!(format!("{result}"), "LINT OK | prettier | 0 issues");
+        assert_eq!(format!("{result}"), "prettier OK 0 issues");
         assert_eq!(result.files_formatted, None);
     }
 
@@ -1582,7 +1574,7 @@ mod tests {
         };
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
-        assert_eq!(result.as_ref(), "PKG CHECK | pip | 0 issues");
+        assert_eq!(result.as_ref(), "pip check 0 issues");
     }
 
     // ========================================================================
@@ -1612,7 +1604,7 @@ mod tests {
             items,
         );
         let display = format!("{result}");
-        assert!(display.contains("INFRA: gh pr list | 2 items"));
+        assert!(display.contains("gh pr list 2 items"));
         assert!(display.contains("#1: fix: update deps (open)"));
         assert!(display.contains("#2: feat: add feature (merged)"));
     }
@@ -1646,7 +1638,7 @@ mod tests {
         };
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
-        assert!(result.as_ref().contains("INFRA: curl GET | 200 OK"));
+        assert!(result.as_ref().contains("curl GET 200 OK"));
     }
 
     #[test]
@@ -1677,7 +1669,7 @@ mod tests {
 
         // Summary header
         assert!(
-            output.starts_with("[diff] 2 files changed"),
+            output.starts_with("2 files changed"),
             "expected summary header, got: {output}"
         );
         // Per-file entries with status and region counts
@@ -1717,9 +1709,9 @@ mod tests {
             None,
         );
         let output = format!("{result}");
-        assert!(output.starts_with("FIND: find | 5 entries (showing 5)"));
-        assert!(output.contains("  ./src/main.rs"));
-        assert!(output.contains("  ./Cargo.toml"));
+        assert!(output.starts_with("find 5/5"));
+        assert!(output.contains(" ./src/main.rs"));
+        assert!(output.contains(" ./Cargo.toml"));
     }
 
     #[test]
@@ -1732,7 +1724,7 @@ mod tests {
             Some("... and 100 more".to_string()),
         );
         let output = format!("{result}");
-        assert!(output.contains("FIND: find | 200 entries (showing 100)"));
+        assert!(output.contains("find 100/200"));
         assert!(output.contains("... and 100 more"));
     }
 
@@ -1769,14 +1761,14 @@ mod tests {
         };
         result.ensure_rendered();
         assert!(!result.rendered.is_empty());
-        assert!(result.rendered.contains("RG: rg | 2 entries"));
+        assert!(result.rendered.contains("rg 2/2"));
     }
 
     #[test]
     fn test_file_result_empty_entries() {
         let result = FileResult::new("find".to_string(), 0, 0, vec![], None);
         let output = format!("{result}");
-        assert!(output.contains("FIND: find | 0 entries (showing 0)"));
+        assert!(output.contains("find 0/0"));
     }
 
     // ========================================================================
@@ -1799,11 +1791,11 @@ mod tests {
         ];
         let result = LogResult::new(4281, 87, 0, 3194, entries, false);
         let output = format!("{result}");
-        assert!(output.contains("LOG: 4281 lines"));
+        assert!(output.contains("4281 lines"));
         assert!(output.contains("87 unique"));
         assert!(output.contains("3194 duplicates removed"));
-        assert!(output.contains("[ERROR] connection refused (\u{d7}47)"));
-        assert!(output.contains("[INFO] request completed (\u{d7}312)"));
+        assert!(output.contains("ERROR: connection refused (\u{d7}47)"));
+        assert!(output.contains("INFO: request completed (\u{d7}312)"));
     }
 
     #[test]
@@ -1815,7 +1807,7 @@ mod tests {
         }];
         let result = LogResult::new(4281, 87, 847, 3194, entries, false);
         let output = format!("{result}");
-        assert!(output.contains("[notice] 847 DEBUG lines hidden"));
+        assert!(output.contains("847 debug lines hidden"));
         assert!(output.contains("skim log --debug-only"));
     }
 
@@ -1828,9 +1820,9 @@ mod tests {
         }];
         let result = LogResult::new(847, 1, 847, 846, entries, true);
         let output = format!("{result}");
-        assert!(output.starts_with("LOG DEBUG: 847 debug lines"));
-        assert!(!output.contains("[notice]"));
-        assert!(output.contains("[DEBUG] cache miss for key=user:123 (\u{d7}203)"));
+        assert!(output.starts_with("debug: 847 lines"));
+        assert!(!output.contains("debug lines hidden"));
+        assert!(output.contains("DEBUG: cache miss for key=user:123 (\u{d7}203)"));
     }
 
     #[test]
@@ -1862,7 +1854,7 @@ mod tests {
         };
         result.ensure_rendered();
         assert!(!result.rendered.is_empty());
-        assert!(result.rendered.contains("LOG: 50 lines"));
+        assert!(result.rendered.contains("50 lines"));
     }
 
     #[test]
@@ -1874,7 +1866,7 @@ mod tests {
         }];
         let result = LogResult::new(1, 1, 0, 0, entries, false);
         let output = format!("{result}");
-        assert!(output.contains("  plain message"));
+        assert!(output.contains(" plain message"));
         assert!(!output.contains('['));
     }
 
@@ -1981,7 +1973,7 @@ mod tests {
             "the diff body",
         );
         let json = serde_json::to_string(&original).unwrap();
-        let deserialized: ShowCommitResult = serde_json::from_str(&json).unwrap();
+        let mut deserialized: ShowCommitResult = serde_json::from_str(&json).unwrap();
 
         // Scalar fields survive round-trip.
         assert_eq!(deserialized.hash, original.hash);
@@ -1990,8 +1982,22 @@ mod tests {
         assert_eq!(deserialized.subject, original.subject);
         assert_eq!(deserialized.files_changed, original.files_changed);
         assert_eq!(deserialized.files.len(), original.files.len());
-        // rendered is preserved when serialized with the full field set.
-        assert_eq!(deserialized.as_ref(), original.as_ref());
+        // rendered is not serialized; ensure_rendered produces a lossy summary
+        // (no diff body since diff_output is not stored in the struct).
+        deserialized.ensure_rendered();
+        assert!(
+            !deserialized.as_ref().is_empty(),
+            "rendered must be populated after ensure_rendered"
+        );
+        assert!(
+            deserialized.as_ref().contains("cafebab"),
+            "short hash must appear"
+        );
+        assert!(deserialized.as_ref().contains("Dave"), "author must appear");
+        assert!(
+            deserialized.as_ref().contains("refactor: clean up"),
+            "subject must appear"
+        );
     }
 
     #[test]
@@ -2204,7 +2210,7 @@ pub(crate) struct ShowCommitResult {
     ///
     /// # AD-GIT-8 (2026-04-11)
     /// Preserved verbatim with 4-space indent stripped. Appended to text render
-    /// as `\n\n{body}` only when non-empty.
+    /// as `\n{body}` only when non-empty.
     #[serde(default)]
     pub(crate) body: String,
     /// Merge parent hashes, when present (e.g. `"abc123 def456"`).
@@ -2219,7 +2225,7 @@ pub(crate) struct ShowCommitResult {
     pub(crate) files_changed: usize,
     /// Files changed in this commit.
     pub(crate) files: Vec<DiffFileEntry>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     rendered: String,
 }
 
@@ -2229,7 +2235,7 @@ impl ShowCommitResult {
     /// # AD-GIT-8 (2026-04-11)
     /// `body` and `parents` are new required parameters. `parents` renders as
     /// `Merge: {parents}\n` before the summary line. `body` renders as
-    /// `\n\n{body}` after the summary only when non-empty.
+    /// `\n{body}` after the summary only when non-empty.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         hash: String,
@@ -2267,7 +2273,7 @@ impl ShowCommitResult {
     ///
     /// # AD-GIT-8 (2026-04-11)
     /// - `parents` (when `Some`) is prepended as `Merge: {parents}\n` before the summary.
-    /// - `body` (when non-empty) is appended as `\n\n{body}` after the summary.
+    /// - `body` (when non-empty) is appended as `\n{body}` after the summary.
     /// - Empty body produces no trailing newlines, keeping subject-only commits compact.
     fn render(
         hash: &str,
@@ -2285,10 +2291,10 @@ impl ShowCommitResult {
         }
         let _ = write!(output, "{short} {author} \u{2014} {subject}");
         if !body.is_empty() {
-            let _ = write!(output, "\n\n{body}");
+            let _ = write!(output, "\n{body}");
         }
         if !diff_output.is_empty() {
-            let _ = write!(output, "\n\n{diff_output}");
+            let _ = write!(output, "\n{diff_output}");
         }
         output
     }
@@ -2325,12 +2331,12 @@ impl ShowCommitResult {
             for file in &self.files {
                 let _ = write!(
                     output,
-                    "\n  {} ({}, {} regions)",
+                    "\n {} ({}, {} regions)",
                     file.path, file.status, file.changed_regions
                 );
             }
             if !self.body.is_empty() {
-                let _ = write!(output, "\n\n{}", self.body);
+                let _ = write!(output, "\n{}", self.body);
             }
             self.rendered = output;
         }

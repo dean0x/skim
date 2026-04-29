@@ -107,9 +107,8 @@ fn test_directory_with_headers() {
         .arg(temp_dir.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("// === "))
-        .stdout(predicate::str::contains("a.ts"))
-        .stdout(predicate::str::contains("b.ts"));
+        .stdout(predicate::str::contains("/a.ts"))
+        .stdout(predicate::str::contains("/b.ts"));
 }
 
 #[test]
@@ -175,7 +174,7 @@ fn test_directory_with_modes() {
         .assert()
         .success()
         .stdout(predicate::str::contains("function test"))
-        .stdout(predicate::str::contains("/* ... */"));
+        .stdout(predicate::str::contains("{...}"));
 
     // Test signatures mode
     Command::cargo_bin("skim")

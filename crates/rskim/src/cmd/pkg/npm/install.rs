@@ -175,7 +175,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG INSTALL | npm"));
+        assert!(display.contains("npm install"));
         assert!(display.contains("added: 127"));
         assert!(display.contains("removed: 3"));
         assert!(display.contains("changed: 14"));

@@ -72,7 +72,7 @@ fn test_alignment_cargo_test_rewrite_and_handler() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS"));
+        .stdout(predicate::str::contains("pass:"));
 }
 
 /// True round-trip: capture `skim rewrite cargo test` stdout, split into
@@ -123,7 +123,7 @@ fn test_alignment_cargo_test_true_roundtrip() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS"));
+        .stdout(predicate::str::contains("pass:"));
 }
 
 /// Verify `pytest` rewrites to `skim test pytest` AND the handler processes
@@ -142,7 +142,7 @@ fn test_alignment_pytest_rewrite_and_handler() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS"));
+        .stdout(predicate::str::contains("pass:"));
 }
 
 /// Verify `npx vitest` rewrites to `skim test vitest` AND the handler
@@ -165,7 +165,7 @@ fn test_alignment_npx_vitest_rewrite_and_handler() {
         .assert()
         // vitest exits 1 when there are failures; fixture has 1 failure.
         .code(1)
-        .stdout(predicate::str::contains("FAIL: 1"));
+        .stdout(predicate::str::contains("fail: 1"));
 }
 
 // ============================================================================
@@ -188,7 +188,7 @@ fn test_alignment_eslint_rewrite_and_handler() {
         .write_stdin(fixture)
         .assert()
         // Non-zero exit on lint failures; just check output contains summary.
-        .stdout(predicate::str::contains("LINT"));
+        .stdout(predicate::str::contains("eslint"));
 }
 
 /// Verify `ruff check .` rewrites to `skim lint ruff .` AND the handler
@@ -206,7 +206,7 @@ fn test_alignment_ruff_rewrite_and_handler() {
         .args(["lint", "ruff"])
         .write_stdin(fixture)
         .assert()
-        .stdout(predicate::str::contains("LINT"));
+        .stdout(predicate::str::contains("ruff"));
 }
 
 /// Verify `mypy .` rewrites to `skim lint mypy .` AND the handler processes
@@ -224,7 +224,7 @@ fn test_alignment_mypy_rewrite_and_handler() {
         .args(["lint", "mypy"])
         .write_stdin(fixture)
         .assert()
-        .stdout(predicate::str::contains("LINT"));
+        .stdout(predicate::str::contains("mypy"));
 }
 
 /// Verify `golangci-lint run ./...` rewrites to `skim lint golangci ./...`
@@ -242,7 +242,7 @@ fn test_alignment_golangci_rewrite_and_handler() {
         .args(["lint", "golangci"])
         .write_stdin(fixture)
         .assert()
-        .stdout(predicate::str::contains("LINT"));
+        .stdout(predicate::str::contains("golangci"));
 }
 
 // ============================================================================
@@ -264,7 +264,7 @@ fn test_alignment_npm_audit_rewrite_and_handler() {
         .args(["pkg", "npm", "audit"])
         .write_stdin(fixture)
         .assert()
-        .stdout(predicate::str::contains("AUDIT"));
+        .stdout(predicate::str::contains("audit"));
 }
 
 /// Verify `npm install express` rewrites to `skim pkg npm install express`
@@ -300,7 +300,7 @@ fn test_alignment_cargo_audit_rewrite_and_handler() {
         .args(["pkg", "cargo", "audit"])
         .write_stdin(fixture)
         .assert()
-        .stdout(predicate::str::contains("AUDIT"));
+        .stdout(predicate::str::contains("audit"));
 }
 
 /// Verify `pip install flask` rewrites to `skim pkg pip install flask`

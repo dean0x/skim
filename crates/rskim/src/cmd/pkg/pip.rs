@@ -358,7 +358,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG INSTALL | pip"));
+        assert!(display.contains("pip install"));
         assert!(display.contains("added: 3"));
     }
 
@@ -384,7 +384,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG CHECK | pip | 0 issues"));
+        assert!(display.contains("pip check 0 issues"));
     }
 
     #[test]
@@ -394,7 +394,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG CHECK | pip"));
+        assert!(display.contains("pip check"));
         assert!(display.contains("2 issues"));
     }
 
@@ -409,7 +409,7 @@ mod tests {
         assert!(result.is_some());
         let result = result.unwrap();
         let display = format!("{result}");
-        assert!(display.contains("PKG OUTDATED | pip | 2 packages"));
+        assert!(display.contains("pip outdated 2 packages"));
         assert!(display.contains("flask 2.3.0 -> 3.0.0"));
     }
 

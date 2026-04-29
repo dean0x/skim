@@ -135,7 +135,7 @@ fn prepare_format_args(_cmd_args: &mut Vec<String>) {}
 /// typically empty on success. On error (e.g., parse error), rustfmt emits
 /// diagnostics on stderr.
 ///
-/// - Exit 0 + empty/minimal output → `LINT OK | rustfmt (0 files formatted)`
+/// - Exit 0 + empty/minimal output → `rustfmt OK (0 files formatted)`
 /// - Any stderr content → treat as passthrough (unexpected error)
 fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     let combined = combine_stdout_stderr(output);
@@ -264,7 +264,7 @@ mod tests {
         );
         if let crate::output::ParseResult::Full(r) = result {
             assert_eq!(r.warnings, 0);
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 
@@ -438,7 +438,7 @@ mod tests {
             result.tier_name()
         );
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
             assert!(
                 r.as_ref().contains("files formatted"),
                 "Expected format-mode render, got: {}",

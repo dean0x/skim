@@ -20,8 +20,8 @@ fn test_skim_test_cargo_in_this_repo() {
         .timeout(std::time::Duration::from_secs(120))
         .assert();
 
-    // Should produce structured output with PASS count (tier 2 regex)
-    assert.stdout(predicate::str::contains("PASS:"));
+    // Should produce structured output with pass count (tier 2 regex)
+    assert.stdout(predicate::str::contains("pass:"));
 }
 
 // ============================================================================
@@ -82,8 +82,8 @@ fn test_skim_test_cargo_stdin_json() {
         .write_stdin(json_input)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 2"))
-        .stdout(predicate::str::contains("FAIL: 0"));
+        .stdout(predicate::str::contains("pass: 2"))
+        .stdout(predicate::str::contains("fail: 0"));
 }
 
 #[test]
@@ -103,5 +103,5 @@ fn test_skim_test_cargo_stdin_plain_text() {
         .write_stdin(text_input)
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS: 5"));
+        .stdout(predicate::str::contains("pass: 5"));
 }

@@ -86,9 +86,9 @@ fn test_guardrail_skipped_in_full_mode() {
 
 #[test]
 fn test_guardrail_triggers_when_output_inflates() {
-    // Structure mode replaces function bodies with ` { /* ... */ }` (14 bytes).
+    // Structure mode replaces function bodies with ` {...}` (6 bytes).
     // For functions with empty bodies `{ }` (3 bytes), each replacement ADDS
-    // 11 bytes. With enough short functions (>= 256 bytes total raw), the
+    // 3 bytes. With enough short functions (>= 256 bytes total raw), the
     // compressed output exceeds the raw size in both bytes and tokens,
     // triggering the guardrail warning on stderr.
     let dir = TempDir::new().unwrap();
@@ -96,8 +96,8 @@ fn test_guardrail_triggers_when_output_inflates() {
 
     // Each line is ~18 bytes: `function XX() { }\n`
     // 20 functions = ~360 bytes raw (above MIN_RAW_SIZE_FOR_GUARDRAIL of 256)
-    // Each function body `{ }` (3 bytes) -> ` { /* ... */ }` (14 bytes) = +11 bytes
-    // Total output growth: 20 * 11 = 220 extra bytes -> ~580 bytes output vs ~360 raw
+    // Each function body `{ }` (3 bytes) -> ` {...}` (6 bytes) = +3 bytes
+    // Total output growth: 20 * 3 = 60 extra bytes -> ~420 bytes output vs ~360 raw
     let mut source = String::new();
     for i in 0..20 {
         source.push_str(&format!("function f{i}() {{ }}\n"));

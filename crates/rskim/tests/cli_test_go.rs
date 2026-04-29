@@ -82,5 +82,5 @@ func TestAdd(t *testing.T) {
         .arg("./...")
         .assert()
         .success()
-        .stdout(predicate::str::contains("PASS"));
+        .stdout(predicate::str::contains("pass:"));
 }

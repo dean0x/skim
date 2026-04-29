@@ -145,8 +145,8 @@ mod tests {
         let result = try_parse_regex(input).unwrap();
         let rendered = format!("{result}");
         assert!(
-            rendered.contains("GREP:"),
-            "Should contain GREP summary, got: {rendered}"
+            rendered.contains("grep "),
+            "Should contain grep summary, got: {rendered}"
         );
         assert!(rendered.contains("matches in"));
     }
@@ -157,8 +157,8 @@ mod tests {
         let result = try_parse_regex(input).unwrap();
         let rendered = format!("{result}");
         assert!(
-            rendered.contains("GREP: grep |"),
-            "Header should start with GREP:"
+            rendered.contains("grep "),
+            "Header should contain tool name"
         );
     }
 }

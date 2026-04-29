@@ -154,7 +154,7 @@ fn prepare_format_args(cmd_args: &mut Vec<String>) {
 /// src/utils/format.ts
 /// ```
 ///
-/// Exit 0 with empty stdout = all files already formatted → `LINT OK`.
+/// Exit 0 with empty stdout = all files already formatted → `{tool} OK (N files formatted)`.
 fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     // Tier 1: parse written file paths from stdout
     if let Some(result) = try_parse_format_structured(&output.stdout) {
@@ -319,7 +319,7 @@ mod tests {
         );
         if let crate::output::ParseResult::Full(r) = result {
             assert_eq!(r.warnings, 0);
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 
@@ -500,7 +500,7 @@ mod tests {
             result.tier_name()
         );
         if let ParseResult::Full(r) = result {
-            assert!(r.as_ref().contains("LINT OK"));
+            assert!(r.as_ref().contains(" OK"));
         }
     }
 

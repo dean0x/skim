@@ -189,8 +189,8 @@ mod tests {
         let result = try_parse_lines(input, Some(0)).unwrap();
         let rendered = format!("{result}");
         assert!(
-            rendered.contains("FIND: find |"),
-            "Header should start with FIND:"
+            rendered.contains("find "),
+            "Header should start with tool name"
         );
         assert!(
             rendered.contains("./src/main.rs"),
