@@ -501,8 +501,9 @@ fn main() -> ExitCode {
     // every subcommand automatically inherits the session context without
     // requiring per-subcommand parsing. The value is passed to AnalyticsConfig
     // and threaded through all recording call sites.
-    let session_id: Option<String> =
-        std::env::args().find_map(|a| a.strip_prefix("--session-id=").map(str::to_string));
+    let session_id: Option<String> = std::env::args()
+        .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string))
+        .filter(|s| !s.is_empty());
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
@@ -560,7 +561,13 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
         process::write_result_and_stats(&result, args.show_stats)?;
-        record_file_analytics(analytics.enabled, &result, "skim -", &args);
+        record_file_analytics(
+            analytics.enabled,
+            &result,
+            "skim -",
+            &args,
+            analytics.session_id.as_deref(),
+        );
         return Ok(());
     }
 
@@ -585,12 +592,24 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
 
     let result = process::process_file(&path, process_options)?;
     process::write_result_and_stats(&result, args.show_stats)?;
-    record_file_analytics(analytics.enabled, &result, &format!("skim {file}"), &args);
+    record_file_analytics(
+        analytics.enabled,
+        &result,
+        &format!("skim {file}"),
+        &args,
+        analytics.session_id.as_deref(),
+    );
     Ok(())
 }
 
 /// Record token analytics for file operations (single file or stdin).
-fn record_file_analytics(enabled: bool, result: &process::ProcessResult, cmd: &str, args: &Args) {
+fn record_file_analytics(
+    enabled: bool,
+    result: &process::ProcessResult,
+    cmd: &str,
+    args: &Args,
+    session_id: Option<&str>,
+) {
     if !enabled {
         return;
     }
@@ -617,7 +636,7 @@ fn record_file_analytics(enabled: bool, result: &process::ProcessResult, cmd: &s
                 mode: Some(mode),
                 language: lang,
                 parse_tier: result.parse_tier.map(str::to_string),
-                session_id: None,
+                session_id: session_id.map(str::to_string),
             },
         );
     }
@@ -786,5 +805,44 @@ mod tests {
                  incorrectly route to the 'test' subcommand."
             );
         }
+    }
+
+    // ========================================================================
+    // B-AC14: empty --session-id= normalisation
+    // ========================================================================
+
+    /// B-AC14: the session_id extraction logic normalises empty values to None.
+    ///
+    /// `std::env::args()` cannot be injected in tests, so we verify the filter
+    /// step directly using the same `find_map(...).filter(|s| !s.is_empty())`
+    /// expression applied to a synthetic arg list.
+    #[test]
+    fn test_empty_session_id_arg_normalised_to_none() {
+        // Simulate `--session-id=` (value is empty string)
+        let args = vec!["skim".to_string(), "--session-id=".to_string()];
+        let session_id: Option<String> = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string))
+            .filter(|s| !s.is_empty());
+        assert!(
+            session_id.is_none(),
+            "--session-id= (empty value) must normalise to None, got {:?}",
+            session_id
+        );
+    }
+
+    /// B-AC14: non-empty --session-id= is preserved as Some.
+    #[test]
+    fn test_non_empty_session_id_arg_preserved() {
+        let args = vec!["skim".to_string(), "--session-id=abc-123".to_string()];
+        let session_id: Option<String> = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string))
+            .filter(|s| !s.is_empty());
+        assert_eq!(
+            session_id.as_deref(),
+            Some("abc-123"),
+            "--session-id=abc-123 must produce Some(\"abc-123\")"
+        );
     }
 }
