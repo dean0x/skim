@@ -18,9 +18,10 @@ pub(super) fn run_log(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--format", "--pretty"]) {
-        return run_passthrough(global_flags, "log", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "log", args, show_stats, analytics_enabled, session_id);
     }
 
     // Strip --oneline — handler injects its own --format flag.
@@ -51,6 +52,7 @@ pub(super) fn run_log(
         false,
         label,
         parse_log,
+        session_id,
     )
 }
 

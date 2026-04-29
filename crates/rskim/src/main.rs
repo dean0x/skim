@@ -496,7 +496,9 @@ fn main() -> ExitCode {
     // Read analytics config from env + CLI flag once at the system boundary.
     // Thread the struct down to all callers — no per-call env reads.
     let cli_disable_analytics = std::env::args().any(|a| a == "--disable-analytics");
-    let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics);
+    // B6: session_id will be extracted from --session-id=VALUE in a later step;
+    // for now pass None so the rest of the pipeline compiles.
+    let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, None);
 
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
         Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
@@ -609,6 +611,7 @@ fn record_file_analytics(enabled: bool, result: &process::ProcessResult, cmd: &s
                 mode: Some(mode),
                 language: lang,
                 parse_tier: result.parse_tier.map(str::to_string),
+                session_id: None,
             },
         );
     }

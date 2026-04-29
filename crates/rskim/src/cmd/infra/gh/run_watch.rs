@@ -77,6 +77,7 @@ pub(super) fn run_watch(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow
     let cfg = StreamConfig {
         analytics_enabled: ctx.analytics_enabled,
         label,
+        session_id: ctx.session_id.clone(),
     };
 
     // Pipe mode: stdin is piped and no run-ID args were given (AD-STR-2).

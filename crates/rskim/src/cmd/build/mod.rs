@@ -38,10 +38,11 @@ pub(crate) fn run(
         None => (None, [].as_slice()),
     };
 
+    let session_id = analytics.session_id.as_deref();
     match sub {
-        Some("cargo") => cargo::run(remaining, show_stats, analytics.enabled),
-        Some("clippy") => cargo::run_clippy(remaining, show_stats, analytics.enabled),
-        Some("tsc") => tsc::run(remaining, show_stats, analytics.enabled),
+        Some("cargo") => cargo::run(remaining, show_stats, analytics.enabled, session_id),
+        Some("clippy") => cargo::run_clippy(remaining, show_stats, analytics.enabled, session_id),
+        Some("tsc") => tsc::run(remaining, show_stats, analytics.enabled, session_id),
         Some(unknown) => {
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             anyhow::bail!(
@@ -113,6 +114,7 @@ pub(super) fn run_parsed_command(
     show_stats: bool,
     analytics_enabled: bool,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let runner = CommandRunner::new(Some(Duration::from_secs(600)));
 
@@ -192,6 +194,7 @@ pub(super) fn run_parsed_command(
         crate::analytics::CommandType::Build,
         output.duration,
         Some(result.tier_name()),
+        session_id,
     );
 
     Ok(exit_code)

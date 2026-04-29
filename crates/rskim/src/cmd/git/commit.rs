@@ -49,9 +49,10 @@ pub(super) fn run_commit(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--help"]) {
-        return run_passthrough(global_flags, "commit", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "commit", args, show_stats, analytics_enabled, session_id);
     }
 
     let (filtered_args, output_format) = extract_output_format(args);
@@ -70,6 +71,7 @@ pub(super) fn run_commit(
         true, // combine_stderr: hook output and "nothing to commit" come from stderr
         label,
         parse_commit,
+        session_id,
     )
 }
 

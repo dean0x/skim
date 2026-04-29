@@ -48,6 +48,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args = vec!["build".to_string()];
     full_args.extend_from_slice(args);
@@ -64,6 +65,7 @@ pub(crate) fn run(
         show_stats,
         analytics_enabled,
         parse,
+        session_id,
     )
 }
 
@@ -75,6 +77,7 @@ pub(crate) fn run_clippy(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args = vec!["clippy".to_string()];
     full_args.extend_from_slice(args);
@@ -91,6 +94,7 @@ pub(crate) fn run_clippy(
         show_stats,
         analytics_enabled,
         parse,
+        session_id,
     )
 }
 

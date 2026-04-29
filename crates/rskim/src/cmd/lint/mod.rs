@@ -57,6 +57,7 @@ pub(crate) fn run(
         show_stats,
         json_output,
         analytics_enabled: analytics.enabled,
+        session_id: analytics.session_id.clone(),
     };
 
     match linter_name.as_str() {
@@ -164,6 +165,7 @@ pub(crate) fn run_linter(
             output_format: ctx.output_format(),
             analytics_enabled: ctx.analytics_enabled,
             family: "lint",
+            session_id: ctx.session_id.as_deref(),
         },
         |output, _args| parse_fn(output),
     )

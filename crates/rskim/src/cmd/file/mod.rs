@@ -52,6 +52,7 @@ pub(crate) fn run(
         show_stats,
         json_output,
         analytics_enabled: analytics.enabled,
+        session_id: analytics.session_id.clone(),
     };
 
     match tool_name.as_str() {
@@ -136,6 +137,7 @@ pub(crate) fn run_file_tool(
             output_format: ctx.output_format(),
             analytics_enabled: ctx.analytics_enabled,
             family: "file",
+            session_id: ctx.session_id.as_deref(),
         },
         |output, _args| parse_fn(output),
     )

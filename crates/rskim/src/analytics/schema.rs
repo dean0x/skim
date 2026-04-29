@@ -38,5 +38,16 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
     }
 
+    if version < 3 {
+        // AD-AN-4: session_id is nullable for backward compatibility — rows
+        // recorded before this migration have NULL session_id and are excluded
+        // from per-session average calculations.
+        conn.execute_batch(
+            "ALTER TABLE token_savings ADD COLUMN session_id TEXT;
+            CREATE INDEX IF NOT EXISTS idx_ts_session_id ON token_savings(session_id);
+            PRAGMA user_version = 3;",
+        )?;
+    }
+
     Ok(())
 }

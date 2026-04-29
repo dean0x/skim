@@ -24,9 +24,10 @@ pub(super) fn run_fetch(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--dry-run", "-q", "--quiet"]) {
-        return run_passthrough(global_flags, "fetch", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "fetch", args, show_stats, analytics_enabled, session_id);
     }
 
     let (filtered_args, output_format) = extract_output_format(args);
@@ -45,6 +46,7 @@ pub(super) fn run_fetch(
         true,
         label,
         parse_fetch,
+        session_id,
     )
 }
 

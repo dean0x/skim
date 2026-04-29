@@ -24,6 +24,7 @@ pub(super) fn run_status(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     // Strip conflicting format flags — handler injects --porcelain=v2 itself.
     let stripped_args: Vec<String> = args
@@ -52,6 +53,7 @@ pub(super) fn run_status(
         false,
         label,
         parse_status,
+        session_id,
     )
 }
 

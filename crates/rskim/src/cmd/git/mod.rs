@@ -60,15 +60,16 @@ pub(crate) fn run(
 
     let subcmd_args = &rest[1..];
     let analytics_enabled = analytics.enabled;
+    let session_id = analytics.session_id.as_deref();
 
     match subcmd.as_str() {
-        "status" => status::run_status(&global_flags, subcmd_args, show_stats, analytics_enabled),
-        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats, analytics_enabled),
-        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, analytics_enabled),
-        "log" => log::run_log(&global_flags, subcmd_args, show_stats, analytics_enabled),
-        "show" => show::run_show(&global_flags, subcmd_args, show_stats, analytics_enabled),
-        "commit" => commit::run_commit(&global_flags, subcmd_args, show_stats, analytics_enabled),
-        "push" => push::run_push(&global_flags, subcmd_args, show_stats, analytics_enabled),
+        "status" => status::run_status(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
+        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
+        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
+        "log" => log::run_log(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
+        "show" => show::run_show(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
+        "commit" => commit::run_commit(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
+        "push" => push::run_push(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(
@@ -267,6 +268,7 @@ pub(super) fn finalize_git_output_owned(
     command_type: crate::analytics::CommandType,
     duration: std::time::Duration,
     parse_tier: Option<&'static str>,
+    session_id: Option<&str>,
 ) {
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&raw, &output);
@@ -280,6 +282,7 @@ pub(super) fn finalize_git_output_owned(
         command_type,
         duration,
         parse_tier,
+        session_id,
     );
 }
 
@@ -303,6 +306,7 @@ pub(super) fn finalize_git_output_passthrough(
     command_type: crate::analytics::CommandType,
     duration: std::time::Duration,
     parse_tier: Option<&'static str>,
+    session_id: Option<&str>,
 ) {
     if show_stats {
         // ALLOC NOTE: count_token_pair borrows; no allocation here.
@@ -320,6 +324,7 @@ pub(super) fn finalize_git_output_passthrough(
             command_type,
             duration,
             parse_tier,
+            session_id,
         );
     }
 }
@@ -339,6 +344,7 @@ pub(super) fn run_passthrough(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.push(subcmd.to_string());
@@ -367,6 +373,7 @@ pub(super) fn run_passthrough(
         crate::analytics::CommandType::Git,
         output.duration,
         Some("passthrough"),
+        session_id,
     );
 
     Ok(map_exit_code(exit_code))
@@ -400,6 +407,7 @@ pub(super) fn run_parsed_command<F>(
     combine_stderr: bool,
     label: String,
     parser: F,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode>
 where
     F: FnOnce(&str) -> GitResult,
@@ -436,6 +444,7 @@ where
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
+            session_id,
         );
         return Ok(map_exit_code(exit_code));
     }
@@ -482,6 +491,7 @@ where
         crate::analytics::CommandType::Git,
         output.duration,
         parse_tier,
+        session_id,
     );
 
     Ok(ExitCode::SUCCESS)
@@ -757,6 +767,7 @@ mod tests {
             command_type,
             duration,
             parse_tier,
+            None,
         );
     }
 

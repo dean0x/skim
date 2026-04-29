@@ -96,6 +96,7 @@ pub(crate) fn run(
         crate::analytics::CommandType::Test,
         output.duration,
         Some(result.tier_name()),
+        None,
     );
 
     // Exit code: mirror pytest's exit code if we ran it, or infer from parse

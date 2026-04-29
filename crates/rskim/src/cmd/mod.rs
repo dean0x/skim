@@ -259,6 +259,9 @@ pub(crate) struct RunContext {
     pub show_stats: bool,
     pub json_output: bool,
     pub analytics_enabled: bool,
+    /// Optional session ID from `AnalyticsConfig::session_id`.
+    /// Threaded through to `ParsedCommandConfig::session_id` at construction.
+    pub session_id: Option<String>,
 }
 
 impl RunContext {
@@ -293,6 +296,10 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// name and made the analytics dashboard ambiguous when multiple families share
     /// tool names (e.g., `cargo` appears in both `build` and `pkg`). (PF-022)
     pub family: &'a str,
+    /// Optional session ID propagated from `AnalyticsConfig::session_id`.
+    /// Passed through to `try_record_command` so every recording carries the
+    /// hook-injected session context when available.
+    pub session_id: Option<&'a str>,
 }
 
 /// Obtain command output from stdin or by spawning the command.
@@ -391,6 +398,7 @@ where
         output_format,
         analytics_enabled,
         family,
+        session_id,
     } = config;
 
     let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
@@ -448,6 +456,7 @@ where
         command_type,
         output.duration,
         Some(result.tier_name()),
+        session_id,
     );
 
     Ok(ExitCode::from(code.clamp(0, 255) as u8))

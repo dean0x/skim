@@ -153,6 +153,7 @@ fn handle_error_exit(
     show_stats: bool,
     analytics_enabled: bool,
     duration: std::time::Duration,
+    session_id: Option<&str>,
 ) -> ExitCode {
     if !stderr.is_empty() {
         eprint!("{stderr}");
@@ -170,6 +171,7 @@ fn handle_error_exit(
         crate::analytics::CommandType::Git,
         duration,
         Some("passthrough"),
+        session_id,
     );
     map_exit_code(exit_code)
 }
@@ -259,6 +261,7 @@ pub(super) fn run_diff(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_diff_help();
@@ -276,7 +279,7 @@ pub(super) fn run_diff(
             "--check",
         ],
     ) {
-        return run_passthrough(global_flags, "diff", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "diff", args, show_stats, analytics_enabled, session_id);
     }
 
     // Extract skim-specific flags before passing args to git
@@ -302,6 +305,7 @@ pub(super) fn run_diff(
             show_stats,
             analytics_enabled,
             output.duration,
+            session_id,
         ));
     }
 
@@ -330,6 +334,7 @@ pub(super) fn run_diff(
             crate::analytics::CommandType::Git,
             duration,
             Some("full"),
+            session_id,
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -356,6 +361,7 @@ pub(super) fn run_diff(
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("degraded"),
+                session_id,
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -380,6 +386,7 @@ pub(super) fn run_diff(
         crate::analytics::CommandType::Git,
         duration,
         Some("full"),
+        session_id,
     );
 
     Ok(ExitCode::SUCCESS)

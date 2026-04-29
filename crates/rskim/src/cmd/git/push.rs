@@ -56,9 +56,10 @@ pub(super) fn run_push(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--help"]) {
-        return run_passthrough(global_flags, "push", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "push", args, show_stats, analytics_enabled, session_id);
     }
 
     let (mut effective_args, output_format) = extract_output_format(args);
@@ -88,6 +89,7 @@ pub(super) fn run_push(
         true, // combine_stderr: push writes to stderr
         label,
         parse_push,
+        session_id,
     )
 }
 

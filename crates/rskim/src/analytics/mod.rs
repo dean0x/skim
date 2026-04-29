@@ -75,6 +75,10 @@ pub(crate) struct TokenSavingsRecord {
     pub(crate) mode: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) parse_tier: Option<String>,
+    /// AD-AN-4: session_id is nullable for backward compatibility — rows
+    /// recorded before schema v3 have NULL and are excluded from per-session
+    /// average calculations.
+    pub(crate) session_id: Option<String>,
 }
 
 // ============================================================================
@@ -141,6 +145,23 @@ pub(crate) struct OriginalCommandStats {
     pub(crate) tokens_saved: u64,
     pub(crate) avg_savings_pct: f64,
     pub(crate) avg_duration_ms: f64,
+}
+
+/// Per-session aggregate statistics derived from the `session_id` column.
+///
+/// AD-AN-2: Only invocations with a non-NULL `session_id` are counted.
+/// Pre-v3 rows (NULL session_id) are excluded so the average reflects
+/// actual observed session throughput rather than inflated all-time totals.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct SessionStats {
+    /// Number of distinct session IDs observed.
+    pub(crate) distinct_sessions: u64,
+    /// Total tokens saved across all tagged invocations.
+    pub(crate) total_tokens_saved: u64,
+    /// Average tokens saved per session (zero-safe, returns 0.0 when no sessions).
+    pub(crate) avg_tokens_per_session: f64,
+    /// Invocations without a session_id (NULL rows, excluded from averages).
+    pub(crate) untagged_invocations: u64,
 }
 
 // ============================================================================
@@ -215,18 +236,27 @@ impl PricingModel {
 /// and per-call `SKIM_DISABLE_ANALYTICS` / `SKIM_INPUT_COST_PER_MTOK` env reads.
 /// Created in `main()` after CLI parsing and threaded to all callers.
 /// Tests construct this struct directly with controlled values — no env mutation.
-#[derive(Debug, Clone, Copy)]
+///
+/// AD-AN-1: `Copy` is intentionally not derived because `session_id: Option<String>`
+/// contains a heap-allocated `String`. `Clone` is derived for explicit duplication
+/// where needed.
+#[derive(Debug, Clone)]
 pub(crate) struct AnalyticsConfig {
     pub enabled: bool,
     pub input_cost_per_mtok: Option<f64>,
+    /// AD-AN-4: Optional session ID injected by the hook rewrite pipeline
+    /// (`--session-id=VALUE`). Propagated to every `TokenSavingsRecord` so
+    /// the per-session dashboard section can group invocations by session.
+    pub session_id: Option<String>,
 }
 
 impl AnalyticsConfig {
     /// Read process env once at the system boundary.
     ///
     /// `cli_disable` is the value of `--disable-analytics` from CLI parsing.
-    /// Call this in main(), then thread the result down to all callers.
-    pub fn from_process(cli_disable: bool) -> Self {
+    /// `session_id` is extracted from `--session-id=VALUE` in `main()` before
+    /// this call. Call this in main(), then thread the result down to all callers.
+    pub fn from_process(cli_disable: bool, session_id: Option<String>) -> Self {
         let env_disabled = std::env::var("SKIM_DISABLE_ANALYTICS")
             .ok()
             .map(|v| Self::parse_disable_value(&v))
@@ -238,6 +268,7 @@ impl AnalyticsConfig {
         Self {
             enabled: !cli_disable && !env_disabled,
             input_cost_per_mtok: cost,
+            session_id,
         }
     }
 
@@ -296,6 +327,14 @@ pub(crate) trait AnalyticsStore {
         _since: Option<i64>,
     ) -> anyhow::Result<Vec<OriginalCommandStats>> {
         Ok(vec![])
+    }
+    fn query_session_stats(&self, _since: Option<i64>) -> anyhow::Result<SessionStats> {
+        Ok(SessionStats {
+            distinct_sessions: 0,
+            total_tokens_saved: 0,
+            avg_tokens_per_session: 0.0,
+            untagged_invocations: 0,
+        })
     }
     fn clear(&self) -> anyhow::Result<()> {
         Ok(())
@@ -367,8 +406,8 @@ impl AnalyticsDb {
             &r.original_cmd
         };
         self.conn.execute(
-            "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path, mode, language, parse_tier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path, mode, language, parse_tier, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 r.timestamp,
                 r.command_type.as_str(),
@@ -381,6 +420,7 @@ impl AnalyticsDb {
                 r.mode,
                 r.language,
                 r.parse_tier,
+                r.session_id,
             ],
         )?;
         Ok(())
@@ -629,6 +669,50 @@ impl AnalyticsDb {
 
         Ok(count)
     }
+
+    /// Query per-session statistics grouped by session_id.
+    ///
+    /// NULL session_id rows are excluded from session grouping but counted in
+    /// `untagged_invocations`. Division by zero is guarded: when
+    /// `distinct_sessions == 0`, `avg_tokens_per_session` is 0.0.
+    pub(crate) fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
+        // Query for sessions (non-NULL session_id rows only)
+        let (where_clause, params) = since_clause_with_extra(since, "session_id IS NOT NULL");
+        let session_sql = format!(
+            "SELECT COUNT(DISTINCT session_id), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0) \
+             FROM token_savings {where_clause}"
+        );
+        let mut stmt = self.conn.prepare(&session_sql)?;
+        let (distinct_sessions, total_tokens_saved): (u64, i64) =
+            stmt.query_row(rusqlite::params_from_iter(params), |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+
+        // Query for untagged invocations (NULL session_id)
+        let (untagged_clause, untagged_params) =
+            since_clause_with_extra(since, "session_id IS NULL");
+        let untagged_sql = format!("SELECT COUNT(*) FROM token_savings {untagged_clause}");
+        let mut untagged_stmt = self.conn.prepare(&untagged_sql)?;
+        let untagged_invocations: u64 = untagged_stmt
+            .query_row(rusqlite::params_from_iter(untagged_params), |row| {
+                row.get(0)
+            })?;
+
+        let total_tokens_saved = total_tokens_saved.max(0) as u64;
+        let avg_tokens_per_session = if distinct_sessions > 0 {
+            total_tokens_saved as f64 / distinct_sessions as f64
+        } else {
+            0.0
+        };
+
+        Ok(SessionStats {
+            distinct_sessions,
+            total_tokens_saved,
+            avg_tokens_per_session,
+            untagged_invocations,
+        })
+    }
 }
 
 impl AnalyticsStore for AnalyticsDb {
@@ -655,6 +739,9 @@ impl AnalyticsStore for AnalyticsDb {
         since: Option<i64>,
     ) -> anyhow::Result<Vec<OriginalCommandStats>> {
         self.query_by_original_cmd(since)
+    }
+    fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
+        self.query_session_stats(since)
     }
     fn clear(&self) -> anyhow::Result<()> {
         self.conn.execute("DELETE FROM token_savings", [])?;
@@ -791,7 +878,7 @@ fn persist_record(record: &TokenSavingsRecord) {
 ///
 /// Callers must check `enabled` before calling; this function always records.
 /// The single external caller (`try_record_command`) already guards on `enabled`,
-/// so removing the redundant parameter here keeps the argument count at 7.
+/// so removing the redundant parameter here keeps the argument count low.
 fn record_fire_and_forget(
     raw_text: String,
     compressed_text: String,
@@ -800,6 +887,7 @@ fn record_fire_and_forget(
     duration: Duration,
     project_path: String,
     parse_tier: Option<String>,
+    session_id: Option<String>,
 ) {
     register_thread(std::thread::spawn(move || {
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
@@ -820,6 +908,7 @@ fn record_fire_and_forget(
             mode: None,
             language: None,
             parse_tier,
+            session_id,
         };
         persist_record(&record);
     }));
@@ -856,6 +945,7 @@ pub(crate) fn try_record_command(
     command_type: CommandType,
     duration: Duration,
     parse_tier: Option<&str>,
+    session_id: Option<&str>,
 ) {
     if !enabled {
         return;
@@ -872,6 +962,7 @@ pub(crate) fn try_record_command(
         duration,
         cwd,
         parse_tier.map(str::to_string),
+        session_id.map(str::to_string),
     );
 }
 
@@ -891,6 +982,7 @@ pub(crate) fn try_record_command_with_counts(
     command_type: CommandType,
     duration: Duration,
     parse_tier: Option<&str>,
+    session_id: Option<&str>,
 ) {
     if !enabled {
         return;
@@ -913,6 +1005,7 @@ pub(crate) fn try_record_command_with_counts(
             mode: None,
             language: None,
             parse_tier: parse_tier.map(str::to_string),
+            session_id: session_id.map(str::to_string),
         },
     );
 }
@@ -951,6 +1044,7 @@ mod tests {
             mode: Some("structure".to_string()),
             language: Some("rust".to_string()),
             parse_tier: None,
+            session_id: None,
         }
     }
 

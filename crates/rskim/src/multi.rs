@@ -294,6 +294,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
                 mode: Some(mode),
                 language: None, // mixed languages
                 parse_tier: None,
+                session_id: None,
             },
         );
     }

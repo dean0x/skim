@@ -79,6 +79,7 @@ pub(crate) fn run(
             output_format: OutputFormat::default(),
             analytics_enabled,
             family: "test",
+            session_id: None,
         },
         move |output, _args| parse_impl(output, is_nextest),
     )

@@ -32,6 +32,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     run_parsed_command(
         "tsc",
@@ -41,6 +42,7 @@ pub(crate) fn run(
         show_stats,
         analytics_enabled,
         parse_tsc,
+        session_id,
     )
 }
 

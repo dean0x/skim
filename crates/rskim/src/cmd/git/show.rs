@@ -185,6 +185,7 @@ pub(super) fn run_show(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_show_help();
@@ -193,15 +194,15 @@ pub(super) fn run_show(
 
     // Passthrough for stat-family and format flags.
     if user_has_flag(args, PASSTHROUGH_FLAGS) {
-        return run_passthrough(global_flags, "show", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "show", args, show_stats, analytics_enabled, session_id);
     }
 
     match detect_show_mode(args) {
         ShowMode::MultiRef => {
-            run_passthrough(global_flags, "show", args, show_stats, analytics_enabled)
+            run_passthrough(global_flags, "show", args, show_stats, analytics_enabled, session_id)
         }
         ShowMode::FileContent { refpath } => {
-            run_show_file_content(global_flags, args, &refpath, show_stats, analytics_enabled)
+            run_show_file_content(global_flags, args, &refpath, show_stats, analytics_enabled, session_id)
         }
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
@@ -212,6 +213,7 @@ pub(super) fn run_show(
                 output_format,
                 show_stats,
                 analytics_enabled,
+                session_id,
             )
         }
     }
@@ -527,6 +529,7 @@ fn emit_show_commit(
     show_stats: bool,
     analytics_enabled: bool,
     duration: std::time::Duration,
+    session_id: Option<&str>,
 ) -> anyhow::Result<()> {
     match output_format {
         OutputFormat::Json => {
@@ -546,6 +549,7 @@ fn emit_show_commit(
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("full"),
+                session_id,
             );
         }
         OutputFormat::Text => {
@@ -575,6 +579,7 @@ fn emit_show_commit(
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("full"),
+                session_id,
             );
         }
     }
@@ -594,6 +599,7 @@ fn run_show_commit(
     output_format: OutputFormat,
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let (raw, duration) = match run_git_show_raw(global_flags, git_args)? {
         ShowRawOutcome::Success { stdout, duration } => (stdout, duration),
@@ -615,6 +621,7 @@ fn run_show_commit(
                 crate::analytics::CommandType::Git,
                 duration,
                 Some("passthrough"),
+                session_id,
             );
             return Ok(exit_code);
         }
@@ -640,6 +647,7 @@ fn run_show_commit(
             crate::analytics::CommandType::Git,
             duration,
             Some("passthrough"),
+            session_id,
         );
         return Ok(ExitCode::SUCCESS);
     };
@@ -652,6 +660,7 @@ fn run_show_commit(
         show_stats,
         analytics_enabled,
         duration,
+        session_id,
     )?;
     Ok(ExitCode::SUCCESS)
 }
@@ -686,6 +695,7 @@ fn passthrough_file_content(
     analytics_enabled: bool,
     duration: std::time::Duration,
     tier: u8,
+    session_id: Option<&str>,
 ) {
     eprintln!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
@@ -707,6 +717,7 @@ fn passthrough_file_content(
         crate::analytics::CommandType::Git,
         duration,
         tier_name,
+        session_id,
     );
 }
 
@@ -726,6 +737,7 @@ fn run_show_file_content(
     refpath: &str,
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     // --json is not meaningful for file-content mode.
     if user_has_flag(args, &["--json"]) {
@@ -770,6 +782,7 @@ fn run_show_file_content(
             crate::analytics::CommandType::Git,
             output.duration,
             Some("passthrough"),
+            session_id,
         );
         return Ok(map_exit_code(exit_code));
     }
@@ -786,7 +799,7 @@ fn run_show_file_content(
         // Tier 2: unsupported or serde-based language — passthrough.
         // Move raw: the else branch always returns, so Rust knows raw is
         // available after the let-else for the Tier 1 path.
-        passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 2);
+        passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 2, session_id);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -805,7 +818,7 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 3);
+            passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 3, session_id);
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -835,6 +848,7 @@ fn run_show_file_content(
         crate::analytics::CommandType::Git,
         duration,
         Some("full"),
+        session_id,
     );
 
     Ok(ExitCode::SUCCESS)
@@ -1163,7 +1177,7 @@ mod tests {
     fn test_file_content_mode_json_rejected() {
         let global_flags: Vec<String> = vec![];
         let args: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
-        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, false)
+        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, false, None)
             .expect("run_show_file_content must not return an anyhow error for --json rejection");
         assert_eq!(
             result,

@@ -99,6 +99,7 @@ pub(crate) fn run(
         crate::analytics::CommandType::Test,
         start.elapsed(),
         Some(result.tier_name()),
+        None,
     );
 
     Ok(exit_code)

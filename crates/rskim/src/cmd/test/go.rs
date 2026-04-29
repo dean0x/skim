@@ -116,6 +116,7 @@ pub(crate) fn run(
         crate::analytics::CommandType::Test,
         output.duration,
         Some(parsed.tier_name()),
+        None,
     );
 
     Ok(exit_code)
