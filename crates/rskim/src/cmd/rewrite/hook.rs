@@ -129,9 +129,9 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         }
     };
 
-    // Extract command using the agent-specific protocol
-    let command = match protocol.parse_input(&json) {
-        Some(input) => input.command,
+    // Extract command (and session_id) using the agent-specific protocol
+    let (command, session_id) = match protocol.parse_input(&json) {
+        Some(input) => (input.command, input.session_id),
         None => {
             audit_hook("", false, "");
             return Ok(ExitCode::SUCCESS); // passthrough on missing/unparseable field
@@ -178,9 +178,23 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
 
     match rewritten {
         Some(ref rewritten_cmd) => {
-            audit_hook(&command, true, rewritten_cmd);
+            // AD-HK-2: Inject --session-id=VALUE into the rewritten command so every
+            // skim invocation in this session is tagged for per-session analytics.
+            // Only inject when session_id is present and command starts with "skim ".
+            let final_cmd = if let Some(ref sid) = session_id {
+                if let Some(rest) = rewritten_cmd.strip_prefix("skim ") {
+                    // Insert --session-id=VALUE after "skim " (the first word).
+                    // e.g. "skim git status" -> "skim --session-id=abc git status"
+                    format!("skim --session-id={sid} {rest}")
+                } else {
+                    rewritten_cmd.clone()
+                }
+            } else {
+                rewritten_cmd.clone()
+            };
+            audit_hook(&command, true, &final_cmd);
             // Use agent-specific response format
-            let response = protocol.format_response(rewritten_cmd);
+            let response = protocol.format_response(&final_cmd);
             let json_out = serde_json::to_string(&response)?;
             println!("{json_out}");
         }
@@ -463,6 +477,66 @@ mod tests {
         assert!(
             !should_warn_today(&stamp),
             "second call same day should not warn"
+        );
+    }
+
+    // ========================================================================
+    // B8: AD-HK-2 — session_id injection into rewritten commands
+    //
+    // The injection logic is inlined in run_hook_mode (not a separate fn),
+    // so tests reproduce the same logic to verify the format contract.
+    // ========================================================================
+
+    /// Helper: reproduce the AD-HK-2 injection format used in run_hook_mode.
+    fn inject_session_id(rewritten_cmd: &str, session_id: Option<&str>) -> String {
+        if let Some(sid) = session_id {
+            if let Some(rest) = rewritten_cmd.strip_prefix("skim ") {
+                return format!("skim --session-id={sid} {rest}");
+            }
+        }
+        rewritten_cmd.to_string()
+    }
+
+    /// AD-HK-2: session_id is injected after "skim " when present.
+    #[test]
+    fn test_session_id_injected_into_skim_command() {
+        let result = inject_session_id("skim git status", Some("abc-123"));
+        assert_eq!(result, "skim --session-id=abc-123 git status");
+    }
+
+    /// AD-HK-2: subcommand and flags are preserved after injection.
+    #[test]
+    fn test_session_id_injection_preserves_subcommand_and_flags() {
+        let result = inject_session_id("skim build cargo --show-stats", Some("sess-xyz"));
+        assert_eq!(result, "skim --session-id=sess-xyz build cargo --show-stats");
+    }
+
+    /// AD-HK-2: no injection when session_id is None.
+    #[test]
+    fn test_session_id_not_injected_when_none() {
+        let result = inject_session_id("skim git log", None);
+        assert_eq!(result, "skim git log");
+    }
+
+    /// AD-HK-2: non-skim commands are not modified even when session_id is present.
+    #[test]
+    fn test_session_id_not_injected_into_non_skim_command() {
+        // A rewritten compound or partial result that doesn't start with "skim " is passthrough
+        let result = inject_session_id("cargo build 2>&1", Some("sess-x"));
+        assert_eq!(result, "cargo build 2>&1");
+    }
+
+    /// AD-HK-2: injection flag format is --session-id=VALUE (equals form, no space).
+    #[test]
+    fn test_session_id_injection_uses_equals_form() {
+        let result = inject_session_id("skim lint eslint", Some("my-session"));
+        assert!(
+            result.contains("--session-id=my-session"),
+            "injection must use --session-id=VALUE equals form, got: {result}"
+        );
+        assert!(
+            !result.contains("--session-id my-session"),
+            "injection must not use space-separated form"
         );
     }
 }

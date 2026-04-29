@@ -23,7 +23,12 @@ impl HookProtocol for CursorHook {
     fn parse_input(&self, json: &serde_json::Value) -> Option<HookInput> {
         // Cursor puts command at top level, not nested under tool_input
         let command = json.get("command").and_then(|c| c.as_str())?.to_string();
-        Some(HookInput { command })
+        // AD-HK-1: Extract session_id from top-level JSON field if present.
+        let session_id = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        Some(HookInput { command, session_id })
     }
 
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value {
@@ -171,5 +176,35 @@ mod tests {
             force: false,
         };
         assert!(hook().uninstall(&opts).is_ok());
+    }
+
+    // ========================================================================
+    // B8: AD-HK-1 — Cursor session_id extraction
+    // ========================================================================
+
+    /// AD-HK-1: Cursor parse_input extracts session_id from top-level JSON.
+    #[test]
+    fn test_cursor_parse_input_extracts_session_id() {
+        let json = serde_json::json!({
+            "session_id": "cursor-session-xyz",
+            "command": "cargo test"
+        });
+        let result = hook().parse_input(&json).unwrap();
+        assert_eq!(result.command, "cargo test");
+        assert_eq!(result.session_id, Some("cursor-session-xyz".to_string()));
+    }
+
+    /// AD-HK-1: session_id is None when absent from Cursor hook JSON.
+    #[test]
+    fn test_cursor_parse_input_no_session_id() {
+        let json = serde_json::json!({
+            "command": "cargo build --release"
+        });
+        let result = hook().parse_input(&json).unwrap();
+        assert_eq!(result.command, "cargo build --release");
+        assert!(
+            result.session_id.is_none(),
+            "session_id should be None when absent"
+        );
     }
 }

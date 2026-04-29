@@ -496,9 +496,14 @@ fn main() -> ExitCode {
     // Read analytics config from env + CLI flag once at the system boundary.
     // Thread the struct down to all callers — no per-call env reads.
     let cli_disable_analytics = std::env::args().any(|a| a == "--disable-analytics");
-    // B6: session_id will be extracted from --session-id=VALUE in a later step;
-    // for now pass None so the rest of the pipeline compiles.
-    let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, None);
+    // AD-HK-3: Extract --session-id=VALUE injected by the hook (B5/B6).
+    // The flag is a global flag parsed here before subcommand routing so that
+    // every subcommand automatically inherits the session context without
+    // requiring per-subcommand parsing. The value is passed to AnalyticsConfig
+    // and threaded through all recording call sites.
+    let session_id: Option<String> = std::env::args()
+        .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string));
+    let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
         Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),

@@ -22,9 +22,15 @@ pub(crate) enum HookSupport {
 }
 
 /// Input extracted from agent's hook event JSON.
+///
+/// AD-HK-1: session_id is extracted from the hook JSON event so that every
+/// skim command rewritten in hook mode is tagged with the originating agent
+/// session. This enables per-session analytics grouping in the stats dashboard.
 #[derive(Debug, Clone)]
 pub(crate) struct HookInput {
     pub(crate) command: String,
+    /// AD-HK-1: Originating agent session ID, if present in the hook JSON.
+    pub(crate) session_id: Option<String>,
 }
 
 /// Result of a hook installation.
@@ -91,13 +97,21 @@ pub(crate) trait HookProtocol {
 ///
 /// Used by Claude Code, Copilot CLI, and Gemini CLI. Cursor differs (top-level `command`).
 /// Codex and OpenCode are awareness-only and return `None` from `parse_input` directly.
+///
+/// AD-HK-1: Also extracts `session_id` from the top-level JSON field when present.
+/// Claude Code emits `{ "session_id": "...", "tool_input": { "command": "..." } }`.
 pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookInput> {
     let command = json
         .get("tool_input")
         .and_then(|ti| ti.get("command"))
         .and_then(|c| c.as_str())?
         .to_string();
-    Some(HookInput { command })
+    // AD-HK-1: Extract session_id from top-level JSON field (Claude Code / Copilot / Gemini).
+    let session_id = json
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some(HookInput { command, session_id })
 }
 
 /// Generate a standard hook script for an agent.
@@ -213,5 +227,55 @@ mod tests {
     #[should_panic(expected = "agent_cli_name contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_agent_name() {
         generate_hook_script("1.0.0", "agent;rm -rf /");
+    }
+
+    // ========================================================================
+    // B8: AD-HK-1 — session_id extraction in parse_tool_input_command
+    // ========================================================================
+
+    /// AD-HK-1: session_id is extracted from the top-level JSON field.
+    #[test]
+    fn test_parse_tool_input_command_extracts_session_id() {
+        let json = serde_json::json!({
+            "session_id": "my-session-abc",
+            "tool_input": {
+                "command": "cargo build"
+            }
+        });
+        let result = parse_tool_input_command(&json).unwrap();
+        assert_eq!(result.command, "cargo build");
+        assert_eq!(result.session_id, Some("my-session-abc".to_string()));
+    }
+
+    /// AD-HK-1: session_id is None when the field is absent.
+    #[test]
+    fn test_parse_tool_input_command_no_session_id() {
+        let json = serde_json::json!({
+            "tool_input": {
+                "command": "cargo test"
+            }
+        });
+        let result = parse_tool_input_command(&json).unwrap();
+        assert_eq!(result.command, "cargo test");
+        assert!(
+            result.session_id.is_none(),
+            "session_id should be None when not in JSON"
+        );
+    }
+
+    /// AD-HK-1: non-string session_id is treated as None (no panic).
+    #[test]
+    fn test_parse_tool_input_command_non_string_session_id_is_none() {
+        let json = serde_json::json!({
+            "session_id": 12345,
+            "tool_input": {
+                "command": "go test ./..."
+            }
+        });
+        let result = parse_tool_input_command(&json).unwrap();
+        assert!(
+            result.session_id.is_none(),
+            "non-string session_id should yield None"
+        );
     }
 }

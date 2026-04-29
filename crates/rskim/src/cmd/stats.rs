@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 // arbitrary value coloring is intentionally not centralised.
 use colored::{ColoredString, Colorize};
 
-use crate::analytics::{AnalyticsDb, AnalyticsStore, OriginalCommandStats, PricingModel};
+use crate::analytics::{AnalyticsDb, AnalyticsStore, OriginalCommandStats, PricingModel, SessionStats};
 use crate::cmd::session::types::parse_duration_ago;
 use crate::tokens;
 
@@ -155,6 +155,7 @@ fn run_json(
     let by_mode = db.query_by_mode(since)?;
     let tier_dist = db.query_tier_distribution(since)?;
     let by_original_cmd = db.query_by_original_cmd(since)?;
+    let session_stats = db.query_session_stats(since)?;
 
     let weighted_pct = weighted_savings_pct(&summary);
 
@@ -185,6 +186,12 @@ fn run_json(
         "by_mode": by_mode,
         "tier_distribution": tier_dist,
         "by_original_cmd": by_original_cmd,
+        "session_stats": {
+            "distinct_sessions": session_stats.distinct_sessions,
+            "total_tokens_saved": session_stats.total_tokens_saved,
+            "avg_tokens_per_session": session_stats.avg_tokens_per_session,
+            "untagged_invocations": session_stats.untagged_invocations,
+        },
         "cost_estimate": cost_estimate,
     });
 
@@ -508,6 +515,47 @@ fn render_parse_quality(
     Ok(())
 }
 
+/// Render per-session analytics summary.
+///
+/// AD-AN-2: Displays distinct session count, total tokens saved across sessions,
+/// average tokens saved per session, and untagged invocation count.
+/// Skipped when no session data is present (distinct_sessions == 0 and
+/// untagged_invocations == 0) to avoid cluttering the dashboard for users
+/// who have not installed the hook or enabled session tracking.
+fn render_session_stats(w: &mut dyn Write, stats: &SessionStats) -> anyhow::Result<()> {
+    if stats.distinct_sessions == 0 && stats.untagged_invocations == 0 {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("Per Session"))?;
+    writeln!(w)?;
+    if stats.distinct_sessions > 0 {
+        writeln!(
+            w,
+            "  Sessions tracked:   {}",
+            tokens::format_number(stats.distinct_sessions as usize)
+        )?;
+        writeln!(
+            w,
+            "  Total tokens saved: {}",
+            tokens::format_number(stats.total_tokens_saved as usize).green()
+        )?;
+        writeln!(
+            w,
+            "  Avg per session:    {}",
+            tokens::format_number(stats.avg_tokens_per_session.round() as usize).green()
+        )?;
+    }
+    if stats.untagged_invocations > 0 {
+        writeln!(
+            w,
+            "  Untagged calls:     {}",
+            tokens::format_number(stats.untagged_invocations as usize)
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
 fn render_cost_section(
     w: &mut dyn Write,
     tokens_saved: u64,
@@ -575,6 +623,7 @@ fn run_dashboard(
     if verbose {
         render_parse_quality(w, &db.query_tier_distribution(since)?)?;
     }
+    render_session_stats(w, &db.query_session_stats(since)?)?;
     render_cost_section(w, summary.tokens_saved, cost_override)?;
 
     Ok(ExitCode::SUCCESS)
@@ -649,6 +698,7 @@ mod tests {
         by_mode: Vec<ModeStats>,
         tier_dist: TierDistribution,
         by_original_cmd: Vec<OriginalCommandStats>,
+        session_stats: SessionStats,
     }
 
     impl MockStore {
@@ -671,6 +721,12 @@ mod tests {
                     passthrough_pct: 0.0,
                 },
                 by_original_cmd: vec![],
+                session_stats: SessionStats {
+                    distinct_sessions: 0,
+                    total_tokens_saved: 0,
+                    avg_tokens_per_session: 0.0,
+                    untagged_invocations: 0,
+                },
             }
         }
 
@@ -746,7 +802,25 @@ mod tests {
                     avg_savings_pct: 72.0,
                     avg_duration_ms: 891.0,
                 }],
+                session_stats: SessionStats {
+                    distinct_sessions: 0,
+                    total_tokens_saved: 0,
+                    avg_tokens_per_session: 0.0,
+                    untagged_invocations: 0,
+                },
             }
+        }
+
+        /// Construct a MockStore variant that has session data for testing the Per Session section.
+        fn with_sessions() -> Self {
+            let mut s = Self::with_data();
+            s.session_stats = SessionStats {
+                distinct_sessions: 5,
+                total_tokens_saved: 50_000,
+                avg_tokens_per_session: 10_000.0,
+                untagged_invocations: 12,
+            };
+            s
         }
     }
 
@@ -774,6 +848,9 @@ mod tests {
             _since: Option<i64>,
         ) -> anyhow::Result<Vec<OriginalCommandStats>> {
             Ok(self.by_original_cmd.clone())
+        }
+        fn query_session_stats(&self, _since: Option<i64>) -> anyhow::Result<SessionStats> {
+            Ok(self.session_stats.clone())
         }
         fn clear(&self) -> anyhow::Result<()> {
             Ok(())
@@ -1363,5 +1440,172 @@ mod tests {
             output.contains("125ms") || output.contains("AVG TIME"),
             "By Category section should display average duration"
         );
+    }
+
+    // ========================================================================
+    // B8: AD-AN-2 — render_session_stats and JSON session_stats field
+    // ========================================================================
+
+    /// AD-AN-2: "Per Session" section is hidden when both counts are zero.
+    #[test]
+    fn test_render_session_stats_hidden_when_empty() {
+        let stats = SessionStats {
+            distinct_sessions: 0,
+            total_tokens_saved: 0,
+            avg_tokens_per_session: 0.0,
+            untagged_invocations: 0,
+        };
+        let mut buf = Vec::new();
+        render_session_stats(&mut buf, &stats).expect("should not fail");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.is_empty(),
+            "Per Session section should produce no output when all counts are zero"
+        );
+    }
+
+    /// AD-AN-2: "Per Session" section is shown when distinct_sessions > 0.
+    #[test]
+    fn test_render_session_stats_shown_with_sessions() {
+        let stats = SessionStats {
+            distinct_sessions: 5,
+            total_tokens_saved: 50_000,
+            avg_tokens_per_session: 10_000.0,
+            untagged_invocations: 0,
+        };
+        let mut buf = Vec::new();
+        render_session_stats(&mut buf, &stats).expect("should not fail");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Per Session"),
+            "Per Session header should appear when distinct_sessions > 0"
+        );
+        assert!(
+            output.contains("Sessions tracked"),
+            "should show 'Sessions tracked' label"
+        );
+        assert!(
+            output.contains("50,000") || output.contains("50K"),
+            "should show total tokens saved"
+        );
+    }
+
+    /// AD-AN-2: "Per Session" section is shown when only untagged_invocations > 0.
+    #[test]
+    fn test_render_session_stats_shown_with_untagged_only() {
+        let stats = SessionStats {
+            distinct_sessions: 0,
+            total_tokens_saved: 0,
+            avg_tokens_per_session: 0.0,
+            untagged_invocations: 7,
+        };
+        let mut buf = Vec::new();
+        render_session_stats(&mut buf, &stats).expect("should not fail");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Per Session"),
+            "Per Session header should appear when untagged_invocations > 0"
+        );
+        assert!(
+            output.contains("Untagged calls"),
+            "should show 'Untagged calls' label"
+        );
+    }
+
+    /// AD-AN-2: "Untagged calls" line is hidden when untagged_invocations == 0.
+    #[test]
+    fn test_render_session_stats_untagged_hidden_when_zero() {
+        let stats = SessionStats {
+            distinct_sessions: 3,
+            total_tokens_saved: 1000,
+            avg_tokens_per_session: 333.0,
+            untagged_invocations: 0,
+        };
+        let mut buf = Vec::new();
+        render_session_stats(&mut buf, &stats).expect("should not fail");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("Untagged calls"),
+            "Untagged calls line should be hidden when untagged_invocations == 0"
+        );
+    }
+
+    /// AD-AN-2: dashboard renders "Per Session" section when session data is present.
+    #[test]
+    fn test_dashboard_shows_per_session_section_with_data() {
+        let store = MockStore::with_sessions();
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            output.contains("Per Session"),
+            "dashboard should show Per Session section when session data is present"
+        );
+        assert!(
+            output.contains("Sessions tracked"),
+            "dashboard Per Session section should show tracked sessions count"
+        );
+        assert!(
+            output.contains("Untagged calls"),
+            "dashboard Per Session section should show untagged calls"
+        );
+    }
+
+    /// AD-AN-2: dashboard hides "Per Session" section when no session data.
+    #[test]
+    fn test_dashboard_hides_per_session_section_when_empty() {
+        let store = MockStore::with_data(); // session_stats all zeros
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            !output.contains("Per Session"),
+            "dashboard should NOT show Per Session section when session data is all zeros"
+        );
+    }
+
+    /// AD-AN-2: JSON output includes session_stats object with correct fields.
+    #[test]
+    fn test_run_json_includes_session_stats_field() {
+        let store = MockStore::with_sessions();
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let ss = &parsed["session_stats"];
+        assert!(
+            ss.is_object(),
+            "JSON output must include 'session_stats' object"
+        );
+        assert_eq!(
+            ss["distinct_sessions"].as_u64().unwrap(),
+            5,
+            "distinct_sessions should be 5"
+        );
+        assert_eq!(
+            ss["total_tokens_saved"].as_u64().unwrap(),
+            50_000,
+            "total_tokens_saved should be 50000"
+        );
+        assert!(
+            (ss["avg_tokens_per_session"].as_f64().unwrap() - 10_000.0).abs() < 1.0,
+            "avg_tokens_per_session should be ~10000"
+        );
+        assert_eq!(
+            ss["untagged_invocations"].as_u64().unwrap(),
+            12,
+            "untagged_invocations should be 12"
+        );
+    }
+
+    /// AD-AN-2: JSON session_stats field is always present (even when zero).
+    #[test]
+    fn test_run_json_session_stats_present_when_empty() {
+        let store = MockStore::with_data(); // session_stats all zeros
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let ss = &parsed["session_stats"];
+        assert!(
+            ss.is_object(),
+            "session_stats must always be present in JSON output, even when zero"
+        );
+        assert_eq!(ss["distinct_sessions"].as_u64().unwrap(), 0);
+        assert_eq!(ss["untagged_invocations"].as_u64().unwrap(), 0);
     }
 }
