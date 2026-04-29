@@ -70,11 +70,7 @@ pub(in crate::cmd::git) fn render_diff_file(
             old, file_diff.path, file_diff.status
         );
     } else {
-        let _ = writeln!(
-            output,
-            "{} ({})",
-            file_diff.path, file_diff.status
-        );
+        let _ = writeln!(output, "{} ({})", file_diff.path, file_diff.status);
     }
 
     // Binary files

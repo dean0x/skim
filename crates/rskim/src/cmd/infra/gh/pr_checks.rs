@@ -300,11 +300,7 @@ mod tests {
         let result = try_parse_checks_text(&input);
         assert!(result.is_some(), "Expected tab text parse to succeed");
         let result = result.unwrap();
-        assert!(
-            result.as_ref().contains("gh "),
-            "got: {}",
-            result.as_ref()
-        );
+        assert!(result.as_ref().contains("gh "), "got: {}", result.as_ref());
         assert!(
             result.as_ref().contains("5 checks"),
             "Expected 5 checks, got: {}",
@@ -318,11 +314,7 @@ mod tests {
         let result = try_parse_checks_text(&input);
         assert!(result.is_some(), "Expected symbol text parse to succeed");
         let result = result.unwrap();
-        assert!(
-            result.as_ref().contains("gh "),
-            "got: {}",
-            result.as_ref()
-        );
+        assert!(result.as_ref().contains("gh "), "got: {}", result.as_ref());
     }
 
     #[test]

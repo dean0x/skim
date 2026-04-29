@@ -1077,10 +1077,7 @@ mod tests {
             skip: 3,
             duration_ms: Some(1234),
         };
-        assert_eq!(
-            format!("{summary}"),
-            "pass: 42 fail: 0 skip: 3 1,234ms"
-        );
+        assert_eq!(format!("{summary}"), "pass: 42 fail: 0 skip: 3 1,234ms");
     }
 
     // ========================================================================
@@ -1114,10 +1111,7 @@ mod tests {
         ];
         let result = TestResult::new(summary, entries);
         // Compact on success: summary only
-        assert_eq!(
-            format!("{result}"),
-            "pass: 3 fail: 0 skip: 0 100ms"
-        );
+        assert_eq!(format!("{result}"), "pass: 3 fail: 0 skip: 0 100ms");
     }
 
     #[test]
@@ -1991,10 +1985,19 @@ mod tests {
         // rendered is not serialized; ensure_rendered produces a lossy summary
         // (no diff body since diff_output is not stored in the struct).
         deserialized.ensure_rendered();
-        assert!(!deserialized.as_ref().is_empty(), "rendered must be populated after ensure_rendered");
-        assert!(deserialized.as_ref().contains("cafebab"), "short hash must appear");
+        assert!(
+            !deserialized.as_ref().is_empty(),
+            "rendered must be populated after ensure_rendered"
+        );
+        assert!(
+            deserialized.as_ref().contains("cafebab"),
+            "short hash must appear"
+        );
         assert!(deserialized.as_ref().contains("Dave"), "author must appear");
-        assert!(deserialized.as_ref().contains("refactor: clean up"), "subject must appear");
+        assert!(
+            deserialized.as_ref().contains("refactor: clean up"),
+            "subject must appear"
+        );
     }
 
     #[test]

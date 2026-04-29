@@ -247,11 +247,7 @@ mod tests {
         let result = try_parse_json(&obj);
         assert!(result.is_some(), "Expected JSON parse to succeed");
         let result = result.unwrap();
-        assert!(
-            result.as_ref().contains("gh "),
-            "got: {}",
-            result.as_ref()
-        );
+        assert!(result.as_ref().contains("gh "), "got: {}", result.as_ref());
         assert!(
             result.as_ref().contains("#12345"),
             "got: {}",

@@ -217,7 +217,10 @@ fn test_last_lines_with_glob_pattern() {
     // lines inside file content. Prepend "\n" so the first header is also
     // preceded by a newline and the split pattern matches uniformly.
     let normalized = format!("\n{stdout}");
-    let sections: Vec<&str> = normalized.split("\n// ").filter(|s| !s.is_empty()).collect();
+    let sections: Vec<&str> = normalized
+        .split("\n// ")
+        .filter(|s| !s.is_empty())
+        .collect();
     assert!(
         sections.len() >= 2,
         "Should have at least 2 file sections in glob output, got {}: {:?}",
