@@ -1136,6 +1136,10 @@ mod tests {
             "cost section should show Standard tier"
         );
         assert!(
+            output.contains("Advanced"),
+            "cost section should show Advanced tier"
+        );
+        assert!(
             output.contains("Premium"),
             "cost section should show Premium tier"
         );

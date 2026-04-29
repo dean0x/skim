@@ -162,13 +162,23 @@ impl PricingModel {
         input_cost_per_mtok: 3.0,
         tier_name: "Standard",
     };
+    /// Advanced tier at $5/MTok.
+    ///
+    /// AD-AN-3: No model hints are attached — pricing tiers shift frequently
+    /// and model names become stale within months. The $5 rate represents a
+    /// mid-range tier between Standard ($3) and Premium ($15) that covers
+    /// several recently-published model price points.
+    pub(crate) const ADVANCED: Self = Self {
+        input_cost_per_mtok: 5.0,
+        tier_name: "Advanced",
+    };
     pub(crate) const PREMIUM: Self = Self {
         input_cost_per_mtok: 15.0,
         tier_name: "Premium",
     };
 
-    pub(crate) fn all_tiers() -> [Self; 3] {
-        [Self::ECONOMY, Self::STANDARD, Self::PREMIUM]
+    pub(crate) fn all_tiers() -> [Self; 4] {
+        [Self::ECONOMY, Self::STANDARD, Self::ADVANCED, Self::PREMIUM]
     }
 
     pub(crate) fn default_pricing() -> Self {
@@ -1417,13 +1427,15 @@ mod tests {
     #[test]
     fn test_pricing_tiers() {
         let tiers = PricingModel::all_tiers();
-        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers.len(), 4);
         assert_eq!(tiers[0].tier_name, "Economy");
         assert_eq!(tiers[0].input_cost_per_mtok, 1.0);
         assert_eq!(tiers[1].tier_name, "Standard");
         assert_eq!(tiers[1].input_cost_per_mtok, 3.0);
-        assert_eq!(tiers[2].tier_name, "Premium");
-        assert_eq!(tiers[2].input_cost_per_mtok, 15.0);
+        assert_eq!(tiers[2].tier_name, "Advanced");
+        assert_eq!(tiers[2].input_cost_per_mtok, 5.0);
+        assert_eq!(tiers[3].tier_name, "Premium");
+        assert_eq!(tiers[3].input_cost_per_mtok, 15.0);
     }
 
     #[test]
