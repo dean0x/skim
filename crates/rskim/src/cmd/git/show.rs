@@ -194,16 +194,33 @@ pub(super) fn run_show(
 
     // Passthrough for stat-family and format flags.
     if user_has_flag(args, PASSTHROUGH_FLAGS) {
-        return run_passthrough(global_flags, "show", args, show_stats, analytics_enabled, session_id);
+        return run_passthrough(
+            global_flags,
+            "show",
+            args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        );
     }
 
     match detect_show_mode(args) {
-        ShowMode::MultiRef => {
-            run_passthrough(global_flags, "show", args, show_stats, analytics_enabled, session_id)
-        }
-        ShowMode::FileContent { refpath } => {
-            run_show_file_content(global_flags, args, &refpath, show_stats, analytics_enabled, session_id)
-        }
+        ShowMode::MultiRef => run_passthrough(
+            global_flags,
+            "show",
+            args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
+        ShowMode::FileContent { refpath } => run_show_file_content(
+            global_flags,
+            args,
+            &refpath,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
             run_show_commit(
@@ -800,7 +817,15 @@ fn run_show_file_content(
         // Tier 2: unsupported or serde-based language — passthrough.
         // Move raw: the else branch always returns, so Rust knows raw is
         // available after the let-else for the Tier 1 path.
-        passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 2, session_id);
+        passthrough_file_content(
+            raw,
+            label,
+            show_stats,
+            analytics_enabled,
+            duration,
+            2,
+            session_id,
+        );
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -819,7 +844,15 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(raw, label, show_stats, analytics_enabled, duration, 3, session_id);
+            passthrough_file_content(
+                raw,
+                label,
+                show_stats,
+                analytics_enabled,
+                duration,
+                3,
+                session_id,
+            );
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -1178,8 +1211,11 @@ mod tests {
     fn test_file_content_mode_json_rejected() {
         let global_flags: Vec<String> = vec![];
         let args: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
-        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, false, None)
-            .expect("run_show_file_content must not return an anyhow error for --json rejection");
+        let result =
+            run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, false, None)
+                .expect(
+                    "run_show_file_content must not return an anyhow error for --json rejection",
+                );
         assert_eq!(
             result,
             ExitCode::from(2),

@@ -508,7 +508,10 @@ mod tests {
     #[test]
     fn test_session_id_injection_preserves_subcommand_and_flags() {
         let result = inject_session_id("skim build cargo --show-stats", Some("sess-xyz"));
-        assert_eq!(result, "skim --session-id=sess-xyz build cargo --show-stats");
+        assert_eq!(
+            result,
+            "skim --session-id=sess-xyz build cargo --show-stats"
+        );
     }
 
     /// AD-HK-2: no injection when session_id is None.

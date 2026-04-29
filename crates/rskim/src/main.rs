@@ -501,8 +501,8 @@ fn main() -> ExitCode {
     // every subcommand automatically inherits the session context without
     // requiring per-subcommand parsing. The value is passed to AnalyticsConfig
     // and threaded through all recording call sites.
-    let session_id: Option<String> = std::env::args()
-        .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string));
+    let session_id: Option<String> =
+        std::env::args().find_map(|a| a.strip_prefix("--session-id=").map(str::to_string));
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {

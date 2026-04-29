@@ -28,7 +28,10 @@ impl HookProtocol for CursorHook {
             .get("session_id")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        Some(HookInput { command, session_id })
+        Some(HookInput {
+            command,
+            session_id,
+        })
     }
 
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value {

@@ -63,13 +63,55 @@ pub(crate) fn run(
     let session_id = analytics.session_id.as_deref();
 
     match subcmd.as_str() {
-        "status" => status::run_status(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
-        "diff" => diff::run_diff(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
-        "fetch" => fetch::run_fetch(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
-        "log" => log::run_log(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
-        "show" => show::run_show(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
-        "commit" => commit::run_commit(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
-        "push" => push::run_push(&global_flags, subcmd_args, show_stats, analytics_enabled, session_id),
+        "status" => status::run_status(
+            &global_flags,
+            subcmd_args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
+        "diff" => diff::run_diff(
+            &global_flags,
+            subcmd_args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
+        "fetch" => fetch::run_fetch(
+            &global_flags,
+            subcmd_args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
+        "log" => log::run_log(
+            &global_flags,
+            subcmd_args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
+        "show" => show::run_show(
+            &global_flags,
+            subcmd_args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
+        "commit" => commit::run_commit(
+            &global_flags,
+            subcmd_args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
+        "push" => push::run_push(
+            &global_flags,
+            subcmd_args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        ),
         other => {
             let safe_other = crate::cmd::sanitize_for_display(other);
             anyhow::bail!(

@@ -14,7 +14,9 @@ use std::time::UNIX_EPOCH;
 // arbitrary value coloring is intentionally not centralised.
 use colored::{ColoredString, Colorize};
 
-use crate::analytics::{AnalyticsDb, AnalyticsStore, OriginalCommandStats, PricingModel, SessionStats};
+use crate::analytics::{
+    AnalyticsDb, AnalyticsStore, OriginalCommandStats, PricingModel, SessionStats,
+};
 use crate::cmd::session::types::parse_duration_ago;
 use crate::tokens;
 

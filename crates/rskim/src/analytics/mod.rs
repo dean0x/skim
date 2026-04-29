@@ -684,8 +684,8 @@ impl AnalyticsDb {
              FROM token_savings {where_clause}"
         );
         let mut stmt = self.conn.prepare(&session_sql)?;
-        let (distinct_sessions, total_tokens_saved): (u64, i64) =
-            stmt.query_row(rusqlite::params_from_iter(params), |row| {
+        let (distinct_sessions, total_tokens_saved): (u64, i64) = stmt
+            .query_row(rusqlite::params_from_iter(params), |row| {
                 Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?))
             })?;
 
@@ -1723,10 +1723,7 @@ mod tests {
     fn test_schema_v3_session_id_column_exists() {
         let (db, _tmp) = test_db();
         // PRAGMA table_info lists all columns; confirm session_id is present.
-        let mut stmt = db
-            .conn
-            .prepare("PRAGMA table_info(token_savings)")
-            .unwrap();
+        let mut stmt = db.conn.prepare("PRAGMA table_info(token_savings)").unwrap();
         let col_names: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -1764,7 +1761,10 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3, "schema version should be 3 after all migrations");
+        assert_eq!(
+            version, 3,
+            "schema version should be 3 after all migrations"
+        );
     }
 
     // ========================================================================

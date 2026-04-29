@@ -111,7 +111,10 @@ pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookI
         .get("session_id")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    Some(HookInput { command, session_id })
+    Some(HookInput {
+        command,
+        session_id,
+    })
 }
 
 /// Generate a standard hook script for an agent.

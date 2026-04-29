@@ -59,7 +59,14 @@ pub(super) fn run_push(
     session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--help"]) {
-        return run_passthrough(global_flags, "push", args, show_stats, analytics_enabled, session_id);
+        return run_passthrough(
+            global_flags,
+            "push",
+            args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        );
     }
 
     let (mut effective_args, output_format) = extract_output_format(args);

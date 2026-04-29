@@ -52,7 +52,14 @@ pub(super) fn run_commit(
     session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--help"]) {
-        return run_passthrough(global_flags, "commit", args, show_stats, analytics_enabled, session_id);
+        return run_passthrough(
+            global_flags,
+            "commit",
+            args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        );
     }
 
     let (filtered_args, output_format) = extract_output_format(args);

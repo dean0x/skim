@@ -280,7 +280,14 @@ pub(super) fn run_diff(
             "--check",
         ],
     ) {
-        return run_passthrough(global_flags, "diff", args, show_stats, analytics_enabled, session_id);
+        return run_passthrough(
+            global_flags,
+            "diff",
+            args,
+            show_stats,
+            analytics_enabled,
+            session_id,
+        );
     }
 
     // Extract skim-specific flags before passing args to git
