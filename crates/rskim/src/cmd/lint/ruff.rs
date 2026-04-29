@@ -167,7 +167,7 @@ fn prepare_format_args(cmd_args: &mut Vec<String>) {
 /// `ruff format` (apply mode) may print the same lines on a dry-run check but
 /// in apply mode it just reformats silently. Either way we parse the output.
 ///
-/// Exit 0 with empty stdout = all files already formatted → `LINT OK`.
+/// Exit 0 with empty stdout = all files already formatted → `{tool} OK (N files formatted)`.
 fn parse_format_impl(output: &CommandOutput) -> ParseResult<LintResult> {
     let combined = combine_stdout_stderr(output);
 

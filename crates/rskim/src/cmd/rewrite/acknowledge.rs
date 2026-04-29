@@ -20,7 +20,7 @@
 //!
 //! `prettier --check` and `rustfmt --check` invoked without explicit file/glob
 //! arguments emit near-zero output on a clean codebase: exit 0, empty stdout.
-//! Rewriting to `skim lint prettier/rustfmt` in this case produces a `LINT OK`
+//! Rewriting to `skim lint prettier/rustfmt` in this case produces an OK
 //! header that is longer than the original empty output. The ACK list causes
 //! the original command to be echoed as-is, respecting the compress-or-skip rule.
 //!
@@ -56,7 +56,7 @@ pub(super) const ACK_PREFIX_PATTERNS: &[&[&str]] = &[
     // AD-RW-11: `npx prettier --check [files]` — same rationale as above.
     &["npx", "prettier", "--check"],
     // AD-RW-11: `rustfmt --check [files]` — empty on clean, short diff headers on
-    // failure. The skim LINT OK wrapper adds tokens without reducing agent load.
+    // failure. The skim OK wrapper adds tokens without reducing agent load.
     &["rustfmt", "--check"],
     // AD-RW-11: `cargo fmt --check` is a `rustfmt --check`-equivalent wrapper;
     // same empty-on-clean contract. Both the short form and the `--` pass-through
