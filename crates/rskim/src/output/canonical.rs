@@ -370,7 +370,7 @@ pub(crate) struct LintGroup {
 /// # AD-LINT-23 (2026-04-15) — render() output for format-mode
 ///
 /// When `files_formatted.is_some()` AND `errors == 0 && warnings == 0`:
-/// → `LINT OK | {tool} ({N} files formatted)`
+/// → `{tool} OK ({N} files formatted)`
 ///
 /// When `files_formatted.is_some()` AND there are issues (i.e., check mode found
 /// problems while files_formatted is also set — unlikely but handled):
@@ -461,7 +461,7 @@ impl LintResult {
     ///
     /// Used by `ruff format`, `prettier --write`, and `rustfmt` (format mode) parsers
     /// to signal that N files were reformatted. Rendered as
-    /// `LINT OK | {tool} ({N} files formatted)` when no issues are present.
+    /// `{tool} OK ({N} files formatted)` when no issues are present.
     pub(crate) fn formatted(tool: String, files_formatted: usize) -> Self {
         let rendered = Self::render(&tool, 0, 0, Some(files_formatted), &[]);
         Self {
