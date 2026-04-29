@@ -46,6 +46,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression and forward raw output unchanged.
     if crate::cmd::is_passthrough_mode() {
@@ -96,7 +97,7 @@ pub(crate) fn run(
         crate::analytics::CommandType::Test,
         output.duration,
         Some(result.tier_name()),
-        None,
+        session_id,
     );
 
     // Exit code: mirror pytest's exit code if we ran it, or infer from parse

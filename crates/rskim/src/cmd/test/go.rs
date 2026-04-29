@@ -31,6 +31,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: run `go test` without flag injections and forward raw output.
     if crate::cmd::is_passthrough_mode() {
@@ -116,7 +117,7 @@ pub(crate) fn run(
         crate::analytics::CommandType::Test,
         output.duration,
         Some(parsed.tier_name()),
-        None,
+        session_id,
     );
 
     Ok(exit_code)

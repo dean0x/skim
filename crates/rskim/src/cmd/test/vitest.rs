@@ -35,6 +35,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
@@ -99,7 +100,7 @@ pub(crate) fn run(
         crate::analytics::CommandType::Test,
         start.elapsed(),
         Some(result.tier_name()),
-        None,
+        session_id,
     );
 
     Ok(exit_code)

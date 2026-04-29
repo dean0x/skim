@@ -25,6 +25,7 @@ pub(crate) fn run(
     show_stats: bool,
     json_output: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -35,7 +36,13 @@ pub(crate) fn run(
     let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
-        "audit" => run_audit(subcmd_args, show_stats, json_output, analytics_enabled),
+        "audit" => run_audit(
+            subcmd_args,
+            show_stats,
+            json_output,
+            analytics_enabled,
+            session_id,
+        ),
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
@@ -70,6 +77,7 @@ fn run_audit(
     show_stats: bool,
     json_output: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
@@ -81,6 +89,7 @@ fn run_audit(
         args,
         show_stats,
         analytics_enabled,
+        session_id,
         |cmd_args| {
             if json_output && !user_has_flag(cmd_args, &["--json"]) {
                 cmd_args.push("--json".to_string());

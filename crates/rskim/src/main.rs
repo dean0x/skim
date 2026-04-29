@@ -572,6 +572,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         jobs: args.jobs,
         no_ignore: args.no_ignore,
         analytics_enabled: analytics.enabled,
+        session_id: analytics.session_id.clone(),
     };
 
     if path.is_dir() {

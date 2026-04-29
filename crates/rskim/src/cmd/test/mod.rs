@@ -35,12 +35,19 @@ pub(crate) fn run(
     };
 
     let runner = runner_name.as_str();
+    let session_id = analytics.session_id.as_deref();
 
     match runner {
-        "cargo" => cargo::run(runner_args, show_stats, analytics.enabled),
-        "go" => go::run(runner_args, show_stats, analytics.enabled),
-        "vitest" | "jest" => vitest::run(runner, runner_args, show_stats, analytics.enabled),
-        "pytest" => pytest::run(runner_args, show_stats, analytics.enabled),
+        "cargo" => cargo::run(runner_args, show_stats, analytics.enabled, session_id),
+        "go" => go::run(runner_args, show_stats, analytics.enabled, session_id),
+        "vitest" | "jest" => vitest::run(
+            runner,
+            runner_args,
+            show_stats,
+            analytics.enabled,
+            session_id,
+        ),
+        "pytest" => pytest::run(runner_args, show_stats, analytics.enabled, session_id),
         _ => {
             let safe_runner = crate::cmd::sanitize_for_display(runner);
             eprintln!(

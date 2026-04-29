@@ -39,12 +39,37 @@ pub(crate) fn run(
     };
 
     let analytics_enabled = analytics.enabled;
+    let session_id = analytics.session_id.as_deref();
 
     match tool_name.as_str() {
-        "npm" => npm::run(tool_args, show_stats, json_output, analytics_enabled),
-        "pnpm" => pnpm::run(tool_args, show_stats, json_output, analytics_enabled),
-        "pip" => pip::run(tool_args, show_stats, json_output, analytics_enabled),
-        "cargo" => cargo::run(tool_args, show_stats, json_output, analytics_enabled),
+        "npm" => npm::run(
+            tool_args,
+            show_stats,
+            json_output,
+            analytics_enabled,
+            session_id,
+        ),
+        "pnpm" => pnpm::run(
+            tool_args,
+            show_stats,
+            json_output,
+            analytics_enabled,
+            session_id,
+        ),
+        "pip" => pip::run(
+            tool_args,
+            show_stats,
+            json_output,
+            analytics_enabled,
+            session_id,
+        ),
+        "cargo" => cargo::run(
+            tool_args,
+            show_stats,
+            json_output,
+            analytics_enabled,
+            session_id,
+        ),
         tool => {
             let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(
@@ -83,6 +108,7 @@ pub(super) fn run_pkg_subcommand<T>(
     user_args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
     inject_flags: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
@@ -107,7 +133,7 @@ where
             output_format: crate::cmd::OutputFormat::default(),
             analytics_enabled,
             family: "pkg",
-            session_id: None,
+            session_id,
         },
         |output, _args| parse_fn(output),
     )

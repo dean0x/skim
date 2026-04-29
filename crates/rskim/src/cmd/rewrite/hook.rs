@@ -181,11 +181,23 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // AD-HK-2: Inject --session-id=VALUE into the rewritten command so every
             // skim invocation in this session is tagged for per-session analytics.
             // Only inject when session_id is present and command starts with "skim ".
+            // SECURITY: session_id is validated to contain only safe characters
+            // (alphanumeric, hyphens, underscores, dots) before interpolation into
+            // the command string. Malicious session IDs with shell metacharacters
+            // (;, |, $, spaces, etc.) are silently dropped to prevent command injection.
             let final_cmd = if let Some(ref sid) = session_id {
-                if let Some(rest) = rewritten_cmd.strip_prefix("skim ") {
-                    // Insert --session-id=VALUE after "skim " (the first word).
-                    // e.g. "skim git status" -> "skim --session-id=abc git status"
-                    format!("skim --session-id={sid} {rest}")
+                let is_safe = !sid.is_empty()
+                    && sid
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+                if is_safe {
+                    if let Some(rest) = rewritten_cmd.strip_prefix("skim ") {
+                        // Insert --session-id=VALUE after "skim " (the first word).
+                        // e.g. "skim git status" -> "skim --session-id=abc git status"
+                        format!("skim --session-id={sid} {rest}")
+                    } else {
+                        rewritten_cmd.clone()
+                    }
                 } else {
                     rewritten_cmd.clone()
                 }
@@ -487,11 +499,18 @@ mod tests {
     // so tests reproduce the same logic to verify the format contract.
     // ========================================================================
 
-    /// Helper: reproduce the AD-HK-2 injection format used in run_hook_mode.
+    /// Helper: reproduce the AD-HK-2 injection format used in run_hook_mode,
+    /// including the security validation that rejects unsafe characters.
     fn inject_session_id(rewritten_cmd: &str, session_id: Option<&str>) -> String {
         if let Some(sid) = session_id {
-            if let Some(rest) = rewritten_cmd.strip_prefix("skim ") {
-                return format!("skim --session-id={sid} {rest}");
+            let is_safe = !sid.is_empty()
+                && sid
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+            if is_safe {
+                if let Some(rest) = rewritten_cmd.strip_prefix("skim ") {
+                    return format!("skim --session-id={sid} {rest}");
+                }
             }
         }
         rewritten_cmd.to_string()
@@ -541,5 +560,66 @@ mod tests {
             !result.contains("--session-id my-session"),
             "injection must not use space-separated form"
         );
+    }
+
+    // ========================================================================
+    // SECURITY: session_id validation — reject shell metacharacters
+    // ========================================================================
+
+    /// SECURITY: session_id with shell metacharacters is silently dropped.
+    #[test]
+    fn test_session_id_with_semicolon_rejected() {
+        let result = inject_session_id("skim git status", Some("foo; rm -rf /"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with semicolons must not be injected"
+        );
+    }
+
+    /// SECURITY: session_id with pipe character is rejected.
+    #[test]
+    fn test_session_id_with_pipe_rejected() {
+        let result = inject_session_id("skim git status", Some("foo|bar"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with pipe must not be injected"
+        );
+    }
+
+    /// SECURITY: session_id with spaces is rejected.
+    #[test]
+    fn test_session_id_with_spaces_rejected() {
+        let result = inject_session_id("skim git status", Some("foo bar"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with spaces must not be injected"
+        );
+    }
+
+    /// SECURITY: session_id with dollar sign (variable expansion) is rejected.
+    #[test]
+    fn test_session_id_with_dollar_rejected() {
+        let result = inject_session_id("skim git status", Some("$HOME"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with $ must not be injected"
+        );
+    }
+
+    /// SECURITY: empty session_id is not injected.
+    #[test]
+    fn test_session_id_empty_not_injected() {
+        let result = inject_session_id("skim git status", Some(""));
+        assert_eq!(
+            result, "skim git status",
+            "empty session_id must not be injected"
+        );
+    }
+
+    /// Safe session_id characters: alphanumeric, hyphens, underscores, dots.
+    #[test]
+    fn test_session_id_safe_chars_accepted() {
+        let result = inject_session_id("skim git status", Some("sess_123-abc.def"));
+        assert_eq!(result, "skim --session-id=sess_123-abc.def git status");
     }
 }

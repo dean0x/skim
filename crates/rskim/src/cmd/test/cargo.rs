@@ -48,6 +48,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     analytics_enabled: bool,
+    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let is_nextest = args.iter().any(|a| a == "nextest");
 
@@ -79,7 +80,7 @@ pub(crate) fn run(
             output_format: OutputFormat::default(),
             analytics_enabled,
             family: "test",
-            session_id: None,
+            session_id,
         },
         move |output, _args| parse_impl(output, is_nextest),
     )
