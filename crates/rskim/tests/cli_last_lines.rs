@@ -212,7 +212,12 @@ fn test_last_lines_with_glob_pattern() {
     // Each file section in multi-file output gets a header line (// file.ts)
     // followed by the per-file output. Verify that per-file content respects the
     // last-lines limit by checking each section individually.
-    let sections: Vec<&str> = stdout.split("// ").filter(|s| !s.is_empty()).collect();
+    //
+    // Split on "\n// " (newline-anchored) to avoid splitting on inline comment
+    // lines inside file content. Prepend "\n" so the first header is also
+    // preceded by a newline and the split pattern matches uniformly.
+    let normalized = format!("\n{stdout}");
+    let sections: Vec<&str> = normalized.split("\n// ").filter(|s| !s.is_empty()).collect();
     assert!(
         sections.len() >= 2,
         "Should have at least 2 file sections in glob output, got {}: {:?}",

@@ -68,7 +68,7 @@ fn test_skim_build_cargo_in_repo() {
         .arg("cargo")
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK"));
+        .stdout(predicate::str::contains("OK warnings:"));
 }
 
 // ============================================================================

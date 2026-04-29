@@ -30,7 +30,7 @@ fn test_build_cargo_success_exit_code() {
         .timeout(std::time::Duration::from_secs(120))
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK"));
+        .stdout(predicate::str::contains("OK warnings:"));
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn test_build_cargo_structured_output() {
         .timeout(std::time::Duration::from_secs(120))
         .assert()
         .success()
-        .stdout(predicate::str::contains("OK"));
+        .stdout(predicate::str::contains("OK warnings:"));
 }
 
 // ============================================================================
