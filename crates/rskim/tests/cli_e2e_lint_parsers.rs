@@ -41,7 +41,7 @@ fn test_eslint_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .code(0) // stdin mode always exits 0
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("eslint "))
         .stdout(predicate::str::contains("2 errors"))
         .stdout(predicate::str::contains("3 warnings"));
 }
@@ -58,7 +58,7 @@ fn test_eslint_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("eslint "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -117,7 +117,7 @@ fn test_ruff_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("ruff "))
         .stdout(predicate::str::contains("3 errors"));
 }
 
@@ -133,7 +133,7 @@ fn test_ruff_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("ruff "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -180,7 +180,7 @@ fn test_mypy_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("mypy "))
         .stdout(predicate::str::contains("3 errors"));
 }
 
@@ -196,7 +196,7 @@ fn test_mypy_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("mypy "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -243,7 +243,7 @@ fn test_golangci_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("golangci "))
         .stdout(predicate::str::contains("1 error"))
         .stdout(predicate::str::contains("3 warning"));
 }
@@ -260,7 +260,7 @@ fn test_golangci_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("golangci "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -306,7 +306,7 @@ fn test_black_tier1_check_fail() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("black "))
         .stdout(predicate::str::contains("formatting"));
 }
 
@@ -329,7 +329,7 @@ fn test_black_tier2_regex_degraded() {
         .write_stdin("would reformat src/main.py\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"));
+        .stdout(predicate::str::contains("black "));
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn test_gofmt_tier1_list_fail() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("gofmt "))
         .stdout(predicate::str::contains("formatting"));
 }
 
@@ -379,7 +379,7 @@ fn test_gofmt_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("gofmt "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -417,7 +417,7 @@ fn test_biome_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("biome "))
         .stdout(predicate::str::contains("1 error"));
 }
 
@@ -429,7 +429,7 @@ fn test_biome_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("biome "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -468,7 +468,7 @@ fn test_dprint_tier1_check_fail() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("dprint "))
         .stdout(predicate::str::contains("formatting"));
 }
 
@@ -479,7 +479,7 @@ fn test_dprint_tier2_regex_degraded() {
         .write_stdin("from src/main.ts:\n  | diff content\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("dprint "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -517,7 +517,7 @@ fn test_oxlint_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("oxlint "))
         .stdout(predicate::str::contains("1 error"))
         .stdout(predicate::str::contains("2 warning"));
 }
@@ -541,7 +541,7 @@ fn test_oxlint_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("oxlint "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -618,7 +618,7 @@ fn test_lint_show_stats_reports_tokens() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("eslint "))
         .stderr(predicate::str::contains("tokens"));
 }
 
@@ -654,7 +654,7 @@ fn test_dprint_check_subcommand_with_piped_stdin() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"))
+        .stdout(predicate::str::contains("dprint "))
         .stdout(predicate::str::contains("formatting"));
 }
 
@@ -679,7 +679,7 @@ fn test_ruff_check_subcommand_with_piped_stdin() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"));
+        .stdout(predicate::str::contains("ruff "));
 }
 
 /// AD-LINT-26: `biome format` subcommand does not block stdin detection.
@@ -691,7 +691,7 @@ fn test_biome_format_subcommand_with_piped_stdin() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"));
+        .stdout(predicate::str::contains("biome "));
 }
 
 /// AD-LINT-26: `biome check` subcommand does not block stdin detection.
@@ -703,7 +703,7 @@ fn test_biome_check_subcommand_with_piped_stdin() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains(" errors,"));
+        .stdout(predicate::str::contains("biome "));
 }
 
 /// AD-LINT-26: file args after a mode subcommand still trigger binary execution.
