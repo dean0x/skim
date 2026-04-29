@@ -298,6 +298,7 @@ pub(super) fn finalize_git_output_owned(
 /// Call sites: `run_passthrough`, `run_parsed_command` non-zero exit,
 /// `run_diff` non-zero exit / empty diff / empty-after-parse, and the
 /// equivalent failure paths in `show.rs`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_git_output_passthrough(
     raw: String,
     label: String,
@@ -399,6 +400,7 @@ pub(super) fn run_passthrough(
 /// the empty stdout buffer, keeping analytics consistent with the passing path.
 /// `raw == compressed` on failure, so the single-clone passthrough variant is
 /// used (PF-018).  The same pattern applies to `run_diff` non-zero exits.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_parsed_command<F>(
     subcmd_args: &[String],
     show_stats: bool,

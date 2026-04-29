@@ -879,6 +879,7 @@ fn persist_record(record: &TokenSavingsRecord) {
 /// Callers must check `enabled` before calling; this function always records.
 /// The single external caller (`try_record_command`) already guards on `enabled`,
 /// so removing the redundant parameter here keeps the argument count low.
+#[allow(clippy::too_many_arguments)]
 fn record_fire_and_forget(
     raw_text: String,
     compressed_text: String,
@@ -937,6 +938,7 @@ pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
 ///
 /// Reduces the 12-15 line inline pattern at each subcommand call site to a
 /// single function call. Token counting is deferred to a background thread.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_record_command(
     enabled: bool,
     raw_text: String,
@@ -974,6 +976,7 @@ pub(crate) fn try_record_command(
 ///
 /// Delegates to [`record_with_counts`] after resolving cwd and building
 /// the record.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_record_command_with_counts(
     enabled: bool,
     raw_tokens: usize,
@@ -1709,5 +1712,208 @@ mod tests {
 
         let results = db.query_by_original_cmd(None).unwrap();
         assert_eq!(results.len(), 15, "should be limited to top 15 results");
+    }
+
+    // ========================================================================
+    // B8: Schema v3 — session_id column
+    // ========================================================================
+
+    /// AD-AN-4: verify the session_id column exists after migration.
+    #[test]
+    fn test_schema_v3_session_id_column_exists() {
+        let (db, _tmp) = test_db();
+        // PRAGMA table_info lists all columns; confirm session_id is present.
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA table_info(token_savings)")
+            .unwrap();
+        let col_names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            col_names.contains(&"session_id".to_string()),
+            "token_savings must have session_id column after v3 migration; found: {col_names:?}"
+        );
+    }
+
+    /// AD-AN-4: verify the idx_ts_session_id index exists after migration.
+    #[test]
+    fn test_schema_v3_session_id_index_exists() {
+        let (db, _tmp) = test_db();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_ts_session_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "idx_ts_session_id index should be created by v3 migration"
+        );
+    }
+
+    /// AD-AN-4: verify schema version is 3 after all migrations.
+    #[test]
+    fn test_schema_version_is_3() {
+        let (db, _tmp) = test_db();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3, "schema version should be 3 after all migrations");
+    }
+
+    // ========================================================================
+    // B8: query_session_stats — tagged and untagged invocations
+    // ========================================================================
+
+    /// AD-AN-2: session_id is stored and retrievable.
+    #[test]
+    fn test_record_with_session_id_stored() {
+        let (db, _tmp) = test_db();
+        let mut r = sample_record();
+        r.session_id = Some("session-abc-123".to_string());
+        db.record(&r).unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT session_id FROM token_savings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            stored,
+            Some("session-abc-123".to_string()),
+            "session_id should be stored and retrievable"
+        );
+    }
+
+    /// AD-AN-2: NULL session_id stored for untagged records.
+    #[test]
+    fn test_record_without_session_id_stores_null() {
+        let (db, _tmp) = test_db();
+        let r = sample_record(); // session_id: None
+        db.record(&r).unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT session_id FROM token_savings", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "session_id should be NULL when not provided"
+        );
+    }
+
+    /// AD-AN-2: query_session_stats returns correct counts for tagged sessions.
+    #[test]
+    fn test_query_session_stats_basic() {
+        let (db, _tmp) = test_db();
+
+        // 3 records tagged to "sess-1", 2 to "sess-2"
+        for _ in 0..3 {
+            let mut r = sample_record();
+            r.session_id = Some("sess-1".to_string());
+            r.raw_tokens = 1000;
+            r.compressed_tokens = 200;
+            db.record(&r).unwrap();
+        }
+        for _ in 0..2 {
+            let mut r = sample_record();
+            r.session_id = Some("sess-2".to_string());
+            r.raw_tokens = 500;
+            r.compressed_tokens = 100;
+            db.record(&r).unwrap();
+        }
+
+        let stats = db.query_session_stats(None).unwrap();
+        assert_eq!(
+            stats.distinct_sessions, 2,
+            "should count 2 distinct sessions"
+        );
+        // sess-1: 3 * (1000 - 200) = 2400; sess-2: 2 * (500 - 100) = 800; total = 3200
+        assert_eq!(
+            stats.total_tokens_saved, 3200,
+            "total tokens saved should be 3200"
+        );
+        // avg per session: 3200 / 2 = 1600
+        assert!(
+            (stats.avg_tokens_per_session - 1600.0).abs() < 1.0,
+            "avg_tokens_per_session should be ~1600.0, got {}",
+            stats.avg_tokens_per_session
+        );
+        assert_eq!(
+            stats.untagged_invocations, 0,
+            "no untagged invocations expected"
+        );
+    }
+
+    /// AD-AN-2: untagged invocations (NULL session_id) are counted separately.
+    #[test]
+    fn test_query_session_stats_untagged() {
+        let (db, _tmp) = test_db();
+
+        // 1 tagged record
+        let mut tagged = sample_record();
+        tagged.session_id = Some("sess-x".to_string());
+        db.record(&tagged).unwrap();
+
+        // 3 untagged records
+        for _ in 0..3 {
+            let r = sample_record(); // session_id: None
+            db.record(&r).unwrap();
+        }
+
+        let stats = db.query_session_stats(None).unwrap();
+        assert_eq!(
+            stats.distinct_sessions, 1,
+            "should count 1 distinct tagged session"
+        );
+        assert_eq!(
+            stats.untagged_invocations, 3,
+            "should count 3 untagged invocations"
+        );
+    }
+
+    /// AD-AN-2: empty DB returns zero-valued SessionStats (no panic).
+    #[test]
+    fn test_query_session_stats_empty_db() {
+        let (db, _tmp) = test_db();
+        let stats = db.query_session_stats(None).unwrap();
+        assert_eq!(stats.distinct_sessions, 0);
+        assert_eq!(stats.total_tokens_saved, 0);
+        assert_eq!(stats.avg_tokens_per_session, 0.0);
+        assert_eq!(stats.untagged_invocations, 0);
+    }
+
+    /// AD-AN-2: since filter applies to session_stats queries.
+    #[test]
+    fn test_query_session_stats_since_filter() {
+        let (db, _tmp) = test_db();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Old tagged record (10 days ago)
+        let mut old = sample_record();
+        old.timestamp = now - 86400 * 10;
+        old.session_id = Some("old-session".to_string());
+        db.record(&old).unwrap();
+
+        // Recent tagged record (1 hour ago)
+        let mut recent = sample_record();
+        recent.timestamp = now - 3600;
+        recent.session_id = Some("new-session".to_string());
+        db.record(&recent).unwrap();
+
+        // Filter to last 24h: should see only new-session
+        let stats = db.query_session_stats(Some(now - 86400)).unwrap();
+        assert_eq!(
+            stats.distinct_sessions, 1,
+            "since filter should exclude old session"
+        );
     }
 }

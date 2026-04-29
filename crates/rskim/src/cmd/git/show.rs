@@ -521,6 +521,7 @@ fn render_show_diff(
 /// directly into the analytics call — eliminating the conditional `Option`
 /// clone dance that previously required a TOCTOU double-check of
 /// an analytics-enabled global (MEDIUM-11, MEDIUM-22).
+#[allow(clippy::too_many_arguments)]
 fn emit_show_commit(
     result: ShowCommitResult,
     raw: String,

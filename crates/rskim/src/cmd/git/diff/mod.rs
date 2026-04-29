@@ -145,6 +145,7 @@ fn print_diff_help() {
 /// and return the mapped exit code.
 ///
 /// Extracted from `run_diff` to keep the happy path readable.
+#[allow(clippy::too_many_arguments)]
 fn handle_error_exit(
     stdout: String,
     stderr: String,

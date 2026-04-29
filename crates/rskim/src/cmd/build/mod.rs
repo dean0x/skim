@@ -106,6 +106,7 @@ fn print_help() {
 /// * `env_vars` - Environment variable overrides for the child process
 /// * `install_hint` - Hint message shown if the program is not found
 /// * `parser` - Function to parse the `CommandOutput` into a `ParseResult<BuildResult>`
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_parsed_command(
     program: &str,
     args: &[String],
