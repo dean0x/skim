@@ -24,9 +24,11 @@ impl HookProtocol for CursorHook {
         // Cursor puts command at top level, not nested under tool_input
         let command = json.get("command").and_then(|c| c.as_str())?.to_string();
         // AD-HK-1: Extract session_id from top-level JSON field if present.
+        // F8: Filter empty strings at the parse boundary so callers never see Some("").
         let session_id = json
             .get("session_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .map(str::to_string);
         Some(HookInput {
             command,
@@ -195,6 +197,21 @@ mod tests {
         let result = hook().parse_input(&json).unwrap();
         assert_eq!(result.command, "cargo test");
         assert_eq!(result.session_id, Some("cursor-session-xyz".to_string()));
+    }
+
+    /// F8: empty session_id is treated as None at the parse boundary.
+    #[test]
+    fn test_cursor_parse_input_empty_session_id_is_none() {
+        let json = serde_json::json!({
+            "session_id": "",
+            "command": "cargo test"
+        });
+        let result = hook().parse_input(&json).unwrap();
+        assert_eq!(result.command, "cargo test");
+        assert!(
+            result.session_id.is_none(),
+            "empty session_id should yield None at parse boundary"
+        );
     }
 
     /// AD-HK-1: session_id is None when absent from Cursor hook JSON.

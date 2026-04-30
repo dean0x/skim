@@ -107,9 +107,11 @@ pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookI
         .and_then(|c| c.as_str())?
         .to_string();
     // AD-HK-1: Extract session_id from top-level JSON field (Claude Code / Copilot / Gemini).
+    // F8: Filter empty strings at the parse boundary so callers never see Some("").
     let session_id = json
         .get("session_id")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
         .map(str::to_string);
     Some(HookInput {
         command,
@@ -263,6 +265,23 @@ mod tests {
         assert!(
             result.session_id.is_none(),
             "session_id should be None when not in JSON"
+        );
+    }
+
+    /// F8: empty string session_id is treated as None at the parse boundary.
+    #[test]
+    fn test_parse_tool_input_command_empty_session_id_is_none() {
+        let json = serde_json::json!({
+            "session_id": "",
+            "tool_input": {
+                "command": "cargo build"
+            }
+        });
+        let result = parse_tool_input_command(&json).unwrap();
+        assert_eq!(result.command, "cargo build");
+        assert!(
+            result.session_id.is_none(),
+            "empty session_id should yield None at parse boundary"
         );
     }
 
