@@ -252,9 +252,16 @@ pub(crate) enum OutputFormat {
 
 /// Cross-cutting configuration for subcommand execution.
 ///
-/// Bundles the three boolean flags that every family dispatcher receives
-/// identically, reducing the 4-parameter `(args, show_stats, json_output,
-/// analytics_enabled)` signature to `(args, ctx)` at every call boundary.
+/// Bundles the four fields that every family dispatcher receives identically,
+/// reducing the positional parameter list to `(args, ctx)` at every call boundary.
+///
+/// ## Fields
+///
+/// - `show_stats` — emit token-reduction statistics to stderr after compression.
+/// - `json_output` — serialize results as JSON instead of human-readable text.
+/// - `analytics_enabled` — persist token savings to the analytics database.
+/// - `session_id` — hook-injected session identifier threaded to every recording
+///   so the stats dashboard can group invocations by originating agent session.
 pub(crate) struct RunContext {
     pub show_stats: bool,
     pub json_output: bool,
