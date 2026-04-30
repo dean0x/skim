@@ -216,7 +216,7 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     };
 
     match rewritten {
-        Some(ref rewritten_cmd) => {
+        Some(rewritten_cmd) => {
             // AD-HK-2: Inject --session-id=VALUE into the rewritten command so every
             // skim invocation in this session is tagged for per-session analytics.
             // Only inject when session_id is present and command starts with "skim ".
@@ -224,9 +224,10 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // hyphens, underscores, dots, max 128 chars) before interpolation into
             // the command string. Malicious session IDs with shell metacharacters
             // (;, |, $, spaces, etc.) are silently dropped to prevent command injection.
+            // F5: match by value so the None arm moves rewritten_cmd instead of cloning.
             let final_cmd = match session_id.as_deref().filter(|sid| crate::analytics::is_safe_session_id(sid)) {
-                Some(sid) => inject_session_id_into_compound(rewritten_cmd, sid),
-                None => rewritten_cmd.clone(),
+                Some(sid) => inject_session_id_into_compound(&rewritten_cmd, sid),
+                None => rewritten_cmd,
             };
             audit_hook(&command, true, &final_cmd);
             // Use agent-specific response format
