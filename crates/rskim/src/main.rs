@@ -890,16 +890,8 @@ mod tests {
     // B-AC14: backward-compatible empty normalisation (now via parse_session_id)
     // ========================================================================
 
-    /// B-AC14: the session_id extraction logic normalises empty values to None.
-    #[test]
-    fn test_empty_session_id_arg_normalised_to_none() {
-        let result = parse_session_id(["skim", "--session-id="]);
-        assert!(
-            result.is_none(),
-            "--session-id= (empty value) must normalise to None, got {:?}",
-            result
-        );
-    }
+    // NOTE: test_parse_session_id_empty (above, tagged F7) already covers empty
+    // value normalisation — no separate test needed here.
 
     /// B-AC14: non-empty --session-id= is preserved as Some.
     #[test]
