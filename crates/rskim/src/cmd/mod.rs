@@ -456,14 +456,16 @@ where
     }
 
     crate::analytics::try_record_command(
-        analytics_enabled,
+        crate::analytics::RecordingContext {
+            enabled: analytics_enabled,
+            command_type,
+            parse_tier: Some(result.tier_name()),
+            session_id,
+        },
         output.stdout,
         compressed,
         format_analytics_label(family, program, &args.join(" ")),
-        command_type,
         output.duration,
-        Some(result.tier_name()),
-        session_id,
     );
 
     Ok(ExitCode::from(code.clamp(0, 255) as u8))

@@ -48,18 +48,10 @@ pub(super) fn run_commit(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--help"]) {
-        return run_passthrough(
-            global_flags,
-            "commit",
-            args,
-            show_stats,
-            analytics_enabled,
-            session_id,
-        );
+        return run_passthrough(global_flags, "commit", args, show_stats, rec);
     }
 
     let (filtered_args, output_format) = extract_output_format(args);
@@ -68,17 +60,16 @@ pub(super) fn run_commit(
     full_args.push("commit".to_string());
     full_args.extend_from_slice(&filtered_args);
 
-    let label = super::build_analytics_label("commit", args, show_stats, analytics_enabled);
+    let label = super::build_analytics_label("commit", args, show_stats, rec.enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
-        analytics_enabled,
+        rec,
         output_format,
         true, // combine_stderr: hook output and "nothing to commit" come from stderr
         label,
         parse_commit,
-        session_id,
     )
 }
 

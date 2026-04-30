@@ -38,11 +38,16 @@ pub(crate) fn run(
         None => (None, [].as_slice()),
     };
 
-    let session_id = analytics.session_id.as_deref();
+    let rec = crate::analytics::RecordingContext {
+        enabled: analytics.enabled,
+        command_type: crate::analytics::CommandType::Build,
+        parse_tier: None,
+        session_id: analytics.session_id.as_deref(),
+    };
     match sub {
-        Some("cargo") => cargo::run(remaining, show_stats, analytics.enabled, session_id),
-        Some("clippy") => cargo::run_clippy(remaining, show_stats, analytics.enabled, session_id),
-        Some("tsc") => tsc::run(remaining, show_stats, analytics.enabled, session_id),
+        Some("cargo") => cargo::run(remaining, show_stats, rec),
+        Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
+        Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             anyhow::bail!(
@@ -106,16 +111,14 @@ fn print_help() {
 /// * `env_vars` - Environment variable overrides for the child process
 /// * `install_hint` - Hint message shown if the program is not found
 /// * `parser` - Function to parse the `CommandOutput` into a `ParseResult<BuildResult>`
-#[allow(clippy::too_many_arguments)]
 pub(super) fn run_parsed_command(
     program: &str,
     args: &[String],
     env_vars: &[(&str, &str)],
     install_hint: &str,
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
-    session_id: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let runner = CommandRunner::new(Some(Duration::from_secs(600)));
 
@@ -188,14 +191,14 @@ pub(super) fn run_parsed_command(
 
     // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
-        analytics_enabled,
+        crate::analytics::RecordingContext {
+            parse_tier: Some(result.tier_name()),
+            ..rec
+        },
         raw_text,
         result.content().to_string(),
         super::format_analytics_label("build", program, &args.join(" ")),
-        crate::analytics::CommandType::Build,
         output.duration,
-        Some(result.tier_name()),
-        session_id,
     );
 
     Ok(exit_code)

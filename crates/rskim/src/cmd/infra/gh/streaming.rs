@@ -244,14 +244,16 @@ impl DropGuard {
         let raw_tokens = self.raw_bytes / 4;
         let compressed_tokens = self.compressed_bytes / 4;
         crate::analytics::try_record_command_with_counts(
-            self.analytics_enabled,
+            crate::analytics::RecordingContext {
+                enabled: self.analytics_enabled,
+                command_type: crate::analytics::CommandType::Infra,
+                parse_tier: Some("streaming"),
+                session_id: self.session_id.as_deref(),
+            },
             raw_tokens,
             compressed_tokens,
             self.label.clone(),
-            crate::analytics::CommandType::Infra,
             self.start.elapsed(),
-            Some("streaming"),
-            self.session_id.as_deref(),
         );
     }
 }

@@ -184,8 +184,7 @@ pub(super) fn run_show(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_show_help();
@@ -194,44 +193,17 @@ pub(super) fn run_show(
 
     // Passthrough for stat-family and format flags.
     if user_has_flag(args, PASSTHROUGH_FLAGS) {
-        return run_passthrough(
-            global_flags,
-            "show",
-            args,
-            show_stats,
-            analytics_enabled,
-            session_id,
-        );
+        return run_passthrough(global_flags, "show", args, show_stats, rec);
     }
 
     match detect_show_mode(args) {
-        ShowMode::MultiRef => run_passthrough(
-            global_flags,
-            "show",
-            args,
-            show_stats,
-            analytics_enabled,
-            session_id,
-        ),
-        ShowMode::FileContent { refpath } => run_show_file_content(
-            global_flags,
-            args,
-            &refpath,
-            show_stats,
-            analytics_enabled,
-            session_id,
-        ),
+        ShowMode::MultiRef => run_passthrough(global_flags, "show", args, show_stats, rec),
+        ShowMode::FileContent { refpath } => {
+            run_show_file_content(global_flags, args, &refpath, show_stats, rec)
+        }
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
-            run_show_commit(
-                global_flags,
-                &git_args,
-                args,
-                output_format,
-                show_stats,
-                analytics_enabled,
-                session_id,
-            )
+            run_show_commit(global_flags, &git_args, args, output_format, show_stats, rec)
         }
     }
 }
@@ -538,17 +510,19 @@ fn render_show_diff(
 /// directly into the analytics call — eliminating the conditional `Option`
 /// clone dance that previously required a TOCTOU double-check of
 /// an analytics-enabled global (MEDIUM-11, MEDIUM-22).
-#[allow(clippy::too_many_arguments)]
 fn emit_show_commit(
     result: ShowCommitResult,
     raw: String,
     label: String,
     output_format: OutputFormat,
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
     duration: std::time::Duration,
-    session_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    let rec_full = crate::analytics::RecordingContext {
+        parse_tier: Some("full"),
+        ..rec
+    };
     match output_format {
         OutputFormat::Json => {
             // JSON: serialise result directly; guardrail is irrelevant here
@@ -558,17 +532,7 @@ fn emit_show_commit(
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
             println!("{json}");
-            finalize_git_output_owned(
-                raw,
-                json,
-                label,
-                show_stats,
-                analytics_enabled,
-                crate::analytics::CommandType::Git,
-                duration,
-                Some("full"),
-                session_id,
-            );
+            finalize_git_output_owned(raw, json, label, show_stats, rec_full, duration);
         }
         OutputFormat::Text => {
             // Apply guardrail: if compressed output is larger than raw, emit raw.
@@ -580,7 +544,7 @@ fn emit_show_commit(
             // Guarding here avoids a full memcpy (~100-500 KB) on the no-telemetry
             // hot path (HIGH-1).  The owned variant then moves both strings into
             // `finalize_git_output_owned` without further cloning (MEDIUM-22).
-            let raw_for_record = if show_stats || analytics_enabled {
+            let raw_for_record = if show_stats || rec.enabled {
                 raw.clone()
             } else {
                 String::new()
@@ -593,11 +557,8 @@ fn emit_show_commit(
                 final_output,
                 label,
                 show_stats,
-                analytics_enabled,
-                crate::analytics::CommandType::Git,
+                rec_full,
                 duration,
-                Some("full"),
-                session_id,
             );
         }
     }
@@ -616,8 +577,7 @@ fn run_show_commit(
     original_args: &[String],
     output_format: OutputFormat,
     show_stats: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     let (raw, duration) = match run_git_show_raw(global_flags, git_args)? {
         ShowRawOutcome::Success { stdout, duration } => (stdout, duration),
@@ -633,13 +593,13 @@ fn run_show_commit(
             // (clone) on the analytics path, 0 when disabled (PF-018).
             super::finalize_git_output_passthrough(
                 stdout,
-                build_analytics_label("show", original_args, show_stats, analytics_enabled),
+                build_analytics_label("show", original_args, show_stats, rec.enabled),
                 show_stats,
-                analytics_enabled,
-                crate::analytics::CommandType::Git,
+                crate::analytics::RecordingContext {
+                    parse_tier: Some("passthrough"),
+                    ..rec
+                },
                 duration,
-                Some("passthrough"),
-                session_id,
             );
             return Ok(exit_code);
         }
@@ -648,7 +608,7 @@ fn run_show_commit(
     // Built before the `render_show_diff` check so both the passthrough and
     // the normal path share the same label (HIGH-3).  Derived from *original*
     // args (before `--json` extraction) so the DB records the full invocation.
-    let label = build_analytics_label("show", original_args, show_stats, analytics_enabled);
+    let label = build_analytics_label("show", original_args, show_stats, rec.enabled);
 
     let Some(result) = render_show_diff(&raw, global_flags, git_args) else {
         // Not a regular commit (annotated tag, blob, tree, etc.) — passthrough.
@@ -661,25 +621,16 @@ fn run_show_commit(
             raw,
             label,
             show_stats,
-            analytics_enabled,
-            crate::analytics::CommandType::Git,
+            crate::analytics::RecordingContext {
+                parse_tier: Some("passthrough"),
+                ..rec
+            },
             duration,
-            Some("passthrough"),
-            session_id,
         );
         return Ok(ExitCode::SUCCESS);
     };
 
-    emit_show_commit(
-        result,
-        raw,
-        label,
-        output_format,
-        show_stats,
-        analytics_enabled,
-        duration,
-        session_id,
-    )?;
+    emit_show_commit(result, raw, label, output_format, show_stats, rec, duration)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -710,10 +661,9 @@ fn passthrough_file_content(
     raw: String,
     label: String,
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
     duration: std::time::Duration,
     tier: u8,
-    session_id: Option<&str>,
 ) {
     eprintln!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
@@ -731,11 +681,11 @@ fn passthrough_file_content(
         raw,
         label,
         show_stats,
-        analytics_enabled,
-        crate::analytics::CommandType::Git,
+        crate::analytics::RecordingContext {
+            parse_tier: tier_name,
+            ..rec
+        },
         duration,
-        tier_name,
-        session_id,
     );
 }
 
@@ -754,8 +704,7 @@ fn run_show_file_content(
     args: &[String],
     refpath: &str,
     show_stats: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     // --json is not meaningful for file-content mode.
     if user_has_flag(args, &["--json"]) {
@@ -794,13 +743,13 @@ fn run_show_file_content(
         // allocation (clone) on the analytics path, 0 when disabled (PF-018).
         super::finalize_git_output_passthrough(
             output.stdout,
-            build_analytics_label("show", args, show_stats, analytics_enabled),
+            build_analytics_label("show", args, show_stats, rec.enabled),
             show_stats,
-            analytics_enabled,
-            crate::analytics::CommandType::Git,
+            crate::analytics::RecordingContext {
+                parse_tier: Some("passthrough"),
+                ..rec
+            },
             output.duration,
-            Some("passthrough"),
-            session_id,
         );
         return Ok(map_exit_code(exit_code));
     }
@@ -808,7 +757,7 @@ fn run_show_file_content(
     let raw = output.stdout;
     let duration = output.duration;
 
-    let label = build_analytics_label("show", args, show_stats, analytics_enabled);
+    let label = build_analytics_label("show", args, show_stats, rec.enabled);
 
     // Detect language from path extension.
     let lang = Language::from_path(Path::new(path_str)).filter(|l| !l.is_serde_based());
@@ -817,15 +766,7 @@ fn run_show_file_content(
         // Tier 2: unsupported or serde-based language — passthrough.
         // Move raw: the else branch always returns, so Rust knows raw is
         // available after the let-else for the Tier 1 path.
-        passthrough_file_content(
-            raw,
-            label,
-            show_stats,
-            analytics_enabled,
-            duration,
-            2,
-            session_id,
-        );
+        passthrough_file_content(raw, label, show_stats, rec, duration, 2);
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -844,15 +785,7 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(
-                raw,
-                label,
-                show_stats,
-                analytics_enabled,
-                duration,
-                3,
-                session_id,
-            );
+            passthrough_file_content(raw, label, show_stats, rec, duration, 3);
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -861,7 +794,7 @@ fn run_show_file_content(
     // Clone raw only here (Tier 1 success path), not on every branch (MEDIUM-18).
     // `apply_to_stderr` takes ownership of raw; clone it first so we can pass
     // the original into `finalize_git_output_owned` without a second allocation.
-    let raw_for_record = if show_stats || analytics_enabled {
+    let raw_for_record = if show_stats || rec.enabled {
         raw.clone()
     } else {
         String::new()
@@ -878,11 +811,11 @@ fn run_show_file_content(
         final_output,
         label,
         show_stats,
-        analytics_enabled,
-        crate::analytics::CommandType::Git,
+        crate::analytics::RecordingContext {
+            parse_tier: Some("full"),
+            ..rec
+        },
         duration,
-        Some("full"),
-        session_id,
     );
 
     Ok(ExitCode::SUCCESS)
@@ -1211,8 +1144,14 @@ mod tests {
     fn test_file_content_mode_json_rejected() {
         let global_flags: Vec<String> = vec![];
         let args: Vec<String> = vec!["HEAD:src/main.rs".into(), "--json".into()];
+        let rec = crate::analytics::RecordingContext {
+            enabled: false,
+            command_type: crate::analytics::CommandType::Git,
+            parse_tier: None,
+            session_id: None,
+        };
         let result =
-            run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, false, None)
+            run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, rec)
                 .expect(
                     "run_show_file_content must not return an anyhow error for --json rejection",
                 );

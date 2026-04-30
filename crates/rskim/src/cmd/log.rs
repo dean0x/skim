@@ -155,14 +155,16 @@ fn record_analytics(
     session_id: Option<&str>,
 ) {
     crate::analytics::try_record_command_with_counts(
-        enabled,
+        crate::analytics::RecordingContext {
+            enabled,
+            command_type: crate::analytics::CommandType::Log,
+            parse_tier: Some(tier),
+            session_id,
+        },
         raw_tokens.unwrap_or(0),
         compressed_tokens.unwrap_or(0),
         "skim log".to_string(),
-        crate::analytics::CommandType::Log,
         duration,
-        Some(tier),
-        session_id,
     );
 }
 

@@ -145,16 +145,14 @@ fn print_diff_help() {
 /// and return the mapped exit code.
 ///
 /// Extracted from `run_diff` to keep the happy path readable.
-#[allow(clippy::too_many_arguments)]
 fn handle_error_exit(
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
     label: String,
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
     duration: std::time::Duration,
-    session_id: Option<&str>,
 ) -> ExitCode {
     if !stderr.is_empty() {
         eprint!("{stderr}");
@@ -168,11 +166,11 @@ fn handle_error_exit(
         stdout,
         label,
         show_stats,
-        analytics_enabled,
-        crate::analytics::CommandType::Git,
+        crate::analytics::RecordingContext {
+            parse_tier: Some("passthrough"),
+            ..rec
+        },
         duration,
-        Some("passthrough"),
-        session_id,
     );
     map_exit_code(exit_code)
 }
@@ -261,8 +259,7 @@ pub(super) fn run_diff(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_diff_help();
@@ -280,14 +277,7 @@ pub(super) fn run_diff(
             "--check",
         ],
     ) {
-        return run_passthrough(
-            global_flags,
-            "diff",
-            args,
-            show_stats,
-            analytics_enabled,
-            session_id,
-        );
+        return run_passthrough(global_flags, "diff", args, show_stats, rec);
     }
 
     // Extract skim-specific flags before passing args to git
@@ -304,16 +294,15 @@ pub(super) fn run_diff(
     let output = runner.run("git", &arg_refs)?;
 
     if output.exit_code != Some(0) {
-        let label = super::build_analytics_label("diff", args, show_stats, analytics_enabled);
+        let label = super::build_analytics_label("diff", args, show_stats, rec.enabled);
         return Ok(handle_error_exit(
             output.stdout,
             output.stderr,
             output.exit_code,
             label,
             show_stats,
-            analytics_enabled,
+            rec,
             output.duration,
-            session_id,
         ));
     }
 
@@ -326,7 +315,7 @@ pub(super) fn run_diff(
 
     let duration = output.duration;
     let raw_diff = output.stdout;
-    let label = super::build_analytics_label("diff", args, show_stats, analytics_enabled);
+    let label = super::build_analytics_label("diff", args, show_stats, rec.enabled);
 
     // Handle empty diff — record zero-compression analytics so the DB stays
     // consistent with run_passthrough (which always records, even for no-op passes).
@@ -338,11 +327,11 @@ pub(super) fn run_diff(
             raw_diff,
             label,
             show_stats,
-            analytics_enabled,
-            crate::analytics::CommandType::Git,
+            crate::analytics::RecordingContext {
+                parse_tier: Some("full"),
+                ..rec
+            },
             duration,
-            Some("full"),
-            session_id,
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -365,11 +354,11 @@ pub(super) fn run_diff(
                 raw_diff,
                 label,
                 show_stats,
-                analytics_enabled,
-                crate::analytics::CommandType::Git,
+                crate::analytics::RecordingContext {
+                    parse_tier: Some("degraded"),
+                    ..rec
+                },
                 duration,
-                Some("degraded"),
-                session_id,
             );
             return Ok(ExitCode::SUCCESS);
         }
@@ -390,11 +379,11 @@ pub(super) fn run_diff(
         result_str,
         label,
         show_stats,
-        analytics_enabled,
-        crate::analytics::CommandType::Git,
+        crate::analytics::RecordingContext {
+            parse_tier: Some("full"),
+            ..rec
+        },
         duration,
-        Some("full"),
-        session_id,
     );
 
     Ok(ExitCode::SUCCESS)

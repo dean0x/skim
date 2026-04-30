@@ -93,14 +93,16 @@ pub(crate) fn run(
 
     // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
-        analytics_enabled,
+        crate::analytics::RecordingContext {
+            enabled: analytics_enabled,
+            command_type: crate::analytics::CommandType::Test,
+            parse_tier: Some(result.tier_name()),
+            session_id,
+        },
         raw_output,
         result.content().to_string(),
         crate::cmd::format_analytics_label("test", program, &args.join(" ")),
-        crate::analytics::CommandType::Test,
         start.elapsed(),
-        Some(result.tier_name()),
-        session_id,
     );
 
     Ok(exit_code)

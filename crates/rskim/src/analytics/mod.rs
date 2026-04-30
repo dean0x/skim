@@ -774,6 +774,43 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 }
 
 // ============================================================================
+// RecordingContext — bundles analytics metadata for subcommand handlers
+// ============================================================================
+
+/// Bundles recording parameters that flow through subcommand handlers.
+///
+/// Introduced in F4 to eliminate the 4-parameter `(analytics_enabled,
+/// command_type, parse_tier, session_id)` tuple that was threaded individually
+/// through every handler function, triggering `clippy::too_many_arguments`
+/// suppressions.
+///
+/// `Copy` is derived so passing `rec` at a call site never requires `&rec`
+/// (the struct is small: one bool, one enum Copy, one Option<&'a str> ×2).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordingContext<'a> {
+    /// Whether analytics recording is enabled for this invocation.
+    pub enabled: bool,
+    /// The command family tag stored in the analytics DB.
+    pub command_type: CommandType,
+    /// Optional tier label set by the parser (e.g. `"full"`, `"degraded"`).
+    pub parse_tier: Option<&'a str>,
+    /// Hook-injected session identifier (AD-AN-4).
+    pub session_id: Option<&'a str>,
+}
+
+/// Owned recording parameters for the background recording thread.
+///
+/// Bundles the fields that `record_fire_and_forget` previously accepted
+/// individually so the thread spawning function stays under the
+/// `clippy::too_many_arguments` threshold.
+struct FireAndForgetParams {
+    command_type: CommandType,
+    project_path: String,
+    parse_tier: Option<String>,
+    session_id: Option<String>,
+}
+
+// ============================================================================
 // Fire-and-forget recording functions
 // ============================================================================
 
@@ -905,17 +942,19 @@ fn persist_record(record: &TokenSavingsRecord) {
 /// Callers must check `enabled` before calling; this function always records.
 /// The single external caller (`try_record_command`) already guards on `enabled`,
 /// so removing the redundant parameter here keeps the argument count low.
-#[allow(clippy::too_many_arguments)]
 fn record_fire_and_forget(
     raw_text: String,
     compressed_text: String,
     original_cmd: String,
-    command_type: CommandType,
     duration: Duration,
-    project_path: String,
-    parse_tier: Option<String>,
-    session_id: Option<String>,
+    params: FireAndForgetParams,
 ) {
+    let FireAndForgetParams {
+        command_type,
+        project_path,
+        parse_tier,
+        session_id,
+    } = params;
     register_thread(std::thread::spawn(move || {
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
             return;
@@ -964,18 +1003,18 @@ pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
 ///
 /// Reduces the 12-15 line inline pattern at each subcommand call site to a
 /// single function call. Token counting is deferred to a background thread.
-#[allow(clippy::too_many_arguments)]
+///
+/// `rec` bundles the recording control fields (enabled, command_type,
+/// parse_tier, session_id) so this function stays under the
+/// `clippy::too_many_arguments` threshold.
 pub(crate) fn try_record_command(
-    enabled: bool,
+    rec: RecordingContext<'_>,
     raw_text: String,
     compressed_text: String,
     original_cmd: String,
-    command_type: CommandType,
     duration: Duration,
-    parse_tier: Option<&str>,
-    session_id: Option<&str>,
 ) {
-    if !enabled {
+    if !rec.enabled {
         return;
     }
     let cwd = std::env::current_dir()
@@ -986,11 +1025,13 @@ pub(crate) fn try_record_command(
         raw_text,
         compressed_text,
         original_cmd,
-        command_type,
         duration,
-        cwd,
-        parse_tier.map(str::to_string),
-        session_id.map(str::to_string),
+        FireAndForgetParams {
+            command_type: rec.command_type,
+            project_path: cwd,
+            parse_tier: rec.parse_tier.map(str::to_string),
+            session_id: rec.session_id.map(str::to_string),
+        },
     );
 }
 
@@ -1002,18 +1043,18 @@ pub(crate) fn try_record_command(
 ///
 /// Delegates to [`record_with_counts`] after resolving cwd and building
 /// the record.
-#[allow(clippy::too_many_arguments)]
+///
+/// `rec` bundles the recording control fields (enabled, command_type,
+/// parse_tier, session_id) so this function stays under the
+/// `clippy::too_many_arguments` threshold.
 pub(crate) fn try_record_command_with_counts(
-    enabled: bool,
+    rec: RecordingContext<'_>,
     raw_tokens: usize,
     compressed_tokens: usize,
     original_cmd: String,
-    command_type: CommandType,
     duration: Duration,
-    parse_tier: Option<&str>,
-    session_id: Option<&str>,
 ) {
-    if !enabled {
+    if !rec.enabled {
         return;
     }
     let cwd = std::env::current_dir()
@@ -1024,7 +1065,7 @@ pub(crate) fn try_record_command_with_counts(
         true,
         TokenSavingsRecord {
             timestamp: now_unix_secs(),
-            command_type,
+            command_type: rec.command_type,
             original_cmd,
             raw_tokens,
             compressed_tokens: compressed_tokens.min(raw_tokens),
@@ -1033,8 +1074,8 @@ pub(crate) fn try_record_command_with_counts(
             project_path: cwd,
             mode: None,
             language: None,
-            parse_tier: parse_tier.map(str::to_string),
-            session_id: session_id.map(str::to_string),
+            parse_tier: rec.parse_tier.map(str::to_string),
+            session_id: rec.session_id.map(str::to_string),
         },
     );
 }
