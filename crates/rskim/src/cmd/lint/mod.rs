@@ -17,7 +17,6 @@ pub(crate) mod ruff;
 pub(crate) mod rustfmt;
 
 use std::collections::BTreeMap;
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
@@ -151,7 +150,7 @@ pub(crate) fn run_linter(
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let use_stdin = super::should_read_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
