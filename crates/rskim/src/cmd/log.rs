@@ -140,6 +140,7 @@ pub(crate) fn run(
         compressed_tokens,
         duration,
         result.tier_name(),
+        analytics.session_id.as_deref(),
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -151,15 +152,19 @@ fn record_analytics(
     compressed_tokens: Option<usize>,
     duration: std::time::Duration,
     tier: &str,
+    session_id: Option<&str>,
 ) {
     crate::analytics::try_record_command_with_counts(
-        enabled,
+        crate::analytics::RecordingContext {
+            enabled,
+            command_type: crate::analytics::CommandType::Log,
+            parse_tier: Some(tier),
+            session_id,
+        },
         raw_tokens.unwrap_or(0),
         compressed_tokens.unwrap_or(0),
         "skim log".to_string(),
-        crate::analytics::CommandType::Log,
         duration,
-        Some(tier),
     );
 }
 

@@ -46,6 +46,7 @@ pub(crate) fn run(
         show_stats,
         json_output,
         analytics_enabled: analytics.enabled,
+        session_id: analytics.session_id.clone(),
     };
 
     match tool_name.as_str() {
@@ -173,10 +174,14 @@ pub(crate) fn run_infra_tool(
             install_hint: config.install_hint,
             use_stdin,
             show_stats: ctx.show_stats,
-            command_type: crate::analytics::CommandType::Infra,
             output_format: ctx.output_format(),
-            analytics_enabled: ctx.analytics_enabled,
             family: "infra",
+            rec: crate::analytics::RecordingContext {
+                enabled: ctx.analytics_enabled,
+                command_type: crate::analytics::CommandType::Infra,
+                parse_tier: None,
+                session_id: ctx.session_id.as_deref(),
+            },
         },
         |output, _args| parse_fn(output),
     )

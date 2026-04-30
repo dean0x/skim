@@ -23,10 +23,10 @@ pub(super) fn run_fetch(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--dry-run", "-q", "--quiet"]) {
-        return run_passthrough(global_flags, "fetch", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "fetch", args, show_stats, rec);
     }
 
     let (filtered_args, output_format) = extract_output_format(args);
@@ -35,12 +35,12 @@ pub(super) fn run_fetch(
     full_args.push("fetch".to_string());
     full_args.extend_from_slice(&filtered_args);
 
-    let label = super::build_analytics_label("fetch", args, show_stats, analytics_enabled);
+    let label = super::build_analytics_label("fetch", args, show_stats, rec.enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
-        analytics_enabled,
+        rec,
         output_format,
         true,
         label,

@@ -15,13 +15,14 @@ use rskim_core::Language;
 use crate::process::{process_file, report_token_stats, ProcessOptions};
 
 /// Options for multi-file processing
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct MultiFileOptions {
     pub(crate) process: ProcessOptions,
     pub(crate) no_header: bool,
     pub(crate) jobs: Option<usize>,
     pub(crate) no_ignore: bool,
     pub(crate) analytics_enabled: bool,
+    pub(crate) session_id: Option<String>,
 }
 
 /// Glob metacharacters recognised by skim.
@@ -294,6 +295,7 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
                 mode: Some(mode),
                 language: None, // mixed languages
                 parse_tier: None,
+                session_id: options.session_id.clone(),
             },
         );
     }

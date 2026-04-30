@@ -59,6 +59,7 @@ mod tests {
     const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
         enabled: false,
         input_cost_per_mtok: None,
+        session_id: None,
     };
 
     #[test]

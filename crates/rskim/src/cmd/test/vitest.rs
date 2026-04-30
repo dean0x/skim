@@ -34,7 +34,7 @@ pub(crate) fn run(
     program: &str,
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
@@ -92,13 +92,11 @@ pub(crate) fn run(
 
     // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
-        analytics_enabled,
+        rec.with_tier(result.tier_name()),
         raw_output,
         result.content().to_string(),
         crate::cmd::format_analytics_label("test", program, &args.join(" ")),
-        crate::analytics::CommandType::Test,
         start.elapsed(),
-        Some(result.tier_name()),
     );
 
     Ok(exit_code)

@@ -8,7 +8,6 @@ mod npm;
 mod pip;
 mod pnpm;
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use crate::output::ParseResult;
@@ -38,13 +37,18 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let analytics_enabled = analytics.enabled;
+    let rec = crate::analytics::RecordingContext {
+        enabled: analytics.enabled,
+        command_type: crate::analytics::CommandType::Pkg,
+        parse_tier: None,
+        session_id: analytics.session_id.as_deref(),
+    };
 
     match tool_name.as_str() {
-        "npm" => npm::run(tool_args, show_stats, json_output, analytics_enabled),
-        "pnpm" => pnpm::run(tool_args, show_stats, json_output, analytics_enabled),
-        "pip" => pip::run(tool_args, show_stats, json_output, analytics_enabled),
-        "cargo" => cargo::run(tool_args, show_stats, json_output, analytics_enabled),
+        "npm" => npm::run(tool_args, show_stats, json_output, rec),
+        "pnpm" => pnpm::run(tool_args, show_stats, json_output, rec),
+        "pip" => pip::run(tool_args, show_stats, json_output, rec),
+        "cargo" => cargo::run(tool_args, show_stats, json_output, rec),
         tool => {
             let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(
@@ -82,7 +86,7 @@ pub(super) fn run_pkg_subcommand<T>(
     config: PkgSubcommandConfig<'_>,
     user_args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
     inject_flags: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
@@ -93,7 +97,7 @@ where
     cmd_args.extend(user_args.iter().cloned());
     inject_flags(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && user_args.is_empty();
+    let use_stdin = crate::cmd::should_read_stdin(user_args);
 
     crate::cmd::run_parsed_command_with_mode(
         crate::cmd::ParsedCommandConfig {
@@ -103,10 +107,9 @@ where
             install_hint: config.install_hint,
             use_stdin,
             show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
             output_format: crate::cmd::OutputFormat::default(),
-            analytics_enabled,
             family: "pkg",
+            rec,
         },
         |output, _args| parse_fn(output),
     )

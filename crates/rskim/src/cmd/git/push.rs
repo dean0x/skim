@@ -55,10 +55,10 @@ pub(super) fn run_push(
     global_flags: &[String],
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     if user_has_flag(args, &["--help"]) {
-        return run_passthrough(global_flags, "push", args, show_stats, analytics_enabled);
+        return run_passthrough(global_flags, "push", args, show_stats, rec);
     }
 
     let (mut effective_args, output_format) = extract_output_format(args);
@@ -78,12 +78,12 @@ pub(super) fn run_push(
     full_args.push("push".to_string());
     full_args.extend_from_slice(&effective_args);
 
-    let label = super::build_analytics_label("push", args, show_stats, analytics_enabled);
+    let label = super::build_analytics_label("push", args, show_stats, rec.enabled);
 
     run_parsed_command(
         &full_args,
         show_stats,
-        analytics_enabled,
+        rec,
         output_format,
         true, // combine_stderr: push writes to stderr
         label,

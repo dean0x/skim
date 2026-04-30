@@ -31,7 +31,7 @@ use crate::runner::CommandOutput;
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     run_parsed_command(
         "tsc",
@@ -39,7 +39,7 @@ pub(crate) fn run(
         &[],
         "npm install -g typescript",
         show_stats,
-        analytics_enabled,
+        rec,
         parse_tsc,
     )
 }

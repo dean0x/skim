@@ -75,6 +75,10 @@ pub(crate) struct TokenSavingsRecord {
     pub(crate) mode: Option<String>,
     pub(crate) language: Option<String>,
     pub(crate) parse_tier: Option<String>,
+    /// AD-AN-4: session_id is nullable for backward compatibility — rows
+    /// recorded before schema v3 have NULL and are excluded from per-session
+    /// average calculations.
+    pub(crate) session_id: Option<String>,
 }
 
 // ============================================================================
@@ -143,6 +147,24 @@ pub(crate) struct OriginalCommandStats {
     pub(crate) avg_duration_ms: f64,
 }
 
+/// Per-session aggregate statistics derived from the `session_id` column.
+///
+/// AD-AN-2: Only invocations with a non-NULL `session_id` are counted.
+/// Pre-v3 rows (NULL session_id) are excluded so the average reflects
+/// actual observed session throughput rather than inflated all-time totals.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct SessionStats {
+    /// Number of distinct session IDs observed.
+    pub(crate) distinct_sessions: u64,
+    /// Tokens saved by session-tagged invocations only (NULL rows excluded).
+    /// See `untagged_invocations` for the excluded count.
+    pub(crate) total_tokens_saved: u64,
+    /// Average tokens saved per session (zero-safe, returns 0.0 when no sessions).
+    pub(crate) avg_tokens_per_session: f64,
+    /// Invocations without a session_id (NULL rows, excluded from averages).
+    pub(crate) untagged_invocations: u64,
+}
+
 // ============================================================================
 // Pricing
 // ============================================================================
@@ -162,13 +184,23 @@ impl PricingModel {
         input_cost_per_mtok: 3.0,
         tier_name: "Standard",
     };
+    /// Advanced tier at $5/MTok.
+    ///
+    /// AD-AN-3: No model hints are attached — pricing tiers shift frequently
+    /// and model names become stale within months. The $5 rate represents a
+    /// mid-range tier between Standard ($3) and Premium ($15) that covers
+    /// several recently-published model price points.
+    pub(crate) const ADVANCED: Self = Self {
+        input_cost_per_mtok: 5.0,
+        tier_name: "Advanced",
+    };
     pub(crate) const PREMIUM: Self = Self {
         input_cost_per_mtok: 15.0,
         tier_name: "Premium",
     };
 
-    pub(crate) fn all_tiers() -> [Self; 3] {
-        [Self::ECONOMY, Self::STANDARD, Self::PREMIUM]
+    pub(crate) fn all_tiers() -> [Self; 4] {
+        [Self::ECONOMY, Self::STANDARD, Self::ADVANCED, Self::PREMIUM]
     }
 
     pub(crate) fn default_pricing() -> Self {
@@ -205,18 +237,27 @@ impl PricingModel {
 /// and per-call `SKIM_DISABLE_ANALYTICS` / `SKIM_INPUT_COST_PER_MTOK` env reads.
 /// Created in `main()` after CLI parsing and threaded to all callers.
 /// Tests construct this struct directly with controlled values — no env mutation.
-#[derive(Debug, Clone, Copy)]
+///
+/// AD-AN-1: `Copy` is intentionally not derived because `session_id: Option<String>`
+/// contains a heap-allocated `String`. `Clone` is derived for explicit duplication
+/// where needed.
+#[derive(Debug, Clone)]
 pub(crate) struct AnalyticsConfig {
     pub enabled: bool,
     pub input_cost_per_mtok: Option<f64>,
+    /// AD-AN-4: Optional session ID injected by the hook rewrite pipeline
+    /// (`--session-id=VALUE`). Propagated to every `TokenSavingsRecord` so
+    /// the per-session dashboard section can group invocations by session.
+    pub session_id: Option<String>,
 }
 
 impl AnalyticsConfig {
     /// Read process env once at the system boundary.
     ///
     /// `cli_disable` is the value of `--disable-analytics` from CLI parsing.
-    /// Call this in main(), then thread the result down to all callers.
-    pub fn from_process(cli_disable: bool) -> Self {
+    /// `session_id` is extracted from `--session-id=VALUE` in `main()` before
+    /// this call. Call this in main(), then thread the result down to all callers.
+    pub fn from_process(cli_disable: bool, session_id: Option<String>) -> Self {
         let env_disabled = std::env::var("SKIM_DISABLE_ANALYTICS")
             .ok()
             .map(|v| Self::parse_disable_value(&v))
@@ -228,6 +269,7 @@ impl AnalyticsConfig {
         Self {
             enabled: !cli_disable && !env_disabled,
             input_cost_per_mtok: cost,
+            session_id,
         }
     }
 
@@ -286,6 +328,14 @@ pub(crate) trait AnalyticsStore {
         _since: Option<i64>,
     ) -> anyhow::Result<Vec<OriginalCommandStats>> {
         Ok(vec![])
+    }
+    fn query_session_stats(&self, _since: Option<i64>) -> anyhow::Result<SessionStats> {
+        Ok(SessionStats {
+            distinct_sessions: 0,
+            total_tokens_saved: 0,
+            avg_tokens_per_session: 0.0,
+            untagged_invocations: 0,
+        })
     }
     fn clear(&self) -> anyhow::Result<()> {
         Ok(())
@@ -357,8 +407,8 @@ impl AnalyticsDb {
             &r.original_cmd
         };
         self.conn.execute(
-            "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path, mode, language, parse_tier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path, mode, language, parse_tier, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 r.timestamp,
                 r.command_type.as_str(),
@@ -371,6 +421,7 @@ impl AnalyticsDb {
                 r.mode,
                 r.language,
                 r.parse_tier,
+                r.session_id,
             ],
         )?;
         Ok(())
@@ -619,6 +670,51 @@ impl AnalyticsDb {
 
         Ok(count)
     }
+
+    /// Query per-session statistics grouped by session_id.
+    ///
+    /// Uses a single conditional-aggregation query instead of two separate queries
+    /// to avoid a TOCTOU race between the two reads and to reduce round-trips.
+    /// `COUNT(DISTINCT session_id)` naturally ignores NULL rows, so no extra WHERE
+    /// clause is needed for the session count.
+    ///
+    /// Division by zero is guarded: when `distinct_sessions == 0`,
+    /// `avg_tokens_per_session` is 0.0 (computed in Rust after the query).
+    pub(crate) fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
+        // F2: Single query using conditional aggregation — eliminates the two-query pattern.
+        let (where_clause, params) = since_clause(since);
+        let sql = format!(
+            "SELECT \
+             COUNT(DISTINCT session_id), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens AND session_id IS NOT NULL \
+                              THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END), 0) \
+             FROM token_savings {where_clause}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let (distinct_sessions, total_tokens_saved, untagged_invocations): (u64, i64, u64) =
+            stmt.query_row(rusqlite::params_from_iter(params), |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })?;
+
+        let total_tokens_saved = total_tokens_saved.max(0) as u64;
+        let avg_tokens_per_session = if distinct_sessions > 0 {
+            total_tokens_saved as f64 / distinct_sessions as f64
+        } else {
+            0.0
+        };
+
+        Ok(SessionStats {
+            distinct_sessions,
+            total_tokens_saved,
+            avg_tokens_per_session,
+            untagged_invocations,
+        })
+    }
 }
 
 impl AnalyticsStore for AnalyticsDb {
@@ -645,6 +741,9 @@ impl AnalyticsStore for AnalyticsDb {
         since: Option<i64>,
     ) -> anyhow::Result<Vec<OriginalCommandStats>> {
         self.query_by_original_cmd(since)
+    }
+    fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
+        self.query_session_stats(since)
     }
     fn clear(&self) -> anyhow::Result<()> {
         self.conn.execute("DELETE FROM token_savings", [])?;
@@ -676,8 +775,88 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 }
 
 // ============================================================================
+// RecordingContext — bundles analytics metadata for subcommand handlers
+// ============================================================================
+
+/// Bundles analytics recording parameters threaded through subcommand handlers.
+///
+/// `Copy` keeps call sites clean (no `&rec` or `.clone()`).  See
+/// [`crate::cmd::RunContext`] for the broader dispatch-layer struct that also
+/// carries UI concerns (`show_stats`, `json_output`) irrelevant to recording.
+/// `RunContext` owns its strings; `RecordingContext` borrows them — the lifetime
+/// boundary is intentional.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecordingContext<'a> {
+    /// Whether analytics recording is enabled for this invocation.
+    pub enabled: bool,
+    /// The command family tag stored in the analytics DB.
+    pub command_type: CommandType,
+    /// Optional tier label set by the parser (e.g. `"full"`, `"degraded"`).
+    pub parse_tier: Option<&'a str>,
+    /// Hook-injected session identifier (AD-AN-4).
+    pub session_id: Option<&'a str>,
+}
+
+impl<'a> RecordingContext<'a> {
+    /// Return a copy of `self` with `parse_tier` set to `Some(tier)`.
+    pub(crate) fn with_tier(self, tier: &'a str) -> Self {
+        Self {
+            parse_tier: Some(tier),
+            ..self
+        }
+    }
+
+    /// Return a copy of `self` with `parse_tier` set to `tier`.
+    ///
+    /// Use when the tier is already `Option<&'a str>` (e.g. from a parser result).
+    pub(crate) fn with_tier_opt(self, tier: Option<&'a str>) -> Self {
+        Self {
+            parse_tier: tier,
+            ..self
+        }
+    }
+}
+
+/// Owned recording parameters for the background recording thread.
+///
+/// Bundles the fields that `record_fire_and_forget` previously accepted
+/// individually so the thread spawning function stays under the
+/// `clippy::too_many_arguments` threshold.
+struct FireAndForgetParams {
+    command_type: CommandType,
+    project_path: String,
+    parse_tier: Option<String>,
+    session_id: Option<String>,
+}
+
+// ============================================================================
 // Fire-and-forget recording functions
 // ============================================================================
+
+/// Returns `true` if `sid` is safe for shell command interpolation.
+///
+/// Allows `[a-zA-Z0-9_\-.]`, max 128 chars. Rejects empty, oversized,
+/// and metacharacter-bearing values to prevent command injection.
+///
+/// ## Why 128 chars?
+///
+/// Session IDs are agent-generated opaque identifiers (typically UUIDs or
+/// short descriptive strings). 128 characters is generous for any plausible
+/// legitimate value while bounding the injected flag length in command strings.
+///
+/// ## Rationale for allowed characters
+///
+/// `[a-zA-Z0-9_-.]` covers UUIDs, ISO 8601 timestamps, dot-separated
+/// identifiers, and human-readable session names. All other characters —
+/// including shell metacharacters (`;`, `|`, `$`, spaces, backticks, etc.)
+/// — are rejected.
+pub(crate) fn is_safe_session_id(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid.len() <= 128
+        && sid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
 
 /// Compute token savings as a percentage.
 ///
@@ -781,16 +960,20 @@ fn persist_record(record: &TokenSavingsRecord) {
 ///
 /// Callers must check `enabled` before calling; this function always records.
 /// The single external caller (`try_record_command`) already guards on `enabled`,
-/// so removing the redundant parameter here keeps the argument count at 7.
+/// so removing the redundant parameter here keeps the argument count low.
 fn record_fire_and_forget(
     raw_text: String,
     compressed_text: String,
     original_cmd: String,
-    command_type: CommandType,
     duration: Duration,
-    project_path: String,
-    parse_tier: Option<String>,
+    params: FireAndForgetParams,
 ) {
+    let FireAndForgetParams {
+        command_type,
+        project_path,
+        parse_tier,
+        session_id,
+    } = params;
     register_thread(std::thread::spawn(move || {
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
             return;
@@ -810,6 +993,7 @@ fn record_fire_and_forget(
             mode: None,
             language: None,
             parse_tier,
+            session_id,
         };
         persist_record(&record);
     }));
@@ -838,16 +1022,18 @@ pub(crate) fn record_with_counts(enabled: bool, record: TokenSavingsRecord) {
 ///
 /// Reduces the 12-15 line inline pattern at each subcommand call site to a
 /// single function call. Token counting is deferred to a background thread.
+///
+/// `rec` bundles the recording control fields (enabled, command_type,
+/// parse_tier, session_id) so this function stays under the
+/// `clippy::too_many_arguments` threshold.
 pub(crate) fn try_record_command(
-    enabled: bool,
+    rec: RecordingContext<'_>,
     raw_text: String,
     compressed_text: String,
     original_cmd: String,
-    command_type: CommandType,
     duration: Duration,
-    parse_tier: Option<&str>,
 ) {
-    if !enabled {
+    if !rec.enabled {
         return;
     }
     let cwd = std::env::current_dir()
@@ -858,10 +1044,13 @@ pub(crate) fn try_record_command(
         raw_text,
         compressed_text,
         original_cmd,
-        command_type,
         duration,
-        cwd,
-        parse_tier.map(str::to_string),
+        FireAndForgetParams {
+            command_type: rec.command_type,
+            project_path: cwd,
+            parse_tier: rec.parse_tier.map(str::to_string),
+            session_id: rec.session_id.map(str::to_string),
+        },
     );
 }
 
@@ -873,16 +1062,18 @@ pub(crate) fn try_record_command(
 ///
 /// Delegates to [`record_with_counts`] after resolving cwd and building
 /// the record.
+///
+/// `rec` bundles the recording control fields (enabled, command_type,
+/// parse_tier, session_id) so this function stays under the
+/// `clippy::too_many_arguments` threshold.
 pub(crate) fn try_record_command_with_counts(
-    enabled: bool,
+    rec: RecordingContext<'_>,
     raw_tokens: usize,
     compressed_tokens: usize,
     original_cmd: String,
-    command_type: CommandType,
     duration: Duration,
-    parse_tier: Option<&str>,
 ) {
-    if !enabled {
+    if !rec.enabled {
         return;
     }
     let cwd = std::env::current_dir()
@@ -893,7 +1084,7 @@ pub(crate) fn try_record_command_with_counts(
         true,
         TokenSavingsRecord {
             timestamp: now_unix_secs(),
-            command_type,
+            command_type: rec.command_type,
             original_cmd,
             raw_tokens,
             compressed_tokens: compressed_tokens.min(raw_tokens),
@@ -902,7 +1093,8 @@ pub(crate) fn try_record_command_with_counts(
             project_path: cwd,
             mode: None,
             language: None,
-            parse_tier: parse_tier.map(str::to_string),
+            parse_tier: rec.parse_tier.map(str::to_string),
+            session_id: rec.session_id.map(str::to_string),
         },
     );
 }
@@ -941,6 +1133,7 @@ mod tests {
             mode: Some("structure".to_string()),
             language: Some("rust".to_string()),
             parse_tier: None,
+            session_id: None,
         }
     }
 
@@ -1393,6 +1586,62 @@ mod tests {
     }
 
     // ========================================================================
+    // is_safe_session_id tests (F1, F6, F10)
+    // ========================================================================
+
+    /// F1: 128-char string is accepted; 129-char string is rejected.
+    #[test]
+    fn test_is_safe_session_id_max_length() {
+        let at_limit = "a".repeat(128);
+        assert!(
+            is_safe_session_id(&at_limit),
+            "128-char session_id should be accepted"
+        );
+        let over_limit = "a".repeat(129);
+        assert!(
+            !is_safe_session_id(&over_limit),
+            "129-char session_id should be rejected"
+        );
+    }
+
+    /// F1: empty string is rejected.
+    #[test]
+    fn test_is_safe_session_id_empty() {
+        assert!(
+            !is_safe_session_id(""),
+            "empty session_id should be rejected"
+        );
+    }
+
+    /// F1: shell metacharacters are rejected.
+    #[test]
+    fn test_is_safe_session_id_with_metacharacters() {
+        assert!(
+            !is_safe_session_id("foo;bar"),
+            "semicolon should be rejected"
+        );
+        assert!(!is_safe_session_id("foo|bar"), "pipe should be rejected");
+        assert!(!is_safe_session_id("foo bar"), "space should be rejected");
+        assert!(
+            !is_safe_session_id("$HOME"),
+            "dollar sign should be rejected"
+        );
+    }
+
+    /// F1: alphanumeric, hyphens, underscores, dots are accepted.
+    #[test]
+    fn test_is_safe_session_id_valid() {
+        assert!(
+            is_safe_session_id("abc-123_test.v2"),
+            "alphanumeric, hyphen, underscore, dot should be accepted"
+        );
+        assert!(
+            is_safe_session_id("session-2024-01-15_abc123"),
+            "typical session ID format should be accepted"
+        );
+    }
+
+    // ========================================================================
     // since_clause_with_extra helper test
     // ========================================================================
 
@@ -1417,13 +1666,15 @@ mod tests {
     #[test]
     fn test_pricing_tiers() {
         let tiers = PricingModel::all_tiers();
-        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers.len(), 4);
         assert_eq!(tiers[0].tier_name, "Economy");
         assert_eq!(tiers[0].input_cost_per_mtok, 1.0);
         assert_eq!(tiers[1].tier_name, "Standard");
         assert_eq!(tiers[1].input_cost_per_mtok, 3.0);
-        assert_eq!(tiers[2].tier_name, "Premium");
-        assert_eq!(tiers[2].input_cost_per_mtok, 15.0);
+        assert_eq!(tiers[2].tier_name, "Advanced");
+        assert_eq!(tiers[2].input_cost_per_mtok, 5.0);
+        assert_eq!(tiers[3].tier_name, "Premium");
+        assert_eq!(tiers[3].input_cost_per_mtok, 15.0);
     }
 
     #[test]
@@ -1603,5 +1854,242 @@ mod tests {
 
         let results = db.query_by_original_cmd(None).unwrap();
         assert_eq!(results.len(), 15, "should be limited to top 15 results");
+    }
+
+    // ========================================================================
+    // B8: Schema v3 — session_id column
+    // ========================================================================
+
+    /// AD-AN-4: verify the session_id column exists after migration.
+    #[test]
+    fn test_schema_v3_session_id_column_exists() {
+        let (db, _tmp) = test_db();
+        // PRAGMA table_info lists all columns; confirm session_id is present.
+        let mut stmt = db.conn.prepare("PRAGMA table_info(token_savings)").unwrap();
+        let col_names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            col_names.contains(&"session_id".to_string()),
+            "token_savings must have session_id column after v3 migration; found: {col_names:?}"
+        );
+    }
+
+    /// AD-AN-4: verify the idx_ts_session_id index exists after migration.
+    #[test]
+    fn test_schema_v3_session_id_index_exists() {
+        let (db, _tmp) = test_db();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_ts_session_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "idx_ts_session_id index should be created by v3 migration"
+        );
+    }
+
+    /// AD-AN-4: verify schema version is 3 after all migrations.
+    #[test]
+    fn test_schema_version_is_3() {
+        let (db, _tmp) = test_db();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 3,
+            "schema version should be 3 after all migrations"
+        );
+    }
+
+    // ========================================================================
+    // B8: query_session_stats — tagged and untagged invocations
+    // ========================================================================
+
+    /// AD-AN-2: session_id is stored and retrievable.
+    #[test]
+    fn test_record_with_session_id_stored() {
+        let (db, _tmp) = test_db();
+        let mut r = sample_record();
+        r.session_id = Some("session-abc-123".to_string());
+        db.record(&r).unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT session_id FROM token_savings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            stored,
+            Some("session-abc-123".to_string()),
+            "session_id should be stored and retrievable"
+        );
+    }
+
+    /// AD-AN-2: NULL session_id stored for untagged records.
+    #[test]
+    fn test_record_without_session_id_stores_null() {
+        let (db, _tmp) = test_db();
+        let r = sample_record(); // session_id: None
+        db.record(&r).unwrap();
+
+        let stored: Option<String> = db
+            .conn
+            .query_row("SELECT session_id FROM token_savings", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "session_id should be NULL when not provided"
+        );
+    }
+
+    /// AD-AN-2: query_session_stats returns correct counts for tagged sessions.
+    #[test]
+    fn test_query_session_stats_basic() {
+        let (db, _tmp) = test_db();
+
+        // 3 records tagged to "sess-1", 2 to "sess-2"
+        for _ in 0..3 {
+            let mut r = sample_record();
+            r.session_id = Some("sess-1".to_string());
+            r.raw_tokens = 1000;
+            r.compressed_tokens = 200;
+            db.record(&r).unwrap();
+        }
+        for _ in 0..2 {
+            let mut r = sample_record();
+            r.session_id = Some("sess-2".to_string());
+            r.raw_tokens = 500;
+            r.compressed_tokens = 100;
+            db.record(&r).unwrap();
+        }
+
+        let stats = db.query_session_stats(None).unwrap();
+        assert_eq!(
+            stats.distinct_sessions, 2,
+            "should count 2 distinct sessions"
+        );
+        // sess-1: 3 * (1000 - 200) = 2400; sess-2: 2 * (500 - 100) = 800; total = 3200
+        assert_eq!(
+            stats.total_tokens_saved, 3200,
+            "total tokens saved should be 3200"
+        );
+        // avg per session: 3200 / 2 = 1600
+        assert!(
+            (stats.avg_tokens_per_session - 1600.0).abs() < 1.0,
+            "avg_tokens_per_session should be ~1600.0, got {}",
+            stats.avg_tokens_per_session
+        );
+        assert_eq!(
+            stats.untagged_invocations, 0,
+            "no untagged invocations expected"
+        );
+    }
+
+    /// AD-AN-2: untagged invocations (NULL session_id) are counted separately
+    /// and do NOT contribute to `total_tokens_saved`.
+    #[test]
+    fn test_query_session_stats_untagged() {
+        let (db, _tmp) = test_db();
+
+        // 1 tagged record: raw=1000, compressed=200 → savings=800
+        let mut tagged = sample_record();
+        tagged.session_id = Some("sess-x".to_string());
+        tagged.raw_tokens = 1000;
+        tagged.compressed_tokens = 200;
+        db.record(&tagged).unwrap();
+
+        // 3 untagged records (session_id: None) — must NOT inflate total_tokens_saved
+        for _ in 0..3 {
+            let r = sample_record(); // session_id: None, raw=1000, compressed=200
+            db.record(&r).unwrap();
+        }
+
+        let stats = db.query_session_stats(None).unwrap();
+        assert_eq!(
+            stats.distinct_sessions, 1,
+            "should count 1 distinct tagged session"
+        );
+        assert_eq!(
+            stats.untagged_invocations, 3,
+            "should count 3 untagged invocations"
+        );
+        // Untagged rows must be excluded from total_tokens_saved.
+        // Only the single tagged record (savings = 800) should count.
+        assert_eq!(
+            stats.total_tokens_saved, 800,
+            "total_tokens_saved must only count tagged rows, not untagged"
+        );
+    }
+
+    /// AD-AN-2: empty DB returns zero-valued SessionStats (no panic).
+    #[test]
+    fn test_query_session_stats_empty_db() {
+        let (db, _tmp) = test_db();
+        let stats = db.query_session_stats(None).unwrap();
+        assert_eq!(stats.distinct_sessions, 0);
+        assert_eq!(stats.total_tokens_saved, 0);
+        assert_eq!(stats.avg_tokens_per_session, 0.0);
+        assert_eq!(stats.untagged_invocations, 0);
+    }
+
+    /// AD-AN-2: since filter applies to session_stats queries.
+    #[test]
+    fn test_query_session_stats_since_filter() {
+        let (db, _tmp) = test_db();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Old tagged record (10 days ago)
+        let mut old = sample_record();
+        old.timestamp = now - 86400 * 10;
+        old.session_id = Some("old-session".to_string());
+        db.record(&old).unwrap();
+
+        // Recent tagged record (1 hour ago)
+        let mut recent = sample_record();
+        recent.timestamp = now - 3600;
+        recent.session_id = Some("new-session".to_string());
+        db.record(&recent).unwrap();
+
+        // Filter to last 24h: should see only new-session
+        let stats = db.query_session_stats(Some(now - 86400)).unwrap();
+        assert_eq!(
+            stats.distinct_sessions, 1,
+            "since filter should exclude old session"
+        );
+    }
+
+    // ========================================================================
+    // AnalyticsConfig::from_process tests (F5 step 3)
+    // ========================================================================
+
+    /// F5: from_process carries session_id when provided.
+    #[test]
+    fn test_from_process_passes_session_id() {
+        let config = AnalyticsConfig::from_process(false, Some("my-session".to_string()));
+        assert_eq!(
+            config.session_id.as_deref(),
+            Some("my-session"),
+            "session_id should propagate through from_process"
+        );
+    }
+
+    /// F5: from_process yields None session_id when not provided.
+    #[test]
+    fn test_from_process_none_session_id() {
+        let config = AnalyticsConfig::from_process(false, None);
+        assert!(
+            config.session_id.is_none(),
+            "session_id should be None when not provided"
+        );
     }
 }

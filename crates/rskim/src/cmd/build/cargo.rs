@@ -47,7 +47,7 @@ static CARGO_ERROR_LINE_RE: LazyLock<Regex> =
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args = vec!["build".to_string()];
     full_args.extend_from_slice(args);
@@ -62,7 +62,7 @@ pub(crate) fn run(
         &[("CARGO_TERM_COLOR", "never")],
         "install Rust from https://rustup.rs",
         show_stats,
-        analytics_enabled,
+        rec,
         parse,
     )
 }
@@ -74,7 +74,7 @@ pub(crate) fn run(
 pub(crate) fn run_clippy(
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     let mut full_args = vec!["clippy".to_string()];
     full_args.extend_from_slice(args);
@@ -89,7 +89,7 @@ pub(crate) fn run_clippy(
         &[("CARGO_TERM_COLOR", "never")],
         "install Rust from https://rustup.rs",
         show_stats,
-        analytics_enabled,
+        rec,
         parse,
     )
 }

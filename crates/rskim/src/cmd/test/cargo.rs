@@ -47,7 +47,7 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     let is_nextest = args.iter().any(|a| a == "nextest");
 
@@ -75,10 +75,9 @@ pub(crate) fn run(
             install_hint: "Install Rust via https://rustup.rs",
             use_stdin,
             show_stats,
-            command_type: crate::analytics::CommandType::Test,
             output_format: OutputFormat::default(),
-            analytics_enabled,
             family: "test",
+            rec,
         },
         move |output, _args| parse_impl(output, is_nextest),
     )

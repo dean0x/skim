@@ -153,6 +153,8 @@ pub(super) struct StreamConfig {
     pub analytics_enabled: bool,
     /// Command label for analytics recording.
     pub label: String,
+    /// AD-AN-1: session_id for per-session analytics grouping.
+    pub session_id: Option<String>,
 }
 
 /// A streaming line-by-line output parser.
@@ -193,8 +195,13 @@ pub(super) trait StreamingParser: Send {
 
 /// Drop guard that records partial analytics on SIGINT/SIGPIPE.
 ///
-/// Holds running totals and a `recorded` flag.  When `Drop` fires, records
+/// Holds running totals and a `recorded` flag; when `Drop` fires, records
 /// only if the success path (`record()`) has not already done so.
+///
+/// Stores `session_id` as an owned `Option<String>` rather than borrowing from
+/// a `RecordingContext<'a>` — a `DropGuard` must outlive every stack frame up
+/// to its `drop`, so borrowed references are not viable here.  `do_record`
+/// reconstructs a short-lived `RecordingContext` from those owned values.
 struct DropGuard {
     label: String,
     start: Instant,
@@ -202,10 +209,11 @@ struct DropGuard {
     compressed_bytes: usize,
     analytics_enabled: bool,
     recorded: bool,
+    session_id: Option<String>,
 }
 
 impl DropGuard {
-    fn new(label: String, analytics_enabled: bool) -> Self {
+    fn new(label: String, analytics_enabled: bool, session_id: Option<String>) -> Self {
         Self {
             label,
             start: Instant::now(),
@@ -213,6 +221,7 @@ impl DropGuard {
             compressed_bytes: 0,
             analytics_enabled,
             recorded: false,
+            session_id,
         }
     }
 
@@ -240,13 +249,16 @@ impl DropGuard {
         let raw_tokens = self.raw_bytes / 4;
         let compressed_tokens = self.compressed_bytes / 4;
         crate::analytics::try_record_command_with_counts(
-            self.analytics_enabled,
+            crate::analytics::RecordingContext {
+                enabled: self.analytics_enabled,
+                command_type: crate::analytics::CommandType::Infra,
+                parse_tier: Some("streaming"),
+                session_id: self.session_id.as_deref(),
+            },
             raw_tokens,
             compressed_tokens,
             self.label.clone(),
-            crate::analytics::CommandType::Infra,
             self.start.elapsed(),
-            Some("streaming"),
         );
     }
 }
@@ -311,7 +323,7 @@ pub(super) fn run_streamed_stdin(
     let stdin = io::stdin();
     let stdin_lock = stdin.lock();
     let mut reader = io::BufReader::new(stdin_lock);
-    let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled);
+    let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled, cfg.session_id);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
     while let Some(raw_line) = read_line_lossy(&mut reader, &mut buf) {
@@ -410,7 +422,7 @@ pub(super) fn run_streamed_spawned(
     let mut child = ChildGuard(child_proc);
 
     let mut stdout = BufWriter::new(io::stdout());
-    let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled);
+    let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled, cfg.session_id);
 
     // Spawn a background thread to drain stderr concurrently (AD-STR-8, PF-023).
     // The thread collects all stderr lines into a Vec so we can feed them through
@@ -572,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_drop_guard_records_once() {
-        let mut guard = DropGuard::new("test".to_string(), false);
+        let mut guard = DropGuard::new("test".to_string(), false, None);
         guard.update(100, 50);
         guard.record();
         assert!(guard.recorded);
@@ -581,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_drop_guard_update_accumulates() {
-        let mut guard = DropGuard::new("test".to_string(), false);
+        let mut guard = DropGuard::new("test".to_string(), false, None);
         guard.update(100, 50);
         guard.update(200, 100);
         assert_eq!(guard.raw_bytes, 300);
@@ -618,6 +630,7 @@ mod tests {
         let cfg = StreamConfig {
             analytics_enabled: false,
             label: "test".to_string(),
+            session_id: None,
         };
         // Use a non-existent binary name to trigger "not found on PATH".
         let code = run_streamed_spawned(parser, "skim_nonexistent_binary_xyz", &[], cfg);
@@ -630,6 +643,7 @@ mod tests {
         let cfg = StreamConfig {
             analytics_enabled: false,
             label: "test".to_string(),
+            session_id: None,
         };
         // /bin/sh -c 'exit 3' exits with code 3.
         let args: Vec<String> = vec!["-c".to_string(), "exit 3".to_string()];
@@ -644,6 +658,7 @@ mod tests {
         let cfg = StreamConfig {
             analytics_enabled: false,
             label: "test".to_string(),
+            session_id: None,
         };
         let args: Vec<String> = vec!["-c".to_string(), "echo hello".to_string()];
         let code = run_streamed_spawned(parser, "/bin/sh", &args, cfg);
@@ -750,6 +765,7 @@ mod tests {
         let cfg = StreamConfig {
             analytics_enabled: false,
             label: "test".to_string(),
+            session_id: None,
         };
         let script = r#"for i in $(seq 1 500); do
     echo "stdout line $i"

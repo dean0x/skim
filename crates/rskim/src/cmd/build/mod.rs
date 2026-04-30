@@ -38,10 +38,16 @@ pub(crate) fn run(
         None => (None, [].as_slice()),
     };
 
+    let rec = crate::analytics::RecordingContext {
+        enabled: analytics.enabled,
+        command_type: crate::analytics::CommandType::Build,
+        parse_tier: None,
+        session_id: analytics.session_id.as_deref(),
+    };
     match sub {
-        Some("cargo") => cargo::run(remaining, show_stats, analytics.enabled),
-        Some("clippy") => cargo::run_clippy(remaining, show_stats, analytics.enabled),
-        Some("tsc") => tsc::run(remaining, show_stats, analytics.enabled),
+        Some("cargo") => cargo::run(remaining, show_stats, rec),
+        Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
+        Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             anyhow::bail!(
@@ -111,7 +117,7 @@ pub(super) fn run_parsed_command(
     env_vars: &[(&str, &str)],
     install_hint: &str,
     show_stats: bool,
-    analytics_enabled: bool,
+    rec: crate::analytics::RecordingContext<'_>,
     parser: fn(&CommandOutput) -> ParseResult<BuildResult>,
 ) -> anyhow::Result<ExitCode> {
     let runner = CommandRunner::new(Some(Duration::from_secs(600)));
@@ -185,13 +191,11 @@ pub(super) fn run_parsed_command(
 
     // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
-        analytics_enabled,
+        rec.with_tier(result.tier_name()),
         raw_text,
         result.content().to_string(),
         super::format_analytics_label("build", program, &args.join(" ")),
-        crate::analytics::CommandType::Build,
         output.duration,
-        Some(result.tier_name()),
     );
 
     Ok(exit_code)

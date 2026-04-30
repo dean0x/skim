@@ -50,6 +50,45 @@ pub(super) const HOOK_MAX_STDIN_BYTES: u64 = 64 * 1024;
 /// passthrough, not an error. Logs a warning to hook.log for debugging.
 pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 
+/// Inject `--session-id=VALUE` into every `skim ` segment of a (possibly compound) command.
+///
+/// Handles compound operators (` && ` and ` || `) by splitting, injecting into each
+/// segment that starts with `skim `, then rejoining with the original operator.
+///
+/// Assumes `sid` has already passed the safety check (alphanumeric, `-`, `_`, `.` only).
+///
+/// # Examples
+/// - `"skim git status"` → `"skim --session-id=abc git status"`
+/// - `"skim git status && skim build cargo"` → `"skim --session-id=abc git status && skim --session-id=abc build cargo"`
+fn inject_session_id_into_compound(cmd: &str, sid: &str) -> String {
+    // Detect compound operator: try ` && ` first, then ` || `.
+    // Only one type is supported per compound command (mixing is unusual for rewritten cmds).
+    let (separator, parts): (&str, Vec<&str>) = if cmd.contains(" && ") {
+        (" && ", cmd.split(" && ").collect())
+    } else if cmd.contains(" || ") {
+        (" || ", cmd.split(" || ").collect())
+    } else {
+        // Simple (non-compound) command — single inject.
+        if let Some(rest) = cmd.strip_prefix("skim ") {
+            return format!("skim --session-id={sid} {rest}");
+        }
+        return cmd.to_string();
+    };
+
+    let injected: Vec<String> = parts
+        .iter()
+        .map(|segment| {
+            if let Some(rest) = segment.strip_prefix("skim ") {
+                format!("skim --session-id={sid} {rest}")
+            } else {
+                (*segment).to_string()
+            }
+        })
+        .collect();
+
+    injected.join(separator)
+}
+
 /// Run as an agent PreToolUse hook.
 ///
 /// Protocol:
@@ -129,9 +168,9 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         }
     };
 
-    // Extract command using the agent-specific protocol
-    let command = match protocol.parse_input(&json) {
-        Some(input) => input.command,
+    // Extract command (and session_id) using the agent-specific protocol
+    let (command, session_id) = match protocol.parse_input(&json) {
+        Some(input) => (input.command, input.session_id),
         None => {
             audit_hook("", false, "");
             return Ok(ExitCode::SUCCESS); // passthrough on missing/unparseable field
@@ -177,10 +216,25 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     };
 
     match rewritten {
-        Some(ref rewritten_cmd) => {
-            audit_hook(&command, true, rewritten_cmd);
+        Some(rewritten_cmd) => {
+            // AD-HK-2: Inject --session-id=VALUE into the rewritten command so every
+            // skim invocation in this session is tagged for per-session analytics.
+            // Only inject when session_id is present and command starts with "skim ".
+            // SECURITY: session_id is validated via is_safe_session_id (alphanumeric,
+            // hyphens, underscores, dots, max 128 chars) before interpolation into
+            // the command string. Malicious session IDs with shell metacharacters
+            // (;, |, $, spaces, etc.) are silently dropped to prevent command injection.
+            // F5: match by value so the None arm moves rewritten_cmd instead of cloning.
+            let final_cmd = match session_id
+                .as_deref()
+                .filter(|sid| crate::analytics::is_safe_session_id(sid))
+            {
+                Some(sid) => inject_session_id_into_compound(&rewritten_cmd, sid),
+                None => rewritten_cmd,
+            };
+            audit_hook(&command, true, &final_cmd);
             // Use agent-specific response format
-            let response = protocol.format_response(rewritten_cmd);
+            let response = protocol.format_response(&final_cmd);
             let json_out = serde_json::to_string(&response)?;
             println!("{json_out}");
         }
@@ -463,6 +517,167 @@ mod tests {
         assert!(
             !should_warn_today(&stamp),
             "second call same day should not warn"
+        );
+    }
+
+    // ========================================================================
+    // B8: AD-HK-2 — session_id injection into rewritten commands
+    //
+    // The injection logic now lives in inject_session_id_into_compound (module level).
+    // This test helper wraps it with the same security validation used in run_hook_mode.
+    // ========================================================================
+
+    /// Helper: apply the AD-HK-2 injection format used in run_hook_mode,
+    /// including the security validation that rejects unsafe characters.
+    /// Delegates to the module-level inject_session_id_into_compound for the
+    /// actual substitution logic so tests cover the production code path.
+    fn inject_session_id(rewritten_cmd: &str, session_id: Option<&str>) -> String {
+        match session_id.filter(|sid| crate::analytics::is_safe_session_id(sid)) {
+            Some(sid) => inject_session_id_into_compound(rewritten_cmd, sid),
+            None => rewritten_cmd.to_string(),
+        }
+    }
+
+    /// AD-HK-2: session_id is injected after "skim " when present.
+    #[test]
+    fn test_session_id_injected_into_skim_command() {
+        let result = inject_session_id("skim git status", Some("abc-123"));
+        assert_eq!(result, "skim --session-id=abc-123 git status");
+    }
+
+    /// AD-HK-2: subcommand and flags are preserved after injection.
+    #[test]
+    fn test_session_id_injection_preserves_subcommand_and_flags() {
+        let result = inject_session_id("skim build cargo --show-stats", Some("sess-xyz"));
+        assert_eq!(
+            result,
+            "skim --session-id=sess-xyz build cargo --show-stats"
+        );
+    }
+
+    /// AD-HK-2: no injection when session_id is None.
+    #[test]
+    fn test_session_id_not_injected_when_none() {
+        let result = inject_session_id("skim git log", None);
+        assert_eq!(result, "skim git log");
+    }
+
+    /// AD-HK-2: non-skim commands are not modified even when session_id is present.
+    #[test]
+    fn test_session_id_not_injected_into_non_skim_command() {
+        // A rewritten compound or partial result that doesn't start with "skim " is passthrough
+        let result = inject_session_id("cargo build 2>&1", Some("sess-x"));
+        assert_eq!(result, "cargo build 2>&1");
+    }
+
+    /// AD-HK-2: injection flag format is --session-id=VALUE (equals form, no space).
+    #[test]
+    fn test_session_id_injection_uses_equals_form() {
+        let result = inject_session_id("skim lint eslint", Some("my-session"));
+        assert!(
+            result.contains("--session-id=my-session"),
+            "injection must use --session-id=VALUE equals form, got: {result}"
+        );
+        assert!(
+            !result.contains("--session-id my-session"),
+            "injection must not use space-separated form"
+        );
+    }
+
+    // ========================================================================
+    // SECURITY: session_id validation — reject shell metacharacters
+    // ========================================================================
+
+    /// SECURITY: session_id with shell metacharacters is silently dropped.
+    #[test]
+    fn test_session_id_with_semicolon_rejected() {
+        let result = inject_session_id("skim git status", Some("foo; rm -rf /"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with semicolons must not be injected"
+        );
+    }
+
+    /// SECURITY: session_id with pipe character is rejected.
+    #[test]
+    fn test_session_id_with_pipe_rejected() {
+        let result = inject_session_id("skim git status", Some("foo|bar"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with pipe must not be injected"
+        );
+    }
+
+    /// SECURITY: session_id with spaces is rejected.
+    #[test]
+    fn test_session_id_with_spaces_rejected() {
+        let result = inject_session_id("skim git status", Some("foo bar"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with spaces must not be injected"
+        );
+    }
+
+    /// SECURITY: session_id with dollar sign (variable expansion) is rejected.
+    #[test]
+    fn test_session_id_with_dollar_rejected() {
+        let result = inject_session_id("skim git status", Some("$HOME"));
+        assert_eq!(
+            result, "skim git status",
+            "session_id with $ must not be injected"
+        );
+    }
+
+    /// SECURITY: empty session_id is not injected.
+    #[test]
+    fn test_session_id_empty_not_injected() {
+        let result = inject_session_id("skim git status", Some(""));
+        assert_eq!(
+            result, "skim git status",
+            "empty session_id must not be injected"
+        );
+    }
+
+    /// Safe session_id characters: alphanumeric, hyphens, underscores, dots.
+    #[test]
+    fn test_session_id_safe_chars_accepted() {
+        let result = inject_session_id("skim git status", Some("sess_123-abc.def"));
+        assert_eq!(result, "skim --session-id=sess_123-abc.def git status");
+    }
+
+    // ========================================================================
+    // B-AC5: compound command injection — all skim segments must be tagged
+    // ========================================================================
+
+    /// B-AC5: compound `&&` command injects session_id into every skim segment.
+    #[test]
+    fn test_session_id_injected_into_compound_and_command() {
+        let result = inject_session_id("skim git status && skim build cargo", Some("sess-abc"));
+        assert_eq!(
+            result,
+            "skim --session-id=sess-abc git status && skim --session-id=sess-abc build cargo",
+            "both skim segments in a && compound must receive --session-id injection"
+        );
+    }
+
+    /// B-AC5: compound `||` command injects session_id into every skim segment.
+    #[test]
+    fn test_session_id_injected_into_compound_or_command() {
+        let result = inject_session_id("skim git status || skim build cargo", Some("sess-abc"));
+        assert_eq!(
+            result,
+            "skim --session-id=sess-abc git status || skim --session-id=sess-abc build cargo",
+            "both skim segments in a || compound must receive --session-id injection"
+        );
+    }
+
+    /// B-AC5: non-skim segments in a compound command are left untouched.
+    #[test]
+    fn test_session_id_compound_non_skim_segment_unchanged() {
+        let result = inject_session_id("skim git status && cargo build 2>&1", Some("sess-abc"));
+        assert_eq!(
+            result, "skim --session-id=sess-abc git status && cargo build 2>&1",
+            "non-skim segment in compound must not be modified"
         );
     }
 }

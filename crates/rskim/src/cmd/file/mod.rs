@@ -8,7 +8,6 @@ pub(crate) mod grep;
 pub(crate) mod ls;
 pub(crate) mod rg;
 
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use std::collections::BTreeMap;
@@ -52,6 +51,7 @@ pub(crate) fn run(
         show_stats,
         json_output,
         analytics_enabled: analytics.enabled,
+        session_id: analytics.session_id.clone(),
     };
 
     match tool_name.as_str() {
@@ -122,7 +122,7 @@ pub(crate) fn run_file_tool(
     let mut cmd_args = args.to_vec();
     prepare_args(&mut cmd_args);
 
-    let use_stdin = !std::io::stdin().is_terminal() && args.is_empty();
+    let use_stdin = super::should_read_stdin(args);
 
     run_parsed_command_with_mode(
         ParsedCommandConfig {
@@ -132,10 +132,14 @@ pub(crate) fn run_file_tool(
             install_hint: config.install_hint,
             use_stdin,
             show_stats: ctx.show_stats,
-            command_type: crate::analytics::CommandType::FileOps,
             output_format: ctx.output_format(),
-            analytics_enabled: ctx.analytics_enabled,
             family: "file",
+            rec: crate::analytics::RecordingContext {
+                enabled: ctx.analytics_enabled,
+                command_type: crate::analytics::CommandType::FileOps,
+                parse_tier: None,
+                session_id: ctx.session_id.as_deref(),
+            },
         },
         |output, _args| parse_fn(output),
     )
