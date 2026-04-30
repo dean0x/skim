@@ -252,33 +252,23 @@ pub(crate) enum OutputFormat {
 
 /// Cross-cutting configuration for subcommand execution.
 ///
-/// Bundles the four fields that every family dispatcher receives identically,
-/// reducing the positional parameter list to `(args, ctx)` at every call boundary.
-///
-/// ## Fields
-///
-/// - `show_stats` — emit token-reduction statistics to stderr after compression.
-/// - `json_output` — serialize results as JSON instead of human-readable text.
-/// - `analytics_enabled` — persist token savings to the analytics database.
-/// - `session_id` — hook-injected session identifier threaded to every recording
-///   so the stats dashboard can group invocations by originating agent session.
+/// Bundles the fields every family dispatcher receives identically, reducing
+/// the positional parameter list to `(args, ctx)` at every call boundary.
 ///
 /// ## Relationship to `RecordingContext`
 ///
-/// `RunContext` is the UI/dispatch layer struct — it carries all cross-cutting
-/// fields needed by subcommand handlers, including UI concerns (`show_stats`,
-/// `json_output`) that are irrelevant to recording.  At recording call sites,
-/// handlers construct a [`crate::analytics::RecordingContext`] from the relevant
-/// subset (`analytics_enabled`, `session_id`) plus the handler-local fields
-/// (`command_type`, `parse_tier`).  The two structs are intentionally separate:
-/// `RunContext` owns its strings (no lifetime parameter), while `RecordingContext`
-/// borrows them (`Copy`, zero-allocation threading through call chains).
+/// Each family dispatcher constructs a [`crate::analytics::RecordingContext`]
+/// from `analytics_enabled`, `session_id`, and the handler-local `command_type`,
+/// then threads it directly through to [`ParsedCommandConfig::rec`].  The two
+/// structs are intentionally separate: `RunContext` owns its strings while
+/// `RecordingContext` borrows them (`Copy`, zero-allocation threading through
+/// call chains).
 pub(crate) struct RunContext {
     pub show_stats: bool,
     pub json_output: bool,
     pub analytics_enabled: bool,
     /// Optional session ID from `AnalyticsConfig::session_id`.
-    /// Threaded through to `ParsedCommandConfig::session_id` at construction.
+    /// Used by family dispatchers when constructing `RecordingContext`.
     pub session_id: Option<String>,
 }
 
@@ -297,6 +287,13 @@ impl RunContext {
 ///
 /// Groups the cross-cutting parameters for [`run_parsed_command_with_mode`]
 /// to reduce its positional parameter count.
+///
+/// ## Analytics threading
+///
+/// `rec` carries the full [`crate::analytics::RecordingContext`] constructed
+/// once by each family dispatcher.  `run_parsed_command_with_mode` calls
+/// `rec.with_tier(result.tier_name())` at the recording site — no
+/// decompose-then-reconstruct at the call site.
 pub(crate) struct ParsedCommandConfig<'a> {
     pub program: &'a str,
     pub args: &'a [String],
@@ -304,9 +301,7 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub install_hint: &'a str,
     pub use_stdin: bool,
     pub show_stats: bool,
-    pub command_type: crate::analytics::CommandType,
     pub output_format: OutputFormat,
-    pub analytics_enabled: bool,
     /// Family name used to build analytics labels (e.g. `"lint"`, `"infra"`, `"file"`).
     ///
     /// Analytics labels are recorded as `"skim {family} {program} {args}"`. Without
@@ -314,10 +309,10 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// name and made the analytics dashboard ambiguous when multiple families share
     /// tool names (e.g., `cargo` appears in both `build` and `pkg`). (PF-022)
     pub family: &'a str,
-    /// Optional session ID propagated from `AnalyticsConfig::session_id`.
-    /// Passed through to `try_record_command` so every recording carries the
-    /// hook-injected session context when available.
-    pub session_id: Option<&'a str>,
+    /// Recording context constructed once by the family dispatcher.
+    /// `run_parsed_command_with_mode` annotates `parse_tier` via
+    /// `rec.with_tier(result.tier_name())` before passing to `try_record_command`.
+    pub rec: crate::analytics::RecordingContext<'a>,
 }
 
 /// Obtain command output from stdin or by spawning the command.
@@ -412,11 +407,9 @@ where
         install_hint,
         use_stdin,
         show_stats,
-        command_type,
         output_format,
-        analytics_enabled,
         family,
-        session_id,
+        rec,
     } = config;
 
     let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
@@ -467,12 +460,7 @@ where
     }
 
     crate::analytics::try_record_command(
-        crate::analytics::RecordingContext {
-            enabled: analytics_enabled,
-            command_type,
-            parse_tier: Some(result.tier_name()),
-            session_id,
-        },
+        rec.with_tier(result.tier_name()),
         output.stdout,
         compressed,
         format_analytics_label(family, program, &args.join(" ")),

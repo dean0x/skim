@@ -520,11 +520,8 @@ fn main() -> ExitCode {
     // Read analytics config from env + CLI flag once at the system boundary.
     // Thread the struct down to all callers — no per-call env reads.
     let cli_disable_analytics = std::env::args().any(|a| a == "--disable-analytics");
-    // AD-HK-3: Extract --session-id=VALUE injected by the hook (B5/B6).
-    // The flag is a global flag parsed here before subcommand routing so that
-    // every subcommand automatically inherits the session context without
-    // requiring per-subcommand parsing. The value is passed to AnalyticsConfig
-    // and threaded through all recording call sites.
+    // Parse --session-id=VALUE before subcommand routing so every subcommand
+    // inherits session context without per-subcommand parsing.
     let session_id = parse_session_id(std::env::args());
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
@@ -883,24 +880,6 @@ mod tests {
         assert!(
             result.is_none(),
             "--session-id <space> VALUE must not be recognised (only equals form supported)"
-        );
-    }
-
-    // ========================================================================
-    // B-AC14: backward-compatible empty normalisation (now via parse_session_id)
-    // ========================================================================
-
-    // NOTE: test_parse_session_id_empty (above, tagged F7) already covers empty
-    // value normalisation — no separate test needed here.
-
-    /// B-AC14: non-empty --session-id= is preserved as Some.
-    #[test]
-    fn test_non_empty_session_id_arg_preserved() {
-        let result = parse_session_id(["skim", "--session-id=abc-123"]);
-        assert_eq!(
-            result.as_deref(),
-            Some("abc-123"),
-            "--session-id=abc-123 must produce Some(\"abc-123\")"
         );
     }
 }

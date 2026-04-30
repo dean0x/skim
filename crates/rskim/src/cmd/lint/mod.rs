@@ -161,11 +161,14 @@ pub(crate) fn run_linter(
             install_hint: config.install_hint,
             use_stdin,
             show_stats: ctx.show_stats,
-            command_type: crate::analytics::CommandType::Lint,
             output_format: ctx.output_format(),
-            analytics_enabled: ctx.analytics_enabled,
             family: "lint",
-            session_id: ctx.session_id.as_deref(),
+            rec: crate::analytics::RecordingContext {
+                enabled: ctx.analytics_enabled,
+                command_type: crate::analytics::CommandType::Lint,
+                parse_tier: None,
+                session_id: ctx.session_id.as_deref(),
+            },
         },
         |output, _args| parse_fn(output),
     )

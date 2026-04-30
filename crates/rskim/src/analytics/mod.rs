@@ -156,12 +156,8 @@ pub(crate) struct OriginalCommandStats {
 pub(crate) struct SessionStats {
     /// Number of distinct session IDs observed.
     pub(crate) distinct_sessions: u64,
-    /// Tokens saved across invocations that carry a non-NULL `session_id`.
-    ///
-    /// Only session-tagged rows contribute to this total.  Rows recorded before
-    /// schema v3 (NULL `session_id`) are excluded so the figure reflects actual
-    /// observed session throughput.  See `untagged_invocations` for the excluded
-    /// row count.
+    /// Tokens saved by session-tagged invocations only (NULL rows excluded).
+    /// See `untagged_invocations` for the excluded count.
     pub(crate) total_tokens_saved: u64,
     /// Average tokens saved per session (zero-safe, returns 0.0 when no sessions).
     pub(crate) avg_tokens_per_session: f64,
@@ -782,25 +778,13 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 // RecordingContext — bundles analytics metadata for subcommand handlers
 // ============================================================================
 
-/// Bundles recording parameters that flow through subcommand handlers.
+/// Bundles analytics recording parameters threaded through subcommand handlers.
 ///
-/// Introduced in F4 to eliminate the 4-parameter `(analytics_enabled,
-/// command_type, parse_tier, session_id)` tuple that was threaded individually
-/// through every handler function, triggering `clippy::too_many_arguments`
-/// suppressions.
-///
-/// `Copy` is derived so passing `rec` at a call site never requires `&rec`
-/// (the struct is small: one bool, one enum Copy, one Option<&'a str> ×2).
-///
-/// ## Relationship to `RunContext`
-///
-/// [`crate::cmd::RunContext`] is the dispatch-layer struct that carries all
-/// cross-cutting fields for a subcommand invocation, including UI concerns
-/// (`show_stats`, `json_output`) that are irrelevant to recording.  At recording
-/// call sites, handlers construct a `RecordingContext` from the recording-relevant
-/// subset of `RunContext` plus handler-local fields (`command_type`, `parse_tier`).
-/// `RecordingContext` uses borrowed `&'a str` references (enabling `Copy`) while
-/// `RunContext` owns its strings — the lifetime boundary is intentional.
+/// `Copy` keeps call sites clean (no `&rec` or `.clone()`).  See
+/// [`crate::cmd::RunContext`] for the broader dispatch-layer struct that also
+/// carries UI concerns (`show_stats`, `json_output`) irrelevant to recording.
+/// `RunContext` owns its strings; `RecordingContext` borrows them — the lifetime
+/// boundary is intentional.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RecordingContext<'a> {
     /// Whether analytics recording is enabled for this invocation.
@@ -815,16 +799,6 @@ pub(crate) struct RecordingContext<'a> {
 
 impl<'a> RecordingContext<'a> {
     /// Return a copy of `self` with `parse_tier` set to `Some(tier)`.
-    ///
-    /// Eliminates the 3-line struct-update boilerplate that appeared at every
-    /// call site where a parser emits a tier annotation:
-    ///
-    /// ```rust
-    /// // Before
-    /// crate::analytics::RecordingContext { parse_tier: Some("full"), ..rec }
-    /// // After
-    /// rec.with_tier("full")
-    /// ```
     pub(crate) fn with_tier(self, tier: &'a str) -> Self {
         Self {
             parse_tier: Some(tier),
@@ -832,18 +806,9 @@ impl<'a> RecordingContext<'a> {
         }
     }
 
-    /// Return a copy of `self` with `parse_tier` replaced by the supplied
-    /// `Option<&'a str>`.
+    /// Return a copy of `self` with `parse_tier` set to `tier`.
     ///
-    /// Used at call sites where the tier is already an `Option` (e.g. derived
-    /// from a local variable or a parser result that may be absent):
-    ///
-    /// ```rust
-    /// // Before
-    /// crate::analytics::RecordingContext { parse_tier: tier_name, ..rec }
-    /// // After
-    /// rec.with_tier_opt(tier_name)
-    /// ```
+    /// Use when the tier is already `Option<&'a str>` (e.g. from a parser result).
     pub(crate) fn with_tier_opt(self, tier: Option<&'a str>) -> Self {
         Self {
             parse_tier: tier,

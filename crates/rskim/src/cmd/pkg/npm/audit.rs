@@ -42,8 +42,7 @@ pub(super) fn run_audit(
     args: &[String],
     show_stats: bool,
     json_output: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
@@ -54,8 +53,7 @@ pub(super) fn run_audit(
         },
         args,
         show_stats,
-        analytics_enabled,
-        session_id,
+        rec,
         |cmd_args| {
             if json_output && !user_has_flag(cmd_args, &["--json"]) {
                 cmd_args.push("--json".to_string());

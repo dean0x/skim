@@ -38,38 +38,18 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     };
 
-    let analytics_enabled = analytics.enabled;
-    let session_id = analytics.session_id.as_deref();
+    let rec = crate::analytics::RecordingContext {
+        enabled: analytics.enabled,
+        command_type: crate::analytics::CommandType::Pkg,
+        parse_tier: None,
+        session_id: analytics.session_id.as_deref(),
+    };
 
     match tool_name.as_str() {
-        "npm" => npm::run(
-            tool_args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            session_id,
-        ),
-        "pnpm" => pnpm::run(
-            tool_args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            session_id,
-        ),
-        "pip" => pip::run(
-            tool_args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            session_id,
-        ),
-        "cargo" => cargo::run(
-            tool_args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            session_id,
-        ),
+        "npm" => npm::run(tool_args, show_stats, json_output, rec),
+        "pnpm" => pnpm::run(tool_args, show_stats, json_output, rec),
+        "pip" => pip::run(tool_args, show_stats, json_output, rec),
+        "cargo" => cargo::run(tool_args, show_stats, json_output, rec),
         tool => {
             let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(
@@ -107,8 +87,7 @@ pub(super) fn run_pkg_subcommand<T>(
     config: PkgSubcommandConfig<'_>,
     user_args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
     inject_flags: impl FnOnce(&mut Vec<String>),
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<T>,
 ) -> anyhow::Result<ExitCode>
@@ -129,11 +108,9 @@ where
             install_hint: config.install_hint,
             use_stdin,
             show_stats,
-            command_type: crate::analytics::CommandType::Pkg,
             output_format: crate::cmd::OutputFormat::default(),
-            analytics_enabled,
             family: "pkg",
-            session_id,
+            rec,
         },
         |output, _args| parse_fn(output),
     )

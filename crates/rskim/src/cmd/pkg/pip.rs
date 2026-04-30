@@ -33,8 +33,7 @@ pub(crate) fn run(
     args: &[String],
     show_stats: bool,
     json_output: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -45,27 +44,9 @@ pub(crate) fn run(
     let (subcmd, subcmd_args) = args.split_first().expect("already verified non-empty");
 
     match subcmd.as_str() {
-        "install" => run_install(
-            subcmd_args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            session_id,
-        ),
-        "check" => run_check(
-            subcmd_args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            session_id,
-        ),
-        "list" => run_list(
-            subcmd_args,
-            show_stats,
-            json_output,
-            analytics_enabled,
-            session_id,
-        ),
+        "install" => run_install(subcmd_args, show_stats, json_output, rec),
+        "check" => run_check(subcmd_args, show_stats, json_output, rec),
+        "list" => run_list(subcmd_args, show_stats, json_output, rec),
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
@@ -103,8 +84,7 @@ fn run_install(
     args: &[String],
     show_stats: bool,
     _json_output: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
@@ -115,8 +95,7 @@ fn run_install(
         },
         args,
         show_stats,
-        analytics_enabled,
-        session_id,
+        rec,
         |_cmd_args| {},
         parse_install,
     )
@@ -167,8 +146,7 @@ fn run_check(
     args: &[String],
     show_stats: bool,
     _json_output: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
@@ -179,8 +157,7 @@ fn run_check(
         },
         args,
         show_stats,
-        analytics_enabled,
-        session_id,
+        rec,
         |_cmd_args| {},
         parse_check,
     )
@@ -246,8 +223,7 @@ fn run_list(
     args: &[String],
     show_stats: bool,
     json_output: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     super::run_pkg_subcommand(
         super::PkgSubcommandConfig {
@@ -258,8 +234,7 @@ fn run_list(
         },
         args,
         show_stats,
-        analytics_enabled,
-        session_id,
+        rec,
         |cmd_args| {
             if json_output {
                 if !user_has_flag(cmd_args, &["--outdated"]) {

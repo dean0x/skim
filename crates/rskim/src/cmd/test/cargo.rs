@@ -75,11 +75,9 @@ pub(crate) fn run(
             install_hint: "Install Rust via https://rustup.rs",
             use_stdin,
             show_stats,
-            command_type: crate::analytics::CommandType::Test,
             output_format: OutputFormat::default(),
-            analytics_enabled: rec.enabled,
             family: "test",
-            session_id: rec.session_id,
+            rec,
         },
         move |output, _args| parse_impl(output, is_nextest),
     )
