@@ -197,6 +197,16 @@ pub(super) trait StreamingParser: Send {
 ///
 /// Holds running totals and a `recorded` flag.  When `Drop` fires, records
 /// only if the success path (`record()`) has not already done so.
+///
+/// ## Owned vs borrowed fields
+///
+/// `DropGuard` stores `analytics_enabled: bool` and `session_id: Option<String>`
+/// as owned values rather than wrapping a `RecordingContext<'a>`.
+/// `RecordingContext` uses borrowed `Option<&'a str>` fields so it can be
+/// `Copy` and passed cheaply across call sites.  A `DropGuard` must outlive
+/// every stack frame up to its `drop`, so it cannot hold borrowed references —
+/// owned values are the correct representation here.  `do_record` reconstructs
+/// a short-lived `RecordingContext` from those owned values at call time.
 struct DropGuard {
     label: String,
     start: Instant,
