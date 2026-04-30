@@ -156,7 +156,12 @@ pub(crate) struct OriginalCommandStats {
 pub(crate) struct SessionStats {
     /// Number of distinct session IDs observed.
     pub(crate) distinct_sessions: u64,
-    /// Total tokens saved across all tagged invocations.
+    /// Tokens saved across invocations that carry a non-NULL `session_id`.
+    ///
+    /// Only session-tagged rows contribute to this total.  Rows recorded before
+    /// schema v3 (NULL `session_id`) are excluded so the figure reflects actual
+    /// observed session throughput.  See `untagged_invocations` for the excluded
+    /// row count.
     pub(crate) total_tokens_saved: u64,
     /// Average tokens saved per session (zero-safe, returns 0.0 when no sessions).
     pub(crate) avg_tokens_per_session: f64,
@@ -786,6 +791,16 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 ///
 /// `Copy` is derived so passing `rec` at a call site never requires `&rec`
 /// (the struct is small: one bool, one enum Copy, one Option<&'a str> ×2).
+///
+/// ## Relationship to `RunContext`
+///
+/// [`crate::cmd::RunContext`] is the dispatch-layer struct that carries all
+/// cross-cutting fields for a subcommand invocation, including UI concerns
+/// (`show_stats`, `json_output`) that are irrelevant to recording.  At recording
+/// call sites, handlers construct a `RecordingContext` from the recording-relevant
+/// subset of `RunContext` plus handler-local fields (`command_type`, `parse_tier`).
+/// `RecordingContext` uses borrowed `&'a str` references (enabling `Copy`) while
+/// `RunContext` owns its strings — the lifetime boundary is intentional.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RecordingContext<'a> {
     /// Whether analytics recording is enabled for this invocation.
@@ -1973,19 +1988,22 @@ mod tests {
         );
     }
 
-    /// AD-AN-2: untagged invocations (NULL session_id) are counted separately.
+    /// AD-AN-2: untagged invocations (NULL session_id) are counted separately
+    /// and do NOT contribute to `total_tokens_saved`.
     #[test]
     fn test_query_session_stats_untagged() {
         let (db, _tmp) = test_db();
 
-        // 1 tagged record
+        // 1 tagged record: raw=1000, compressed=200 → savings=800
         let mut tagged = sample_record();
         tagged.session_id = Some("sess-x".to_string());
+        tagged.raw_tokens = 1000;
+        tagged.compressed_tokens = 200;
         db.record(&tagged).unwrap();
 
-        // 3 untagged records
+        // 3 untagged records (session_id: None) — must NOT inflate total_tokens_saved
         for _ in 0..3 {
-            let r = sample_record(); // session_id: None
+            let r = sample_record(); // session_id: None, raw=1000, compressed=200
             db.record(&r).unwrap();
         }
 
@@ -1997,6 +2015,12 @@ mod tests {
         assert_eq!(
             stats.untagged_invocations, 3,
             "should count 3 untagged invocations"
+        );
+        // Untagged rows must be excluded from total_tokens_saved.
+        // Only the single tagged record (savings = 800) should count.
+        assert_eq!(
+            stats.total_tokens_saved, 800,
+            "total_tokens_saved must only count tagged rows, not untagged"
         );
     }
 

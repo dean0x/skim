@@ -262,6 +262,17 @@ pub(crate) enum OutputFormat {
 /// - `analytics_enabled` — persist token savings to the analytics database.
 /// - `session_id` — hook-injected session identifier threaded to every recording
 ///   so the stats dashboard can group invocations by originating agent session.
+///
+/// ## Relationship to `RecordingContext`
+///
+/// `RunContext` is the UI/dispatch layer struct — it carries all cross-cutting
+/// fields needed by subcommand handlers, including UI concerns (`show_stats`,
+/// `json_output`) that are irrelevant to recording.  At recording call sites,
+/// handlers construct a [`crate::analytics::RecordingContext`] from the relevant
+/// subset (`analytics_enabled`, `session_id`) plus the handler-local fields
+/// (`command_type`, `parse_tier`).  The two structs are intentionally separate:
+/// `RunContext` owns its strings (no lifetime parameter), while `RecordingContext`
+/// borrows them (`Copy`, zero-allocation threading through call chains).
 pub(crate) struct RunContext {
     pub show_stats: bool,
     pub json_output: bool,
