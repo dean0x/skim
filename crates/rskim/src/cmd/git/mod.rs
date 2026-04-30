@@ -337,10 +337,7 @@ pub(super) fn run_passthrough(
         output.stdout,
         build_analytics_label(subcmd, args, show_stats, rec.enabled),
         show_stats,
-        crate::analytics::RecordingContext {
-            parse_tier: Some("passthrough"),
-            ..rec
-        },
+        rec.with_tier("passthrough"),
         output.duration,
     );
 
@@ -407,10 +404,7 @@ where
             scrubbed_stdout,
             label,
             show_stats,
-            crate::analytics::RecordingContext {
-                parse_tier: Some("passthrough"),
-                ..rec
-            },
+            rec.with_tier("passthrough"),
             output.duration,
         );
         return Ok(map_exit_code(exit_code));
@@ -454,7 +448,7 @@ where
         result_str,
         label,
         show_stats,
-        crate::analytics::RecordingContext { parse_tier, ..rec },
+        rec.with_tier_opt(parse_tier),
         output.duration,
     );
 

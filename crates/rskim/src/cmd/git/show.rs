@@ -526,10 +526,7 @@ fn emit_show_commit(
     rec: crate::analytics::RecordingContext<'_>,
     duration: std::time::Duration,
 ) -> anyhow::Result<()> {
-    let rec_full = crate::analytics::RecordingContext {
-        parse_tier: Some("full"),
-        ..rec
-    };
+    let rec_full = rec.with_tier("full");
     match output_format {
         OutputFormat::Json => {
             // JSON: serialise result directly; guardrail is irrelevant here
@@ -602,10 +599,7 @@ fn run_show_commit(
                 stdout,
                 build_analytics_label("show", original_args, show_stats, rec.enabled),
                 show_stats,
-                crate::analytics::RecordingContext {
-                    parse_tier: Some("passthrough"),
-                    ..rec
-                },
+                rec.with_tier("passthrough"),
                 duration,
             );
             return Ok(exit_code);
@@ -628,10 +622,7 @@ fn run_show_commit(
             raw,
             label,
             show_stats,
-            crate::analytics::RecordingContext {
-                parse_tier: Some("passthrough"),
-                ..rec
-            },
+            rec.with_tier("passthrough"),
             duration,
         );
         return Ok(ExitCode::SUCCESS);
@@ -688,10 +679,7 @@ fn passthrough_file_content(
         raw,
         label,
         show_stats,
-        crate::analytics::RecordingContext {
-            parse_tier: tier_name,
-            ..rec
-        },
+        rec.with_tier_opt(tier_name),
         duration,
     );
 }
@@ -752,10 +740,7 @@ fn run_show_file_content(
             output.stdout,
             build_analytics_label("show", args, show_stats, rec.enabled),
             show_stats,
-            crate::analytics::RecordingContext {
-                parse_tier: Some("passthrough"),
-                ..rec
-            },
+            rec.with_tier("passthrough"),
             output.duration,
         );
         return Ok(map_exit_code(exit_code));
@@ -818,10 +803,7 @@ fn run_show_file_content(
         final_output,
         label,
         show_stats,
-        crate::analytics::RecordingContext {
-            parse_tier: Some("full"),
-            ..rec
-        },
+        rec.with_tier("full"),
         duration,
     );
 

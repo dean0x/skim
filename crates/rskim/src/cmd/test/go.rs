@@ -109,10 +109,7 @@ pub(crate) fn run(
 
     // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
-        crate::analytics::RecordingContext {
-            parse_tier: Some(parsed.tier_name()),
-            ..rec
-        },
+        rec.with_tier(parsed.tier_name()),
         combined,
         parsed.content().to_string(),
         crate::cmd::format_analytics_label("test", "go", &args.join(" ")),

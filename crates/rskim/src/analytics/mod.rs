@@ -813,6 +813,45 @@ pub(crate) struct RecordingContext<'a> {
     pub session_id: Option<&'a str>,
 }
 
+impl<'a> RecordingContext<'a> {
+    /// Return a copy of `self` with `parse_tier` set to `Some(tier)`.
+    ///
+    /// Eliminates the 3-line struct-update boilerplate that appeared at every
+    /// call site where a parser emits a tier annotation:
+    ///
+    /// ```rust
+    /// // Before
+    /// crate::analytics::RecordingContext { parse_tier: Some("full"), ..rec }
+    /// // After
+    /// rec.with_tier("full")
+    /// ```
+    pub(crate) fn with_tier(self, tier: &'a str) -> Self {
+        Self {
+            parse_tier: Some(tier),
+            ..self
+        }
+    }
+
+    /// Return a copy of `self` with `parse_tier` replaced by the supplied
+    /// `Option<&'a str>`.
+    ///
+    /// Used at call sites where the tier is already an `Option` (e.g. derived
+    /// from a local variable or a parser result that may be absent):
+    ///
+    /// ```rust
+    /// // Before
+    /// crate::analytics::RecordingContext { parse_tier: tier_name, ..rec }
+    /// // After
+    /// rec.with_tier_opt(tier_name)
+    /// ```
+    pub(crate) fn with_tier_opt(self, tier: Option<&'a str>) -> Self {
+        Self {
+            parse_tier: tier,
+            ..self
+        }
+    }
+}
+
 /// Owned recording parameters for the background recording thread.
 ///
 /// Bundles the fields that `record_fire_and_forget` previously accepted

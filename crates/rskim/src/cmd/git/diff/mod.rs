@@ -166,10 +166,7 @@ fn handle_error_exit(
         stdout,
         label,
         show_stats,
-        crate::analytics::RecordingContext {
-            parse_tier: Some("passthrough"),
-            ..rec
-        },
+        rec.with_tier("passthrough"),
         duration,
     );
     map_exit_code(exit_code)
@@ -327,10 +324,7 @@ pub(super) fn run_diff(
             raw_diff,
             label,
             show_stats,
-            crate::analytics::RecordingContext {
-                parse_tier: Some("full"),
-                ..rec
-            },
+            rec.with_tier("full"),
             duration,
         );
         return Ok(ExitCode::SUCCESS);
@@ -354,10 +348,7 @@ pub(super) fn run_diff(
                 raw_diff,
                 label,
                 show_stats,
-                crate::analytics::RecordingContext {
-                    parse_tier: Some("degraded"),
-                    ..rec
-                },
+                rec.with_tier("degraded"),
                 duration,
             );
             return Ok(ExitCode::SUCCESS);
@@ -379,10 +370,7 @@ pub(super) fn run_diff(
         result_str,
         label,
         show_stats,
-        crate::analytics::RecordingContext {
-            parse_tier: Some("full"),
-            ..rec
-        },
+        rec.with_tier("full"),
         duration,
     );
 

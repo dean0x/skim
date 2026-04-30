@@ -191,10 +191,7 @@ pub(super) fn run_parsed_command(
 
     // Record analytics (fire-and-forget, non-blocking).
     crate::analytics::try_record_command(
-        crate::analytics::RecordingContext {
-            parse_tier: Some(result.tier_name()),
-            ..rec
-        },
+        rec.with_tier(result.tier_name()),
         raw_text,
         result.content().to_string(),
         super::format_analytics_label("build", program, &args.join(" ")),
