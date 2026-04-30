@@ -691,8 +691,8 @@ impl AnalyticsDb {
              FROM token_savings {where_clause}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let (distinct_sessions, total_tokens_saved, untagged_invocations): (u64, i64, u64) = stmt
-            .query_row(rusqlite::params_from_iter(params), |row| {
+        let (distinct_sessions, total_tokens_saved, untagged_invocations): (u64, i64, u64) =
+            stmt.query_row(rusqlite::params_from_iter(params), |row| {
                 Ok((
                     row.get::<_, u64>(0)?,
                     row.get::<_, i64>(1)?,
@@ -1588,7 +1588,10 @@ mod tests {
     /// F1: empty string is rejected.
     #[test]
     fn test_is_safe_session_id_empty() {
-        assert!(!is_safe_session_id(""), "empty session_id should be rejected");
+        assert!(
+            !is_safe_session_id(""),
+            "empty session_id should be rejected"
+        );
     }
 
     /// F1: shell metacharacters are rejected.
@@ -1598,14 +1601,8 @@ mod tests {
             !is_safe_session_id("foo;bar"),
             "semicolon should be rejected"
         );
-        assert!(
-            !is_safe_session_id("foo|bar"),
-            "pipe should be rejected"
-        );
-        assert!(
-            !is_safe_session_id("foo bar"),
-            "space should be rejected"
-        );
+        assert!(!is_safe_session_id("foo|bar"), "pipe should be rejected");
+        assert!(!is_safe_session_id("foo bar"), "space should be rejected");
         assert!(
             !is_safe_session_id("$HOME"),
             "dollar sign should be rejected"

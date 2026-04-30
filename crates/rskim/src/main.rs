@@ -503,11 +503,7 @@ where
     S: AsRef<str>,
 {
     args.into_iter()
-        .find_map(|a| {
-            a.as_ref()
-                .strip_prefix("--session-id=")
-                .map(str::to_string)
-        })
+        .find_map(|a| a.as_ref().strip_prefix("--session-id=").map(str::to_string))
         .filter(|s| analytics::is_safe_session_id(s))
 }
 
@@ -876,10 +872,7 @@ mod tests {
     fn test_parse_session_id_too_long() {
         let long_value = format!("--session-id={}", "a".repeat(129));
         let result = parse_session_id(["skim", long_value.as_str()]);
-        assert!(
-            result.is_none(),
-            "129-char session_id must be rejected"
-        );
+        assert!(result.is_none(), "129-char session_id must be rejected");
     }
 
     /// F9: space-separated form --session-id VALUE is not recognised.

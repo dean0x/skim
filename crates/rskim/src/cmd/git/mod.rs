@@ -454,10 +454,7 @@ where
         result_str,
         label,
         show_stats,
-        crate::analytics::RecordingContext {
-            parse_tier,
-            ..rec
-        },
+        crate::analytics::RecordingContext { parse_tier, ..rec },
         output.duration,
     );
 
@@ -723,7 +720,13 @@ mod tests {
             let (orig, comp) = crate::process::count_token_pair(raw, output);
             crate::process::report_token_stats(orig, comp, "");
         }
-        crate::analytics::try_record_command(rec, raw.to_string(), output.to_string(), label, duration);
+        crate::analytics::try_record_command(
+            rec,
+            raw.to_string(),
+            output.to_string(),
+            label,
+            duration,
+        );
     }
 
     /// Documents that `run_parsed_command` records analytics on non-zero exit.

@@ -44,7 +44,15 @@ pub(super) fn run_status(
 
     let label = super::build_analytics_label("status", args, show_stats, rec.enabled);
 
-    run_parsed_command(&full_args, show_stats, rec, output_format, false, label, parse_status)
+    run_parsed_command(
+        &full_args,
+        show_stats,
+        rec,
+        output_format,
+        false,
+        label,
+        parse_status,
+    )
 }
 
 /// Accumulated per-category file lists from a porcelain v2 status parse.

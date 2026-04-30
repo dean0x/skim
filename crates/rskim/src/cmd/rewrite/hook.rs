@@ -225,7 +225,10 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // the command string. Malicious session IDs with shell metacharacters
             // (;, |, $, spaces, etc.) are silently dropped to prevent command injection.
             // F5: match by value so the None arm moves rewritten_cmd instead of cloning.
-            let final_cmd = match session_id.as_deref().filter(|sid| crate::analytics::is_safe_session_id(sid)) {
+            let final_cmd = match session_id
+                .as_deref()
+                .filter(|sid| crate::analytics::is_safe_session_id(sid))
+            {
                 Some(sid) => inject_session_id_into_compound(&rewritten_cmd, sid),
                 None => rewritten_cmd,
             };

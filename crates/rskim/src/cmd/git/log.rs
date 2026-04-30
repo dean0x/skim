@@ -43,7 +43,15 @@ pub(super) fn run_log(
 
     let label = super::build_analytics_label("log", args, show_stats, rec.enabled);
 
-    run_parsed_command(&full_args, show_stats, rec, output_format, false, label, parse_log)
+    run_parsed_command(
+        &full_args,
+        show_stats,
+        rec,
+        output_format,
+        false,
+        label,
+        parse_log,
+    )
 }
 
 /// Parse formatted `git log` output into a compressed GitResult.

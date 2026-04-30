@@ -203,7 +203,14 @@ pub(super) fn run_show(
         }
         ShowMode::Commit => {
             let (git_args, output_format) = extract_output_format(args);
-            run_show_commit(global_flags, &git_args, args, output_format, show_stats, rec)
+            run_show_commit(
+                global_flags,
+                &git_args,
+                args,
+                output_format,
+                show_stats,
+                rec,
+            )
         }
     }
 }
@@ -1150,11 +1157,8 @@ mod tests {
             parse_tier: None,
             session_id: None,
         };
-        let result =
-            run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, rec)
-                .expect(
-                    "run_show_file_content must not return an anyhow error for --json rejection",
-                );
+        let result = run_show_file_content(&global_flags, &args, "HEAD:src/main.rs", false, rec)
+            .expect("run_show_file_content must not return an anyhow error for --json rejection");
         assert_eq!(
             result,
             ExitCode::from(2),
