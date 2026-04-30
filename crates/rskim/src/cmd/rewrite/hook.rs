@@ -220,22 +220,13 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // AD-HK-2: Inject --session-id=VALUE into the rewritten command so every
             // skim invocation in this session is tagged for per-session analytics.
             // Only inject when session_id is present and command starts with "skim ".
-            // SECURITY: session_id is validated to contain only safe characters
-            // (alphanumeric, hyphens, underscores, dots) before interpolation into
+            // SECURITY: session_id is validated via is_safe_session_id (alphanumeric,
+            // hyphens, underscores, dots, max 128 chars) before interpolation into
             // the command string. Malicious session IDs with shell metacharacters
             // (;, |, $, spaces, etc.) are silently dropped to prevent command injection.
-            let final_cmd = if let Some(ref sid) = session_id {
-                let is_safe = !sid.is_empty()
-                    && sid
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
-                if is_safe {
-                    inject_session_id_into_compound(rewritten_cmd, sid)
-                } else {
-                    rewritten_cmd.clone()
-                }
-            } else {
-                rewritten_cmd.clone()
+            let final_cmd = match session_id.as_deref().filter(|sid| crate::analytics::is_safe_session_id(sid)) {
+                Some(sid) => inject_session_id_into_compound(rewritten_cmd, sid),
+                None => rewritten_cmd.clone(),
             };
             audit_hook(&command, true, &final_cmd);
             // Use agent-specific response format
@@ -537,16 +528,10 @@ mod tests {
     /// Delegates to the module-level inject_session_id_into_compound for the
     /// actual substitution logic so tests cover the production code path.
     fn inject_session_id(rewritten_cmd: &str, session_id: Option<&str>) -> String {
-        if let Some(sid) = session_id {
-            let is_safe = !sid.is_empty()
-                && sid
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
-            if is_safe {
-                return inject_session_id_into_compound(rewritten_cmd, sid);
-            }
+        match session_id.filter(|sid| crate::analytics::is_safe_session_id(sid)) {
+            Some(sid) => inject_session_id_into_compound(rewritten_cmd, sid),
+            None => rewritten_cmd.to_string(),
         }
-        rewritten_cmd.to_string()
     }
 
     /// AD-HK-2: session_id is injected after "skim " when present.

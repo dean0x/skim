@@ -777,6 +777,31 @@ fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String
 // Fire-and-forget recording functions
 // ============================================================================
 
+/// Returns `true` if `sid` is safe for shell command interpolation.
+///
+/// Allows `[a-zA-Z0-9_\-.]`, max 128 chars. Rejects empty, oversized,
+/// and metacharacter-bearing values to prevent command injection.
+///
+/// ## Why 128 chars?
+///
+/// Session IDs are agent-generated opaque identifiers (typically UUIDs or
+/// short descriptive strings). 128 characters is generous for any plausible
+/// legitimate value while bounding the injected flag length in command strings.
+///
+/// ## Rationale for allowed characters
+///
+/// `[a-zA-Z0-9_-.]` covers UUIDs, ISO 8601 timestamps, dot-separated
+/// identifiers, and human-readable session names. All other characters —
+/// including shell metacharacters (`;`, `|`, `$`, spaces, backticks, etc.)
+/// — are rejected.
+pub(crate) fn is_safe_session_id(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid.len() <= 128
+        && sid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
 /// Compute token savings as a percentage.
 ///
 /// Returns 0.0 when:
@@ -1497,6 +1522,65 @@ mod tests {
         assert!(
             (savings_percentage(100, 20) - 80.0).abs() < 0.01,
             "expected ~80.0%"
+        );
+    }
+
+    // ========================================================================
+    // is_safe_session_id tests (F1, F6, F10)
+    // ========================================================================
+
+    /// F1: 128-char string is accepted; 129-char string is rejected.
+    #[test]
+    fn test_is_safe_session_id_max_length() {
+        let at_limit = "a".repeat(128);
+        assert!(
+            is_safe_session_id(&at_limit),
+            "128-char session_id should be accepted"
+        );
+        let over_limit = "a".repeat(129);
+        assert!(
+            !is_safe_session_id(&over_limit),
+            "129-char session_id should be rejected"
+        );
+    }
+
+    /// F1: empty string is rejected.
+    #[test]
+    fn test_is_safe_session_id_empty() {
+        assert!(!is_safe_session_id(""), "empty session_id should be rejected");
+    }
+
+    /// F1: shell metacharacters are rejected.
+    #[test]
+    fn test_is_safe_session_id_with_metacharacters() {
+        assert!(
+            !is_safe_session_id("foo;bar"),
+            "semicolon should be rejected"
+        );
+        assert!(
+            !is_safe_session_id("foo|bar"),
+            "pipe should be rejected"
+        );
+        assert!(
+            !is_safe_session_id("foo bar"),
+            "space should be rejected"
+        );
+        assert!(
+            !is_safe_session_id("$HOME"),
+            "dollar sign should be rejected"
+        );
+    }
+
+    /// F1: alphanumeric, hyphens, underscores, dots are accepted.
+    #[test]
+    fn test_is_safe_session_id_valid() {
+        assert!(
+            is_safe_session_id("abc-123_test.v2"),
+            "alphanumeric, hyphen, underscore, dot should be accepted"
+        );
+        assert!(
+            is_safe_session_id("session-2024-01-15_abc123"),
+            "typical session ID format should be accepted"
         );
     }
 
