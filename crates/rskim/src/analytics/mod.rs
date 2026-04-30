@@ -672,31 +672,32 @@ impl AnalyticsDb {
 
     /// Query per-session statistics grouped by session_id.
     ///
-    /// NULL session_id rows are excluded from session grouping but counted in
-    /// `untagged_invocations`. Division by zero is guarded: when
-    /// `distinct_sessions == 0`, `avg_tokens_per_session` is 0.0.
+    /// Uses a single conditional-aggregation query instead of two separate queries
+    /// to avoid a TOCTOU race between the two reads and to reduce round-trips.
+    /// `COUNT(DISTINCT session_id)` naturally ignores NULL rows, so no extra WHERE
+    /// clause is needed for the session count.
+    ///
+    /// Division by zero is guarded: when `distinct_sessions == 0`,
+    /// `avg_tokens_per_session` is 0.0 (computed in Rust after the query).
     pub(crate) fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
-        // Query for sessions (non-NULL session_id rows only)
-        let (where_clause, params) = since_clause_with_extra(since, "session_id IS NOT NULL");
-        let session_sql = format!(
-            "SELECT COUNT(DISTINCT session_id), \
-             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0) \
+        // F2: Single query using conditional aggregation — eliminates the two-query pattern.
+        let (where_clause, params) = since_clause(since);
+        let sql = format!(
+            "SELECT \
+             COUNT(DISTINCT session_id), \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens AND session_id IS NOT NULL \
+                              THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END), 0) \
              FROM token_savings {where_clause}"
         );
-        let mut stmt = self.conn.prepare(&session_sql)?;
-        let (distinct_sessions, total_tokens_saved): (u64, i64) = stmt
+        let mut stmt = self.conn.prepare(&sql)?;
+        let (distinct_sessions, total_tokens_saved, untagged_invocations): (u64, i64, u64) = stmt
             .query_row(rusqlite::params_from_iter(params), |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?))
-            })?;
-
-        // Query for untagged invocations (NULL session_id)
-        let (untagged_clause, untagged_params) =
-            since_clause_with_extra(since, "session_id IS NULL");
-        let untagged_sql = format!("SELECT COUNT(*) FROM token_savings {untagged_clause}");
-        let mut untagged_stmt = self.conn.prepare(&untagged_sql)?;
-        let untagged_invocations: u64 = untagged_stmt
-            .query_row(rusqlite::params_from_iter(untagged_params), |row| {
-                row.get(0)
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
             })?;
 
         let total_tokens_saved = total_tokens_saved.max(0) as u64;
