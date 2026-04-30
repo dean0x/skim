@@ -2001,4 +2001,29 @@ mod tests {
             "since filter should exclude old session"
         );
     }
+
+    // ========================================================================
+    // AnalyticsConfig::from_process tests (F5 step 3)
+    // ========================================================================
+
+    /// F5: from_process carries session_id when provided.
+    #[test]
+    fn test_from_process_passes_session_id() {
+        let config = AnalyticsConfig::from_process(false, Some("my-session".to_string()));
+        assert_eq!(
+            config.session_id.as_deref(),
+            Some("my-session"),
+            "session_id should propagate through from_process"
+        );
+    }
+
+    /// F5: from_process yields None session_id when not provided.
+    #[test]
+    fn test_from_process_none_session_id() {
+        let config = AnalyticsConfig::from_process(false, None);
+        assert!(
+            config.session_id.is_none(),
+            "session_id should be None when not provided"
+        );
+    }
 }

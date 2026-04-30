@@ -483,6 +483,34 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Extract and validate `--session-id=VALUE` from a command-line argument iterator.
+///
+/// Returns `Some(value)` when exactly one `--session-id=VALUE` argument is present
+/// and `value` passes [`analytics::is_safe_session_id`]. Returns `None` when the
+/// flag is absent, the value is empty, the value is unsafe, or the value exceeds
+/// 128 characters.
+///
+/// Only the equals form (`--session-id=VALUE`) is recognised. The space-separated
+/// form (`--session-id VALUE`) is not supported — the hook always injects the flag
+/// in equals form, and accepting the space form would complicate the pre-parse
+/// routing logic.
+///
+/// This is a pure function over an iterator so it can be unit-tested without
+/// mutating `std::env::args()`.
+fn parse_session_id<I, S>(args: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .find_map(|a| {
+            a.as_ref()
+                .strip_prefix("--session-id=")
+                .map(str::to_string)
+        })
+        .filter(|s| analytics::is_safe_session_id(s))
+}
+
 fn main() -> ExitCode {
     // Initialise debug flag from SKIM_DEBUG env var once, before any threads
     // are spawned. After this call, is_debug_enabled() is a pure atomic load.
@@ -501,9 +529,7 @@ fn main() -> ExitCode {
     // every subcommand automatically inherits the session context without
     // requiring per-subcommand parsing. The value is passed to AnalyticsConfig
     // and threaded through all recording call sites.
-    let session_id: Option<String> = std::env::args()
-        .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string))
-        .filter(|s| !s.is_empty());
+    let session_id = parse_session_id(std::env::args());
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {
@@ -808,39 +834,86 @@ mod tests {
     }
 
     // ========================================================================
-    // B-AC14: empty --session-id= normalisation
+    // parse_session_id tests (F7, F9, F10)
+    // ========================================================================
+
+    /// F7: --session-id=VALUE is extracted as Some(VALUE).
+    #[test]
+    fn test_parse_session_id_present() {
+        let result = parse_session_id(["skim", "--session-id=abc-123"]);
+        assert_eq!(result.as_deref(), Some("abc-123"));
+    }
+
+    /// F7: absent flag returns None.
+    #[test]
+    fn test_parse_session_id_absent() {
+        let result = parse_session_id(["skim", "test", "cargo"]);
+        assert!(result.is_none(), "no --session-id should yield None");
+    }
+
+    /// F7: empty value --session-id= returns None (rejects empty at validation).
+    #[test]
+    fn test_parse_session_id_empty() {
+        let result = parse_session_id(["skim", "--session-id="]);
+        assert!(
+            result.is_none(),
+            "--session-id= (empty value) must yield None"
+        );
+    }
+
+    /// F7: unsafe value with shell metacharacters returns None.
+    #[test]
+    fn test_parse_session_id_unsafe() {
+        let result = parse_session_id(["skim", "--session-id=a;b"]);
+        assert!(
+            result.is_none(),
+            "--session-id=a;b (metacharacter) must yield None"
+        );
+    }
+
+    /// F1: value exceeding 128 chars returns None.
+    #[test]
+    fn test_parse_session_id_too_long() {
+        let long_value = format!("--session-id={}", "a".repeat(129));
+        let result = parse_session_id(["skim", long_value.as_str()]);
+        assert!(
+            result.is_none(),
+            "129-char session_id must be rejected"
+        );
+    }
+
+    /// F9: space-separated form --session-id VALUE is not recognised.
+    #[test]
+    fn test_parse_session_id_space_form() {
+        // Space form: the hook always injects in equals form; space form is intentionally unsupported.
+        let result = parse_session_id(["skim", "--session-id", "abc-123"]);
+        assert!(
+            result.is_none(),
+            "--session-id <space> VALUE must not be recognised (only equals form supported)"
+        );
+    }
+
+    // ========================================================================
+    // B-AC14: backward-compatible empty normalisation (now via parse_session_id)
     // ========================================================================
 
     /// B-AC14: the session_id extraction logic normalises empty values to None.
-    ///
-    /// `std::env::args()` cannot be injected in tests, so we verify the filter
-    /// step directly using the same `find_map(...).filter(|s| !s.is_empty())`
-    /// expression applied to a synthetic arg list.
     #[test]
     fn test_empty_session_id_arg_normalised_to_none() {
-        // Simulate `--session-id=` (value is empty string)
-        let args = vec!["skim".to_string(), "--session-id=".to_string()];
-        let session_id: Option<String> = args
-            .iter()
-            .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string))
-            .filter(|s| !s.is_empty());
+        let result = parse_session_id(["skim", "--session-id="]);
         assert!(
-            session_id.is_none(),
+            result.is_none(),
             "--session-id= (empty value) must normalise to None, got {:?}",
-            session_id
+            result
         );
     }
 
     /// B-AC14: non-empty --session-id= is preserved as Some.
     #[test]
     fn test_non_empty_session_id_arg_preserved() {
-        let args = vec!["skim".to_string(), "--session-id=abc-123".to_string()];
-        let session_id: Option<String> = args
-            .iter()
-            .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string))
-            .filter(|s| !s.is_empty());
+        let result = parse_session_id(["skim", "--session-id=abc-123"]);
         assert_eq!(
-            session_id.as_deref(),
+            result.as_deref(),
             Some("abc-123"),
             "--session-id=abc-123 must produce Some(\"abc-123\")"
         );
