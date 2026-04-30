@@ -43,7 +43,7 @@ pub(crate) fn run(
     };
 
     match runner {
-        "cargo" => cargo::run(runner_args, show_stats, analytics.enabled, rec.session_id),
+        "cargo" => cargo::run(runner_args, show_stats, rec),
         "go" => go::run(runner_args, show_stats, rec),
         "vitest" | "jest" => vitest::run(runner, runner_args, show_stats, rec),
         "pytest" => pytest::run(runner_args, show_stats, rec),

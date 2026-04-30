@@ -47,8 +47,7 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
-    analytics_enabled: bool,
-    session_id: Option<&str>,
+    rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     let is_nextest = args.iter().any(|a| a == "nextest");
 
@@ -78,9 +77,9 @@ pub(crate) fn run(
             show_stats,
             command_type: crate::analytics::CommandType::Test,
             output_format: OutputFormat::default(),
-            analytics_enabled,
+            analytics_enabled: rec.enabled,
             family: "test",
-            session_id,
+            session_id: rec.session_id,
         },
         move |output, _args| parse_impl(output, is_nextest),
     )
