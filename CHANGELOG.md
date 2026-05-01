@@ -17,6 +17,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+## [2.7.0] - 2026-05-01
+
+Line numbers, session tracking, output sanitization. 3,002 tests passing (up from 2,883 in v2.6.0).
+
+### Added
+- `-n`/`--line-numbers` flag — prefix output lines with source line numbers across all transformation modes (#155)
+- Session tracking pipeline — `session_id` extraction from agent hooks (Claude, Cursor, Copilot, Gemini), injection into rewritten commands, per-session stats on analytics dashboard (#150)
+- Schema v3 migration — nullable `session_id` column with index in analytics database
+- Advanced $5/MTok pricing tier between Standard ($3) and Premium ($15)
+- `RecordingContext<'a>` struct — eliminates parameter threading in analytics pipeline
+- `is_safe_session_id()` — centralized session ID validation (128-char max, rejects metacharacters)
+
+### Changed
+- Output sanitization across all parsers: dropped command-type prefixes (BUILD/LINT/PKG/TEST/INFRA/LOG/FILE), lowercase status labels (pass/fail/skip), reduced indentation, collapsed body stubs (`{...}` from `{ /* ... */ }`), simplified multi-file separators and diff headers
+- Git operation prefixes simplified: `[status]`/`[log]`/`[fetch]` → `status`/`log`/`fetch`
+- `serde(skip_serializing)` added to all rendered fields in canonical types
+- Init guidance uses `--line-numbers` instead of `-n` for clarity
+
+### Testing
+- 3,002 tests passing (up from 2,883 in v2.6.0)
+
 ## [2.6.0] - 2026-04-27
 
 Terminal UX overhaul, non-interactive init, plugin ecosystem removal. 2,883 tests passing (up from 2,800 in v2.5.1).
@@ -824,6 +845,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.7.0** (2026-05-01): Line numbers, session tracking, output sanitization (3,002 tests)
 - **2.6.0** (2026-04-27): Terminal UX overhaul, non-interactive init, plugin ecosystem removal (2,883 tests)
 - **2.5.1** (2026-04-20): Hook safety, SKIM_PASSTHROUGH bypass, npx fallback, 5 new parsers (2,800 tests)
 - **2.5.0** (2026-04-17): Formatter output compression, 8 new lint parsers (2,629 tests)
