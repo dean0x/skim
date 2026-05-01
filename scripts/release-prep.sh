@@ -121,8 +121,12 @@ if [ $TEST_EXIT -ne 0 ]; then
 fi
 echo -e "${GREEN}✓${RESET} cargo test"
 
-# Extract test count from harness summary line: "PASS: 2629 | FAIL: 0 | SKIP: 0"
-RAW_COUNT=$(echo "$TEST_OUTPUT" | grep -E 'PASS: [0-9]+' | tail -1 | sed 's/.*PASS: \([0-9]*\).*/\1/')
+# Extract test count: sum all "N passed" lines (one per test binary),
+# or fall back to skim-formatted "PASS: N" summary
+RAW_COUNT=$(echo "$TEST_OUTPUT" | grep -oE '([0-9]+) passed' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}' || true)
+if [ -z "$RAW_COUNT" ] || [ "$RAW_COUNT" = "0" ]; then
+  RAW_COUNT=$(echo "$TEST_OUTPUT" | grep -oE 'PASS: [0-9]+' | grep -oE '[0-9]+' | awk '{s+=$1} END {print s}' || true)
+fi
 
 if [ -z "$RAW_COUNT" ]; then
   echo -e "${YELLOW}⚠${RESET}  Could not extract test count from test output — test count sync will be skipped"
