@@ -272,6 +272,7 @@ pub(super) fn build_file_result(
 ///
 /// Models `tool` as a positional value with the known tool names so that
 /// `skim file <TAB>` suggests `find`, `grep`, `ls`, `rg`, `tree`.
+#[allow(dead_code)] // retained for potential future use in completions
 pub(super) fn command() -> clap::Command {
     clap::Command::new("file")
         .about("Run file operation tools and parse output for AI context windows")

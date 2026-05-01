@@ -224,6 +224,7 @@ pub(crate) use super::combine_output as combine_stdout_stderr;
 ///
 /// Models `tool` as a positional value with the known tool names so that
 /// `skim infra <TAB>` suggests `aws`, `curl`, `gh`, `wget`.
+#[allow(dead_code)] // retained for potential future use in completions
 pub(super) fn command() -> clap::Command {
     clap::Command::new("infra")
         .about("Run infrastructure tools and parse output for AI context windows")

@@ -37,7 +37,7 @@ fn skim_cmd() -> Command {
 fn test_exit_code_cargo_pass_json() {
     let fixture = include_str!("fixtures/cmd/test/cargo_pass.json");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .code(0);
@@ -50,7 +50,7 @@ fn test_exit_code_cargo_fail_json() {
     // not from the parsed test results.
     let fixture = include_str!("fixtures/cmd/test/cargo_fail.json");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -62,7 +62,7 @@ fn test_exit_code_cargo_fail_json() {
 fn test_exit_code_cargo_nextest_pass() {
     let fixture = include_str!("fixtures/cmd/test/cargo_nextest_pass.txt");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .code(0);
@@ -76,7 +76,7 @@ fn test_exit_code_cargo_nextest_fail_via_stdin() {
     // regex match). Exit code is 0 from synthetic stdin exit code.
     let fixture = include_str!("fixtures/cmd/test/cargo_nextest_fail.txt");
     skim_cmd()
-        .args(["--debug", "test", "cargo"])
+        .args(["--debug", "cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -89,7 +89,7 @@ fn test_exit_code_cargo_passthrough_garbage() {
     // so the process exits 0.
     let fixture = include_str!("fixtures/cmd/test/cargo_passthrough.txt");
     skim_cmd()
-        .args(["--debug", "test", "cargo"])
+        .args(["--debug", "cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -104,7 +104,7 @@ fn test_exit_code_cargo_passthrough_garbage() {
 fn test_exit_code_vitest_pass_json() {
     let fixture = include_str!("fixtures/vitest/vitest_pass.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .code(0);
@@ -115,7 +115,7 @@ fn test_exit_code_vitest_fail_json() {
     // Vitest infers exit code from parsed results (fail > 0 => FAILURE)
     let fixture = include_str!("fixtures/vitest/vitest_fail.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0));
@@ -125,7 +125,7 @@ fn test_exit_code_vitest_fail_json() {
 fn test_exit_code_vitest_passthrough_garbage() {
     // Vitest passthrough always returns ExitCode::FAILURE
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin("completely unparseable garbage text\n")
         .assert()
         .code(predicate::ne(0));
@@ -139,7 +139,7 @@ fn test_exit_code_vitest_passthrough_garbage() {
 fn test_exit_code_pytest_pass() {
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(0);
@@ -150,7 +150,7 @@ fn test_exit_code_pytest_fail() {
     // Pytest infers exit code from parsed results (fail > 0 => FAILURE)
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0));
@@ -160,7 +160,7 @@ fn test_exit_code_pytest_fail() {
 fn test_exit_code_pytest_all_fail() {
     let fixture = include_str!("fixtures/cmd/test/pytest_all_fail.txt");
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0));
@@ -170,7 +170,7 @@ fn test_exit_code_pytest_all_fail() {
 fn test_exit_code_pytest_passthrough_garbage() {
     // Pytest passthrough: exit_code is None (stdin) so it infers FAILURE
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin("random garbage not pytest output\n")
         .assert()
         .code(predicate::ne(0));

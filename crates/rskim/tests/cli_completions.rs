@@ -266,7 +266,7 @@ fn test_completions_include_file_subcommands() {
 }
 
 #[test]
-fn test_completions_include_infra_subcommands() {
+fn test_completions_include_tool_subcommands() {
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["completions", "bash"])
@@ -274,14 +274,11 @@ fn test_completions_include_infra_subcommands() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.contains("infra"),
-        "Bash completions should include 'infra' subcommand"
-    );
-    for tool in &["aws", "curl", "gh", "wget"] {
+    // v2.8.0: flat dispatch — tool names are top-level subcommands
+    for tool in &["aws", "curl", "gh", "wget", "cargo", "eslint", "npm", "find"] {
         assert!(
             stdout.contains(tool),
-            "Bash completions should include '{tool}' as infra tool"
+            "Bash completions should include '{tool}' as top-level subcommand"
         );
     }
 }

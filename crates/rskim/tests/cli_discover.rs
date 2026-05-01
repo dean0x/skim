@@ -372,9 +372,9 @@ fn test_discover_skim_commands_excluded_from_analysis() {
     std::fs::create_dir_all(&project_dir).unwrap();
 
     // Session with: 2 skim commands (should be excluded) + 1 regular command
-    let session = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t01","name":"Bash","input":{"command":"skim test cargo"}}]},"timestamp":"2024-01-01T00:00:00Z","sessionId":"sess1"}
+    let session = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t01","name":"Bash","input":{"command":"skim cargo test"}}]},"timestamp":"2024-01-01T00:00:00Z","sessionId":"sess1"}
 {"type":"user","message":{"content":[{"tool_use_id":"t01","type":"tool_result","content":"ok"}]}}
-{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t02","name":"Bash","input":{"command":"skim build clippy"}}]},"timestamp":"2024-01-01T00:01:00Z","sessionId":"sess1"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t02","name":"Bash","input":{"command":"skim cargo clippy"}}]},"timestamp":"2024-01-01T00:01:00Z","sessionId":"sess1"}
 {"type":"user","message":{"content":[{"tool_use_id":"t02","type":"tool_result","content":"ok"}]}}
 {"type":"assistant","message":{"content":[{"type":"tool_use","id":"t03","name":"Bash","input":{"command":"cargo test"}}]},"timestamp":"2024-01-01T00:02:00Z","sessionId":"sess1"}
 {"type":"user","message":{"content":[{"tool_use_id":"t03","type":"tool_result","content":"test result: ok. 5 passed"}]}}
@@ -406,7 +406,7 @@ fn test_discover_only_skim_commands_shows_zero() {
     let project_dir = claude_dir.join("test-project");
     std::fs::create_dir_all(&project_dir).unwrap();
 
-    let session = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t01","name":"Bash","input":{"command":"skim test cargo"}}]},"timestamp":"2024-01-01T00:00:00Z","sessionId":"sess1"}
+    let session = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t01","name":"Bash","input":{"command":"skim cargo test"}}]},"timestamp":"2024-01-01T00:00:00Z","sessionId":"sess1"}
 {"type":"user","message":{"content":[{"tool_use_id":"t01","type":"tool_result","content":"ok"}]}}
 "#;
     std::fs::write(project_dir.join("skim-only.jsonl"), session).unwrap();

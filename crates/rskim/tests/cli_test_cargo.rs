@@ -1,4 +1,6 @@
-//! Integration tests for `skim test cargo` subcommand (#46).
+//! Integration tests for `skim cargo test` subcommand (#46).
+//!
+//! v2.8.0: Flat dispatch — `skim cargo test` replaces `skim test cargo`.
 //!
 //! Tests the end-to-end cargo test parser via the CLI binary.
 
@@ -11,12 +13,12 @@ use predicates::prelude::*;
 
 #[test]
 fn test_skim_test_cargo_in_this_repo() {
-    // Run `skim test cargo -p rskim-core` on skim's own repo.
+    // Run `skim cargo test -p rskim-core` on skim's own repo.
     // This executes a real `cargo test` and parses the output.
     // We use -p rskim-core to limit scope and speed up the test.
     let assert = Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "cargo", "-p", "rskim-core"])
+        .args(["cargo", "test", "-p", "rskim-core"])
         .timeout(std::time::Duration::from_secs(120))
         .assert();
 
@@ -29,39 +31,22 @@ fn test_skim_test_cargo_in_this_repo() {
 // ============================================================================
 
 #[test]
-fn test_skim_test_help() {
+fn test_skim_cargo_help() {
+    // v2.8.0: `skim cargo --help` — "test" is no longer a subcommand.
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "--help"])
+        .args(["cargo", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test"))
-        .stdout(predicate::str::contains("cargo"));
-}
-
-#[test]
-fn test_skim_test_no_args_shows_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["test"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("skim test"));
+        .stdout(predicate::str::contains("skim cargo"));
 }
 
 // ============================================================================
 // Unknown runner
 // ============================================================================
 
-#[test]
-fn test_skim_test_unknown_runner() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["test", "nonexistent-runner"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unknown runner"));
-}
+// v2.8.0: "test" is no longer a subcommand. Unknown tool names are unknown
+// subcommands at the dispatch level. This test is removed.
 
 // ============================================================================
 // Piped stdin parsing
@@ -78,7 +63,7 @@ fn test_skim_test_cargo_stdin_json() {
 
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(json_input)
         .assert()
         .success()
@@ -99,7 +84,7 @@ fn test_skim_test_cargo_stdin_plain_text() {
 
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(text_input)
         .assert()
         .success()

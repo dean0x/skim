@@ -1,55 +1,57 @@
-//! Integration tests for `skim build` subcommand (#51).
+//! Integration tests for build tool dispatch (flat dispatch).
+//!
+//! v2.8.0: `skim build cargo` → `skim cargo build`
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 // ============================================================================
-// Help and dispatch
+// Help and dispatch — cargo
 // ============================================================================
 
 #[test]
-fn test_skim_build_help() {
+fn test_skim_cargo_help() {
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("build")
+        .arg("cargo")
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build"))
-        .stdout(predicate::str::contains("cargo"))
-        .stdout(predicate::str::contains("tsc"));
+        .stdout(predicate::str::contains("skim cargo"))
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("clippy"));
 }
 
 #[test]
-fn test_skim_build_short_help() {
+fn test_skim_cargo_short_help() {
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("build")
+        .arg("cargo")
         .arg("-h")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build"));
+        .stdout(predicate::str::contains("skim cargo"));
 }
 
 #[test]
-fn test_skim_build_no_tool_shows_error() {
+fn test_skim_cargo_no_subcmd_shows_help() {
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("build")
+        .arg("cargo")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("missing required argument"));
+        .success()
+        .stdout(predicate::str::contains("skim cargo"));
 }
 
 #[test]
-fn test_skim_build_unknown_tool_shows_error() {
+fn test_skim_cargo_unknown_subcmd_shows_error() {
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("build")
+        .arg("cargo")
         .arg("webpack")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown build tool"));
+        .stderr(predicate::str::contains("unsupported subcommand"));
 }
 
 // ============================================================================
@@ -61,11 +63,11 @@ fn test_skim_build_unknown_tool_shows_error() {
 /// Since we are running inside the skim repo which is already built,
 /// this should succeed quickly with cached artifacts.
 #[test]
-fn test_skim_build_cargo_in_repo() {
+fn test_skim_cargo_build_in_repo() {
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("build")
         .arg("cargo")
+        .arg("build")
         .assert()
         .success()
         .stdout(predicate::str::contains("OK warnings:"));
@@ -76,13 +78,28 @@ fn test_skim_build_cargo_in_repo() {
 // ============================================================================
 
 #[test]
-fn test_skim_build_cargo_stub_dispatches() {
-    // Running `skim build cargo` should NOT show "not yet implemented"
+fn test_skim_cargo_build_dispatches() {
+    // Running `skim cargo build` should NOT show "not yet implemented"
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("build")
         .arg("cargo")
+        .arg("build")
         .assert()
         .stdout(predicate::str::contains("not yet implemented").not())
         .stderr(predicate::str::contains("not yet implemented").not());
+}
+
+// ============================================================================
+// Old category syntax rejected
+// ============================================================================
+
+#[test]
+fn test_old_build_subcommand_rejected() {
+    // `skim build` should NOT route to build category — it falls through to FileOperation
+    // and fails because there's no file named "build"
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("build")
+        .assert()
+        .failure();
 }

@@ -132,22 +132,56 @@ pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
 ///
 /// IMPORTANT: Only register subcommands we will actually implement.
 /// Keep this list exact — no broad patterns. See GRANITE lesson #336.
+///
+/// v2.8.0: Flat dispatch — tool names promoted to top-level subcommands.
+/// Category prefixes (build, lint, pkg, infra, file, test) removed.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
+    // Meta/utility (unchanged)
     "agents",
-    "build",
     "completions",
     "discover",
-    "file",
     "git",
-    "infra",
     "init",
     "learn",
-    "lint",
     "log",
-    "pkg",
     "rewrite",
     "stats",
-    "test",
+    // Multi-category dispatchers
+    "cargo",
+    "go",
+    // Test runners
+    "jest",
+    "pytest",
+    "vitest",
+    // Build tools
+    "tsc",
+    // Linters (11)
+    "biome",
+    "black",
+    "dprint",
+    "eslint",
+    "gofmt",
+    "golangci",
+    "mypy",
+    "oxlint",
+    "prettier",
+    "ruff",
+    "rustfmt",
+    // Package managers
+    "npm",
+    "pnpm",
+    "pip",
+    // Infrastructure
+    "aws",
+    "curl",
+    "gh",
+    "wget",
+    // File operations
+    "find",
+    "grep",
+    "ls",
+    "rg",
+    "tree",
 ];
 
 /// Check whether `name` is a registered subcommand.
@@ -470,11 +504,159 @@ where
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
+/// Prepend a tool name to an arg slice.
+fn prepend(tool: &str, args: &[String]) -> Vec<String> {
+    let mut v = vec![tool.to_string()];
+    v.extend_from_slice(args);
+    v
+}
+
+/// Route `skim cargo <subcmd> [args...]` to the correct category handler.
+///
+/// Handles flag interleaving: `skim cargo --show-stats test` works because
+/// we skip flags to find the first positional (the cargo subcmd), then pass
+/// ALL args (including flags) to the category dispatcher which handles
+/// flag extraction itself.
+fn dispatch_cargo(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_cargo_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Find first non-flag arg as the cargo subcommand.
+    let subcmd_idx = args.iter().position(|a| !a.starts_with('-'));
+    let Some(idx) = subcmd_idx else {
+        eprintln!(
+            "skim cargo: missing subcommand\n\n\
+             Usage: skim cargo <test|build|clippy|audit|nextest> [args...]\n\n\
+             Supported subcommands: test, nextest, build, clippy, audit"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+
+    let subcmd = args[idx].as_str();
+
+    // Build args without the subcmd token, preserving all flags and other args
+    let without_subcmd: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, s)| s.clone())
+        .collect();
+
+    match subcmd {
+        "test" | "t" => test::run(&prepend("cargo", &without_subcmd), analytics),
+        // nextest: keep the "nextest" token — the test handler uses it to select
+        // the nextest parse path instead of the plain cargo-test path.
+        "nextest" => test::run(&prepend("cargo", args), analytics),
+        "build" | "b" => build::run(&prepend("cargo", &without_subcmd), analytics),
+        "clippy" => build::run(&prepend("clippy", &without_subcmd), analytics),
+        // audit: keep "audit" in args — pkg::run uses it to select the audit parser.
+        "audit" => pkg::run(&prepend("cargo", args), analytics),
+        unknown => {
+            let safe = sanitize_for_display(unknown);
+            eprintln!(
+                "skim cargo: unsupported subcommand '{safe}'\n\n\
+                 Usage: skim cargo <test|build|clippy|audit|nextest> [args...]\n\n\
+                 Supported subcommands: test, nextest, build, clippy, audit"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Route `skim go <subcmd> [args...]` to the correct category handler.
+fn dispatch_go(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_go_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let subcmd_idx = args.iter().position(|a| !a.starts_with('-'));
+    let Some(idx) = subcmd_idx else {
+        eprintln!(
+            "skim go: missing subcommand\n\n\
+             Usage: skim go <test> [args...]\n\n\
+             Supported subcommands: test"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+
+    let subcmd = args[idx].as_str();
+
+    // Build args without the subcmd token, preserving all flags and other args.
+    let without_subcmd: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, s)| s.clone())
+        .collect();
+
+    match subcmd {
+        "test" => test::run(&prepend("go", &without_subcmd), analytics),
+        unknown => {
+            let safe = sanitize_for_display(unknown);
+            eprintln!(
+                "skim go: unsupported subcommand '{safe}'\n\n\
+                 Usage: skim go <test> [args...]\n\n\
+                 Supported subcommands: test"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn print_cargo_help() {
+    print!(
+        "skim cargo\n\
+         \n\
+           Cargo subcommand compression\n\
+         \n\
+         Usage: skim cargo <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test       Run and compress cargo test output\n\
+           nextest    Run and compress cargo nextest output\n\
+           build      Run and compress cargo build output\n\
+           clippy     Run and compress cargo clippy output\n\
+           audit      Run and compress cargo audit output\n\
+         \n\
+         Examples:\n\
+           skim cargo test\n\
+           skim cargo build --release\n\
+           skim cargo clippy -- -D warnings\n\
+           skim cargo audit\n"
+    );
+}
+
+fn print_go_help() {
+    print!(
+        "skim go\n\
+         \n\
+           Go subcommand compression\n\
+         \n\
+         Usage: skim go <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test       Run and compress go test output\n\
+         \n\
+         Examples:\n\
+           skim go test ./...\n\
+           skim go test -v ./pkg/...\n"
+    );
+}
+
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
-/// Exit code semantics (GRANITE lesson — exit code corruption is P1):
-/// - `--help` / `-h`: prints description to stdout, returns SUCCESS
-/// - Otherwise: prints "not yet implemented" to stderr, returns FAILURE
+/// v2.8.0: Flat dispatch — tool names are top-level subcommands.
+/// `cargo` and `go` use multi-category dispatchers; other tools route
+/// directly to their category handler with the tool name prepended.
 pub(crate) fn dispatch(
     subcommand: &str,
     args: &[String],
@@ -490,21 +672,32 @@ pub(crate) fn dispatch(
     }
 
     match subcommand {
+        // Unchanged meta/utility
         "agents" => agents::run(args, analytics),
-        "build" => build::run(args, analytics),
         "completions" => completions::run(args, analytics),
         "discover" => discover::run(args, analytics),
-        "file" => file::run(args, analytics),
         "git" => git::run(args, analytics),
-        "infra" => infra::run(args, analytics),
         "init" => init::run(args, analytics),
         "learn" => learn::run(args, analytics),
-        "lint" => lint::run(args, analytics),
         "log" => log::run(args, analytics),
-        "pkg" => pkg::run(args, analytics),
         "rewrite" => rewrite::run(args, analytics),
         "stats" => stats::run(args, analytics),
-        "test" => test::run(args, analytics),
+
+        // Multi-category dispatchers
+        "cargo" => dispatch_cargo(args, analytics),
+        "go" => dispatch_go(args, analytics),
+
+        // Direct-to-category routing (prepend tool name for category dispatcher)
+        "jest" | "pytest" | "vitest" => test::run(&prepend(subcommand, args), analytics),
+        "tsc" => build::run(&prepend(subcommand, args), analytics),
+        "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "mypy" | "oxlint"
+        | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
+        "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
+        "aws" | "curl" | "gh" | "wget" => infra::run(&prepend(subcommand, args), analytics),
+        "find" | "grep" | "ls" | "rg" | "tree" => {
+            file::run(&prepend(subcommand, args), analytics)
+        }
+
         // Unreachable: is_known_subcommand guard above rejects unknown names
         _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
     }

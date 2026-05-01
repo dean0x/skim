@@ -150,7 +150,7 @@ mod tests {
             version: 1,
             is_match: true,
             original: "cargo test",
-            rewritten: "skim test cargo",
+            rewritten: "skim cargo test",
             category: Some(RewriteCategory::Test),
             confidence: "exact",
             compound: false,
@@ -159,7 +159,7 @@ mod tests {
         let json = serde_json::to_string(&output).expect("serialization must not fail");
         assert!(json.contains("\"match\":true"));
         assert!(json.contains("\"original\":\"cargo test\""));
-        assert!(json.contains("\"rewritten\":\"skim test cargo\""));
+        assert!(json.contains("\"rewritten\":\"skim cargo test\""));
         assert!(json.contains("\"category\":\"test\""));
         assert!(json.contains("\"confidence\":\"exact\""));
         assert!(json.contains("\"compound\":false"));
@@ -191,7 +191,7 @@ mod tests {
             version: 1,
             is_match: true,
             original: "cargo test && cargo build",
-            rewritten: "skim test cargo && skim build cargo",
+            rewritten: "skim cargo test && skim cargo build",
             category: Some(RewriteCategory::Test),
             confidence: "exact",
             compound: true,

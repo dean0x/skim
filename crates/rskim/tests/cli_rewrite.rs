@@ -18,13 +18,13 @@ fn test_rewrite_cargo_test_with_separator() {
         .args(["rewrite", "cargo", "test", "--", "--nocapture"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo -- --nocapture"));
+        .stdout(predicate::str::contains("skim cargo test -- --nocapture"));
 }
 
 #[test]
 fn test_rewrite_ls_no_match() {
     // NOTE: bare `ls` now matches the catch-all rule (B.1) added in v2.5.1 and
-    // IS rewritten to `skim file ls`.  Updated from the original no-match expectation.
+    // IS rewritten to `skim ls` (v2.8.0 flat dispatch: was `skim file ls`).  Updated from the original no-match expectation.
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "ls"])
@@ -40,7 +40,7 @@ fn test_rewrite_cargo_build() {
         .args(["rewrite", "cargo", "build"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build cargo"));
+        .stdout(predicate::str::contains("skim cargo build"));
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn test_rewrite_go_test_with_path() {
         .args(["rewrite", "go", "test", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test go ./..."));
+        .stdout(predicate::str::contains("skim go test ./..."));
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn test_rewrite_pytest_with_flag() {
         .args(["rewrite", "pytest", "-v"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test pytest -v"));
+        .stdout(predicate::str::contains("skim pytest -v"));
 }
 
 // ============================================================================
@@ -74,7 +74,7 @@ fn test_rewrite_with_env_var() {
         .args(["rewrite", "RUST_LOG=debug", "cargo", "test"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("RUST_LOG=debug skim test cargo"));
+        .stdout(predicate::str::contains("RUST_LOG=debug skim cargo test"));
 }
 
 // ============================================================================
@@ -88,7 +88,7 @@ fn test_rewrite_cargo_toolchain_nightly() {
         .args(["rewrite", "cargo", "+nightly", "test"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo +nightly"));
+        .stdout(predicate::str::contains("skim cargo test +nightly"));
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn test_rewrite_env_var_with_toolchain() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "RUST_LOG=debug skim test cargo +nightly",
+            "RUST_LOG=debug skim cargo test +nightly",
         ));
 }
 
@@ -115,9 +115,9 @@ fn test_rewrite_compound_and_and() {
         .args(["rewrite", "cargo", "test", "&&", "cargo", "build"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains("skim cargo test"))
         .stdout(predicate::str::contains("&&"))
-        .stdout(predicate::str::contains("skim build cargo"));
+        .stdout(predicate::str::contains("skim cargo build"));
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn test_rewrite_compound_pipe() {
         .write_stdin("cargo test | head\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains("skim cargo test"))
         .stdout(predicate::str::contains("|"))
         .stdout(predicate::str::contains("head"));
 }
@@ -141,7 +141,7 @@ fn test_rewrite_compound_semicolon() {
         .args(["rewrite", "cargo", "test", ";", "echo", "done"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains("skim cargo test"))
         .stdout(predicate::str::contains(";"))
         .stdout(predicate::str::contains("echo done"));
 }
@@ -190,7 +190,7 @@ fn test_rewrite_compound_or_or() {
         .write_stdin("cargo test || echo fail\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains("skim cargo test"))
         .stdout(predicate::str::contains("||"))
         .stdout(predicate::str::contains("echo fail"));
 }
@@ -204,9 +204,9 @@ fn test_rewrite_compound_no_spaces_around_operator() {
         .write_stdin("cargo test&&cargo build\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"))
+        .stdout(predicate::str::contains("skim cargo test"))
         .stdout(predicate::str::contains("&&"))
-        .stdout(predicate::str::contains("skim build cargo"));
+        .stdout(predicate::str::contains("skim cargo build"));
 }
 
 #[test]
@@ -218,7 +218,7 @@ fn test_rewrite_compound_escaped_quotes() {
         .write_stdin("echo \"say \\\"hello\\\"\" && cargo test\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"));
+        .stdout(predicate::str::contains("skim cargo test"));
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn test_rewrite_compound_mixed_pipe_and_sequential() {
         .write_stdin("cargo test && cargo build | head\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"));
+        .stdout(predicate::str::contains("skim cargo test"));
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn test_rewrite_redirect_stderr_to_stdout() {
         .write_stdin("cargo test 2>&1\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo 2>&1"));
+        .stdout(predicate::str::contains("skim cargo test 2>&1"));
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn test_rewrite_redirect_stderr_to_stdout_pipe() {
         .write_stdin("cargo test 2>&1 | head\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo 2>&1"))
+        .stdout(predicate::str::contains("skim cargo test 2>&1"))
         .stdout(predicate::str::contains("|"))
         .stdout(predicate::str::contains("head"));
 }
@@ -282,9 +282,9 @@ fn test_rewrite_redirect_stderr_to_stdout_compound() {
         .write_stdin("cargo test 2>&1 && cargo build\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo 2>&1"))
+        .stdout(predicate::str::contains("skim cargo test 2>&1"))
         .stdout(predicate::str::contains("&&"))
-        .stdout(predicate::str::contains("skim build cargo"));
+        .stdout(predicate::str::contains("skim cargo build"));
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn test_rewrite_redirect_stderr_to_devnull() {
         .write_stdin("cargo test 2>/dev/null\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo 2>/dev/null"));
+        .stdout(predicate::str::contains("skim cargo test 2>/dev/null"));
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn test_rewrite_redirect_stdout_to_file() {
         .write_stdin("cargo test > output.txt\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo > output.txt"));
+        .stdout(predicate::str::contains("skim cargo test > output.txt"));
 }
 
 #[test]
@@ -317,7 +317,7 @@ fn test_rewrite_redirect_both_to_file() {
         .write_stdin("cargo test &> output.txt\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo &> output.txt"));
+        .stdout(predicate::str::contains("skim cargo test &> output.txt"));
 }
 
 #[test]
@@ -488,7 +488,7 @@ fn test_rewrite_stdin_cargo_test() {
         .write_stdin("cargo test\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"));
+        .stdout(predicate::str::contains("skim cargo test"));
 }
 
 // ============================================================================
@@ -586,7 +586,7 @@ fn test_rewrite_nextest() {
         .args(["rewrite", "cargo", "nextest", "run"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"));
+        .stdout(predicate::str::contains("skim cargo nextest"));
 }
 
 // ============================================================================
@@ -678,7 +678,7 @@ fn test_find_standalone_rewritten() {
         .write_stdin("find . -name foo\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file find"));
+        .stdout(predicate::str::contains("skim find"));
 }
 
 /// Standalone `rg pattern` (no pipe) SHOULD still be rewritten.
@@ -690,7 +690,7 @@ fn test_rg_standalone_rewritten() {
         .write_stdin("rg pattern\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file rg"));
+        .stdout(predicate::str::contains("skim rg"));
 }
 
 /// `find . || echo fail` — `||` is NOT a pipe, so `find` IS rewritten.
@@ -703,7 +703,7 @@ fn test_find_or_chain_still_rewritten() {
         .write_stdin("find . || echo fail\n")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file find"));
+        .stdout(predicate::str::contains("skim find"));
 }
 
 // ============================================================================
@@ -747,11 +747,11 @@ fn test_rewrite_ls_pipe_excluded() {
 #[test]
 fn test_rewrite_ls_catch_all_matches() {
     // NOTE: bare `ls` matches the catch-all rule (B.1) added in v2.5.1 and
-    // IS rewritten to `skim file ls` when NOT on the source side of a pipe.
+    // IS rewritten to `skim ls` when NOT on the source side of a pipe (v2.8.0 flat dispatch).
     Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "ls"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file ls"));
+        .stdout(predicate::str::contains("skim ls"));
 }

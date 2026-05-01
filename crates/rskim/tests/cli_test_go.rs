@@ -1,4 +1,6 @@
-//! Integration tests for `skim test go` subcommand (#49).
+//! Integration tests for `skim go test` subcommand (#49).
+//!
+//! v2.8.0: Flat dispatch — `skim go test` replaces `skim test go`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -9,36 +11,20 @@ use std::process::Command as StdCommand;
 // ============================================================================
 
 #[test]
-fn test_skim_test_help() {
+fn test_skim_go_help() {
+    // v2.8.0: `skim go --help` — "test" is no longer a subcommand.
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
+        .arg("go")
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test"));
+        .stdout(predicate::str::contains("skim go"));
 }
 
-#[test]
-fn test_skim_test_go_unknown_runner() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg("test")
-        .arg("nonexistent")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unknown runner"));
-}
-
-#[test]
-fn test_skim_test_no_args_shows_help() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg("test")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Available runners"));
-}
+// v2.8.0: "test" is no longer a subcommand. Unknown runner tests via
+// `skim test nonexistent` are removed — unknown names are handled at the
+// dispatch level as unknown subcommands.
 
 // ============================================================================
 // Real `go test` integration (gated on Go being installed)
@@ -77,8 +63,8 @@ func TestAdd(t *testing.T) {
     Command::cargo_bin("skim")
         .unwrap()
         .current_dir(dir.path())
-        .arg("test")
         .arg("go")
+        .arg("test")
         .arg("./...")
         .assert()
         .success()

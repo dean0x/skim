@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn test_opencode_format_response_returns_null() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         assert_eq!(response, serde_json::Value::Null);
     }
 
