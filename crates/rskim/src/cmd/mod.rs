@@ -990,6 +990,83 @@ mod tests {
     }
 
     // ========================================================================
+    // extract_subcmd tests
+    // ========================================================================
+
+    /// Happy path: first non-flag arg is the subcommand.
+    #[test]
+    fn test_extract_subcmd_finds_first_positional() {
+        let args: Vec<String> = vec!["test".into(), "--release".into()];
+        let result = extract_subcmd("cargo", &args, "usage", "test").unwrap();
+        assert_eq!(result, Some(("test", 0)));
+    }
+
+    /// Flags before the subcommand are skipped; the positional is found at the
+    /// correct index so `prepend_without` will remove the right element.
+    #[test]
+    fn test_extract_subcmd_skips_leading_flags() {
+        let args: Vec<String> = vec!["--show-stats".into(), "build".into(), "--release".into()];
+        let result = extract_subcmd("cargo", &args, "usage", "build").unwrap();
+        assert_eq!(result, Some(("build", 1)));
+    }
+
+    /// When every arg starts with `-` there is no subcommand; the function
+    /// prints the error message and returns `None` (caller returns FAILURE).
+    #[test]
+    fn test_extract_subcmd_returns_none_when_all_flags() {
+        let args: Vec<String> = vec!["--show-stats".into(), "--json".into()];
+        let result = extract_subcmd("cargo", &args, "usage", "test").unwrap();
+        assert!(result.is_none());
+    }
+
+    /// Empty arg slice → no subcommand found, returns `None`.
+    #[test]
+    fn test_extract_subcmd_empty_args() {
+        let args: Vec<String> = vec![];
+        let result = extract_subcmd("cargo", &args, "usage", "test").unwrap();
+        assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // prepend_without tests
+    // ========================================================================
+
+    /// Removes an element from the middle and prepends the tool name.
+    #[test]
+    fn test_prepend_without_removes_middle_element() {
+        let args: Vec<String> = vec!["--show-stats".into(), "test".into(), "--release".into()];
+        // skip_idx=1 removes "test"; result is ["cargo", "--show-stats", "--release"]
+        let result = prepend_without("cargo", &args, 1);
+        assert_eq!(result, vec!["cargo", "--show-stats", "--release"]);
+    }
+
+    /// Removes the first element and prepends the tool name.
+    #[test]
+    fn test_prepend_without_removes_first_element() {
+        let args: Vec<String> = vec!["test".into(), "--release".into()];
+        // skip_idx=0 removes "test"; result is ["cargo", "--release"]
+        let result = prepend_without("cargo", &args, 0);
+        assert_eq!(result, vec!["cargo", "--release"]);
+    }
+
+    /// Removes the last element and prepends the tool name.
+    #[test]
+    fn test_prepend_without_removes_last_element() {
+        let args: Vec<String> = vec!["--release".into(), "test".into()];
+        // skip_idx=1 removes "test"; result is ["cargo", "--release"]
+        let result = prepend_without("cargo", &args, 1);
+        assert_eq!(result, vec!["cargo", "--release"]);
+    }
+
+    /// Single-element slice: removes that element, leaving only the tool name.
+    #[test]
+    fn test_prepend_without_single_element_slice() {
+        let args: Vec<String> = vec!["test".into()];
+        let result = prepend_without("cargo", &args, 0);
+        assert_eq!(result, vec!["cargo"]);
+    }
+
+    // ========================================================================
     // dispatch() coverage — KNOWN_SUBCOMMANDS sync guard
     // ========================================================================
 
@@ -1020,6 +1097,18 @@ mod tests {
                 dispatch(subcommand, &args, &a)
             });
 
+            if let Err(ref payload) = result {
+                // Surface the panic payload so non-routing panics (real bugs) are
+                // distinguishable from missing-match-arm panics in CI output.
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("<non-string panic payload>");
+                eprintln!(
+                    "dispatch() panicked for '{subcommand}' — panic payload: {msg}"
+                );
+            }
             assert!(
                 result.is_ok(),
                 "dispatch() panicked for known subcommand '{subcommand}': \
