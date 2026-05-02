@@ -521,12 +521,49 @@ fn prepend(tool: &str, args: &[String]) -> Vec<String> {
     v
 }
 
-/// Route `skim cargo <subcmd> [args...]` to the correct category handler.
+/// Shared scaffolding for multi-category dispatchers (`cargo`, `go`, …).
 ///
 /// Handles flag interleaving: `skim cargo --show-stats test` works because
-/// we skip flags to find the first positional (the cargo subcmd), then pass
-/// ALL args (including flags) to the category dispatcher which handles
-/// flag extraction itself.
+/// we skip leading flags to find the first positional (the subcommand token),
+/// then the caller decides which args to forward.
+///
+/// Returns `Ok(Some((subcmd_str, subcmd_idx)))` when a subcommand is found, or
+/// `Ok(None)` after printing the missing-subcommand error (caller should return
+/// `ExitCode::FAILURE`).  The `tool` parameter is used only in the error message.
+fn extract_subcmd<'a>(
+    tool: &str,
+    args: &'a [String],
+    usage: &str,
+    supported: &str,
+) -> Result<Option<(&'a str, usize)>, anyhow::Error> {
+    match args.iter().position(|a| !a.starts_with('-')) {
+        Some(idx) => Ok(Some((args[idx].as_str(), idx))),
+        None => {
+            eprintln!(
+                "skim {tool}: missing subcommand\n\n\
+                 Usage: {usage}\n\n\
+                 Supported subcommands: {supported}"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Build a `Vec<String>` with `tool` prepended and the element at `skip_idx`
+/// removed, pre-allocating the exact capacity needed.
+fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> {
+    let mut v = Vec::with_capacity(args.len()); // len - 1 + 1 == len
+    v.push(tool.to_string());
+    v.extend(
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip_idx)
+            .map(|(_, s)| s.clone()),
+    );
+    v
+}
+
+/// Route `skim cargo <subcmd> [args...]` to the correct category handler.
 fn dispatch_cargo(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -536,34 +573,23 @@ fn dispatch_cargo(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Find first non-flag arg as the cargo subcommand.
-    let subcmd_idx = args.iter().position(|a| !a.starts_with('-'));
-    let Some(idx) = subcmd_idx else {
-        eprintln!(
-            "skim cargo: missing subcommand\n\n\
-             Usage: skim cargo <test|build|clippy|audit|nextest> [args...]\n\n\
-             Supported subcommands: test, nextest, build, clippy, audit"
-        );
+    let Some((subcmd, idx)) = extract_subcmd(
+        "cargo",
+        args,
+        "skim cargo <test|build|clippy|audit|nextest> [args...]",
+        "test, nextest, build, clippy, audit",
+    )?
+    else {
         return Ok(ExitCode::FAILURE);
     };
 
-    let subcmd = args[idx].as_str();
-
-    // Build args without the subcmd token, preserving all flags and other args
-    let without_subcmd: Vec<String> = args
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != idx)
-        .map(|(_, s)| s.clone())
-        .collect();
-
     match subcmd {
-        "test" | "t" => test::run(&prepend("cargo", &without_subcmd), analytics),
+        "test" | "t" => test::run(&prepend_without("cargo", args, idx), analytics),
         // nextest: keep the "nextest" token — the test handler uses it to select
         // the nextest parse path instead of the plain cargo-test path.
         "nextest" => test::run(&prepend("cargo", args), analytics),
-        "build" | "b" => build::run(&prepend("cargo", &without_subcmd), analytics),
-        "clippy" => build::run(&prepend("clippy", &without_subcmd), analytics),
+        "build" | "b" => build::run(&prepend_without("cargo", args, idx), analytics),
+        "clippy" => build::run(&prepend_without("clippy", args, idx), analytics),
         // audit: keep "audit" in args — pkg::run uses it to select the audit parser.
         "audit" => pkg::run(&prepend("cargo", args), analytics),
         unknown => {
@@ -588,28 +614,18 @@ fn dispatch_go(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let subcmd_idx = args.iter().position(|a| !a.starts_with('-'));
-    let Some(idx) = subcmd_idx else {
-        eprintln!(
-            "skim go: missing subcommand\n\n\
-             Usage: skim go <test> [args...]\n\n\
-             Supported subcommands: test"
-        );
+    let Some((subcmd, idx)) = extract_subcmd(
+        "go",
+        args,
+        "skim go <test> [args...]",
+        "test",
+    )?
+    else {
         return Ok(ExitCode::FAILURE);
     };
 
-    let subcmd = args[idx].as_str();
-
-    // Build args without the subcmd token, preserving all flags and other args.
-    let without_subcmd: Vec<String> = args
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != idx)
-        .map(|(_, s)| s.clone())
-        .collect();
-
     match subcmd {
-        "test" => test::run(&prepend("go", &without_subcmd), analytics),
+        "test" => test::run(&prepend_without("go", args, idx), analytics),
         unknown => {
             let safe = sanitize_for_display(unknown);
             eprintln!(
@@ -631,15 +647,17 @@ fn print_cargo_help() {
          Usage: skim cargo <SUBCOMMAND> [args...]\n\
          \n\
          Subcommands:\n\
-           test       Run and compress cargo test output\n\
+           test (t)   Run and compress cargo test output\n\
            nextest    Run and compress cargo nextest output\n\
-           build      Run and compress cargo build output\n\
+           build (b)  Run and compress cargo build output\n\
            clippy     Run and compress cargo clippy output\n\
            audit      Run and compress cargo audit output\n\
          \n\
          Examples:\n\
            skim cargo test\n\
+           skim cargo t          (alias for test)\n\
            skim cargo build --release\n\
+           skim cargo b --release  (alias for build)\n\
            skim cargo clippy -- -D warnings\n\
            skim cargo audit\n"
     );
