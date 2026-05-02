@@ -535,7 +535,7 @@ fn extract_subcmd<'a>(
     args: &'a [String],
     usage: &str,
     supported: &str,
-) -> Result<Option<(&'a str, usize)>, anyhow::Error> {
+) -> anyhow::Result<Option<(&'a str, usize)>> {
     match args.iter().position(|a| !a.starts_with('-')) {
         Some(idx) => Ok(Some((args[idx].as_str(), idx))),
         None => {
@@ -552,7 +552,7 @@ fn extract_subcmd<'a>(
 /// Build a `Vec<String>` with `tool` prepended and the element at `skip_idx`
 /// removed, pre-allocating the exact capacity needed.
 fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> {
-    let mut v = Vec::with_capacity(args.len()); // len - 1 + 1 == len
+    let mut v = Vec::with_capacity(args.len()); // remove one, prepend one → same len
     v.push(tool.to_string());
     v.extend(
         args.iter()
@@ -1002,12 +1002,6 @@ mod tests {
     fn test_dispatch_covers_all_known_subcommands() {
         use std::panic;
 
-        let analytics = crate::analytics::AnalyticsConfig {
-            enabled: false,
-            session_id: None,
-            input_cost_per_mtok: None,
-        };
-
         for &subcommand in KNOWN_SUBCOMMANDS {
             // Pass --help so handlers exit cleanly rather than spawning real
             // processes. Most category handlers print help and return SUCCESS
@@ -1015,8 +1009,8 @@ mod tests {
             // straight to the handler with the same args.
             let args: Vec<String> = vec!["--help".to_string()];
 
+            // AnalyticsConfig is not UnwindSafe, so construct it inside the closure.
             let result = panic::catch_unwind(|| {
-                // analytics is not UnwindSafe, so re-create inside the closure.
                 let a = crate::analytics::AnalyticsConfig {
                     enabled: false,
                     session_id: None,
@@ -1052,6 +1046,11 @@ mod tests {
 
         // Also verify that an unknown name is NOT in KNOWN_SUBCOMMANDS and
         // correctly returns an Err (not a panic) from dispatch().
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: false,
+            session_id: None,
+            input_cost_per_mtok: None,
+        };
         let unknown_result = dispatch("__unknown_xyz__", &[], &analytics);
         assert!(
             unknown_result.is_err(),
