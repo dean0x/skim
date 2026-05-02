@@ -1,8 +1,8 @@
-//! Lint subcommand dispatcher (#104, #116, #133)
+//! Lint handler — dispatches to linter parsers (#104, #116, #133)
 //!
-//! Routes `skim lint <linter> [args...]` to the appropriate linter parser.
-//! Currently supported linters: `biome`, `black`, `dprint`, `eslint`, `gofmt`,
-//! `golangci`, `mypy`, `oxlint`, `prettier`, `ruff`, `rustfmt`.
+//! Called via flat dispatch: `skim <linter> [args...]`. Supported linters:
+//! `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`,
+//! `oxlint`, `prettier`, `ruff`, `rustfmt`.
 
 pub(crate) mod biome;
 pub(crate) mod black;
@@ -30,7 +30,7 @@ const KNOWN_LINTERS: &[&str] = &[
     "ruff", "rustfmt",
 ];
 
-/// Entry point for `skim lint <linter> [args...]`.
+/// Entry point for `skim <linter> [args...]` (lint handler).
 ///
 /// If no linter is specified or `--help` / `-h` is passed, prints usage
 /// and exits. Otherwise dispatches to the linter-specific handler.
@@ -74,9 +74,9 @@ pub(crate) fn run(
         linter => {
             let safe_linter = crate::cmd::sanitize_for_display(linter);
             eprintln!(
-                "skim lint: unknown linter '{safe_linter}'\n\
+                "skim: unknown linter '{safe_linter}'\n\
                  Available linters: {}\n\
-                 Run 'skim lint --help' for usage information",
+                 Run 'skim <linter> --help' for usage information",
                 KNOWN_LINTERS.join(", ")
             );
             Ok(ExitCode::FAILURE)
@@ -85,7 +85,7 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim lint <linter> [args...]");
+    println!("skim <linter> [args...]");
     println!();
     println!("  Run linters and parse the output for AI context windows.");
     println!();
@@ -99,18 +99,18 @@ fn print_help() {
     println!("  --show-stats    Show token statistics");
     println!();
     println!("Examples:");
-    println!("  skim lint biome check .        Run biome check");
-    println!("  skim lint black src/           Run black --check");
-    println!("  skim lint dprint check .       Run dprint check");
-    println!("  skim lint eslint .             Run eslint");
-    println!("  skim lint gofmt ./...          Run gofmt -l");
-    println!("  skim lint golangci run ./...   Run golangci-lint");
-    println!("  skim lint mypy src/            Run mypy");
-    println!("  skim lint oxlint src/          Run oxlint");
-    println!("  skim lint prettier .           Run prettier --check");
-    println!("  skim lint ruff check .         Run ruff check");
-    println!("  skim lint rustfmt src/         Run rustfmt --check");
-    println!("  eslint . 2>&1 | skim lint eslint  Pipe eslint output");
+    println!("  skim biome check .        Run biome check");
+    println!("  skim black src/           Run black --check");
+    println!("  skim dprint check .       Run dprint check");
+    println!("  skim eslint .             Run eslint");
+    println!("  skim gofmt ./...          Run gofmt -l");
+    println!("  skim golangci run ./...   Run golangci-lint");
+    println!("  skim mypy src/            Run mypy");
+    println!("  skim oxlint src/          Run oxlint");
+    println!("  skim prettier .           Run prettier --check");
+    println!("  skim ruff check .         Run ruff check");
+    println!("  skim rustfmt src/         Run rustfmt --check");
+    println!("  eslint . 2>&1 | skim eslint  Pipe eslint output");
 }
 
 // ============================================================================

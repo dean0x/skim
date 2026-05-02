@@ -1,8 +1,9 @@
 //! Build output compression (#51)
 //!
-//! Executes build tools (cargo, clippy, tsc) and compresses their output
-//! using three-tier parse degradation. Supports both direct invocation and
-//! piped stdin.
+//! Handles build tool output for cargo, clippy, and tsc using three-tier
+//! parse degradation. Called via flat dispatch (`skim tsc`) or multi-category
+//! dispatch (`skim cargo build`, `skim cargo clippy`). Supports both direct
+//! invocation and piped stdin.
 
 pub(crate) mod cargo;
 pub(crate) mod tsc;
@@ -18,9 +19,11 @@ use crate::runner::{CommandOutput, CommandRunner};
 // Public dispatch
 // ============================================================================
 
-/// Dispatch the `build` subcommand.
+/// Dispatch build tool handlers.
 ///
-/// Usage: `skim build {cargo|clippy|tsc} [args...]`
+/// Called by flat dispatch (`skim tsc`) or multi-category dispatch
+/// (`skim cargo build`, `skim cargo clippy`). The `args` slice has the
+/// tool name prepended by the caller.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -67,12 +70,9 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim build");
+    println!("Build tool output compression");
     println!();
     println!("  Execute build tools and compress output for AI context windows.");
-    println!();
-    println!("USAGE:");
-    println!("  skim build <TOOL> [args...]");
     println!();
     println!("TOOLS:");
     println!("  cargo      Run cargo build with output compression");
@@ -80,10 +80,10 @@ fn print_help() {
     println!("  tsc        Run TypeScript compiler with output compression");
     println!();
     println!("EXAMPLES:");
-    println!("  skim build cargo");
-    println!("  skim build cargo --release");
-    println!("  skim build clippy -- -W clippy::pedantic");
-    println!("  skim build tsc --noEmit");
+    println!("  skim cargo build");
+    println!("  skim cargo build --release");
+    println!("  skim cargo clippy -- -W clippy::pedantic");
+    println!("  skim tsc --noEmit");
 }
 
 // Shared helpers (user_has_flag, inject_flag_before_separator) are in crate::cmd

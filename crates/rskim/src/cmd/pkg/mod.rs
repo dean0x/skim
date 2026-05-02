@@ -1,7 +1,7 @@
-//! Package manager output compression (#105)
+//! Package manager handler — dispatches to package manager parsers (#105)
 //!
-//! Routes `skim pkg <tool> [subcmd] [args...]` to the appropriate package
-//! manager parser. Currently supported tools: `npm`, `pnpm`, `pip`, `cargo`.
+//! Called via flat dispatch: `skim <tool> [subcmd] [args...]`. Supported
+//! tools: `npm`, `pnpm`, `pip`, `cargo`.
 
 mod cargo;
 mod npm;
@@ -13,10 +13,10 @@ use std::process::ExitCode;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-/// Known package manager tools that `skim pkg` can dispatch to.
+/// Known package manager tools that the pkg handler can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["npm", "pnpm", "pip", "cargo"];
 
-/// Entry point for `skim pkg <tool> [subcmd] [args...]`.
+/// Entry point for `skim <tool> [subcmd] [args...]` (pkg handler).
 ///
 /// If no tool is specified or `--help` / `-h` is passed, prints usage
 /// and exits. Otherwise dispatches to the tool-specific handler.
@@ -52,9 +52,9 @@ pub(crate) fn run(
         tool => {
             let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(
-                "skim pkg: unknown tool '{safe_tool}'\n\
+                "skim: unknown tool '{safe_tool}'\n\
                  Available tools: {}\n\
-                 Run 'skim pkg --help' for usage information",
+                 Run 'skim <tool> --help' for usage information",
                 KNOWN_TOOLS.join(", ")
             );
             Ok(ExitCode::FAILURE)
@@ -116,7 +116,7 @@ where
 }
 
 fn print_help() {
-    println!("skim pkg <tool> [subcmd] [args...]");
+    println!("skim <tool> [subcmd] [args...]");
     println!();
     println!("  Parse package manager output for AI context windows.");
     println!();
@@ -126,14 +126,14 @@ fn print_help() {
     }
     println!();
     println!("Examples:");
-    println!("  skim pkg npm install              Run npm install");
-    println!("  skim pkg npm audit                Run npm audit");
-    println!("  skim pkg npm outdated             Run npm outdated");
-    println!("  skim pkg pip install flask        Run pip install flask");
-    println!("  skim pkg pip check                Run pip check");
-    println!("  skim pkg cargo audit              Run cargo audit");
-    println!("  skim pkg pnpm install             Run pnpm install");
-    println!("  npm install 2>&1 | skim pkg npm install  Pipe npm output");
+    println!("  skim npm install              Run npm install");
+    println!("  skim npm audit                Run npm audit");
+    println!("  skim npm outdated             Run npm outdated");
+    println!("  skim pip install flask        Run pip install flask");
+    println!("  skim pip check                Run pip check");
+    println!("  skim cargo audit              Run cargo audit");
+    println!("  skim pnpm install             Run pnpm install");
+    println!("  npm install 2>&1 | skim npm install  Pipe npm output");
 }
 
 // ============================================================================
