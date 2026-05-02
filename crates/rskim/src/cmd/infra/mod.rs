@@ -18,7 +18,7 @@ use crate::output::canonical::InfraResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-/// Known infra tools that `skim infra` can dispatch to.
+/// Known infra tools that the infra handler can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["aws", "curl", "gh", "wget"];
 
 /// Entry point for `skim <tool> [args...]` (infra handler).

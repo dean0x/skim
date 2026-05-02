@@ -24,7 +24,7 @@ use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-/// Known linters that `skim lint` can dispatch to.
+/// Known linters that the lint handler can dispatch to.
 const KNOWN_LINTERS: &[&str] = &[
     "biome", "black", "dprint", "eslint", "gofmt", "golangci", "mypy", "oxlint", "prettier",
     "ruff", "rustfmt",

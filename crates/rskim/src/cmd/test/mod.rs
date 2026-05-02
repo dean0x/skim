@@ -1,4 +1,4 @@
-//! Test subcommand dispatcher (#46, #47, #48, #49)
+//! Test handler — dispatches to test runner parsers (#46, #47, #48, #49)
 //!
 //! Routes `skim <runner> [args...]` to the appropriate test parser.
 //! Currently supported runners: `cargo`, `go`, `vitest`, `jest`, `pytest`.
@@ -11,7 +11,7 @@ pub(crate) mod vitest;
 
 use std::process::ExitCode;
 
-/// Known test runners that `skim test` can dispatch to.
+/// Known test runners that the test handler can dispatch to.
 const KNOWN_RUNNERS: &[&str] = &["cargo", "go", "vitest", "jest", "pytest"];
 
 /// Entry point for `skim <runner> [args...]` (test runners).
