@@ -220,7 +220,6 @@ pub(crate) fn build_streaming_label(
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
-
 // ============================================================================
 // Unit tests
 // ============================================================================

@@ -275,7 +275,9 @@ fn test_completions_include_tool_subcommands() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     // v2.8.0: flat dispatch — tool names are top-level subcommands
-    for tool in &["aws", "curl", "gh", "wget", "cargo", "eslint", "npm", "find"] {
+    for tool in &[
+        "aws", "curl", "gh", "wget", "cargo", "eslint", "npm", "find",
+    ] {
         assert!(
             stdout.contains(tool),
             "Bash completions should include '{tool}' as top-level subcommand"

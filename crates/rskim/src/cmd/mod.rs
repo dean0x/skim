@@ -552,7 +552,11 @@ fn extract_subcmd<'a>(
 /// Build a `Vec<String>` with `tool` prepended and the element at `skip_idx`
 /// removed, pre-allocating the exact capacity needed.
 fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> {
-    debug_assert!(skip_idx < args.len(), "skip_idx {skip_idx} out of bounds for args len {}", args.len());
+    debug_assert!(
+        skip_idx < args.len(),
+        "skip_idx {skip_idx} out of bounds for args len {}",
+        args.len()
+    );
     let mut v = Vec::with_capacity(args.len()); // remove one, prepend one → same len
     v.push(tool.to_string());
     v.extend(
@@ -614,12 +618,7 @@ fn dispatch_go(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let Some((subcmd, idx)) = extract_subcmd(
-        "go",
-        args,
-        "skim go <test> [args...]",
-        "test",
-    )?
+    let Some((subcmd, idx)) = extract_subcmd("go", args, "skim go <test> [args...]", "test")?
     else {
         return Ok(ExitCode::FAILURE);
     };
@@ -732,9 +731,7 @@ pub(crate) fn dispatch(
         | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
         "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
         "aws" | "curl" | "gh" | "wget" => infra::run(&prepend(subcommand, args), analytics),
-        "find" | "grep" | "ls" | "rg" | "tree" => {
-            file::run(&prepend(subcommand, args), analytics)
-        }
+        "find" | "grep" | "ls" | "rg" | "tree" => file::run(&prepend(subcommand, args), analytics),
 
         // Deprecated v2.7 category subcommands — forward with deprecation warning.
         // args are passed as-is; each category handler accepts the old format.
@@ -742,33 +739,45 @@ pub(crate) fn dispatch(
             "test",
             "Use the tool name directly, e.g.: skim jest, skim pytest, skim vitest,\n\
              or for cargo: skim cargo test",
-            args, analytics, test::run,
+            args,
+            analytics,
+            test::run,
         ),
         "build" => dispatch_deprecated(
             "build",
             "Use the tool name directly, e.g.: skim tsc\n\
              or for cargo: skim cargo build",
-            args, analytics, build::run,
+            args,
+            analytics,
+            build::run,
         ),
         "lint" => dispatch_deprecated(
             "lint",
             "Use the tool name directly, e.g.: skim eslint, skim ruff, skim mypy",
-            args, analytics, lint::run,
+            args,
+            analytics,
+            lint::run,
         ),
         "pkg" => dispatch_deprecated(
             "pkg",
             "Use the tool name directly, e.g.: skim npm, skim pnpm, skim pip",
-            args, analytics, pkg::run,
+            args,
+            analytics,
+            pkg::run,
         ),
         "file" => dispatch_deprecated(
             "file",
             "Use the tool name directly, e.g.: skim find, skim grep, skim ls, skim rg, skim tree",
-            args, analytics, file::run,
+            args,
+            analytics,
+            file::run,
         ),
         "infra" => dispatch_deprecated(
             "infra",
             "Use the tool name directly, e.g.: skim gh, skim aws, skim curl, skim wget",
-            args, analytics, infra::run,
+            args,
+            analytics,
+            infra::run,
         ),
 
         _ => {
@@ -1104,9 +1113,7 @@ mod tests {
                     .map(|s| s.as_str())
                     .or_else(|| payload.downcast_ref::<&str>().copied())
                     .unwrap_or("<non-string panic payload>");
-                eprintln!(
-                    "dispatch() panicked for '{subcommand}' — panic payload: {msg}"
-                );
+                eprintln!("dispatch() panicked for '{subcommand}' — panic payload: {msg}");
             }
             assert!(
                 result.is_ok(),

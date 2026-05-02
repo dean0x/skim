@@ -964,9 +964,7 @@ fn test_rewrite_npm_install_with_args() {
         .args(["rewrite", "npm", "install", "express", "lodash"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "skim npm install express lodash",
-        ));
+        .stdout(predicate::str::contains("skim npm install express lodash"));
 }
 
 #[test]
@@ -1239,9 +1237,7 @@ fn test_rewrite_gh_pr_list_json_roundtrip() {
         .args(["rewrite", "gh", "pr", "list", "--json", "number"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "skim gh pr list --json number",
-        ));
+        .stdout(predicate::str::contains("skim gh pr list --json number"));
 }
 
 #[test]

@@ -677,8 +677,7 @@ mod tests {
     fn test_session_id_injected_into_deprecated_category_format() {
         let result = inject_session_id("skim build cargo", Some("sess-abc"));
         assert_eq!(
-            result,
-            "skim --session-id=sess-abc build cargo",
+            result, "skim --session-id=sess-abc build cargo",
             "deprecated category-first format must still receive --session-id injection"
         );
     }
