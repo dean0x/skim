@@ -324,7 +324,7 @@ pub(crate) fn process_stdin(
         if let Some(fname) = filename_hint {
             anyhow::anyhow!(
                 "Language detection failed: unrecognized filename '{}'\n\
-                 Supported extensions: .ts, .tsx, .js, .jsx, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
+                 Supported extensions: .ts, .tsx, .js, .jsx, .cjs, .mjs, .py, .rs, .go, .java, .c, .h, .cpp, .hpp, .cxx, .cc, .md, .json, .yaml, .yml, .toml\n\
                  Hint: use --language to specify the language explicitly\n\
                  Example: cat file | skim - --language=typescript",
                 fname
