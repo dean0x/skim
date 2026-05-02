@@ -64,6 +64,8 @@ fn test_skim_test_cargo_stdin_json() {
     Command::cargo_bin("skim")
         .unwrap()
         .args(["cargo", "test"])
+        // Remove SKIM_PASSTHROUGH so compression is not bypassed inside the child process.
+        .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(json_input)
         .assert()
         .success()
@@ -85,6 +87,8 @@ fn test_skim_test_cargo_stdin_plain_text() {
     Command::cargo_bin("skim")
         .unwrap()
         .args(["cargo", "test"])
+        // Remove SKIM_PASSTHROUGH so compression is not bypassed inside the child process.
+        .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(text_input)
         .assert()
         .success()
@@ -176,6 +180,7 @@ fn test_skim_cargo_b_alias_dispatches_to_build() {
         .args(["cargo", "b"])
         // Must not produce an error about unsupported subcommand
         .assert()
+        .success()
         .stderr(predicate::str::contains("unsupported subcommand").not())
         // Must also not show "missing subcommand" (the alias was recognised)
         .stderr(predicate::str::contains("missing subcommand").not());
@@ -234,4 +239,84 @@ fn test_skim_build_deprecated_category_warns() {
         !stderr.contains("unsupported subcommand"),
         "unexpected unsupported-subcommand error: {stderr}"
     );
+}
+
+// ============================================================================
+// Unknown cargo subcommand — error path coverage
+// ============================================================================
+
+/// `skim cargo unknownthing` must fail with an "unsupported subcommand" error
+/// on stderr. This covers the `unknown` arm in `dispatch_cargo`.
+#[test]
+fn test_skim_cargo_unknown_subcommand_errors() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["cargo", "unknownthing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported subcommand"));
+}
+
+// ============================================================================
+// Deprecation aliases — old `skim lint` / `skim pkg` / `skim file` / `skim infra`
+// ============================================================================
+
+/// `skim lint --help` (old v2.7 syntax) must print a deprecation warning to
+/// stderr. Uses --help to avoid requiring real tool input.
+#[test]
+fn test_skim_lint_deprecated_category_warns() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        // Old category syntax: `skim lint --help`
+        .args(["lint", "--help"])
+        .assert()
+        // Deprecation warning must appear on stderr
+        .stderr(predicate::str::contains("deprecated"))
+        // Must not produce an "unsupported subcommand" error — the path is wired
+        .stderr(predicate::str::contains("unsupported subcommand").not());
+}
+
+/// `skim pkg --help` (old v2.7 syntax) must print a deprecation warning to
+/// stderr. Uses --help to avoid requiring real tool input.
+#[test]
+fn test_skim_pkg_deprecated_category_warns() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        // Old category syntax: `skim pkg --help`
+        .args(["pkg", "--help"])
+        .assert()
+        // Deprecation warning must appear on stderr
+        .stderr(predicate::str::contains("deprecated"))
+        // Must not produce an "unsupported subcommand" error — the path is wired
+        .stderr(predicate::str::contains("unsupported subcommand").not());
+}
+
+/// `skim file --help` (old v2.7 syntax) must print a deprecation warning to
+/// stderr. Uses --help to avoid requiring real tool input.
+#[test]
+fn test_skim_file_deprecated_category_warns() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        // Old category syntax: `skim file --help`
+        .args(["file", "--help"])
+        .assert()
+        // Deprecation warning must appear on stderr
+        .stderr(predicate::str::contains("deprecated"))
+        // Must not produce an "unsupported subcommand" error — the path is wired
+        .stderr(predicate::str::contains("unsupported subcommand").not());
+}
+
+/// `skim infra --help` (old v2.7 syntax) must print a deprecation warning to
+/// stderr. Uses --help to avoid requiring real tool input.
+#[test]
+fn test_skim_infra_deprecated_category_warns() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        // Old category syntax: `skim infra --help`
+        .args(["infra", "--help"])
+        .assert()
+        // Deprecation warning must appear on stderr
+        .stderr(predicate::str::contains("deprecated"))
+        // Must not produce an "unsupported subcommand" error — the path is wired
+        .stderr(predicate::str::contains("unsupported subcommand").not());
 }
