@@ -54,15 +54,14 @@ pub(crate) fn run(
         Some(unknown) => {
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             anyhow::bail!(
-                "unknown build tool: '{safe_unknown}'\n\n\
-                 Usage: skim build {{cargo|clippy|tsc}} [args...]\n\n\
+                "unknown build tool: {safe_unknown}\n\
                  Supported tools: cargo, clippy, tsc"
             );
         }
         None => {
             anyhow::bail!(
                 "missing required argument: <TOOL>\n\n\
-                 Usage: skim build {{cargo|clippy|tsc}} [args...]\n\n\
+                 Usage: skim {{cargo|clippy|tsc}} [args...]\n\n\
                  Supported tools: cargo, clippy, tsc"
             );
         }
@@ -70,16 +69,19 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("Build tool output compression");
+    println!("skim <tool> [args...]");
     println!();
-    println!("  Execute build tools and compress output for AI context windows.");
+    println!("  Run build tools and compress output for AI context windows.");
     println!();
-    println!("TOOLS:");
+    println!("Available tools:");
     println!("  cargo      Run cargo build with output compression");
     println!("  clippy     Run cargo clippy with output compression");
     println!("  tsc        Run TypeScript compiler with output compression");
     println!();
-    println!("EXAMPLES:");
+    println!("Flags:");
+    println!("  --show-stats    Show token statistics");
+    println!();
+    println!("Examples:");
     println!("  skim cargo build");
     println!("  skim cargo build --release");
     println!("  skim cargo clippy -- -W clippy::pedantic");
