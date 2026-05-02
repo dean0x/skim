@@ -161,11 +161,7 @@ pub(super) fn run_parsed_command(
     }
 
     // Combine stdout+stderr for stats and analytics
-    let raw_text = if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    };
+    let raw_text = super::combine_output(&output).into_owned();
 
     // Report token stats if requested
     if show_stats {

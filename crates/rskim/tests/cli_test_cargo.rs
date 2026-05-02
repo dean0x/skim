@@ -221,24 +221,15 @@ fn test_skim_test_deprecated_category_warns_and_succeeds() {
 /// This test verifies the deprecated path is wired and warns correctly.
 #[test]
 fn test_skim_build_deprecated_category_warns() {
-    let output = Command::cargo_bin("skim")
+    Command::cargo_bin("skim")
         .unwrap()
         // Old category syntax: `skim build cargo`
         .args(["build", "cargo"])
-        .output()
-        .expect("skim build cargo must not hang");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Deprecation warning must appear on stderr.
-    assert!(
-        stderr.contains("deprecated"),
-        "expected deprecation warning on stderr, got: {stderr}"
-    );
-    // Must not produce an "unsupported subcommand" error — the path is wired.
-    assert!(
-        !stderr.contains("unsupported subcommand"),
-        "unexpected unsupported-subcommand error: {stderr}"
-    );
+        .assert()
+        // Deprecation warning must appear on stderr.
+        .stderr(predicate::str::contains("deprecated"))
+        // Must not produce an "unsupported subcommand" error — the path is wired.
+        .stderr(predicate::str::contains("unsupported subcommand").not());
 }
 
 // ============================================================================

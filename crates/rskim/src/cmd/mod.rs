@@ -558,8 +558,7 @@ fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> 
     v.extend(
         args.iter()
             .enumerate()
-            .filter(|(i, _)| *i != skip_idx)
-            .map(|(_, s)| s.clone()),
+            .filter_map(|(i, s)| (i != skip_idx).then(|| s.clone())),
     );
     v
 }
