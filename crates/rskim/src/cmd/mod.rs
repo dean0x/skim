@@ -135,6 +135,8 @@ pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
 ///
 /// v2.8.0: Flat dispatch — tool names promoted to top-level subcommands.
 /// Category prefixes (build, lint, pkg, infra, file, test) removed.
+/// Deprecated category names retained here for backward-compat; dispatch()
+/// prints a deprecation warning and forwards to the appropriate handler.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     // Meta/utility (unchanged)
     "agents",
@@ -182,6 +184,14 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "ls",
     "rg",
     "tree",
+    // Deprecated v2.7 category subcommands — kept for backward compatibility.
+    // dispatch() emits a deprecation warning and forwards to the handler.
+    "test",
+    "build",
+    "lint",
+    "pkg",
+    "file",
+    "infra",
 ];
 
 /// Check whether `name` is a registered subcommand.
@@ -663,8 +673,9 @@ pub(crate) fn dispatch(
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     if !is_known_subcommand(subcommand) {
+        let safe = sanitize_for_display(subcommand);
         anyhow::bail!(
-            "Unknown subcommand: '{subcommand}'\n\
+            "Unknown subcommand: '{safe}'\n\
              Available subcommands: {}\n\
              Run 'skim --help' for usage information",
             KNOWN_SUBCOMMANDS.join(", ")
@@ -696,6 +707,56 @@ pub(crate) fn dispatch(
         "aws" | "curl" | "gh" | "wget" => infra::run(&prepend(subcommand, args), analytics),
         "find" | "grep" | "ls" | "rg" | "tree" => {
             file::run(&prepend(subcommand, args), analytics)
+        }
+
+        // Deprecated v2.7 category subcommands — forward with deprecation warning.
+        // `skim test pytest` → warn, then run as `skim pytest` (flat syntax).
+        // `skim test cargo`  → warn, then run as `skim cargo test` (dispatcher).
+        // The first arg in `args` is the old tool/subcommand name.
+        "test" => {
+            eprintln!(
+                "skim: 'test' category subcommand is deprecated since v2.8.0.\n\
+                 Use the tool name directly, e.g.: skim jest, skim pytest, skim vitest,\n\
+                 or for cargo: skim cargo test"
+            );
+            // Forward: treat args as-is — category handler still accepts them.
+            test::run(args, analytics)
+        }
+        "build" => {
+            eprintln!(
+                "skim: 'build' category subcommand is deprecated since v2.8.0.\n\
+                 Use the tool name directly, e.g.: skim tsc,\n\
+                 or for cargo: skim cargo build"
+            );
+            build::run(args, analytics)
+        }
+        "lint" => {
+            eprintln!(
+                "skim: 'lint' category subcommand is deprecated since v2.8.0.\n\
+                 Use the tool name directly, e.g.: skim eslint, skim ruff, skim mypy"
+            );
+            lint::run(args, analytics)
+        }
+        "pkg" => {
+            eprintln!(
+                "skim: 'pkg' category subcommand is deprecated since v2.8.0.\n\
+                 Use the tool name directly, e.g.: skim npm, skim pnpm, skim pip"
+            );
+            pkg::run(args, analytics)
+        }
+        "file" => {
+            eprintln!(
+                "skim: 'file' category subcommand is deprecated since v2.8.0.\n\
+                 Use the tool name directly, e.g.: skim find, skim grep, skim ls, skim rg, skim tree"
+            );
+            file::run(args, analytics)
+        }
+        "infra" => {
+            eprintln!(
+                "skim: 'infra' category subcommand is deprecated since v2.8.0.\n\
+                 Use the tool name directly, e.g.: skim gh, skim aws, skim curl, skim wget"
+            );
+            infra::run(args, analytics)
         }
 
         // Unreachable: is_known_subcommand guard above rejects unknown names
@@ -906,5 +967,82 @@ mod tests {
     fn test_read_bounded_empty_input() {
         let result = read_bounded(b"".as_ref(), 1024).unwrap();
         assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // dispatch() coverage — KNOWN_SUBCOMMANDS sync guard
+    // ========================================================================
+
+    /// Verify that every entry in KNOWN_SUBCOMMANDS has a corresponding match
+    /// arm in dispatch() and does NOT hit the unreachable!() fallback.
+    ///
+    /// dispatch() calls real subcommand handlers which may fail for unrelated
+    /// reasons (missing binary, empty args), but they must never panic with
+    /// "unknown subcommand passed is_known_subcommand guard". We distinguish
+    /// that specific panic from ordinary handler errors by catching panics.
+    #[test]
+    fn test_dispatch_covers_all_known_subcommands() {
+        use std::panic;
+
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: false,
+            session_id: None,
+            input_cost_per_mtok: None,
+        };
+
+        for &subcommand in KNOWN_SUBCOMMANDS {
+            // Pass --help so handlers exit cleanly rather than spawning real
+            // processes. Most category handlers print help and return SUCCESS
+            // when --help is the only arg; the deprecated category arms forward
+            // straight to the handler with the same args.
+            let args: Vec<String> = vec!["--help".to_string()];
+
+            let result = panic::catch_unwind(|| {
+                // analytics is not UnwindSafe, so re-create inside the closure.
+                let a = crate::analytics::AnalyticsConfig {
+                    enabled: false,
+                    session_id: None,
+                    input_cost_per_mtok: None,
+                };
+                dispatch(subcommand, &args, &a)
+            });
+
+            match result {
+                Ok(_) => {
+                    // Handler ran (may have returned Ok or Err — both are fine).
+                }
+                Err(panic_val) => {
+                    // A panic occurred. Fail only if it's the unreachable!() guard.
+                    let is_routing_panic = panic_val
+                        .downcast_ref::<String>()
+                        .map(|s| s.contains("passed is_known_subcommand guard"))
+                        .unwrap_or(false)
+                        || panic_val
+                            .downcast_ref::<&str>()
+                            .map(|s| s.contains("passed is_known_subcommand guard"))
+                            .unwrap_or(false);
+
+                    assert!(
+                        !is_routing_panic,
+                        "dispatch() hit unreachable!() for subcommand '{subcommand}': \
+                         entry is in KNOWN_SUBCOMMANDS but has no match arm in dispatch()"
+                    );
+                    // Any other panic (e.g. from handler internals) is not our concern here.
+                }
+            }
+        }
+
+        // Also verify that an unknown name is NOT in KNOWN_SUBCOMMANDS and
+        // correctly returns an Err (not a panic) from dispatch().
+        let unknown_result = dispatch("__unknown_xyz__", &[], &analytics);
+        assert!(
+            unknown_result.is_err(),
+            "dispatch() should return Err for unknown subcommand"
+        );
+        let err_msg = unknown_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unknown subcommand"),
+            "error message should mention 'Unknown subcommand', got: {err_msg}"
+        );
     }
 }
