@@ -1,7 +1,7 @@
-//! Infrastructure tool subcommand dispatcher (#116, #131)
+//! Infrastructure tool handler — dispatches to infra parsers (#116, #131)
 //!
-//! Routes `skim infra <tool> [args...]` to the appropriate infra tool parser.
-//! Currently supported tools: `aws`, `curl`, `gh`, `wget`.
+//! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
+//! `aws`, `curl`, `gh`, `wget`.
 //!
 //! The `gh` handler supports list commands (`pr list`, `issue list`, `run list`)
 //! and view commands (`issue view`, `pr view`, `pr checks`, `run view`).
@@ -21,7 +21,7 @@ use crate::runner::CommandOutput;
 /// Known infra tools that `skim infra` can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["aws", "curl", "gh", "wget"];
 
-/// Entry point for `skim infra <tool> [args...]`.
+/// Entry point for `skim <tool> [args...]` (infra handler).
 ///
 /// If no tool is specified or `--help` / `-h` is passed, prints usage
 /// and exits. Otherwise dispatches to the tool-specific handler.
@@ -57,9 +57,9 @@ pub(crate) fn run(
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(
-                "skim infra: unknown tool '{safe_tool}'\n\
+                "skim: unknown tool '{safe_tool}'\n\
                  Available tools: {}\n\
-                 Run 'skim infra --help' for usage information",
+                 Run 'skim <tool> --help' for usage information",
                 KNOWN_TOOLS.join(", ")
             );
             Ok(ExitCode::FAILURE)
@@ -109,7 +109,7 @@ fn extract_infra_json_flag(args: &[String]) -> (Vec<String>, bool) {
 }
 
 fn print_help() {
-    println!("skim infra <tool> [args...]");
+    println!("skim <tool> [args...]");
     println!();
     println!("  Run infrastructure tools and parse the output for AI context windows.");
     println!();
@@ -123,16 +123,16 @@ fn print_help() {
     println!("  --show-stats    Show token statistics");
     println!();
     println!("Examples:");
-    println!("  skim infra gh pr list              List GitHub pull requests");
-    println!("  skim infra gh issue list           List GitHub issues");
-    println!("  skim infra gh run list             List workflow runs");
-    println!("  skim infra gh issue view 42        View GitHub issue details");
-    println!("  skim infra gh pr view 15           View PR details");
-    println!("  skim infra gh pr checks 15         View PR check status");
-    println!("  skim infra gh run view 12345       View workflow run details");
-    println!("  skim infra aws s3 ls               List S3 buckets");
-    println!("  skim infra curl https://api.example.com/data  Make HTTP request");
-    println!("  skim infra wget https://example.com/file.txt  Download a file");
+    println!("  skim gh pr list              List GitHub pull requests");
+    println!("  skim gh issue list           List GitHub issues");
+    println!("  skim gh run list             List workflow runs");
+    println!("  skim gh issue view 42        View GitHub issue details");
+    println!("  skim gh pr view 15           View PR details");
+    println!("  skim gh pr checks 15         View PR check status");
+    println!("  skim gh run view 12345       View workflow run details");
+    println!("  skim aws s3 ls               List S3 buckets");
+    println!("  skim curl https://api.example.com/data  Make HTTP request");
+    println!("  skim wget https://example.com/file.txt  Download a file");
 }
 
 // ============================================================================
@@ -220,33 +220,6 @@ pub(crate) fn build_streaming_label(
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
-/// Build the clap `Command` definition for shell completions.
-///
-/// Models `tool` as a positional value with the known tool names so that
-/// `skim infra <TAB>` suggests `aws`, `curl`, `gh`, `wget`.
-#[allow(dead_code)] // retained for potential future use in completions
-pub(super) fn command() -> clap::Command {
-    clap::Command::new("infra")
-        .about("Run infrastructure tools and parse output for AI context windows")
-        .arg(
-            clap::Arg::new("tool")
-                .value_name("TOOL")
-                .value_parser(["aws", "curl", "gh", "wget"])
-                .help("Infrastructure tool to run (aws, curl, gh, wget)"),
-        )
-        .arg(
-            clap::Arg::new("json")
-                .long("json")
-                .action(clap::ArgAction::SetTrue)
-                .help("Emit structured JSON output"),
-        )
-        .arg(
-            clap::Arg::new("show-stats")
-                .long("show-stats")
-                .action(clap::ArgAction::SetTrue)
-                .help("Show token statistics"),
-        )
-}
 
 // ============================================================================
 // Unit tests
