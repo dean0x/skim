@@ -59,7 +59,7 @@ pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 ///
 /// # Examples
 /// - `"skim git status"` → `"skim --session-id=abc git status"`
-/// - `"skim git status && skim build cargo"` → `"skim --session-id=abc git status && skim --session-id=abc build cargo"`
+/// - `"skim git status && skim cargo build"` → `"skim --session-id=abc git status && skim --session-id=abc cargo build"`
 fn inject_session_id_into_compound(cmd: &str, sid: &str) -> String {
     // Detect compound operator: try ` && ` first, then ` || `.
     // Only one type is supported per compound command (mixing is unusual for rewritten cmds).
@@ -548,10 +548,10 @@ mod tests {
     /// AD-HK-2: subcommand and flags are preserved after injection.
     #[test]
     fn test_session_id_injection_preserves_subcommand_and_flags() {
-        let result = inject_session_id("skim build cargo --show-stats", Some("sess-xyz"));
+        let result = inject_session_id("skim cargo build --show-stats", Some("sess-xyz"));
         assert_eq!(
             result,
-            "skim --session-id=sess-xyz build cargo --show-stats"
+            "skim --session-id=sess-xyz cargo build --show-stats"
         );
     }
 
@@ -573,7 +573,7 @@ mod tests {
     /// AD-HK-2: injection flag format is --session-id=VALUE (equals form, no space).
     #[test]
     fn test_session_id_injection_uses_equals_form() {
-        let result = inject_session_id("skim lint eslint", Some("my-session"));
+        let result = inject_session_id("skim eslint", Some("my-session"));
         assert!(
             result.contains("--session-id=my-session"),
             "injection must use --session-id=VALUE equals form, got: {result}"
@@ -652,10 +652,10 @@ mod tests {
     /// B-AC5: compound `&&` command injects session_id into every skim segment.
     #[test]
     fn test_session_id_injected_into_compound_and_command() {
-        let result = inject_session_id("skim git status && skim build cargo", Some("sess-abc"));
+        let result = inject_session_id("skim git status && skim cargo build", Some("sess-abc"));
         assert_eq!(
             result,
-            "skim --session-id=sess-abc git status && skim --session-id=sess-abc build cargo",
+            "skim --session-id=sess-abc git status && skim --session-id=sess-abc cargo build",
             "both skim segments in a && compound must receive --session-id injection"
         );
     }
@@ -663,11 +663,23 @@ mod tests {
     /// B-AC5: compound `||` command injects session_id into every skim segment.
     #[test]
     fn test_session_id_injected_into_compound_or_command() {
-        let result = inject_session_id("skim git status || skim build cargo", Some("sess-abc"));
+        let result = inject_session_id("skim git status || skim cargo build", Some("sess-abc"));
         assert_eq!(
             result,
-            "skim --session-id=sess-abc git status || skim --session-id=sess-abc build cargo",
+            "skim --session-id=sess-abc git status || skim --session-id=sess-abc cargo build",
             "both skim segments in a || compound must receive --session-id injection"
+        );
+    }
+
+    /// Backward-compat: deprecated category-first format (e.g. `skim build cargo`) still
+    /// receives session_id injection — the hook does not special-case dispatch format.
+    #[test]
+    fn test_session_id_injected_into_deprecated_category_format() {
+        let result = inject_session_id("skim build cargo", Some("sess-abc"));
+        assert_eq!(
+            result,
+            "skim --session-id=sess-abc build cargo",
+            "deprecated category-first format must still receive --session-id injection"
         );
     }
 
