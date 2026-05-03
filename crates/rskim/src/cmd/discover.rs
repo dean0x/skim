@@ -666,11 +666,11 @@ mod tests {
         // Non-rewritable commands
         assert!(would_rewrite("cat file.txt").is_none());
         // NOTE: bare `ls` now matches the catch-all rule (B.1) added in v2.5.1
-        assert_eq!(would_rewrite("ls"), Some("skim file ls".to_string()));
+        assert_eq!(would_rewrite("ls"), Some("skim ls".to_string()));
         assert!(would_rewrite("echo hello").is_none());
         assert!(would_rewrite("cargo run").is_none());
         // Already a skim command
-        assert!(would_rewrite("skim test cargo").is_none());
+        assert!(would_rewrite("skim cargo test").is_none());
     }
 
     #[test]
@@ -705,7 +705,7 @@ mod tests {
     fn test_would_rewrite_targets() {
         assert_eq!(
             would_rewrite("cargo test"),
-            Some("skim test cargo".to_string())
+            Some("skim cargo test".to_string())
         );
         assert_eq!(
             would_rewrite("git status"),
@@ -716,7 +716,7 @@ mod tests {
             Some("skim file.rs --mode=pseudo".to_string())
         );
         // bare `ls` now matches the catch-all rule (B.1) added in v2.5.1
-        assert_eq!(would_rewrite("ls"), Some("skim file ls".to_string()));
+        assert_eq!(would_rewrite("ls"), Some("skim ls".to_string()));
     }
 
     #[test]
@@ -734,7 +734,7 @@ mod tests {
         // ls -la/-R matches specific rule; bare ls matches catch-all (B.1, v2.5.1)
         assert!(would_rewrite("ls -la").is_some());
         assert!(would_rewrite("ls -R src/").is_some());
-        assert_eq!(would_rewrite("ls"), Some("skim file ls".to_string()));
+        assert_eq!(would_rewrite("ls"), Some("skim ls".to_string()));
     }
 
     #[test]
@@ -790,8 +790,8 @@ mod tests {
     #[test]
     fn test_classify_bash_skips_skim_commands() {
         // Commands that start with "skim " are already rewritten — skip entirely.
-        assert!(classify_bash_command("skim test cargo").is_none());
-        assert!(classify_bash_command("skim build clippy").is_none());
+        assert!(classify_bash_command("skim cargo test").is_none());
+        assert!(classify_bash_command("skim cargo clippy").is_none());
         assert!(classify_bash_command("skim git status").is_none());
         assert!(classify_bash_command("skim file.rs").is_none());
     }
@@ -894,8 +894,8 @@ mod tests {
     #[test]
     fn test_analyze_excludes_already_rewritten_commands() {
         // Commands starting with "skim " should NOT be counted as rewritable
-        let inv1 = make_bash_invocation("skim test cargo --nocapture");
-        let inv2 = make_bash_invocation("skim build clippy");
+        let inv1 = make_bash_invocation("skim cargo test --nocapture");
+        let inv2 = make_bash_invocation("skim cargo clippy");
         let inv3 = make_bash_invocation("cargo test"); // this one IS rewritable
         let invocations = vec![inv1, inv2, inv3];
 

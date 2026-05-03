@@ -16,7 +16,7 @@
 //!
 //! # Auto-detection (stdin / piped usage)
 //!
-//! When `skim infra gh` receives piped stdin with no arguments, the dispatcher
+//! When `skim gh` receives piped stdin with no arguments, the dispatcher
 //! uses strong discriminators to route JSON objects to the correct parser:
 //! - `"jobs"` field → run view
 //! - `"headRefName"` field → PR view
@@ -73,7 +73,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
 // Run entry point
 // ============================================================================
 
-/// Run `skim infra gh [args...]`.
+/// Run `skim gh [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -126,7 +126,7 @@ pub(crate) fn run(
         ("api", _) => {
             // Strip the leading "api" token so run_infra_tool sees the
             // remaining args only.  This lets use_stdin detection fire when
-            // the user pipes `gh api ... | skim infra gh api` with no
+            // the user pipes `gh api ... | skim gh api` with no
             // endpoint arg — args[1..] is empty → stdin is read.
             // api::prepare_args re-inserts "api" before the spawn so the
             // child process still receives `gh api [endpoint...]`.
@@ -150,7 +150,7 @@ pub(crate) fn run(
 /// Parse function used for list-routed commands that may receive piped JSON of
 /// any gh type via stdin.
 ///
-/// When the user pipes `gh ... | skim infra gh` without explicit subcommand
+/// When the user pipes `gh ... | skim gh` without explicit subcommand
 /// arguments, this function auto-detects the JSON shape and routes accordingly:
 /// - JSON object with `"jobs"` → run view
 /// - JSON object with `"headRefName"` → PR view

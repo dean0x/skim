@@ -132,22 +132,60 @@ pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
 ///
 /// IMPORTANT: Only register subcommands we will actually implement.
 /// Keep this list exact — no broad patterns. See GRANITE lesson #336.
+///
+/// v2.8.0: Flat dispatch — tool names are top-level subcommands.
+///
+/// NOTE: This array is NOT used by the dispatch router. Its current purposes are:
+///   1. Shell completion candidates (completions subcommand)
+///   2. Sync-guard test (`test_dispatch_covers_all_known_subcommands`) — asserts
+///      every registered name reaches a match arm in `dispatch()` without panicking.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
+    // Meta/utility (unchanged)
     "agents",
-    "build",
     "completions",
     "discover",
-    "file",
     "git",
-    "infra",
     "init",
     "learn",
-    "lint",
     "log",
-    "pkg",
     "rewrite",
     "stats",
-    "test",
+    // Multi-category dispatchers
+    "cargo",
+    "go",
+    // Test runners
+    "jest",
+    "pytest",
+    "vitest",
+    // Build tools
+    "tsc",
+    // Linters (11)
+    "biome",
+    "black",
+    "dprint",
+    "eslint",
+    "gofmt",
+    "golangci",
+    "mypy",
+    "oxlint",
+    "prettier",
+    "ruff",
+    "rustfmt",
+    // Package managers
+    "npm",
+    "pnpm",
+    "pip",
+    // Infrastructure
+    "aws",
+    "curl",
+    "gh",
+    "wget",
+    // File operations
+    "find",
+    "grep",
+    "ls",
+    "rg",
+    "tree",
 ];
 
 /// Check whether `name` is a registered subcommand.
@@ -470,43 +508,217 @@ where
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
+/// Prepend a tool name to an arg slice.
+fn prepend(tool: &str, args: &[String]) -> Vec<String> {
+    let mut v = Vec::with_capacity(args.len() + 1);
+    v.push(tool.to_string());
+    v.extend_from_slice(args);
+    v
+}
+
+/// Shared scaffolding for multi-category dispatchers (`cargo`, `go`, …).
+///
+/// Handles flag interleaving: `skim cargo --show-stats test` works because
+/// we skip leading flags to find the first positional (the subcommand token),
+/// then the caller decides which args to forward.
+///
+/// Returns `Ok(Some((subcmd_str, subcmd_idx)))` when a subcommand is found, or
+/// `Ok(None)` after printing the missing-subcommand error (caller should return
+/// `ExitCode::FAILURE`).  The `tool` parameter is used only in the error message.
+fn extract_subcmd<'a>(
+    tool: &str,
+    args: &'a [String],
+    usage: &str,
+    supported: &str,
+) -> anyhow::Result<Option<(&'a str, usize)>> {
+    match args.iter().position(|a| !a.starts_with('-')) {
+        Some(idx) => Ok(Some((args[idx].as_str(), idx))),
+        None => {
+            eprintln!(
+                "skim {tool}: missing subcommand\n\n\
+                 Usage: {usage}\n\n\
+                 Supported subcommands: {supported}"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Build a `Vec<String>` with `tool` prepended and the element at `skip_idx`
+/// removed, pre-allocating the exact capacity needed.
+fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> {
+    debug_assert!(
+        skip_idx < args.len(),
+        "skip_idx {skip_idx} out of bounds for args len {}",
+        args.len()
+    );
+    let mut v = Vec::with_capacity(args.len()); // remove one, prepend one → same len
+    v.push(tool.to_string());
+    v.extend(
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip_idx)
+            .map(|(_, s)| s.clone()),
+    );
+    v
+}
+
+/// Route `skim cargo <subcmd> [args...]` to the correct category handler.
+fn dispatch_cargo(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_cargo_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some((subcmd, idx)) = extract_subcmd(
+        "cargo",
+        args,
+        "skim cargo <test|build|clippy|audit|nextest> [args...]",
+        "test, nextest, build, clippy, audit",
+    )?
+    else {
+        return Ok(ExitCode::FAILURE);
+    };
+
+    match subcmd {
+        "test" | "t" => test::run(&prepend_without("cargo", args, idx), analytics),
+        // nextest: keep the "nextest" token — the test handler uses it to select
+        // the nextest parse path instead of the plain cargo-test path.
+        "nextest" => test::run(&prepend("cargo", args), analytics),
+        "build" | "b" => build::run(&prepend_without("cargo", args, idx), analytics),
+        "clippy" => build::run(&prepend_without("clippy", args, idx), analytics),
+        // audit: keep "audit" in args — pkg::run uses it to select the audit parser.
+        "audit" => pkg::run(&prepend("cargo", args), analytics),
+        unknown => {
+            let safe = sanitize_for_display(unknown);
+            eprintln!(
+                "skim cargo: unknown subcommand '{safe}'\n\n\
+                 Usage: skim cargo <test|build|clippy|audit|nextest> [args...]\n\n\
+                 Supported subcommands: test, nextest, build, clippy, audit"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Route `skim go <subcmd> [args...]` to the correct category handler.
+fn dispatch_go(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_go_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some((subcmd, idx)) = extract_subcmd("go", args, "skim go <test> [args...]", "test")?
+    else {
+        return Ok(ExitCode::FAILURE);
+    };
+
+    match subcmd {
+        "test" => test::run(&prepend_without("go", args, idx), analytics),
+        unknown => {
+            let safe = sanitize_for_display(unknown);
+            eprintln!(
+                "skim go: unknown subcommand '{safe}'\n\n\
+                 Usage: skim go <test> [args...]\n\n\
+                 Supported subcommands: test"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn print_cargo_help() {
+    print!(
+        "skim cargo\n\
+         \n\
+           Cargo subcommand compression\n\
+         \n\
+         Usage: skim cargo <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test (t)   Run and compress cargo test output\n\
+           nextest    Run and compress cargo nextest output\n\
+           build (b)  Run and compress cargo build output\n\
+           clippy     Run and compress cargo clippy output\n\
+           audit      Run and compress cargo audit output\n\
+         \n\
+         Examples:\n\
+           skim cargo test\n\
+           skim cargo t          (alias for test)\n\
+           skim cargo build --release\n\
+           skim cargo b --release  (alias for build)\n\
+           skim cargo clippy -- -D warnings\n\
+           skim cargo audit\n"
+    );
+}
+
+fn print_go_help() {
+    print!(
+        "skim go\n\
+         \n\
+           Go subcommand compression\n\
+         \n\
+         Usage: skim go <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test       Run and compress go test output\n\
+         \n\
+         Examples:\n\
+           skim go test ./...\n\
+           skim go test -v ./pkg/...\n"
+    );
+}
+
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
-/// Exit code semantics (GRANITE lesson — exit code corruption is P1):
-/// - `--help` / `-h`: prints description to stdout, returns SUCCESS
-/// - Otherwise: prints "not yet implemented" to stderr, returns FAILURE
+/// v2.8.0: Flat dispatch — tool names are top-level subcommands.
+/// `cargo` and `go` use multi-category dispatchers; other tools route
+/// directly to their category handler with the tool name prepended.
 pub(crate) fn dispatch(
     subcommand: &str,
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    if !is_known_subcommand(subcommand) {
-        anyhow::bail!(
-            "Unknown subcommand: '{subcommand}'\n\
-             Available subcommands: {}\n\
-             Run 'skim --help' for usage information",
-            KNOWN_SUBCOMMANDS.join(", ")
-        );
-    }
-
     match subcommand {
+        // Unchanged meta/utility
         "agents" => agents::run(args, analytics),
-        "build" => build::run(args, analytics),
         "completions" => completions::run(args, analytics),
         "discover" => discover::run(args, analytics),
-        "file" => file::run(args, analytics),
         "git" => git::run(args, analytics),
-        "infra" => infra::run(args, analytics),
         "init" => init::run(args, analytics),
         "learn" => learn::run(args, analytics),
-        "lint" => lint::run(args, analytics),
         "log" => log::run(args, analytics),
-        "pkg" => pkg::run(args, analytics),
         "rewrite" => rewrite::run(args, analytics),
         "stats" => stats::run(args, analytics),
-        "test" => test::run(args, analytics),
-        // Unreachable: is_known_subcommand guard above rejects unknown names
-        _ => unreachable!("unknown subcommand '{subcommand}' passed is_known_subcommand guard"),
+
+        // Multi-category dispatchers
+        "cargo" => dispatch_cargo(args, analytics),
+        "go" => dispatch_go(args, analytics),
+
+        // Direct-to-category routing (prepend tool name for category dispatcher)
+        "jest" | "pytest" | "vitest" => test::run(&prepend(subcommand, args), analytics),
+        "tsc" => build::run(&prepend(subcommand, args), analytics),
+        "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "mypy" | "oxlint"
+        | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
+        "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
+        "aws" | "curl" | "gh" | "wget" => infra::run(&prepend(subcommand, args), analytics),
+        "find" | "grep" | "ls" | "rg" | "tree" => file::run(&prepend(subcommand, args), analytics),
+
+        _ => {
+            let safe = sanitize_for_display(subcommand);
+            anyhow::bail!(
+                "Unknown subcommand: '{safe}'\n\
+                 Available subcommands: {}\n\
+                 Run 'skim --help' for usage information",
+                KNOWN_SUBCOMMANDS.join(", ")
+            );
+        }
     }
 }
 
@@ -713,5 +925,160 @@ mod tests {
     fn test_read_bounded_empty_input() {
         let result = read_bounded(b"".as_ref(), 1024).unwrap();
         assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // extract_subcmd tests
+    // ========================================================================
+
+    /// Happy path: first non-flag arg is the subcommand.
+    #[test]
+    fn test_extract_subcmd_finds_first_positional() {
+        let args: Vec<String> = vec!["test".into(), "--release".into()];
+        let result = extract_subcmd("cargo", &args, "usage", "test").unwrap();
+        assert_eq!(result, Some(("test", 0)));
+    }
+
+    /// Flags before the subcommand are skipped; the positional is found at the
+    /// correct index so `prepend_without` will remove the right element.
+    #[test]
+    fn test_extract_subcmd_skips_leading_flags() {
+        let args: Vec<String> = vec!["--show-stats".into(), "build".into(), "--release".into()];
+        let result = extract_subcmd("cargo", &args, "usage", "build").unwrap();
+        assert_eq!(result, Some(("build", 1)));
+    }
+
+    /// When every arg starts with `-` there is no subcommand; the function
+    /// prints the error message and returns `None` (caller returns FAILURE).
+    #[test]
+    fn test_extract_subcmd_returns_none_when_all_flags() {
+        let args: Vec<String> = vec!["--show-stats".into(), "--json".into()];
+        let result = extract_subcmd("cargo", &args, "usage", "test").unwrap();
+        assert!(result.is_none());
+    }
+
+    /// Empty arg slice → no subcommand found, returns `None`.
+    #[test]
+    fn test_extract_subcmd_empty_args() {
+        let args: Vec<String> = vec![];
+        let result = extract_subcmd("cargo", &args, "usage", "test").unwrap();
+        assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // prepend_without tests
+    // ========================================================================
+
+    /// Removes an element from the middle and prepends the tool name.
+    #[test]
+    fn test_prepend_without_removes_middle_element() {
+        let args: Vec<String> = vec!["--show-stats".into(), "test".into(), "--release".into()];
+        // skip_idx=1 removes "test"; result is ["cargo", "--show-stats", "--release"]
+        let result = prepend_without("cargo", &args, 1);
+        assert_eq!(result, vec!["cargo", "--show-stats", "--release"]);
+    }
+
+    /// Removes the first element and prepends the tool name.
+    #[test]
+    fn test_prepend_without_removes_first_element() {
+        let args: Vec<String> = vec!["test".into(), "--release".into()];
+        // skip_idx=0 removes "test"; result is ["cargo", "--release"]
+        let result = prepend_without("cargo", &args, 0);
+        assert_eq!(result, vec!["cargo", "--release"]);
+    }
+
+    /// Removes the last element and prepends the tool name.
+    #[test]
+    fn test_prepend_without_removes_last_element() {
+        let args: Vec<String> = vec!["--release".into(), "test".into()];
+        // skip_idx=1 removes "test"; result is ["cargo", "--release"]
+        let result = prepend_without("cargo", &args, 1);
+        assert_eq!(result, vec!["cargo", "--release"]);
+    }
+
+    /// Single-element slice: removes that element, leaving only the tool name.
+    #[test]
+    fn test_prepend_without_single_element_slice() {
+        let args: Vec<String> = vec!["test".into()];
+        let result = prepend_without("cargo", &args, 0);
+        assert_eq!(result, vec!["cargo"]);
+    }
+
+    /// Out-of-bounds skip_idx fires the debug_assert (debug builds only).
+    ///
+    /// This test documents the invariant: callers are responsible for passing a
+    /// valid index.  The assert only fires in debug builds (`cfg(debug_assertions)`),
+    /// so this test is gated on that condition.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "skip_idx 1 out of bounds for args len 1")]
+    fn test_prepend_without_panics_on_out_of_bounds() {
+        let args: Vec<String> = vec!["test".into()];
+        prepend_without("cargo", &args, 1); // skip_idx=1 is out of bounds for len 1
+    }
+
+    // ========================================================================
+    // dispatch() coverage — KNOWN_SUBCOMMANDS sync guard
+    // ========================================================================
+
+    /// Verify that every entry in KNOWN_SUBCOMMANDS routes through dispatch()
+    /// without panicking.
+    ///
+    /// dispatch() calls real subcommand handlers which may fail for unrelated
+    /// reasons (missing binary, empty args), but they must never panic. Any
+    /// panic here means a match arm is missing for a registered subcommand.
+    #[test]
+    fn test_dispatch_covers_all_known_subcommands() {
+        use std::panic;
+
+        for &subcommand in KNOWN_SUBCOMMANDS {
+            // Pass --help so handlers exit cleanly rather than spawning real
+            // processes. Most category handlers print help and return SUCCESS
+            // when --help is the only arg.
+            let args: Vec<String> = vec!["--help".to_string()];
+
+            // AnalyticsConfig is not UnwindSafe, so construct it inside the closure.
+            let result = panic::catch_unwind(|| {
+                let a = crate::analytics::AnalyticsConfig {
+                    enabled: false,
+                    session_id: None,
+                    input_cost_per_mtok: None,
+                };
+                dispatch(subcommand, &args, &a)
+            });
+
+            if let Err(ref payload) = result {
+                // Surface the panic payload so non-routing panics (real bugs) are
+                // distinguishable from missing-match-arm panics in CI output.
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("<non-string panic payload>");
+                eprintln!("dispatch() panicked for '{subcommand}' — panic payload: {msg}");
+            }
+            assert!(
+                result.is_ok(),
+                "dispatch() panicked for known subcommand '{subcommand}': \
+                 handler should not panic (check handler implementation)"
+            );
+        }
+
+        // Also verify that an unknown name correctly returns an Err from dispatch().
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: false,
+            session_id: None,
+            input_cost_per_mtok: None,
+        };
+        let unknown_result = dispatch("__unknown_xyz__", &[], &analytics);
+        assert!(
+            unknown_result.is_err(),
+            "dispatch() should return Err for unknown subcommand"
+        );
+        let err_msg = unknown_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unknown subcommand"),
+            "error message should mention 'Unknown subcommand', got: {err_msg}"
+        );
     }
 }

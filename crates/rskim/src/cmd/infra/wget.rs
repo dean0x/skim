@@ -43,7 +43,7 @@ static RE_WGET_ERROR: LazyLock<Regex> =
 static RE_WGET_ANY_STATUS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:HTTP|response|status)[^\n]*?\b([1-5]\d{2})\b").unwrap());
 
-/// Run `skim infra wget [args...]`.
+/// Run `skim wget [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

@@ -1,4 +1,6 @@
-//! Integration tests for `skim test vitest` subcommand (#48).
+//! Integration tests for `skim vitest` subcommand (#48).
+//!
+//! v2.8.0: Flat dispatch — `skim vitest` replaces `skim test vitest`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -23,25 +25,15 @@ fn read_fixture(name: &str) -> String {
 // ============================================================================
 
 #[test]
-fn test_skim_test_help() {
+fn test_skim_vitest_help() {
+    // v2.8.0: `skim vitest --help` — "test" is no longer a subcommand.
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
+        .arg("vitest")
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test"));
-}
-
-#[test]
-fn test_skim_test_vitest_no_args_shows_help() {
-    // `skim test` with no runner should show help
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg("test")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Available runners"));
+        .stdout(predicate::str::contains("skim vitest"));
 }
 
 // ============================================================================
@@ -54,7 +46,6 @@ fn test_skim_test_vitest_stdin_pass() {
 
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
         .arg("vitest")
         .write_stdin(fixture)
         .assert()
@@ -69,7 +60,6 @@ fn test_skim_test_vitest_stdin_fail() {
 
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
         .arg("vitest")
         .write_stdin(fixture)
         .assert()
@@ -86,7 +76,6 @@ fn test_skim_test_vitest_stdin_pnpm_prefix() {
 
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
         .arg("vitest")
         .write_stdin(fixture)
         .assert()
@@ -106,7 +95,6 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
     Command::cargo_bin("skim")
         .unwrap()
         .arg("--debug")
-        .arg("test")
         .arg("vitest")
         .write_stdin(input)
         .assert()
@@ -127,7 +115,6 @@ fn test_skim_test_vitest_stdin_passthrough() {
     Command::cargo_bin("skim")
         .unwrap()
         .arg("--debug")
-        .arg("test")
         .arg("vitest")
         .write_stdin(input)
         .assert()
@@ -140,16 +127,9 @@ fn test_skim_test_vitest_stdin_passthrough() {
 // Unknown runner
 // ============================================================================
 
-#[test]
-fn test_skim_test_unknown_runner() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg("test")
-        .arg("unknown_runner")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unknown runner"));
-}
+// v2.8.0: "test" is no longer a subcommand — unknown tool names are now
+// Unknown subcommands handled at the dispatch level. This test is removed
+// because there is no "test <runner>" dispatch path anymore.
 
 // ============================================================================
 // Jest alias
@@ -159,10 +139,9 @@ fn test_skim_test_unknown_runner() {
 fn test_skim_test_jest_alias_works() {
     let fixture = read_fixture("vitest_pass.json");
 
-    // `skim test jest` should route to the vitest parser (compatible format)
+    // `skim jest` should route to the vitest parser (compatible format)
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("test")
         .arg("jest")
         .write_stdin(fixture)
         .assert()
@@ -188,7 +167,6 @@ fn test_vitest_with_args_does_not_read_stdin() {
         .unwrap()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
-        .arg("test")
         .arg("vitest")
         .arg("run")
         .assert()
@@ -202,7 +180,6 @@ fn test_jest_with_args_does_not_read_stdin() {
         .unwrap()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
-        .arg("test")
         .arg("jest")
         .arg("run")
         .assert()

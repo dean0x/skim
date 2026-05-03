@@ -1,7 +1,7 @@
-//! File operations subcommand dispatcher (#116)
+//! File operations handler — dispatches to file tool parsers (#116)
 //!
-//! Routes `skim file <tool> [args...]` to the appropriate file tool parser.
-//! Currently supported tools: `find`, `grep`, `ls`, `rg`, `tree`.
+//! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
+//! `find`, `grep`, `ls`, `rg`, `tree`.
 
 pub(crate) mod find;
 pub(crate) mod grep;
@@ -17,7 +17,7 @@ use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-/// Known file tools that `skim file` can dispatch to.
+/// Known file tools that the file handler can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["find", "grep", "ls", "rg", "tree"];
 
 /// Maximum path/match entries shown in output (truncation cap).
@@ -26,7 +26,7 @@ pub(crate) const MAX_DISPLAY_ENTRIES: usize = 100;
 /// Maximum lines accepted from a single tool invocation.
 pub(crate) const MAX_INPUT_LINES: usize = 100_000;
 
-/// Entry point for `skim file <tool> [args...]`.
+/// Entry point for `skim <tool> [args...]` (file handler).
 ///
 /// If no tool is specified or `--help` / `-h` is passed, prints usage
 /// and exits. Otherwise dispatches to the tool-specific handler.
@@ -63,9 +63,9 @@ pub(crate) fn run(
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(
-                "skim file: unknown tool '{safe_tool}'\n\
+                "skim: unknown tool '{safe_tool}'\n\
                  Available tools: {}\n\
-                 Run 'skim file --help' for usage information",
+                 Run 'skim <tool> --help' for usage information",
                 KNOWN_TOOLS.join(", ")
             );
             Ok(ExitCode::FAILURE)
@@ -74,7 +74,7 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim file <tool> [args...]");
+    println!("skim <tool> [args...]");
     println!();
     println!("  Run file operation tools and parse the output for AI context windows.");
     println!();
@@ -88,11 +88,11 @@ fn print_help() {
     println!("  --show-stats    Show token statistics");
     println!();
     println!("Examples:");
-    println!("  skim file find . -name '*.rs'       Find Rust files");
-    println!("  skim file ls -la                    List files with details");
-    println!("  skim file tree src/                 Directory tree");
-    println!("  skim file grep -rn 'TODO' src/      Grep recursively");
-    println!("  skim file rg 'fn main' src/         Ripgrep search");
+    println!("  skim find . -name '*.rs'       Find Rust files");
+    println!("  skim ls -la                    List files with details");
+    println!("  skim tree src/                 Directory tree");
+    println!("  skim grep -rn 'TODO' src/      Grep recursively");
+    println!("  skim rg 'fn main' src/         Ripgrep search");
 }
 
 // ============================================================================
@@ -266,33 +266,6 @@ pub(super) fn build_file_result(
         all_entries,
         footer,
     ))
-}
-
-/// Build the clap `Command` definition for shell completions.
-///
-/// Models `tool` as a positional value with the known tool names so that
-/// `skim file <TAB>` suggests `find`, `grep`, `ls`, `rg`, `tree`.
-pub(super) fn command() -> clap::Command {
-    clap::Command::new("file")
-        .about("Run file operation tools and parse output for AI context windows")
-        .arg(
-            clap::Arg::new("tool")
-                .value_name("TOOL")
-                .value_parser(["find", "grep", "ls", "rg", "tree"])
-                .help("File tool to run (find, grep, ls, rg, tree)"),
-        )
-        .arg(
-            clap::Arg::new("json")
-                .long("json")
-                .action(clap::ArgAction::SetTrue)
-                .help("Emit structured JSON output"),
-        )
-        .arg(
-            clap::Arg::new("show-stats")
-                .long("show-stats")
-                .action(clap::ArgAction::SetTrue)
-                .help("Show token statistics"),
-        )
 }
 
 // ============================================================================

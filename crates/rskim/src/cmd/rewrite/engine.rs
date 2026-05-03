@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_cargo_test() {
         let result = try_rewrite(&["cargo", "test"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "test", "cargo"]);
+        assert_eq!(result.tokens, vec!["skim", "cargo", "test"]);
     }
 
     #[test]
@@ -272,26 +272,26 @@ mod tests {
         let result = try_rewrite(&["cargo", "test", "--", "--nocapture"]).unwrap();
         assert_eq!(
             result.tokens,
-            vec!["skim", "test", "cargo", "--", "--nocapture"]
+            vec!["skim", "cargo", "test", "--", "--nocapture"]
         );
     }
 
     #[test]
     fn test_cargo_nextest_run() {
         let result = try_rewrite(&["cargo", "nextest", "run"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "test", "cargo"]);
+        assert_eq!(result.tokens, vec!["skim", "cargo", "nextest"]);
     }
 
     #[test]
     fn test_cargo_clippy() {
         let result = try_rewrite(&["cargo", "clippy"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "build", "clippy"]);
+        assert_eq!(result.tokens, vec!["skim", "cargo", "clippy"]);
     }
 
     #[test]
     fn test_cargo_build() {
         let result = try_rewrite(&["cargo", "build"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "build", "cargo"]);
+        assert_eq!(result.tokens, vec!["skim", "cargo", "build"]);
     }
 
     #[test]
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn test_cargo_toolchain_nightly() {
         let result = try_rewrite(&["cargo", "+nightly", "test"]).unwrap();
-        assert_eq!(result.tokens, vec!["skim", "test", "cargo", "+nightly"]);
+        assert_eq!(result.tokens, vec!["skim", "cargo", "test", "+nightly"]);
     }
 
     #[test]
@@ -416,7 +416,7 @@ mod tests {
         let result = try_rewrite(&["RUST_LOG=debug", "cargo", "+nightly", "test"]).unwrap();
         assert_eq!(
             result.tokens,
-            vec!["RUST_LOG=debug", "skim", "test", "cargo", "+nightly"]
+            vec!["RUST_LOG=debug", "skim", "cargo", "test", "+nightly"]
         );
     }
 

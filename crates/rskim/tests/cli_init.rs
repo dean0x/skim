@@ -617,7 +617,7 @@ fn test_hook_cargo_test_match() {
     assert!(json["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap()
-        .contains("skim test cargo"));
+        .contains("skim cargo test"));
 }
 
 #[test]
@@ -641,7 +641,7 @@ fn test_hook_already_rewritten_passthrough() {
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--hook"])
-        .write_stdin(hook_payload("skim test cargo"))
+        .write_stdin(hook_payload("skim cargo test"))
         .assert()
         .success();
 
@@ -730,7 +730,7 @@ fn test_hook_compound_command_rewrite() {
         .as_str()
         .unwrap();
     assert!(
-        rewritten.contains("skim test cargo"),
+        rewritten.contains("skim cargo test"),
         "First segment should be rewritten, got: {rewritten}"
     );
     assert!(
@@ -790,7 +790,7 @@ fn test_hook_version_mismatch_warning() {
         json["hookSpecificOutput"]["updatedInput"]["command"]
             .as_str()
             .unwrap()
-            .contains("skim test cargo"),
+            .contains("skim cargo test"),
         "Rewrite should succeed despite version mismatch"
     );
 

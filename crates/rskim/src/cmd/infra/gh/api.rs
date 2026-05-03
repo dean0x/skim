@@ -593,12 +593,12 @@ mod tests {
         assert_eq!(args, vec!["api".to_string(), "/repos/foo/bar".to_string()]);
     }
 
-    // ---- pipe-mode parse (simulates `gh api ... | skim infra gh api`) ----
+    // ---- pipe-mode parse (simulates `gh api ... | skim gh api`) ----
 
     #[test]
     fn test_parse_impl_accepts_piped_json_object() {
         // Mirrors the Tester's scenario:
-        //   echo '{"login": "foo", "id": 42}' | skim infra gh api
+        //   echo '{"login": "foo", "id": 42}' | skim gh api
         //
         // The dispatcher reads stdin into CommandOutput.stdout and calls
         // parse_impl.  The result must be Full (not Passthrough) and exit 0.

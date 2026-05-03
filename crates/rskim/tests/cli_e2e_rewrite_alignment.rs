@@ -30,32 +30,36 @@
 //!
 //! | Developer command        | Rewrite target          | Handler stdin support |
 //! |--------------------------|-------------------------|-----------------------|
-//! | cargo test               | skim test cargo         | yes (JSON/text)       |
-//! | pytest                   | skim test pytest        | yes (text)            |
-//! | npx vitest               | skim test vitest        | yes (text)            |
-//! | cargo build              | skim build cargo        | no (runs real cmd)    |
-//! | eslint .                 | skim lint eslint .      | yes (JSON/text)       |
-//! | ruff check .             | skim lint ruff .        | yes (JSON/text)       |
-//! | mypy .                   | skim lint mypy .        | yes (JSON/text)       |
-//! | golangci-lint run ./...  | skim lint golangci ./...| yes (JSON/text)       |
-//! | npm audit                | skim pkg npm audit      | yes (JSON)            |
-//! | npm install express      | skim pkg npm install    | yes (JSON/text)       |
-//! | pip install flask        | skim pkg pip install    | yes (text)            |
-//! | cargo audit              | skim pkg cargo audit    | yes (JSON)            |
+//! | cargo test               | skim cargo test         | yes (JSON/text)       |
+//! | pytest                   | skim pytest             | yes (text)            |
+//! | npx vitest               | skim vitest             | yes (text)            |
+//! | cargo build              | skim cargo build        | no (runs real cmd)    |
+//! | eslint .                 | skim eslint .           | yes (JSON/text)       |
+//! | ruff check .             | skim ruff .             | yes (JSON/text)       |
+//! | mypy .                   | skim mypy .             | yes (JSON/text)       |
+//! | golangci-lint run ./...  | skim golangci ./...     | yes (JSON/text)       |
+//! | npm audit                | skim npm audit          | yes (JSON)            |
+//! | npm install express      | skim npm install        | yes (JSON/text)       |
+//! | pip install flask        | skim pip install        | yes (text)            |
+//! | cargo audit              | skim cargo audit        | yes (JSON)            |
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn skim_cmd() -> Command {
-    Command::cargo_bin("skim").unwrap()
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd
 }
 
 // ============================================================================
 // Rewrite-to-handler alignment: test handlers
 // ============================================================================
 
-/// Verify `cargo test` rewrites to `skim test cargo` AND the handler processes
+/// Verify `cargo test` rewrites to `skim cargo test` AND the handler processes
 /// cargo JSON test output correctly.
+///
+/// v2.8.0: Flat dispatch — `skim cargo test` replaces `skim test cargo`.
 #[test]
 fn test_alignment_cargo_test_rewrite_and_handler() {
     // Step 1: rewrite produces the expected target.
@@ -63,12 +67,12 @@ fn test_alignment_cargo_test_rewrite_and_handler() {
         .args(["rewrite", "cargo", "test"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"));
+        .stdout(predicate::str::contains("skim cargo test"));
 
     // Step 2: handler accepts fixture stdin and compresses it.
     let fixture = include_str!("fixtures/cmd/test/cargo_pass.json");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -108,14 +112,15 @@ fn test_alignment_cargo_test_true_roundtrip() {
     );
 
     // Step 2: parse the rewrite output into tokens and execute.
-    // `rewritten` is e.g. "skim test cargo" — split by whitespace and
+    // `rewritten` is e.g. "skim cargo test" — split by whitespace and
     // drop the leading "skim" token (assert_cmd already selects the binary).
+    // v2.8.0: Flat dispatch — `skim cargo test` replaces `skim test cargo`.
     let tokens: Vec<&str> = rewritten.split_whitespace().collect();
     assert!(
         tokens.first() == Some(&"skim"),
         "rewrite output must start with 'skim'; got: {rewritten}"
     );
-    let handler_args = &tokens[1..]; // ["test", "cargo"]
+    let handler_args = &tokens[1..]; // ["cargo", "test"]
 
     let fixture = include_str!("fixtures/cmd/test/cargo_pass.json");
     skim_cmd()
@@ -126,41 +131,45 @@ fn test_alignment_cargo_test_true_roundtrip() {
         .stdout(predicate::str::contains("pass:"));
 }
 
-/// Verify `pytest` rewrites to `skim test pytest` AND the handler processes
+/// Verify `pytest` rewrites to `skim pytest` AND the handler processes
 /// pytest text output correctly.
+///
+/// v2.8.0: Flat dispatch — `skim pytest` replaces `skim test pytest`.
 #[test]
 fn test_alignment_pytest_rewrite_and_handler() {
     skim_cmd()
         .args(["rewrite", "pytest"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test pytest"));
+        .stdout(predicate::str::contains("skim pytest"));
 
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .success()
         .stdout(predicate::str::contains("pass:"));
 }
 
-/// Verify `npx vitest` rewrites to `skim test vitest` AND the handler
+/// Verify `npx vitest` rewrites to `skim vitest` AND the handler
 /// processes vitest text output.
+///
+/// v2.8.0: Flat dispatch — `skim vitest` replaces `skim test vitest`.
 #[test]
 fn test_alignment_npx_vitest_rewrite_and_handler() {
     skim_cmd()
         .args(["rewrite", "npx", "vitest"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test vitest"));
+        .stdout(predicate::str::contains("skim vitest"));
 
     // vitest handler accepts stdin. Use a fixture matching the PIPE_RE pattern:
     // "Tests  N passed | N failed | N total" so the handler parses it as Full/Degraded
     // and exits 0 (no failures).
     let fixture = include_str!("fixtures/cmd/test/vitest_regex_fail.txt");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         // vitest exits 1 when there are failures; fixture has 1 failure.
@@ -172,7 +181,7 @@ fn test_alignment_npx_vitest_rewrite_and_handler() {
 // Rewrite-to-handler alignment: lint handlers
 // ============================================================================
 
-/// Verify `eslint .` rewrites to `skim lint eslint .` AND the handler
+/// Verify `eslint .` rewrites to `skim eslint .` AND the handler
 /// processes eslint JSON output.
 #[test]
 fn test_alignment_eslint_rewrite_and_handler() {
@@ -180,18 +189,18 @@ fn test_alignment_eslint_rewrite_and_handler() {
         .args(["rewrite", "eslint", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint eslint"));
+        .stdout(predicate::str::contains("skim eslint"));
 
     let fixture = include_str!("fixtures/cmd/lint/eslint_fail.json");
     skim_cmd()
-        .args(["lint", "eslint"])
+        .args(["eslint"])
         .write_stdin(fixture)
         .assert()
         // Non-zero exit on lint failures; just check output contains summary.
         .stdout(predicate::str::contains("eslint"));
 }
 
-/// Verify `ruff check .` rewrites to `skim lint ruff .` AND the handler
+/// Verify `ruff check .` rewrites to `skim ruff .` AND the handler
 /// processes ruff JSON output.
 #[test]
 fn test_alignment_ruff_rewrite_and_handler() {
@@ -199,17 +208,17 @@ fn test_alignment_ruff_rewrite_and_handler() {
         .args(["rewrite", "ruff", "check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint ruff"));
+        .stdout(predicate::str::contains("skim ruff"));
 
     let fixture = include_str!("fixtures/cmd/lint/ruff_fail.json");
     skim_cmd()
-        .args(["lint", "ruff"])
+        .args(["ruff"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("ruff"));
 }
 
-/// Verify `mypy .` rewrites to `skim lint mypy .` AND the handler processes
+/// Verify `mypy .` rewrites to `skim mypy .` AND the handler processes
 /// mypy JSON output.
 #[test]
 fn test_alignment_mypy_rewrite_and_handler() {
@@ -217,17 +226,17 @@ fn test_alignment_mypy_rewrite_and_handler() {
         .args(["rewrite", "mypy", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint mypy"));
+        .stdout(predicate::str::contains("skim mypy"));
 
     let fixture = include_str!("fixtures/cmd/lint/mypy_fail.json");
     skim_cmd()
-        .args(["lint", "mypy"])
+        .args(["mypy"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("mypy"));
 }
 
-/// Verify `golangci-lint run ./...` rewrites to `skim lint golangci ./...`
+/// Verify `golangci-lint run ./...` rewrites to `skim golangci ./...`
 /// AND the handler processes golangci JSON output.
 #[test]
 fn test_alignment_golangci_rewrite_and_handler() {
@@ -235,11 +244,11 @@ fn test_alignment_golangci_rewrite_and_handler() {
         .args(["rewrite", "golangci-lint", "run", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint golangci"));
+        .stdout(predicate::str::contains("skim golangci"));
 
     let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
     skim_cmd()
-        .args(["lint", "golangci"])
+        .args(["golangci"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("golangci"));
@@ -249,73 +258,81 @@ fn test_alignment_golangci_rewrite_and_handler() {
 // Rewrite-to-handler alignment: pkg handlers
 // ============================================================================
 
-/// Verify `npm audit` rewrites to `skim pkg npm audit` AND the handler
+/// Verify `npm audit` rewrites to `skim npm audit` AND the handler
 /// processes npm audit JSON output.
+///
+/// v2.8.0: Flat dispatch — `skim npm audit` replaces `skim pkg npm audit`.
 #[test]
 fn test_alignment_npm_audit_rewrite_and_handler() {
     skim_cmd()
         .args(["rewrite", "npm", "audit"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm audit"));
+        .stdout(predicate::str::contains("skim npm audit"));
 
     let fixture = include_str!("fixtures/cmd/pkg/npm_audit.json");
     skim_cmd()
-        .args(["pkg", "npm", "audit"])
+        .args(["npm", "audit"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("audit"));
 }
 
-/// Verify `npm install express` rewrites to `skim pkg npm install express`
+/// Verify `npm install express` rewrites to `skim npm install express`
 /// AND the handler processes npm install JSON output.
+///
+/// v2.8.0: Flat dispatch — `skim npm install` replaces `skim pkg npm install`.
 #[test]
 fn test_alignment_npm_install_rewrite_and_handler() {
     skim_cmd()
         .args(["rewrite", "npm", "install", "express"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm install express"));
+        .stdout(predicate::str::contains("skim npm install express"));
 
     let fixture = include_str!("fixtures/cmd/pkg/npm_install.json");
     skim_cmd()
-        .args(["pkg", "npm", "install"])
+        .args(["npm", "install"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("INSTALL").or(predicate::str::contains("install")));
 }
 
-/// Verify `cargo audit` rewrites to `skim pkg cargo audit` AND the handler
+/// Verify `cargo audit` rewrites to `skim cargo audit` AND the handler
 /// processes cargo audit JSON output.
+///
+/// v2.8.0: Flat dispatch — `skim cargo audit` replaces `skim pkg cargo audit`.
 #[test]
 fn test_alignment_cargo_audit_rewrite_and_handler() {
     skim_cmd()
         .args(["rewrite", "cargo", "audit"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg cargo audit"));
+        .stdout(predicate::str::contains("skim cargo audit"));
 
     let fixture = include_str!("fixtures/cmd/pkg/cargo_audit.json");
     skim_cmd()
-        .args(["pkg", "cargo", "audit"])
+        .args(["cargo", "audit"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("audit"));
 }
 
-/// Verify `pip install flask` rewrites to `skim pkg pip install flask`
+/// Verify `pip install flask` rewrites to `skim pip install flask`
 /// AND the handler processes pip install text output.
+///
+/// v2.8.0: Flat dispatch — `skim pip install` replaces `skim pkg pip install`.
 #[test]
 fn test_alignment_pip_install_rewrite_and_handler() {
     skim_cmd()
         .args(["rewrite", "pip", "install", "flask"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pip install flask"));
+        .stdout(predicate::str::contains("skim pip install flask"));
 
     let fixture = include_str!("fixtures/cmd/pkg/pip_install.txt");
     skim_cmd()
-        .args(["pkg", "pip", "install"])
+        .args(["pip", "install"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("INSTALL").or(predicate::str::contains("install")));
@@ -327,7 +344,7 @@ fn test_alignment_pip_install_rewrite_and_handler() {
 
 /// AD-RW-11: `prettier --check` is ACKed — the rewrite echoes the original command
 /// (exit 0) rather than mapping to a handler. Verify this does NOT produce a
-/// `skim lint prettier` string (which would imply a handler invocation).
+/// `skim prettier` string (which would imply a handler invocation).
 #[test]
 fn test_alignment_prettier_check_acked_not_rewritten_to_handler() {
     let output = skim_cmd()
@@ -347,7 +364,7 @@ fn test_alignment_prettier_check_acked_not_rewritten_to_handler() {
         "ACK must echo original command: {stdout}"
     );
     assert!(
-        !stdout.contains("skim lint prettier"),
+        !stdout.contains("skim prettier"),
         "ACK must NOT produce a handler rewrite: {stdout}"
     );
 }
@@ -367,7 +384,7 @@ fn test_alignment_rustfmt_check_acked_not_rewritten_to_handler() {
         "ACK must echo original command: {stdout}"
     );
     assert!(
-        !stdout.contains("skim lint rustfmt"),
+        !stdout.contains("skim rustfmt"),
         "ACK must NOT produce a handler rewrite: {stdout}"
     );
 }
@@ -387,7 +404,7 @@ fn test_alignment_cargo_fmt_check_acked() {
         "ACK must echo original command: {stdout}"
     );
     assert!(
-        !stdout.contains("skim lint rustfmt"),
+        !stdout.contains("skim rustfmt"),
         "ACK must NOT rewrite to a handler: {stdout}"
     );
 }
@@ -456,8 +473,10 @@ fn test_alignment_rewrite_single_quoted_cargo_fmt() {
 // ============================================================================
 
 /// The rewrite engine and the handler both must agree on the subcommand path.
-/// This test exercises `skim test cargo` vs `skim test cargo --` (with sep)
+/// This test exercises `skim cargo test` vs `skim cargo test --` (with sep)
 /// to verify the separator is preserved by the rewrite engine.
+///
+/// v2.8.0: Flat dispatch — `skim cargo test` replaces `skim test cargo`.
 #[test]
 fn test_alignment_cargo_test_separator_preserved() {
     // Rewrite must preserve the `-- --nocapture` suffix.
@@ -465,11 +484,13 @@ fn test_alignment_cargo_test_separator_preserved() {
         .args(["rewrite", "cargo", "test", "--", "--nocapture"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo -- --nocapture"));
+        .stdout(predicate::str::contains("skim cargo test -- --nocapture"));
 }
 
-/// Verify that `npm ci` rewrites to `skim pkg npm install` (alias handling)
+/// Verify that `npm ci` rewrites to `skim npm install` (alias handling)
 /// and the install handler works with npm install JSON fixture.
+///
+/// v2.8.0: Flat dispatch — `skim npm install` replaces `skim pkg npm install`.
 #[test]
 fn test_alignment_npm_ci_alias_and_handler() {
     // `npm ci` is an alias for `npm install` in the rewrite rules.
@@ -477,19 +498,21 @@ fn test_alignment_npm_ci_alias_and_handler() {
         .args(["rewrite", "npm", "ci"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm install"));
+        .stdout(predicate::str::contains("skim npm install"));
 
-    // The handler it routes to is `skim pkg npm install`.
+    // The handler it routes to is `skim npm install`.
     let fixture = include_str!("fixtures/cmd/pkg/npm_install.json");
     skim_cmd()
-        .args(["pkg", "npm", "install"])
+        .args(["npm", "install"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("INSTALL").or(predicate::str::contains("install")));
 }
 
-/// Verify that `python3 -m pytest` rewrites to `skim test pytest` and the
+/// Verify that `python3 -m pytest` rewrites to `skim pytest` and the
 /// pytest handler accepts the same fixture as bare `pytest`.
+///
+/// v2.8.0: Flat dispatch — `skim pytest` replaces `skim test pytest`.
 #[test]
 fn test_alignment_python3_m_pytest_same_handler_as_bare_pytest() {
     // Both forms rewrite to the same handler.
@@ -508,13 +531,13 @@ fn test_alignment_python3_m_pytest_same_handler_as_bare_pytest() {
     let bare_stdout = String::from_utf8(bare.stdout).unwrap();
     let python3_stdout = String::from_utf8(python3.stdout).unwrap();
 
-    // Both must produce the same handler target (skim test pytest).
+    // Both must produce the same handler target (skim pytest).
     assert!(
-        bare_stdout.contains("skim test pytest"),
-        "bare pytest must rewrite to skim test pytest: {bare_stdout}"
+        bare_stdout.contains("skim pytest"),
+        "bare pytest must rewrite to skim pytest: {bare_stdout}"
     );
     assert!(
-        python3_stdout.contains("skim test pytest"),
-        "python3 -m pytest must rewrite to skim test pytest: {python3_stdout}"
+        python3_stdout.contains("skim pytest"),
+        "python3 -m pytest must rewrite to skim pytest: {python3_stdout}"
     );
 }

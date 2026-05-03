@@ -93,16 +93,16 @@ mod tests {
 
     #[test]
     fn test_copilot_format_response_is_deny() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         assert_eq!(response["permissionDecision"], "deny");
     }
 
     #[test]
     fn test_copilot_format_response_includes_command_in_reason() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         let reason = response["reason"].as_str().unwrap();
         assert!(
-            reason.contains("skim test cargo"),
+            reason.contains("skim cargo test"),
             "reason should contain the rewritten command, got: {reason}"
         );
         assert!(
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn test_copilot_format_response_no_allow() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         // Must be "deny", never "allow" (Copilot's allow is broken)
         assert_ne!(
             response["permissionDecision"].as_str().unwrap(),
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_copilot_format_response_no_hook_specific_output() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         // Copilot uses deny-with-suggestion, not hookSpecificOutput
         assert!(
             response.get("hookSpecificOutput").is_none(),

@@ -20,7 +20,7 @@
 //!
 //! `prettier --check` and `rustfmt --check` invoked without explicit file/glob
 //! arguments emit near-zero output on a clean codebase: exit 0, empty stdout.
-//! Rewriting to `skim lint prettier/rustfmt` in this case produces an OK
+//! Rewriting to `skim prettier/rustfmt` in this case produces an OK
 //! header that is longer than the original empty output. The ACK list causes
 //! the original command to be echoed as-is, respecting the compress-or-skip rule.
 //!
@@ -39,7 +39,7 @@
 //!
 //! DESIGN DECISION: We acknowledge the entire `prettier --check` prefix family.
 //! The rationale: even with file args, the output list is brief enough that
-//! `skim lint prettier` provides marginal compression value. The overhead of the
+//! `skim prettier` provides marginal compression value. The overhead of the
 //! skim header outweighs the gain for small to medium projects. This aligns with
 //! the compress-or-skip feedback rule.
 

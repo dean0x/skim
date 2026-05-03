@@ -3,6 +3,9 @@
 //! Tests each pkg tool/subcommand at different degradation tiers via stdin piping,
 //! verifying structured output markers and stderr diagnostics.
 //!
+//! v2.8.0: Flat dispatch — tool names are top-level subcommands.
+//! e.g. `skim npm install` instead of `skim pkg npm install`.
+//!
 //! Tier behavior reference:
 //! - Full: no stderr markers
 //! - Degraded: "[skim:warning] ..." on stderr (only with --debug)
@@ -12,41 +15,9 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn skim_cmd() -> Command {
-    Command::cargo_bin("skim").unwrap()
-}
-
-// ============================================================================
-// skim pkg --help
-// ============================================================================
-
-#[test]
-fn test_pkg_help() {
-    skim_cmd()
-        .args(["pkg", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Available tools:"))
-        .stdout(predicate::str::contains("npm"))
-        .stdout(predicate::str::contains("pip"))
-        .stdout(predicate::str::contains("cargo"));
-}
-
-#[test]
-fn test_pkg_no_args_shows_help() {
-    skim_cmd()
-        .arg("pkg")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Available tools:"));
-}
-
-#[test]
-fn test_pkg_unknown_tool() {
-    skim_cmd()
-        .args(["pkg", "yarn"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unknown tool"));
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd
 }
 
 // ============================================================================
@@ -57,7 +28,7 @@ fn test_pkg_unknown_tool() {
 fn test_npm_install_tier1_json() {
     let fixture = include_str!("fixtures/cmd/pkg/npm_install.json");
     skim_cmd()
-        .args(["pkg", "npm", "install"])
+        .args(["npm", "install"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -74,7 +45,7 @@ fn test_npm_install_tier1_json() {
 fn test_npm_install_tier2_regex() {
     let fixture = include_str!("fixtures/cmd/pkg/npm_install_text.txt");
     skim_cmd()
-        .args(["--debug", "pkg", "npm", "install"])
+        .args(["--debug", "npm", "install"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -90,7 +61,7 @@ fn test_npm_install_tier2_regex() {
 #[test]
 fn test_npm_install_passthrough() {
     skim_cmd()
-        .args(["--debug", "pkg", "npm", "install"])
+        .args(["--debug", "npm", "install"])
         .write_stdin("completely unparseable output")
         .assert()
         .success()
@@ -106,7 +77,7 @@ fn test_npm_install_passthrough() {
 fn test_npm_audit_tier1_json() {
     let fixture = include_str!("fixtures/cmd/pkg/npm_audit.json");
     skim_cmd()
-        .args(["pkg", "npm", "audit"])
+        .args(["npm", "audit"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -119,7 +90,7 @@ fn test_npm_audit_tier1_json() {
 fn test_npm_audit_clean_tier1() {
     let fixture = include_str!("fixtures/cmd/pkg/npm_audit_clean.json");
     skim_cmd()
-        .args(["pkg", "npm", "audit"])
+        .args(["npm", "audit"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -134,7 +105,7 @@ fn test_npm_audit_clean_tier1() {
 fn test_npm_outdated_tier1_json() {
     let fixture = include_str!("fixtures/cmd/pkg/npm_outdated.json");
     skim_cmd()
-        .args(["pkg", "npm", "outdated"])
+        .args(["npm", "outdated"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -150,7 +121,7 @@ fn test_npm_outdated_tier1_json() {
 fn test_npm_ls_tier1_json() {
     let fixture = include_str!("fixtures/cmd/pkg/npm_ls.json");
     skim_cmd()
-        .args(["pkg", "npm", "ls"])
+        .args(["npm", "ls"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -166,7 +137,7 @@ fn test_npm_ls_tier1_json() {
 #[test]
 fn test_npm_no_subcmd_shows_help() {
     skim_cmd()
-        .args(["pkg", "npm"])
+        .args(["npm"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Subcommands:"))
@@ -182,7 +153,7 @@ fn test_npm_no_subcmd_shows_help() {
 fn test_pip_install_tier1_regex() {
     let fixture = include_str!("fixtures/cmd/pkg/pip_install.txt");
     skim_cmd()
-        .args(["pkg", "pip", "install"])
+        .args(["pip", "install"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -198,7 +169,7 @@ fn test_pip_install_tier1_regex() {
 fn test_pip_check_clean() {
     let fixture = include_str!("fixtures/cmd/pkg/pip_check_clean.txt");
     skim_cmd()
-        .args(["pkg", "pip", "check"])
+        .args(["pip", "check"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -214,7 +185,7 @@ fn test_pip_check_clean() {
 fn test_pip_check_issues() {
     let fixture = include_str!("fixtures/cmd/pkg/pip_check_issues.txt");
     skim_cmd()
-        .args(["pkg", "pip", "check"])
+        .args(["pip", "check"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -230,7 +201,7 @@ fn test_pip_check_issues() {
 fn test_pip_list_json() {
     let fixture = include_str!("fixtures/cmd/pkg/pip_outdated.json");
     skim_cmd()
-        .args(["pkg", "pip", "list"])
+        .args(["pip", "list"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -246,7 +217,7 @@ fn test_pip_list_json() {
 fn test_pnpm_install_regex() {
     let fixture = include_str!("fixtures/cmd/pkg/pnpm_install.txt");
     skim_cmd()
-        .args(["pkg", "pnpm", "install"])
+        .args(["pnpm", "install"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -262,7 +233,7 @@ fn test_pnpm_install_regex() {
 fn test_pnpm_audit_json() {
     let fixture = include_str!("fixtures/cmd/pkg/pnpm_audit.json");
     skim_cmd()
-        .args(["pkg", "pnpm", "audit"])
+        .args(["pnpm", "audit"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -278,7 +249,7 @@ fn test_pnpm_audit_json() {
 fn test_pnpm_outdated_json() {
     let fixture = include_str!("fixtures/cmd/pkg/pnpm_outdated.json");
     skim_cmd()
-        .args(["pkg", "pnpm", "outdated"])
+        .args(["pnpm", "outdated"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -294,7 +265,7 @@ fn test_pnpm_outdated_json() {
 fn test_cargo_audit_json() {
     let fixture = include_str!("fixtures/cmd/pkg/cargo_audit.json");
     skim_cmd()
-        .args(["pkg", "cargo", "audit"])
+        .args(["cargo", "audit"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -307,7 +278,7 @@ fn test_cargo_audit_json() {
 fn test_cargo_audit_clean_json() {
     let fixture = include_str!("fixtures/cmd/pkg/cargo_audit_clean.json");
     skim_cmd()
-        .args(["pkg", "cargo", "audit"])
+        .args(["cargo", "audit"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -322,7 +293,7 @@ fn test_cargo_audit_clean_json() {
 fn test_cargo_audit_tier2_regex() {
     let text = "Crate:   buffer-utils\nVersion: 0.3.1\nTitle:   Buffer overflow\nID:      RUSTSEC-2024-0001";
     skim_cmd()
-        .args(["--debug", "pkg", "cargo", "audit"])
+        .args(["--debug", "cargo", "audit"])
         .write_stdin(text)
         .assert()
         .success()
@@ -337,7 +308,7 @@ fn test_cargo_audit_tier2_regex() {
 #[test]
 fn test_cargo_audit_passthrough() {
     skim_cmd()
-        .args(["--debug", "pkg", "cargo", "audit"])
+        .args(["--debug", "cargo", "audit"])
         .write_stdin("completely unparseable output")
         .assert()
         .success()

@@ -40,7 +40,7 @@ fn is_format_mode(args: &[String]) -> bool {
     args.first().is_some_and(|a| a == "fmt")
 }
 
-/// Run `skim lint dprint [args...]`.
+/// Run `skim dprint [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -57,7 +57,7 @@ fn run_check(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "check" subcommand so that stdin is detected when no
-    // file args remain (e.g., `cat output.txt | skim lint dprint check`).
+    // file args remain (e.g., `cat output.txt | skim dprint check`).
     // `prepare_check_args` re-injects "check" unconditionally when absent.
     let remaining: Vec<String> = args
         .iter()
@@ -114,7 +114,7 @@ fn run_format(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "fmt" subcommand so that stdin is detected when no
-    // file args remain (e.g., `cat output.txt | skim lint dprint fmt`).
+    // file args remain (e.g., `cat output.txt | skim dprint fmt`).
     // `prepare_format_args` re-injects "fmt" for binary execution.
     let remaining: Vec<String> = args.iter().skip(1).cloned().collect();
     super::run_linter(

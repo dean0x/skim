@@ -1,8 +1,9 @@
 //! Build output compression (#51)
 //!
-//! Executes build tools (cargo, clippy, tsc) and compresses their output
-//! using three-tier parse degradation. Supports both direct invocation and
-//! piped stdin.
+//! Handles build tool output for cargo, clippy, and tsc using three-tier
+//! parse degradation. Called via flat dispatch (`skim tsc`) or multi-category
+//! dispatch (`skim cargo build`, `skim cargo clippy`). Supports both direct
+//! invocation and piped stdin.
 
 pub(crate) mod cargo;
 pub(crate) mod tsc;
@@ -18,9 +19,11 @@ use crate::runner::{CommandOutput, CommandRunner};
 // Public dispatch
 // ============================================================================
 
-/// Dispatch the `build` subcommand.
+/// Dispatch build tool handlers.
 ///
-/// Usage: `skim build {cargo|clippy|tsc} [args...]`
+/// Called by flat dispatch (`skim tsc`) or multi-category dispatch
+/// (`skim cargo build`, `skim cargo clippy`). The `args` slice has the
+/// tool name prepended by the caller.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -49,41 +52,47 @@ pub(crate) fn run(
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
         Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
+            // Defensive branch: flat dispatch always prepends a known tool name
+            // (cargo/clippy/tsc) before calling this function, so this arm is
+            // only reachable via internal routing bugs. Use eprintln! + FAILURE
+            // (not bail!) consistent with sibling handlers (pkg, lint, test).
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
-            anyhow::bail!(
-                "unknown build tool: '{safe_unknown}'\n\n\
-                 Usage: skim build {{cargo|clippy|tsc}} [args...]\n\n\
+            eprintln!(
+                "skim: unknown subcommand '{safe_unknown}'\n\
                  Supported tools: cargo, clippy, tsc"
             );
+            Ok(ExitCode::FAILURE)
         }
         None => {
-            anyhow::bail!(
-                "missing required argument: <TOOL>\n\n\
-                 Usage: skim build {{cargo|clippy|tsc}} [args...]\n\n\
+            eprintln!(
+                "skim: missing build tool\n\n\
+                 Usage: skim cargo build [args...]\n\
+                 Usage: skim tsc [args...]\n\n\
                  Supported tools: cargo, clippy, tsc"
             );
+            Ok(ExitCode::FAILURE)
         }
     }
 }
 
 fn print_help() {
-    println!("skim build");
+    println!("skim {{cargo build|cargo clippy|tsc}} [args...]");
     println!();
-    println!("  Execute build tools and compress output for AI context windows.");
+    println!("  Run build tools and compress output for AI context windows.");
     println!();
-    println!("USAGE:");
-    println!("  skim build <TOOL> [args...]");
-    println!();
-    println!("TOOLS:");
+    println!("Available tools:");
     println!("  cargo      Run cargo build with output compression");
     println!("  clippy     Run cargo clippy with output compression");
     println!("  tsc        Run TypeScript compiler with output compression");
     println!();
-    println!("EXAMPLES:");
-    println!("  skim build cargo");
-    println!("  skim build cargo --release");
-    println!("  skim build clippy -- -W clippy::pedantic");
-    println!("  skim build tsc --noEmit");
+    println!("Flags:");
+    println!("  --show-stats    Show token statistics");
+    println!();
+    println!("Examples:");
+    println!("  skim cargo build");
+    println!("  skim cargo build --release");
+    println!("  skim cargo clippy -- -W clippy::pedantic");
+    println!("  skim tsc --noEmit");
 }
 
 // Shared helpers (user_has_flag, inject_flag_before_separator) are in crate::cmd
@@ -148,9 +157,7 @@ pub(super) fn run_parsed_command(
     let result = parser(&output);
 
     // Emit markers to stderr (warnings, notices)
-    let stderr = std::io::stderr();
-    let mut stderr_handle = stderr.lock();
-    let _ = result.emit_markers(&mut stderr_handle);
+    let _ = result.emit_markers(&mut std::io::stderr().lock());
 
     // Print the result content to stdout
     let content = result.content();
@@ -158,16 +165,15 @@ pub(super) fn run_parsed_command(
         println!("{content}");
     }
 
-    // Combine stdout+stderr for stats and analytics
-    let raw_text = if output.stderr.is_empty() {
-        output.stdout.clone()
-    } else {
-        format!("{}\n{}", output.stdout, output.stderr)
-    };
+    // Combine stdout+stderr for stats and analytics.
+    // Hold as Cow to avoid an unconditional String clone: Borrowed when stderr
+    // is empty (fast path), Owned only when both streams are non-empty.
+    let raw_cow = super::combine_output(&output);
 
-    // Report token stats if requested
+    // Report token stats if requested. count_token_pair takes &str so we
+    // borrow through the Cow without forcing an allocation.
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_text, result.content());
+        let (orig, comp) = crate::process::count_token_pair(raw_cow.as_ref(), result.content());
         crate::process::report_token_stats(orig, comp, "");
     }
 
@@ -190,9 +196,11 @@ pub(super) fn run_parsed_command(
     };
 
     // Record analytics (fire-and-forget, non-blocking).
+    // try_record_command takes ownership, so convert to String here — the
+    // single call site where ownership is actually required.
     crate::analytics::try_record_command(
         rec.with_tier(result.tier_name()),
-        raw_text,
+        raw_cow.into_owned(),
         result.content().to_string(),
         super::format_analytics_label("build", program, &args.join(" ")),
         output.duration,

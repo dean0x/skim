@@ -19,7 +19,7 @@ const CONFIG: FileToolConfig<'static> = FileToolConfig {
     install_hint: "grep is typically pre-installed. For better compression, install ripgrep: https://github.com/BurntSushi/ripgrep",
 };
 
-/// Run `skim file grep [args...]`.
+/// Run `skim grep [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

@@ -92,15 +92,15 @@ mod tests {
 
     #[test]
     fn test_claude_format_response() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         let output = response.get("hookSpecificOutput").unwrap();
         assert_eq!(output["hookEventName"], "PreToolUse");
-        assert_eq!(output["updatedInput"]["command"], "skim test cargo");
+        assert_eq!(output["updatedInput"]["command"], "skim cargo test");
     }
 
     #[test]
     fn test_claude_format_response_no_permission_decision() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         // SECURITY: Must never set permissionDecision
         assert!(response.get("permissionDecision").is_none());
     }

@@ -1,4 +1,6 @@
-//! Integration tests for `skim test pytest` subcommand (#47).
+//! Integration tests for `skim pytest` subcommand (#47).
+//!
+//! v2.8.0: Flat dispatch — `skim pytest` replaces `skim test pytest`.
 //!
 //! Tests end-to-end CLI behavior: help output, piped fixture parsing,
 //! and (optionally) real pytest execution when available.
@@ -12,23 +14,14 @@ use std::process;
 // ============================================================================
 
 #[test]
-fn test_skim_test_help_mentions_pytest() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["test", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("pytest"));
-}
-
-#[test]
-fn test_skim_test_pytest_help() {
-    // `skim test pytest` with no stdin and no args should attempt to run pytest.
+fn test_skim_pytest_help() {
+    // v2.8.0: `skim pytest --help` — "test" is no longer a subcommand.
+    // `skim pytest` with --help and no stdin should attempt to run pytest --help.
     // Since we can't guarantee pytest is installed, we just check that
     // the subcommand routing works (doesn't say "not yet implemented").
     let output = Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest", "--help"])
+        .args(["pytest", "--help"])
         .output()
         .unwrap();
 
@@ -42,7 +35,7 @@ fn test_skim_test_pytest_help() {
     );
     assert!(
         !combined.contains("not yet implemented"),
-        "skim test pytest should be implemented, got: {combined}"
+        "skim pytest should be implemented, got: {combined}"
     );
 }
 
@@ -55,7 +48,7 @@ fn test_piped_all_pass() {
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -68,7 +61,7 @@ fn test_piped_with_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -82,7 +75,7 @@ fn test_piped_mixed() {
     let fixture = include_str!("fixtures/cmd/test/pytest_mixed.txt");
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -96,7 +89,7 @@ fn test_piped_all_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_all_fail.txt");
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -108,7 +101,7 @@ fn test_piped_all_failures() {
 fn test_piped_passthrough_for_garbage() {
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin("this is not pytest output\n")
         .assert()
         // Passthrough: should still output something (the raw input)
@@ -126,7 +119,7 @@ fn test_piped_passthrough_mode_skips_compression() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .env("SKIM_PASSTHROUGH", "1")
         .write_stdin(fixture)
         .assert()
@@ -148,7 +141,7 @@ fn test_failure_context_appended_on_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -162,7 +155,7 @@ fn test_failure_context_absent_on_all_pass() {
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
     Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -173,15 +166,8 @@ fn test_failure_context_absent_on_all_pass() {
 // Unknown runner
 // ============================================================================
 
-#[test]
-fn test_unknown_runner() {
-    Command::cargo_bin("skim")
-        .unwrap()
-        .args(["test", "unknown_runner_xyz"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unknown runner"));
-}
+// v2.8.0: "test" is no longer a subcommand. Unknown tool names are unknown
+// subcommands at the dispatch level. This test is removed.
 
 // ============================================================================
 // Real pytest execution (gated on pytest availability)
@@ -209,7 +195,7 @@ fn test_real_pytest_if_available() {
 
     let output = Command::cargo_bin("skim")
         .unwrap()
-        .args(["test", "pytest", test_file.to_str().unwrap()])
+        .args(["pytest", test_file.to_str().unwrap()])
         .output()
         .unwrap();
 
@@ -240,7 +226,6 @@ fn test_pytest_with_args_does_not_read_stdin() {
         .unwrap()
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
-        .arg("test")
         .arg("pytest")
         .arg("-v")
         .output()

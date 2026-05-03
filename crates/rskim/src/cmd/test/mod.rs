@@ -1,6 +1,6 @@
-//! Test subcommand dispatcher (#46, #47, #48, #49)
+//! Test handler — dispatches to test runner parsers (#46, #47, #48, #49)
 //!
-//! Routes `skim test <runner> [args...]` to the appropriate test parser.
+//! Routes `skim <runner> [args...]` to the appropriate test parser.
 //! Currently supported runners: `cargo`, `go`, `vitest`, `jest`, `pytest`.
 
 pub(crate) mod cargo;
@@ -11,10 +11,10 @@ pub(crate) mod vitest;
 
 use std::process::ExitCode;
 
-/// Known test runners that `skim test` can dispatch to.
+/// Known test runners that the test handler can dispatch to.
 const KNOWN_RUNNERS: &[&str] = &["cargo", "go", "vitest", "jest", "pytest"];
 
-/// Entry point for `skim test <runner> [args...]`.
+/// Entry point for `skim <runner> [args...]` (test runners).
 ///
 /// If no runner is specified or `--help` / `-h` is passed, prints usage
 /// and exits. Otherwise dispatches to the runner-specific handler.
@@ -50,9 +50,9 @@ pub(crate) fn run(
         _ => {
             let safe_runner = crate::cmd::sanitize_for_display(runner);
             eprintln!(
-                "skim test: unknown runner '{safe_runner}'\n\
+                "skim: unknown runner '{safe_runner}'\n\
                  Available runners: {}\n\
-                 Run 'skim test --help' for usage information",
+                 Run 'skim <runner> --help' for usage information",
                 KNOWN_RUNNERS.join(", ")
             );
             Ok(ExitCode::FAILURE)
@@ -61,19 +61,19 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim test <runner> [args...]");
+    println!("skim <runner> [args...]");
     println!();
     println!("  Run tests through a runner and parse the output.");
     println!();
     println!("Available runners:");
     for runner in KNOWN_RUNNERS {
-        println!("  {runner}");
+        println!("  skim {runner}");
     }
     println!();
     println!("Examples:");
-    println!("  skim test cargo                Run cargo test");
-    println!("  skim test go ./...             Run all Go tests");
-    println!("  skim test vitest               Run vitest");
-    println!("  skim test pytest               Run pytest");
-    println!("  cargo test 2>&1 | skim test cargo  Pipe cargo output");
+    println!("  skim cargo test                Run cargo test");
+    println!("  skim go test ./...             Run all Go tests");
+    println!("  skim vitest                    Run vitest");
+    println!("  skim pytest                    Run pytest");
+    println!("  cargo test 2>&1 | skim cargo test  Pipe cargo output");
 }

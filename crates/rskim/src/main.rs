@@ -185,21 +185,23 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
     skim file.ts --no-cache                  Disable caching for pure transformation\n  \
     skim --clear-cache                       Clear all cached files\n\n\
 SUBCOMMANDS:\n  \
-    agents                                   Show detected AI agents and hook/session status\n  \
-    build                                    Build with output parsing\n  \
-    completions <SHELL>                      Generate shell completions (bash, zsh, fish, ...)\n  \
-    discover                                 Identify missed optimization opportunities\n  \
-    file                                     Read and transform source files (default)\n  \
-    git                                      Git helpers (AST-aware diff, status, log)\n  \
-    infra                                    Infrastructure output compression (terraform, k8s)\n  \
+    cargo <test|build|clippy|nextest|audit>  Cargo subcommand compression\n  \
+    go test                                  Go test compression\n  \
+    pytest / vitest / jest                   Test runner compression\n  \
+    tsc                                      TypeScript build compression\n  \
+    eslint / ruff / mypy / biome / ...       Lint output compression\n  \
+    npm / pnpm / pip                         Package manager compression\n  \
+    gh / aws / curl / wget                   Infrastructure tool compression\n  \
+    find / grep / ls / rg / tree             File operation compression\n  \
+    git                                      Git output compression (diff, status, log, ...)\n  \
+    log                                      Log output compression\n  \
+    agents                                   Show detected AI agents\n  \
+    completions <SHELL>                      Generate shell completions\n  \
+    discover                                 Identify missed optimizations\n  \
     init                                     Initialize skim configuration\n  \
-    learn                                    Detect CLI error patterns and generate correction rules\n  \
-    lint                                     Lint output compression (eslint, ruff, mypy, ...)\n  \
-    log                                      Log output compression (JSON + regex)\n  \
-    pkg                                      Package manager output compression (npm, pip, cargo)\n  \
-    rewrite [--suggest] <COMMAND>...          Rewrite commands into skim equivalents\n  \
-    stats [--since N] [--format json]        Show token analytics dashboard\n  \
-    test                                     Run test with output parsing\n\n\
+    learn                                    Detect CLI error patterns\n  \
+    rewrite <COMMAND>...                     Rewrite commands into skim equivalents\n  \
+    stats [--since N] [--format json]        Token analytics dashboard\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
     /// File, directory, or glob pattern to process (use '-' for stdin)
@@ -803,13 +805,13 @@ mod tests {
     /// for `--mode`, not route to the `test` subcommand.
     #[test]
     fn test_flag_value_matching_subcommand_is_consumed() {
-        // Verify "test" is actually a known subcommand (precondition)
+        // Verify "cargo" is actually a known subcommand (precondition)
         assert!(
-            cmd::is_known_subcommand("test"),
-            "precondition: 'test' must be a known subcommand for this test"
+            cmd::is_known_subcommand("cargo"),
+            "precondition: 'cargo' must be a known subcommand for this test"
         );
 
-        // All value-consuming flags should consume "test" as their value,
+        // All value-consuming flags should consume "cargo" as their value,
         // so resolve_invocation should never route to Subcommand when the
         // flag is followed by a subcommand name as its value.
         //
@@ -820,8 +822,8 @@ mod tests {
         for flag in VALUE_FLAGS {
             assert!(
                 is_flag_with_value(flag),
-                "If {flag} does not consume its value, `skim {flag} test` would \
-                 incorrectly route to the 'test' subcommand."
+                "If {flag} does not consume its value, `skim {flag} cargo` would \
+                 incorrectly route to the 'cargo' subcommand."
             );
         }
     }

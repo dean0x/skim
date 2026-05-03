@@ -38,7 +38,7 @@ static RE_CARGO_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"test result: \w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored").unwrap()
 });
 
-/// Run `skim test cargo [args...]`.
+/// Run `skim cargo test [args...]`.
 ///
 /// Builds the cargo command, executes it, and parses the output using
 /// three-tier degradation. For nextest, skips JSON injection entirely.

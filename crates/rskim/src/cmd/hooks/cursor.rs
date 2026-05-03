@@ -102,9 +102,9 @@ mod tests {
 
     #[test]
     fn test_cursor_format_response() {
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         assert_eq!(response["permission"], "allow");
-        assert_eq!(response["updated_input"]["command"], "skim test cargo");
+        assert_eq!(response["updated_input"]["command"], "skim cargo test");
     }
 
     #[test]
@@ -112,7 +112,7 @@ mod tests {
         // SECURITY: Cursor's hook protocol REQUIRES "permission": "allow" in
         // every response. This is NOT Claude Code's permissionDecision -- it is
         // a distinct, required field in Cursor's schema.
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         assert_eq!(
             response.get("permission").and_then(|v| v.as_str()),
             Some("allow"),
@@ -123,14 +123,14 @@ mod tests {
     #[test]
     fn test_cursor_format_response_no_hook_specific_output() {
         // Cursor uses permission/updated_input, not hookSpecificOutput
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         assert!(response.get("hookSpecificOutput").is_none());
     }
 
     #[test]
     fn test_cursor_format_response_no_permission_decision() {
         // Cursor must not emit Claude Code's permissionDecision field
-        let response = hook().format_response("skim test cargo");
+        let response = hook().format_response("skim cargo test");
         assert!(
             response.get("permissionDecision").is_none(),
             "Cursor response must not contain Claude Code's permissionDecision"

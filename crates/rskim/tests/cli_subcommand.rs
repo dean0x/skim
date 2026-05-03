@@ -183,13 +183,14 @@ fn test_subcommand_help_exits_zero() {
 
 #[test]
 fn test_subcommand_short_help_exits_zero() {
+    // v2.8.0: "build" is no longer a top-level subcommand; use "cargo" instead.
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("build")
+        .arg("cargo")
         .arg("-h")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build"));
+        .stdout(predicate::str::contains("skim cargo"));
 }
 
 // All known subcommands are now implemented — no stubs remaining.
@@ -259,24 +260,25 @@ fn test_full_path_to_dir_named_as_subcommand_uses_separator_heuristic() {
 #[test]
 fn test_bare_dir_named_as_subcommand_routes_to_subcommand() {
     let dir = TempDir::new().unwrap();
-    // Create a directory called "build" (a known subcommand name) with a source file inside
-    let build_dir = dir.path().join("build");
-    fs::create_dir(&build_dir).unwrap();
-    let file = build_dir.join("main.rs");
+    // Create a directory called "cargo" (a known subcommand name) with a source file inside
+    let cargo_dir = dir.path().join("cargo");
+    fs::create_dir(&cargo_dir).unwrap();
+    let file = cargo_dir.join("main.rs");
     fs::write(&file, "fn main() {}").unwrap();
 
-    // After the router fix, bare "build" ALWAYS routes to the subcommand
+    // After the router fix, bare "cargo" ALWAYS routes to the subcommand
     // regardless of whether a directory with that name exists on disk.
-    // To process such a directory, users must use ./build or the full path.
+    // To process such a directory, users must use ./cargo or the full path.
+    // v2.8.0: "cargo" is a top-level subcommand (was "build" previously).
     Command::cargo_bin("skim")
         .unwrap()
         .current_dir(dir.path())
-        .arg("build")
+        .arg("cargo")
         .arg("--help")
         .assert()
         .success()
         // Should show the subcommand help, not process the directory
-        .stdout(predicate::str::contains("skim build"));
+        .stdout(predicate::str::contains("skim cargo"));
 }
 
 // ============================================================================
@@ -322,6 +324,8 @@ fn test_mode_equals_syntax_is_single_token() {
 
 #[test]
 fn test_help_lists_subcommands() {
+    // v2.8.0: Flat dispatch — tool names are top-level subcommands.
+    // "test" and "build" are no longer category subcommands.
     Command::cargo_bin("skim")
         .unwrap()
         .arg("--help")
@@ -329,8 +333,8 @@ fn test_help_lists_subcommands() {
         .success()
         .stdout(predicate::str::contains("SUBCOMMANDS"))
         .stdout(predicate::str::contains("init"))
-        .stdout(predicate::str::contains("test"))
-        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("cargo"))
+        .stdout(predicate::str::contains("vitest"))
         .stdout(predicate::str::contains("completions"));
 }
 
@@ -355,18 +359,20 @@ fn test_unknown_word_routes_to_file_operation() {
 // ============================================================================
 
 #[test]
-fn test_subcommand_file_help() {
+fn test_subcommand_find_help() {
+    // v2.8.0: `skim find --help` — "file" is no longer a subcommand.
     skim_cmd()
-        .args(["file", "--help"])
+        .args(["find", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("find"));
 }
 
 #[test]
-fn test_subcommand_infra_help() {
+fn test_subcommand_gh_help() {
+    // v2.8.0: `skim gh --help` — "infra" is no longer a subcommand.
     skim_cmd()
-        .args(["infra", "--help"])
+        .args(["gh", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("gh"));
@@ -385,13 +391,8 @@ fn test_subcommand_log_help() {
 // Error/edge paths
 // ============================================================================
 
-#[test]
-fn test_subcommand_file_unknown_tool() {
-    skim_cmd()
-        .args(["file", "unknown-tool-xyz"])
-        .assert()
-        .failure();
-}
+// v2.8.0: "file" is no longer a subcommand. Unknown tool names are unknown
+// subcommands at the dispatch level. This test is removed.
 
 // log uses its own stdin path (not run_parsed_command_with_mode), so empty
 // stdin is intentionally treated as success — unlike file/test subcommands
@@ -421,11 +422,12 @@ fn test_file_find_empty_stdin_falls_through_to_spawn() {
     // as the fallback.  On macOS it exits 1 (usage to stderr, empty stdout);
     // on Linux it defaults to "." and exits 0 with directory listing.
     // The process completing without hanging proves the spawn path ran.
+    // v2.8.0: `skim find` replaces `skim file find`.
     let output = skim_cmd()
-        .args(["file", "find"])
+        .args(["find"])
         .write_stdin("")
         .output()
-        .expect("skim file find should complete without hanging");
+        .expect("skim find should complete without hanging");
     // On Linux find succeeds (exit 0); on macOS it fails (exit 1).
     // Either is acceptable — the key property is that we spawned find
     // rather than blocking on empty stdin.
@@ -439,7 +441,7 @@ fn test_file_find_empty_stdin_falls_through_to_spawn() {
 #[test]
 fn test_subcommand_file_json() {
     let output = skim_cmd()
-        .args(["file", "find", "--json"])
+        .args(["find", "--json"])
         .write_stdin(FIND_FIXTURE)
         .output()
         .unwrap();
@@ -452,7 +454,7 @@ fn test_subcommand_file_json() {
 #[test]
 fn test_subcommand_infra_json() {
     let output = skim_cmd()
-        .args(["infra", "gh", "--json"])
+        .args(["gh", "--json"])
         .write_stdin(GH_FIXTURE)
         .output()
         .unwrap();
@@ -490,7 +492,7 @@ fn test_subcommand_log_json() {
 #[test]
 fn test_subcommand_file_show_stats() {
     let output = skim_cmd()
-        .args(["file", "find", "--show-stats"])
+        .args(["find", "--show-stats"])
         .write_stdin(FIND_FIXTURE)
         .output()
         .unwrap();
@@ -505,7 +507,7 @@ fn test_subcommand_file_show_stats() {
 #[test]
 fn test_subcommand_infra_show_stats() {
     let output = skim_cmd()
-        .args(["infra", "gh", "--show-stats"])
+        .args(["gh", "--show-stats"])
         .write_stdin(GH_FIXTURE)
         .output()
         .unwrap();
@@ -540,7 +542,7 @@ fn test_subcommand_log_show_stats() {
 fn test_subcommand_infra_gh_issue_view() {
     // Pipe issue JSON fixture via stdin — auto-detect should produce compressed output
     let output = skim_cmd()
-        .args(["infra", "gh"])
+        .args(["gh"])
         .write_stdin(GH_ISSUE_VIEW_FIXTURE)
         .output()
         .unwrap();
@@ -559,7 +561,7 @@ fn test_subcommand_infra_gh_issue_view() {
 #[test]
 fn test_subcommand_infra_gh_pr_view() {
     let output = skim_cmd()
-        .args(["infra", "gh"])
+        .args(["gh"])
         .write_stdin(GH_PR_VIEW_FIXTURE)
         .output()
         .unwrap();
@@ -578,7 +580,7 @@ fn test_subcommand_infra_gh_pr_view() {
 #[test]
 fn test_subcommand_infra_gh_pr_checks() {
     let output = skim_cmd()
-        .args(["infra", "gh"])
+        .args(["gh"])
         .write_stdin(GH_PR_CHECKS_FIXTURE)
         .output()
         .unwrap();
@@ -593,7 +595,7 @@ fn test_subcommand_infra_gh_pr_checks() {
 #[test]
 fn test_subcommand_infra_gh_run_view() {
     let output = skim_cmd()
-        .args(["infra", "gh"])
+        .args(["gh"])
         .write_stdin(GH_RUN_VIEW_FIXTURE)
         .output()
         .unwrap();
@@ -612,7 +614,7 @@ fn test_subcommand_infra_gh_run_view() {
 #[test]
 fn test_subcommand_infra_gh_issue_view_json_output() {
     let output = skim_cmd()
-        .args(["infra", "gh", "--json"])
+        .args(["gh", "--json"])
         .write_stdin(GH_ISSUE_VIEW_FIXTURE)
         .output()
         .unwrap();
@@ -633,7 +635,7 @@ fn test_subcommand_infra_gh_issue_view_json_output() {
 #[test]
 fn test_subcommand_infra_gh_run_view_json_output() {
     let output = skim_cmd()
-        .args(["infra", "gh", "--json"])
+        .args(["gh", "--json"])
         .write_stdin(GH_RUN_VIEW_FIXTURE)
         .output()
         .unwrap();
@@ -650,7 +652,7 @@ fn test_subcommand_infra_gh_run_view_json_output() {
 fn test_subcommand_infra_gh_existing_list_unchanged() {
     // Regression guard: existing list fixture must still work correctly
     let output = skim_cmd()
-        .args(["infra", "gh"])
+        .args(["gh"])
         .write_stdin(GH_FIXTURE)
         .output()
         .unwrap();
@@ -669,12 +671,12 @@ fn test_subcommand_infra_gh_existing_list_unchanged() {
 #[test]
 fn test_subcommand_infra_gh_run_watch_pipe_exits_clean() {
     // Mirrors the Tester's scenario:
-    //   printf "workflow step 1\nworkflow step 2\ncompleted\n" | skim infra gh run watch
+    //   printf "workflow step 1\nworkflow step 2\ncompleted\n" | skim gh run watch
     //
     // None of the lines match job-status patterns, so no output is produced
     // but the process must exit 0 (clean finalize on empty state).
     let output = skim_cmd()
-        .args(["infra", "gh", "run", "watch"])
+        .args(["gh", "run", "watch"])
         .write_stdin("workflow step 1\nworkflow step 2\ncompleted\n")
         .output()
         .unwrap();
@@ -687,11 +689,11 @@ fn test_subcommand_infra_gh_run_watch_pipe_exits_clean() {
 
 #[test]
 fn test_subcommand_infra_gh_run_watch_pipe_with_job_lines() {
-    // Validates that actual job-status lines piped to `skim infra gh run watch`
+    // Validates that actual job-status lines piped to `skim gh run watch`
     // produce compressed output (summaries) and exit 0.
     let input = "  * build In progress\n  ✓ build Completed\n  X test Failed\n";
     let output = skim_cmd()
-        .args(["infra", "gh", "run", "watch"])
+        .args(["gh", "run", "watch"])
         .write_stdin(input)
         .output()
         .unwrap();
@@ -706,12 +708,12 @@ fn test_subcommand_infra_gh_run_watch_pipe_with_job_lines() {
 #[test]
 fn test_subcommand_infra_gh_api_pipe_json_object() {
     // Mirrors the Tester's scenario:
-    //   echo '{"login": "foo", "id": 42}' | skim infra gh api
+    //   echo '{"login": "foo", "id": 42}' | skim gh api
     //
     // Must parse the JSON object and exit 0 (previously: exit 1 with error).
     let json = r#"{"login": "foo", "id": 42}"#;
     let output = skim_cmd()
-        .args(["infra", "gh", "api"])
+        .args(["gh", "api"])
         .write_stdin(json)
         .output()
         .unwrap();
@@ -730,11 +732,11 @@ fn test_subcommand_infra_gh_api_pipe_json_object() {
 
 #[test]
 fn test_subcommand_infra_gh_api_pipe_json_array() {
-    // Validates array input piped to `skim infra gh api` is parsed and
+    // Validates array input piped to `skim gh api` is parsed and
     // emits compressed output rather than an error.
     let json = r#"[{"id": 1, "name": "repo-a"}, {"id": 2, "name": "repo-b"}]"#;
     let output = skim_cmd()
-        .args(["infra", "gh", "api"])
+        .args(["gh", "api"])
         .write_stdin(json)
         .output()
         .unwrap();

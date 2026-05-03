@@ -3,6 +3,11 @@
 //! Tests each parser at different degradation tiers via stdin piping,
 //! verifying structured output markers and stderr diagnostics.
 //!
+//! v2.8.0: Flat dispatch — tool names are top-level subcommands.
+//! e.g. `skim cargo test` instead of `skim test cargo`,
+//!      `skim vitest` instead of `skim test vitest`,
+//!      `skim pytest` instead of `skim test pytest`.
+//!
 //! Tier behavior reference (from emit_markers in output/mod.rs):
 //! - Full: no stderr markers
 //! - Degraded: "[skim:warning] ..." on stderr (only with --debug)
@@ -26,7 +31,7 @@ fn skim_cmd() -> Command {
 fn test_cargo_tier1_json_pass_structured_output() {
     let fixture = include_str!("fixtures/cmd/test/cargo_pass.json");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -40,7 +45,7 @@ fn test_cargo_tier1_json_fail_structured_output() {
     // maps exit code from the synthetic CommandOutput, not from parsed results.
     let fixture = include_str!("fixtures/cmd/test/cargo_fail.json");
     skim_cmd()
-        .args(["test", "cargo"])
+        .args(["cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -62,7 +67,7 @@ fn test_cargo_nextest_pass_passthrough_via_stdin() {
     // Without "nextest" in args, nextest output hits passthrough tier
     let fixture = include_str!("fixtures/cmd/test/cargo_nextest_pass.txt");
     skim_cmd()
-        .args(["--debug", "test", "cargo"])
+        .args(["--debug", "cargo", "test"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -76,7 +81,7 @@ fn test_cargo_nextest_fail_passthrough_via_stdin() {
     // Without "nextest" in args, nextest output hits passthrough tier
     let fixture = include_str!("fixtures/cmd/test/cargo_nextest_fail.txt");
     skim_cmd()
-        .args(["--debug", "test", "cargo"])
+        .args(["--debug", "cargo", "test"])
         .write_stdin(fixture)
         .assert()
         // Exit code 0 from synthetic stdin exit code
@@ -96,7 +101,7 @@ fn test_cargo_tier2_regex_degraded() {
     // so the process exits 0 when tests pass.
     let text_input = "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured";
     skim_cmd()
-        .args(["--debug", "test", "cargo"])
+        .args(["--debug", "cargo", "test"])
         .write_stdin(text_input)
         .assert()
         .success()
@@ -112,7 +117,7 @@ fn test_cargo_tier2_regex_degraded() {
 fn test_cargo_tier3_passthrough_garbage_input() {
     let fixture = include_str!("fixtures/cmd/test/cargo_passthrough.txt");
     skim_cmd()
-        .args(["--debug", "test", "cargo"])
+        .args(["--debug", "cargo", "test"])
         .write_stdin(fixture)
         .assert()
         // Passthrough preserves raw content on stdout
@@ -125,7 +130,7 @@ fn test_cargo_tier3_passthrough_garbage_input() {
 fn test_cargo_passthrough_preserves_raw_content() {
     let garbage = "completely unparseable output\nno json, no regex match\n";
     skim_cmd()
-        .args(["--debug", "test", "cargo"])
+        .args(["--debug", "cargo", "test"])
         .write_stdin(garbage)
         .assert()
         .stdout(predicate::str::contains("completely unparseable output"))
@@ -140,7 +145,7 @@ fn test_cargo_passthrough_preserves_raw_content() {
 fn test_vitest_tier1_json_pass() {
     let fixture = include_str!("fixtures/vitest/vitest_pass.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -152,7 +157,7 @@ fn test_vitest_tier1_json_pass() {
 fn test_vitest_tier1_json_fail_with_detail() {
     let fixture = include_str!("fixtures/vitest/vitest_fail.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -164,7 +169,7 @@ fn test_vitest_tier1_json_fail_with_detail() {
 fn test_vitest_tier1_pnpm_prefix() {
     let fixture = include_str!("fixtures/vitest/vitest_pnpm_prefix.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -180,7 +185,7 @@ fn test_vitest_tier2_regex_pipe_format() {
     // Pipe-format summary triggers tier 2 regex
     let input = "Tests  3 passed | 0 failed | 3 total\n";
     skim_cmd()
-        .args(["--debug", "test", "vitest"])
+        .args(["--debug", "vitest"])
         .write_stdin(input)
         .assert()
         .success()
@@ -192,7 +197,7 @@ fn test_vitest_tier2_regex_pipe_format() {
 fn test_vitest_tier2_regex_fail_fixture() {
     let fixture = include_str!("fixtures/cmd/test/vitest_regex_fail.txt");
     skim_cmd()
-        .args(["--debug", "test", "vitest"])
+        .args(["--debug", "vitest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -207,7 +212,7 @@ fn test_vitest_tier2_regex_fail_fixture() {
 #[test]
 fn test_vitest_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "test", "vitest"])
+        .args(["--debug", "vitest"])
         .write_stdin("random garbage not vitest output\n")
         .assert()
         .stderr(predicate::str::contains("[skim:notice]"));
@@ -221,7 +226,7 @@ fn test_vitest_tier3_passthrough_garbage() {
 fn test_pytest_tier1_pass() {
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -233,7 +238,7 @@ fn test_pytest_tier1_pass() {
 fn test_pytest_tier1_fail_with_detail() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -245,7 +250,7 @@ fn test_pytest_tier1_fail_with_detail() {
 fn test_pytest_tier1_mixed() {
     let fixture = include_str!("fixtures/cmd/test/pytest_mixed.txt");
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -263,7 +268,7 @@ fn test_pytest_tier1_mixed() {
 #[test]
 fn test_pytest_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "test", "pytest"])
+        .args(["--debug", "pytest"])
         .write_stdin("random garbage not pytest output\n")
         .assert()
         .stderr(predicate::str::contains("[skim:notice]"));
@@ -273,7 +278,7 @@ fn test_pytest_passthrough_garbage() {
 fn test_pytest_passthrough_preserves_raw() {
     let garbage = "some unrecognized tool output\nline 2\nline 3\n";
     skim_cmd()
-        .args(["test", "pytest"])
+        .args(["pytest"])
         .write_stdin(garbage)
         .assert()
         .stdout(predicate::str::contains("some unrecognized tool output"));
@@ -290,7 +295,7 @@ fn test_pytest_passthrough_preserves_raw() {
 fn test_vitest_degraded_silent_without_debug() {
     let input = "Tests  3 passed | 0 failed | 3 total\n";
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(input)
         .assert()
         .success()
@@ -303,7 +308,7 @@ fn test_vitest_degraded_silent_without_debug() {
 #[test]
 fn test_vitest_passthrough_silent_without_debug() {
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin("random garbage not vitest output\n")
         .assert()
         // No --debug flag: no markers on stderr
@@ -315,14 +320,14 @@ fn test_vitest_passthrough_silent_without_debug() {
 // stderr hint on compressed failure (Fix E)
 // ============================================================================
 
-/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`,
+/// Pipe a failing vitest JSON fixture through stdin to `skim vitest`,
 /// capture stderr, verify it contains `[skim] compressed output` (the hint
 /// that tells the user how to see full raw output).
 #[test]
 fn test_stderr_hint_on_compressed_failure() {
     let fixture = include_str!("fixtures/vitest/vitest_fail.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -335,7 +340,7 @@ fn test_stderr_hint_on_compressed_failure() {
 fn test_no_stderr_hint_on_success() {
     let fixture = include_str!("fixtures/vitest/vitest_pass.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -356,14 +361,14 @@ fn test_no_stderr_hint_on_passthrough() {
     // Vitest passthrough returns ExitCode::FAILURE but does not emit the hint
     // because it bypasses run_parsed_command_with_mode entirely.
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin("completely unparseable garbage output that matches nothing\n")
         .assert()
         .code(predicate::ne(0))
         .stderr(predicate::str::contains("[skim] compressed output").not());
 }
 
-/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`,
+/// Pipe a failing vitest JSON fixture through stdin to `skim vitest`,
 /// capture stderr, and assert it contains BOTH `[skim] compressed output`
 /// AND `SKIM_PASSTHROUGH=1`. This validates the full hint message format,
 /// not just the prefix.
@@ -371,7 +376,7 @@ fn test_no_stderr_hint_on_passthrough() {
 fn test_stderr_hint_contains_passthrough_instruction() {
     let fixture = include_str!("fixtures/vitest/vitest_fail.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))
@@ -383,14 +388,14 @@ fn test_stderr_hint_contains_passthrough_instruction() {
 // Go test: passthrough exec path (#49)
 // ============================================================================
 //
-// NOTE: `skim test go` does NOT read from stdin. Unlike vitest/cargo, the go
+// NOTE: `skim go test` does NOT read from stdin. Unlike vitest/cargo, the go
 // handler always spawns the `go` binary directly (with `-json` injection or
 // without it in SKIM_PASSTHROUGH mode). There is no stdin-reading code path.
 // The unit tests in src/cmd/test/go.rs cover the three-tier parse() function
 // exhaustively. The E2E test below verifies the passthrough exec path
 // dispatches to `go` and surfaces the install hint when `go` is absent.
 
-/// Verify that `skim test go` with SKIM_PASSTHROUGH=1 attempts to exec `go`
+/// Verify that `skim go test` with SKIM_PASSTHROUGH=1 attempts to exec `go`
 /// and surfaces the install hint when the binary is not available.
 ///
 /// This test is skipped when `go` is installed because the exec succeeds (or
@@ -413,7 +418,7 @@ fn test_go_passthrough_exec_path_surfaces_install_hint() {
     // tries runner.run("go", &["test"]) which fails with "failed to execute".
     // The go::run() function maps that error to include the install hint.
     let output = skim_cmd()
-        .args(["test", "go"])
+        .args(["go", "test"])
         .env("SKIM_PASSTHROUGH", "1")
         .output()
         .unwrap();
@@ -437,7 +442,7 @@ fn test_go_passthrough_exec_path_surfaces_install_hint() {
 // Vitest: failure context banner (#49)
 // ============================================================================
 
-/// Pipe a failing vitest JSON fixture through stdin to `skim test vitest`
+/// Pipe a failing vitest JSON fixture through stdin to `skim vitest`
 /// and assert that stdout contains the `--- failure context` banner.
 ///
 /// When skim compresses a failing test run, it appends raw tail lines
@@ -447,7 +452,7 @@ fn test_go_passthrough_exec_path_surfaces_install_hint() {
 fn test_vitest_failure_context_banner_present() {
     let fixture = include_str!("fixtures/vitest/vitest_fail.json");
     skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .write_stdin(fixture)
         .assert()
         .code(predicate::ne(0))

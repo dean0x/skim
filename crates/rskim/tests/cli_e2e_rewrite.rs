@@ -1,13 +1,15 @@
 //! E2E tests for untested rewrite rules, compound commands, and hook mode (#54).
 //!
 //! Covers rewrite rules that have unit tests but NO previous CLI-level tests:
-//! - python3 -m pytest -> skim test pytest
-//! - python -m pytest -> skim test pytest
-//! - npx vitest -> skim test vitest
-//! - npx tsc -> skim build tsc
-//! - vitest (bare) -> skim test vitest
-//! - tsc (bare) -> skim build tsc
-//! - cargo clippy -> skim build clippy
+//! - python3 -m pytest -> skim pytest
+//! - python -m pytest -> skim pytest
+//! - npx vitest -> skim vitest
+//! - npx tsc -> skim tsc
+//! - vitest (bare) -> skim vitest
+//! - tsc (bare) -> skim tsc
+//! - cargo clippy -> skim cargo clippy
+//!
+//! v2.8.0: Flat dispatch — tool names are top-level subcommands.
 //!
 //! Also covers hook mode and three-segment compound commands.
 
@@ -15,7 +17,9 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn skim_cmd() -> Command {
-    Command::cargo_bin("skim").unwrap()
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd
 }
 
 // ============================================================================
@@ -28,7 +32,7 @@ fn test_rewrite_python3_m_pytest() {
         .args(["rewrite", "python3", "-m", "pytest"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test pytest"));
+        .stdout(predicate::str::contains("skim pytest"));
 }
 
 #[test]
@@ -37,7 +41,7 @@ fn test_rewrite_python3_m_pytest_with_args() {
         .args(["rewrite", "python3", "-m", "pytest", "-v", "tests/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test pytest -v tests/"));
+        .stdout(predicate::str::contains("skim pytest -v tests/"));
 }
 
 #[test]
@@ -46,7 +50,7 @@ fn test_rewrite_python_m_pytest() {
         .args(["rewrite", "python", "-m", "pytest"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test pytest"));
+        .stdout(predicate::str::contains("skim pytest"));
 }
 
 #[test]
@@ -55,7 +59,7 @@ fn test_rewrite_python_m_pytest_with_args() {
         .args(["rewrite", "python", "-m", "pytest", "--tb=short"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test pytest --tb=short"));
+        .stdout(predicate::str::contains("skim pytest --tb=short"));
 }
 
 // ============================================================================
@@ -68,7 +72,7 @@ fn test_rewrite_npx_vitest() {
         .args(["rewrite", "npx", "vitest"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test vitest"));
+        .stdout(predicate::str::contains("skim vitest"));
 }
 
 #[test]
@@ -78,7 +82,7 @@ fn test_rewrite_npx_vitest_with_args() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "skim test vitest --reporter=json --run",
+            "skim vitest --reporter=json --run",
         ));
 }
 
@@ -88,7 +92,7 @@ fn test_rewrite_npx_tsc() {
         .args(["rewrite", "npx", "tsc"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build tsc"));
+        .stdout(predicate::str::contains("skim tsc"));
 }
 
 #[test]
@@ -97,7 +101,7 @@ fn test_rewrite_npx_tsc_with_args() {
         .args(["rewrite", "npx", "tsc", "--noEmit"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build tsc --noEmit"));
+        .stdout(predicate::str::contains("skim tsc --noEmit"));
 }
 
 // ============================================================================
@@ -110,7 +114,7 @@ fn test_rewrite_vitest_bare() {
         .args(["rewrite", "vitest"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test vitest"));
+        .stdout(predicate::str::contains("skim vitest"));
 }
 
 #[test]
@@ -119,7 +123,7 @@ fn test_rewrite_vitest_bare_with_args() {
         .args(["rewrite", "vitest", "--run", "math"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test vitest --run math"));
+        .stdout(predicate::str::contains("skim vitest --run math"));
 }
 
 #[test]
@@ -128,7 +132,7 @@ fn test_rewrite_tsc_bare() {
         .args(["rewrite", "tsc"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build tsc"));
+        .stdout(predicate::str::contains("skim tsc"));
 }
 
 #[test]
@@ -137,7 +141,7 @@ fn test_rewrite_tsc_bare_with_args() {
         .args(["rewrite", "tsc", "--noEmit", "--watch"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build tsc --noEmit --watch"));
+        .stdout(predicate::str::contains("skim tsc --noEmit --watch"));
 }
 
 #[test]
@@ -146,7 +150,7 @@ fn test_rewrite_cargo_clippy() {
         .args(["rewrite", "cargo", "clippy"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim build clippy"));
+        .stdout(predicate::str::contains("skim cargo clippy"));
 }
 
 #[test]
@@ -156,7 +160,7 @@ fn test_rewrite_cargo_clippy_with_args() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "skim build clippy -- -W clippy::pedantic",
+            "skim cargo clippy -- -W clippy::pedantic",
         ));
 }
 
@@ -193,9 +197,9 @@ fn test_rewrite_three_segment_output() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"))
-        .stdout(predicate::str::contains("skim build cargo"))
-        .stdout(predicate::str::contains("skim build clippy"));
+        .stdout(predicate::str::contains("skim cargo test"))
+        .stdout(predicate::str::contains("skim cargo build"))
+        .stdout(predicate::str::contains("skim cargo clippy"));
 }
 
 // ============================================================================
@@ -229,7 +233,7 @@ fn test_rewrite_hook_cargo_test() {
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"));
+        .stdout(predicate::str::contains("skim cargo test"));
 }
 
 #[test]
@@ -238,7 +242,7 @@ fn test_rewrite_hook_passthrough_already_rewritten() {
     // Hook mode always exits 0 (passthrough is silent success).
     let input = serde_json::json!({
         "tool_input": {
-            "command": "skim test cargo"
+            "command": "skim cargo test"
         }
     });
     skim_cmd()
@@ -306,8 +310,8 @@ fn test_rewrite_hook_compound_cargo_test_and_build() {
         .write_stdin(serde_json::to_string(&input).unwrap())
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test cargo"))
-        .stdout(predicate::str::contains("skim build cargo"));
+        .stdout(predicate::str::contains("skim cargo test"))
+        .stdout(predicate::str::contains("skim cargo build"));
 }
 
 // ============================================================================
@@ -336,7 +340,7 @@ fn test_rewrite_hook_default_is_claude_code_behavior() {
         "Default hook mode should produce Claude Code hookSpecificOutput"
     );
     assert!(
-        stdout.contains("skim test cargo"),
+        stdout.contains("skim cargo test"),
         "Should rewrite cargo test"
     );
 }
@@ -362,7 +366,7 @@ fn test_rewrite_hook_agent_claude_code_explicit() {
     assert!(json["hookSpecificOutput"]["updatedInput"]["command"]
         .as_str()
         .unwrap()
-        .contains("skim test cargo"));
+        .contains("skim cargo test"));
 }
 
 #[test]
@@ -392,7 +396,7 @@ fn test_rewrite_hook_agent_gemini_match() {
         json["tool_input"]["command"]
             .as_str()
             .unwrap()
-            .contains("skim test cargo"),
+            .contains("skim cargo test"),
         "Gemini response should contain rewritten command"
     );
 }
@@ -440,7 +444,7 @@ fn test_rewrite_hook_agent_copilot_match() {
         "Copilot response should have permissionDecision=deny"
     );
     assert!(
-        json["reason"].as_str().unwrap().contains("skim test cargo"),
+        json["reason"].as_str().unwrap().contains("skim cargo test"),
         "Copilot deny reason should contain rewritten command"
     );
 }
@@ -490,7 +494,7 @@ fn test_rewrite_hook_agent_cursor_match() {
         json["updated_input"]["command"]
             .as_str()
             .unwrap()
-            .contains("skim test cargo"),
+            .contains("skim cargo test"),
         "Cursor response should contain rewritten command"
     );
 }
@@ -701,14 +705,16 @@ fn test_passthrough_hook_skips_rewrite() {
     );
 }
 
-/// Verify that SKIM_PASSTHROUGH=1 with `skim test vitest` does NOT inject
+/// Verify that SKIM_PASSTHROUGH=1 with `skim vitest` does NOT inject
 /// --reporter=json. Plain text piped in is forwarded unchanged without JSON
 /// transformation.
+///
+/// v2.8.0: `skim vitest` replaces `skim test vitest`.
 #[test]
 fn test_passthrough_direct_vitest_no_json_injection() {
     let plain_text = "Tests  3 passed | 0 failed | 3 total\n";
     let output = skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .env("SKIM_PASSTHROUGH", "1")
         .write_stdin(plain_text)
         .output()
@@ -738,7 +744,7 @@ fn test_passthrough_forwards_raw_content() {
     // important property is that raw content is forwarded without compression.
     let fixture = include_str!("fixtures/vitest/vitest_fail.json");
     let output = skim_cmd()
-        .args(["test", "vitest"])
+        .args(["vitest"])
         .env("SKIM_PASSTHROUGH", "1")
         .write_stdin(fixture)
         .output()
@@ -767,7 +773,7 @@ fn test_rewrite_eslint() {
         .args(["rewrite", "eslint", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint eslint ."));
+        .stdout(predicate::str::contains("skim eslint ."));
 }
 
 #[test]
@@ -785,7 +791,7 @@ fn test_rewrite_npx_eslint() {
         .args(["rewrite", "npx", "eslint", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint eslint src/"));
+        .stdout(predicate::str::contains("skim eslint src/"));
 }
 
 #[test]
@@ -794,7 +800,7 @@ fn test_rewrite_ruff_check() {
         .args(["rewrite", "ruff", "check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint ruff ."));
+        .stdout(predicate::str::contains("skim ruff ."));
 }
 
 #[test]
@@ -803,7 +809,7 @@ fn test_rewrite_ruff_bare() {
         .args(["rewrite", "ruff", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint ruff ."));
+        .stdout(predicate::str::contains("skim ruff ."));
 }
 
 #[test]
@@ -812,7 +818,7 @@ fn test_rewrite_ruff_format() {
         .args(["rewrite", "ruff", "format", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint ruff"));
+        .stdout(predicate::str::contains("skim ruff"));
 }
 
 #[test]
@@ -821,7 +827,7 @@ fn test_rewrite_ruff_format_check() {
         .args(["rewrite", "ruff", "format", "--check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint ruff"));
+        .stdout(predicate::str::contains("skim ruff"));
 }
 
 #[test]
@@ -830,7 +836,7 @@ fn test_rewrite_mypy() {
         .args(["rewrite", "mypy", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint mypy ."));
+        .stdout(predicate::str::contains("skim mypy ."));
 }
 
 #[test]
@@ -839,7 +845,7 @@ fn test_rewrite_python_m_mypy() {
         .args(["rewrite", "python", "-m", "mypy", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint mypy ."));
+        .stdout(predicate::str::contains("skim mypy ."));
 }
 
 #[test]
@@ -848,7 +854,7 @@ fn test_rewrite_python3_m_mypy() {
         .args(["rewrite", "python3", "-m", "mypy", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint mypy src/"));
+        .stdout(predicate::str::contains("skim mypy src/"));
 }
 
 #[test]
@@ -857,7 +863,7 @@ fn test_rewrite_golangci_lint_run() {
         .args(["rewrite", "golangci-lint", "run", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint golangci ./..."));
+        .stdout(predicate::str::contains("skim golangci ./..."));
 }
 
 #[test]
@@ -866,7 +872,7 @@ fn test_rewrite_golangci_lint_bare() {
         .args(["rewrite", "golangci-lint", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint golangci ./..."));
+        .stdout(predicate::str::contains("skim golangci ./..."));
 }
 
 // ============================================================================
@@ -879,7 +885,7 @@ fn test_rewrite_npm_audit() {
         .args(["rewrite", "npm", "audit"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm audit"));
+        .stdout(predicate::str::contains("skim npm audit"));
 }
 
 #[test]
@@ -888,7 +894,7 @@ fn test_rewrite_npm_i_express() {
         .args(["rewrite", "npm", "i", "express"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm install express"));
+        .stdout(predicate::str::contains("skim npm install express"));
 }
 
 #[test]
@@ -897,7 +903,7 @@ fn test_rewrite_npm_ci() {
         .args(["rewrite", "npm", "ci"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm install"));
+        .stdout(predicate::str::contains("skim npm install"));
 }
 
 #[test]
@@ -906,7 +912,7 @@ fn test_rewrite_pip_install_flask() {
         .args(["rewrite", "pip", "install", "flask"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pip install flask"));
+        .stdout(predicate::str::contains("skim pip install flask"));
 }
 
 #[test]
@@ -915,7 +921,7 @@ fn test_rewrite_pip3_check() {
         .args(["rewrite", "pip3", "check"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pip check"));
+        .stdout(predicate::str::contains("skim pip check"));
 }
 
 #[test]
@@ -924,7 +930,7 @@ fn test_rewrite_cargo_audit() {
         .args(["rewrite", "cargo", "audit"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg cargo audit"));
+        .stdout(predicate::str::contains("skim cargo audit"));
 }
 
 #[test]
@@ -933,7 +939,7 @@ fn test_rewrite_pnpm_install() {
         .args(["rewrite", "pnpm", "install"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pnpm install"));
+        .stdout(predicate::str::contains("skim pnpm install"));
 }
 
 #[test]
@@ -960,9 +966,7 @@ fn test_rewrite_npm_install_with_args() {
         .args(["rewrite", "npm", "install", "express", "lodash"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "skim pkg npm install express lodash",
-        ));
+        .stdout(predicate::str::contains("skim npm install express lodash"));
 }
 
 #[test]
@@ -971,7 +975,7 @@ fn test_rewrite_npm_outdated() {
         .args(["rewrite", "npm", "outdated"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm outdated"));
+        .stdout(predicate::str::contains("skim npm outdated"));
 }
 
 #[test]
@@ -980,7 +984,7 @@ fn test_rewrite_npm_ls() {
         .args(["rewrite", "npm", "ls"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg npm ls"));
+        .stdout(predicate::str::contains("skim npm ls"));
 }
 
 #[test]
@@ -989,7 +993,7 @@ fn test_rewrite_pnpm_audit() {
         .args(["rewrite", "pnpm", "audit"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pnpm audit"));
+        .stdout(predicate::str::contains("skim pnpm audit"));
 }
 
 #[test]
@@ -998,7 +1002,7 @@ fn test_rewrite_pnpm_outdated() {
         .args(["rewrite", "pnpm", "outdated"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pnpm outdated"));
+        .stdout(predicate::str::contains("skim pnpm outdated"));
 }
 
 #[test]
@@ -1007,7 +1011,7 @@ fn test_rewrite_pip_list() {
         .args(["rewrite", "pip", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pip list"));
+        .stdout(predicate::str::contains("skim pip list"));
 }
 
 #[test]
@@ -1016,7 +1020,7 @@ fn test_rewrite_pip3_install() {
         .args(["rewrite", "pip3", "install", "flask"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pip install flask"));
+        .stdout(predicate::str::contains("skim pip install flask"));
 }
 
 #[test]
@@ -1025,7 +1029,7 @@ fn test_rewrite_pip3_list() {
         .args(["rewrite", "pip3", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim pkg pip list"));
+        .stdout(predicate::str::contains("skim pip list"));
 }
 
 // ============================================================================
@@ -1034,7 +1038,7 @@ fn test_rewrite_pip3_list() {
 
 /// AD-RW-11: `prettier --check` is acknowledged as already-compact.
 /// The original command is echoed on stdout (exit 0) rather than being
-/// rewritten to `skim lint prettier`, per the compress-or-skip rule.
+/// rewritten to `skim prettier`, per the compress-or-skip rule.
 #[test]
 fn test_rewrite_prettier_check_acknowledged() {
     skim_cmd()
@@ -1050,7 +1054,7 @@ fn test_rewrite_prettier_write() {
         .args(["rewrite", "prettier", "--write", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint prettier"));
+        .stdout(predicate::str::contains("skim prettier"));
 }
 
 #[test]
@@ -1059,12 +1063,12 @@ fn test_rewrite_npx_prettier_write() {
         .args(["rewrite", "npx", "prettier", "--write", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint prettier"));
+        .stdout(predicate::str::contains("skim prettier"));
 }
 
 /// AD-RW-11: `rustfmt --check` is acknowledged as already-compact.
 /// The original command is echoed on stdout rather than being
-/// rewritten to `skim lint rustfmt`.
+/// rewritten to `skim rustfmt`.
 #[test]
 fn test_rewrite_rustfmt_check_acknowledged() {
     skim_cmd()
@@ -1080,7 +1084,7 @@ fn test_rewrite_gh_pr_list() {
         .args(["rewrite", "gh", "pr", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra gh"));
+        .stdout(predicate::str::contains("skim gh"));
 }
 
 #[test]
@@ -1089,7 +1093,7 @@ fn test_rewrite_aws_s3_ls() {
         .args(["rewrite", "aws", "s3", "ls"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra aws"));
+        .stdout(predicate::str::contains("skim aws"));
 }
 
 #[test]
@@ -1098,7 +1102,7 @@ fn test_rewrite_curl_api() {
         .args(["rewrite", "curl", "https://api.example.com"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra curl"));
+        .stdout(predicate::str::contains("skim curl"));
 }
 
 #[test]
@@ -1107,7 +1111,7 @@ fn test_rewrite_wget_file() {
         .args(["rewrite", "wget", "https://example.com/f.tar.gz"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra wget"));
+        .stdout(predicate::str::contains("skim wget"));
 }
 
 #[test]
@@ -1116,7 +1120,7 @@ fn test_rewrite_find_name() {
         .args(["rewrite", "find", ".", "-name", "*.rs"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file find"));
+        .stdout(predicate::str::contains("skim find"));
 }
 
 #[test]
@@ -1125,7 +1129,7 @@ fn test_rewrite_ls_la() {
         .args(["rewrite", "ls", "-la"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file ls"));
+        .stdout(predicate::str::contains("skim ls"));
 }
 
 #[test]
@@ -1134,7 +1138,7 @@ fn test_rewrite_tree_bare() {
         .args(["rewrite", "tree"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file tree"));
+        .stdout(predicate::str::contains("skim tree"));
 }
 
 #[test]
@@ -1143,7 +1147,7 @@ fn test_rewrite_grep_r() {
         .args(["rewrite", "grep", "-r", "TODO", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file grep"));
+        .stdout(predicate::str::contains("skim grep"));
 }
 
 #[test]
@@ -1152,7 +1156,7 @@ fn test_rewrite_rg_pattern() {
         .args(["rewrite", "rg", "pattern"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim file rg"));
+        .stdout(predicate::str::contains("skim rg"));
 }
 
 #[test]
@@ -1230,34 +1234,32 @@ fn test_rewrite_git_log_oneline_roundtrip() {
 
 #[test]
 fn test_rewrite_gh_pr_list_json_roundtrip() {
-    // `gh pr list --json number` should rewrite to `skim infra gh pr list --json number`
+    // v2.8.0: `gh pr list --json number` rewrites to `skim gh pr list --json number`
     skim_cmd()
         .args(["rewrite", "gh", "pr", "list", "--json", "number"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "skim infra gh pr list --json number",
-        ));
+        .stdout(predicate::str::contains("skim gh pr list --json number"));
 }
 
 #[test]
 fn test_rewrite_jest_roundtrip() {
-    // `jest src/` should rewrite to `skim test jest src/`
+    // `jest src/` should rewrite to `skim jest src/` (v2.8.0 flat dispatch)
     skim_cmd()
         .args(["rewrite", "jest", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test jest src/"));
+        .stdout(predicate::str::contains("skim jest src/"));
 }
 
 #[test]
 fn test_rewrite_npx_jest_roundtrip() {
-    // `npx jest src/` should rewrite to `skim test jest src/`
+    // `npx jest src/` should rewrite to `skim jest src/` (v2.8.0 flat dispatch)
     skim_cmd()
         .args(["rewrite", "npx", "jest", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim test jest src/"));
+        .stdout(predicate::str::contains("skim jest src/"));
 }
 
 // ============================================================================
@@ -1270,7 +1272,7 @@ fn test_rewrite_gh_issue_view() {
         .args(["rewrite", "gh", "issue", "view", "42"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra gh issue view 42"));
+        .stdout(predicate::str::contains("skim gh issue view 42"));
 }
 
 #[test]
@@ -1306,7 +1308,7 @@ fn test_rewrite_gh_pr_view() {
         .args(["rewrite", "gh", "pr", "view", "15"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra gh pr view 15"));
+        .stdout(predicate::str::contains("skim gh pr view 15"));
 }
 
 #[test]
@@ -1342,7 +1344,7 @@ fn test_rewrite_gh_pr_checks() {
         .args(["rewrite", "gh", "pr", "checks", "15"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra gh pr checks 15"));
+        .stdout(predicate::str::contains("skim gh pr checks 15"));
 }
 
 #[test]
@@ -1368,7 +1370,7 @@ fn test_rewrite_gh_run_view() {
         .args(["rewrite", "gh", "run", "view", "12345"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim infra gh run view 12345"));
+        .stdout(predicate::str::contains("skim gh run view 12345"));
 }
 
 #[test]
@@ -1415,7 +1417,7 @@ fn test_rewrite_black_check() {
         .args(["rewrite", "black", "--check", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint black"));
+        .stdout(predicate::str::contains("skim black"));
 }
 
 #[test]
@@ -1424,7 +1426,7 @@ fn test_rewrite_black_bare() {
         .args(["rewrite", "black", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint black"));
+        .stdout(predicate::str::contains("skim black"));
 }
 
 #[test]
@@ -1442,7 +1444,7 @@ fn test_rewrite_gofmt_l() {
         .args(["rewrite", "gofmt", "-l", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint gofmt"));
+        .stdout(predicate::str::contains("skim gofmt"));
 }
 
 #[test]
@@ -1451,7 +1453,7 @@ fn test_rewrite_gofmt_bare() {
         .args(["rewrite", "gofmt", "cmd/server.go"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint gofmt"));
+        .stdout(predicate::str::contains("skim gofmt"));
 }
 
 #[test]
@@ -1469,7 +1471,7 @@ fn test_rewrite_biome_check() {
         .args(["rewrite", "biome", "check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint biome"));
+        .stdout(predicate::str::contains("skim biome"));
 }
 
 #[test]
@@ -1493,7 +1495,7 @@ fn test_rewrite_biome_format() {
         .args(["rewrite", "biome", "format", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint biome"));
+        .stdout(predicate::str::contains("skim biome"));
 }
 
 #[test]
@@ -1502,7 +1504,7 @@ fn test_rewrite_npx_biome_check() {
         .args(["rewrite", "npx", "biome", "check", "."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint biome"));
+        .stdout(predicate::str::contains("skim biome"));
 }
 
 #[test]
@@ -1511,7 +1513,7 @@ fn test_rewrite_dprint_check() {
         .args(["rewrite", "dprint", "check"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint dprint"));
+        .stdout(predicate::str::contains("skim dprint"));
 }
 
 #[test]
@@ -1520,7 +1522,7 @@ fn test_rewrite_dprint_fmt() {
         .args(["rewrite", "dprint", "fmt"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint dprint"));
+        .stdout(predicate::str::contains("skim dprint"));
 }
 
 #[test]
@@ -1529,7 +1531,7 @@ fn test_rewrite_dprint_bare() {
         .args(["rewrite", "dprint"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint dprint"));
+        .stdout(predicate::str::contains("skim dprint"));
 }
 
 #[test]
@@ -1538,7 +1540,7 @@ fn test_rewrite_oxlint() {
         .args(["rewrite", "oxlint", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint oxlint"));
+        .stdout(predicate::str::contains("skim oxlint"));
 }
 
 #[test]
@@ -1556,5 +1558,5 @@ fn test_rewrite_npx_oxlint() {
         .args(["rewrite", "npx", "oxlint", "src/"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim lint oxlint"));
+        .stdout(predicate::str::contains("skim oxlint"));
 }

@@ -37,12 +37,12 @@ fn test_classify_compound_all_rewritten() {
     match result {
         CommandClassification::Rewritten(s) => {
             assert!(
-                s.contains("skim test cargo"),
-                "Expected skim test cargo in output, got: {s}"
+                s.contains("skim cargo test"),
+                "Expected skim cargo test in output, got: {s}"
             );
             assert!(
-                s.contains("skim build clippy"),
-                "Expected skim build clippy in output, got: {s}"
+                s.contains("skim cargo clippy"),
+                "Expected skim cargo clippy in output, got: {s}"
             );
             assert!(s.contains("&&"), "Expected && operator in output, got: {s}");
         }
@@ -248,8 +248,8 @@ fn test_would_rewrite_gh_pr_list_json_rewrites() {
     assert!(result.is_some(), "gh pr list --json should now rewrite");
     let rewritten = result.unwrap();
     assert!(
-        rewritten.contains("skim infra gh pr list"),
-        "Expected 'skim infra gh pr list' in output, got: {rewritten}"
+        rewritten.contains("skim gh pr list"),
+        "Expected 'skim gh pr list' in output, got: {rewritten}"
     );
 }
 
@@ -257,8 +257,8 @@ fn test_would_rewrite_gh_pr_list_json_rewrites() {
 fn test_would_rewrite_jest_rewrites() {
     assert_eq!(
         would_rewrite("jest src/"),
-        Some("skim test jest src/".to_string()),
-        "jest should rewrite to skim test jest"
+        Some("skim jest src/".to_string()),
+        "jest should rewrite to skim jest"
     );
 }
 
@@ -266,8 +266,8 @@ fn test_would_rewrite_jest_rewrites() {
 fn test_would_rewrite_npx_jest_rewrites() {
     assert_eq!(
         would_rewrite("npx jest src/"),
-        Some("skim test jest src/".to_string()),
-        "npx jest should rewrite to skim test jest"
+        Some("skim jest src/".to_string()),
+        "npx jest should rewrite to skim jest"
     );
 }
 

@@ -26,7 +26,7 @@ fn skim_cmd() -> Command {
 fn test_eslint_tier1_json_pass() {
     let fixture = include_str!("fixtures/cmd/lint/eslint_pass.json");
     skim_cmd()
-        .args(["lint", "eslint"])
+        .args(["eslint"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -37,7 +37,7 @@ fn test_eslint_tier1_json_pass() {
 fn test_eslint_tier1_json_fail() {
     let fixture = include_str!("fixtures/cmd/lint/eslint_fail.json");
     skim_cmd()
-        .args(["lint", "eslint"])
+        .args(["eslint"])
         .write_stdin(fixture)
         .assert()
         .code(0) // stdin mode always exits 0
@@ -54,7 +54,7 @@ fn test_eslint_tier1_json_fail() {
 fn test_eslint_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/eslint_text.txt");
     skim_cmd()
-        .args(["--debug", "lint", "eslint"])
+        .args(["--debug", "eslint"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -69,7 +69,7 @@ fn test_eslint_tier2_regex_degraded() {
 #[test]
 fn test_eslint_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "eslint"])
+        .args(["--debug", "eslint"])
         .write_stdin("random garbage not eslint output\n")
         .assert()
         .success()
@@ -85,7 +85,7 @@ fn test_eslint_tier3_passthrough_garbage() {
 fn test_eslint_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/eslint_fail.json");
     skim_cmd()
-        .args(["lint", "--json", "eslint"])
+        .args(["eslint", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -97,7 +97,7 @@ fn test_eslint_json_flag_full() {
 fn test_eslint_json_flag_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/eslint_text.txt");
     skim_cmd()
-        .args(["lint", "--json", "eslint"])
+        .args(["eslint", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -113,7 +113,7 @@ fn test_eslint_json_flag_degraded() {
 fn test_ruff_tier1_json_fail() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_fail.json");
     skim_cmd()
-        .args(["lint", "ruff"])
+        .args(["ruff"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -129,7 +129,7 @@ fn test_ruff_tier1_json_fail() {
 fn test_ruff_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_text.txt");
     skim_cmd()
-        .args(["--debug", "lint", "ruff"])
+        .args(["--debug", "ruff"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -144,7 +144,7 @@ fn test_ruff_tier2_regex_degraded() {
 #[test]
 fn test_ruff_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "ruff"])
+        .args(["--debug", "ruff"])
         .write_stdin("random garbage not ruff output\n")
         .assert()
         .success()
@@ -160,7 +160,7 @@ fn test_ruff_tier3_passthrough_garbage() {
 fn test_ruff_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_fail.json");
     skim_cmd()
-        .args(["lint", "--json", "ruff"])
+        .args(["ruff", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -176,7 +176,7 @@ fn test_ruff_json_flag_full() {
 fn test_mypy_tier1_json_fail() {
     let fixture = include_str!("fixtures/cmd/lint/mypy_fail.json");
     skim_cmd()
-        .args(["lint", "mypy"])
+        .args(["mypy"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -192,7 +192,7 @@ fn test_mypy_tier1_json_fail() {
 fn test_mypy_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/mypy_text.txt");
     skim_cmd()
-        .args(["--debug", "lint", "mypy"])
+        .args(["--debug", "mypy"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -207,7 +207,7 @@ fn test_mypy_tier2_regex_degraded() {
 #[test]
 fn test_mypy_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "mypy"])
+        .args(["--debug", "mypy"])
         .write_stdin("random garbage not mypy output\n")
         .assert()
         .success()
@@ -223,7 +223,7 @@ fn test_mypy_tier3_passthrough_garbage() {
 fn test_mypy_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/mypy_fail.json");
     skim_cmd()
-        .args(["lint", "--json", "mypy"])
+        .args(["mypy", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -239,7 +239,7 @@ fn test_mypy_json_flag_full() {
 fn test_golangci_tier1_json_fail() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
     skim_cmd()
-        .args(["lint", "golangci"])
+        .args(["golangci"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -256,7 +256,7 @@ fn test_golangci_tier1_json_fail() {
 fn test_golangci_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_text.txt");
     skim_cmd()
-        .args(["--debug", "lint", "golangci"])
+        .args(["--debug", "golangci"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -271,7 +271,7 @@ fn test_golangci_tier2_regex_degraded() {
 #[test]
 fn test_golangci_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "golangci"])
+        .args(["--debug", "golangci"])
         .write_stdin("random garbage not golangci output\n")
         .assert()
         .success()
@@ -287,7 +287,7 @@ fn test_golangci_tier3_passthrough_garbage() {
 fn test_golangci_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
     skim_cmd()
-        .args(["lint", "--json", "golangci"])
+        .args(["golangci", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -302,7 +302,7 @@ fn test_golangci_json_flag_full() {
 fn test_black_tier1_check_fail() {
     let fixture = include_str!("fixtures/cmd/lint/black_check_fail.txt");
     skim_cmd()
-        .args(["lint", "black"])
+        .args(["black"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -314,7 +314,7 @@ fn test_black_tier1_check_fail() {
 fn test_black_tier1_check_pass() {
     let fixture = include_str!("fixtures/cmd/lint/black_check_pass.txt");
     skim_cmd()
-        .args(["lint", "black"])
+        .args(["black"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -325,7 +325,7 @@ fn test_black_tier1_check_pass() {
 fn test_black_tier2_regex_degraded() {
     // Plain `would reformat` without `All done!` context
     skim_cmd()
-        .args(["--debug", "lint", "black"])
+        .args(["--debug", "black"])
         .write_stdin("would reformat src/main.py\n")
         .assert()
         .success()
@@ -335,7 +335,7 @@ fn test_black_tier2_regex_degraded() {
 #[test]
 fn test_black_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "black"])
+        .args(["--debug", "black"])
         .write_stdin("random garbage not black output\n")
         .assert()
         .success()
@@ -347,7 +347,7 @@ fn test_black_tier3_passthrough_garbage() {
 fn test_black_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/black_check_fail.txt");
     skim_cmd()
-        .args(["lint", "--json", "black"])
+        .args(["black", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -363,7 +363,7 @@ fn test_black_json_flag_full() {
 fn test_gofmt_tier1_list_fail() {
     let fixture = include_str!("fixtures/cmd/lint/gofmt_list_fail.txt");
     skim_cmd()
-        .args(["lint", "gofmt"])
+        .args(["gofmt"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -375,7 +375,7 @@ fn test_gofmt_tier1_list_fail() {
 fn test_gofmt_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/gofmt_diff_fail.txt");
     skim_cmd()
-        .args(["--debug", "lint", "gofmt"])
+        .args(["--debug", "gofmt"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -386,7 +386,7 @@ fn test_gofmt_tier2_regex_degraded() {
 #[test]
 fn test_gofmt_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "gofmt"])
+        .args(["--debug", "gofmt"])
         .write_stdin("random garbage not gofmt output\n")
         .assert()
         .success()
@@ -398,7 +398,7 @@ fn test_gofmt_tier3_passthrough_garbage() {
 fn test_gofmt_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/gofmt_list_fail.txt");
     skim_cmd()
-        .args(["lint", "--json", "gofmt"])
+        .args(["gofmt", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -413,7 +413,7 @@ fn test_gofmt_json_flag_full() {
 fn test_biome_tier1_json_fail() {
     let fixture = include_str!("fixtures/cmd/lint/biome_check_fail.json");
     skim_cmd()
-        .args(["lint", "biome"])
+        .args(["biome"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -425,7 +425,7 @@ fn test_biome_tier1_json_fail() {
 fn test_biome_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/biome_check_text.txt");
     skim_cmd()
-        .args(["--debug", "lint", "biome"])
+        .args(["--debug", "biome"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -436,7 +436,7 @@ fn test_biome_tier2_regex_degraded() {
 #[test]
 fn test_biome_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "biome"])
+        .args(["--debug", "biome"])
         .write_stdin("random garbage not biome output\n")
         .assert()
         .success()
@@ -448,7 +448,7 @@ fn test_biome_tier3_passthrough_garbage() {
 fn test_biome_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/biome_check_fail.json");
     skim_cmd()
-        .args(["lint", "--json", "biome"])
+        .args(["biome", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -464,7 +464,7 @@ fn test_biome_json_flag_full() {
 fn test_dprint_tier1_check_fail() {
     let fixture = include_str!("fixtures/cmd/lint/dprint_check_fail.txt");
     skim_cmd()
-        .args(["lint", "dprint"])
+        .args(["dprint"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -475,7 +475,7 @@ fn test_dprint_tier1_check_fail() {
 #[test]
 fn test_dprint_tier2_regex_degraded() {
     skim_cmd()
-        .args(["--debug", "lint", "dprint"])
+        .args(["--debug", "dprint"])
         .write_stdin("from src/main.ts:\n  | diff content\n")
         .assert()
         .success()
@@ -486,7 +486,7 @@ fn test_dprint_tier2_regex_degraded() {
 #[test]
 fn test_dprint_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "dprint"])
+        .args(["--debug", "dprint"])
         .write_stdin("random garbage not dprint output\n")
         .assert()
         .success()
@@ -498,7 +498,7 @@ fn test_dprint_tier3_passthrough_garbage() {
 fn test_dprint_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/dprint_check_fail.txt");
     skim_cmd()
-        .args(["lint", "--json", "dprint"])
+        .args(["dprint", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -513,7 +513,7 @@ fn test_dprint_json_flag_full() {
 fn test_oxlint_tier1_json_fail() {
     let fixture = include_str!("fixtures/cmd/lint/oxlint_fail.json");
     skim_cmd()
-        .args(["lint", "oxlint"])
+        .args(["oxlint"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -526,7 +526,7 @@ fn test_oxlint_tier1_json_fail() {
 fn test_oxlint_tier1_json_pass() {
     let fixture = include_str!("fixtures/cmd/lint/oxlint_pass.json");
     skim_cmd()
-        .args(["lint", "oxlint"])
+        .args(["oxlint"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -537,7 +537,7 @@ fn test_oxlint_tier1_json_pass() {
 fn test_oxlint_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/oxlint_text.txt");
     skim_cmd()
-        .args(["--debug", "lint", "oxlint"])
+        .args(["--debug", "oxlint"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -548,7 +548,7 @@ fn test_oxlint_tier2_regex_degraded() {
 #[test]
 fn test_oxlint_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "lint", "oxlint"])
+        .args(["--debug", "oxlint"])
         .write_stdin("random garbage not oxlint output\n")
         .assert()
         .success()
@@ -560,7 +560,7 @@ fn test_oxlint_tier3_passthrough_garbage() {
 fn test_oxlint_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/oxlint_fail.json");
     skim_cmd()
-        .args(["lint", "--json", "oxlint"])
+        .args(["oxlint", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -570,41 +570,20 @@ fn test_oxlint_json_flag_full() {
 
 // ============================================================================
 // Dispatcher: help and unknown linter
+//
+// NOTE: "lint" is no longer a subcommand in v2.8.0 flat dispatch. Linter
+// tools are dispatched directly (e.g. `skim eslint`, `skim ruff`).
+// The old `skim lint --help`, `skim lint unknown-linter`, and `skim lint`
+// forms are no longer valid. Each tool now has its own top-level entry point.
 // ============================================================================
 
-#[test]
-fn test_lint_help() {
-    skim_cmd()
-        .args(["lint", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Available linters:"))
-        .stdout(predicate::str::contains("eslint"))
-        .stdout(predicate::str::contains("ruff"))
-        .stdout(predicate::str::contains("mypy"))
-        .stdout(predicate::str::contains("golangci"))
-        .stdout(predicate::str::contains("black"))
-        .stdout(predicate::str::contains("biome"))
-        .stdout(predicate::str::contains("oxlint"));
-}
+// test_lint_help removed: "lint" is not a subcommand in flat dispatch (v2.8.0).
+// Use `skim --help` or `skim eslint --help` etc. for tool-specific help.
 
-#[test]
-fn test_lint_unknown_linter() {
-    skim_cmd()
-        .args(["lint", "unknown-linter"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unknown linter 'unknown-linter'"));
-}
+// test_lint_unknown_linter removed: "lint" is not a subcommand in flat dispatch (v2.8.0).
+// `skim unknown-linter` falls through to FileOperation dispatch.
 
-#[test]
-fn test_lint_no_args_shows_help() {
-    skim_cmd()
-        .args(["lint"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Available linters:"));
-}
+// test_lint_no_args_shows_help removed: "lint" is not a subcommand in flat dispatch (v2.8.0).
 
 // ============================================================================
 // --show-stats integration
@@ -614,7 +593,7 @@ fn test_lint_no_args_shows_help() {
 fn test_lint_show_stats_reports_tokens() {
     let fixture = include_str!("fixtures/cmd/lint/eslint_fail.json");
     skim_cmd()
-        .args(["lint", "--show-stats", "eslint"])
+        .args(["eslint", "--show-stats"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -626,7 +605,7 @@ fn test_lint_show_stats_reports_tokens() {
 // Stdin detection with mode subcommand args (bugfix: AD-LINT-26)
 //
 // When a user pipes output AND specifies a mode subcommand, e.g.:
-//   cat dprint_fmt_output.txt | skim lint dprint fmt
+//   cat dprint_fmt_output.txt | skim dprint fmt
 //
 // The "fmt" subcommand must not prevent stdin detection. The fix strips the
 // consumed mode subcommand from `args` before calling `run_linter`, so
@@ -638,7 +617,7 @@ fn test_lint_show_stats_reports_tokens() {
 fn test_dprint_fmt_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/dprint_fmt_output.txt");
     skim_cmd()
-        .args(["lint", "dprint", "fmt"])
+        .args(["dprint", "fmt"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -650,7 +629,7 @@ fn test_dprint_fmt_subcommand_with_piped_stdin() {
 fn test_dprint_check_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/dprint_check_fail.txt");
     skim_cmd()
-        .args(["lint", "dprint", "check"])
+        .args(["dprint", "check"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -663,7 +642,7 @@ fn test_dprint_check_subcommand_with_piped_stdin() {
 fn test_ruff_format_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_format_pass.txt");
     skim_cmd()
-        .args(["lint", "ruff", "format"])
+        .args(["ruff", "format"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -675,7 +654,7 @@ fn test_ruff_format_subcommand_with_piped_stdin() {
 fn test_ruff_check_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/ruff_fail.json");
     skim_cmd()
-        .args(["lint", "ruff", "check"])
+        .args(["ruff", "check"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -687,7 +666,7 @@ fn test_ruff_check_subcommand_with_piped_stdin() {
 fn test_biome_format_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/biome_format_fail.txt");
     skim_cmd()
-        .args(["lint", "biome", "format"])
+        .args(["biome", "format"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -699,7 +678,7 @@ fn test_biome_format_subcommand_with_piped_stdin() {
 fn test_biome_check_subcommand_with_piped_stdin() {
     let fixture = include_str!("fixtures/cmd/lint/biome_check_fail.json");
     skim_cmd()
-        .args(["lint", "biome", "check"])
+        .args(["biome", "check"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -708,7 +687,7 @@ fn test_biome_check_subcommand_with_piped_stdin() {
 
 /// AD-LINT-26: file args after a mode subcommand still trigger binary execution.
 ///
-/// `skim lint dprint fmt .` has remaining args=["."] after stripping "fmt",
+/// `skim dprint fmt .` has remaining args=["."] after stripping "fmt",
 /// so `use_stdin` is false and dprint binary is invoked.
 /// We can't run the binary in CI (it won't be installed), so we only verify
 /// the error path is "binary not found", not "stdin read failure".
@@ -717,7 +696,7 @@ fn test_dprint_fmt_with_file_args_invokes_binary() {
     // When file args are present, stdin should NOT be used even if piped.
     // The binary won't be installed, so we expect a "not found" style error.
     let result = skim_cmd()
-        .args(["lint", "dprint", "fmt", "."])
+        .args(["dprint", "fmt", "."])
         .write_stdin("Formatted 1 files.\n")
         .output()
         .unwrap();
@@ -748,7 +727,7 @@ fn test_dprint_fmt_with_file_args_invokes_binary() {
 fn test_biome_format_success_produces_files_formatted() {
     let fixture = include_str!("fixtures/cmd/lint/biome_format_pass.txt");
     skim_cmd()
-        .args(["lint", "biome", "format"])
+        .args(["biome", "format"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -764,7 +743,7 @@ fn test_biome_format_success_produces_files_formatted() {
 fn test_prettier_write_output_produces_files_formatted() {
     let fixture = include_str!("fixtures/cmd/lint/prettier_write_output.txt");
     skim_cmd()
-        .args(["lint", "prettier", "--write"])
+        .args(["prettier", "--write"])
         .write_stdin(fixture)
         .assert()
         .success()

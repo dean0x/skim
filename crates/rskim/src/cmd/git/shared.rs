@@ -12,7 +12,7 @@
 //! Keeping these helpers here avoids import cycles: `push.rs` and `commit.rs`
 //! can `use super::shared::scrub_credential_url` without pulling in the full mod.rs
 //! dispatch machinery.  The `pub(crate)` visibility allows infra streaming commands
-//! (e.g. `skim infra gh run watch`) to scrub URLs from their analytics labels.
+//! (e.g. `skim gh run watch`) to scrub URLs from their analytics labels.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;

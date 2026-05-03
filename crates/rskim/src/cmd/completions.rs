@@ -76,17 +76,31 @@ fn build_full_command() -> Command {
     cmd = cmd.subcommand(super::init::command());
     cmd = cmd.subcommand(super::discover::command());
     cmd = cmd.subcommand(super::learn::command());
-    cmd = cmd.subcommand(super::file::command());
-    cmd = cmd.subcommand(super::infra::command());
     cmd = cmd.subcommand(super::log::command());
+
+    // Multi-category dispatchers with their own subcommands
+    cmd = cmd.subcommand(
+        Command::new("cargo")
+            .about("Cargo subcommand compression")
+            .subcommand(Command::new("test").about("Compress cargo test output"))
+            .subcommand(Command::new("build").about("Compress cargo build output"))
+            .subcommand(Command::new("clippy").about("Compress cargo clippy output"))
+            .subcommand(Command::new("nextest").about("Compress cargo nextest output"))
+            .subcommand(Command::new("audit").about("Compress cargo audit output")),
+    );
+    cmd = cmd.subcommand(
+        Command::new("go")
+            .about("Go subcommand compression")
+            .subcommand(Command::new("test").about("Compress go test output")),
+    );
 
     // Subcommands with full arg definitions added above -- skip in the stub loop.
     const IMPLEMENTED_SUBCOMMANDS: &[&str] = &[
         "agents",
+        "cargo",
         "completions",
         "discover",
-        "file",
-        "infra",
+        "go",
         "init",
         "learn",
         "log",
@@ -98,7 +112,7 @@ fn build_full_command() -> Command {
         if IMPLEMENTED_SUBCOMMANDS.contains(name) {
             continue; // already added with full arg definitions above
         }
-        cmd = cmd.subcommand(Command::new(*name).about("Planned subcommand"));
+        cmd = cmd.subcommand(Command::new(*name).about("Tool output compression"));
     }
 
     cmd

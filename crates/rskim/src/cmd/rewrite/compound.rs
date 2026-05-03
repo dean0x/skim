@@ -670,9 +670,9 @@ mod tests {
         ];
         let result = try_rewrite_compound(&segments).unwrap();
         let joined = result.tokens.join(" ");
-        assert!(joined.contains("skim test cargo"));
+        assert!(joined.contains("skim cargo test"));
         assert!(joined.contains("&&"));
-        assert!(joined.contains("skim build cargo"));
+        assert!(joined.contains("skim cargo build"));
     }
 
     #[test]
@@ -691,7 +691,7 @@ mod tests {
         ];
         let result = try_rewrite_compound(&segments).unwrap();
         let joined = result.tokens.join(" ");
-        assert!(joined.contains("skim test cargo"));
+        assert!(joined.contains("skim cargo test"));
         assert!(joined.contains("echo done"));
     }
 

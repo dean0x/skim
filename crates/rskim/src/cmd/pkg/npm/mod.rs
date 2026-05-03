@@ -16,7 +16,7 @@ use std::process::ExitCode;
 // Re-exported from parent so submodules can access via `super::`.
 use super::{combine_output, run_pkg_subcommand, PkgSubcommandConfig};
 
-/// Run `skim pkg npm <subcmd> [args...]`.
+/// Run `skim npm <subcmd> [args...]`.
 ///
 /// Sub-dispatches to install, audit, outdated, or ls based on the first arg.
 pub(crate) fn run(
@@ -41,9 +41,9 @@ pub(crate) fn run(
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
-                "skim pkg npm: unknown subcommand '{safe}'\n\
+                "skim npm: unknown subcommand '{safe}'\n\
                  Available: install, audit, outdated, ls\n\
-                 Run 'skim pkg npm --help' for usage"
+                 Run 'skim npm --help' for usage"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -51,7 +51,7 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim pkg npm <subcmd> [args...]");
+    println!("skim npm <subcmd> [args...]");
     println!();
     println!("  Parse npm output for AI context windows.");
     println!();
@@ -62,9 +62,9 @@ fn print_help() {
     println!("  ls         Parse npm ls output");
     println!();
     println!("Examples:");
-    println!("  skim pkg npm install");
-    println!("  skim pkg npm audit");
-    println!("  skim pkg npm outdated");
-    println!("  skim pkg npm ls");
-    println!("  npm install 2>&1 | skim pkg npm install");
+    println!("  skim npm install");
+    println!("  skim npm audit");
+    println!("  skim npm outdated");
+    println!("  skim npm ls");
+    println!("  npm install 2>&1 | skim npm install");
 }

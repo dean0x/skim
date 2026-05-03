@@ -60,7 +60,7 @@ fn is_format_mode(args: &[String]) -> bool {
     user_has_flag(args, &["--format", "-f"])
 }
 
-/// Run `skim lint rustfmt [args...]`.
+/// Run `skim rustfmt [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -375,7 +375,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// AD-LINT-26: bare invocation (no args) must default to check mode, not format.
-    /// Bare `skim lint rustfmt` must never rewrite files without an explicit flag.
+    /// Bare `skim rustfmt` must never rewrite files without an explicit flag.
     #[test]
     fn test_is_format_mode_bare_args_is_false() {
         let args: Vec<String> = vec![];

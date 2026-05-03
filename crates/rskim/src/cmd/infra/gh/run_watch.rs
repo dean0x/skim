@@ -54,10 +54,10 @@ pub(super) const MAX_STREAM_JOBS: usize = 64;
 /// Run `gh run watch` with streaming compression.
 ///
 /// Supports two modes:
-/// - **Pipe mode** (`gh run watch | skim infra gh run watch`): when stdin is
+/// - **Pipe mode** (`gh run watch | skim gh run watch`): when stdin is
 ///   piped and no args are provided, reads from stdin via
 ///   [`run_streamed_stdin`].
-/// - **Spawn mode** (`skim infra gh run watch <id>`): spawns `gh run watch
+/// - **Spawn mode** (`skim gh run watch <id>`): spawns `gh run watch
 ///   [args]` as a child process via [`run_streamed_spawned`].
 ///
 /// `--exit-status` flag is propagated to `gh` in spawn mode; non-zero
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn test_parser_processes_pipe_scenario_lines() {
         // Mirrors the Tester's scenario:
-        //   printf "workflow step 1\nworkflow step 2\ncompleted\n" | skim infra gh run watch
+        //   printf "workflow step 1\nworkflow step 2\ncompleted\n" | skim gh run watch
         //
         // The RunWatchParser receives these lines via on_line().  None match
         // job-status patterns, so all are suppressed; finalize() on empty

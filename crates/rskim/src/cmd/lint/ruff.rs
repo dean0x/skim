@@ -52,7 +52,7 @@ fn is_format_mode(args: &[String]) -> bool {
     args.first().is_some_and(|a| a == "format")
 }
 
-/// Run `skim lint ruff [args...]`.
+/// Run `skim ruff [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -73,7 +73,7 @@ fn run_check(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "check" subcommand so that stdin is detected when no
-    // file args remain (e.g., `cat output.txt | skim lint ruff check`).
+    // file args remain (e.g., `cat output.txt | skim ruff check`).
     // `prepare_check_args` re-injects "check" unconditionally when absent.
     let starts_with_check = args.first().is_some_and(|a| a == "check");
     let remaining: Vec<String> = args
@@ -131,7 +131,7 @@ fn run_format(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "format" subcommand so that stdin is detected when no
-    // file args remain (e.g., `cat output.txt | skim lint ruff format`).
+    // file args remain (e.g., `cat output.txt | skim ruff format`).
     // `prepare_format_args` re-injects "format" for binary execution.
     let remaining: Vec<String> = args.iter().skip(1).cloned().collect();
     super::run_linter(

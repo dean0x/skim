@@ -1,6 +1,8 @@
-//! E2E tests for build parsers (#54).
+//! E2E tests for build parsers (flat dispatch).
 //!
-//! Tests the build subcommand's CLI behavior for cargo build and clippy.
+//! v2.8.0: `skim build cargo` → `skim cargo build`
+//!
+//! Tests the cargo/clippy dispatch CLI behavior.
 //!
 //! NOTE: Build parsers do NOT support stdin piping — they always execute the
 //! real build command. These tests verify real build execution behavior and
@@ -23,21 +25,10 @@ fn skim_cmd() -> Command {
 
 #[test]
 fn test_build_cargo_success_exit_code() {
-    // Running `skim build cargo` on the skim repo itself should succeed
-    // (already compiled artifacts are cached).
+    // Running `skim cargo build` on the skim repo itself should succeed
+    // (already compiled artifacts are cached) and produce structured output.
     skim_cmd()
-        .args(["build", "cargo"])
-        .timeout(std::time::Duration::from_secs(120))
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("OK warnings:"));
-}
-
-#[test]
-fn test_build_cargo_structured_output() {
-    // Verify the output includes build result markers
-    skim_cmd()
-        .args(["build", "cargo"])
+        .args(["cargo", "build"])
         .timeout(std::time::Duration::from_secs(120))
         .assert()
         .success()
@@ -50,10 +41,10 @@ fn test_build_cargo_structured_output() {
 
 #[test]
 fn test_build_clippy_success_exit_code() {
-    // Running `skim build clippy` on the skim repo should succeed
+    // Running `skim cargo clippy` on the skim repo should succeed
     // (clean code, no warnings that trigger failure).
     skim_cmd()
-        .args(["build", "clippy"])
+        .args(["cargo", "clippy"])
         .timeout(std::time::Duration::from_secs(120))
         .assert()
         .success();
@@ -64,19 +55,19 @@ fn test_build_clippy_success_exit_code() {
 // ============================================================================
 
 #[test]
-fn test_build_unknown_tool_exit_code() {
+fn test_cargo_unknown_subcmd_exit_code() {
     skim_cmd()
-        .args(["build", "webpack"])
+        .args(["cargo", "webpack"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown build tool"));
+        .stderr(predicate::str::contains("unknown subcommand"));
 }
 
 #[test]
-fn test_build_missing_tool_exit_code() {
+fn test_cargo_no_subcmd_shows_help() {
     skim_cmd()
-        .arg("build")
+        .arg("cargo")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("missing required argument"));
+        .success()
+        .stdout(predicate::str::contains("skim cargo"));
 }
