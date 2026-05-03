@@ -243,7 +243,7 @@ fn test_completions_help() {
 // ============================================================================
 
 #[test]
-fn test_completions_include_file_subcommands() {
+fn test_completions_include_file_tool_subcommands() {
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["completions", "bash"])
@@ -251,16 +251,11 @@ fn test_completions_include_file_subcommands() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    // file subcommand and its tools should appear in completions
-    assert!(
-        stdout.contains("file"),
-        "Bash completions should include 'file' subcommand"
-    );
-    // Check for at least some known file tools
+    // Check for at least some known file tools as top-level subcommands
     for tool in &["find", "grep", "ls", "rg", "tree"] {
         assert!(
             stdout.contains(tool),
-            "Bash completions should include '{tool}' as file tool"
+            "Bash completions should include '{tool}' as top-level subcommand"
         );
     }
 }

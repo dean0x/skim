@@ -89,17 +89,3 @@ fn test_skim_cargo_build_dispatches() {
         .stderr(predicate::str::contains("not yet implemented").not());
 }
 
-// ============================================================================
-// Old category syntax rejected
-// ============================================================================
-
-#[test]
-fn test_old_build_subcommand_rejected() {
-    // `skim build` should NOT route to build category — it falls through to FileOperation
-    // and fails because there's no file named "build"
-    Command::cargo_bin("skim")
-        .unwrap()
-        .arg("build")
-        .assert()
-        .failure();
-}

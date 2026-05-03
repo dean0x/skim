@@ -671,17 +671,6 @@ mod tests {
         );
     }
 
-    /// Backward-compat: deprecated category-first format (e.g. `skim build cargo`) still
-    /// receives session_id injection — the hook does not special-case dispatch format.
-    #[test]
-    fn test_session_id_injected_into_deprecated_category_format() {
-        let result = inject_session_id("skim build cargo", Some("sess-abc"));
-        assert_eq!(
-            result, "skim --session-id=sess-abc build cargo",
-            "deprecated category-first format must still receive --session-id injection"
-        );
-    }
-
     /// B-AC5: non-skim segments in a compound command are left untouched.
     #[test]
     fn test_session_id_compound_non_skim_segment_unchanged() {

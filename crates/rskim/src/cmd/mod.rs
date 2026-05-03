@@ -133,10 +133,7 @@ pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
 /// IMPORTANT: Only register subcommands we will actually implement.
 /// Keep this list exact — no broad patterns. See GRANITE lesson #336.
 ///
-/// v2.8.0: Flat dispatch — tool names promoted to top-level subcommands.
-/// Category prefixes (build, lint, pkg, infra, file, test) removed.
-/// Deprecated category names retained here for backward-compat; dispatch()
-/// prints a deprecation warning and forwards to the appropriate handler.
+/// v2.8.0: Flat dispatch — tool names are top-level subcommands.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     // Meta/utility (unchanged)
     "agents",
@@ -184,14 +181,6 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "ls",
     "rg",
     "tree",
-    // Deprecated v2.7 category subcommands — kept for backward compatibility.
-    // dispatch() emits a deprecation warning and forwards to the handler.
-    "test",
-    "build",
-    "lint",
-    "pkg",
-    "file",
-    "infra",
 ];
 
 /// Check whether `name` is a registered subcommand.
@@ -679,25 +668,6 @@ fn print_go_help() {
     );
 }
 
-/// Emit a v2.8.0 deprecation warning for an old category subcommand and
-/// forward to its handler.
-///
-/// Centralises the `eprintln!` + forward pattern so each deprecated match arm
-/// is a single call instead of a repeated 4-line block.
-fn dispatch_deprecated(
-    category: &str,
-    hint: &str,
-    args: &[String],
-    analytics: &crate::analytics::AnalyticsConfig,
-    handler: fn(&[String], &crate::analytics::AnalyticsConfig) -> anyhow::Result<ExitCode>,
-) -> anyhow::Result<ExitCode> {
-    eprintln!(
-        "skim: '{category}' category subcommand is deprecated since v2.8.0.\n\
-         {hint}"
-    );
-    handler(args, analytics)
-}
-
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
 /// v2.8.0: Flat dispatch — tool names are top-level subcommands.
@@ -732,53 +702,6 @@ pub(crate) fn dispatch(
         "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
         "aws" | "curl" | "gh" | "wget" => infra::run(&prepend(subcommand, args), analytics),
         "find" | "grep" | "ls" | "rg" | "tree" => file::run(&prepend(subcommand, args), analytics),
-
-        // Deprecated v2.7 category subcommands — forward with deprecation warning.
-        // args are passed as-is; each category handler accepts the old format.
-        "test" => dispatch_deprecated(
-            "test",
-            "Use the tool name directly, e.g.: skim jest, skim pytest, skim vitest,\n\
-             or for cargo: skim cargo test",
-            args,
-            analytics,
-            test::run,
-        ),
-        "build" => dispatch_deprecated(
-            "build",
-            "Use the tool name directly, e.g.: skim tsc\n\
-             or for cargo: skim cargo build",
-            args,
-            analytics,
-            build::run,
-        ),
-        "lint" => dispatch_deprecated(
-            "lint",
-            "Use the tool name directly, e.g.: skim eslint, skim ruff, skim mypy",
-            args,
-            analytics,
-            lint::run,
-        ),
-        "pkg" => dispatch_deprecated(
-            "pkg",
-            "Use the tool name directly, e.g.: skim npm, skim pnpm, skim pip",
-            args,
-            analytics,
-            pkg::run,
-        ),
-        "file" => dispatch_deprecated(
-            "file",
-            "Use the tool name directly, e.g.: skim find, skim grep, skim ls, skim rg, skim tree",
-            args,
-            analytics,
-            file::run,
-        ),
-        "infra" => dispatch_deprecated(
-            "infra",
-            "Use the tool name directly, e.g.: skim gh, skim aws, skim curl, skim wget",
-            args,
-            analytics,
-            infra::run,
-        ),
 
         _ => {
             let safe = sanitize_for_display(subcommand);
@@ -1091,8 +1014,7 @@ mod tests {
         for &subcommand in KNOWN_SUBCOMMANDS {
             // Pass --help so handlers exit cleanly rather than spawning real
             // processes. Most category handlers print help and return SUCCESS
-            // when --help is the only arg; the deprecated category arms forward
-            // straight to the handler with the same args.
+            // when --help is the only arg.
             let args: Vec<String> = vec!["--help".to_string()];
 
             // AnalyticsConfig is not UnwindSafe, so construct it inside the closure.
