@@ -52,9 +52,13 @@ pub(crate) fn run(
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
         Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
+            // Defensive branch: flat dispatch always prepends a known tool name
+            // (cargo/clippy/tsc) before calling this function, so this arm is
+            // only reachable via internal routing bugs. Use eprintln! + FAILURE
+            // (not bail!) consistent with sibling handlers (pkg, lint, test).
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             eprintln!(
-                "skim: unknown build tool '{safe_unknown}'\n\
+                "skim: unknown subcommand '{safe_unknown}'\n\
                  Supported tools: cargo, clippy, tsc"
             );
             Ok(ExitCode::FAILURE)
@@ -72,7 +76,7 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim <tool> [args...]");
+    println!("skim {{cargo build|cargo clippy|tsc}} [args...]");
     println!();
     println!("  Run build tools and compress output for AI context windows.");
     println!();
@@ -163,12 +167,15 @@ pub(super) fn run_parsed_command(
         println!("{content}");
     }
 
-    // Combine stdout+stderr for stats and analytics
-    let raw_text = super::combine_output(&output).into_owned();
+    // Combine stdout+stderr for stats and analytics.
+    // Hold as Cow to avoid an unconditional String clone: Borrowed when stderr
+    // is empty (fast path), Owned only when both streams are non-empty.
+    let raw_cow = super::combine_output(&output);
 
-    // Report token stats if requested
+    // Report token stats if requested. count_token_pair takes &str so we
+    // borrow through the Cow without forcing an allocation.
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_text, result.content());
+        let (orig, comp) = crate::process::count_token_pair(raw_cow.as_ref(), result.content());
         crate::process::report_token_stats(orig, comp, "");
     }
 
@@ -191,9 +198,11 @@ pub(super) fn run_parsed_command(
     };
 
     // Record analytics (fire-and-forget, non-blocking).
+    // try_record_command takes ownership, so convert to String here — the
+    // single call site where ownership is actually required.
     crate::analytics::try_record_command(
         rec.with_tier(result.tier_name()),
-        raw_text,
+        raw_cow.into_owned(),
         result.content().to_string(),
         super::format_analytics_label("build", program, &args.join(" ")),
         output.duration,
