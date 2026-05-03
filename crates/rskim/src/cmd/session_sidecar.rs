@@ -123,7 +123,9 @@ pub(crate) fn read_session_id(cache_dir: &Path) -> Option<String> {
 fn try_read_sidecar(path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
-    let age = SystemTime::now().duration_since(mtime).unwrap_or(Duration::MAX);
+    let age = SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or(Duration::MAX);
     if age > SIDECAR_MAX_AGE {
         return None;
     }
@@ -341,7 +343,10 @@ mod tests {
         let age2 = SystemTime::now()
             .duration_since(meta2.modified().unwrap())
             .unwrap_or(Duration::MAX);
-        assert!(age2 < SIDECAR_MAX_AGE, "mtime should be refreshed after second write");
+        assert!(
+            age2 < SIDECAR_MAX_AGE,
+            "mtime should be refreshed after second write"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -376,7 +381,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sessions_dir = dir.path().join(SESSIONS_DIR);
 
-        write_raw_sidecar(&sessions_dir, std::process::id(), "bad session id with spaces!");
+        write_raw_sidecar(
+            &sessions_dir,
+            std::process::id(),
+            "bad session id with spaces!",
+        );
 
         let result = read_session_id(dir.path());
         assert_eq!(result, None, "invalid content should be rejected");
@@ -442,7 +451,10 @@ mod tests {
         let stale_path = write_raw_sidecar(&sessions_dir, stale_pid, "old-session");
         set_file_age(&stale_path, Duration::from_secs(25 * 3600));
 
-        assert!(stale_path.exists(), "stale file should exist before trigger");
+        assert!(
+            stale_path.exists(),
+            "stale file should exist before trigger"
+        );
 
         // Trigger cleanup by writing a new sidecar (cleanup runs on every write).
         write_session_id("new-session", dir.path());
