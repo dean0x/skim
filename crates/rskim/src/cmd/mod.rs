@@ -134,6 +134,11 @@ pub(crate) fn check_passthrough_value(val: Option<String>) -> bool {
 /// Keep this list exact — no broad patterns. See GRANITE lesson #336.
 ///
 /// v2.8.0: Flat dispatch — tool names are top-level subcommands.
+///
+/// NOTE: This array is NOT used by the dispatch router. Its current purposes are:
+///   1. Shell completion candidates (completions subcommand)
+///   2. Sync-guard test (`test_dispatch_covers_all_known_subcommands`) — asserts
+///      every registered name reaches a match arm in `dispatch()` without panicking.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     // Meta/utility (unchanged)
     "agents",
@@ -542,7 +547,7 @@ fn extract_subcmd<'a>(
 /// Build a `Vec<String>` with `tool` prepended and the element at `skip_idx`
 /// removed, pre-allocating the exact capacity needed.
 fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> {
-    assert!(
+    debug_assert!(
         skip_idx < args.len(),
         "skip_idx {skip_idx} out of bounds for args len {}",
         args.len()
@@ -590,7 +595,7 @@ fn dispatch_cargo(
         unknown => {
             let safe = sanitize_for_display(unknown);
             eprintln!(
-                "skim cargo: unsupported subcommand '{safe}'\n\n\
+                "skim cargo: unknown subcommand '{safe}'\n\n\
                  Usage: skim cargo <test|build|clippy|audit|nextest> [args...]\n\n\
                  Supported subcommands: test, nextest, build, clippy, audit"
             );
@@ -619,7 +624,7 @@ fn dispatch_go(
         unknown => {
             let safe = sanitize_for_display(unknown);
             eprintln!(
-                "skim go: unsupported subcommand '{safe}'\n\n\
+                "skim go: unknown subcommand '{safe}'\n\n\
                  Usage: skim go <test> [args...]\n\n\
                  Supported subcommands: test"
             );
@@ -999,6 +1004,19 @@ mod tests {
         assert_eq!(result, vec!["cargo"]);
     }
 
+    /// Out-of-bounds skip_idx fires the debug_assert (debug builds only).
+    ///
+    /// This test documents the invariant: callers are responsible for passing a
+    /// valid index.  The assert only fires in debug builds (`cfg(debug_assertions)`),
+    /// so this test is gated on that condition.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "skip_idx 1 out of bounds for args len 1")]
+    fn test_prepend_without_panics_on_out_of_bounds() {
+        let args: Vec<String> = vec!["test".into()];
+        prepend_without("cargo", &args, 1); // skip_idx=1 is out of bounds for len 1
+    }
+
     // ========================================================================
     // dispatch() coverage — KNOWN_SUBCOMMANDS sync guard
     // ========================================================================
@@ -1042,7 +1060,7 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "dispatch() panicked for known subcommand '{subcommand}': \
-                 entry is in KNOWN_SUBCOMMANDS but has no match arm in dispatch()"
+                 handler should not panic (check handler implementation)"
             );
         }
 
