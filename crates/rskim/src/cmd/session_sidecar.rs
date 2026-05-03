@@ -122,8 +122,6 @@ pub(crate) fn read_session_id(cache_dir: &Path) -> Option<String> {
 /// Returns `None` in all other cases (missing file, stale, invalid content).
 fn try_read_sidecar(path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
-
-    // Stale check: skip files older than SIDECAR_MAX_AGE.
     let mtime = metadata.modified().ok()?;
     let age = SystemTime::now().duration_since(mtime).unwrap_or(Duration::MAX);
     if age > SIDECAR_MAX_AGE {
@@ -132,12 +130,7 @@ fn try_read_sidecar(path: &Path) -> Option<String> {
 
     let content = std::fs::read_to_string(path).ok()?;
     let trimmed = content.trim();
-
-    if crate::analytics::is_safe_session_id(trimmed) {
-        Some(trimmed.to_string())
-    } else {
-        None
-    }
+    crate::analytics::is_safe_session_id(trimmed).then(|| trimmed.to_string())
 }
 
 /// Remove sidecar files older than [`CLEANUP_MAX_AGE`].
@@ -201,11 +194,11 @@ fn parent_of(pid: u32) -> Option<u32> {
     }
 }
 
-/// Return the parent PID of `pid` on macOS using `proc_pidinfo(PROC_PIDTBSDINFO)`.
+/// Return the parent PID of `pid` on macOS using `proc_pidinfo(PROC_PIDTASKALLINFO)`.
 ///
-/// `proc_pidinfo` fills a `proc_taskallinfo.pbsd` (`proc_bsdinfo`) struct whose
-/// `pbi_ppid` field holds the parent PID. This avoids the deprecated `sysctl`
-/// path and uses the stable libproc API that is available on macOS 10.5+.
+/// `proc_pidinfo` fills a `proc_taskallinfo` struct whose `.pbsd.pbi_ppid`
+/// field holds the parent PID. This avoids the deprecated `sysctl` path and
+/// uses the stable libproc API available on macOS 10.5+.
 #[cfg(target_os = "macos")]
 fn parent_of(pid: u32) -> Option<u32> {
     use std::mem;
@@ -213,13 +206,14 @@ fn parent_of(pid: u32) -> Option<u32> {
     // SAFETY: `proc_taskallinfo` is a plain C struct; zero-initialising it is
     // valid. `proc_pidinfo` fills it in-place via the raw pointer. The buffer
     // size matches the struct size exactly, as required by the API.
+    // Flavor PROC_PIDTASKALLINFO (2) pairs with the proc_taskallinfo struct.
     let mut info: libc::proc_taskallinfo = unsafe { mem::zeroed() };
     let size = mem::size_of::<libc::proc_taskallinfo>() as libc::c_int;
 
     let ret = unsafe {
         libc::proc_pidinfo(
             pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
+            libc::PROC_PIDTASKALLINFO,
             0,
             &mut info as *mut _ as *mut libc::c_void,
             size,
@@ -431,8 +425,6 @@ mod tests {
 
         assert_eq!(val_a, Some("session-for-a".to_string()));
         assert_eq!(val_b, Some("session-for-b".to_string()));
-        // Ensure A didn't bleed into B.
-        assert_ne!(val_a, val_b);
     }
 
     // -----------------------------------------------------------------------
@@ -479,39 +471,26 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_session_id wins over sidecar (integration guard)
+    // Fallback priority: explicit session_id wins over sidecar
     // -----------------------------------------------------------------------
 
-    /// Explicit --session-id in args takes priority; sidecar is only a fallback.
-    ///
-    /// This test validates the contract between `parse_session_id` and
-    /// `read_session_id` at the callsite in `main.rs`:
-    ///
-    ///   let session_id = parse_session_id(args)
-    ///       .or_else(|| read_session_id(cache_dir));
-    ///
-    /// When `parse_session_id` returns `Some`, `.or_else` short-circuits and
-    /// `read_session_id` is never called.
+    /// When an explicit session ID is already resolved, `read_session_id` is the
+    /// fallback — it is only used when the caller has `None`. This test confirms
+    /// that a sidecar written for the current PID is readable, and that a
+    /// pre-existing `Some` value is unaffected by what the sidecar contains.
     #[test]
-    fn test_explicit_session_id_wins() {
-        // Simulate args with --session-id=VALUE
-        let args = vec!["skim", "--session-id=explicit-value", "cargo", "test"];
-        let explicit = args
-            .iter()
-            .find_map(|a| a.strip_prefix("--session-id=").map(str::to_string))
-            .filter(|s| crate::analytics::is_safe_session_id(s));
-
-        // Sidecar has a different value.
+    fn test_read_session_id_is_a_fallback() {
         let dir = TempDir::new().unwrap();
         let sessions_dir = dir.path().join(SESSIONS_DIR);
         write_raw_sidecar(&sessions_dir, std::process::id(), "sidecar-value");
 
-        // `.or_else` semantics: explicit wins.
-        let session_id = explicit.or_else(|| read_session_id(dir.path()));
-        assert_eq!(
-            session_id,
-            Some("explicit-value".to_string()),
-            "explicit --session-id must take precedence over sidecar"
-        );
+        // When no explicit session_id is present, the sidecar is used.
+        let from_sidecar = None::<String>.or_else(|| read_session_id(dir.path()));
+        assert_eq!(from_sidecar, Some("sidecar-value".to_string()));
+
+        // When an explicit session_id is already present, the sidecar is not used.
+        let explicit = Some("explicit-value".to_string());
+        let resolved = explicit.or_else(|| read_session_id(dir.path()));
+        assert_eq!(resolved, Some("explicit-value".to_string()));
     }
 }
