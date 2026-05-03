@@ -157,9 +157,7 @@ pub(super) fn run_parsed_command(
     let result = parser(&output);
 
     // Emit markers to stderr (warnings, notices)
-    let stderr = std::io::stderr();
-    let mut stderr_handle = stderr.lock();
-    let _ = result.emit_markers(&mut stderr_handle);
+    let _ = result.emit_markers(&mut std::io::stderr().lock());
 
     // Print the result content to stdout
     let content = result.content();

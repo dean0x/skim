@@ -26,18 +26,7 @@ fn skim_cmd() -> Command {
 #[test]
 fn test_build_cargo_success_exit_code() {
     // Running `skim cargo build` on the skim repo itself should succeed
-    // (already compiled artifacts are cached).
-    skim_cmd()
-        .args(["cargo", "build"])
-        .timeout(std::time::Duration::from_secs(120))
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("OK warnings:"));
-}
-
-#[test]
-fn test_build_cargo_structured_output() {
-    // Verify the output includes build result markers
+    // (already compiled artifacts are cached) and produce structured output.
     skim_cmd()
         .args(["cargo", "build"])
         .timeout(std::time::Duration::from_secs(120))
