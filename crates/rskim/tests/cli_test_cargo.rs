@@ -253,4 +253,3 @@ fn test_skim_pip_unknown_subcommand_errors() {
         .failure()
         .stderr(predicate::str::contains("unknown subcommand"));
 }
-

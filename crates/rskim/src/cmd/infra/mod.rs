@@ -287,7 +287,7 @@ mod tests {
 
     /// Credential-bearing URLs in args must be scrubbed from the analytics label.
     ///
-    /// A streaming command like `skim gh api https://token@github.com/repo`
+    /// A streaming command like `skim infra gh api https://token@github.com/repo`
     /// must not write the token to the analytics DB or stats output.
     #[test]
     fn test_build_streaming_label_scrubs_credentials() {

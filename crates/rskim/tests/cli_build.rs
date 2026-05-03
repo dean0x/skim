@@ -88,4 +88,3 @@ fn test_skim_cargo_build_dispatches() {
         .stdout(predicate::str::contains("not yet implemented").not())
         .stderr(predicate::str::contains("not yet implemented").not());
 }
-
