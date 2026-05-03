@@ -524,7 +524,12 @@ fn main() -> ExitCode {
     let cli_disable_analytics = std::env::args().any(|a| a == "--disable-analytics");
     // Parse --session-id=VALUE before subcommand routing so every subcommand
     // inherits session context without per-subcommand parsing.
-    let session_id = parse_session_id(std::env::args());
+    // AD-SC-1: Fall back to PID-keyed sidecar when --session-id is absent so
+    // direct skim invocations (bypassing the hook) still get attribution.
+    let session_id = parse_session_id(std::env::args()).or_else(|| {
+        let dir = cmd::resolve_cache_dir()?;
+        cmd::session_sidecar::read_session_id(&dir)
+    });
     let analytics = analytics::AnalyticsConfig::from_process(cli_disable_analytics, session_id);
 
     let result: anyhow::Result<ExitCode> = match resolve_invocation() {

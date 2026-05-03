@@ -177,6 +177,17 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         }
     };
 
+    // AD-SC-1: Persist session_id to PID-keyed sidecar for fallback attribution.
+    // Direct skim invocations that bypass this hook can later discover the
+    // session by walking process ancestry (see session_sidecar::read_session_id).
+    if let Some(ref sid) = session_id {
+        if crate::analytics::is_safe_session_id(sid) {
+            if let Some(dir) = cache_dir() {
+                crate::cmd::session_sidecar::write_session_id(sid, &dir);
+            }
+        }
+    }
+
     // If already starts with "skim " — already rewritten, passthrough
     if command.starts_with("skim ") {
         audit_hook(&command, false, "");
