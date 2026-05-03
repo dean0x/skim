@@ -202,3 +202,55 @@ fn test_skim_cargo_unknown_subcommand_errors() {
         .stderr(predicate::str::contains("unsupported subcommand"));
 }
 
+// ============================================================================
+// Error-path E2E coverage — go, npm, pnpm, pip unknown/missing subcommands
+// ============================================================================
+
+/// `skim go unknownthing` must fail with an "unsupported subcommand" error.
+/// Covers the `unknown` arm in `dispatch_go`.
+#[test]
+fn test_skim_go_unknown_subcommand_errors() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["go", "unknownthing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported subcommand"));
+}
+
+/// `skim npm unknownthing` must fail with an "unknown subcommand" error.
+/// Covers the `other` arm in `pkg::npm::run`.
+#[test]
+fn test_skim_npm_unknown_subcommand_errors() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["npm", "unknownthing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown subcommand"));
+}
+
+/// `skim pnpm unknownthing` must fail with an "unknown subcommand" error.
+/// Covers the `other` arm in `pkg::pnpm::run`.
+#[test]
+fn test_skim_pnpm_unknown_subcommand_errors() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["pnpm", "unknownthing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown subcommand"));
+}
+
+/// `skim pip unknownthing` must fail with an "unknown subcommand" error.
+/// Covers the `other` arm in `pkg::pip::run`.
+#[test]
+fn test_skim_pip_unknown_subcommand_errors() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["pip", "unknownthing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown subcommand"));
+}
+
