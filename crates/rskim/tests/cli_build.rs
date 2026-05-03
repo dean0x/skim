@@ -51,7 +51,7 @@ fn test_skim_cargo_unknown_subcmd_shows_error() {
         .arg("webpack")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unsupported subcommand"));
+        .stderr(predicate::str::contains("unknown subcommand"));
 }
 
 // ============================================================================

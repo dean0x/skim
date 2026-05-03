@@ -194,6 +194,16 @@ pub(crate) fn run_infra_tool(
 /// URLs from args before joining so that tokens are never written to the analytics
 /// database or shown in stats output.  Returns an empty string when analytics is
 /// disabled (avoids unnecessary formatting).  SEE: PF-022.
+///
+/// # Analytics label format
+///
+/// Labels are produced as `"skim infra <tool> <subcommand> [args]"` — the
+/// `"infra"` family prefix is retained for **backwards-compatible analytics
+/// grouping** even though the user-facing CLI no longer exposes the `infra`
+/// category (commands are now invoked as `skim gh …`, not `skim infra gh …`).
+/// Changing the prefix would silently break historical trend data stored in the
+/// analytics database.  The divergence between the label and the CLI surface is
+/// intentional and must not be "fixed" to match the current CLI syntax.
 pub(crate) fn build_streaming_label(
     family: &str,
     program: &str,
@@ -254,6 +264,12 @@ mod tests {
     // build_streaming_label tests (PF-022)
     // ========================================================================
 
+    // NOTE: Analytics labels intentionally retain the "infra" family prefix
+    // (e.g. "skim infra gh run watch 12345") for backwards-compatible grouping
+    // of historical data in the analytics database, even though the user-facing
+    // CLI no longer exposes the "infra" category (commands are now invoked as
+    // "skim gh …").  Do not update these expected values to match the current
+    // CLI syntax — that would silently corrupt stored analytics trends.
     #[test]
     fn test_build_streaming_label_with_args() {
         let args: Vec<String> = vec!["12345".to_string()];

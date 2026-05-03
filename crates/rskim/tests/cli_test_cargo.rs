@@ -99,7 +99,7 @@ fn test_skim_test_cargo_stdin_plain_text() {
 // `skim cargo nextest` — dispatch correctness (issue: missing coverage)
 // ============================================================================
 
-/// `skim cargo nextest` must not produce an "unsupported subcommand" error.
+/// `skim cargo nextest` must not produce an "unknown subcommand" error.
 ///
 /// The nextest dispatch path keeps the "nextest" token in args (unlike the "test"
 /// arm which strips it), routing through a distinct code path in `dispatch_cargo`.
@@ -117,8 +117,8 @@ fn test_skim_cargo_nextest_is_listed_in_help_as_supported() {
         .success()
         // nextest must appear in the help text as a supported subcommand
         .stdout(predicate::str::contains("nextest"))
-        // must not have an unsupported-subcommand error
-        .stderr(predicate::str::contains("unsupported subcommand").not());
+        // must not have an unknown-subcommand error
+        .stderr(predicate::str::contains("unknown subcommand").not());
 }
 
 /// Piping nextest-style output to `skim cargo test` (without the nextest token)
@@ -178,10 +178,10 @@ fn test_skim_cargo_b_alias_dispatches_to_build() {
     Command::cargo_bin("skim")
         .unwrap()
         .args(["cargo", "b"])
-        // Must not produce an error about unsupported subcommand
+        // Must not produce an error about unknown subcommand
         .assert()
         .success()
-        .stderr(predicate::str::contains("unsupported subcommand").not())
+        .stderr(predicate::str::contains("unknown subcommand").not())
         // Must also not show "missing subcommand" (the alias was recognised)
         .stderr(predicate::str::contains("missing subcommand").not());
 }
@@ -190,7 +190,7 @@ fn test_skim_cargo_b_alias_dispatches_to_build() {
 // Unknown cargo subcommand — error path coverage
 // ============================================================================
 
-/// `skim cargo unknownthing` must fail with an "unsupported subcommand" error
+/// `skim cargo unknownthing` must fail with an "unknown subcommand" error
 /// on stderr. This covers the `unknown` arm in `dispatch_cargo`.
 #[test]
 fn test_skim_cargo_unknown_subcommand_errors() {
@@ -199,14 +199,14 @@ fn test_skim_cargo_unknown_subcommand_errors() {
         .args(["cargo", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unsupported subcommand"));
+        .stderr(predicate::str::contains("unknown subcommand"));
 }
 
 // ============================================================================
 // Error-path E2E coverage — go, npm, pnpm, pip unknown/missing subcommands
 // ============================================================================
 
-/// `skim go unknownthing` must fail with an "unsupported subcommand" error.
+/// `skim go unknownthing` must fail with an "unknown subcommand" error.
 /// Covers the `unknown` arm in `dispatch_go`.
 #[test]
 fn test_skim_go_unknown_subcommand_errors() {
@@ -215,7 +215,7 @@ fn test_skim_go_unknown_subcommand_errors() {
         .args(["go", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unsupported subcommand"));
+        .stderr(predicate::str::contains("unknown subcommand"));
 }
 
 /// `skim npm unknownthing` must fail with an "unknown subcommand" error.

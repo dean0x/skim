@@ -71,7 +71,7 @@ fn test_cargo_unknown_subcmd_exit_code() {
         .args(["cargo", "webpack"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unsupported subcommand"));
+        .stderr(predicate::str::contains("unknown subcommand"));
 }
 
 #[test]
