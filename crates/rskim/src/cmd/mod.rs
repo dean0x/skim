@@ -505,7 +505,8 @@ where
 
 /// Prepend a tool name to an arg slice.
 fn prepend(tool: &str, args: &[String]) -> Vec<String> {
-    let mut v = vec![tool.to_string()];
+    let mut v = Vec::with_capacity(args.len() + 1);
+    v.push(tool.to_string());
     v.extend_from_slice(args);
     v
 }
@@ -541,7 +542,7 @@ fn extract_subcmd<'a>(
 /// Build a `Vec<String>` with `tool` prepended and the element at `skip_idx`
 /// removed, pre-allocating the exact capacity needed.
 fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> {
-    debug_assert!(
+    assert!(
         skip_idx < args.len(),
         "skip_idx {skip_idx} out of bounds for args len {}",
         args.len()
@@ -551,7 +552,8 @@ fn prepend_without(tool: &str, args: &[String], skip_idx: usize) -> Vec<String> 
     v.extend(
         args.iter()
             .enumerate()
-            .filter_map(|(i, s)| (i != skip_idx).then(|| s.clone())),
+            .filter(|(i, _)| *i != skip_idx)
+            .map(|(_, s)| s.clone()),
     );
     v
 }

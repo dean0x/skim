@@ -53,17 +53,20 @@ pub(crate) fn run(
         Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
-            anyhow::bail!(
-                "unknown build tool: {safe_unknown}\n\
+            eprintln!(
+                "skim: unknown build tool '{safe_unknown}'\n\
                  Supported tools: cargo, clippy, tsc"
             );
+            Ok(ExitCode::FAILURE)
         }
         None => {
-            anyhow::bail!(
-                "missing required argument: <TOOL>\n\n\
-                 Usage: skim {{cargo|clippy|tsc}} [args...]\n\n\
+            eprintln!(
+                "skim: missing build tool\n\n\
+                 Usage: skim cargo build [args...]\n\
+                 Usage: skim tsc [args...]\n\n\
                  Supported tools: cargo, clippy, tsc"
             );
+            Ok(ExitCode::FAILURE)
         }
     }
 }
