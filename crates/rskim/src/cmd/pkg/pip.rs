@@ -28,7 +28,7 @@ static RE_PIP_REQUIREMENT: LazyLock<Regex> =
 // Public entry point
 // ============================================================================
 
-/// Run `skim pkg pip <subcmd> [args...]`.
+/// Run `skim pip <subcmd> [args...]`.
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
@@ -50,9 +50,9 @@ pub(crate) fn run(
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
-                "skim pkg pip: unknown subcommand '{safe}'\n\
+                "skim pip: unknown subcommand '{safe}'\n\
                  Available: install, check, list\n\
-                 Run 'skim pkg pip --help' for usage"
+                 Run 'skim pip --help' for usage"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -60,7 +60,7 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim pkg pip <subcmd> [args...]");
+    println!("skim pip <subcmd> [args...]");
     println!();
     println!("  Parse pip output for AI context windows.");
     println!();
@@ -70,10 +70,10 @@ fn print_help() {
     println!("  list       Parse pip list --outdated output");
     println!();
     println!("Examples:");
-    println!("  skim pkg pip install flask");
-    println!("  skim pkg pip check");
-    println!("  skim pkg pip list");
-    println!("  pip install flask 2>&1 | skim pkg pip install");
+    println!("  skim pip install flask");
+    println!("  skim pip check");
+    println!("  skim pip list");
+    println!("  pip install flask 2>&1 | skim pip install");
 }
 
 // ============================================================================

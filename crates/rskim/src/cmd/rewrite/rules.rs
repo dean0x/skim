@@ -1041,7 +1041,7 @@ mod tests {
         // `ls -la` matches the specific rule, not the catch-all.
         let tokens: &[&str] = &["ls", "-la"];
         let result = try_rewrite(tokens).expect("should rewrite ls -la");
-        // Both specific and catch-all rewrite to skim file ls — result is identical.
+        // Both specific and catch-all rewrite to skim ls — result is identical.
         assert!(
             result.tokens.contains(&"skim".to_string()),
             "Expected skim rewrite"

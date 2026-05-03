@@ -32,7 +32,7 @@ static RE_OXLINT_LOCATION: LazyLock<Regex> =
 /// Matches rule name lines in oxlint fancy output (`  × rule-name` or `  ⚠ rule-name`).
 static RE_OXLINT_RULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^  [×⚠] (.+)$").unwrap());
 
-/// Run `skim lint oxlint [args...]`.
+/// Run `skim oxlint [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

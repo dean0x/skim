@@ -28,7 +28,7 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
 static RE_GOLANGCI_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+):(\d+)(?::\d+)?:\s+(.+)\s+\((\S+)\)$").unwrap());
 
-/// Run `skim lint golangci [args...]`.
+/// Run `skim golangci [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

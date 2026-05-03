@@ -58,7 +58,7 @@ fn is_format_mode(args: &[String]) -> bool {
     user_has_flag(args, &["--write", "-w"])
 }
 
-/// Run `skim lint prettier [args...]`.
+/// Run `skim prettier [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -120,7 +120,7 @@ fn run_format(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip --write / -w so that `args.is_empty()` is true when no file targets
-    // remain, enabling stdin detection (e.g., `cat output.txt | skim lint prettier --write`).
+    // remain, enabling stdin detection (e.g., `cat output.txt | skim prettier --write`).
     // `prepare_format_args` re-injects --write for binary execution.
     let remaining: Vec<String> = args
         .iter()

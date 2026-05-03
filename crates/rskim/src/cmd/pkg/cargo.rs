@@ -17,7 +17,7 @@ use crate::runner::CommandOutput;
 // Public entry point
 // ============================================================================
 
-/// Run `skim pkg cargo <subcmd> [args...]`.
+/// Run `skim cargo <subcmd> [args...]`.
 ///
 /// Currently only `audit` is supported.
 pub(crate) fn run(
@@ -39,9 +39,9 @@ pub(crate) fn run(
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
-                "skim pkg cargo: unknown subcommand '{safe}'\n\
+                "skim cargo: unknown subcommand '{safe}'\n\
                  Available: audit\n\
-                 Run 'skim pkg cargo --help' for usage"
+                 Run 'skim cargo --help' for usage"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -49,7 +49,7 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim pkg cargo <subcmd> [args...]");
+    println!("skim cargo <subcmd> [args...]");
     println!();
     println!("  Parse cargo package manager output for AI context windows.");
     println!();
@@ -57,8 +57,8 @@ fn print_help() {
     println!("  audit    Parse cargo audit output");
     println!();
     println!("Examples:");
-    println!("  skim pkg cargo audit");
-    println!("  cargo audit --json | skim pkg cargo audit");
+    println!("  skim cargo audit");
+    println!("  cargo audit --json | skim cargo audit");
 }
 
 // ============================================================================

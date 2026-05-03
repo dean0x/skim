@@ -39,7 +39,7 @@ const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 static RE_AWS_TABLE_ROW: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\|\s+(\S[^|]+\S)\s+\|").unwrap());
 
-/// Run `skim infra aws [args...]`.
+/// Run `skim aws [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

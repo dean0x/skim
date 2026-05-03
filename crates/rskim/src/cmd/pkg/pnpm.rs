@@ -25,7 +25,7 @@ static RE_PNPM_PACKAGES: LazyLock<Regex> =
 // Public entry point
 // ============================================================================
 
-/// Run `skim pkg pnpm <subcmd> [args...]`.
+/// Run `skim pnpm <subcmd> [args...]`.
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
@@ -47,9 +47,9 @@ pub(crate) fn run(
         other => {
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!(
-                "skim pkg pnpm: unknown subcommand '{safe}'\n\
+                "skim pnpm: unknown subcommand '{safe}'\n\
                  Available: install, audit, outdated\n\
-                 Run 'skim pkg pnpm --help' for usage"
+                 Run 'skim pnpm --help' for usage"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -57,7 +57,7 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim pkg pnpm <subcmd> [args...]");
+    println!("skim pnpm <subcmd> [args...]");
     println!();
     println!("  Parse pnpm output for AI context windows.");
     println!();
@@ -67,10 +67,10 @@ fn print_help() {
     println!("  outdated   Parse pnpm outdated output");
     println!();
     println!("Examples:");
-    println!("  skim pkg pnpm install");
-    println!("  skim pkg pnpm audit");
-    println!("  skim pkg pnpm outdated");
-    println!("  pnpm install 2>&1 | skim pkg pnpm install");
+    println!("  skim pnpm install");
+    println!("  skim pnpm audit");
+    println!("  skim pnpm outdated");
+    println!("  pnpm install 2>&1 | skim pnpm install");
 }
 
 // ============================================================================

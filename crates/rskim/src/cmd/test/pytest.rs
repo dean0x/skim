@@ -12,8 +12,8 @@
 //! ## Usage
 //!
 //! ```text
-//! skim test pytest [args...]          # Execute pytest, parse output
-//! pytest ... | skim test pytest       # Parse piped stdin
+//! skim pytest [args...]          # Execute pytest, parse output
+//! pytest ... | skim pytest       # Parse piped stdin
 //! ```
 
 use std::collections::HashSet;
@@ -123,14 +123,14 @@ pub(crate) fn run(
 /// This is shown before forwarding `--help` to real pytest so the user
 /// sees both skim's behavior and pytest's own flags.
 fn print_pytest_help() {
-    println!("skim test pytest [ARGS...]");
+    println!("skim pytest [ARGS...]");
     println!();
     println!("  Run pytest and parse its output into a structured summary.");
     println!();
     println!("  BEHAVIOR:");
     println!("    - Injects --tb=short and -q unless you override them");
     println!("    - Parses output into PASS/FAIL/SKIP counts with failure details");
-    println!("    - Supports piped input: pytest ... | skim test pytest");
+    println!("    - Supports piped input: pytest ... | skim pytest");
     println!();
     println!("  FLAGS MANAGED BY SKIM:");
     println!("    --tb=short     Injected unless --tb is already set");

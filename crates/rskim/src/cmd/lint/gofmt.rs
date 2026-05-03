@@ -35,7 +35,7 @@ static RE_GOFMT_DIFF: LazyLock<Regex> =
 /// Validate that a line is a `.go` file path (Tier 1 `-l` output).
 static RE_GOFMT_FILE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(.+\.go)$").unwrap());
 
-/// Run `skim lint gofmt [args...]`.
+/// Run `skim gofmt [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

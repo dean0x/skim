@@ -56,7 +56,7 @@ fn is_biome_subcommand(s: &str) -> bool {
     matches!(s, "check" | "lint" | "format" | "ci")
 }
 
-/// Run `skim lint biome [args...]`.
+/// Run `skim biome [args...]`.
 ///
 /// # AD-LINT-24 (2026-04-15) — Biome dual-mode routing
 ///
@@ -78,7 +78,7 @@ fn run_check(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "check" / "lint" subcommand so that stdin is detected
-    // when no file args remain (e.g., `cat output.txt | skim lint biome check`).
+    // when no file args remain (e.g., `cat output.txt | skim biome check`).
     // `prepare_check_args` re-injects the subcommand when absent.
     let has_subcommand = args.first().is_some_and(|a| is_biome_subcommand(a));
     let remaining: Vec<String> = args
@@ -131,7 +131,7 @@ fn run_format(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // Strip the consumed "format" subcommand so that stdin is detected when no
-    // file args remain (e.g., `cat output.txt | skim lint biome format`).
+    // file args remain (e.g., `cat output.txt | skim biome format`).
     // `prepare_format_args` re-injects "format" for binary execution.
     let remaining: Vec<String> = args.iter().skip(1).cloned().collect();
     super::run_linter(

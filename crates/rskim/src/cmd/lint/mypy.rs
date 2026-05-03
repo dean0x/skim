@@ -29,7 +29,7 @@ static RE_MYPY_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(.+):(\d+):\s+(error|warning|note):\s+(.+?)(?:\s+\[(\S+)\])?$").unwrap()
 });
 
-/// Run `skim lint mypy [args...]`.
+/// Run `skim mypy [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

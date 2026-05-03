@@ -1,6 +1,6 @@
 //! ls and tree parser with three-tier degradation (#116).
 //!
-//! Handles both `skim file ls` and `skim file tree`, dispatched from `mod.rs`
+//! Handles both `skim ls` and `skim tree`, dispatched from `mod.rs`
 //! via the `tool_name` parameter.
 //!
 //! **ls tiers:**
@@ -57,7 +57,7 @@ static RE_TREE_SUMMARY: LazyLock<Regex> =
 static RE_TREE_ENTRY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[\|\+\\\u{251C}\u{2514}\u{2502}\s]").unwrap());
 
-/// Run `skim file ls [args...]` or `skim file tree [args...]`.
+/// Run `skim ls [args...]` or `skim tree [args...]`.
 ///
 /// `tool_name` is either "ls" or "tree", passed by the dispatcher.
 pub(crate) fn run(

@@ -23,7 +23,7 @@ const CONFIG: FileToolConfig<'static> = FileToolConfig {
     install_hint: "Install ripgrep: https://github.com/BurntSushi/ripgrep",
 };
 
-/// Run `skim file rg [args...]`.
+/// Run `skim rg [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

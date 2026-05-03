@@ -287,14 +287,14 @@ mod tests {
         table_unconstrained
             .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
             .set_header(["Command", "Rewrite"]);
-        table_unconstrained.add_row([long_cell.as_str(), "skim infra gh pr list"]);
+        table_unconstrained.add_row([long_cell.as_str(), "skim gh pr list"]);
         let lines_unconstrained = table_unconstrained.to_string().lines().count();
 
         let mut table_constrained = comfy_table::Table::new();
         table_constrained
             .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
             .set_header(["Command", "Rewrite"]);
-        table_constrained.add_row([long_cell.as_str(), "skim infra gh pr list"]);
+        table_constrained.add_row([long_cell.as_str(), "skim gh pr list"]);
         table_constrained.set_width(available);
         let lines_constrained = table_constrained.to_string().lines().count();
 
@@ -328,7 +328,7 @@ mod tests {
         table
             .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
             .set_header(["Command", "Rewrite"]);
-        table.add_row([long_cell.as_str(), "skim infra gh pr list"]);
+        table.add_row([long_cell.as_str(), "skim gh pr list"]);
 
         // term_width == 0 → no set_width call; natural width preserved.
         let rendered = table.to_string();

@@ -20,7 +20,7 @@ const CONFIG: FileToolConfig<'static> = FileToolConfig {
     install_hint: "find is typically pre-installed on Unix systems",
 };
 
-/// Run `skim file find [args...]`.
+/// Run `skim find [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
     // find has no useful flag injections — its output format is always line-per-path
     run_file_tool(CONFIG, args, ctx, |_| {}, parse_impl)

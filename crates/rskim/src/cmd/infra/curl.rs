@@ -40,7 +40,7 @@ static RE_CURL_HTTP_STATUS: LazyLock<Regex> =
 /// Uses literal space instead of \s so indented body content is preserved.
 static RE_CURL_VERBOSE_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[*><{} ]").unwrap());
 
-/// Run `skim infra curl [args...]`.
+/// Run `skim curl [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

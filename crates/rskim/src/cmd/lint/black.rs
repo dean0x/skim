@@ -50,7 +50,7 @@ fn is_format_mode(args: &[String]) -> bool {
     !args.is_empty() && !user_has_flag(args, &["--check", "--diff"])
 }
 
-/// Run `skim lint black [args...]`.
+/// Run `skim black [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,

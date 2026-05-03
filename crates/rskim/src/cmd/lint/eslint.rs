@@ -37,7 +37,7 @@ static RE_ESLINT_LINE: LazyLock<Regex> = LazyLock::new(|| {
 static RE_ESLINT_FILE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(/.+\S|[A-Z]:\\.+\S)$").unwrap());
 
-/// Run `skim lint eslint [args...]`.
+/// Run `skim eslint [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
