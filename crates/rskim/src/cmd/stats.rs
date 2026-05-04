@@ -112,7 +112,7 @@ fn print_help() {
     println!("FLAGS:");
     println!("  --since <DURATION>    Filter to recent data (e.g., 7d, 24h, 4w)");
     println!("  --format json         Output as JSON");
-    println!("  --verbose, -v         Show parse quality section");
+    println!("  --verbose, -v         Show per-session and parse quality sections");
     println!("  --clear               Delete all analytics data");
     println!();
     println!("EXAMPLES:");
@@ -333,6 +333,7 @@ fn render_header(w: &mut dyn Write, period: &str) -> anyhow::Result<()> {
 fn render_summary(
     w: &mut dyn Write,
     summary: &crate::analytics::AnalyticsSummary,
+    session_stats: &SessionStats,
 ) -> anyhow::Result<()> {
     let weighted_pct = weighted_savings_pct(summary);
 
@@ -353,6 +354,13 @@ fn render_summary(
         "  Tokens saved: {}",
         tokens::format_number(summary.tokens_saved as usize).green(),
     )?;
+    if session_stats.distinct_sessions > 0 {
+        writeln!(
+            w,
+            "  Avg/session:  {}",
+            tokens::format_number(session_stats.avg_tokens_per_session.round() as usize).green()
+        )?;
+    }
     writeln!(w)?;
     writeln!(
         w,
@@ -541,11 +549,6 @@ fn render_session_stats(w: &mut dyn Write, stats: &SessionStats) -> anyhow::Resu
             "  Total tokens saved: {}",
             tokens::format_number(stats.total_tokens_saved as usize).green()
         )?;
-        writeln!(
-            w,
-            "  Avg per session:    {}",
-            tokens::format_number(stats.avg_tokens_per_session.round() as usize).green()
-        )?;
     }
     if stats.untagged_invocations > 0 {
         writeln!(
@@ -615,17 +618,19 @@ fn run_dashboard(
         return Ok(ExitCode::SUCCESS);
     }
 
+    let session_stats = db.query_session_stats(since)?;
+
     let period = since_str.map_or("all time".to_string(), |s| format!("last {s}"));
     render_header(w, &period)?;
-    render_summary(w, &summary)?;
+    render_summary(w, &summary, &session_stats)?;
     render_by_category(w, &db.query_by_command(since)?)?;
     render_by_language(w, &db.query_by_language(since)?)?;
     render_by_mode(w, &db.query_by_mode(since)?)?;
     render_by_original_cmd(w, &db.query_by_original_cmd(since)?)?;
     if verbose {
+        render_session_stats(w, &session_stats)?;
         render_parse_quality(w, &db.query_tier_distribution(since)?)?;
     }
-    render_session_stats(w, &db.query_session_stats(since)?)?;
     render_cost_section(w, summary.tokens_saved, cost_override)?;
 
     Ok(ExitCode::SUCCESS)
@@ -1251,8 +1256,14 @@ mod tests {
             tokens_saved: 0,
             avg_savings_pct: 0.0,
         };
+        let empty_sessions = SessionStats {
+            distinct_sessions: 0,
+            total_tokens_saved: 0,
+            avg_tokens_per_session: 0.0,
+            untagged_invocations: 0,
+        };
         let mut buf = Vec::new();
-        render_summary(&mut buf, &summary).expect("render should not fail");
+        render_summary(&mut buf, &summary, &empty_sessions).expect("render should not fail");
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("0.0%"), "zero raw_tokens should show 0.0%");
     }
@@ -1532,33 +1543,84 @@ mod tests {
         );
     }
 
-    /// AD-AN-2: dashboard renders "Per Session" section when session data is present.
+    /// Per Session section is hidden in default (non-verbose) mode even with data.
     #[test]
-    fn test_dashboard_shows_per_session_section_with_data() {
+    fn test_dashboard_hides_per_session_in_default_mode() {
         let store = MockStore::with_sessions();
         let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
-            output.contains("Per Session"),
-            "dashboard should show Per Session section when session data is present"
-        );
-        assert!(
-            output.contains("Sessions tracked"),
-            "dashboard Per Session section should show tracked sessions count"
-        );
-        assert!(
-            output.contains("Untagged calls"),
-            "dashboard Per Session section should show untagged calls"
+            !output.contains("Per Session"),
+            "Per Session section should be hidden in default mode"
         );
     }
 
-    /// AD-AN-2: dashboard hides "Per Session" section when no session data.
+    /// Per Session section appears in verbose mode when session data is present.
     #[test]
-    fn test_dashboard_hides_per_session_section_when_empty() {
+    fn test_dashboard_shows_per_session_in_verbose_mode() {
+        let store = MockStore::with_sessions();
+        let output = capture(|w| run_dashboard(w, &store, None, true, None, None));
+        assert!(
+            output.contains("Per Session"),
+            "verbose mode should show Per Session section when session data is present"
+        );
+        assert!(
+            output.contains("Sessions tracked"),
+            "verbose Per Session section should show tracked sessions count"
+        );
+        assert!(
+            output.contains("Untagged calls"),
+            "verbose Per Session section should show untagged calls"
+        );
+    }
+
+    /// Per Session section is hidden in verbose mode when no session data.
+    #[test]
+    fn test_dashboard_hides_per_session_in_verbose_when_empty() {
+        let store = MockStore::with_data(); // session_stats all zeros
+        let output = capture(|w| run_dashboard(w, &store, None, true, None, None));
+        assert!(
+            !output.contains("Per Session"),
+            "verbose mode should NOT show Per Session section when session data is all zeros"
+        );
+    }
+
+    /// Avg/session appears in Summary section when session data exists.
+    #[test]
+    fn test_summary_shows_avg_per_session() {
+        let store = MockStore::with_sessions();
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            output.contains("Avg/session"),
+            "Summary should show Avg/session when session data is present"
+        );
+        assert!(
+            output.contains("10,000"),
+            "Summary Avg/session should show 10,000"
+        );
+    }
+
+    /// Avg/session is omitted from Summary when no sessions tracked.
+    #[test]
+    fn test_summary_hides_avg_per_session_when_no_sessions() {
         let store = MockStore::with_data(); // session_stats all zeros
         let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
         assert!(
-            !output.contains("Per Session"),
-            "dashboard should NOT show Per Session section when session data is all zeros"
+            !output.contains("Avg/session"),
+            "Summary should NOT show Avg/session when no sessions tracked"
+        );
+    }
+
+    /// Verbose Per Session section no longer shows "Avg per session" (promoted to Summary).
+    #[test]
+    fn test_verbose_per_session_excludes_avg() {
+        let store = MockStore::with_sessions();
+        let output = capture(|w| run_dashboard(w, &store, None, true, None, None));
+        // Find the Per Session section and check it doesn't contain "Avg per session"
+        let per_session_start = output.find("Per Session").expect("should have Per Session");
+        let after_per_session = &output[per_session_start..];
+        assert!(
+            !after_per_session.contains("Avg per session"),
+            "Per Session section should NOT contain 'Avg per session' (promoted to Summary)"
         );
     }
 
