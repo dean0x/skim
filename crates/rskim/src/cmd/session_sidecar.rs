@@ -178,15 +178,17 @@ const CLEANUP_SENTINEL: &str = ".last_cleanup";
 fn cleanup_stale_rate_limited(sessions_dir: &Path) {
     let sentinel = sessions_dir.join(CLEANUP_SENTINEL);
 
-    if let Ok(meta) = std::fs::metadata(&sentinel) {
-        if let Ok(mtime) = meta.modified() {
-            let age = SystemTime::now()
+    if let Ok(age) = std::fs::metadata(&sentinel)
+        .and_then(|m| m.modified())
+        .map(|mtime| {
+            SystemTime::now()
                 .duration_since(mtime)
-                .unwrap_or(Duration::MAX);
-            if age < CLEANUP_RATE_LIMIT {
-                // Cleaned up recently — skip.
-                return;
-            }
+                .unwrap_or(Duration::MAX)
+        })
+    {
+        if age < CLEANUP_RATE_LIMIT {
+            // Cleaned up recently — skip.
+            return;
         }
     }
 

@@ -81,7 +81,7 @@ fn inject_session_id_into_compound(cmd: &str, sid: &str) -> String {
             if let Some(rest) = segment.strip_prefix("skim ") {
                 format!("skim --session-id={sid} {rest}")
             } else {
-                (*segment).to_string()
+                segment.to_string()
             }
         })
         .collect();
@@ -236,7 +236,6 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // hyphens, underscores, dots, max 128 chars) before interpolation into
             // the command string. Malicious session IDs with shell metacharacters
             // (;, |, $, spaces, etc.) are silently dropped to prevent command injection.
-            // F5: match by value so the None arm moves rewritten_cmd instead of cloning.
             let final_cmd = match session_id
                 .as_deref()
                 .filter(|sid| crate::analytics::is_safe_session_id(sid))
