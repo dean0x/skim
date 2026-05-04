@@ -108,19 +108,6 @@ fn archive_path(log_path: &Path, index: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// Get the skim cache directory, respecting `$SKIM_CACHE_DIR` override and
-/// platform conventions.
-///
-/// Priority: `SKIM_CACHE_DIR` env > `dirs::cache_dir()/skim`.
-/// The env override enables test isolation on all platforms (especially macOS
-/// where `dirs::cache_dir()` ignores `$XDG_CACHE_HOME`).
-///
-/// Production callers use this convenience wrapper. Tests that need isolation
-/// should construct a [`CacheEnv`] directly and call [`CacheEnv::resolve_cache_dir`].
-pub(super) fn cache_dir() -> Option<std::path::PathBuf> {
-    CacheEnv::from_process().resolve_cache_dir()
-}
-
 /// Generate a timestamp string in ISO-8601 format (UTC approximation).
 ///
 /// Uses `days_to_date` (Howard Hinnant calendar algorithm) to avoid
