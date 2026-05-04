@@ -28,6 +28,7 @@
 //!
 //! Write path: ≤1 ms. Read path: ≤2 ms. Both are fire-and-forget / early-exit.
 
+use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -63,23 +64,46 @@ const MAX_ANCESTRY_DEPTH: usize = 5;
 /// Callers should validate `session_id` through
 /// [`crate::analytics::is_safe_session_id`] before calling this function.
 pub(crate) fn write_session_id(session_id: &str, cache_dir: &Path) {
+    // Defense-in-depth: reject malformed IDs even though callers should
+    // have validated already.
+    if !crate::analytics::is_safe_session_id(session_id) {
+        return;
+    }
+
     let Some(ppid) = get_ppid() else { return };
 
     let dir = cache_dir.join(SESSIONS_DIR);
     let _ = std::fs::create_dir_all(&dir);
 
     let file_path = dir.join(format!("{ppid}.id"));
-    let _ = std::fs::write(&file_path, session_id);
 
-    // Set restrictive permissions on Unix so only the owner can read.
+    // On Unix, open with O_CREAT|O_WRONLY|O_TRUNC and mode 0o600 in a single
+    // syscall so the file is never briefly world-readable (eliminates the
+    // TOCTOU window that exists with fs::write followed by set_permissions).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&file_path)
+        {
+            let _ = f.write_all(session_id.as_bytes());
+        }
+    }
+
+    // On non-Unix platforms get_ppid() always returns None, so this branch
+    // is unreachable in practice. It exists to keep the code compiling on
+    // Windows without dead-code warnings.
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&file_path, session_id);
     }
 
     // Opportunistic cleanup — best-effort, errors ignored.
-    cleanup_stale(&dir);
+    cleanup_stale_rate_limited(&dir);
 }
 
 /// Walk process ancestry to find a session ID sidecar.
@@ -135,9 +159,47 @@ fn try_read_sidecar(path: &Path) -> Option<String> {
     crate::analytics::is_safe_session_id(trimmed).then(|| trimmed.to_string())
 }
 
+/// Maximum interval between opportunistic cleanup runs.
+///
+/// Cleanup touches every file in the sessions directory — running it on every
+/// hook write (potentially thousands per session) adds unbounded overhead.
+/// This constant gates cleanup behind a sentinel file so it runs at most once
+/// per hour regardless of write frequency.
+const CLEANUP_RATE_LIMIT: Duration = Duration::from_secs(3600);
+
+/// Sentinel file name written into `sessions_dir` after each cleanup run.
+const CLEANUP_SENTINEL: &str = ".last_cleanup";
+
+/// Run [`cleanup_stale`] only when the sentinel file is absent or older than
+/// [`CLEANUP_RATE_LIMIT`].
+///
+/// Writes a fresh sentinel after each cleanup run. All errors are silently
+/// ignored — this is best-effort.
+fn cleanup_stale_rate_limited(sessions_dir: &Path) {
+    let sentinel = sessions_dir.join(CLEANUP_SENTINEL);
+
+    if let Ok(meta) = std::fs::metadata(&sentinel) {
+        if let Ok(mtime) = meta.modified() {
+            let age = SystemTime::now()
+                .duration_since(mtime)
+                .unwrap_or(Duration::MAX);
+            if age < CLEANUP_RATE_LIMIT {
+                // Cleaned up recently — skip.
+                return;
+            }
+        }
+    }
+
+    cleanup_stale(sessions_dir);
+
+    // Refresh sentinel (best-effort).
+    let _ = std::fs::write(&sentinel, b"");
+}
+
 /// Remove sidecar files older than [`CLEANUP_MAX_AGE`].
 ///
-/// Called opportunistically on the write path. All errors are silently ignored.
+/// Called via [`cleanup_stale_rate_limited`] on the write path. All errors are
+/// silently ignored.
 fn cleanup_stale(sessions_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(sessions_dir) else {
         return;
@@ -146,6 +208,10 @@ fn cleanup_stale(sessions_dir: &Path) {
     let now = SystemTime::now();
 
     for entry in entries.flatten() {
+        // Skip the rate-limit sentinel itself.
+        if entry.file_name() == CLEANUP_SENTINEL {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
         let age = now.duration_since(mtime).unwrap_or(Duration::MAX);
@@ -222,7 +288,12 @@ fn parent_of(pid: u32) -> Option<u32> {
         )
     };
 
-    if ret <= 0 {
+    // A return value of 0 or negative signals an error. A return value that
+    // is positive but less than the expected struct size indicates a short
+    // read — the remaining bytes were never filled in and would contain
+    // zeroes from the mem::zeroed() initialisation. Both cases must be
+    // rejected to avoid returning a garbage PPID.
+    if ret < size {
         return None;
     }
 
@@ -441,6 +512,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Files older than CLEANUP_MAX_AGE are removed when a new sidecar is written.
+    ///
+    /// Requires Unix because `write_session_id` calls `get_ppid()` which returns
+    /// `None` (and returns early) on non-Unix platforms, so no cleanup is ever
+    /// triggered there.
+    #[cfg(unix)]
     #[test]
     fn test_cleanup_removes_old_files() {
         let dir = TempDir::new().unwrap();
@@ -504,5 +580,86 @@ mod tests {
         let explicit = Some("explicit-value".to_string());
         let resolved = explicit.or_else(|| read_session_id(dir.path()));
         assert_eq!(resolved, Some("explicit-value".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // write_session_id: validation guard (issue write-validate)
+    // -----------------------------------------------------------------------
+
+    /// write_session_id must silently reject invalid session IDs and not create
+    /// any file. This is the defense-in-depth guard added to the function itself
+    /// regardless of whether the caller already validated.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_rejects_invalid_session_id() {
+        let dir = TempDir::new().unwrap();
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+
+        // A session ID with spaces fails is_safe_session_id.
+        write_session_id("bad session id!", dir.path());
+
+        // No sidecar file should have been created.
+        let Some(ppid) = get_ppid() else { return };
+        let sidecar = sessions_dir.join(format!("{ppid}.id"));
+        assert!(
+            !sidecar.exists(),
+            "write_session_id must not create a file for an invalid session ID"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_stale_rate_limited (issue cleanup-hot-path)
+    // -----------------------------------------------------------------------
+
+    /// cleanup_stale_rate_limited must skip the full directory scan when the
+    /// sentinel file is fresh (written within CLEANUP_RATE_LIMIT).
+    #[test]
+    fn test_cleanup_rate_limited_skips_when_sentinel_fresh() {
+        let dir = TempDir::new().unwrap();
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Plant a stale sidecar that would be removed if cleanup ran.
+        let stale_pid: u32 = 88888;
+        let stale_path = write_raw_sidecar(&sessions_dir, stale_pid, "old-session");
+        set_file_age(&stale_path, Duration::from_secs(25 * 3600));
+
+        // Write a fresh sentinel so cleanup is skipped.
+        let sentinel = sessions_dir.join(CLEANUP_SENTINEL);
+        std::fs::write(&sentinel, b"").unwrap();
+        // Sentinel is brand new — within CLEANUP_RATE_LIMIT.
+
+        cleanup_stale_rate_limited(&sessions_dir);
+
+        assert!(
+            stale_path.exists(),
+            "stale file must NOT be removed when cleanup is rate-limited by a fresh sentinel"
+        );
+    }
+
+    /// cleanup_stale_rate_limited must run cleanup when the sentinel is older
+    /// than CLEANUP_RATE_LIMIT.
+    #[test]
+    fn test_cleanup_rate_limited_runs_when_sentinel_old() {
+        let dir = TempDir::new().unwrap();
+        let sessions_dir = dir.path().join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Plant a stale sidecar.
+        let stale_pid: u32 = 77777;
+        let stale_path = write_raw_sidecar(&sessions_dir, stale_pid, "old-session");
+        set_file_age(&stale_path, Duration::from_secs(25 * 3600));
+
+        // Write an old sentinel (2 hours old — past the 1-hour rate limit).
+        let sentinel = sessions_dir.join(CLEANUP_SENTINEL);
+        std::fs::write(&sentinel, b"").unwrap();
+        set_file_age(&sentinel, CLEANUP_RATE_LIMIT + Duration::from_secs(1));
+
+        cleanup_stale_rate_limited(&sessions_dir);
+
+        assert!(
+            !stale_path.exists(),
+            "stale file must be removed when sentinel is older than CLEANUP_RATE_LIMIT"
+        );
     }
 }
