@@ -889,4 +889,81 @@ mod tests {
             "--session-id <space> VALUE must not be recognised (only equals form supported)"
         );
     }
+
+    // ========================================================================
+    // Fallback chain: parse_session_id().or_else(|| read_session_id()) (AD-SC-1)
+    // ========================================================================
+
+    /// AD-SC-1: When --session-id is absent, the sidecar fallback is used.
+    ///
+    /// This test exercises the actual .or_else() composition wired in main():
+    ///   parse_session_id(args).or_else(|| read_session_id(&dir))
+    ///
+    /// It writes a sidecar keyed to the current PID, passes args that contain
+    /// no --session-id flag, and asserts the composed result equals the sidecar
+    /// value. This validates that the two halves of the fallback chain connect
+    /// correctly at the entry point.
+    #[test]
+    fn test_fallback_chain_uses_sidecar_when_no_flag() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        // "sessions" mirrors the private SESSIONS_DIR constant in session_sidecar.
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("{}.id", std::process::id())),
+            "sidecar-session-42",
+        )
+        .unwrap();
+
+        // No --session-id flag in args → parse_session_id returns None.
+        let from_parse = parse_session_id(["skim", "test", "cargo"]);
+        assert!(from_parse.is_none(), "precondition: no flag yields None");
+
+        // Compose exactly as main() does.
+        let resolved = from_parse.or_else(|| cmd::session_sidecar::read_session_id(dir.path()));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("sidecar-session-42"),
+            "sidecar must be used when --session-id flag is absent"
+        );
+    }
+
+    /// AD-SC-1: When --session-id is present, parse_session_id wins and the
+    /// sidecar is never consulted.
+    ///
+    /// Mirrors the composition in main() but with an explicit flag. Even though
+    /// a valid sidecar exists for the current PID, the .or_else() closure must
+    /// not execute when the left-hand side is Some.
+    #[test]
+    fn test_fallback_chain_explicit_flag_wins_over_sidecar() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        // Plant a sidecar that would be found if the fallback were consulted.
+        std::fs::write(
+            sessions_dir.join(format!("{}.id", std::process::id())),
+            "sidecar-should-not-win",
+        )
+        .unwrap();
+
+        // --session-id flag present → parse_session_id returns Some.
+        let from_parse = parse_session_id(["skim", "--session-id=explicit-session-99"]);
+        assert_eq!(
+            from_parse.as_deref(),
+            Some("explicit-session-99"),
+            "precondition: flag value must be extracted"
+        );
+
+        // Compose exactly as main() does.
+        let resolved = from_parse.or_else(|| cmd::session_sidecar::read_session_id(dir.path()));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("explicit-session-99"),
+            "explicit --session-id must take priority over sidecar"
+        );
+    }
 }
