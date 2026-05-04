@@ -22,6 +22,7 @@ mod log;
 mod pkg;
 mod rewrite;
 mod session;
+pub(crate) mod session_sidecar;
 mod stats;
 mod test;
 pub(crate) mod ux;
@@ -60,6 +61,14 @@ pub(crate) fn should_read_stdin(args: &[String]) -> bool {
 /// Re-exported from [`crate::runner::MAX_OUTPUT_BYTES`] so the stdin cap and
 /// the pipe-capture cap stay in sync automatically — no duplicated literal.
 pub(crate) use crate::runner::MAX_OUTPUT_BYTES as MAX_STDIN_BYTES;
+
+/// Resolve the skim cache directory for use by callers outside the `cmd` module.
+///
+/// Delegates to [`hook_log::CacheEnv`] so that `SKIM_CACHE_DIR` overrides are
+/// respected consistently everywhere.
+pub(crate) fn resolve_cache_dir() -> Option<std::path::PathBuf> {
+    hook_log::CacheEnv::from_process().resolve_cache_dir()
+}
 
 /// Core bounded read loop, injectable for testing.
 ///

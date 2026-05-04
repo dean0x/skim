@@ -51,6 +51,8 @@ tempfile = "3.0"
 insta = "1.39"
 criterion = "0.5"
 serial_test = "3.0"
+libc = "0.2"
+filetime = "0.2"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"

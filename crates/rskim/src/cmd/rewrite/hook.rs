@@ -81,7 +81,7 @@ fn inject_session_id_into_compound(cmd: &str, sid: &str) -> String {
             if let Some(rest) = segment.strip_prefix("skim ") {
                 format!("skim --session-id={sid} {rest}")
             } else {
-                (*segment).to_string()
+                segment.to_string()
             }
         })
         .collect();
@@ -177,6 +177,18 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         }
     };
 
+    // AD-SC-1: Persist session_id to PID-keyed sidecar for fallback attribution.
+    // Direct skim invocations that bypass this hook can later discover the
+    // session by walking process ancestry (see session_sidecar::read_session_id).
+    if let Some(sid) = session_id
+        .as_deref()
+        .filter(|sid| crate::analytics::is_safe_session_id(sid))
+    {
+        if let Some(dir) = crate::cmd::resolve_cache_dir() {
+            crate::cmd::session_sidecar::write_session_id(sid, &dir);
+        }
+    }
+
     // If already starts with "skim " — already rewritten, passthrough
     if command.starts_with("skim ") {
         audit_hook(&command, false, "");
@@ -224,7 +236,6 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // hyphens, underscores, dots, max 128 chars) before interpolation into
             // the command string. Malicious session IDs with shell metacharacters
             // (;, |, $, spaces, etc.) are silently dropped to prevent command injection.
-            // F5: match by value so the None arm moves rewritten_cmd instead of cloning.
             let final_cmd = match session_id
                 .as_deref()
                 .filter(|sid| crate::analytics::is_safe_session_id(sid))
@@ -292,7 +303,7 @@ fn check_hook_integrity(agent: AgentKind) -> bool {
         Ok(false) => {
             // Tampered! Log warning to file (NEVER stderr).
             // Rate-limit: per-agent daily stamp to avoid log spam.
-            let stamp_path = match cache_dir() {
+            let stamp_path = match crate::cmd::resolve_cache_dir() {
                 Some(dir) => dir.join(format!(".hook-integrity-warned-{agent_name}")),
                 None => {
                     crate::cmd::hook_log::log_hook_warning(&format!(
@@ -333,7 +344,7 @@ fn check_hook_version_mismatch(agent: AgentKind) {
     let agent_name = agent.cli_name();
 
     // Rate limit: per-agent, warn at most once per day
-    let stamp_path = match cache_dir() {
+    let stamp_path = match crate::cmd::resolve_cache_dir() {
         Some(dir) => dir.join(format!(".hook-version-warned-{agent_name}")),
         None => return,
     };
@@ -364,7 +375,7 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
         return;
     }
 
-    let log_path = match cache_dir() {
+    let log_path = match crate::cmd::resolve_cache_dir() {
         Some(dir) => dir.join("hook-audit.log"),
         None => return,
     };
@@ -408,12 +419,6 @@ fn audit_archive_path(log_path: &std::path::Path, index: u32) -> std::path::Path
     let mut path = log_path.as_os_str().to_owned();
     path.push(format!(".{index}"));
     std::path::PathBuf::from(path)
-}
-
-/// Re-export `cache_dir` from `hook_log` to avoid duplication.
-/// See `hook_log::cache_dir` for full documentation.
-fn cache_dir() -> Option<std::path::PathBuf> {
-    crate::cmd::hook_log::cache_dir()
 }
 
 /// Get today's date as YYYY-MM-DD string.
