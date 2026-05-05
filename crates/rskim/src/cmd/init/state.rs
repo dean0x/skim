@@ -72,9 +72,12 @@ pub(super) fn detect_state(flags: &InitFlags, agent: crate::cmd::session::AgentK
         }
     }
 
-    // Scan for existing non-skim Bash hooks (plugin collision detection)
-    let existing_bash_hooks =
-        scan_existing_bash_hooks(parsed_settings.as_ref(), protocol.hook_event_key());
+    // Scan for existing non-skim hooks (plugin collision detection)
+    let existing_bash_hooks = scan_existing_bash_hooks(
+        parsed_settings.as_ref(),
+        protocol.hook_event_key(),
+        protocol.tool_matcher(),
+    );
 
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags, agent)?;
@@ -121,16 +124,22 @@ fn hook_script_uses_bare_command(config_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Scan already-parsed settings JSON for existing non-skim Bash hooks under `event_key`.
+/// Scan already-parsed settings JSON for existing non-skim hooks under `event_key`
+/// that match the agent's `tool_matcher`.
 ///
-/// Returns the command strings of any Bash-matcher entries that are NOT skim entries.
+/// Returns the command strings of any matching entries that are NOT skim entries.
 /// Used for plugin collision detection -- warns the user if another tool is also
-/// intercepting Bash commands.
+/// intercepting the same tool type.
 ///
 /// `event_key` is the agent-specific hook event key (e.g., `"PreToolUse"`, `"BeforeTool"`).
+/// `tool_matcher` is the agent-specific matcher string (e.g., `"Bash"`, `"Shell"`, `"bash"`).
 /// Accepts `Option<&Value>` so callers can reuse an already-parsed settings file
 /// instead of re-reading from disk.
-fn scan_existing_bash_hooks(parsed: Option<&serde_json::Value>, event_key: &str) -> Vec<String> {
+fn scan_existing_bash_hooks(
+    parsed: Option<&serde_json::Value>,
+    event_key: &str,
+    tool_matcher: &str,
+) -> Vec<String> {
     let Some(json) = parsed else {
         return Vec::new();
     };
@@ -145,12 +154,12 @@ fn scan_existing_bash_hooks(parsed: Option<&serde_json::Value>, event_key: &str)
 
     let mut other_hooks = Vec::new();
     for entry in entries {
-        // Only care about "Bash" matcher entries
-        let is_bash_matcher = entry
+        // Only care about entries matching the agent's tool matcher
+        let is_matching_tool = entry
             .get("matcher")
             .and_then(|m| m.as_str())
-            .is_some_and(|m| m == "Bash");
-        if !is_bash_matcher {
+            .is_some_and(|m| m == tool_matcher);
+        if !is_matching_tool {
             continue;
         }
         // Skip skim entries
@@ -358,7 +367,7 @@ mod tests {
     #[test]
     fn test_scan_existing_bash_hooks_none_input() {
         // No parsed settings at all
-        let result = scan_existing_bash_hooks(None, "PreToolUse");
+        let result = scan_existing_bash_hooks(None, "PreToolUse", "Bash");
         assert!(result.is_empty());
     }
 
@@ -374,7 +383,7 @@ mod tests {
             }
         });
 
-        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse");
+        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse", "Bash");
         assert!(result.is_empty(), "skim entries should be excluded");
     }
 
@@ -396,7 +405,7 @@ mod tests {
             }
         });
 
-        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse");
+        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse", "Bash");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "/usr/bin/other-security-hook");
     }
@@ -413,7 +422,7 @@ mod tests {
             }
         });
 
-        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse");
+        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse", "Bash");
         assert!(result.is_empty(), "non-Bash matchers should be ignored");
     }
 

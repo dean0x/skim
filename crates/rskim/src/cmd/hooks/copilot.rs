@@ -81,38 +81,9 @@ impl HookProtocol for CopilotCliHook {
     }
 
     /// Copilot's config wraps event arrays in `{ "version": 1, "hooks": { "preToolUse": [...] } }`.
+    /// Delegates to the shared `upsert_hook_versioned` helper.
     fn upsert_hook(&self, config: &mut serde_json::Value, hook_script_path: &str) -> anyhow::Result<()> {
-        let obj = config
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
-
-        // Ensure version field is present
-        obj.entry("version").or_insert(serde_json::json!(1));
-
-        let hooks = obj
-            .entry("hooks")
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("config 'hooks' is not an object"))?;
-
-        let event_arr = hooks
-            .entry(self.hook_event_key())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-            .as_array_mut()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "config 'hooks.{}' is not an array",
-                    self.hook_event_key()
-                )
-            })?;
-
-        // Remove existing skim entries (idempotent upsert)
-        event_arr.retain(|e| !self.is_skim_entry(e));
-
-        // Append new entry
-        event_arr.push(self.build_config_entry(hook_script_path));
-
-        Ok(())
+        super::upsert_hook_versioned(config, hook_script_path, self)
     }
 }
 

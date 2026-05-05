@@ -112,8 +112,8 @@ pub(crate) trait HookProtocol {
 
     /// The top-level event key under `hooks` where hook entries live.
     ///
-    /// Default: `"PreToolUse"` (Claude Code, Crush, Copilot CLI).
-    /// Override: Gemini CLI → `"BeforeTool"`, Cursor → `"beforeShellExecution"`.
+    /// Default: `"PreToolUse"` (Claude Code, Crush).
+    /// Override: Gemini CLI → `"BeforeTool"`, Cursor → `"preToolUse"`, Copilot CLI → `"preToolUse"`.
     #[allow(dead_code)]
     fn hook_event_key(&self) -> &'static str {
         "PreToolUse"
@@ -121,7 +121,7 @@ pub(crate) trait HookProtocol {
 
     /// The tool matcher value used when inserting a hook entry.
     ///
-    /// Default: `"Bash"`. Cursor does not use a matcher field (returns empty string).
+    /// Default: `"Bash"`. Cursor overrides to `"Shell"`, Copilot CLI overrides to `"bash"`.
     #[allow(dead_code)]
     fn tool_matcher(&self) -> &'static str {
         "Bash"
@@ -303,21 +303,30 @@ pub(crate) trait HookProtocol {
             .and_then(|h| h.get(self.hook_event_key()))
             .and_then(|v| v.as_array())
         {
-            Some(arr) => arr.clone(),
+            Some(arr) => arr,
             None => return Vec::new(),
         };
 
         let mut other = Vec::new();
-        for entry in &entries {
+        for entry in entries {
             if self.is_skim_entry(entry) {
                 continue;
             }
+            // Claude Code / Gemini / Crush format: nested "hooks" array with "command" field.
             if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
                 for hook in hooks {
                     if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
                         other.push(cmd.to_string());
                     }
                 }
+            }
+            // Cursor flat format: top-level "command" field.
+            if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+                other.push(cmd.to_string());
+            }
+            // Copilot CLI format: top-level "bash" field.
+            if let Some(cmd) = entry.get("bash").and_then(|c| c.as_str()) {
+                other.push(cmd.to_string());
             }
         }
         other
@@ -363,6 +372,53 @@ pub(crate) fn parse_tool_input_command(json: &serde_json::Value) -> Option<HookI
         command,
         session_id,
     })
+}
+
+/// Upsert a skim hook entry into a versioned config JSON value in place.
+///
+/// Shared by Cursor and Copilot CLI, both of which wrap their event arrays in:
+/// ```json
+/// { "version": 1, "hooks": { "<event_key>": [...] } }
+/// ```
+///
+/// The `protocol` is used to obtain `hook_event_key()`, `is_skim_entry()`, and
+/// `build_config_entry()` so the caller's overrides are respected.
+pub(crate) fn upsert_hook_versioned(
+    config: &mut serde_json::Value,
+    hook_script_path: &str,
+    protocol: &dyn HookProtocol,
+) -> anyhow::Result<()> {
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
+
+    // Ensure version field is present.
+    obj.entry("version").or_insert(serde_json::json!(1));
+
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config 'hooks' is not an object"))?;
+
+    let event_arr = hooks
+        .entry(protocol.hook_event_key())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "config 'hooks.{}' is not an array",
+                protocol.hook_event_key()
+            )
+        })?;
+
+    // Remove existing skim entries (idempotent upsert).
+    event_arr.retain(|e| !protocol.is_skim_entry(e));
+
+    // Append new entry.
+    event_arr.push(protocol.build_config_entry(hook_script_path));
+
+    Ok(())
 }
 
 /// Generate a standard hook script for an agent.
