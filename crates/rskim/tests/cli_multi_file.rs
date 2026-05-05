@@ -136,7 +136,7 @@ fn test_multi_file_no_header_flag() {
     fs::write(temp.path().join("a.ts"), "function a() {}").unwrap();
     fs::write(temp.path().join("b.ts"), "function b() {}").unwrap();
 
-    // "// ===" is the multi-file separator marker in the output
+    // Headers use the format "// {path}" — assert none appear with --no-header
     Command::cargo_bin("skim")
         .unwrap()
         .arg(temp.path().join("a.ts"))
