@@ -136,14 +136,12 @@ fn glob_walk_root(pattern: &str) -> (&str, &str) {
         // For absolute paths like "/Users/foo/src/**/*.ts":
         //   segments = ["", "Users", "foo", "src", "**", "*.ts"]
         //   static_count = 4  (segments 0..4 have no glob chars)
-        //   lengths = [0, 5, 3, 3], separators = 3
-        //   root_end = 11 + 3 = 14 (but - 1 for sep before glob) -> 13
-        //   Wait: we want root = "/Users/foo/src" (len=14).
+        //   root = "/Users/foo/src" (len=14)
         //
         // The formula: sum of static segment lengths + (static_count - 1) separators
-        // gives us the end index of the last static segment in the original string.
+        // gives the end index of the last static segment in the original string.
         // For absolute paths the leading "" segment has len=0, so the leading "/" is
-        // naturally captured as the separator counted between segment 0 and segment 1.
+        // captured as the separator between segment 0 and segment 1.
         let root_end: usize = segments[..static_count]
             .iter()
             .map(|s| s.len())
@@ -323,14 +321,14 @@ pub(crate) fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> a
 /// All resolved paths are collected into a single `Vec<PathBuf>` and processed
 /// together. This enables `skim file1.ts file2.ts` and mixed forms like
 /// `skim 'src/**/*.ts' extra.py`.
-///
-/// `cmd_str` is used only for analytics attribution (e.g. `"skim file1.ts file2.ts"`).
 pub(crate) fn process_explicit_files(
     args: &[String],
     options: MultiFileOptions,
-    cmd_str: &str,
 ) -> anyhow::Result<()> {
-    debug_assert!(!args.is_empty(), "BUG: process_explicit_files called with empty args");
+    debug_assert!(
+        !args.is_empty(),
+        "BUG: process_explicit_files called with empty args"
+    );
 
     let no_ignore = options.no_ignore;
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -387,7 +385,6 @@ pub(crate) fn process_explicit_files(
         );
     }
 
-    let _ = cmd_str; // used for analytics attribution by caller
     process_files(paths, options)
 }
 

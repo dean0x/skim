@@ -23,11 +23,7 @@ fn test_multi_file_two_args_both_processed() {
         "function alpha() { return 1; }",
     )
     .unwrap();
-    fs::write(
-        temp.path().join("beta.ts"),
-        "function beta() { return 2; }",
-    )
-    .unwrap();
+    fs::write(temp.path().join("beta.ts"), "function beta() { return 2; }").unwrap();
 
     Command::cargo_bin("skim")
         .unwrap()
@@ -43,16 +39,8 @@ fn test_multi_file_two_args_both_processed() {
 fn test_multi_file_three_args() {
     let temp = TempDir::new().unwrap();
 
-    fs::write(
-        temp.path().join("one.ts"),
-        "function one() { return 1; }",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("two.ts"),
-        "function two() { return 2; }",
-    )
-    .unwrap();
+    fs::write(temp.path().join("one.ts"), "function one() { return 1; }").unwrap();
+    fs::write(temp.path().join("two.ts"), "function two() { return 2; }").unwrap();
     fs::write(
         temp.path().join("three.ts"),
         "function three() { return 3; }",
@@ -80,11 +68,7 @@ fn test_multi_file_mixed_languages() {
         "fn main() { println!(\"hello\"); }",
     )
     .unwrap();
-    fs::write(
-        temp.path().join("script.py"),
-        "def run():\n    pass\n",
-    )
-    .unwrap();
+    fs::write(temp.path().join("script.py"), "def run():\n    pass\n").unwrap();
 
     Command::cargo_bin("skim")
         .unwrap()
@@ -238,21 +222,9 @@ fn test_multi_file_stdin_mixed_fails() {
 fn test_multi_file_mix_plain_and_glob() {
     let temp = TempDir::new().unwrap();
 
-    fs::write(
-        temp.path().join("explicit.ts"),
-        "function explicit() {}",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("glob1.ts"),
-        "function glob1() {}",
-    )
-    .unwrap();
-    fs::write(
-        temp.path().join("glob2.ts"),
-        "function glob2() {}",
-    )
-    .unwrap();
+    fs::write(temp.path().join("explicit.ts"), "function explicit() {}").unwrap();
+    fs::write(temp.path().join("glob1.ts"), "function glob1() {}").unwrap();
+    fs::write(temp.path().join("glob2.ts"), "function glob2() {}").unwrap();
 
     // Pass explicit.ts as a plain arg and use a glob to match glob*.ts
     let glob_pattern = format!("{}/*.ts", temp.path().display());
@@ -264,5 +236,8 @@ fn test_multi_file_mix_plain_and_glob() {
         .assert()
         .success()
         .stdout(predicate::str::contains("function explicit"))
-        .stdout(predicate::str::contains("function glob1").or(predicate::str::contains("function glob2")));
+        .stdout(
+            predicate::str::contains("function glob1")
+                .or(predicate::str::contains("function glob2")),
+        );
 }
