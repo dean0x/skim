@@ -345,12 +345,15 @@ fn test_init_preserves_symlinks() {
 fn test_init_project_mode() {
     let dir = TempDir::new().unwrap();
     let project_dir = dir.path().join("my-project");
+    let claude_config = dir.path().join("claude-home");
     fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&claude_config).unwrap();
 
     Command::cargo_bin("skim")
         .unwrap()
         .arg("init")
         .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", claude_config.as_os_str())
         .current_dir(&project_dir)
         .assert()
         .success();
@@ -391,12 +394,15 @@ fn test_init_yes_flag() {
 fn test_init_project_yes() {
     let dir = TempDir::new().unwrap();
     let project_dir = dir.path().join("proj");
+    let claude_config = dir.path().join("claude-home");
     fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&claude_config).unwrap();
 
     Command::cargo_bin("skim")
         .unwrap()
         .arg("init")
         .args(["--project", "--yes"])
+        .env("CLAUDE_CONFIG_DIR", claude_config.as_os_str())
         .current_dir(&project_dir)
         .assert()
         .success();
