@@ -155,7 +155,7 @@ cargo fmt -- --check           # Format check
 - `file` — File operations compression: find, ls, tree, grep, rg output parsing (`--json`, `--show-stats`)
 - `git` — Git output compression: AST-aware diff (function boundaries, `--mode`), status, log, fetch, show, commit, push. All support `--json`.
 - `infra` — Infrastructure tool compression: gh (pr/issue/run/release/api/run watch/release view), aws, curl, wget output parsing (`--json`, `--show-stats`)
-- `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode)
+- `init` — Install skim as an agent hook (Claude Code, Cursor, Codex, Gemini, Copilot, Crush)
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`, `--no-truncate`)
 - `lint` — Lint and formatter output compression (eslint, ruff, mypy, golangci-lint, prettier, rustfmt, biome, dprint, oxlint, black, gofmt)
 - `log` — Log compression: JSON structured + regex plaintext deduplication, debug filtering, stack trace collapsing (`--json`, `--show-stats`)
@@ -177,7 +177,7 @@ cargo fmt -- --check           # Format check
 - `SKIM_COPILOT_DIR` — Override Copilot CLI sessions directory
 - `SKIM_CURSOR_DB_PATH` — Override Cursor workspace state database path
 - `SKIM_GEMINI_DIR` — Override Gemini CLI sessions directory
-- `SKIM_OPENCODE_DIR` — Override OpenCode sessions directory
+- `SKIM_CRUSH_DIR` — Override Crush sessions directory
 
 **Debug:**
 - `SKIM_DEBUG` — Set to `1`/`true`/`yes` to enable debug output (warnings/notices on stderr). Also available as `--debug` CLI flag.

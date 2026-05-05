@@ -731,9 +731,9 @@ fn corrections_count(content: &str) -> usize {
 
 /// Write the rules file to the appropriate agent-specific location.
 ///
-/// For agents with a rules directory (Claude Code, Cursor, Copilot),
-/// creates the file automatically. For single-file agents (Codex, Gemini,
-/// OpenCode), prints the content with instructions to paste.
+/// For agents with a rules directory (Claude Code, Cursor, Copilot, Crush),
+/// creates the file automatically. For single-file agents (Codex, Gemini),
+/// prints the content with instructions to paste.
 fn write_rules_file(
     content: &str,
     agent: AgentKind,

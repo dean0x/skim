@@ -26,7 +26,7 @@ fn detect_agent(kind: AgentKind, home: Option<&Path>) -> AgentStatus {
         AgentKind::CodexCli => detect_codex_cli(home),
         AgentKind::GeminiCli => detect_gemini_cli(home),
         AgentKind::CopilotCli => detect_copilot_cli(),
-        AgentKind::OpenCode => detect_opencode(),
+        AgentKind::Crush => detect_crush(),
     }
 }
 
@@ -127,9 +127,9 @@ fn detect_codex_cli(home: Option<&Path>) -> AgentStatus {
         None
     };
 
-    // Codex CLI has experimental hook support
+    // Codex CLI provides guidance only — hooks cannot rewrite commands yet
     let hooks = HookStatus::NotSupported {
-        note: "experimental hooks only",
+        note: "guidance only (hooks cannot rewrite commands yet)",
     };
 
     let rules = codex_dir.as_ref().map(|p| {
@@ -237,32 +237,53 @@ fn detect_copilot_cli() -> AgentStatus {
     }
 }
 
-fn detect_opencode() -> AgentStatus {
-    // OpenCode uses .opencode/ directory in project root
-    let opencode_dir = std::env::var("SKIM_OPENCODE_DIR")
+fn detect_crush() -> AgentStatus {
+    // Crush stores config in ~/.crush/ directory
+    let crush_dir = std::env::var("SKIM_CRUSH_DIR")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| AgentKind::OpenCode.project_dir());
-    let detected = opencode_dir.is_dir();
+        .or_else(|| dirs::home_dir().map(|h| AgentKind::Crush.config_dir(&h)));
+    let detected = crush_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = if detected {
-        let count = count_files_in_dir(&opencode_dir);
-        Some(SessionInfo {
-            path: tilde_path(&opencode_dir),
-            detail: format!("{count} files"),
+        crush_dir.as_ref().map(|p| {
+            let count = count_files_in_dir(p);
+            SessionInfo {
+                path: tilde_path(p),
+                detail: format!("{count} files"),
+            }
         })
     } else {
         None
     };
 
-    let hooks = HookStatus::NotSupported {
-        note: "TypeScript plugin model",
+    let hooks = if detected {
+        let has_hook = crush_dir
+            .as_ref()
+            .and_then(|p| read_settings_guarded(&p.join("crush.json")))
+            .is_some_and(|v| has_skim_hook_in_settings(&v));
+        if has_hook {
+            HookStatus::Installed {
+                version: None,
+                integrity: "ok",
+            }
+        } else {
+            HookStatus::NotInstalled
+        }
+    } else {
+        HookStatus::NotInstalled
     };
 
-    let rules = None; // OpenCode uses AGENTS.md, not a rules directory
+    let rules = crush_dir.as_ref().map(|p| {
+        let rules_dir = p.join("rules");
+        RulesInfo {
+            path: format!("{}/", rules_dir.display()),
+            exists: rules_dir.is_dir(),
+        }
+    });
 
     AgentStatus {
-        kind: AgentKind::OpenCode,
+        kind: AgentKind::Crush,
         detected,
         sessions,
         hooks,
@@ -286,16 +307,29 @@ fn read_settings_guarded(path: &Path) -> Option<serde_json::Value> {
 /// Check whether a Gemini CLI settings object contains any hook whose
 /// command references "skim".
 fn has_skim_hook_in_settings(settings: &serde_json::Value) -> bool {
-    let hooks = match settings.get("hooks").and_then(|v| v.as_object()) {
-        Some(h) => h,
-        None => return false,
+    let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) else {
+        return false;
     };
     hooks.values().any(|arr| {
         arr.as_array().is_some_and(|entries| {
             entries.iter().any(|e| {
-                e.get("command")
+                // Check flat format: entry.command (legacy Gemini CLI format)
+                let flat_match = e
+                    .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|cmd| cmd.contains("skim"))
+                    .is_some_and(|cmd| cmd.contains("skim"));
+                // Check nested format: entry.hooks[].command (standard skim install format)
+                let nested_match = e
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|inner| {
+                        inner.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|cmd| cmd.contains("skim"))
+                        })
+                    });
+                flat_match || nested_match
             })
         })
     })
@@ -526,6 +560,33 @@ mod tests {
     #[test]
     fn test_has_skim_hook_in_settings_no_hooks() {
         let settings = serde_json::json!({ "theme": "dark" });
+        assert!(!has_skim_hook_in_settings(&settings));
+    }
+
+    #[test]
+    fn test_has_skim_hook_in_settings_nested_format() {
+        // Standard skim install format: entry.hooks[].command
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/home/.crush/hooks/skim-rewrite.sh"}]
+                }]
+            }
+        });
+        assert!(has_skim_hook_in_settings(&settings));
+    }
+
+    #[test]
+    fn test_has_skim_hook_in_settings_nested_no_match() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/usr/bin/other-tool"}]
+                }]
+            }
+        });
         assert!(!has_skim_hook_in_settings(&settings));
     }
 

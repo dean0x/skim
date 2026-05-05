@@ -42,6 +42,25 @@ impl HookProtocol for GeminiCliHook {
     fn generate_script(&self, version: &str) -> String {
         super::generate_hook_script(version, "gemini")
     }
+
+    // -------------------------------------------------------------------------
+    // Config lifecycle overrides — Gemini CLI uses BeforeTool event key
+    // -------------------------------------------------------------------------
+
+    /// Gemini CLI uses `BeforeTool` instead of `PreToolUse`.
+    fn hook_event_key(&self) -> &'static str {
+        "BeforeTool"
+    }
+
+    /// Gemini CLI matches on `run_shell_command` (not `Bash`).
+    fn tool_matcher(&self) -> &'static str {
+        "run_shell_command"
+    }
+
+    /// Gemini CLI uses milliseconds for timeout (60 000 ms = 60 s).
+    fn hook_timeout(&self) -> u64 {
+        60000
+    }
 }
 
 // ============================================================================
@@ -192,5 +211,82 @@ mod tests {
             force: false,
         };
         assert!(hook().uninstall(&opts).is_ok());
+    }
+
+    // ========================================================================
+    // Phase 4: Config lifecycle override tests
+    // ========================================================================
+
+    #[test]
+    fn test_gemini_config_filename_is_settings_json() {
+        assert_eq!(hook().config_filename(), "settings.json");
+    }
+
+    #[test]
+    fn test_gemini_hook_event_key_is_before_tool() {
+        assert_eq!(hook().hook_event_key(), "BeforeTool");
+    }
+
+    #[test]
+    fn test_gemini_tool_matcher() {
+        assert_eq!(hook().tool_matcher(), "run_shell_command");
+    }
+
+    #[test]
+    fn test_gemini_hook_timeout_is_milliseconds() {
+        // Gemini uses milliseconds — 60 000 ms = 60 s
+        assert_eq!(hook().hook_timeout(), 60000);
+    }
+
+    #[test]
+    fn test_gemini_build_config_entry_shape() {
+        let entry = hook().build_config_entry("/home/user/.gemini/hooks/skim-rewrite.sh");
+        // Matcher must be run_shell_command (not Bash)
+        assert_eq!(entry["matcher"], "run_shell_command");
+        // Timeout must be 60000 (milliseconds)
+        let hooks_arr = entry["hooks"]
+            .as_array()
+            .expect("entry should have hooks array");
+        let timeout = hooks_arr[0]["timeout"]
+            .as_u64()
+            .expect("timeout should be u64");
+        assert_eq!(timeout, 60000, "Gemini timeout must be 60000 ms");
+    }
+
+    #[test]
+    fn test_gemini_upsert_hook_uses_before_tool() {
+        let mut config = serde_json::json!({});
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
+
+        // Should be under BeforeTool, not PreToolUse
+        assert!(
+            config["hooks"]["BeforeTool"].is_array(),
+            "should use BeforeTool event key"
+        );
+        assert!(
+            config["hooks"].get("PreToolUse").is_none(),
+            "should NOT use PreToolUse"
+        );
+    }
+
+    #[test]
+    fn test_gemini_detect_hook_reads_before_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = serde_json::json!({
+            "hooks": {
+                "BeforeTool": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": dir.path().join("hooks/skim-rewrite.sh").to_str().unwrap()}]
+                }]
+            }
+        });
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(hook().detect_hook(dir.path()));
     }
 }

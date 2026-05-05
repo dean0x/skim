@@ -346,17 +346,17 @@ mod tests {
         .unwrap();
 
         // Write awareness hash
-        write_awareness_hash(config_dir, "opencode", &awareness_path).unwrap();
+        write_awareness_hash(config_dir, "crush", &awareness_path).unwrap();
 
         // Verify — should be valid
-        let valid = verify_awareness_integrity(config_dir, "opencode", &awareness_path).unwrap();
+        let valid = verify_awareness_integrity(config_dir, "crush", &awareness_path).unwrap();
         assert!(valid, "freshly written awareness hash should verify");
 
         // Tamper with the awareness file
         std::fs::write(&awareness_path, "# modified by user\n").unwrap();
 
         // Verify — should be tampered
-        let valid = verify_awareness_integrity(config_dir, "opencode", &awareness_path).unwrap();
+        let valid = verify_awareness_integrity(config_dir, "crush", &awareness_path).unwrap();
         assert!(!valid, "modified awareness file should fail verification");
     }
 

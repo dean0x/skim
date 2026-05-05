@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(AgentKind::CodexCli.cli_name(), "codex");
         assert_eq!(AgentKind::GeminiCli.cli_name(), "gemini");
         assert_eq!(AgentKind::CopilotCli.cli_name(), "copilot");
-        assert_eq!(AgentKind::OpenCode.cli_name(), "opencode");
+        assert_eq!(AgentKind::Crush.cli_name(), "crush");
     }
 
     #[test]

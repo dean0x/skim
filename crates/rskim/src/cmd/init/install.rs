@@ -3,13 +3,13 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::flags::InitFlags;
+use super::flags::{detect_installed_agents, resolve_single_agent, DetectionEnv, InitFlags};
 use super::helpers::{
     atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
 };
-use super::state::{detect_state, has_skim_hook_entry, DetectedState};
-use crate::cmd::hooks::generate_hook_script;
+use super::state::{detect_state, has_skim_hook_entry, read_settings_json, DetectedState};
+use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
 /// Verify that the target agent appears to be installed on this system.
@@ -17,9 +17,13 @@ use crate::cmd::session::{AgentKind, InstructionEnv};
 /// Checks for the expected config directory. If the agent's config dir
 /// doesn't exist, returns an error with a helpful message rather than
 /// silently creating an orphan config.
-fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::Result<()> {
+fn verify_agent_installed(
+    state: &DetectedState,
+    agent: AgentKind,
+    flags: &InitFlags,
+) -> anyhow::Result<()> {
     // Claude Code: always proceed (we create ~/.claude/ if needed)
-    if flags.agent == AgentKind::ClaudeCode {
+    if agent == AgentKind::ClaudeCode {
         return Ok(());
     }
 
@@ -30,21 +34,19 @@ fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::R
 
     // Check if the config dir exists (or a parent indicator)
     if !state.config_dir.exists() {
-        let hint = match flags.agent {
+        let hint = match agent {
             AgentKind::Cursor => "Install Cursor from https://cursor.com",
             AgentKind::GeminiCli => "Install Gemini CLI: npm install -g @google/gemini-cli",
             AgentKind::CopilotCli => {
                 "Install GitHub Copilot CLI: gh extension install github/gh-copilot"
             }
             AgentKind::CodexCli => "Install Codex CLI: npm install -g @openai/codex",
-            AgentKind::OpenCode => {
-                "Install OpenCode: go install github.com/opencode-ai/opencode@latest"
-            }
+            AgentKind::Crush => "Install Crush from https://crushcode.ai",
             AgentKind::ClaudeCode => unreachable!("handled above"),
         };
         anyhow::bail!(
             "{} does not appear to be installed (config dir not found: {})\nhint: {}",
-            flags.agent.display_name(),
+            agent.display_name(),
             state.config_dir.display(),
             hint
         );
@@ -60,13 +62,17 @@ fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::R
 /// - `--no-guidance` is set, or
 /// - The agent has no instruction file (guidance feature not applicable), or
 /// - The file content contains the versioned start marker for `skim_version`.
-fn is_guidance_current(flags: &InitFlags, skim_version: &str, env: &InstructionEnv) -> bool {
+fn is_guidance_current(
+    agent: AgentKind,
+    flags: &InitFlags,
+    skim_version: &str,
+    env: &InstructionEnv,
+) -> bool {
     if flags.no_guidance {
         return true;
     }
     let global = !flags.project;
-    flags
-        .agent
+    agent
         .instruction_file(global, env)
         .map(|p| {
             std::fs::read_to_string(&p)
@@ -84,7 +90,7 @@ fn print_install_header(agent_name: &str) {
 }
 
 fn print_collision_warning(hooks: &[String]) {
-    println!("  WARNING: Other Bash PreToolUse hooks detected:");
+    println!("  WARNING: Other hooks detected for the same tool matcher:");
     for hook_cmd in hooks {
         println!("    - {hook_cmd}");
     }
@@ -123,18 +129,84 @@ fn print_completion_message(agent_name: &str) {
 }
 
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let env = InstructionEnv::from_process();
-    let state = detect_state(flags)?;
+    if let Some(agent) = resolve_single_agent(flags) {
+        // Explicit --agent: single-agent mode
+        run_install_single(flags, agent)
+    } else {
+        // No --agent: auto-detect all installed agents
+        run_install_auto_detect(flags)
+    }
+}
 
-    verify_agent_installed(&state, flags)?;
-    print_install_header(flags.agent.display_name());
-    print_detected_state(&state);
-
-    if !state.existing_bash_hooks.is_empty() {
-        print_collision_warning(&state.existing_bash_hooks);
+/// Install skim for all detected agents when no explicit `--agent` was given.
+fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let agents = detect_installed_agents(&DetectionEnv::from_process());
+    if agents.is_empty() {
+        eprintln!(
+            "No supported agents found. Install one of: Claude Code, Cursor, Gemini CLI, \
+             Copilot CLI, Codex CLI, Crush"
+        );
+        return Ok(std::process::ExitCode::FAILURE);
     }
 
-    let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
+    // Single-agent fast path: skip the loop overhead when only one agent is detected.
+    // This also preserves the original error propagation behaviour (errors are returned
+    // rather than caught-and-summarised), which is important for test assertions.
+    if agents.len() == 1 {
+        let agent_flags = InitFlags {
+            agent: Some(agents[0]),
+            ..*flags
+        };
+        return run_install_single(&agent_flags, agents[0]);
+    }
+
+    let mut any_failed = false;
+    for &agent in &agents {
+        let agent_flags = InitFlags {
+            agent: Some(agent),
+            ..*flags
+        };
+        match run_install_single(&agent_flags, agent) {
+            Ok(code) if code == std::process::ExitCode::SUCCESS => {}
+            Ok(code) => {
+                any_failed = true;
+                eprintln!(
+                    "  ✗ {}: failed (exit code: {:?})",
+                    agent.display_name(),
+                    code
+                );
+            }
+            Err(e) => {
+                any_failed = true;
+                eprintln!("  ✗ {}: failed — {e}", agent.display_name());
+            }
+        }
+    }
+
+    Ok(if any_failed {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+/// Install skim for a single, explicit agent.
+fn run_install_single(
+    flags: &InitFlags,
+    agent: AgentKind,
+) -> anyhow::Result<std::process::ExitCode> {
+    let env = InstructionEnv::from_process();
+    let state = detect_state(flags, agent)?;
+
+    verify_agent_installed(&state, agent, flags)?;
+    print_install_header(agent.display_name());
+    print_detected_state(&state);
+
+    if !state.existing_hooks.is_empty() {
+        print_collision_warning(&state.existing_hooks);
+    }
+
+    let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     if state.hook_installed && state.hook_is_current() && guidance_current {
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
@@ -153,7 +225,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     }
 
     execute_install(&state, flags.no_guidance, global, &env)?;
-    print_completion_message(flags.agent.display_name());
+    print_completion_message(agent.display_name());
 
     Ok(std::process::ExitCode::SUCCESS)
 }
@@ -206,7 +278,15 @@ fn execute_install(
     // B7: Create hook script
     create_hook_script(state)?;
 
-    // B8: Patch settings.json
+    // Legacy migration: if this is Cursor, clean skim entries from settings.json
+    // before writing to the correct hooks.json. This removes stale entries that
+    // may have been written in a previous skim version when Cursor was (incorrectly)
+    // treated as using the Claude Code settings.json / PreToolUse format.
+    if let Some(AgentKind::Cursor) = AgentKind::from_str(state.agent_cli_name) {
+        migrate_cursor_legacy_settings(&state.config_dir)?;
+    }
+
+    // B8: Patch settings.json (or hooks.json for Cursor)
     patch_settings(state)?;
 
     // Inject guidance into agent instruction file
@@ -319,6 +399,73 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
 }
 
 // ============================================================================
+// Legacy Cursor migration (AC-9)
+// ============================================================================
+
+/// Remove skim hook entries from a JSON settings value, using the Claude Code
+/// format (nested `hooks` array under `hooks.<event_key>`).
+///
+/// This is the mirror of `remove_skim_from_settings` in `uninstall.rs`, but
+/// operating on a mutable `serde_json::Value` and a specific event key.
+fn remove_skim_entries_from_event(settings: &mut serde_json::Value, event_key: &str) -> bool {
+    let Some(obj) = settings.as_object_mut() else {
+        return false;
+    };
+
+    if let Some(hooks_obj) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        if let Some(arr) = hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
+            let before = arr.len();
+            arr.retain(|entry| !has_skim_hook_entry(entry));
+            let removed = arr.len() < before;
+            if arr.is_empty() {
+                hooks_obj.remove(event_key);
+            }
+            if hooks_obj.is_empty() {
+                obj.remove("hooks");
+            }
+            return removed;
+        }
+    }
+    false
+}
+
+/// Clean up skim hook entries from Cursor's legacy `settings.json`.
+///
+/// Earlier skim versions incorrectly wrote Cursor hook config to `settings.json`
+/// using the Claude Code / PreToolUse format. This migration removes those stale
+/// entries before writing to the correct `hooks.json` location, so both files
+/// are kept clean.
+///
+/// Non-fatal: if `settings.json` doesn't exist or can't be parsed, this is
+/// silently skipped (the correct `hooks.json` is still written).
+fn migrate_cursor_legacy_settings(config_dir: &std::path::Path) -> anyhow::Result<()> {
+    let legacy_path = config_dir.join("settings.json");
+    if !legacy_path.exists() {
+        return Ok(());
+    }
+
+    let Some(mut settings) = read_settings_json(&legacy_path) else {
+        return Ok(()); // Unreadable or invalid — skip silently
+    };
+
+    // Remove skim entries from all legacy event keys (both casing variants)
+    let removed_pre = remove_skim_entries_from_event(&mut settings, "PreToolUse");
+    let removed_lower = remove_skim_entries_from_event(&mut settings, "preToolUse");
+
+    if removed_pre || removed_lower {
+        // Atomic write to legacy path
+        let real_path = resolve_real_settings_path(&legacy_path)?;
+        atomic_write_settings(&settings, &real_path)?;
+        println!(
+            "  {} Cleaned legacy settings.json entry (migrated to hooks.json)",
+            check_mark(true)
+        );
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Settings.json patching (B8)
 // ============================================================================
 
@@ -346,43 +493,6 @@ fn backup_settings(
     Ok(())
 }
 
-/// Insert or update the skim hook entry in `hooks.PreToolUse`.
-fn upsert_hook_entry(
-    settings: &mut serde_json::Value,
-    hook_script_path: &str,
-) -> anyhow::Result<()> {
-    let obj = settings
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json root is not an object"))?;
-
-    let hooks = obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks' is not an object"))?;
-
-    let pre_tool_use = hooks
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks.PreToolUse' is not an array"))?;
-
-    // Remove existing skim entry (to update in place)
-    pre_tool_use.retain(|entry| !has_skim_hook_entry(entry));
-
-    // Insert new entry
-    pre_tool_use.push(serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": hook_script_path,
-            "timeout": 5
-        }]
-    }));
-
-    Ok(())
-}
-
 fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     // Ensure config dir exists
     if !state.config_dir.exists() {
@@ -403,16 +513,24 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
         );
     }
 
-    // Upsert hook entry
+    // Upsert hook entry via the agent-specific protocol (correct event key and format)
+    let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unrecognised agent CLI name {:?}; this is a bug in state detection",
+            state.agent_cli_name
+        )
+    })?;
+    let protocol = protocol_for_agent(agent);
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-    upsert_hook_entry(&mut settings, &hook_script_path.display().to_string())?;
+    protocol.upsert_hook(&mut settings, &hook_script_path.display().to_string())?;
 
     atomic_write_settings(&settings, &real_path)?;
 
     println!(
-        "  {} Patched: {} (PreToolUse hook added)",
+        "  {} Patched: {} ({} hook added)",
         check_mark(true),
-        state.settings_path.display()
+        state.settings_path.display(),
+        protocol.hook_event_key(),
     );
 
     Ok(())
@@ -640,29 +758,16 @@ pub(super) fn remove_guidance(
         Some(s) => s,
         None => return Ok(()), // soft skip (too large or unreadable)
     };
-    if let Some((start, end)) = find_skim_section(&content) {
+    if let Some(stripped) = strip_skim_section(&content) {
         if path.extension().is_some_and(|ext| ext == "mdc") {
             // Skim owns .mdc files entirely — delete on removal
             std::fs::remove_file(&path)?;
+        } else if stripped.is_empty() {
+            // File was only the skim section — delete the file
+            std::fs::remove_file(&path)?;
         } else {
-            let mut updated = format!(
-                "{}{}",
-                content[..start].trim_end_matches('\n'),
-                &content[end..]
-            )
-            .trim()
-            .to_string();
-            if !updated.is_empty() {
-                updated.push('\n');
-            }
-
-            if updated.is_empty() {
-                // File was only the skim section — delete the file
-                std::fs::remove_file(&path)?;
-            } else {
-                // Atomic write using dynamic extension (issue 10)
-                atomic_write_stripped(&path, &updated)?;
-            }
+            // Atomic write using dynamic extension (issue 10)
+            atomic_write_stripped(&path, &stripped)?;
         }
         println!(
             "  {} Removed guidance from {}",
@@ -791,13 +896,20 @@ pub(super) fn print_dry_run_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::protocol_for_agent;
     use crate::cmd::init::helpers::guidance_content;
+    use crate::cmd::session::AgentKind;
 
     #[test]
     fn test_upsert_hook_entry_idempotent() {
+        let protocol = protocol_for_agent(AgentKind::ClaudeCode);
         let mut settings = serde_json::json!({});
-        upsert_hook_entry(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
-        upsert_hook_entry(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
+        protocol
+            .upsert_hook(&mut settings, "/path/to/skim-rewrite.sh")
+            .unwrap();
+        protocol
+            .upsert_hook(&mut settings, "/path/to/skim-rewrite.sh")
+            .unwrap();
 
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(

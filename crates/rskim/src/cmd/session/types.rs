@@ -11,7 +11,7 @@ pub(crate) enum AgentKind {
     GeminiCli,
     CopilotCli,
     Cursor,
-    OpenCode,
+    Crush,
 }
 
 impl AgentKind {
@@ -23,7 +23,7 @@ impl AgentKind {
             "gemini" | "gemini-cli" => Some(AgentKind::GeminiCli),
             "copilot" | "copilot-cli" => Some(AgentKind::CopilotCli),
             "cursor" => Some(AgentKind::Cursor),
-            "opencode" | "open-code" => Some(AgentKind::OpenCode),
+            "crush" => Some(AgentKind::Crush),
             _ => None,
         }
     }
@@ -35,7 +35,7 @@ impl AgentKind {
             AgentKind::GeminiCli => "Gemini CLI",
             AgentKind::CopilotCli => "Copilot CLI",
             AgentKind::Cursor => "Cursor",
-            AgentKind::OpenCode => "OpenCode",
+            AgentKind::Crush => "Crush",
         }
     }
 
@@ -46,7 +46,7 @@ impl AgentKind {
             AgentKind::GeminiCli => "gemini",
             AgentKind::CopilotCli => "copilot",
             AgentKind::Cursor => "cursor",
-            AgentKind::OpenCode => "opencode",
+            AgentKind::Crush => "crush",
         }
     }
 
@@ -54,7 +54,17 @@ impl AgentKind {
     ///
     /// Shared by `discover` and `learn` subcommands to avoid duplicating the
     /// error message with supported agent list.
+    ///
+    /// Provides a targeted migration hint for removed agents (e.g., `opencode` → `crush`).
     pub(crate) fn parse_cli_arg(s: &str) -> anyhow::Result<Self> {
+        // Provide a clear migration error for the removed opencode agent
+        if s == "opencode" || s == "open-code" {
+            anyhow::bail!(
+                "agent 'opencode' has been removed from skim.\n\
+                 Use 'crush' instead: skim discover --agent crush\n\
+                 Install Crush: https://crushcode.ai"
+            );
+        }
         Self::from_str(s).ok_or_else(|| {
             let supported: Vec<&str> = Self::all_supported().iter().map(|a| a.cli_name()).collect();
             anyhow::anyhow!(
@@ -73,7 +83,7 @@ impl AgentKind {
             AgentKind::GeminiCli,
             AgentKind::CopilotCli,
             AgentKind::Cursor,
-            AgentKind::OpenCode,
+            AgentKind::Crush,
         ]
     }
 
@@ -85,8 +95,9 @@ impl AgentKind {
             AgentKind::ClaudeCode => Some(".claude/rules"),
             AgentKind::Cursor => Some(".cursor/rules"),
             AgentKind::CopilotCli => Some(".github/instructions"),
+            AgentKind::Crush => Some(".crush/rules"),
             // These agents use single-file configs -- user pastes content manually
-            AgentKind::CodexCli | AgentKind::GeminiCli | AgentKind::OpenCode => None,
+            AgentKind::CodexCli | AgentKind::GeminiCli => None,
         }
     }
 
@@ -99,7 +110,7 @@ impl AgentKind {
             AgentKind::GeminiCli => ".gemini",
             AgentKind::CopilotCli => ".github",
             AgentKind::CodexCli => ".codex",
-            AgentKind::OpenCode => ".opencode",
+            AgentKind::Crush => ".crush",
         }
     }
 
@@ -130,12 +141,12 @@ impl AgentKind {
     }
 
     /// CWD-relative detection path for project-scoped agents.
-    /// Returns `Some` for agents detected via CWD (Copilot, OpenCode),
+    /// Returns `Some` for agents detected via CWD (Copilot),
     /// `None` for agents detected via home directory.
     #[allow(dead_code)] // Used in tests; kept for future callers
     pub(crate) fn detect_dir(&self) -> Option<PathBuf> {
         match self {
-            AgentKind::CopilotCli | AgentKind::OpenCode => Some(self.project_dir()),
+            AgentKind::CopilotCli => Some(self.project_dir()),
             _ => None,
         }
     }
@@ -176,11 +187,11 @@ impl AgentKind {
                 .home_dir
                 .as_ref()
                 .map(|h| h.join(".copilot/copilot-instructions.md")),
-            (AgentKind::OpenCode, true) => {
+            (AgentKind::Crush, true) => {
                 let base = env
-                    .opencode_config_dir
+                    .crush_config_dir
                     .clone()
-                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".config/opencode")));
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".crush")));
                 base.map(|d| d.join("AGENTS.md"))
             }
             (AgentKind::Cursor, true) => None, // UI-only, no file-based global config
@@ -190,7 +201,7 @@ impl AgentKind {
             (AgentKind::CopilotCli, false) => Some(".github/copilot-instructions.md".into()),
             (AgentKind::CodexCli, false) => Some("AGENTS.md".into()),
             (AgentKind::GeminiCli, false) => Some("GEMINI.md".into()),
-            (AgentKind::OpenCode, false) => Some("AGENTS.md".into()),
+            (AgentKind::Crush, false) => Some("AGENTS.md".into()),
         }
     }
 
@@ -226,9 +237,12 @@ impl std::fmt::Display for AgentKind {
 #[derive(Debug, Default)]
 pub(crate) struct InstructionEnv {
     pub home_dir: Option<PathBuf>,
-    pub claude_config_dir: Option<PathBuf>, // CLAUDE_CONFIG_DIR
-    pub codex_home: Option<PathBuf>,        // CODEX_HOME
-    pub opencode_config_dir: Option<PathBuf>, // OPENCODE_CONFIG_DIR
+    /// `CLAUDE_CONFIG_DIR` override
+    pub claude_config_dir: Option<PathBuf>,
+    /// `CODEX_HOME` override
+    pub codex_home: Option<PathBuf>,
+    /// `CRUSH_CONFIG_DIR` override
+    pub crush_config_dir: Option<PathBuf>,
 }
 
 impl InstructionEnv {
@@ -239,7 +253,7 @@ impl InstructionEnv {
             home_dir: dirs::home_dir(),
             claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
             codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
-            opencode_config_dir: std::env::var_os("OPENCODE_CONFIG_DIR").map(PathBuf::from),
+            crush_config_dir: std::env::var_os("CRUSH_CONFIG_DIR").map(PathBuf::from),
         }
     }
 }
@@ -419,9 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_kind_from_str_opencode() {
-        assert_eq!(AgentKind::from_str("opencode"), Some(AgentKind::OpenCode));
-        assert_eq!(AgentKind::from_str("open-code"), Some(AgentKind::OpenCode));
+    fn test_agent_kind_from_str_crush() {
+        assert_eq!(AgentKind::from_str("crush"), Some(AgentKind::Crush));
     }
 
     #[test]
@@ -451,6 +464,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_agent_kind_parse_cli_arg_opencode_migration_hint() {
+        // "opencode" and "open-code" must give a targeted migration hint, not generic error.
+        for removed in ["opencode", "open-code"] {
+            let err = AgentKind::parse_cli_arg(removed).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("opencode"),
+                "error should mention 'opencode', got: {msg}"
+            );
+            assert!(
+                msg.contains("crush"),
+                "error should mention 'crush' as replacement, got: {msg}"
+            );
+        }
+    }
+
     // ---- AgentKind::display_name / cli_name ----
 
     #[test]
@@ -460,7 +490,7 @@ mod tests {
         assert_eq!(AgentKind::GeminiCli.display_name(), "Gemini CLI");
         assert_eq!(AgentKind::CopilotCli.display_name(), "Copilot CLI");
         assert_eq!(AgentKind::Cursor.display_name(), "Cursor");
-        assert_eq!(AgentKind::OpenCode.display_name(), "OpenCode");
+        assert_eq!(AgentKind::Crush.display_name(), "Crush");
     }
 
     #[test]
@@ -470,7 +500,7 @@ mod tests {
         assert_eq!(AgentKind::GeminiCli.cli_name(), "gemini");
         assert_eq!(AgentKind::CopilotCli.cli_name(), "copilot");
         assert_eq!(AgentKind::Cursor.cli_name(), "cursor");
-        assert_eq!(AgentKind::OpenCode.cli_name(), "opencode");
+        assert_eq!(AgentKind::Crush.cli_name(), "crush");
     }
 
     // ---- AgentKind::all_supported ----
@@ -484,7 +514,7 @@ mod tests {
         assert!(all.contains(&AgentKind::GeminiCli));
         assert!(all.contains(&AgentKind::CopilotCli));
         assert!(all.contains(&AgentKind::Cursor));
-        assert!(all.contains(&AgentKind::OpenCode));
+        assert!(all.contains(&AgentKind::Crush));
     }
 
     // ---- AgentKind::rules_dir ----
@@ -497,9 +527,9 @@ mod tests {
             AgentKind::CopilotCli.rules_dir(),
             Some(".github/instructions")
         );
+        assert_eq!(AgentKind::Crush.rules_dir(), Some(".crush/rules"));
         assert_eq!(AgentKind::CodexCli.rules_dir(), None);
         assert_eq!(AgentKind::GeminiCli.rules_dir(), None);
-        assert_eq!(AgentKind::OpenCode.rules_dir(), None);
     }
 
     // ---- Display impl ----
@@ -529,7 +559,7 @@ mod tests {
         assert_eq!(AgentKind::GeminiCli.dot_dir_name(), ".gemini");
         assert_eq!(AgentKind::CopilotCli.dot_dir_name(), ".github");
         assert_eq!(AgentKind::CodexCli.dot_dir_name(), ".codex");
-        assert_eq!(AgentKind::OpenCode.dot_dir_name(), ".opencode");
+        assert_eq!(AgentKind::Crush.dot_dir_name(), ".crush");
     }
 
     // ---- AgentKind::config_dir ----
@@ -554,8 +584,8 @@ mod tests {
             PathBuf::from("/fake/home/.github")
         );
         assert_eq!(
-            AgentKind::OpenCode.config_dir(&home),
-            PathBuf::from("/fake/home/.opencode")
+            AgentKind::Crush.config_dir(&home),
+            PathBuf::from("/fake/home/.crush")
         );
     }
 
@@ -591,13 +621,10 @@ mod tests {
         assert!(AgentKind::Cursor.detect_dir().is_none());
         assert!(AgentKind::GeminiCli.detect_dir().is_none());
         assert!(AgentKind::CodexCli.detect_dir().is_none());
+        assert!(AgentKind::Crush.detect_dir().is_none());
         assert_eq!(
             AgentKind::CopilotCli.detect_dir(),
             Some(PathBuf::from(".github"))
-        );
-        assert_eq!(
-            AgentKind::OpenCode.detect_dir(),
-            Some(PathBuf::from(".opencode"))
         );
     }
 
@@ -683,10 +710,10 @@ mod tests {
     }
 
     #[test]
-    fn test_instruction_file_opencode_global() {
+    fn test_instruction_file_crush_global() {
         let env = default_env();
-        let path = AgentKind::OpenCode.instruction_file(true, &env).unwrap();
-        assert_eq!(path, PathBuf::from("/fake/home/.config/opencode/AGENTS.md"));
+        let path = AgentKind::Crush.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/fake/home/.crush/AGENTS.md"));
     }
 
     #[test]
@@ -712,14 +739,14 @@ mod tests {
     }
 
     #[test]
-    fn test_instruction_file_opencode_env_override() {
+    fn test_instruction_file_crush_env_override() {
         let env = InstructionEnv {
             home_dir: Some(fake_home()),
-            opencode_config_dir: Some(PathBuf::from("/tmp/test-opencode")),
+            crush_config_dir: Some(PathBuf::from("/tmp/test-crush")),
             ..Default::default()
         };
-        let path = AgentKind::OpenCode.instruction_file(true, &env).unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/test-opencode/AGENTS.md"));
+        let path = AgentKind::Crush.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test-crush/AGENTS.md"));
     }
 
     #[test]
@@ -730,9 +757,9 @@ mod tests {
     }
 
     #[test]
-    fn test_instruction_file_opencode_project() {
+    fn test_instruction_file_crush_project() {
         let env = default_env();
-        let path = AgentKind::OpenCode.instruction_file(false, &env).unwrap();
+        let path = AgentKind::Crush.instruction_file(false, &env).unwrap();
         assert_eq!(path, PathBuf::from("AGENTS.md"));
     }
 
@@ -751,6 +778,6 @@ mod tests {
         );
         assert_eq!(AgentKind::CodexCli.rules_filename(), "skim-corrections.md");
         assert_eq!(AgentKind::GeminiCli.rules_filename(), "skim-corrections.md");
-        assert_eq!(AgentKind::OpenCode.rules_filename(), "skim-corrections.md");
+        assert_eq!(AgentKind::Crush.rules_filename(), "skim-corrections.md");
     }
 }
