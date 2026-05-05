@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::flags::InitFlags;
 use super::helpers::{resolve_config_dir_for_agent, HOOK_SCRIPT_NAME};
-use crate::cmd::hooks::protocol_for_agent;
+use crate::cmd::hooks::{protocol_for_agent, HookProtocol};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
@@ -22,8 +22,8 @@ pub(super) struct DetectedState {
     pub(super) hook_uses_bare_command: bool,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
-    /// Existing non-skim Bash PreToolUse hooks (plugin collision detection)
-    pub(super) existing_bash_hooks: Vec<String>,
+    /// Existing non-skim hooks for the agent's tool matcher (plugin collision detection)
+    pub(super) existing_hooks: Vec<String>,
     /// CLI name of the target agent (e.g., "claude-code", "cursor") for integrity hashing
     pub(super) agent_cli_name: &'static str,
 }
@@ -60,7 +60,7 @@ pub(super) fn detect_state(flags: &InitFlags, agent: crate::cmd::session::AgentK
             .and_then(|v| v.as_array())
         {
             for entry in arr {
-                if has_skim_hook_entry(entry) {
+                if protocol.is_skim_entry(entry) {
                     hook_installed = true;
                     hook_version = extract_hook_version_from_entry(
                         entry,
@@ -73,7 +73,7 @@ pub(super) fn detect_state(flags: &InitFlags, agent: crate::cmd::session::AgentK
     }
 
     // Scan for existing non-skim hooks (plugin collision detection)
-    let existing_bash_hooks = scan_existing_bash_hooks(
+    let existing_hooks = scan_existing_hooks(
         parsed_settings.as_ref(),
         protocol.hook_event_key(),
         protocol.tool_matcher(),
@@ -98,7 +98,7 @@ pub(super) fn detect_state(flags: &InitFlags, agent: crate::cmd::session::AgentK
         hook_version,
         hook_uses_bare_command,
         dual_scope_warning,
-        existing_bash_hooks,
+        existing_hooks,
         agent_cli_name: agent.cli_name(),
     })
 }
@@ -135,7 +135,7 @@ fn hook_script_uses_bare_command(config_dir: &Path) -> bool {
 /// `tool_matcher` is the agent-specific matcher string (e.g., `"Bash"`, `"Shell"`, `"bash"`).
 /// Accepts `Option<&Value>` so callers can reuse an already-parsed settings file
 /// instead of re-reading from disk.
-fn scan_existing_bash_hooks(
+fn scan_existing_hooks(
     parsed: Option<&serde_json::Value>,
     event_key: &str,
     tool_matcher: &str,
@@ -198,7 +198,7 @@ pub(super) fn check_dual_scope(flags: &InitFlags, agent: crate::cmd::session::Ag
             json.get("hooks")?
                 .get(protocol.hook_event_key())?
                 .as_array()
-                .map(|arr| arr.iter().any(has_skim_hook_entry))
+                .map(|arr| arr.iter().any(|e| protocol.is_skim_entry(e)))
         })
         .unwrap_or(false);
 
@@ -365,14 +365,14 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_existing_bash_hooks_none_input() {
+    fn test_scan_existing_hooks_none_input() {
         // No parsed settings at all
-        let result = scan_existing_bash_hooks(None, "PreToolUse", "Bash");
+        let result = scan_existing_hooks(None, "PreToolUse", "Bash");
         assert!(result.is_empty());
     }
 
     #[test]
-    fn test_scan_existing_bash_hooks_no_other_hooks() {
+    fn test_scan_existing_hooks_no_other_hooks() {
         // Only skim hook
         let settings = serde_json::json!({
             "hooks": {
@@ -383,13 +383,13 @@ mod tests {
             }
         });
 
-        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse", "Bash");
+        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash");
         assert!(result.is_empty(), "skim entries should be excluded");
     }
 
     #[test]
-    fn test_scan_existing_bash_hooks_detects_other_bash_hook() {
-        // Settings with both skim and another Bash hook
+    fn test_scan_existing_hooks_detects_other_hook() {
+        // Settings with both skim and another hook with the same matcher
         let settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
@@ -405,14 +405,14 @@ mod tests {
             }
         });
 
-        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse", "Bash");
+        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "/usr/bin/other-security-hook");
     }
 
     #[test]
-    fn test_scan_existing_bash_hooks_ignores_non_bash_matchers() {
-        // A non-Bash matcher should be ignored
+    fn test_scan_existing_hooks_ignores_non_matching_matchers() {
+        // An entry with a different matcher should be ignored
         let settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
@@ -422,8 +422,8 @@ mod tests {
             }
         });
 
-        let result = scan_existing_bash_hooks(Some(&settings), "PreToolUse", "Bash");
-        assert!(result.is_empty(), "non-Bash matchers should be ignored");
+        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash");
+        assert!(result.is_empty(), "entries with a different matcher should be ignored");
     }
 
     // ---- parse_version_from_script ----

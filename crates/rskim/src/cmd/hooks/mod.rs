@@ -137,7 +137,7 @@ pub(crate) trait HookProtocol {
 
     /// Build a config entry JSON object for this agent's hook format.
     ///
-    /// Default produces the Claude Code / Gemini / Copilot format:
+    /// Default produces the Claude Code / Gemini / Crush format:
     /// ```json
     /// {
     ///   "matcher": "Bash",
@@ -145,7 +145,7 @@ pub(crate) trait HookProtocol {
     /// }
     /// ```
     ///
-    /// Agents with different formats (e.g., Cursor) override this method.
+    /// Agents with different formats (Cursor, Copilot CLI) override this method.
     #[allow(dead_code)]
     fn build_config_entry(&self, hook_script_path: &str) -> serde_json::Value {
         serde_json::json!({
@@ -319,13 +319,11 @@ pub(crate) trait HookProtocol {
                         other.push(cmd.to_string());
                     }
                 }
-            }
             // Cursor flat format: top-level "command" field.
-            if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+            } else if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
                 other.push(cmd.to_string());
-            }
             // Copilot CLI format: top-level "bash" field.
-            if let Some(cmd) = entry.get("bash").and_then(|c| c.as_str()) {
+            } else if let Some(cmd) = entry.get("bash").and_then(|c| c.as_str()) {
                 other.push(cmd.to_string());
             }
         }
@@ -825,5 +823,68 @@ mod tests {
         let hook = claude::ClaudeCodeHook;
         let others = hook.scan_other_hooks(config_dir);
         assert_eq!(others, vec!["/usr/bin/other-security-hook"]);
+    }
+
+    // ========================================================================
+    // upsert_hook_versioned — direct unit tests for the shared DRY helper
+    // ========================================================================
+
+    /// upsert_hook_versioned creates a versioned config from scratch.
+    #[test]
+    fn test_upsert_hook_versioned_creates_from_empty() {
+        let mut config = serde_json::json!({});
+        let hook = cursor::CursorHook;
+        upsert_hook_versioned(&mut config, "/path/to/skim-rewrite.sh", &hook).unwrap();
+
+        assert_eq!(config["version"], 1);
+        let arr = config["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["command"], "/path/to/skim-rewrite.sh");
+    }
+
+    /// upsert_hook_versioned is idempotent: a second call replaces the existing entry.
+    #[test]
+    fn test_upsert_hook_versioned_idempotent() {
+        let mut config = serde_json::json!({});
+        let hook = cursor::CursorHook;
+        upsert_hook_versioned(&mut config, "/path/to/skim-rewrite.sh", &hook).unwrap();
+        upsert_hook_versioned(&mut config, "/path/to/skim-rewrite.sh", &hook).unwrap();
+
+        let arr = config["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "idempotent upsert must not duplicate entries");
+    }
+
+    /// upsert_hook_versioned preserves pre-existing non-skim entries.
+    #[test]
+    fn test_upsert_hook_versioned_preserves_other_entries() {
+        let other_entry = serde_json::json!({
+            "command": "/usr/bin/other-hook",
+            "matcher": "Shell",
+            "timeout": 10
+        });
+        let mut config = serde_json::json!({
+            "version": 1,
+            "hooks": { "preToolUse": [other_entry] }
+        });
+        let hook = cursor::CursorHook;
+        upsert_hook_versioned(&mut config, "/path/to/skim-rewrite.sh", &hook).unwrap();
+
+        let arr = config["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "non-skim entry must be preserved");
+        let commands: Vec<&str> = arr
+            .iter()
+            .filter_map(|e| e["command"].as_str())
+            .collect();
+        assert!(commands.contains(&"/usr/bin/other-hook"));
+        assert!(commands.contains(&"/path/to/skim-rewrite.sh"));
+    }
+
+    /// upsert_hook_versioned errors when config root is not an object.
+    #[test]
+    fn test_upsert_hook_versioned_errors_on_non_object_root() {
+        let mut config = serde_json::json!([]);
+        let hook = cursor::CursorHook;
+        let result = upsert_hook_versioned(&mut config, "/path/to/skim-rewrite.sh", &hook);
+        assert!(result.is_err(), "non-object root must return an error");
     }
 }
