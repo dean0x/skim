@@ -176,13 +176,11 @@ fn scan_existing_hooks(
                     other_hooks.push(cmd.to_string());
                 }
             }
-        }
         // Cursor flat format: top-level "command" field.
-        if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+        } else if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
             other_hooks.push(cmd.to_string());
-        }
         // Copilot CLI format: top-level "bash" field.
-        if let Some(cmd) = entry.get("bash").and_then(|c| c.as_str()) {
+        } else if let Some(cmd) = entry.get("bash").and_then(|c| c.as_str()) {
             other_hooks.push(cmd.to_string());
         }
     }

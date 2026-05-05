@@ -742,29 +742,16 @@ pub(super) fn remove_guidance(
         Some(s) => s,
         None => return Ok(()), // soft skip (too large or unreadable)
     };
-    if let Some((start, end)) = find_skim_section(&content) {
+    if let Some(stripped) = strip_skim_section(&content) {
         if path.extension().is_some_and(|ext| ext == "mdc") {
             // Skim owns .mdc files entirely — delete on removal
             std::fs::remove_file(&path)?;
+        } else if stripped.is_empty() {
+            // File was only the skim section — delete the file
+            std::fs::remove_file(&path)?;
         } else {
-            let mut updated = format!(
-                "{}{}",
-                content[..start].trim_end_matches('\n'),
-                &content[end..]
-            )
-            .trim()
-            .to_string();
-            if !updated.is_empty() {
-                updated.push('\n');
-            }
-
-            if updated.is_empty() {
-                // File was only the skim section — delete the file
-                std::fs::remove_file(&path)?;
-            } else {
-                // Atomic write using dynamic extension (issue 10)
-                atomic_write_stripped(&path, &updated)?;
-            }
+            // Atomic write using dynamic extension (issue 10)
+            atomic_write_stripped(&path, &stripped)?;
         }
         println!(
             "  {} Removed guidance from {}",
