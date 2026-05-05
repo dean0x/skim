@@ -3,7 +3,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::flags::InitFlags;
+use super::flags::{resolve_agent, InitFlags};
 use super::helpers::{
     atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
@@ -17,9 +17,9 @@ use crate::cmd::session::{AgentKind, InstructionEnv};
 /// Checks for the expected config directory. If the agent's config dir
 /// doesn't exist, returns an error with a helpful message rather than
 /// silently creating an orphan config.
-fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::Result<()> {
+fn verify_agent_installed(state: &DetectedState, agent: AgentKind, flags: &InitFlags) -> anyhow::Result<()> {
     // Claude Code: always proceed (we create ~/.claude/ if needed)
-    if flags.agent == AgentKind::ClaudeCode {
+    if agent == AgentKind::ClaudeCode {
         return Ok(());
     }
 
@@ -30,21 +30,19 @@ fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::R
 
     // Check if the config dir exists (or a parent indicator)
     if !state.config_dir.exists() {
-        let hint = match flags.agent {
+        let hint = match agent {
             AgentKind::Cursor => "Install Cursor from https://cursor.com",
             AgentKind::GeminiCli => "Install Gemini CLI: npm install -g @google/gemini-cli",
             AgentKind::CopilotCli => {
                 "Install GitHub Copilot CLI: gh extension install github/gh-copilot"
             }
             AgentKind::CodexCli => "Install Codex CLI: npm install -g @openai/codex",
-            AgentKind::OpenCode => {
-                "Install OpenCode: go install github.com/opencode-ai/opencode@latest"
-            }
+            AgentKind::Crush => "Install Crush from https://crushcode.ai",
             AgentKind::ClaudeCode => unreachable!("handled above"),
         };
         anyhow::bail!(
             "{} does not appear to be installed (config dir not found: {})\nhint: {}",
-            flags.agent.display_name(),
+            agent.display_name(),
             state.config_dir.display(),
             hint
         );
@@ -60,13 +58,12 @@ fn verify_agent_installed(state: &DetectedState, flags: &InitFlags) -> anyhow::R
 /// - `--no-guidance` is set, or
 /// - The agent has no instruction file (guidance feature not applicable), or
 /// - The file content contains the versioned start marker for `skim_version`.
-fn is_guidance_current(flags: &InitFlags, skim_version: &str, env: &InstructionEnv) -> bool {
+fn is_guidance_current(agent: AgentKind, flags: &InitFlags, skim_version: &str, env: &InstructionEnv) -> bool {
     if flags.no_guidance {
         return true;
     }
     let global = !flags.project;
-    flags
-        .agent
+    agent
         .instruction_file(global, env)
         .map(|p| {
             std::fs::read_to_string(&p)
@@ -124,17 +121,18 @@ fn print_completion_message(agent_name: &str) {
 
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
-    let state = detect_state(flags)?;
+    let agent = resolve_agent(flags);
+    let state = detect_state(flags, agent)?;
 
-    verify_agent_installed(&state, flags)?;
-    print_install_header(flags.agent.display_name());
+    verify_agent_installed(&state, agent, flags)?;
+    print_install_header(agent.display_name());
     print_detected_state(&state);
 
     if !state.existing_bash_hooks.is_empty() {
         print_collision_warning(&state.existing_bash_hooks);
     }
 
-    let guidance_current = is_guidance_current(flags, &state.skim_version, &env);
+    let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     if state.hook_installed && state.hook_is_current() && guidance_current {
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
@@ -153,7 +151,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
     }
 
     execute_install(&state, flags.no_guidance, global, &env)?;
-    print_completion_message(flags.agent.display_name());
+    print_completion_message(agent.display_name());
 
     Ok(std::process::ExitCode::SUCCESS)
 }

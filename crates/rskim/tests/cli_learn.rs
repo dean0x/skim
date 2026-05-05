@@ -361,7 +361,7 @@ fn test_learn_generate_copilot_writes_instructions_md_with_frontmatter() {
             nonexistent.join("no-cursor.vscdb").to_str().unwrap(),
         )
         .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
-        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_CRUSH_DIR", nonexistent.to_str().unwrap())
         .current_dir(work_dir.path());
 
     cmd.assert()
@@ -439,7 +439,7 @@ fn test_learn_generate_codex_prints_to_stdout_no_file() {
             nonexistent.join("no-cursor.vscdb").to_str().unwrap(),
         )
         .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
-        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_CRUSH_DIR", nonexistent.to_str().unwrap())
         .current_dir(work_dir.path());
 
     cmd.assert()
@@ -495,7 +495,7 @@ fn test_learn_no_cross_agent_data_leakage() {
             nonexistent.join("no-cursor.vscdb").to_str().unwrap(),
         )
         .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
-        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap());
+        .env("SKIM_CRUSH_DIR", nonexistent.to_str().unwrap());
 
     cmd.assert().success().stdout(
         predicate::str::contains("No CLI error patterns detected")

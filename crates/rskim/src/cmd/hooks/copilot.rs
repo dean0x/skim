@@ -43,6 +43,15 @@ impl HookProtocol for CopilotCliHook {
     fn generate_script(&self, version: &str) -> String {
         super::generate_hook_script(version, "copilot")
     }
+
+    // -------------------------------------------------------------------------
+    // Config lifecycle overrides — Copilot CLI uses preToolUse (lowercase)
+    // -------------------------------------------------------------------------
+
+    /// Copilot CLI uses lowercase `preToolUse` instead of `PreToolUse`.
+    fn hook_event_key(&self) -> &'static str {
+        "preToolUse"
+    }
 }
 
 // ============================================================================
@@ -167,5 +176,46 @@ mod tests {
             force: false,
         };
         assert!(hook().uninstall(&opts).is_ok());
+    }
+
+    // ========================================================================
+    // Phase 4: Config lifecycle override tests
+    // ========================================================================
+
+    #[test]
+    fn test_copilot_config_filename() {
+        assert_eq!(hook().config_filename(), "settings.json");
+    }
+
+    #[test]
+    fn test_copilot_hook_event_key_is_lowercase() {
+        assert_eq!(hook().hook_event_key(), "preToolUse");
+    }
+
+    #[test]
+    fn test_copilot_upsert_hook_uses_pre_tool_use_lowercase() {
+        let mut config = serde_json::json!({});
+        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+
+        assert!(config["hooks"]["preToolUse"].is_array(), "should use lowercase preToolUse");
+        assert!(config["hooks"].get("PreToolUse").is_none(), "should NOT use uppercase PreToolUse");
+    }
+
+    #[test]
+    fn test_copilot_detect_hook_reads_pre_tool_use_lowercase() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = serde_json::json!({
+            "hooks": {
+                "preToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/home/.github/hooks/skim-rewrite.sh"}]
+                }]
+            }
+        });
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        ).unwrap();
+        assert!(hook().detect_hook(dir.path()));
     }
 }

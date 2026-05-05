@@ -42,6 +42,15 @@ impl HookProtocol for GeminiCliHook {
     fn generate_script(&self, version: &str) -> String {
         super::generate_hook_script(version, "gemini")
     }
+
+    // -------------------------------------------------------------------------
+    // Config lifecycle overrides — Gemini CLI uses BeforeTool event key
+    // -------------------------------------------------------------------------
+
+    /// Gemini CLI uses `BeforeTool` instead of `PreToolUse`.
+    fn hook_event_key(&self) -> &'static str {
+        "BeforeTool"
+    }
 }
 
 // ============================================================================
@@ -192,5 +201,47 @@ mod tests {
             force: false,
         };
         assert!(hook().uninstall(&opts).is_ok());
+    }
+
+    // ========================================================================
+    // Phase 4: Config lifecycle override tests
+    // ========================================================================
+
+    #[test]
+    fn test_gemini_config_filename_is_settings_json() {
+        assert_eq!(hook().config_filename(), "settings.json");
+    }
+
+    #[test]
+    fn test_gemini_hook_event_key_is_before_tool() {
+        assert_eq!(hook().hook_event_key(), "BeforeTool");
+    }
+
+    #[test]
+    fn test_gemini_upsert_hook_uses_before_tool() {
+        let mut config = serde_json::json!({});
+        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+
+        // Should be under BeforeTool, not PreToolUse
+        assert!(config["hooks"]["BeforeTool"].is_array(), "should use BeforeTool event key");
+        assert!(config["hooks"].get("PreToolUse").is_none(), "should NOT use PreToolUse");
+    }
+
+    #[test]
+    fn test_gemini_detect_hook_reads_before_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = serde_json::json!({
+            "hooks": {
+                "BeforeTool": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": dir.path().join("hooks/skim-rewrite.sh").to_str().unwrap()}]
+                }]
+            }
+        });
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        ).unwrap();
+        assert!(hook().detect_hook(dir.path()));
     }
 }

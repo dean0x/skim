@@ -1,6 +1,6 @@
 //! Uninstall flow for `skim init` (B10).
 
-use super::flags::InitFlags;
+use super::flags::{resolve_agent, InitFlags};
 use super::helpers::{
     atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
     resolve_config_dir_for_agent, resolve_real_settings_path, HOOK_SCRIPT_NAME, SETTINGS_FILE,
@@ -35,7 +35,8 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value) {
 }
 
 pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let config_dir = resolve_config_dir_for_agent(flags.project, flags.agent)?;
+    let agent = resolve_agent(flags);
+    let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
     let settings_path = config_dir.join(SETTINGS_FILE);
     let hook_script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
 
@@ -60,7 +61,7 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
     if script_exists {
         if let Ok(false) = crate::cmd::integrity::verify_script_integrity(
             &config_dir,
-            flags.agent.cli_name(),
+            agent.cli_name(),
             &hook_script_path,
         ) {
             if !flags.force {
@@ -130,13 +131,13 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
         );
 
         // Clean up hash manifest (#57)
-        let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, flags.agent.cli_name());
+        let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, agent.cli_name());
     }
 
     // Remove guidance from instruction file
     let global = !flags.project;
     let env = InstructionEnv::from_process();
-    super::install::remove_guidance(flags.agent, global, &env)?;
+    super::install::remove_guidance(agent, global, &env)?;
 
     println!();
     println!("  skim hook has been uninstalled.");

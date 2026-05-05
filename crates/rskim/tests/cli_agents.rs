@@ -140,7 +140,7 @@ fn test_agents_lists_all_supported() {
     assert!(cli_names.contains(&"codex"), "missing codex");
     assert!(cli_names.contains(&"gemini"), "missing gemini");
     assert!(cli_names.contains(&"copilot"), "missing copilot");
-    assert!(cli_names.contains(&"opencode"), "missing opencode");
+    assert!(cli_names.contains(&"crush"), "missing crush");
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn test_agents_no_agents_all_not_detected() {
             nonexistent.join("no-cursor.vscdb").to_str().unwrap(),
         )
         .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
-        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_CRUSH_DIR", nonexistent.to_str().unwrap())
         .output()
         .unwrap();
 
@@ -185,7 +185,7 @@ fn test_agents_no_agents_all_not_detected() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let agents = parsed["agents"].as_array().unwrap();
 
-    // At minimum, Claude Code and OpenCode use env overrides.
+    // At minimum, Claude Code and Crush use env overrides.
     // Some agents (Cursor, Copilot, Gemini) detect from filesystem paths that
     // don't have env overrides in the agents command. But with nonexistent paths
     // set for those that do have overrides, we can at least verify the structure.
@@ -194,7 +194,7 @@ fn test_agents_no_agents_all_not_detected() {
         let detected = agent["detected"].as_bool().unwrap();
         // For agents whose detection depends on env vars we've overridden,
         // they should not be detected
-        if name == "Claude Code" || name == "OpenCode" {
+        if name == "Claude Code" || name == "Crush" {
             assert!(
                 !detected,
                 "{name} should not be detected with nonexistent path"
@@ -210,7 +210,7 @@ const EXPECTED_AGENTS: &[&str] = &[
     "codex",
     "gemini",
     "copilot",
-    "opencode",
+    "crush",
 ];
 
 #[test]
@@ -263,21 +263,28 @@ fn test_agents_claude_detected_with_session_count() {
 }
 
 #[test]
-fn test_agents_opencode_shows_typescript_plugin_note() {
-    // OpenCode should show "not supported (TypeScript plugin model)" for hooks
-    let output = skim_cmd().args(["agents", "--json"]).output().unwrap();
+fn test_agents_crush_shows_hook_status() {
+    // Crush should show hook status (not installed when crush dir doesn't exist)
+    let dir = TempDir::new().unwrap();
+    let nonexistent = dir.path().join("nonexistent");
+
+    let output = skim_cmd()
+        .args(["agents", "--json"])
+        .env("SKIM_CRUSH_DIR", nonexistent.to_str().unwrap())
+        .output()
+        .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let agents = parsed["agents"].as_array().unwrap();
-    let opencode = agents
+    let crush = agents
         .iter()
-        .find(|a| a["cli_name"] == "opencode")
-        .expect("should have opencode agent");
+        .find(|a| a["cli_name"] == "crush")
+        .expect("should have crush agent");
 
-    assert_eq!(opencode["hooks"]["status"], "not_supported");
-    assert_eq!(opencode["hooks"]["note"], "TypeScript plugin model");
+    assert_eq!(crush["detected"], false);
+    assert_eq!(crush["hooks"]["status"], "not_installed");
 }
 
 #[test]
@@ -289,7 +296,7 @@ fn test_agents_text_not_detected_without_fixtures() {
     skim_cmd()
         .args(["agents"])
         .env("SKIM_PROJECTS_DIR", nonexistent.to_str().unwrap())
-        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_CRUSH_DIR", nonexistent.to_str().unwrap())
         .assert()
         .success()
         .stdout(predicate::str::contains("not detected"))

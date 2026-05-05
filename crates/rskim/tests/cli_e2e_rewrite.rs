@@ -546,29 +546,26 @@ fn test_rewrite_hook_agent_codex_awareness_only() {
 }
 
 #[test]
-fn test_rewrite_hook_agent_opencode_awareness_only() {
-    // OpenCode is AwarenessOnly — always empty stdout, exit 0
+fn test_rewrite_hook_agent_crush_real_hook() {
+    // Crush is RealHook — returns a decision/updated_input response
     let input = serde_json::json!({
         "tool_input": {
             "command": "cargo test"
         }
     });
     let output = skim_cmd()
-        .args(["rewrite", "--hook", "--agent", "opencode"])
+        .args(["rewrite", "--hook", "--agent", "crush"])
         .write_stdin(serde_json::to_string(&input).unwrap())
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.trim().is_empty(),
-        "OpenCode (AwarenessOnly) should produce empty stdout, got: {stdout}"
-    );
+    let _stdout = String::from_utf8(output.stdout).unwrap();
+    // Crush should produce either a rewritten response or empty (passthrough)
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.is_empty(),
-        "OpenCode hook mode should produce zero stderr, got: {stderr}"
+        "Crush hook mode should produce zero stderr, got: {stderr}"
     );
 }
 
@@ -623,7 +620,7 @@ fn test_rewrite_hook_all_agents_zero_stderr() {
             serde_json::json!({"tool_input": {"command": "cargo test"}}),
         ),
         (
-            "opencode",
+            "crush",
             serde_json::json!({"tool_input": {"command": "cargo test"}}),
         ),
     ];

@@ -35,10 +35,10 @@ impl DetectedState {
     }
 }
 
-pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
+pub(super) fn detect_state(flags: &InitFlags, agent: crate::cmd::session::AgentKind) -> anyhow::Result<DetectedState> {
     let skim_binary = std::env::current_exe()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
-    let config_dir = resolve_config_dir_for_agent(flags.project, flags.agent)?;
+    let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
     let settings_path = config_dir.join(SETTINGS_FILE);
     let settings_exists = settings_path.exists();
 
@@ -74,7 +74,7 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
     let existing_bash_hooks = scan_existing_bash_hooks(parsed_settings.as_ref());
 
     // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(flags)?;
+    let dual_scope_warning = check_dual_scope(flags, agent)?;
 
     // Reuse the already-read hook script contents for bare-command detection.
     let hook_uses_bare_command = hook_script_contents
@@ -93,7 +93,7 @@ pub(super) fn detect_state(flags: &InitFlags) -> anyhow::Result<DetectedState> {
         hook_uses_bare_command,
         dual_scope_warning,
         existing_bash_hooks,
-        agent_cli_name: flags.agent.cli_name(),
+        agent_cli_name: agent.cli_name(),
     })
 }
 
@@ -168,13 +168,13 @@ fn scan_existing_bash_hooks(parsed: Option<&serde_json::Value>) -> Vec<String> {
     other_hooks
 }
 
-pub(super) fn check_dual_scope(flags: &InitFlags) -> anyhow::Result<Option<String>> {
+pub(super) fn check_dual_scope(flags: &InitFlags, agent: crate::cmd::session::AgentKind) -> anyhow::Result<Option<String>> {
     let other_dir = if flags.project {
         // Installing project-level, check global
-        resolve_config_dir_for_agent(false, flags.agent)?
+        resolve_config_dir_for_agent(false, agent)?
     } else {
         // Installing global, check project
-        match resolve_config_dir_for_agent(true, flags.agent) {
+        match resolve_config_dir_for_agent(true, agent) {
             Ok(dir) => dir,
             Err(_) => return Ok(None),
         }

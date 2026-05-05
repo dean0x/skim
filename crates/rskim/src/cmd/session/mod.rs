@@ -2,15 +2,15 @@
 //!
 //! Provides agent-agnostic types and the `SessionProvider` trait for scanning
 //! AI agent session files. Six providers ship today (Claude Code, Codex CLI,
-//! Copilot CLI, Cursor, Gemini CLI, OpenCode); new agents are added by
+//! Copilot CLI, Cursor, Gemini CLI, Crush); new agents are added by
 //! implementing the trait -- no conditionals in business logic.
 
 mod claude;
 mod codex;
 mod copilot;
+mod crush;
 mod cursor;
 mod gemini;
-mod opencode;
 pub(crate) mod types;
 
 #[allow(unused_imports)] // ToolResult used by learn.rs tests
@@ -60,7 +60,7 @@ pub(crate) fn detect_agents() -> Vec<Box<dyn SessionProvider>> {
     if let Some(p) = gemini::GeminiCliProvider::detect() {
         providers.push(Box::new(p));
     }
-    if let Some(p) = opencode::OpenCodeProvider::detect() {
+    if let Some(p) = crush::CrushProvider::detect() {
         providers.push(Box::new(p));
     }
     providers
@@ -77,7 +77,7 @@ fn detect_single(kind: AgentKind) -> Vec<Box<dyn SessionProvider>> {
         AgentKind::CopilotCli => copilot::CopilotCliProvider::detect().map(|p| Box::new(p) as _),
         AgentKind::Cursor => cursor::CursorProvider::detect().map(|p| Box::new(p) as _),
         AgentKind::GeminiCli => gemini::GeminiCliProvider::detect().map(|p| Box::new(p) as _),
-        AgentKind::OpenCode => opencode::OpenCodeProvider::detect().map(|p| Box::new(p) as _),
+        AgentKind::Crush => crush::CrushProvider::detect().map(|p| Box::new(p) as _),
     };
     opt.into_iter().collect()
 }

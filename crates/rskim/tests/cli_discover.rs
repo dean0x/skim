@@ -23,7 +23,7 @@ fn skim_cmd_neutralized(nonexistent: &std::path::Path) -> Command {
             nonexistent.join("no-cursor.vscdb").as_os_str(),
         )
         .env("SKIM_GEMINI_DIR", nonexistent.as_os_str())
-        .env("SKIM_OPENCODE_DIR", nonexistent.as_os_str());
+        .env("SKIM_CRUSH_DIR", nonexistent.as_os_str());
     cmd
 }
 
@@ -101,7 +101,7 @@ fn test_discover_no_agent_dir() {
             dir.path().join("no-cursor.vscdb").to_str().unwrap(),
         )
         .env("SKIM_GEMINI_DIR", nonexistent.to_str().unwrap())
-        .env("SKIM_OPENCODE_DIR", nonexistent.to_str().unwrap())
+        .env("SKIM_CRUSH_DIR", nonexistent.to_str().unwrap())
         .assert()
         .success()
         .stdout(predicate::str::contains("No AI agent sessions found"));

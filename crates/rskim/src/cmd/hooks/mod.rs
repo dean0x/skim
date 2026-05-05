@@ -2,13 +2,28 @@
 //!
 //! Each agent that supports tool interception hooks implements `HookProtocol`.
 //! Agents without hook support use awareness-only installation.
+//!
+//! ## Config lifecycle methods
+//!
+//! The trait includes config-lifecycle methods with sane defaults covering the
+//! Claude Code `settings.json` / `hooks.PreToolUse` format. Agents that use a
+//! different on-disk format override the relevant methods:
+//!
+//! | Agent       | Config file   | Event key    | Matcher |
+//! |-------------|---------------|--------------|---------|
+//! | Claude Code | settings.json | PreToolUse   | Bash    |
+//! | Cursor      | hooks.json    | beforeShellExecution | (n/a) |
+//! | Gemini CLI  | settings.json | BeforeTool   | Bash    |
+//! | Copilot CLI | settings.json | preToolUse   | Bash    |
+//! | Crush       | crush.json    | PreToolUse   | Bash    |
+//! | Codex CLI   | (none)        | (none)       | (none)  |
 
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod copilot;
+pub(crate) mod crush;
 pub(crate) mod cursor;
 pub(crate) mod gemini;
-pub(crate) mod opencode;
 
 use super::session::AgentKind;
 
@@ -65,6 +80,7 @@ pub(crate) struct UninstallOpts {
 /// - Hook event parsing (agent JSON -> HookInput)
 /// - Response formatting (rewritten command -> agent JSON)
 /// - Script generation (binary path -> shell script)
+/// - Config lifecycle (config file name, event key, entry format)
 /// - Installation/uninstallation
 pub(crate) trait HookProtocol {
     #[allow(dead_code)] // Used in tests only
@@ -76,6 +92,236 @@ pub(crate) trait HookProtocol {
 
     #[allow(dead_code)] // Used in tests only
     fn generate_script(&self, version: &str) -> String;
+
+    // -------------------------------------------------------------------------
+    // Config lifecycle methods
+    //
+    // Default implementations match the Claude Code `settings.json` /
+    // `hooks.PreToolUse` format. Agents with different config formats override
+    // the relevant methods.
+    // -------------------------------------------------------------------------
+
+    /// Name of the config file that contains hook configuration.
+    ///
+    /// Default: `"settings.json"` (Claude Code, Gemini CLI, Copilot CLI).
+    /// Override: Cursor → `"hooks.json"`, Crush → `"crush.json"`.
+    #[allow(dead_code)]
+    fn config_filename(&self) -> &'static str {
+        "settings.json"
+    }
+
+    /// The top-level event key under `hooks` where hook entries live.
+    ///
+    /// Default: `"PreToolUse"` (Claude Code, Crush, Copilot CLI).
+    /// Override: Gemini CLI → `"BeforeTool"`, Cursor → `"beforeShellExecution"`.
+    #[allow(dead_code)]
+    fn hook_event_key(&self) -> &'static str {
+        "PreToolUse"
+    }
+
+    /// The tool matcher value used when inserting a hook entry.
+    ///
+    /// Default: `"Bash"`. Cursor does not use a matcher field (returns empty string).
+    #[allow(dead_code)]
+    fn tool_matcher(&self) -> &'static str {
+        "Bash"
+    }
+
+    /// Timeout in seconds for the hook command.
+    ///
+    /// Default: 5 seconds (matches Claude Code defaults).
+    #[allow(dead_code)]
+    fn hook_timeout(&self) -> u64 {
+        5
+    }
+
+    /// Build a config entry JSON object for this agent's hook format.
+    ///
+    /// Default produces the Claude Code / Gemini / Copilot format:
+    /// ```json
+    /// {
+    ///   "matcher": "Bash",
+    ///   "hooks": [{ "type": "command", "command": "<path>", "timeout": 5 }]
+    /// }
+    /// ```
+    ///
+    /// Agents with different formats (e.g., Cursor) override this method.
+    #[allow(dead_code)]
+    fn build_config_entry(&self, hook_script_path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "matcher": self.tool_matcher(),
+            "hooks": [{
+                "type": "command",
+                "command": hook_script_path,
+                "timeout": self.hook_timeout()
+            }]
+        })
+    }
+
+    /// Return `true` if `entry` is a skim hook entry in this agent's config format.
+    ///
+    /// Default checks for `"skim-rewrite"` substring in any nested `command` value
+    /// (Claude Code / Gemini / Copilot / Crush). Cursor overrides this.
+    #[allow(dead_code)]
+    fn is_skim_entry(&self, entry: &serde_json::Value) -> bool {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_some_and(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|cmd| cmd.contains("skim-rewrite"))
+                })
+            })
+    }
+
+    /// Upsert the skim hook entry into a parsed config JSON value in place.
+    ///
+    /// Removes any existing skim entry under `hooks.<event_key>`, then appends
+    /// the new entry. Creates the `hooks` and event-key arrays if absent.
+    ///
+    /// Default implementation handles the Claude Code / Gemini / Copilot /
+    /// Crush array-of-objects format. Cursor overrides this.
+    #[allow(dead_code)]
+    fn upsert_hook(&self, config: &mut serde_json::Value, hook_script_path: &str) -> anyhow::Result<()> {
+        let obj = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
+
+        let hooks = obj
+            .entry("hooks")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config 'hooks' is not an object"))?;
+
+        let event_arr = hooks
+            .entry(self.hook_event_key())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config 'hooks.{}' is not an array",
+                    self.hook_event_key()
+                )
+            })?;
+
+        // Remove existing skim entries (idempotent upsert)
+        event_arr.retain(|e| !self.is_skim_entry(e));
+
+        // Append new entry
+        event_arr.push(self.build_config_entry(hook_script_path));
+
+        Ok(())
+    }
+
+    /// Remove all skim hook entries from a parsed config JSON value in place.
+    ///
+    /// Returns `true` if any entries were removed, `false` if none found.
+    #[allow(dead_code)]
+    fn remove_skim_entries(&self, config: &mut serde_json::Value) -> bool {
+        let Some(hooks) = config
+            .get_mut("hooks")
+            .and_then(|h| h.as_object_mut())
+        else {
+            return false;
+        };
+
+        let Some(event_arr) = hooks
+            .get_mut(self.hook_event_key())
+            .and_then(|v| v.as_array_mut())
+        else {
+            return false;
+        };
+
+        let before = event_arr.len();
+        event_arr.retain(|e| !self.is_skim_entry(e));
+        event_arr.len() < before
+    }
+
+    /// Detect whether skim is installed in the config at `config_dir`.
+    ///
+    /// Reads `config_dir/<config_filename()>`, parses JSON, and checks for
+    /// a skim entry under `hooks.<hook_event_key()>`.
+    ///
+    /// Returns `true` when the config file exists and contains a skim entry.
+    /// Returns `false` on any I/O or parse error (non-fatal).
+    #[allow(dead_code)]
+    fn detect_hook(&self, config_dir: &std::path::Path) -> bool {
+        use crate::cmd::init::MAX_SETTINGS_SIZE;
+
+        let config_path = config_dir.join(self.config_filename());
+        let meta = match std::fs::metadata(&config_path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if meta.len() > MAX_SETTINGS_SIZE {
+            return false;
+        }
+        let contents = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&contents) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        json.get("hooks")
+            .and_then(|h| h.get(self.hook_event_key()))
+            .and_then(|v| v.as_array())
+            .is_some_and(|entries| entries.iter().any(|e| self.is_skim_entry(e)))
+    }
+
+    /// Scan `config_dir/<config_filename()>` for non-skim hook entries in the
+    /// same event bucket. Returns the command strings of any such entries.
+    ///
+    /// Used for collision-detection warnings during install.
+    #[allow(dead_code)]
+    fn scan_other_hooks(&self, config_dir: &std::path::Path) -> Vec<String> {
+        use crate::cmd::init::MAX_SETTINGS_SIZE;
+
+        let config_path = config_dir.join(self.config_filename());
+        let meta = match std::fs::metadata(&config_path) {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        if meta.len() > MAX_SETTINGS_SIZE {
+            return Vec::new();
+        }
+        let contents = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let json: serde_json::Value = match serde_json::from_str(&contents) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        let entries = match json
+            .get("hooks")
+            .and_then(|h| h.get(self.hook_event_key()))
+            .and_then(|v| v.as_array())
+        {
+            Some(arr) => arr.clone(),
+            None => return Vec::new(),
+        };
+
+        let mut other = Vec::new();
+        for entry in &entries {
+            if self.is_skim_entry(entry) {
+                continue;
+            }
+            if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
+                for hook in hooks {
+                    if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                        other.push(cmd.to_string());
+                    }
+                }
+            }
+        }
+        other
+    }
 
     /// Default no-op install. Override for agents with real hook installation.
     #[allow(dead_code)] // Used in tests only
@@ -95,8 +341,8 @@ pub(crate) trait HookProtocol {
 
 /// Shared parser for agents whose hook JSON nests the command under `tool_input.command`.
 ///
-/// Used by Claude Code, Copilot CLI, and Gemini CLI. Cursor differs (top-level `command`).
-/// Codex and OpenCode are awareness-only and return `None` from `parse_input` directly.
+/// Used by Claude Code, Crush, Copilot CLI, and Gemini CLI. Cursor differs (top-level `command`).
+/// Codex is awareness-only and returns `None` from `parse_input` directly.
 ///
 /// AD-HK-1: Also extracts `session_id` from the top-level JSON field when present.
 /// Claude Code emits `{ "session_id": "...", "tool_input": { "command": "..." } }`.
@@ -162,7 +408,7 @@ pub(crate) fn protocol_for_agent(kind: AgentKind) -> Box<dyn HookProtocol> {
         AgentKind::GeminiCli => Box::new(gemini::GeminiCliHook),
         AgentKind::CopilotCli => Box::new(copilot::CopilotCliHook),
         AgentKind::CodexCli => Box::new(codex::CodexCliHook),
-        AgentKind::OpenCode => Box::new(opencode::OpenCodeHook),
+        AgentKind::Crush => Box::new(crush::CrushHook),
     }
 }
 
@@ -299,5 +545,229 @@ mod tests {
             result.session_id.is_none(),
             "non-string session_id should yield None"
         );
+    }
+
+    // ========================================================================
+    // Phase 3: Config lifecycle method tests (default implementation via
+    // ClaudeCodeHook which uses all defaults)
+    // ========================================================================
+
+    #[test]
+    fn test_default_config_filename() {
+        let hook = claude::ClaudeCodeHook;
+        assert_eq!(hook.config_filename(), "settings.json");
+    }
+
+    #[test]
+    fn test_default_hook_event_key() {
+        let hook = claude::ClaudeCodeHook;
+        assert_eq!(hook.hook_event_key(), "PreToolUse");
+    }
+
+    #[test]
+    fn test_default_tool_matcher() {
+        let hook = claude::ClaudeCodeHook;
+        assert_eq!(hook.tool_matcher(), "Bash");
+    }
+
+    #[test]
+    fn test_default_hook_timeout() {
+        let hook = claude::ClaudeCodeHook;
+        assert_eq!(hook.hook_timeout(), 5);
+    }
+
+    #[test]
+    fn test_default_build_config_entry() {
+        let hook = claude::ClaudeCodeHook;
+        let entry = hook.build_config_entry("/path/to/skim-rewrite.sh");
+        assert_eq!(entry["matcher"], "Bash");
+        let hooks_arr = entry["hooks"].as_array().unwrap();
+        assert_eq!(hooks_arr.len(), 1);
+        assert_eq!(hooks_arr[0]["type"], "command");
+        assert_eq!(hooks_arr[0]["command"], "/path/to/skim-rewrite.sh");
+        assert_eq!(hooks_arr[0]["timeout"], 5);
+    }
+
+    #[test]
+    fn test_default_is_skim_entry_true() {
+        let hook = claude::ClaudeCodeHook;
+        let entry = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/home/.claude/hooks/skim-rewrite.sh"}]
+        });
+        assert!(hook.is_skim_entry(&entry));
+    }
+
+    #[test]
+    fn test_default_is_skim_entry_false() {
+        let hook = claude::ClaudeCodeHook;
+        let entry = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/usr/bin/other-tool"}]
+        });
+        assert!(!hook.is_skim_entry(&entry));
+    }
+
+    #[test]
+    fn test_default_upsert_hook_creates_entry() {
+        let hook = claude::ClaudeCodeHook;
+        let mut config = serde_json::json!({});
+        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh").unwrap();
+
+        let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["matcher"], "Bash");
+    }
+
+    #[test]
+    fn test_default_upsert_hook_idempotent() {
+        let hook = claude::ClaudeCodeHook;
+        let mut config = serde_json::json!({});
+        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh").unwrap();
+        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh").unwrap();
+
+        let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "idempotent upsert should not duplicate entries");
+    }
+
+    #[test]
+    fn test_default_upsert_hook_preserves_other_entries() {
+        let hook = claude::ClaudeCodeHook;
+        let mut config = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/usr/bin/other-tool"}]
+                }]
+            }
+        });
+        hook.upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+
+        let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "should preserve non-skim entries");
+    }
+
+    #[test]
+    fn test_default_remove_skim_entries_removes() {
+        let hook = claude::ClaudeCodeHook;
+        let mut config = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/home/.claude/hooks/skim-rewrite.sh"}]
+                }]
+            }
+        });
+        let removed = hook.remove_skim_entries(&mut config);
+        assert!(removed);
+        let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_default_remove_skim_entries_no_match() {
+        let hook = claude::ClaudeCodeHook;
+        let mut config = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/usr/bin/other-tool"}]
+                }]
+            }
+        });
+        let removed = hook.remove_skim_entries(&mut config);
+        assert!(!removed);
+    }
+
+    #[test]
+    fn test_default_detect_hook_installed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        let config = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": config_dir.join("hooks/skim-rewrite.sh").to_str().unwrap()}]
+                }]
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        ).unwrap();
+
+        let hook = claude::ClaudeCodeHook;
+        assert!(hook.detect_hook(config_dir));
+    }
+
+    #[test]
+    fn test_default_detect_hook_not_installed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        let config = serde_json::json!({ "theme": "dark" });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        ).unwrap();
+
+        let hook = claude::ClaudeCodeHook;
+        assert!(!hook.detect_hook(config_dir));
+    }
+
+    #[test]
+    fn test_default_detect_hook_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hook = claude::ClaudeCodeHook;
+        assert!(!hook.detect_hook(dir.path()), "missing config file should return false");
+    }
+
+    #[test]
+    fn test_default_scan_other_hooks_empty_when_only_skim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        let config = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/home/.claude/hooks/skim-rewrite.sh"}]
+                }]
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        ).unwrap();
+
+        let hook = claude::ClaudeCodeHook;
+        let others = hook.scan_other_hooks(config_dir);
+        assert!(others.is_empty(), "only skim entry should return empty vec");
+    }
+
+    #[test]
+    fn test_default_scan_other_hooks_returns_non_skim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        let config = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "/home/.claude/hooks/skim-rewrite.sh"}]
+                    },
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "/usr/bin/other-security-hook"}]
+                    }
+                ]
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        ).unwrap();
+
+        let hook = claude::ClaudeCodeHook;
+        let others = hook.scan_other_hooks(config_dir);
+        assert_eq!(others, vec!["/usr/bin/other-security-hook"]);
     }
 }

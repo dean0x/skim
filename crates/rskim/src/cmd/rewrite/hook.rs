@@ -130,7 +130,7 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     let agent_kind = agent.unwrap_or(AgentKind::ClaudeCode);
     let protocol = protocol_for_agent(agent_kind);
 
-    // AwarenessOnly agents (Codex, OpenCode) have no hook mechanism — passthrough immediately
+    // AwarenessOnly agents (Codex) have no hook mechanism — passthrough immediately
     if protocol.hook_support() == HookSupport::AwarenessOnly {
         return Ok(ExitCode::SUCCESS);
     }

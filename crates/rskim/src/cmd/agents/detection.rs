@@ -26,7 +26,7 @@ fn detect_agent(kind: AgentKind, home: Option<&Path>) -> AgentStatus {
         AgentKind::CodexCli => detect_codex_cli(home),
         AgentKind::GeminiCli => detect_gemini_cli(home),
         AgentKind::CopilotCli => detect_copilot_cli(),
-        AgentKind::OpenCode => detect_opencode(),
+        AgentKind::Crush => detect_crush(),
     }
 }
 
@@ -237,32 +237,53 @@ fn detect_copilot_cli() -> AgentStatus {
     }
 }
 
-fn detect_opencode() -> AgentStatus {
-    // OpenCode uses .opencode/ directory in project root
-    let opencode_dir = std::env::var("SKIM_OPENCODE_DIR")
+fn detect_crush() -> AgentStatus {
+    // Crush stores config in ~/.crush/ directory
+    let crush_dir = std::env::var("SKIM_CRUSH_DIR")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| AgentKind::OpenCode.project_dir());
-    let detected = opencode_dir.is_dir();
+        .or_else(|| dirs::home_dir().map(|h| AgentKind::Crush.config_dir(&h)));
+    let detected = crush_dir.as_ref().is_some_and(|p| p.is_dir());
 
     let sessions = if detected {
-        let count = count_files_in_dir(&opencode_dir);
-        Some(SessionInfo {
-            path: tilde_path(&opencode_dir),
-            detail: format!("{count} files"),
+        crush_dir.as_ref().map(|p| {
+            let count = count_files_in_dir(p);
+            SessionInfo {
+                path: tilde_path(p),
+                detail: format!("{count} files"),
+            }
         })
     } else {
         None
     };
 
-    let hooks = HookStatus::NotSupported {
-        note: "TypeScript plugin model",
+    let hooks = if detected {
+        let has_hook = crush_dir
+            .as_ref()
+            .and_then(|p| read_settings_guarded(&p.join("crush.json")))
+            .is_some_and(|v| has_skim_hook_in_settings(&v));
+        if has_hook {
+            HookStatus::Installed {
+                version: None,
+                integrity: "ok",
+            }
+        } else {
+            HookStatus::NotInstalled
+        }
+    } else {
+        HookStatus::NotInstalled
     };
 
-    let rules = None; // OpenCode uses AGENTS.md, not a rules directory
+    let rules = crush_dir.as_ref().map(|p| {
+        let rules_dir = p.join("rules");
+        RulesInfo {
+            path: format!("{}/", rules_dir.display()),
+            exists: rules_dir.is_dir(),
+        }
+    });
 
     AgentStatus {
-        kind: AgentKind::OpenCode,
+        kind: AgentKind::Crush,
         detected,
         sessions,
         hooks,
