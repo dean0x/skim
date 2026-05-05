@@ -575,7 +575,7 @@ cargo bench
 - Three-tier degradation: Structured → Regex → Passthrough
 
 ✅ **Agent Integration:**
-- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, OpenCode
+- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush
 - `skim rewrite` — command rewriting engine with `--hook` mode
 - MCP server mode for agent-native workflows
 

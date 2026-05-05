@@ -3,6 +3,7 @@
 //! Parses Crush JSONL session files from `~/.crush/` directory.
 //! Crush stores sessions similarly to Claude Code using JSONL format.
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use super::types::*;
@@ -29,6 +30,15 @@ impl CrushProvider {
             AgentKind::Crush.config_dir(&dirs::home_dir()?)
         };
 
+        Self::detect_with_dir(sessions_dir)
+    }
+
+    /// Inner detection helper — checks whether `sessions_dir` is an existing
+    /// directory and wraps it in `CrushProvider` if so.
+    ///
+    /// Extracted to allow testing the detection logic directly with a
+    /// constructed path, avoiding `std::env::set_var` in tests.
+    fn detect_with_dir(sessions_dir: PathBuf) -> Option<Self> {
         if sessions_dir.is_dir() {
             Some(Self { sessions_dir })
         } else {
@@ -113,10 +123,11 @@ impl SessionProvider for CrushProvider {
             );
         }
 
-        let content = std::fs::read_to_string(&file.path)?;
+        let reader = BufReader::new(std::fs::File::open(&file.path)?);
         let mut invocations = Vec::new();
 
-        for line in content.lines() {
+        for line in reader.lines() {
+            let line = line?;
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -209,11 +220,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_crush_provider_detect_env_override_nonexistent() {
-        std::env::set_var("SKIM_CRUSH_DIR", "/tmp/nonexistent-crush-test-dir");
-        let provider = CrushProvider::detect();
+    fn test_crush_provider_detect_nonexistent_dir() {
+        // Test detection logic directly — no env mutation, race-condition-free.
+        let provider =
+            CrushProvider::detect_with_dir(PathBuf::from("/tmp/nonexistent-crush-test-dir"));
         assert!(provider.is_none());
-        std::env::remove_var("SKIM_CRUSH_DIR");
     }
 
     #[test]

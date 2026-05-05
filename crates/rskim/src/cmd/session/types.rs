@@ -54,7 +54,17 @@ impl AgentKind {
     ///
     /// Shared by `discover` and `learn` subcommands to avoid duplicating the
     /// error message with supported agent list.
+    ///
+    /// Provides a targeted migration hint for removed agents (e.g., `opencode` → `crush`).
     pub(crate) fn parse_cli_arg(s: &str) -> anyhow::Result<Self> {
+        // Provide a clear migration error for the removed opencode agent
+        if s == "opencode" || s == "open-code" {
+            anyhow::bail!(
+                "agent 'opencode' has been removed from skim.\n\
+                 Use 'crush' instead: skim discover --agent crush\n\
+                 Install Crush: https://crushcode.ai"
+            );
+        }
         Self::from_str(s).ok_or_else(|| {
             let supported: Vec<&str> = Self::all_supported().iter().map(|a| a.cli_name()).collect();
             anyhow::anyhow!(
@@ -85,7 +95,7 @@ impl AgentKind {
             AgentKind::ClaudeCode => Some(".claude/rules"),
             AgentKind::Cursor => Some(".cursor/rules"),
             AgentKind::CopilotCli => Some(".github/instructions"),
-            AgentKind::Crush => Some(".crush/rules/"),
+            AgentKind::Crush => Some(".crush/rules"),
             // These agents use single-file configs -- user pastes content manually
             AgentKind::CodexCli | AgentKind::GeminiCli => None,
         }
@@ -451,6 +461,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_agent_kind_parse_cli_arg_opencode_migration_hint() {
+        // "opencode" and "open-code" must give a targeted migration hint, not generic error.
+        for removed in ["opencode", "open-code"] {
+            let err = AgentKind::parse_cli_arg(removed).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("opencode"),
+                "error should mention 'opencode', got: {msg}"
+            );
+            assert!(
+                msg.contains("crush"),
+                "error should mention 'crush' as replacement, got: {msg}"
+            );
+        }
+    }
+
     // ---- AgentKind::display_name / cli_name ----
 
     #[test]
@@ -497,7 +524,7 @@ mod tests {
             AgentKind::CopilotCli.rules_dir(),
             Some(".github/instructions")
         );
-        assert_eq!(AgentKind::Crush.rules_dir(), Some(".crush/rules/"));
+        assert_eq!(AgentKind::Crush.rules_dir(), Some(".crush/rules"));
         assert_eq!(AgentKind::CodexCli.rules_dir(), None);
         assert_eq!(AgentKind::GeminiCli.rules_dir(), None);
     }
