@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 // ============================================================================
 
 pub(super) const HOOK_SCRIPT_NAME: &str = "skim-rewrite.sh";
-pub(super) const SETTINGS_FILE: &str = "settings.json";
 pub(super) const SETTINGS_BACKUP: &str = "settings.json.bak";
 
 // ============================================================================

@@ -8,8 +8,8 @@ use super::helpers::{
     atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
 };
-use super::state::{detect_state, has_skim_hook_entry, DetectedState};
-use crate::cmd::hooks::generate_hook_script;
+use super::state::{detect_state, DetectedState};
+use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
 /// Verify that the target agent appears to be installed on this system.
@@ -344,43 +344,6 @@ fn backup_settings(
     Ok(())
 }
 
-/// Insert or update the skim hook entry in `hooks.PreToolUse`.
-fn upsert_hook_entry(
-    settings: &mut serde_json::Value,
-    hook_script_path: &str,
-) -> anyhow::Result<()> {
-    let obj = settings
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json root is not an object"))?;
-
-    let hooks = obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks' is not an object"))?;
-
-    let pre_tool_use = hooks
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json 'hooks.PreToolUse' is not an array"))?;
-
-    // Remove existing skim entry (to update in place)
-    pre_tool_use.retain(|entry| !has_skim_hook_entry(entry));
-
-    // Insert new entry
-    pre_tool_use.push(serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": hook_script_path,
-            "timeout": 5
-        }]
-    }));
-
-    Ok(())
-}
-
 fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
     // Ensure config dir exists
     if !state.config_dir.exists() {
@@ -401,16 +364,24 @@ fn patch_settings(state: &DetectedState) -> anyhow::Result<()> {
         );
     }
 
-    // Upsert hook entry
+    // Upsert hook entry via the agent-specific protocol (correct event key and format)
+    let agent = AgentKind::from_str(state.agent_cli_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unrecognised agent CLI name {:?}; this is a bug in state detection",
+            state.agent_cli_name
+        )
+    })?;
+    let protocol = protocol_for_agent(agent);
     let hook_script_path = state.config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-    upsert_hook_entry(&mut settings, &hook_script_path.display().to_string())?;
+    protocol.upsert_hook(&mut settings, &hook_script_path.display().to_string())?;
 
     atomic_write_settings(&settings, &real_path)?;
 
     println!(
-        "  {} Patched: {} (PreToolUse hook added)",
+        "  {} Patched: {} ({} hook added)",
         check_mark(true),
-        state.settings_path.display()
+        state.settings_path.display(),
+        protocol.hook_event_key(),
     );
 
     Ok(())
@@ -789,13 +760,16 @@ pub(super) fn print_dry_run_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::protocol_for_agent;
     use crate::cmd::init::helpers::guidance_content;
+    use crate::cmd::session::AgentKind;
 
     #[test]
     fn test_upsert_hook_entry_idempotent() {
+        let protocol = protocol_for_agent(AgentKind::ClaudeCode);
         let mut settings = serde_json::json!({});
-        upsert_hook_entry(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
-        upsert_hook_entry(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
+        protocol.upsert_hook(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
+        protocol.upsert_hook(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
 
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(

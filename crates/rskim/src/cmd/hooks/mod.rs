@@ -12,7 +12,7 @@
 //! | Agent       | Config file   | Event key    | Matcher |
 //! |-------------|---------------|--------------|---------|
 //! | Claude Code | settings.json | PreToolUse   | Bash    |
-//! | Cursor      | hooks.json    | beforeShellExecution | (n/a) |
+//! | Cursor      | settings.json | PreToolUse   | Bash    |
 //! | Gemini CLI  | settings.json | BeforeTool   | Bash    |
 //! | Copilot CLI | settings.json | preToolUse   | Bash    |
 //! | Crush       | crush.json    | PreToolUse   | Bash    |

@@ -307,16 +307,29 @@ fn read_settings_guarded(path: &Path) -> Option<serde_json::Value> {
 /// Check whether a Gemini CLI settings object contains any hook whose
 /// command references "skim".
 fn has_skim_hook_in_settings(settings: &serde_json::Value) -> bool {
-    let hooks = match settings.get("hooks").and_then(|v| v.as_object()) {
-        Some(h) => h,
-        None => return false,
+    let Some(hooks) = settings.get("hooks").and_then(|v| v.as_object()) else {
+        return false;
     };
     hooks.values().any(|arr| {
         arr.as_array().is_some_and(|entries| {
             entries.iter().any(|e| {
-                e.get("command")
+                // Check flat format: entry.command (legacy Gemini CLI format)
+                let flat_match = e
+                    .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|cmd| cmd.contains("skim"))
+                    .is_some_and(|cmd| cmd.contains("skim"));
+                // Check nested format: entry.hooks[].command (standard skim install format)
+                let nested_match = e
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|inner| {
+                        inner.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|cmd| cmd.contains("skim"))
+                        })
+                    });
+                flat_match || nested_match
             })
         })
     })
@@ -547,6 +560,33 @@ mod tests {
     #[test]
     fn test_has_skim_hook_in_settings_no_hooks() {
         let settings = serde_json::json!({ "theme": "dark" });
+        assert!(!has_skim_hook_in_settings(&settings));
+    }
+
+    #[test]
+    fn test_has_skim_hook_in_settings_nested_format() {
+        // Standard skim install format: entry.hooks[].command
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/home/.crush/hooks/skim-rewrite.sh"}]
+                }]
+            }
+        });
+        assert!(has_skim_hook_in_settings(&settings));
+    }
+
+    #[test]
+    fn test_has_skim_hook_in_settings_nested_no_match() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/usr/bin/other-tool"}]
+                }]
+            }
+        });
         assert!(!has_skim_hook_in_settings(&settings));
     }
 
