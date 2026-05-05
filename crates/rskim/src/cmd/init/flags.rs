@@ -63,20 +63,31 @@ impl DetectionEnv {
     /// Call this in `main`-adjacent code, then thread the struct down to
     /// callers — never call from within library functions.
     pub(super) fn from_process() -> Self {
+        let read = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
         Self {
             home_dir: dirs::home_dir(),
-            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(std::path::PathBuf::from),
-            cursor_config_dir: std::env::var_os("CURSOR_CONFIG_DIR")
-                .map(std::path::PathBuf::from),
-            gemini_config_dir: std::env::var_os("GEMINI_CONFIG_DIR")
-                .map(std::path::PathBuf::from),
-            copilot_config_dir: std::env::var_os("COPILOT_CONFIG_DIR")
-                .map(std::path::PathBuf::from),
-            codex_config_dir: std::env::var_os("CODEX_CONFIG_DIR")
-                .map(std::path::PathBuf::from),
-            crush_config_dir: std::env::var_os("CRUSH_CONFIG_DIR")
-                .map(std::path::PathBuf::from),
+            claude_config_dir: read("CLAUDE_CONFIG_DIR"),
+            cursor_config_dir: read("CURSOR_CONFIG_DIR"),
+            gemini_config_dir: read("GEMINI_CONFIG_DIR"),
+            copilot_config_dir: read("COPILOT_CONFIG_DIR"),
+            codex_config_dir: read("CODEX_CONFIG_DIR"),
+            crush_config_dir: read("CRUSH_CONFIG_DIR"),
+        }
+    }
+
+    /// Return the per-agent config-dir override for `agent`, if any.
+    ///
+    /// Single enumeration point for the agent → override-field mapping.
+    /// `any_override` and the filter match in [`detect_installed_agents`]
+    /// both delegate here so that adding a new agent only requires one edit.
+    pub(super) fn override_for(&self, agent: AgentKind) -> Option<&std::path::Path> {
+        match agent {
+            AgentKind::ClaudeCode => self.claude_config_dir.as_deref(),
+            AgentKind::Cursor => self.cursor_config_dir.as_deref(),
+            AgentKind::GeminiCli => self.gemini_config_dir.as_deref(),
+            AgentKind::CopilotCli => self.copilot_config_dir.as_deref(),
+            AgentKind::CodexCli => self.codex_config_dir.as_deref(),
+            AgentKind::Crush => self.crush_config_dir.as_deref(),
         }
     }
 }
@@ -98,12 +109,9 @@ impl DetectionEnv {
 ///
 /// Returns an empty `Vec` when no supported agents are found.
 pub(super) fn detect_installed_agents(env: &DetectionEnv) -> Vec<AgentKind> {
-    let any_override = env.claude_config_dir.is_some()
-        || env.cursor_config_dir.is_some()
-        || env.gemini_config_dir.is_some()
-        || env.copilot_config_dir.is_some()
-        || env.codex_config_dir.is_some()
-        || env.crush_config_dir.is_some();
+    let any_override = AgentKind::all_supported()
+        .iter()
+        .any(|&a| env.override_for(a).is_some());
 
     AgentKind::all_supported()
         .iter()
@@ -111,15 +119,9 @@ pub(super) fn detect_installed_agents(env: &DetectionEnv) -> Vec<AgentKind> {
             if any_override {
                 // In override mode: only include agents with an explicit env path
                 // that points to an existing directory.
-                let override_path: Option<&std::path::PathBuf> = match agent {
-                    AgentKind::ClaudeCode => env.claude_config_dir.as_ref(),
-                    AgentKind::Cursor => env.cursor_config_dir.as_ref(),
-                    AgentKind::GeminiCli => env.gemini_config_dir.as_ref(),
-                    AgentKind::CopilotCli => env.copilot_config_dir.as_ref(),
-                    AgentKind::CodexCli => env.codex_config_dir.as_ref(),
-                    AgentKind::Crush => env.crush_config_dir.as_ref(),
-                };
-                override_path.map(|p| p.is_dir()).unwrap_or(false)
+                env.override_for(agent)
+                    .map(|p| p.is_dir())
+                    .unwrap_or(false)
             } else {
                 // Normal mode: detect by home-dir presence
                 env.home_dir
@@ -135,22 +137,24 @@ pub(super) fn detect_installed_agents(env: &DetectionEnv) -> Vec<AgentKind> {
 /// Resolve the target agent from flags (single-agent compatibility shim).
 ///
 /// - If `flags.agent` is `Some(kind)`, return it directly.
-/// - If `None`, scan for installed agents (home-dir detection) and return the
+/// - If `None`, scan for installed agents via `env.home_dir` and return the
 ///   first found. Falls back to `AgentKind::ClaudeCode` when nothing is detected
 ///   (mirrors old default behaviour so `skim init` without `--agent` still works
 ///   on a clean system).
 ///
+/// Accepts a [`DetectionEnv`] so that callers can inject a controlled home dir
+/// in tests — the same DI pattern used by [`detect_installed_agents`].
+///
 /// Used by `run_uninstall` for single-agent uninstall. Install uses
 /// `detect_installed_agents()` instead to support multi-agent auto-detect.
-pub(super) fn resolve_agent(flags: &InitFlags) -> AgentKind {
+pub(super) fn resolve_agent(flags: &InitFlags, env: &DetectionEnv) -> AgentKind {
     if let Some(agent) = flags.agent {
         return agent;
     }
 
     // Auto-detect: pick the first agent whose config directory exists.
-    let home = dirs::home_dir();
     for &agent in AgentKind::all_supported() {
-        if let Some(ref h) = home {
+        if let Some(ref h) = env.home_dir {
             let config_dir = agent.config_dir(h);
             if config_dir.is_dir() {
                 return agent;
@@ -427,13 +431,15 @@ mod tests {
             no_guidance: false,
             agent: Some(AgentKind::Cursor),
         };
-        assert_eq!(resolve_agent(&flags), AgentKind::Cursor);
+        // env is unused when agent is explicit; default env is fine
+        assert_eq!(resolve_agent(&flags, &DetectionEnv::default()), AgentKind::Cursor);
     }
 
     #[test]
     fn test_resolve_agent_fallback_when_none() {
-        // When agent is None and no agents are installed (temp home doesn't exist),
-        // should fall back to ClaudeCode
+        // Inject a non-existent home dir so no agent config dirs can match,
+        // forcing the ClaudeCode fallback. Previously called dirs::home_dir()
+        // directly, making this branch untestable.
         let flags = InitFlags {
             project: false,
             yes: false,
@@ -443,12 +449,16 @@ mod tests {
             no_guidance: false,
             agent: None,
         };
-        // We can't control dirs::home_dir(), but we can assert the fallback works
-        // without panicking and returns a valid AgentKind
-        let resolved = resolve_agent(&flags);
-        assert!(
-            AgentKind::all_supported().contains(&resolved),
-            "resolve_agent should return a supported agent, got: {resolved:?}"
+        let env = DetectionEnv {
+            home_dir: Some(std::path::PathBuf::from(
+                "/tmp/__skim_test_nonexistent_home_dir__",
+            )),
+            ..DetectionEnv::default()
+        };
+        assert_eq!(
+            resolve_agent(&flags, &env),
+            AgentKind::ClaudeCode,
+            "should fall back to ClaudeCode when no agent config dirs exist"
         );
     }
 }

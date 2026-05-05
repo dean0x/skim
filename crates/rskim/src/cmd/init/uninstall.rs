@@ -87,7 +87,7 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
 
 /// Uninstall skim for a single explicit agent (dispatched by `run_uninstall`).
 fn run_uninstall_single(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agent = resolve_agent(flags);
+    let agent = resolve_agent(flags, &DetectionEnv::from_process());
     run_uninstall_for_agent(flags, agent)
 }
 
