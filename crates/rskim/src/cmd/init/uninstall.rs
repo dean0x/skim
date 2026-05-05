@@ -1,6 +1,8 @@
 //! Uninstall flow for `skim init` (B10).
 
-use super::flags::{detect_installed_agents, resolve_agent, resolve_single_agent, DetectionEnv, InitFlags};
+use super::flags::{
+    detect_installed_agents, resolve_agent, resolve_single_agent, DetectionEnv, InitFlags,
+};
 use super::helpers::{
     atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
     resolve_config_dir_for_agent, resolve_real_settings_path, HOOK_SCRIPT_NAME,
@@ -19,10 +21,7 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value, event_key: &str) 
     };
 
     if let Some(hooks_obj) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        if let Some(arr) = hooks_obj
-            .get_mut(event_key)
-            .and_then(|p| p.as_array_mut())
-        {
+        if let Some(arr) = hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
             arr.retain(|entry| !has_skim_hook_entry(entry));
             if arr.is_empty() {
                 hooks_obj.remove(event_key);
@@ -69,7 +68,11 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
             Ok(code) if code == std::process::ExitCode::SUCCESS => {}
             Ok(code) => {
                 any_failed = true;
-                eprintln!("  ✗ {}: uninstall failed (exit code: {:?})", agent.display_name(), code);
+                eprintln!(
+                    "  ✗ {}: uninstall failed (exit code: {:?})",
+                    agent.display_name(),
+                    code
+                );
             }
             Err(e) => {
                 any_failed = true;
@@ -91,7 +94,10 @@ fn run_uninstall_single(flags: &InitFlags) -> anyhow::Result<std::process::ExitC
     run_uninstall_for_agent(flags, agent)
 }
 
-fn run_uninstall_for_agent(flags: &InitFlags, agent: crate::cmd::session::AgentKind) -> anyhow::Result<std::process::ExitCode> {
+fn run_uninstall_for_agent(
+    flags: &InitFlags,
+    agent: crate::cmd::session::AgentKind,
+) -> anyhow::Result<std::process::ExitCode> {
     let protocol = protocol_for_agent(agent);
     let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
     let settings_path = config_dir.join(protocol.config_filename());

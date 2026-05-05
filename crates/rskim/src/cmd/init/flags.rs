@@ -119,9 +119,7 @@ pub(super) fn detect_installed_agents(env: &DetectionEnv) -> Vec<AgentKind> {
             if any_override {
                 // In override mode: only include agents with an explicit env path
                 // that points to an existing directory.
-                env.override_for(agent)
-                    .map(|p| p.is_dir())
-                    .unwrap_or(false)
+                env.override_for(agent).map(|p| p.is_dir()).unwrap_or(false)
             } else {
                 // Normal mode: detect by home-dir presence
                 env.home_dir
@@ -395,7 +393,11 @@ mod tests {
             crush_config_dir: None,
         };
         let detected = detect_installed_agents(&env);
-        assert_eq!(detected.len(), 2, "should detect exactly the two agents whose env paths exist");
+        assert_eq!(
+            detected.len(),
+            2,
+            "should detect exactly the two agents whose env paths exist"
+        );
         assert!(detected.contains(&AgentKind::ClaudeCode));
         assert!(detected.contains(&AgentKind::GeminiCli));
     }
@@ -432,7 +434,10 @@ mod tests {
             agent: Some(AgentKind::Cursor),
         };
         // env is unused when agent is explicit; default env is fine
-        assert_eq!(resolve_agent(&flags, &DetectionEnv::default()), AgentKind::Cursor);
+        assert_eq!(
+            resolve_agent(&flags, &DetectionEnv::default()),
+            AgentKind::Cursor
+        );
     }
 
     #[test]

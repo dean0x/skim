@@ -82,7 +82,11 @@ impl HookProtocol for CopilotCliHook {
 
     /// Copilot's config wraps event arrays in `{ "version": 1, "hooks": { "preToolUse": [...] } }`.
     /// Delegates to the shared `upsert_hook_versioned` helper.
-    fn upsert_hook(&self, config: &mut serde_json::Value, hook_script_path: &str) -> anyhow::Result<()> {
+    fn upsert_hook(
+        &self,
+        config: &mut serde_json::Value,
+        hook_script_path: &str,
+    ) -> anyhow::Result<()> {
         super::upsert_hook_versioned(config, hook_script_path, self)
     }
 }
@@ -235,8 +239,7 @@ mod tests {
         let entry = hook().build_config_entry("/home/user/.github/hooks/skim-rewrite.sh");
         // Must use "bash" field, not "command"
         assert_eq!(
-            entry["bash"],
-            "/home/user/.github/hooks/skim-rewrite.sh",
+            entry["bash"], "/home/user/.github/hooks/skim-rewrite.sh",
             "Copilot entries must use 'bash' field"
         );
         assert!(
@@ -289,8 +292,12 @@ mod tests {
     #[test]
     fn test_copilot_upsert_hook_idempotent() {
         let mut config = serde_json::json!({});
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
 
         let entries = config["hooks"]["preToolUse"].as_array().unwrap();
         assert_eq!(
@@ -303,10 +310,18 @@ mod tests {
     #[test]
     fn test_copilot_upsert_hook_uses_pre_tool_use_lowercase() {
         let mut config = serde_json::json!({});
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
 
-        assert!(config["hooks"]["preToolUse"].is_array(), "should use lowercase preToolUse");
-        assert!(config["hooks"].get("PreToolUse").is_none(), "should NOT use uppercase PreToolUse");
+        assert!(
+            config["hooks"]["preToolUse"].is_array(),
+            "should use lowercase preToolUse"
+        );
+        assert!(
+            config["hooks"].get("PreToolUse").is_none(),
+            "should NOT use uppercase PreToolUse"
+        );
     }
 
     #[test]
@@ -325,7 +340,8 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(hook().detect_hook(dir.path()));
     }
 }

@@ -221,7 +221,9 @@ mod tests {
     #[test]
     fn test_crush_upsert_hook_into_crush_json_format() {
         let mut config = serde_json::json!({});
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
 
         let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
@@ -244,7 +246,8 @@ mod tests {
         std::fs::write(
             dir.path().join("crush.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(hook().detect_hook(dir.path()));
     }
 
@@ -264,7 +267,11 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
-        assert!(!hook().detect_hook(dir.path()), "crush should not detect hook from settings.json");
+        )
+        .unwrap();
+        assert!(
+            !hook().detect_hook(dir.path()),
+            "crush should not detect hook from settings.json"
+        );
     }
 }

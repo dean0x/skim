@@ -244,19 +244,31 @@ mod tests {
         // Matcher must be run_shell_command (not Bash)
         assert_eq!(entry["matcher"], "run_shell_command");
         // Timeout must be 60000 (milliseconds)
-        let hooks_arr = entry["hooks"].as_array().expect("entry should have hooks array");
-        let timeout = hooks_arr[0]["timeout"].as_u64().expect("timeout should be u64");
+        let hooks_arr = entry["hooks"]
+            .as_array()
+            .expect("entry should have hooks array");
+        let timeout = hooks_arr[0]["timeout"]
+            .as_u64()
+            .expect("timeout should be u64");
         assert_eq!(timeout, 60000, "Gemini timeout must be 60000 ms");
     }
 
     #[test]
     fn test_gemini_upsert_hook_uses_before_tool() {
         let mut config = serde_json::json!({});
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
 
         // Should be under BeforeTool, not PreToolUse
-        assert!(config["hooks"]["BeforeTool"].is_array(), "should use BeforeTool event key");
-        assert!(config["hooks"].get("PreToolUse").is_none(), "should NOT use PreToolUse");
+        assert!(
+            config["hooks"]["BeforeTool"].is_array(),
+            "should use BeforeTool event key"
+        );
+        assert!(
+            config["hooks"].get("PreToolUse").is_none(),
+            "should NOT use PreToolUse"
+        );
     }
 
     #[test]
@@ -273,7 +285,8 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(hook().detect_hook(dir.path()));
     }
 }

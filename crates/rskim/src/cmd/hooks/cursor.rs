@@ -94,7 +94,11 @@ impl HookProtocol for CursorHook {
     /// This differs from the Claude Code default which stores hooks directly at
     /// the top level without a version wrapper. Delegates to the shared
     /// `upsert_hook_versioned` helper.
-    fn upsert_hook(&self, config: &mut serde_json::Value, hook_script_path: &str) -> anyhow::Result<()> {
+    fn upsert_hook(
+        &self,
+        config: &mut serde_json::Value,
+        hook_script_path: &str,
+    ) -> anyhow::Result<()> {
         super::upsert_hook_versioned(config, hook_script_path, self)
     }
 
@@ -250,7 +254,9 @@ mod tests {
     #[test]
     fn test_cursor_upsert_hook_creates_version_wrapper() {
         let mut config = serde_json::json!({});
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
 
         assert_eq!(config["version"], 1, "Cursor config must have version: 1");
         assert!(
@@ -262,8 +268,12 @@ mod tests {
     #[test]
     fn test_cursor_upsert_hook_idempotent() {
         let mut config = serde_json::json!({});
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
-        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
+        hook()
+            .upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
 
         let entries = config["hooks"]["preToolUse"].as_array().unwrap();
         assert_eq!(

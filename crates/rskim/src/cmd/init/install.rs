@@ -17,7 +17,11 @@ use crate::cmd::session::{AgentKind, InstructionEnv};
 /// Checks for the expected config directory. If the agent's config dir
 /// doesn't exist, returns an error with a helpful message rather than
 /// silently creating an orphan config.
-fn verify_agent_installed(state: &DetectedState, agent: AgentKind, flags: &InitFlags) -> anyhow::Result<()> {
+fn verify_agent_installed(
+    state: &DetectedState,
+    agent: AgentKind,
+    flags: &InitFlags,
+) -> anyhow::Result<()> {
     // Claude Code: always proceed (we create ~/.claude/ if needed)
     if agent == AgentKind::ClaudeCode {
         return Ok(());
@@ -58,7 +62,12 @@ fn verify_agent_installed(state: &DetectedState, agent: AgentKind, flags: &InitF
 /// - `--no-guidance` is set, or
 /// - The agent has no instruction file (guidance feature not applicable), or
 /// - The file content contains the versioned start marker for `skim_version`.
-fn is_guidance_current(agent: AgentKind, flags: &InitFlags, skim_version: &str, env: &InstructionEnv) -> bool {
+fn is_guidance_current(
+    agent: AgentKind,
+    flags: &InitFlags,
+    skim_version: &str,
+    env: &InstructionEnv,
+) -> bool {
     if flags.no_guidance {
         return true;
     }
@@ -161,7 +170,11 @@ fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::Ex
             Ok(code) if code == std::process::ExitCode::SUCCESS => {}
             Ok(code) => {
                 any_failed = true;
-                eprintln!("  ✗ {}: failed (exit code: {:?})", agent.display_name(), code);
+                eprintln!(
+                    "  ✗ {}: failed (exit code: {:?})",
+                    agent.display_name(),
+                    code
+                );
             }
             Err(e) => {
                 any_failed = true;
@@ -178,7 +191,10 @@ fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::Ex
 }
 
 /// Install skim for a single, explicit agent.
-fn run_install_single(flags: &InitFlags, agent: AgentKind) -> anyhow::Result<std::process::ExitCode> {
+fn run_install_single(
+    flags: &InitFlags,
+    agent: AgentKind,
+) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
     let state = detect_state(flags, agent)?;
 
@@ -888,8 +904,12 @@ mod tests {
     fn test_upsert_hook_entry_idempotent() {
         let protocol = protocol_for_agent(AgentKind::ClaudeCode);
         let mut settings = serde_json::json!({});
-        protocol.upsert_hook(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
-        protocol.upsert_hook(&mut settings, "/path/to/skim-rewrite.sh").unwrap();
+        protocol
+            .upsert_hook(&mut settings, "/path/to/skim-rewrite.sh")
+            .unwrap();
+        protocol
+            .upsert_hook(&mut settings, "/path/to/skim-rewrite.sh")
+            .unwrap();
 
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(

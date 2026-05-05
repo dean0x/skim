@@ -36,7 +36,10 @@ impl DetectedState {
     }
 }
 
-pub(super) fn detect_state(flags: &InitFlags, agent: crate::cmd::session::AgentKind) -> anyhow::Result<DetectedState> {
+pub(super) fn detect_state(
+    flags: &InitFlags,
+    agent: crate::cmd::session::AgentKind,
+) -> anyhow::Result<DetectedState> {
     let skim_binary = std::env::current_exe()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
     let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
@@ -188,7 +191,10 @@ fn scan_existing_hooks(
     other_hooks
 }
 
-pub(super) fn check_dual_scope(flags: &InitFlags, agent: crate::cmd::session::AgentKind) -> anyhow::Result<Option<String>> {
+pub(super) fn check_dual_scope(
+    flags: &InitFlags,
+    agent: crate::cmd::session::AgentKind,
+) -> anyhow::Result<Option<String>> {
     let other_dir = if flags.project {
         // Installing project-level, check global
         resolve_config_dir_for_agent(false, agent)?
@@ -439,7 +445,10 @@ mod tests {
         });
 
         let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash", &ClaudeCodeHook);
-        assert!(result.is_empty(), "entries with a different matcher should be ignored");
+        assert!(
+            result.is_empty(),
+            "entries with a different matcher should be ignored"
+        );
     }
 
     #[test]

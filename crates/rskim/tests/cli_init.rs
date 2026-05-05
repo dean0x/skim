@@ -1299,11 +1299,17 @@ fn test_init_multi_agent_auto_detect_installs_claude_and_gemini() {
 
     // Hook scripts must be created for both agents
     assert!(
-        project_dir.path().join(".claude/hooks/skim-rewrite.sh").exists(),
+        project_dir
+            .path()
+            .join(".claude/hooks/skim-rewrite.sh")
+            .exists(),
         "Claude Code hook script should be created"
     );
     assert!(
-        project_dir.path().join(".gemini/hooks/skim-rewrite.sh").exists(),
+        project_dir
+            .path()
+            .join(".gemini/hooks/skim-rewrite.sh")
+            .exists(),
         "Gemini CLI hook script should be created"
     );
 
@@ -1332,8 +1338,14 @@ fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
     // Verify hook scripts exist after install
     let claude_hook = project_dir.path().join(".claude/hooks/skim-rewrite.sh");
     let gemini_hook = project_dir.path().join(".gemini/hooks/skim-rewrite.sh");
-    assert!(claude_hook.exists(), "Claude Code hook should exist after install");
-    assert!(gemini_hook.exists(), "Gemini CLI hook should exist after install");
+    assert!(
+        claude_hook.exists(),
+        "Claude Code hook should exist after install"
+    );
+    assert!(
+        gemini_hook.exists(),
+        "Gemini CLI hook should exist after install"
+    );
 
     // Step 2: uninstall both agents without specifying --agent
     Command::cargo_bin("skim")

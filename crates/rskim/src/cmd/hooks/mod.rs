@@ -184,7 +184,11 @@ pub(crate) trait HookProtocol {
     /// Default implementation handles the Claude Code / Gemini / Copilot /
     /// Crush array-of-objects format. Cursor overrides this.
     #[allow(dead_code)]
-    fn upsert_hook(&self, config: &mut serde_json::Value, hook_script_path: &str) -> anyhow::Result<()> {
+    fn upsert_hook(
+        &self,
+        config: &mut serde_json::Value,
+        hook_script_path: &str,
+    ) -> anyhow::Result<()> {
         let obj = config
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
@@ -200,10 +204,7 @@ pub(crate) trait HookProtocol {
             .or_insert_with(|| serde_json::Value::Array(Vec::new()))
             .as_array_mut()
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "config 'hooks.{}' is not an array",
-                    self.hook_event_key()
-                )
+                anyhow::anyhow!("config 'hooks.{}' is not an array", self.hook_event_key())
             })?;
 
         // Remove existing skim entries (idempotent upsert)
@@ -220,10 +221,7 @@ pub(crate) trait HookProtocol {
     /// Returns `true` if any entries were removed, `false` if none found.
     #[allow(dead_code)]
     fn remove_skim_entries(&self, config: &mut serde_json::Value) -> bool {
-        let Some(hooks) = config
-            .get_mut("hooks")
-            .and_then(|h| h.as_object_mut())
-        else {
+        let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
             return false;
         };
 
@@ -666,7 +664,8 @@ mod tests {
     fn test_default_upsert_hook_creates_entry() {
         let hook = claude::ClaudeCodeHook;
         let mut config = serde_json::json!({});
-        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh").unwrap();
+        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh")
+            .unwrap();
 
         let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
@@ -677,11 +676,17 @@ mod tests {
     fn test_default_upsert_hook_idempotent() {
         let hook = claude::ClaudeCodeHook;
         let mut config = serde_json::json!({});
-        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh").unwrap();
-        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh").unwrap();
+        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh")
+            .unwrap();
+        hook.upsert_hook(&mut config, "/path/to/skim-rewrite.sh")
+            .unwrap();
 
         let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(entries.len(), 1, "idempotent upsert should not duplicate entries");
+        assert_eq!(
+            entries.len(),
+            1,
+            "idempotent upsert should not duplicate entries"
+        );
     }
 
     #[test]
@@ -695,7 +700,8 @@ mod tests {
                 }]
             }
         });
-        hook.upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook.upsert_hook(&mut config, "/path/skim-rewrite.sh")
+            .unwrap();
 
         let entries = config["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "should preserve non-skim entries");
@@ -748,7 +754,8 @@ mod tests {
         std::fs::write(
             config_dir.join("settings.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let hook = claude::ClaudeCodeHook;
         assert!(hook.detect_hook(config_dir));
@@ -762,7 +769,8 @@ mod tests {
         std::fs::write(
             config_dir.join("settings.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let hook = claude::ClaudeCodeHook;
         assert!(!hook.detect_hook(config_dir));
@@ -772,7 +780,10 @@ mod tests {
     fn test_default_detect_hook_missing_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let hook = claude::ClaudeCodeHook;
-        assert!(!hook.detect_hook(dir.path()), "missing config file should return false");
+        assert!(
+            !hook.detect_hook(dir.path()),
+            "missing config file should return false"
+        );
     }
 
     #[test]
@@ -790,7 +801,8 @@ mod tests {
         std::fs::write(
             config_dir.join("settings.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let hook = claude::ClaudeCodeHook;
         let others = hook.scan_other_hooks(config_dir);
@@ -818,7 +830,8 @@ mod tests {
         std::fs::write(
             config_dir.join("settings.json"),
             serde_json::to_string_pretty(&config).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let hook = claude::ClaudeCodeHook;
         let others = hook.scan_other_hooks(config_dir);
@@ -871,10 +884,7 @@ mod tests {
 
         let arr = config["hooks"]["preToolUse"].as_array().unwrap();
         assert_eq!(arr.len(), 2, "non-skim entry must be preserved");
-        let commands: Vec<&str> = arr
-            .iter()
-            .filter_map(|e| e["command"].as_str())
-            .collect();
+        let commands: Vec<&str> = arr.iter().filter_map(|e| e["command"].as_str()).collect();
         assert!(commands.contains(&"/usr/bin/other-hook"));
         assert!(commands.contains(&"/path/to/skim-rewrite.sh"));
     }

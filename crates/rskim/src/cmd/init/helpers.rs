@@ -273,9 +273,7 @@ pub(super) fn print_help() {
     println!("  --global            Install to user-level config directory (default)");
     println!("  --project           Install to project-level config directory");
     println!("  --agent <name>      Target agent (default: claude-code)");
-    println!(
-        "                      Supported: claude-code, cursor, gemini, copilot, codex, crush"
-    );
+    println!("                      Supported: claude-code, cursor, gemini, copilot, codex, crush");
     println!("  --yes, -y           Skip confirmation (uninstall only; install is always non-interactive)");
     println!("  --dry-run           Print actions without writing");
     println!("  --uninstall         Remove hook and clean up");

@@ -201,12 +201,24 @@ fn parse_crush_line(json: &serde_json::Value, session_id: &str) -> Option<ToolIn
         };
 
         let tool_input = match tool_name.as_str() {
-            "Bash" | "bash" | "shell" => ToolInput::Bash { command: str_field("command") },
-            "Read" | "read_file" => ToolInput::Read { file_path: str_field("file_path") },
-            "Write" | "write_file" => ToolInput::Write { file_path: str_field("file_path") },
-            "Edit" | "edit_file" => ToolInput::Edit { file_path: str_field("file_path") },
-            "Glob" | "glob" => ToolInput::Glob { pattern: str_field("pattern") },
-            "Grep" | "grep" => ToolInput::Grep { pattern: str_field("pattern") },
+            "Bash" | "bash" | "shell" => ToolInput::Bash {
+                command: str_field("command"),
+            },
+            "Read" | "read_file" => ToolInput::Read {
+                file_path: str_field("file_path"),
+            },
+            "Write" | "write_file" => ToolInput::Write {
+                file_path: str_field("file_path"),
+            },
+            "Edit" | "edit_file" => ToolInput::Edit {
+                file_path: str_field("file_path"),
+            },
+            "Glob" | "glob" => ToolInput::Glob {
+                pattern: str_field("pattern"),
+            },
+            "Grep" | "grep" => ToolInput::Grep {
+                pattern: str_field("pattern"),
+            },
             _ => ToolInput::Other {
                 tool_name: tool_name.clone(),
                 raw: input,
@@ -364,9 +376,13 @@ mod tests {
         let invocations = provider.parse_session(&session_file).unwrap();
         assert_eq!(invocations.len(), 2);
         assert_eq!(invocations[0].tool_name, "Bash");
-        assert!(matches!(&invocations[0].input, ToolInput::Bash { command } if command == "cargo test"));
+        assert!(
+            matches!(&invocations[0].input, ToolInput::Bash { command } if command == "cargo test")
+        );
         assert_eq!(invocations[1].tool_name, "Read");
-        assert!(matches!(&invocations[1].input, ToolInput::Read { file_path } if file_path == "/tmp/a.rs"));
+        assert!(
+            matches!(&invocations[1].input, ToolInput::Read { file_path } if file_path == "/tmp/a.rs")
+        );
     }
 
     /// parse_session skips malformed lines and blank lines — the BufReader path
