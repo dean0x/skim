@@ -1,5 +1,7 @@
 //! Shared helper functions and constants for `skim init`.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -116,6 +118,10 @@ pub(super) fn load_or_create_settings(path: &Path) -> anyhow::Result<serde_json:
 }
 
 /// Atomically write settings JSON to disk using tmp+rename.
+///
+/// On Unix, the temporary file is created with mode 0o600 (owner read/write only)
+/// before the rename, so the settings file is never world-readable — regardless
+/// of the process umask.
 pub(super) fn atomic_write_settings(
     settings: &serde_json::Value,
     path: &Path,
@@ -123,6 +129,14 @@ pub(super) fn atomic_write_settings(
     let pretty = serde_json::to_string_pretty(settings)?;
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, format!("{pretty}\n"))?;
+    #[cfg(unix)]
+    {
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+    }
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }

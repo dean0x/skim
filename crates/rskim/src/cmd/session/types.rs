@@ -237,9 +237,12 @@ impl std::fmt::Display for AgentKind {
 #[derive(Debug, Default)]
 pub(crate) struct InstructionEnv {
     pub home_dir: Option<PathBuf>,
-    pub claude_config_dir: Option<PathBuf>, // CLAUDE_CONFIG_DIR
-    pub codex_home: Option<PathBuf>,        // CODEX_HOME
-    pub crush_config_dir: Option<PathBuf>,  // CRUSH_CONFIG_DIR
+    /// `CLAUDE_CONFIG_DIR` override
+    pub claude_config_dir: Option<PathBuf>,
+    /// `CODEX_HOME` override
+    pub codex_home: Option<PathBuf>,
+    /// `CRUSH_CONFIG_DIR` override
+    pub crush_config_dir: Option<PathBuf>,
 }
 
 impl InstructionEnv {
