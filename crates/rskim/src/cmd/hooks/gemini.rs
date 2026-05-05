@@ -51,6 +51,16 @@ impl HookProtocol for GeminiCliHook {
     fn hook_event_key(&self) -> &'static str {
         "BeforeTool"
     }
+
+    /// Gemini CLI matches on `run_shell_command` (not `Bash`).
+    fn tool_matcher(&self) -> &'static str {
+        "run_shell_command"
+    }
+
+    /// Gemini CLI uses milliseconds for timeout (60 000 ms = 60 s).
+    fn hook_timeout(&self) -> u64 {
+        60000
+    }
 }
 
 // ============================================================================
@@ -215,6 +225,28 @@ mod tests {
     #[test]
     fn test_gemini_hook_event_key_is_before_tool() {
         assert_eq!(hook().hook_event_key(), "BeforeTool");
+    }
+
+    #[test]
+    fn test_gemini_tool_matcher() {
+        assert_eq!(hook().tool_matcher(), "run_shell_command");
+    }
+
+    #[test]
+    fn test_gemini_hook_timeout_is_milliseconds() {
+        // Gemini uses milliseconds — 60 000 ms = 60 s
+        assert_eq!(hook().hook_timeout(), 60000);
+    }
+
+    #[test]
+    fn test_gemini_build_config_entry_shape() {
+        let entry = hook().build_config_entry("/home/user/.gemini/hooks/skim-rewrite.sh");
+        // Matcher must be run_shell_command (not Bash)
+        assert_eq!(entry["matcher"], "run_shell_command");
+        // Timeout must be 60000 (milliseconds)
+        let hooks_arr = entry["hooks"].as_array().expect("entry should have hooks array");
+        let timeout = hooks_arr[0]["timeout"].as_u64().expect("timeout should be u64");
+        assert_eq!(timeout, 60000, "Gemini timeout must be 60000 ms");
     }
 
     #[test]

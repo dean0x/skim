@@ -1,6 +1,6 @@
 //! Uninstall flow for `skim init` (B10).
 
-use super::flags::{resolve_agent, InitFlags};
+use super::flags::{detect_installed_agents, resolve_agent, resolve_single_agent, InitFlags};
 use super::helpers::{
     atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
     resolve_config_dir_for_agent, resolve_real_settings_path, HOOK_SCRIPT_NAME,
@@ -35,7 +35,63 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value, event_key: &str) 
 }
 
 pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    if resolve_single_agent(flags).is_none() {
+        return run_uninstall_auto_detect(flags);
+    }
+    run_uninstall_single(flags)
+}
+
+/// Uninstall skim from all detected agents when no explicit `--agent` was given.
+fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let agents = detect_installed_agents();
+    if agents.is_empty() {
+        println!("  No supported agents found. Nothing to uninstall.");
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+
+    // Single-agent fast path: skip the loop overhead when only one agent is detected.
+    // Preserves original error propagation for test assertions.
+    if agents.len() == 1 {
+        let agent_flags = InitFlags {
+            agent: Some(agents[0]),
+            ..*flags
+        };
+        return run_uninstall_for_agent(&agent_flags, agents[0]);
+    }
+
+    let mut any_failed = false;
+    for &agent in &agents {
+        let agent_flags = InitFlags {
+            agent: Some(agent),
+            ..*flags
+        };
+        match run_uninstall_for_agent(&agent_flags, agent) {
+            Ok(code) if code == std::process::ExitCode::SUCCESS => {}
+            Ok(code) => {
+                any_failed = true;
+                eprintln!("  ✗ {}: uninstall failed (exit code: {:?})", agent.display_name(), code);
+            }
+            Err(e) => {
+                any_failed = true;
+                eprintln!("  ✗ {}: uninstall failed — {e}", agent.display_name());
+            }
+        }
+    }
+
+    Ok(if any_failed {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+/// Uninstall skim for a single explicit agent (dispatched by `run_uninstall`).
+fn run_uninstall_single(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
     let agent = resolve_agent(flags);
+    run_uninstall_for_agent(flags, agent)
+}
+
+fn run_uninstall_for_agent(flags: &InitFlags, agent: crate::cmd::session::AgentKind) -> anyhow::Result<std::process::ExitCode> {
     let protocol = protocol_for_agent(agent);
     let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
     let settings_path = config_dir.join(protocol.config_filename());

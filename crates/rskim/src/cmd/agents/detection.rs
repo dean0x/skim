@@ -127,9 +127,9 @@ fn detect_codex_cli(home: Option<&Path>) -> AgentStatus {
         None
     };
 
-    // Codex CLI has experimental hook support
+    // Codex CLI provides guidance only — hooks cannot rewrite commands yet
     let hooks = HookStatus::NotSupported {
-        note: "experimental hooks only",
+        note: "guidance only (hooks cannot rewrite commands yet)",
     };
 
     let rules = codex_dir.as_ref().map(|p| {

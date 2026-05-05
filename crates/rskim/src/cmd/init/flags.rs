@@ -3,7 +3,11 @@
 use crate::cmd::session::AgentKind;
 
 /// Parsed command-line flags for the init subcommand.
-#[derive(Debug)]
+///
+/// All fields are `Copy`-friendly primitive types so that the multi-agent
+/// install loop can create per-agent `InitFlags` values using struct-update
+/// syntax (`InitFlags { agent: Some(agent), ..flags }`) without cloning.
+#[derive(Debug, Clone, Copy)]
 pub(super) struct InitFlags {
     pub(super) project: bool,
     /// Accepted for backward compatibility (no-op for install, still used by uninstall).
@@ -20,13 +24,86 @@ pub(super) struct InitFlags {
     pub(super) agent: Option<AgentKind>,
 }
 
-/// Resolve the target agent from flags.
+/// Resolve a single explicit agent from flags, or `None` for auto-detect mode.
+///
+/// Returns `Some(kind)` when `--agent` was supplied explicitly.
+/// Returns `None` when no `--agent` flag was given (auto-detect mode).
+pub(super) fn resolve_single_agent(flags: &InitFlags) -> Option<AgentKind> {
+    flags.agent
+}
+
+/// Detect all agents whose config directories exist on this system.
+///
+/// Used in auto-detect mode (no `--agent` flag) to install/uninstall skim
+/// for every agent that is currently installed.
+///
+/// Respects agent-specific environment variable overrides
+/// (`CLAUDE_CONFIG_DIR`, `CURSOR_CONFIG_DIR`, `GEMINI_CONFIG_DIR`, etc.)
+/// so that integration tests using isolated temp directories are not affected
+/// by agents installed elsewhere on the system.
+///
+/// When `CLAUDE_CONFIG_DIR` is set but no equivalent env override exists for
+/// another agent, that agent is excluded from auto-detection. This ensures
+/// test isolation: setting only `CLAUDE_CONFIG_DIR` restricts auto-detect to
+/// Claude Code only.
+///
+/// Returns an empty `Vec` when no supported agents are found.
+pub(super) fn detect_installed_agents() -> Vec<AgentKind> {
+    // When agent-specific env var overrides are active, restrict detection to
+    // only those agents whose env var is set. This ensures test isolation:
+    // if `CLAUDE_CONFIG_DIR` is set but no other overrides, only Claude Code
+    // is detected, preserving the old single-agent test behaviour.
+    let claude_override = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let cursor_override = std::env::var("CURSOR_CONFIG_DIR").ok();
+    let gemini_override = std::env::var("GEMINI_CONFIG_DIR").ok();
+    let copilot_override = std::env::var("COPILOT_CONFIG_DIR").ok();
+    let codex_override = std::env::var("CODEX_CONFIG_DIR").ok();
+    let crush_override = std::env::var("CRUSH_CONFIG_DIR").ok();
+
+    let any_override = claude_override.is_some()
+        || cursor_override.is_some()
+        || gemini_override.is_some()
+        || copilot_override.is_some()
+        || codex_override.is_some()
+        || crush_override.is_some();
+
+    let home = dirs::home_dir();
+
+    AgentKind::all_supported()
+        .iter()
+        .filter(|&&agent| {
+            if any_override {
+                // In override mode: only include agents with an explicit env var
+                let env_path: Option<std::path::PathBuf> = match agent {
+                    AgentKind::ClaudeCode => claude_override.as_ref().map(std::path::PathBuf::from),
+                    AgentKind::Cursor => cursor_override.as_ref().map(std::path::PathBuf::from),
+                    AgentKind::GeminiCli => gemini_override.as_ref().map(std::path::PathBuf::from),
+                    AgentKind::CopilotCli => copilot_override.as_ref().map(std::path::PathBuf::from),
+                    AgentKind::CodexCli => codex_override.as_ref().map(std::path::PathBuf::from),
+                    AgentKind::Crush => crush_override.as_ref().map(std::path::PathBuf::from),
+                };
+                env_path.map(|p| p.is_dir()).unwrap_or(false)
+            } else {
+                // Normal mode: detect by home-dir presence
+                home.as_ref()
+                    .map(|h| agent.config_dir(h).is_dir())
+                    .unwrap_or(false)
+            }
+        })
+        .copied()
+        .collect()
+}
+
+/// Resolve the target agent from flags (single-agent compatibility shim).
 ///
 /// - If `flags.agent` is `Some(kind)`, return it directly.
 /// - If `None`, scan for installed agents (home-dir detection) and return the
 ///   first found. Falls back to `AgentKind::ClaudeCode` when nothing is detected
 ///   (mirrors old default behaviour so `skim init` without `--agent` still works
 ///   on a clean system).
+///
+/// Used by `run_uninstall` for single-agent uninstall. Install uses
+/// `detect_installed_agents()` instead to support multi-agent auto-detect.
 pub(super) fn resolve_agent(flags: &InitFlags) -> AgentKind {
     if let Some(agent) = flags.agent {
         return agent;
@@ -201,7 +278,66 @@ mod tests {
         assert_eq!(flags.agent, Some(AgentKind::Crush));
     }
 
-    // ---- resolve_agent ----
+    // ---- resolve_single_agent ----
+
+    #[test]
+    fn test_resolve_single_agent_returns_explicit() {
+        let flags = InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: Some(AgentKind::Cursor),
+        };
+        assert_eq!(resolve_single_agent(&flags), Some(AgentKind::Cursor));
+    }
+
+    #[test]
+    fn test_resolve_single_agent_returns_none_when_auto_detect() {
+        let flags = InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+        };
+        assert_eq!(resolve_single_agent(&flags), None);
+    }
+
+    // ---- detect_installed_agents ----
+
+    #[test]
+    fn test_detect_installed_agents_returns_subset_of_supported() {
+        // We can't control which agents are actually installed in the test env,
+        // but every returned agent must be in the supported list.
+        let detected = detect_installed_agents();
+        let supported = AgentKind::all_supported();
+        for agent in &detected {
+            assert!(
+                supported.contains(agent),
+                "detect_installed_agents returned unsupported agent: {agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_installed_agents_no_duplicates() {
+        let detected = detect_installed_agents();
+        for (i, a) in detected.iter().enumerate() {
+            for b in &detected[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "detect_installed_agents returned duplicate agent: {a:?}"
+                );
+            }
+        }
+    }
+
+    // ---- resolve_agent (compat shim) ----
 
     #[test]
     fn test_resolve_agent_explicit() {

@@ -9,14 +9,14 @@
 //! Claude Code `settings.json` / `hooks.PreToolUse` format. Agents that use a
 //! different on-disk format override the relevant methods:
 //!
-//! | Agent       | Config file   | Event key    | Matcher |
-//! |-------------|---------------|--------------|---------|
-//! | Claude Code | settings.json | PreToolUse   | Bash    |
-//! | Cursor      | settings.json | PreToolUse   | Bash    |
-//! | Gemini CLI  | settings.json | BeforeTool   | Bash    |
-//! | Copilot CLI | settings.json | preToolUse   | Bash    |
-//! | Crush       | crush.json    | PreToolUse   | Bash    |
-//! | Codex CLI   | (none)        | (none)       | (none)  |
+//! | Agent       | Config file   | Event key    | Matcher           |
+//! |-------------|---------------|--------------|-------------------|
+//! | Claude Code | settings.json | PreToolUse   | Bash              |
+//! | Cursor      | hooks.json    | preToolUse   | Shell             |
+//! | Gemini CLI  | settings.json | BeforeTool   | run_shell_command |
+//! | Copilot CLI | settings.json | preToolUse   | bash              |
+//! | Crush       | crush.json    | PreToolUse   | Bash              |
+//! | Codex CLI   | (none)        | (none)       | (none)            |
 
 pub(crate) mod claude;
 pub(crate) mod codex;

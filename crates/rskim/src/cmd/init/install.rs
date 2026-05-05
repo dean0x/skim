@@ -3,12 +3,12 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::flags::{resolve_agent, InitFlags};
+use super::flags::{detect_installed_agents, resolve_single_agent, InitFlags};
 use super::helpers::{
     atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
 };
-use super::state::{detect_state, DetectedState};
+use super::state::{detect_state, has_skim_hook_entry, read_settings_json, DetectedState};
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
@@ -120,8 +120,66 @@ fn print_completion_message(agent_name: &str) {
 }
 
 pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    if let Some(agent) = resolve_single_agent(flags) {
+        // Explicit --agent: single-agent mode
+        run_install_single(flags, agent)
+    } else {
+        // No --agent: auto-detect all installed agents
+        run_install_auto_detect(flags)
+    }
+}
+
+/// Install skim for all detected agents when no explicit `--agent` was given.
+fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let agents = detect_installed_agents();
+    if agents.is_empty() {
+        eprintln!(
+            "No supported agents found. Install one of: Claude Code, Cursor, Gemini CLI, \
+             Copilot CLI, Codex CLI, Crush"
+        );
+        return Ok(std::process::ExitCode::FAILURE);
+    }
+
+    // Single-agent fast path: skip the loop overhead when only one agent is detected.
+    // This also preserves the original error propagation behaviour (errors are returned
+    // rather than caught-and-summarised), which is important for test assertions.
+    if agents.len() == 1 {
+        let agent_flags = InitFlags {
+            agent: Some(agents[0]),
+            ..*flags
+        };
+        return run_install_single(&agent_flags, agents[0]);
+    }
+
+    let mut any_failed = false;
+    for &agent in &agents {
+        let agent_flags = InitFlags {
+            agent: Some(agent),
+            ..*flags
+        };
+        match run_install_single(&agent_flags, agent) {
+            Ok(code) if code == std::process::ExitCode::SUCCESS => {}
+            Ok(code) => {
+                any_failed = true;
+                eprintln!("  ✗ {}: failed (exit code: {:?})", agent.display_name(), code);
+            }
+            Err(e) => {
+                any_failed = true;
+                eprintln!("  ✗ {}: failed — {e}", agent.display_name());
+            }
+        }
+    }
+
+    Ok(if any_failed {
+        std::process::ExitCode::FAILURE
+    } else {
+        std::process::ExitCode::SUCCESS
+    })
+}
+
+/// Install skim for a single, explicit agent.
+fn run_install_single(flags: &InitFlags, agent: AgentKind) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
-    let agent = resolve_agent(flags);
     let state = detect_state(flags, agent)?;
 
     verify_agent_installed(&state, agent, flags)?;
@@ -204,7 +262,15 @@ fn execute_install(
     // B7: Create hook script
     create_hook_script(state)?;
 
-    // B8: Patch settings.json
+    // Legacy migration: if this is Cursor, clean skim entries from settings.json
+    // before writing to the correct hooks.json. This removes stale entries that
+    // may have been written in a previous skim version when Cursor was (incorrectly)
+    // treated as using the Claude Code settings.json / PreToolUse format.
+    if let Some(AgentKind::Cursor) = AgentKind::from_str(state.agent_cli_name) {
+        migrate_cursor_legacy_settings(&state.config_dir)?;
+    }
+
+    // B8: Patch settings.json (or hooks.json for Cursor)
     patch_settings(state)?;
 
     // Inject guidance into agent instruction file
@@ -310,6 +376,73 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
             state.agent_cli_name,
             HOOK_SCRIPT_NAME,
             &hash,
+        );
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Legacy Cursor migration (AC-9)
+// ============================================================================
+
+/// Remove skim hook entries from a JSON settings value, using the Claude Code
+/// format (nested `hooks` array under `hooks.<event_key>`).
+///
+/// This is the mirror of `remove_skim_from_settings` in `uninstall.rs`, but
+/// operating on a mutable `serde_json::Value` and a specific event key.
+fn remove_skim_entries_from_event(settings: &mut serde_json::Value, event_key: &str) -> bool {
+    let Some(obj) = settings.as_object_mut() else {
+        return false;
+    };
+
+    if let Some(hooks_obj) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        if let Some(arr) = hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
+            let before = arr.len();
+            arr.retain(|entry| !has_skim_hook_entry(entry));
+            let removed = arr.len() < before;
+            if arr.is_empty() {
+                hooks_obj.remove(event_key);
+            }
+            if hooks_obj.is_empty() {
+                obj.remove("hooks");
+            }
+            return removed;
+        }
+    }
+    false
+}
+
+/// Clean up skim hook entries from Cursor's legacy `settings.json`.
+///
+/// Earlier skim versions incorrectly wrote Cursor hook config to `settings.json`
+/// using the Claude Code / PreToolUse format. This migration removes those stale
+/// entries before writing to the correct `hooks.json` location, so both files
+/// are kept clean.
+///
+/// Non-fatal: if `settings.json` doesn't exist or can't be parsed, this is
+/// silently skipped (the correct `hooks.json` is still written).
+fn migrate_cursor_legacy_settings(config_dir: &std::path::Path) -> anyhow::Result<()> {
+    let legacy_path = config_dir.join("settings.json");
+    if !legacy_path.exists() {
+        return Ok(());
+    }
+
+    let Some(mut settings) = read_settings_json(&legacy_path) else {
+        return Ok(()); // Unreadable or invalid — skip silently
+    };
+
+    // Remove skim entries from all legacy event keys (both casing variants)
+    let removed_pre = remove_skim_entries_from_event(&mut settings, "PreToolUse");
+    let removed_lower = remove_skim_entries_from_event(&mut settings, "preToolUse");
+
+    if removed_pre || removed_lower {
+        // Atomic write to legacy path
+        let real_path = resolve_real_settings_path(&legacy_path)?;
+        atomic_write_settings(&settings, &real_path)?;
+        println!(
+            "  {} Cleaned legacy settings.json entry (migrated to hooks.json)",
+            check_mark(true)
         );
     }
 

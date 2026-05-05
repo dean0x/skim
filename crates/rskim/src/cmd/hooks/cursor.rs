@@ -1,14 +1,20 @@
 //! Cursor hook protocol implementation.
 //!
-//! Cursor uses `beforeShellExecution` hooks via `.cursor/hooks.json`.
+//! Cursor uses `preToolUse` hooks via `.cursor/hooks.json`.
 //! The hook reads JSON with command at top level (not nested under
 //! tool_input like Claude Code), rewrites if matched, and responds
 //! with `{ "permission": "allow", "updated_input": { "command": ... } }`.
+//!
+//! ## Config format (hooks.json)
+//!
+//! Cursor's hooks.json wraps entries in `{ "version": 1, "hooks": { "preToolUse": [...] } }`.
+//! Each entry is a flat object `{ "command": "<path>", "matcher": "Shell", "timeout": 5 }`.
+//! This differs from the Claude Code format which nests a `"hooks"` array inside each entry.
 
 use super::{HookInput, HookProtocol, HookSupport};
 use crate::cmd::session::AgentKind;
 
-/// Cursor hook implementation (`beforeShellExecution` via `.cursor/hooks.json`).
+/// Cursor hook implementation (`preToolUse` hooks via `.cursor/hooks.json`).
 pub(crate) struct CursorHook;
 
 impl HookProtocol for CursorHook {
@@ -50,6 +56,83 @@ impl HookProtocol for CursorHook {
 
     fn generate_script(&self, version: &str) -> String {
         super::generate_hook_script(version, "cursor")
+    }
+
+    // -------------------------------------------------------------------------
+    // Config lifecycle overrides — Cursor uses hooks.json with flat entry format
+    // -------------------------------------------------------------------------
+
+    /// Cursor stores hook config in `hooks.json` (not `settings.json`).
+    fn config_filename(&self) -> &'static str {
+        "hooks.json"
+    }
+
+    /// Cursor uses `preToolUse` (lowercase) as the event key.
+    fn hook_event_key(&self) -> &'static str {
+        "preToolUse"
+    }
+
+    /// Cursor matches on `Shell` tool name.
+    fn tool_matcher(&self) -> &'static str {
+        "Shell"
+    }
+
+    /// Cursor's config entry is a flat object (no nested `"hooks"` array).
+    ///
+    /// Format: `{ "command": "<path>", "matcher": "Shell", "timeout": 5 }`
+    fn build_config_entry(&self, hook_script_path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "command": hook_script_path,
+            "matcher": self.tool_matcher(),
+            "timeout": self.hook_timeout()
+        })
+    }
+
+    /// Cursor's `hooks.json` uses a top-level `"version"` field and wraps event
+    /// arrays under `"hooks": { "preToolUse": [...] }`.
+    ///
+    /// This differs from the Claude Code default which stores hooks directly at
+    /// the top level without a version wrapper.
+    fn upsert_hook(&self, config: &mut serde_json::Value, hook_script_path: &str) -> anyhow::Result<()> {
+        let obj = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
+
+        // Ensure version field is present
+        obj.entry("version").or_insert(serde_json::json!(1));
+
+        let hooks = obj
+            .entry("hooks")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("config 'hooks' is not an object"))?;
+
+        let event_arr = hooks
+            .entry(self.hook_event_key())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config 'hooks.{}' is not an array",
+                    self.hook_event_key()
+                )
+            })?;
+
+        // Remove existing skim entries (idempotent upsert)
+        event_arr.retain(|e| !self.is_skim_entry(e));
+
+        // Append new flat-format entry
+        event_arr.push(self.build_config_entry(hook_script_path));
+
+        Ok(())
+    }
+
+    /// Cursor entries are flat objects — skim entries have a top-level `"command"` field.
+    fn is_skim_entry(&self, entry: &serde_json::Value) -> bool {
+        entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("skim-rewrite"))
     }
 }
 
@@ -159,6 +242,91 @@ mod tests {
     fn test_cursor_generate_script_init_comment() {
         let script = hook().generate_script("1.0.0");
         assert!(script.contains("skim init --agent cursor"));
+    }
+
+    // ========================================================================
+    // Phase 4: Config lifecycle override tests (AC-2)
+    // ========================================================================
+
+    #[test]
+    fn test_cursor_config_filename() {
+        assert_eq!(hook().config_filename(), "hooks.json");
+    }
+
+    #[test]
+    fn test_cursor_hook_event_key() {
+        assert_eq!(hook().hook_event_key(), "preToolUse");
+    }
+
+    #[test]
+    fn test_cursor_tool_matcher() {
+        assert_eq!(hook().tool_matcher(), "Shell");
+    }
+
+    #[test]
+    fn test_cursor_build_config_entry_flat_format() {
+        // Cursor entries must be flat — no nested "hooks" array
+        let entry = hook().build_config_entry("/home/user/.cursor/hooks/skim-rewrite.sh");
+        assert_eq!(entry["command"], "/home/user/.cursor/hooks/skim-rewrite.sh");
+        assert_eq!(entry["matcher"], "Shell");
+        assert!(entry.get("timeout").is_some(), "should have timeout field");
+        assert!(
+            entry.get("hooks").is_none(),
+            "Cursor entries must NOT have a nested 'hooks' array"
+        );
+    }
+
+    #[test]
+    fn test_cursor_upsert_hook_creates_version_wrapper() {
+        let mut config = serde_json::json!({});
+        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+
+        assert_eq!(config["version"], 1, "Cursor config must have version: 1");
+        assert!(
+            config["hooks"]["preToolUse"].is_array(),
+            "entries should be under hooks.preToolUse"
+        );
+    }
+
+    #[test]
+    fn test_cursor_upsert_hook_idempotent() {
+        let mut config = serde_json::json!({});
+        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+        hook().upsert_hook(&mut config, "/path/skim-rewrite.sh").unwrap();
+
+        let entries = config["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "running upsert twice should produce exactly one entry, not a duplicate"
+        );
+    }
+
+    #[test]
+    fn test_cursor_is_skim_entry_positive() {
+        let entry = serde_json::json!({
+            "command": "/home/user/.cursor/hooks/skim-rewrite.sh",
+            "matcher": "Shell",
+            "timeout": 5
+        });
+        assert!(hook().is_skim_entry(&entry));
+    }
+
+    #[test]
+    fn test_cursor_is_skim_entry_negative() {
+        // Not a skim entry — different command
+        let other = serde_json::json!({
+            "command": "/home/user/.cursor/hooks/other-hook.sh",
+            "matcher": "Shell",
+            "timeout": 5
+        });
+        assert!(!hook().is_skim_entry(&other));
+
+        // Not a skim entry — no command field
+        let no_command = serde_json::json!({
+            "matcher": "Shell"
+        });
+        assert!(!hook().is_skim_entry(&no_command));
     }
 
     #[test]
