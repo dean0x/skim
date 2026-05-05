@@ -81,7 +81,7 @@ fn print_install_header(agent_name: &str) {
 }
 
 fn print_collision_warning(hooks: &[String]) {
-    println!("  WARNING: Other Bash PreToolUse hooks detected:");
+    println!("  WARNING: Other hooks detected for the same tool matcher:");
     for hook_cmd in hooks {
         println!("    - {hook_cmd}");
     }
@@ -186,8 +186,8 @@ fn run_install_single(flags: &InitFlags, agent: AgentKind) -> anyhow::Result<std
     print_install_header(agent.display_name());
     print_detected_state(&state);
 
-    if !state.existing_bash_hooks.is_empty() {
-        print_collision_warning(&state.existing_bash_hooks);
+    if !state.existing_hooks.is_empty() {
+        print_collision_warning(&state.existing_hooks);
     }
 
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);

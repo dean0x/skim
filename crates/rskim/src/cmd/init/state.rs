@@ -77,6 +77,7 @@ pub(super) fn detect_state(flags: &InitFlags, agent: crate::cmd::session::AgentK
         parsed_settings.as_ref(),
         protocol.hook_event_key(),
         protocol.tool_matcher(),
+        protocol.as_ref(),
     );
 
     // Dual-scope check (B5)
@@ -133,12 +134,14 @@ fn hook_script_uses_bare_command(config_dir: &Path) -> bool {
 ///
 /// `event_key` is the agent-specific hook event key (e.g., `"PreToolUse"`, `"BeforeTool"`).
 /// `tool_matcher` is the agent-specific matcher string (e.g., `"Bash"`, `"Shell"`, `"bash"`).
+/// `protocol` is used to determine whether an entry is a skim entry (agent-format-aware).
 /// Accepts `Option<&Value>` so callers can reuse an already-parsed settings file
 /// instead of re-reading from disk.
 fn scan_existing_hooks(
     parsed: Option<&serde_json::Value>,
     event_key: &str,
     tool_matcher: &str,
+    protocol: &dyn HookProtocol,
 ) -> Vec<String> {
     let Some(json) = parsed else {
         return Vec::new();
@@ -162,17 +165,25 @@ fn scan_existing_hooks(
         if !is_matching_tool {
             continue;
         }
-        // Skip skim entries
-        if has_skim_hook_entry(entry) {
+        // Skip skim entries using the agent-format-aware check.
+        if protocol.is_skim_entry(entry) {
             continue;
         }
-        // Extract command strings for reporting
+        // Claude Code / Gemini / Crush format: nested "hooks" array with "command" field.
         if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
             for hook in hooks {
                 if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
                     other_hooks.push(cmd.to_string());
                 }
             }
+        }
+        // Cursor flat format: top-level "command" field.
+        if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
+            other_hooks.push(cmd.to_string());
+        }
+        // Copilot CLI format: top-level "bash" field.
+        if let Some(cmd) = entry.get("bash").and_then(|c| c.as_str()) {
+            other_hooks.push(cmd.to_string());
         }
     }
 
@@ -238,7 +249,11 @@ pub(super) fn read_settings_json(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&contents).ok()
 }
 
-/// Check if a PreToolUse entry contains a skim hook (substring match on "skim-rewrite").
+/// Check if a PreToolUse entry contains a skim hook in Claude Code / Gemini / Crush format.
+///
+/// Checks for `"skim-rewrite"` substring in a nested `hooks[].command` value.
+/// This is the Claude Code / Gemini / Crush format. For Cursor and Copilot CLI,
+/// use `protocol.is_skim_entry()` which dispatches to agent-specific logic.
 pub(crate) fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
     entry
         .get("hooks")
@@ -331,6 +346,9 @@ pub(super) fn extract_hook_version_from_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::hooks::claude::ClaudeCodeHook;
+    use crate::cmd::hooks::copilot::CopilotCliHook;
+    use crate::cmd::hooks::cursor::CursorHook;
 
     #[test]
     fn test_hook_script_uses_bare_command_new_format() {
@@ -367,13 +385,13 @@ mod tests {
     #[test]
     fn test_scan_existing_hooks_none_input() {
         // No parsed settings at all
-        let result = scan_existing_hooks(None, "PreToolUse", "Bash");
+        let result = scan_existing_hooks(None, "PreToolUse", "Bash", &ClaudeCodeHook);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_scan_existing_hooks_no_other_hooks() {
-        // Only skim hook
+        // Only skim hook — Claude Code format
         let settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
@@ -383,13 +401,13 @@ mod tests {
             }
         });
 
-        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash");
+        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash", &ClaudeCodeHook);
         assert!(result.is_empty(), "skim entries should be excluded");
     }
 
     #[test]
     fn test_scan_existing_hooks_detects_other_hook() {
-        // Settings with both skim and another hook with the same matcher
+        // Settings with both skim and another hook with the same matcher (Claude Code format)
         let settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
@@ -405,7 +423,7 @@ mod tests {
             }
         });
 
-        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash");
+        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash", &ClaudeCodeHook);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "/usr/bin/other-security-hook");
     }
@@ -422,8 +440,86 @@ mod tests {
             }
         });
 
-        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash");
+        let result = scan_existing_hooks(Some(&settings), "PreToolUse", "Bash", &ClaudeCodeHook);
         assert!(result.is_empty(), "entries with a different matcher should be ignored");
+    }
+
+    #[test]
+    fn test_scan_existing_hooks_cursor_format() {
+        // Cursor flat format: non-skim entry uses top-level "command" field
+        let settings = serde_json::json!({
+            "hooks": {
+                "preToolUse": [
+                    {
+                        "matcher": "Shell",
+                        "command": "/home/.cursor/hooks/skim-rewrite.sh"
+                    },
+                    {
+                        "matcher": "Shell",
+                        "command": "/usr/bin/other-cursor-hook"
+                    }
+                ]
+            }
+        });
+
+        let result = scan_existing_hooks(Some(&settings), "preToolUse", "Shell", &CursorHook);
+        assert_eq!(result.len(), 1, "non-skim Cursor entry should be detected");
+        assert_eq!(result[0], "/usr/bin/other-cursor-hook");
+    }
+
+    #[test]
+    fn test_scan_existing_hooks_cursor_skim_entry_excluded() {
+        // Cursor skim entry should be excluded from collision results
+        let settings = serde_json::json!({
+            "hooks": {
+                "preToolUse": [{
+                    "matcher": "Shell",
+                    "command": "/home/.cursor/hooks/skim-rewrite.sh"
+                }]
+            }
+        });
+
+        let result = scan_existing_hooks(Some(&settings), "preToolUse", "Shell", &CursorHook);
+        assert!(result.is_empty(), "Cursor skim entry should be excluded");
+    }
+
+    #[test]
+    fn test_scan_existing_hooks_copilot_format() {
+        // Copilot CLI format: non-skim entry uses top-level "bash" field
+        let settings = serde_json::json!({
+            "hooks": {
+                "preToolUse": [
+                    {
+                        "matcher": "bash",
+                        "bash": "/home/.github/hooks/skim-rewrite.sh"
+                    },
+                    {
+                        "matcher": "bash",
+                        "bash": "/usr/bin/other-copilot-hook"
+                    }
+                ]
+            }
+        });
+
+        let result = scan_existing_hooks(Some(&settings), "preToolUse", "bash", &CopilotCliHook);
+        assert_eq!(result.len(), 1, "non-skim Copilot entry should be detected");
+        assert_eq!(result[0], "/usr/bin/other-copilot-hook");
+    }
+
+    #[test]
+    fn test_scan_existing_hooks_copilot_skim_entry_excluded() {
+        // Copilot skim entry should be excluded from collision results
+        let settings = serde_json::json!({
+            "hooks": {
+                "preToolUse": [{
+                    "matcher": "bash",
+                    "bash": "/home/.github/hooks/skim-rewrite.sh"
+                }]
+            }
+        });
+
+        let result = scan_existing_hooks(Some(&settings), "preToolUse", "bash", &CopilotCliHook);
+        assert!(result.is_empty(), "Copilot skim entry should be excluded");
     }
 
     // ---- parse_version_from_script ----
