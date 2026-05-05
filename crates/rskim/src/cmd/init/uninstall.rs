@@ -1,6 +1,6 @@
 //! Uninstall flow for `skim init` (B10).
 
-use super::flags::{detect_installed_agents, resolve_agent, resolve_single_agent, InitFlags};
+use super::flags::{detect_installed_agents, resolve_agent, resolve_single_agent, DetectionEnv, InitFlags};
 use super::helpers::{
     atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
     resolve_config_dir_for_agent, resolve_real_settings_path, HOOK_SCRIPT_NAME,
@@ -43,7 +43,7 @@ pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::E
 
 /// Uninstall skim from all detected agents when no explicit `--agent` was given.
 fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agents = detect_installed_agents();
+    let agents = detect_installed_agents(&DetectionEnv::from_process());
     if agents.is_empty() {
         println!("  No supported agents found. Nothing to uninstall.");
         return Ok(std::process::ExitCode::SUCCESS);

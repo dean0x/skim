@@ -560,8 +560,20 @@ fn test_rewrite_hook_agent_crush_real_hook() {
         .unwrap();
 
     assert!(output.status.success());
-    let _stdout = String::from_utf8(output.stdout).unwrap();
-    // Crush should produce either a rewritten response or empty (passthrough)
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("Crush hook mode should emit valid JSON");
+    assert_eq!(
+        json["decision"], "allow",
+        "Crush response should have decision=allow"
+    );
+    assert!(
+        json["updated_input"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("skim cargo test"),
+        "Crush response should contain rewritten command"
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.is_empty(),

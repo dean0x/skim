@@ -3,7 +3,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::flags::{detect_installed_agents, resolve_single_agent, InitFlags};
+use super::flags::{detect_installed_agents, resolve_single_agent, DetectionEnv, InitFlags};
 use super::helpers::{
     atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
@@ -131,7 +131,7 @@ pub(super) fn run_install(flags: &InitFlags) -> anyhow::Result<std::process::Exi
 
 /// Install skim for all detected agents when no explicit `--agent` was given.
 fn run_install_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agents = detect_installed_agents();
+    let agents = detect_installed_agents(&DetectionEnv::from_process());
     if agents.is_empty() {
         eprintln!(
             "No supported agents found. Install one of: Claude Code, Cursor, Gemini CLI, \
