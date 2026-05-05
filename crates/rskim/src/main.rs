@@ -477,14 +477,11 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     }
 
     // --filename is only valid when the single argument is '-' (stdin)
-    if args.filename.is_some() {
-        let is_stdin = args.files.len() == 1 && args.files[0] == "-";
-        if !is_stdin {
-            anyhow::bail!(
-                "--filename is only valid when reading from stdin (file argument is '-')\n\
-                 For files on disk, language is auto-detected from the file extension."
-            );
-        }
+    if args.filename.is_some() && !(args.files.len() == 1 && args.files[0] == "-") {
+        anyhow::bail!(
+            "--filename is only valid when reading from stdin (file argument is '-')\n\
+             For files on disk, language is auto-detected from the file extension."
+        );
     }
 
     Ok(())
@@ -593,6 +590,15 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         line_numbers: args.line_numbers,
     };
 
+    let multi_options = multi::MultiFileOptions {
+        process: process_options,
+        no_header: args.no_header,
+        jobs: args.jobs,
+        no_ignore: args.no_ignore,
+        analytics_enabled: analytics.enabled,
+        session_id: analytics.session_id.clone(),
+    };
+
     // === Single-argument path (existing behaviour, unchanged) ===
     if args.files.len() == 1 {
         let file = &args.files[0];
@@ -611,15 +617,6 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         }
 
         let path = PathBuf::from(file);
-
-        let multi_options = multi::MultiFileOptions {
-            process: process_options,
-            no_header: args.no_header,
-            jobs: args.jobs,
-            no_ignore: args.no_ignore,
-            analytics_enabled: analytics.enabled,
-            session_id: analytics.session_id.clone(),
-        };
 
         if path.is_dir() {
             return multi::process_directory(&path, multi_options);
@@ -655,17 +652,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
     // Expand each argument: glob pattern → expand, directory → collect,
     // plain file → add directly.  All results are gathered into a single Vec
     // and processed together via process_files.
-    let multi_options = multi::MultiFileOptions {
-        process: process_options,
-        no_header: args.no_header,
-        jobs: args.jobs,
-        no_ignore: args.no_ignore,
-        analytics_enabled: analytics.enabled,
-        session_id: analytics.session_id.clone(),
-    };
-
-    let cmd_str = format!("skim {}", args.files.join(" "));
-    multi::process_explicit_files(&args.files, multi_options, &cmd_str)
+    multi::process_explicit_files(&args.files, multi_options)
 }
 
 /// Record token analytics for file operations (single file or stdin).

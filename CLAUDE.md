@@ -122,6 +122,8 @@ curl -L https://github.com/dean0x/skim/releases/latest/download/rskim-x86_64-unk
 
 ## Commands
 
+**Local dev binary:** `target/release/skim` is on PATH for local testing. After every merge to main, run `cargo build --release` to keep it current.
+
 ### Build & Test
 ```bash
 cargo build --release          # Production build
@@ -244,6 +246,7 @@ git push origin main --tags
 
 ### Post-Release Cleanup
 - Delete release branch: `git branch -d release/vX.Y.Z`
+- Rebuild local dev binary: `cargo build --release` (keeps `target/release/skim` current with main)
 
 ## Design Constraints
 
