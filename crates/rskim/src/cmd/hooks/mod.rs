@@ -887,4 +887,90 @@ mod tests {
         let result = upsert_hook_versioned(&mut config, "/path/to/skim-rewrite.sh", &hook);
         assert!(result.is_err(), "non-object root must return an error");
     }
+
+    // ========================================================================
+    // scan_other_hooks — Cursor flat "command" and Copilot flat "bash" formats
+    // ========================================================================
+
+    /// Cursor flat format: scan_other_hooks extracts top-level "command" from
+    /// a non-skim entry in hooks.json.
+    #[test]
+    fn test_scan_other_hooks_cursor_flat_command_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        // Cursor uses hooks.json with a versioned wrapper and flat entries
+        // where each entry has a top-level "command" field.
+        let config = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "preToolUse": [
+                    {
+                        "command": "/home/user/.cursor/hooks/skim-rewrite.sh",
+                        "matcher": "Shell",
+                        "timeout": 5
+                    },
+                    {
+                        "command": "/usr/bin/other-cursor-hook",
+                        "matcher": "Shell",
+                        "timeout": 10
+                    }
+                ]
+            }
+        });
+        std::fs::write(
+            config_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let hook = cursor::CursorHook;
+        let others = hook.scan_other_hooks(config_dir);
+        assert_eq!(
+            others,
+            vec!["/usr/bin/other-cursor-hook"],
+            "scan_other_hooks must extract non-skim entries via flat 'command' field"
+        );
+    }
+
+    /// Copilot CLI format: scan_other_hooks extracts top-level "bash" from
+    /// a non-skim entry in settings.json.
+    #[test]
+    fn test_scan_other_hooks_copilot_flat_bash_format() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        // Copilot CLI uses settings.json with a versioned wrapper and flat entries
+        // where each entry has a top-level "bash" field instead of "command".
+        let config = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "preToolUse": [
+                    {
+                        "type": "command",
+                        "bash": "/home/user/.copilot/hooks/skim-rewrite.sh",
+                        "matcher": "bash",
+                        "timeoutSec": 5
+                    },
+                    {
+                        "type": "command",
+                        "bash": "/usr/bin/other-copilot-hook",
+                        "matcher": "bash",
+                        "timeoutSec": 10
+                    }
+                ]
+            }
+        });
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let hook = copilot::CopilotCliHook;
+        let others = hook.scan_other_hooks(config_dir);
+        assert_eq!(
+            others,
+            vec!["/usr/bin/other-copilot-hook"],
+            "scan_other_hooks must extract non-skim entries via flat 'bash' field"
+        );
+    }
 }

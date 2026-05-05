@@ -1248,7 +1248,7 @@ fn create_agent_config_dir() -> (TempDir, std::path::PathBuf) {
 }
 
 #[test]
-fn test_init_multi_agent_auto_detect_installs_both() {
+fn test_init_multi_agent_auto_detect_installs_claude_and_gemini() {
     // Create isolated config dirs for Claude Code and Gemini CLI.
     // Setting CLAUDE_CONFIG_DIR and GEMINI_CONFIG_DIR causes detect_installed_agents
     // to scope detection to only those two agents (override mode).
@@ -1313,7 +1313,7 @@ fn test_init_multi_agent_auto_detect_installs_both() {
 }
 
 #[test]
-fn test_init_multi_agent_auto_detect_uninstalls_both() {
+fn test_init_multi_agent_auto_detect_uninstalls_claude_and_gemini() {
     // Create isolated config dirs for Claude Code and Gemini CLI.
     let (claude_dir, claude_path) = create_agent_config_dir();
     let (gemini_dir, gemini_path) = create_agent_config_dir();
@@ -1355,29 +1355,34 @@ fn test_init_multi_agent_auto_detect_uninstalls_both() {
         "Gemini CLI hook script should be deleted after uninstall"
     );
 
-    // Settings files should have skim hook entries removed
+    // Settings files should have skim hook entries removed.
+    // Both files must still exist (uninstall patches them, not deletes them).
     let claude_settings = project_dir.path().join(".claude/settings.json");
-    if claude_settings.exists() {
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&claude_settings).unwrap()).unwrap();
-        let hooks = json.get("hooks");
-        assert!(
-            hooks.is_none() || hooks.and_then(|h| h.get("PreToolUse")).is_none(),
-            "Claude Code hooks.PreToolUse should be removed after uninstall"
-        );
-    }
+    assert!(
+        claude_settings.exists(),
+        "Claude Code settings.json must still exist after uninstall (hook entries are removed, file is kept)"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&claude_settings).unwrap()).unwrap();
+    let hooks = json.get("hooks");
+    assert!(
+        hooks.is_none() || hooks.and_then(|h| h.get("PreToolUse")).is_none(),
+        "Claude Code hooks.PreToolUse should be removed after uninstall"
+    );
 
     let gemini_settings = project_dir.path().join(".gemini/settings.json");
-    if gemini_settings.exists() {
-        let json: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&gemini_settings).unwrap()).unwrap();
-        let hooks = json.get("hooks");
-        // Gemini CLI uses BeforeTool as its hook event key
-        assert!(
-            hooks.is_none() || hooks.and_then(|h| h.get("BeforeTool")).is_none(),
-            "Gemini CLI hooks.BeforeTool should be removed after uninstall"
-        );
-    }
+    assert!(
+        gemini_settings.exists(),
+        "Gemini CLI settings.json must still exist after uninstall (hook entries are removed, file is kept)"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&gemini_settings).unwrap()).unwrap();
+    let hooks = json.get("hooks");
+    // Gemini CLI uses BeforeTool as its hook event key
+    assert!(
+        hooks.is_none() || hooks.and_then(|h| h.get("BeforeTool")).is_none(),
+        "Gemini CLI hooks.BeforeTool should be removed after uninstall"
+    );
 
     // Keep TempDirs alive until end of test.
     drop(claude_dir);

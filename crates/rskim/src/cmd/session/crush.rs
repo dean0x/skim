@@ -243,6 +243,22 @@ mod tests {
     }
 
     #[test]
+    fn test_crush_provider_detect_existing_dir() {
+        // Happy path: detect_with_dir returns Some when the directory exists.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = CrushProvider::detect_with_dir(dir.path().to_path_buf());
+        assert!(
+            provider.is_some(),
+            "detect_with_dir must return Some when the directory exists"
+        );
+        assert_eq!(
+            provider.unwrap().sessions_dir,
+            dir.path(),
+            "sessions_dir must match the provided path"
+        );
+    }
+
+    #[test]
     fn test_crush_provider_agent_kind() {
         let dir = tempfile::TempDir::new().unwrap();
         let provider = CrushProvider {
