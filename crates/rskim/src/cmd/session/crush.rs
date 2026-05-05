@@ -38,6 +38,12 @@ impl CrushProvider {
     ///
     /// Extracted to allow testing the detection logic directly with a
     /// constructed path, avoiding `std::env::set_var` in tests.
+    ///
+    /// TODO: The other five providers (Claude, Gemini, Codex, Copilot, Cursor)
+    /// inline this check inside `detect()` and rely on env-var mutation for
+    /// testing.  Extracting an equivalent `detect_with_dir` helper to all of
+    /// them would make tests race-condition-free and is tracked as a follow-up
+    /// consistency improvement.
     fn detect_with_dir(sessions_dir: PathBuf) -> Option<Self> {
         if sessions_dir.is_dir() {
             Some(Self { sessions_dir })
@@ -123,11 +129,20 @@ impl SessionProvider for CrushProvider {
             );
         }
 
+        // BufReader is used here (rather than read_to_string) so that large
+        // sessions near the 100 MB limit are read one line at a time instead
+        // of being loaded entirely into memory.  Other providers use
+        // read_to_string; that is acceptable for now because their content
+        // tends to be smaller, but Crush sessions can saturate the limit.
+        // See: intentional divergence from Claude/Gemini/Codex parse_session.
         let reader = BufReader::new(std::fs::File::open(&file.path)?);
         let mut invocations = Vec::new();
 
         for line in reader.lines() {
             let line = line?;
+            // BufReader::lines() strips the line terminator (\n / \r\n).
+            // trim() is still needed to remove any leading whitespace that
+            // some editors or tooling may prepend.
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -303,5 +318,95 @@ mod tests {
     fn test_parse_crush_line_missing_message() {
         let json = serde_json::json!({ "timestamp": "2024-01-01T00:00:00Z" });
         assert!(parse_crush_line(&json, "sess-1").is_none());
+    }
+
+    // ---- parse_session BufReader tests ----------------------------------------
+
+    /// parse_session reads valid JSONL via BufReader and returns the correct
+    /// tool invocations — exercises the happy path of the line-by-line reader.
+    #[test]
+    fn test_parse_session_bufreader_valid_jsonl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let jsonl = concat!(
+            "{\"timestamp\":\"2024-01-01T00:00:00Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"cargo test\"}}]}}\n",
+            "{\"timestamp\":\"2024-01-01T00:00:01Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{\"file_path\":\"/tmp/a.rs\"}}]}}\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+
+        let provider = CrushProvider {
+            sessions_dir: dir.path().to_path_buf(),
+        };
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let session_file = SessionFile {
+            path,
+            modified,
+            agent: AgentKind::Crush,
+            session_id: "sess".to_string(),
+        };
+
+        let invocations = provider.parse_session(&session_file).unwrap();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].tool_name, "Bash");
+        assert!(matches!(&invocations[0].input, ToolInput::Bash { command } if command == "cargo test"));
+        assert_eq!(invocations[1].tool_name, "Read");
+        assert!(matches!(&invocations[1].input, ToolInput::Read { file_path } if file_path == "/tmp/a.rs"));
+    }
+
+    /// parse_session skips malformed lines and blank lines — the BufReader path
+    /// must be as tolerant as the read_to_string path used in other providers.
+    #[test]
+    fn test_parse_session_bufreader_skips_malformed_and_blank_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sess.jsonl");
+        let jsonl = concat!(
+            "not-json\n",
+            "\n",
+            "{\"timestamp\":\"2024-01-01T00:00:00Z\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"command\":\"echo hi\"}}]}}\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+
+        let provider = CrushProvider {
+            sessions_dir: dir.path().to_path_buf(),
+        };
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let session_file = SessionFile {
+            path,
+            modified,
+            agent: AgentKind::Crush,
+            session_id: "sess".to_string(),
+        };
+
+        let invocations = provider.parse_session(&session_file).unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].tool_name, "Bash");
+    }
+
+    /// parse_session rejects files exceeding MAX_SESSION_SIZE — the size guard
+    /// runs before the BufReader is opened.
+    #[test]
+    fn test_parse_session_rejects_oversized_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("big.jsonl");
+
+        // Write a sparse file whose reported size exceeds the 100 MB limit.
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_SIZE + 1).unwrap();
+
+        let provider = CrushProvider {
+            sessions_dir: dir.path().to_path_buf(),
+        };
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let session_file = SessionFile {
+            path,
+            modified,
+            agent: AgentKind::Crush,
+            session_id: "big".to_string(),
+        };
+
+        let result = provider.parse_session(&session_file);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("too large"), "expected 'too large' in: {msg}");
     }
 }
