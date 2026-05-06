@@ -204,9 +204,10 @@ SUBCOMMANDS:\n  \
     stats [--since N] [--format json]        Token analytics dashboard\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
-    /// File, directory, or glob pattern to process (use '-' for stdin)
-    #[arg(value_name = "FILE", required_unless_present = "clear_cache")]
-    file: Option<String>,
+    /// Files, directories, or glob patterns to process (use '-' for stdin).
+    /// Multiple arguments are accepted: `skim file1.ts file2.ts` or `skim 'src/**/*.ts' file.py`.
+    #[arg(value_name = "FILE")]
+    files: Vec<String>,
 
     /// Transformation mode
     #[arg(short, long, value_enum, default_value = "structure")]
@@ -475,7 +476,8 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         );
     }
 
-    if args.filename.is_some() && args.file.as_deref() != Some("-") {
+    // --filename is only valid when the single argument is '-' (stdin)
+    if args.filename.is_some() && !(args.files.len() == 1 && args.files[0] == "-") {
         anyhow::bail!(
             "--filename is only valid when reading from stdin (file argument is '-')\n\
              For files on disk, language is auto-detected from the file extension."
@@ -554,8 +556,11 @@ fn main() -> ExitCode {
 
 /// File/directory/glob/stdin processing pipeline.
 ///
-/// Parses CLI args via clap, validates constraints, then delegates to
-/// the appropriate processor (stdin, directory, glob, or single file).
+/// Parses CLI args via clap, validates constraints, then routes to
+/// the appropriate processor based on argument count:
+/// - 0 args → usage error
+/// - 1 arg  → `process_single_arg` (stdin, directory, glob, or single file)
+/// - N args → explicit multi-file list (no stdin mixing allowed)
 fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
@@ -566,10 +571,13 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         return Ok(());
     }
 
-    let file = args
-        .file
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("FILE argument is required"))?;
+    if args.files.is_empty() {
+        anyhow::bail!(
+            "FILE argument is required\n\
+             Usage: skim <FILE|DIR|GLOB> [--mode structure|signatures|types|full]\n\
+             Use 'skim --help' for more information."
+        );
+    }
 
     let process_options = process::ProcessOptions {
         mode: Mode::from(args.mode),
@@ -584,21 +592,6 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         line_numbers: args.line_numbers,
     };
 
-    if file == "-" {
-        let result = process::process_stdin(process_options, args.filename.as_deref())?;
-        process::write_result_and_stats(&result, args.show_stats)?;
-        record_file_analytics(
-            analytics.enabled,
-            &result,
-            "skim -",
-            &args,
-            analytics.session_id.as_deref(),
-        );
-        return Ok(());
-    }
-
-    let path = PathBuf::from(&file);
-
     let multi_options = multi::MultiFileOptions {
         process: process_options,
         no_header: args.no_header,
@@ -608,12 +601,68 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         session_id: analytics.session_id.clone(),
     };
 
+    if args.files.len() == 1 {
+        return process_single_arg(
+            &args.files[0],
+            &args,
+            analytics,
+            process_options,
+            multi_options,
+        );
+    }
+
+    // === Multiple arguments: `skim file1.ts file2.ts` ===
+    //
+    // Stdin (`-`) cannot be mixed with other files: the single stdin stream
+    // cannot be read once per file argument.
+    if args.files.iter().any(|f| f == "-") {
+        anyhow::bail!(
+            "stdin ('-') cannot be combined with other file arguments\n\
+             Use 'skim -' alone to read from stdin, or specify file paths directly."
+        );
+    }
+
+    // Expand each argument: glob pattern → expand, directory → collect,
+    // plain file → add directly.  All results are gathered into a single Vec
+    // and processed together via process_files.
+    multi::process_explicit_files(&args.files, multi_options)
+}
+
+/// Dispatch a single argument to the appropriate processor.
+///
+/// Handles four cases in priority order:
+/// 1. `-`       → read from stdin
+/// 2. directory → recursive directory walk
+/// 3. glob      → glob pattern expansion
+/// 4. file path → single file processing
+fn process_single_arg(
+    file: &str,
+    args: &Args,
+    analytics: &analytics::AnalyticsConfig,
+    process_options: process::ProcessOptions,
+    multi_options: multi::MultiFileOptions,
+) -> anyhow::Result<()> {
+    if file == "-" {
+        let result = process::process_stdin(process_options, args.filename.as_deref())?;
+        process::write_result_and_stats(&result, args.show_stats)?;
+        record_file_analytics(
+            analytics.enabled,
+            &result,
+            "skim -",
+            args,
+            analytics.session_id.as_deref(),
+        );
+        return Ok(());
+    }
+
+    let path = PathBuf::from(file);
+
     if path.is_dir() {
         return multi::process_directory(&path, multi_options);
     }
 
-    if multi::has_glob_pattern(&file) {
-        return multi::process_glob(&file, multi_options);
+    if multi::has_glob_pattern(file) {
+        return multi::process_glob(file, multi_options);
     }
 
     let result = process::process_file(&path, process_options)?;
@@ -622,7 +671,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         analytics.enabled,
         &result,
         &format!("skim {file}"),
-        &args,
+        args,
         analytics.session_id.as_deref(),
     );
     Ok(())

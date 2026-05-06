@@ -113,14 +113,18 @@ fn test_glob_no_matches() {
 }
 
 #[test]
-fn test_glob_absolute_path_rejected() {
+fn test_glob_absolute_path_accepted() {
+    // Absolute paths are legitimate and must NOT be rejected — AI agents and
+    // shell users commonly pass fully-qualified paths.  /etc/*.conf is unlikely
+    // to return results in a test environment, so we just verify the error is
+    // "No files found" (pattern evaluated, no match) rather than a validation
+    // rejection.
     Command::cargo_bin("skim")
         .unwrap()
-        .arg("/etc/*.conf")
+        .arg("/nonexistent_skim_test_dir/*.conf")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("must be relative"))
-        .stderr(predicate::str::contains("cannot start with '/'"));
+        .stderr(predicate::str::contains("No files found"));
 }
 
 #[test]

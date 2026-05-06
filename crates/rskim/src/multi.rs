@@ -37,40 +37,21 @@ pub(crate) fn has_glob_pattern(path: &str) -> bool {
     path.contains(GLOB_METACHARACTERS)
 }
 
-/// Validate glob pattern to prevent path traversal attacks
+/// Validate glob pattern to prevent path traversal attacks.
+///
+/// Absolute Unix paths (`/Users/…`) and Windows drive paths (`C:/…`) are
+/// intentionally **allowed** — AI agents and shell users routinely pass fully
+/// qualified paths. Only genuinely dangerous patterns are rejected:
+///
+/// - `..` traversal (escapes the intended subtree)
+/// - Windows UNC network paths (`\\server\share`) — not local paths
 fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
-    // Reject absolute paths
-    if pattern.starts_with('/') {
-        anyhow::bail!(
-            "Glob pattern must be relative (cannot start with '/')\n\
-             Pattern: {}\n\
-             Use relative paths like 'src/**/*.ts' instead of '/src/**/*.ts'",
-            pattern
-        );
-    }
-
-    // Reject Windows drive letter paths (e.g., "C:\..." or "D:/...")
-    if pattern.len() >= 3 {
-        let bytes = pattern.as_bytes();
-        if bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && (bytes[2] == b'\\' || bytes[2] == b'/')
-        {
-            anyhow::bail!(
-                "Glob pattern must be relative (absolute Windows path not allowed)\n\
-                 Pattern: {}\n\
-                 Use relative paths like 'src/**/*.ts' instead",
-                pattern
-            );
-        }
-    }
-
-    // Reject Windows UNC paths (e.g., "\\server\share")
+    // Reject Windows UNC paths (e.g., "\\server\share") — network paths, not local
     if pattern.starts_with("\\\\") {
         anyhow::bail!(
-            "Glob pattern must be relative (UNC path not allowed)\n\
+            "Glob pattern cannot use UNC network paths\n\
              Pattern: {}\n\
-             Use relative paths like 'src/**/*.ts' instead",
+             Use a local path like '/Users/foo/src/**/*.ts' instead",
             pattern
         );
     }
@@ -80,7 +61,7 @@ fn validate_glob_pattern(pattern: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "Glob pattern cannot contain '..' (parent directory traversal)\n\
              Pattern: {}\n\
-             This prevents accessing files outside the current directory",
+             This prevents accessing files outside the intended directory",
             pattern
         );
     }
@@ -115,14 +96,20 @@ fn configure_walker(builder: &mut WalkBuilder, no_ignore: bool) {
 /// glob metacharacters ([`GLOB_METACHARACTERS`]), and join them as the root.
 /// The remainder becomes the override pattern.
 ///
+/// Absolute Unix paths are handled correctly: the leading empty segment from
+/// `"/Users/foo/src/**/*.ts".split('/')` is treated as a static segment, so
+/// the computed root includes the leading `/`.
+///
 /// # Examples
 ///
 /// ```text
-/// "src/**/*.ts"       -> ("src",       "**/*.ts")
-/// "*.ts"              -> (".",         "*.ts")
-/// "src/utils/**/*.ts" -> ("src/utils", "**/*.ts")
-/// "**/*.ts"           -> (".",         "**/*.ts")
-/// "src/*.rs"          -> ("src",       "*.rs")
+/// "src/**/*.ts"             -> ("src",            "**/*.ts")
+/// "*.ts"                    -> (".",               "*.ts")
+/// "src/utils/**/*.ts"       -> ("src/utils",       "**/*.ts")
+/// "**/*.ts"                 -> (".",               "**/*.ts")
+/// "src/*.rs"                -> ("src",             "*.rs")
+/// "/Users/foo/src/**/*.ts"  -> ("/Users/foo/src",  "**/*.ts")
+/// "/**/*.ts"                -> ("/",               "**/*.ts")
 /// ```
 fn glob_walk_root(pattern: &str) -> (&str, &str) {
     let segments: Vec<&str> = pattern.split('/').collect();
@@ -136,6 +123,7 @@ fn glob_walk_root(pattern: &str) -> (&str, &str) {
     }
 
     if static_count == 0 {
+        // First segment itself contains glob chars (e.g. "**/*.ts", "*.ts")
         (".", pattern)
     } else if static_count == segments.len() {
         // All segments are static (no glob metacharacters). Treat the
@@ -144,7 +132,16 @@ fn glob_walk_root(pattern: &str) -> (&str, &str) {
         // before calling, but we must not panic on unexpected input.
         (pattern, "**")
     } else {
-        // Find the byte offset where the glob portion starts
+        // Find the byte offset where the glob portion starts.
+        // For absolute paths like "/Users/foo/src/**/*.ts":
+        //   segments = ["", "Users", "foo", "src", "**", "*.ts"]
+        //   static_count = 4  (segments 0..4 have no glob chars)
+        //   root = "/Users/foo/src" (len=14)
+        //
+        // The formula: sum of static segment lengths + (static_count - 1) separators
+        // gives the end index of the last static segment in the original string.
+        // For absolute paths the leading "" segment has len=0, so the leading "/" is
+        // captured as the separator between segment 0 and segment 1.
         let root_end: usize = segments[..static_count]
             .iter()
             .map(|s| s.len())
@@ -152,7 +149,18 @@ fn glob_walk_root(pattern: &str) -> (&str, &str) {
             + static_count
             - 1; // account for the '/' separators between segments
 
-        let root = &pattern[..root_end];
+        // Edge case: absolute path whose first glob char appears right after the
+        // leading slash (e.g. "/**/*.ts").
+        //   segments = ["", "**", "*.ts"], static_count = 1
+        //   root_end = 0 + 1 - 1 = 0  =>  pattern[..0] = ""  (wrong — should be "/")
+        // Handle by checking if root_end would produce an empty slice for an absolute
+        // path: in that case return "/" as the root.
+        let root = if root_end == 0 && pattern.starts_with('/') {
+            "/"
+        } else {
+            &pattern[..root_end]
+        };
+
         let rest = &pattern[root_end + 1..]; // skip the '/' separator
         (root, rest)
     }
@@ -169,8 +177,8 @@ fn no_ignore_hint(no_ignore: bool) -> &'static str {
 
 /// Process multiple files with parallel processing via rayon.
 ///
-/// Used by both glob and directory inputs. Handles parallel execution,
-/// error aggregation, and accumulated token statistics.
+/// Used by glob, directory, and explicit multi-file inputs. Handles parallel
+/// execution, error aggregation, and accumulated token statistics.
 ///
 /// Precondition: `paths` must be non-empty. Callers should validate and
 /// produce a descriptive error (with `--no-ignore` hint) before calling.
@@ -303,14 +311,94 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
     Ok(())
 }
 
-/// Process multiple files matched by glob pattern.
+/// Process a list of explicitly specified file arguments.
 ///
-/// Uses `ignore::WalkBuilder` for directory walking (respects `.gitignore`
-/// and hidden file rules by default), then filters entries with a
-/// `globset::GlobMatcher` to match the user's glob pattern. This ensures
-/// gitignore rules are applied *before* glob matching, so gitignored files
-/// are excluded even when the glob would otherwise match them.
-pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::Result<()> {
+/// Each argument may be:
+/// - A glob pattern (contains `*`, `?`, `[`, or `{`) — expanded via [`process_glob`] logic
+/// - A directory path — files are collected recursively via [`collect_files_from_directory`]
+/// - A plain file path — added directly
+///
+/// All resolved paths are collected into a single `Vec<PathBuf>` and processed
+/// together. This enables `skim file1.ts file2.ts` and mixed forms like
+/// `skim 'src/**/*.ts' extra.py`.
+pub(crate) fn process_explicit_files(
+    args: &[String],
+    options: MultiFileOptions,
+) -> anyhow::Result<()> {
+    debug_assert!(
+        !args.is_empty(),
+        "BUG: process_explicit_files called with empty args"
+    );
+
+    let no_ignore = options.no_ignore;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for arg in args {
+        if has_glob_pattern(arg) {
+            // Glob expansion — validate then walk
+            match expand_glob_to_paths(arg, no_ignore) {
+                Ok(mut matched) => paths.append(&mut matched),
+                Err(e) => errors.push(format!("{arg}: {e}")),
+            }
+        } else {
+            let path = PathBuf::from(arg);
+            if path.is_dir() {
+                let mut dir_files = collect_files_from_directory(&path, no_ignore);
+                if dir_files.is_empty() {
+                    errors.push(format!(
+                        "No files found in directory '{}'{}",
+                        path.display(),
+                        no_ignore_hint(no_ignore)
+                    ));
+                } else {
+                    paths.append(&mut dir_files);
+                }
+            } else if path.exists() {
+                paths.push(path);
+            } else {
+                errors.push(format!("File not found: '{}'", path.display()));
+            }
+        }
+    }
+
+    if !errors.is_empty() && paths.is_empty() {
+        // All arguments failed — report the first error as the primary message,
+        // then list the rest.
+        let mut msg = errors.remove(0);
+        for e in errors {
+            msg.push('\n');
+            msg.push_str(&e);
+        }
+        anyhow::bail!("{}", msg);
+    }
+
+    // Partial failures: warn on stderr but continue with resolved paths.
+    for e in &errors {
+        eprintln!("Warning: {e}");
+    }
+
+    if paths.is_empty() {
+        anyhow::bail!(
+            "No files found for the given arguments{}",
+            no_ignore_hint(no_ignore)
+        );
+    }
+
+    // Deduplicate: a plain file arg and a glob arg may both resolve to the
+    // same path (e.g. `skim explicit.ts '*.ts'`). Sort first so dedup is O(n).
+    paths.sort();
+    paths.dedup();
+
+    process_files(paths, options)
+}
+
+/// Expand a glob pattern to a list of matching paths.
+///
+/// Separated from [`process_glob`] so it can be used within
+/// [`process_explicit_files`] without going through the full single-glob
+/// pipeline (which calls `process_files` directly).
+fn expand_glob_to_paths(pattern: &str, no_ignore: bool) -> anyhow::Result<Vec<PathBuf>> {
     validate_glob_pattern(pattern)?;
 
     let (walk_root, glob_pattern) = glob_walk_root(pattern);
@@ -322,12 +410,8 @@ pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::
     let matcher = glob.compile_matcher();
 
     let mut builder = WalkBuilder::new(walk_root);
-    configure_walker(&mut builder, options.no_ignore);
+    configure_walker(&mut builder, no_ignore);
 
-    // SECURITY: Symlink traversal is prevented by `follow_links(false)` on the
-    // walker (configured in `configure_walker`). Path traversal via `..` is
-    // rejected by `validate_glob_pattern`. Together these make `canonicalize()`
-    // unnecessary here, avoiding a syscall per file in the hot path.
     let paths: Vec<PathBuf> = builder
         .build()
         .filter_map(|entry| entry.ok())
@@ -346,10 +430,22 @@ pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::
         anyhow::bail!(
             "No files found: pattern '{}'{}",
             pattern,
-            no_ignore_hint(options.no_ignore)
+            no_ignore_hint(no_ignore)
         );
     }
 
+    Ok(paths)
+}
+
+/// Process multiple files matched by glob pattern.
+///
+/// Uses `ignore::WalkBuilder` for directory walking (respects `.gitignore`
+/// and hidden file rules by default), then filters entries with a
+/// `globset::GlobMatcher` to match the user's glob pattern. This ensures
+/// gitignore rules are applied *before* glob matching, so gitignored files
+/// are excluded even when the glob would otherwise match them.
+pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::Result<()> {
+    let paths = expand_glob_to_paths(pattern, options.no_ignore)?;
     process_files(paths, options)
 }
 
@@ -408,19 +504,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_glob_pattern_rejects_absolute_unix_paths() {
-        let result = validate_glob_pattern("/etc/passwd");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("cannot start with '/'"), "got: {msg}");
+    fn test_validate_glob_pattern_accepts_absolute_unix_paths() {
+        // Absolute paths are legitimate in AI agent workflows where the full
+        // path is known. They must NOT be rejected.
+        assert!(validate_glob_pattern("/etc/passwd").is_ok());
+        assert!(validate_glob_pattern("/Users/foo/src/**/*.ts").is_ok());
+        assert!(validate_glob_pattern("/src/**/*.ts").is_ok());
     }
 
     #[test]
-    fn test_validate_glob_pattern_rejects_absolute_path_with_glob() {
-        let result = validate_glob_pattern("/src/**/*.ts");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("cannot start with '/'"), "got: {msg}");
+    fn test_validate_glob_pattern_accepts_windows_drive_paths() {
+        // Windows drive-letter paths are absolute local paths, not network
+        // paths. Allow them so Windows users can pass absolute paths.
+        assert!(validate_glob_pattern("C:\\Users\\*.ts").is_ok());
+        assert!(validate_glob_pattern("D:/projects/**/*.rs").is_ok());
     }
 
     #[test]
@@ -440,19 +537,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_glob_pattern_rejects_windows_drive_paths() {
-        let result = validate_glob_pattern("C:\\Users\\*.ts");
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("absolute Windows path"), "got: {msg}");
-    }
-
-    #[test]
     fn test_validate_glob_pattern_rejects_windows_unc_paths() {
         let result = validate_glob_pattern("\\\\server\\share\\*.ts");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("UNC path"), "got: {msg}");
+        assert!(msg.contains("UNC network paths"), "got: {msg}");
     }
 
     #[test]
@@ -523,5 +612,32 @@ mod tests {
         // with a match-everything glob. This should not happen in practice
         // (callers check has_glob_pattern first), but must not panic.
         assert_eq!(glob_walk_root("src/file.ts"), ("src/file.ts", "**"));
+    }
+
+    // ========================================================================
+    // glob_walk_root: absolute path tests
+    // ========================================================================
+
+    #[test]
+    fn test_glob_walk_root_absolute_path() {
+        // /Users/foo/src/**/*.ts should split to root=/Users/foo/src, glob=**/*.ts
+        assert_eq!(
+            glob_walk_root("/Users/foo/src/**/*.ts"),
+            ("/Users/foo/src", "**/*.ts")
+        );
+    }
+
+    #[test]
+    fn test_glob_walk_root_absolute_root_glob() {
+        // "/**/*.ts" — glob char immediately after leading slash
+        // segments = ["", "**", "*.ts"], static_count = 1 (just "")
+        // root_end = 0 + 1 - 1 = 0, but pattern starts with '/', so root = "/"
+        assert_eq!(glob_walk_root("/**/*.ts"), ("/", "**/*.ts"));
+    }
+
+    #[test]
+    fn test_glob_walk_root_absolute_single_dir() {
+        // "/src/*.rs" -> ("/src", "*.rs")
+        assert_eq!(glob_walk_root("/src/*.rs"), ("/src", "*.rs"));
     }
 }
