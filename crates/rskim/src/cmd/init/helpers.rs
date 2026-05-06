@@ -147,55 +147,63 @@ pub(super) fn atomic_write_settings(
 
 /// Generate the skim guidance section content with version markers.
 ///
-/// Intent-based decision table that helps agents pick the right tool once
-/// per file, avoiding the wasteful skim-then-Read anti-pattern.
+/// Principle-based guidance that helps agents decide when skim adds value
+/// vs when to Read directly.
 pub(super) fn guidance_content(version: &str) -> String {
     format!(
         r#"<!-- skim-start v{version} -->
 ## Skim — Context-Optimized Code Reading
 
 `skim` is installed and a rewrite hook is active that automatically optimizes
-shell commands. For explicit use, call `skim` via Bash (or `rskim`).
+shell commands. For explicit use, call `skim` via Bash.
 
-### What skim shows
+### What skim does
 
-Skim strips function/method bodies and preserves structure, signatures, types,
-and doc comments. It shows *what exists* in a file — not *how it works*.
-Use `-n` / `--line-numbers` to annotate each output line with its original
-source line number (tab-separated: `{{line}}\t{{content}}`).
+Skim shows you the **structure** of a file — signatures, types, headings,
+definitions — while stripping implementation details and body content.
+It works on code files (functions/classes) and prose files (headings/sections).
+Use `-n` / `--line-numbers` to enrich the output with original source line numbers.
 
-### Choose ONE tool per file
+### When to use skim
 
-Before touching a file, decide your intent — then use the right tool once.
+**General principle:** Use skim when structure is sufficient for your task.
+If your next step requires the actual content (editing, understanding logic,
+debugging), go straight to Read — don't skim first.
 
-| Intent | Tool | Why |
-|--------|------|-----|
-| **List files** — "what files exist here?" | `ls` or Glob | Cheapest — names only, no content |
-| **Survey structure** — "what's in this file?" | `skim <file>` | Structure at 60-80% fewer tokens |
-| **Find the right file** — narrowing candidates | `skim 'src/**/*.ts'` | Peeks inside each file cheaply. Use ls/Glob first if names suffice |
-| **API surface** — "what can I call?" | `skim --mode=signatures` | Function/method signatures only |
-| **Understand logic** — "how does X work?" | Read (targeted range) | Skim strips the bodies you need |
-| **Edit a file** — you will modify it | `skim --line-numbers <file>` then Read (section) | `--line-numbers` gives source line numbers; Read only the section you need |
-| **Debug/trace** — following control flow | Read (targeted range) | Implementation details matter |
+Skim earns its cost when you want to **orient** — understand what exists in a
+file or across files without committing to reading all the content. Examples:
+- Understanding what a module defines before deciding what to read in detail
+- Surveying a directory of files to build a mental model of a codebase area
+- Checking what sections a spec or config file contains
+
+Skim wastes tokens when you already know you need the content — most commonly
+when you're about to edit a file. Read it directly.
 
 ### Anti-pattern: skim then Read the same file
 
-**Avoid skimming a file and then Reading the same file** unless `--line-numbers` is involved.
-This wastes more tokens than either tool alone. Pick one:
-- If you need bodies but not line numbers → go straight to Read.
-- If you only need structure/signatures → skim it and move on.
-- If you need structure AND line numbers for editing → `skim --line-numbers <file>`, then Read only the narrow range you will modify.
+If you skim a file and then Read it (in full or in large part), you paid for
+the file twice. This means skim was the wrong choice — you needed content,
+not structure. Pick one tool per file based on what you actually need.
 
-The only valid skim→Read sequence without `--line-numbers` is across **different files**:
-skim a directory to find the right file, then Read that one file.
+The valid skim→Read sequence is across **different files**: skim several files
+to orient, then Read the one you actually need in detail.
 
 ### Quick Reference
 
 ```
-skim <file>                    # structural overview (strips bodies)
-skim -n <file>                 # structural overview with source line numbers
-skim <file> --mode=signatures  # function/method signatures only
-skim 'src/**/*.ts'             # multi-file scan
+skim <file>                      # structural overview (default mode)
+skim -n <file>                   # structural overview with source line numbers
+skim 'src/**/*.ts'               # multi-file scan (glob)
+skim file1.ts file2.ts           # multi-file scan (explicit files)
+skim src/                        # all files in directory recursively
+skim <file> --max-lines 50       # cap output with AST-aware truncation
+skim <file> --tokens 500         # fit output within a token budget
+
+# Modes (most to least content):
+# full → pseudo → structure (default) → minimal → signatures → types
+skim <file> --mode=types         # type definitions only
+skim <file> --mode=signatures    # function/method signatures only
+skim <file> --mode=pseudo        # logic without syntactic noise
 ```
 <!-- skim-end -->"#,
         version = version
@@ -306,12 +314,21 @@ mod tests {
         assert!(content.ends_with("<!-- skim-end -->"));
         // Version appears in the skim-start marker
         assert!(content.contains("v2.1.0"));
-        // Intent-based guidance
-        assert!(content.contains("Choose ONE tool per file"));
+        // Principle-based guidance
+        assert!(content.contains("When to use skim"));
+        assert!(content.contains("General principle"));
         assert!(content.contains("Anti-pattern: skim then Read"));
+        // Quick reference covers new features
+        assert!(content.contains("--tokens"));
+        assert!(content.contains("--max-lines"));
+        assert!(content.contains("--mode=types"));
+        // No prescriptive decision table
+        assert!(!content.contains("Choose ONE tool per file"));
         // SKIM_PASSTHROUGH is NOT documented in guidance — agents learn about it
         // from stderr hints emitted on compressed non-zero exits (shared.rs, mod.rs).
         assert!(!content.contains("SKIM_PASSTHROUGH"));
+        // No rskim mention in guidance body
+        assert!(!content.contains("rskim"));
     }
 
     #[test]
