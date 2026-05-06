@@ -182,7 +182,7 @@ fn no_ignore_hint(no_ignore: bool) -> &'static str {
 ///
 /// Precondition: `paths` must be non-empty. Callers should validate and
 /// produce a descriptive error (with `--no-ignore` hint) before calling.
-pub(crate) fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Result<()> {
+fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Result<()> {
     debug_assert!(
         !paths.is_empty(),
         "BUG: process_files called with empty paths"
@@ -385,6 +385,11 @@ pub(crate) fn process_explicit_files(
         );
     }
 
+    // Deduplicate: a plain file arg and a glob arg may both resolve to the
+    // same path (e.g. `skim explicit.ts '*.ts'`). Sort first so dedup is O(n).
+    paths.sort();
+    paths.dedup();
+
     process_files(paths, options)
 }
 
@@ -440,45 +445,7 @@ fn expand_glob_to_paths(pattern: &str, no_ignore: bool) -> anyhow::Result<Vec<Pa
 /// gitignore rules are applied *before* glob matching, so gitignored files
 /// are excluded even when the glob would otherwise match them.
 pub(crate) fn process_glob(pattern: &str, options: MultiFileOptions) -> anyhow::Result<()> {
-    validate_glob_pattern(pattern)?;
-
-    let (walk_root, glob_pattern) = glob_walk_root(pattern);
-
-    let glob = GlobBuilder::new(glob_pattern)
-        .literal_separator(false)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", pattern, e))?;
-    let matcher = glob.compile_matcher();
-
-    let mut builder = WalkBuilder::new(walk_root);
-    configure_walker(&mut builder, options.no_ignore);
-
-    // SECURITY: Symlink traversal is prevented by `follow_links(false)` on the
-    // walker (configured in `configure_walker`). Path traversal via `..` is
-    // rejected by `validate_glob_pattern`. Together these make `canonicalize()`
-    // unnecessary here, avoiding a syscall per file in the hot path.
-    let paths: Vec<PathBuf> = builder
-        .build()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
-        .filter(|entry| {
-            entry
-                .path()
-                .strip_prefix(walk_root)
-                .ok()
-                .is_some_and(|rel| matcher.is_match(rel))
-        })
-        .map(|entry| entry.into_path())
-        .collect();
-
-    if paths.is_empty() {
-        anyhow::bail!(
-            "No files found: pattern '{}'{}",
-            pattern,
-            no_ignore_hint(options.no_ignore)
-        );
-    }
-
+    let paths = expand_glob_to_paths(pattern, options.no_ignore)?;
     process_files(paths, options)
 }
 
