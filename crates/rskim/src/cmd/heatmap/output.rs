@@ -89,12 +89,7 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     out.push('\n');
 
     // Blast Radius (coupling)
-    let threshold_pct = 0.0; // We show whatever passed the threshold filter
-    section_header(
-        &mut out,
-        &format!("Blast Radius (coupling > {threshold_pct:.0}%):",),
-        use_color,
-    );
+    section_header(&mut out, "Blast Radius (coupling above threshold):", use_color);
     let mut files_with_coupling: Vec<_> = result
         .files
         .iter()

@@ -9,6 +9,15 @@ use crate::runner::{is_spawn_error, CommandRunner};
 
 use super::types::{CommitRecord, FileChange, HeatmapConfig};
 
+/// Map a `CommandRunner` error to a friendly "git not installed" message when appropriate.
+fn git_not_found(e: anyhow::Error) -> anyhow::Error {
+    if is_spawn_error(&e) {
+        anyhow::anyhow!("git is not installed or not in PATH")
+    } else {
+        e
+    }
+}
+
 // ============================================================================
 // Trait — for testability
 // ============================================================================
@@ -53,13 +62,7 @@ impl CliGitSource {
         let out = self
             .runner
             .run("git", &["rev-parse", "--show-toplevel"])
-            .map_err(|e| {
-                if is_spawn_error(&e) {
-                    anyhow::anyhow!("git is not installed or not in PATH")
-                } else {
-                    e
-                }
-            })?;
+            .map_err(git_not_found)?;
         Ok(out.stdout.trim().to_string())
     }
 
@@ -81,8 +84,8 @@ impl CliGitSource {
         if n == 0 {
             return Ok(None);
         }
-        let skip = format!("{}", n.saturating_sub(1));
-        let n_str = format!("{n}");
+        let skip = n.saturating_sub(1).to_string();
+        let n_str = n.to_string();
         let out = self.runner.run(
             "git",
             &[
@@ -99,18 +102,9 @@ impl CliGitSource {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let ts: u64 = trimmed
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        if ts == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(ts))
-        }
+        // trimmed is non-empty; first line is the timestamp
+        let ts: u64 = trimmed.lines().next().unwrap_or("").parse().unwrap_or(0);
+        Ok((ts > 0).then_some(ts))
     }
 
     /// Build the git log arg list from a config.
@@ -145,13 +139,7 @@ impl GitDataSource for CliGitSource {
         let mut owned_args: Vec<String> = Vec::new();
         let args = self.build_git_log_args(config, &mut owned_args);
 
-        let output = self.runner.run("git", &args).map_err(|e| {
-            if is_spawn_error(&e) {
-                anyhow::anyhow!("git is not installed or not in PATH")
-            } else {
-                e
-            }
-        })?;
+        let output = self.runner.run("git", &args).map_err(git_not_found)?;
 
         parse_git_log_output(&output.stdout)
     }
@@ -258,9 +246,7 @@ fn resolve_rename(raw: &str) -> String {
             // inner is "old => new"
             if let Some(arrow_pos) = inner.find(" => ") {
                 let new_part = &inner[arrow_pos + 4..];
-                // Reconstruct: prefix + new_part + suffix
-                let resolved = format!("{prefix}{new_part}{suffix}");
-                return resolved;
+                return format!("{prefix}{new_part}{suffix}");
             }
         }
     }

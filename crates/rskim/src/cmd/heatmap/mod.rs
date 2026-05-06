@@ -14,6 +14,7 @@ mod metrics;
 mod output;
 mod types;
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,8 +29,8 @@ use metrics::{
 };
 use output::{render_json, render_text};
 use types::{
-    AuthorMetrics, ChurnMetrics, CouplingEntry, FileMetrics, FixRiskMetrics, HeatmapConfig,
-    HeatmapResult, WindowInfo,
+    AuthorMetrics, ChurnMetrics, FileMetrics, FixRiskMetrics, HeatmapConfig, HeatmapResult,
+    WindowInfo,
 };
 
 // ============================================================================
@@ -74,25 +75,27 @@ pub(crate) fn run(
         }
     };
 
-    let source = CliGitSource::new();
-    run_with_source(&source, &config, analytics)
+    let git_source = CliGitSource::new();
+    run_with_source(&git_source, &git_source, &config, analytics)
 }
 
 /// Orchestration with injected data source (enables testing).
+///
+/// `git` handles infrastructure checks (repo detection, root, shallow clone,
+/// commit count). `source` handles the actual commit fetch and may be a test double.
 fn run_with_source(
+    git: &CliGitSource,
     source: &dyn GitDataSource,
     config: &HeatmapConfig,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    let git_source = CliGitSource::new();
-
     // Step 1: Validate git environment
-    if !git_source.is_git_repo() {
+    if !git.is_git_repo() {
         eprintln!("skim heatmap: Not a git repository");
         return Ok(ExitCode::FAILURE);
     }
 
-    let repo_root = match git_source.get_repo_root() {
+    let repo_root = match git.get_repo_root() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("skim heatmap: {e}");
@@ -102,7 +105,7 @@ fn run_with_source(
 
     let mut warnings: Vec<String> = Vec::new();
 
-    if git_source.detect_shallow_clone() {
+    if git.detect_shallow_clone() {
         warnings.push(
             "Shallow clone detected — history may be incomplete, metrics may be skewed."
                 .to_string(),
@@ -110,7 +113,7 @@ fn run_with_source(
     }
 
     // Step 2: Resolve effective config (presets and --last)
-    let effective_config = resolve_effective_config(config, &git_source, &mut warnings)?;
+    let effective_config = resolve_effective_config(config, git, &mut warnings)?;
 
     // Step 3: Fetch commits
     let raw_commits = match source.fetch_commits(&effective_config) {
@@ -165,7 +168,7 @@ fn run_with_source(
     let modules = compute_encapsulation(&commits, 3);
 
     // Step 6: Assemble FileMetrics
-    let mut all_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_paths: HashSet<String> = HashSet::new();
     for commit in &commits {
         for f in &commit.files {
             all_paths.insert(f.path.clone());
@@ -191,17 +194,7 @@ fn run_with_source(
                 combined_pct: 0.0,
                 insufficient_data: true,
             });
-            let blast_radius = blast_radius_map
-                .get(&path)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|e| CouplingEntry {
-                    path: e.path,
-                    confidence: e.confidence,
-                    support: e.support,
-                })
-                .collect();
+            let blast_radius = blast_radius_map.get(&path).cloned().unwrap_or_default();
 
             FileMetrics {
                 path,

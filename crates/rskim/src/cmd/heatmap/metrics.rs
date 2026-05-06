@@ -104,9 +104,8 @@ pub(crate) fn compute_coupling(
                 }
                 let a = files[i].to_string();
                 let b = files[j].to_string();
-                let key = (a, b);
-                *co_occur.entry(key.clone()).or_insert(0.0) += weight;
-                *support_count.entry(key).or_insert(0) += 1;
+                *support_count.entry((a.clone(), b.clone())).or_insert(0) += 1;
+                *co_occur.entry((a, b)).or_insert(0.0) += weight;
             }
         }
     }
@@ -124,10 +123,7 @@ pub(crate) fn compute_coupling(
         if confidence < threshold {
             continue;
         }
-        let sup = support_count
-            .get(&(a.clone(), b.clone()))
-            .copied()
-            .unwrap_or(0);
+        let sup = support_count.get(&(a.clone(), b.clone())).copied().unwrap_or(0);
         if sup < min_support {
             continue;
         }
@@ -353,27 +349,10 @@ pub(crate) fn compute_fix_after_touch(
             // Proximity: non-fix commit at index i, followed by a fix commit
             // also touching this file within the next `window` commits
             let index_set: HashSet<usize> = indices.iter().copied().collect();
-            let mut proximity_count = 0usize;
             let non_fix_indices: Vec<usize> =
                 indices.iter().copied().filter(|&i| !is_fix[i]).collect();
 
-            for &idx in &non_fix_indices {
-                let upper = (idx + 1 + window).min(commits.len());
-                let found_fix = ((idx + 1)..upper).any(|j| is_fix[j] && index_set.contains(&j));
-                if found_fix {
-                    proximity_count += 1;
-                }
-            }
-
-            let proximity_pct = if non_fix_indices.is_empty() {
-                0.0
-            } else {
-                (proximity_count as f64 / total as f64) * 100.0
-            };
-
-            // Union: commits flagged by either signal
-            let keyword_set: HashSet<usize> =
-                indices.iter().copied().filter(|&i| is_fix[i]).collect();
+            // Build proximity set (non-fix indices followed by a fix within window)
             let proximity_set: HashSet<usize> = non_fix_indices
                 .iter()
                 .copied()
@@ -383,6 +362,15 @@ pub(crate) fn compute_fix_after_touch(
                 })
                 .collect();
 
+            let proximity_pct = if non_fix_indices.is_empty() {
+                0.0
+            } else {
+                (proximity_set.len() as f64 / total as f64) * 100.0
+            };
+
+            // Union: commits flagged by either signal
+            let keyword_set: HashSet<usize> =
+                indices.iter().copied().filter(|&i| is_fix[i]).collect();
             let union_count = keyword_set.union(&proximity_set).count();
             let combined_pct = (union_count as f64 / total as f64) * 100.0;
 
