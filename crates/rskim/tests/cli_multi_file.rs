@@ -102,14 +102,14 @@ fn test_multi_file_shows_headers() {
         .clone();
 
     let stdout = String::from_utf8_lossy(&output);
-    // Each file should have its path in a header comment
+    // Each file should appear as a "// {path}" header comment
     assert!(
-        stdout.contains("a.ts"),
-        "Expected header for a.ts, got:\n{stdout}"
+        stdout.contains("// ") && stdout.contains("a.ts"),
+        "Expected '// ...a.ts' header, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("b.ts"),
-        "Expected header for b.ts, got:\n{stdout}"
+        stdout.contains("// ") && stdout.contains("b.ts"),
+        "Expected '// ...b.ts' header, got:\n{stdout}"
     );
 }
 
@@ -212,6 +212,27 @@ fn test_multi_file_stdin_mixed_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("stdin").or(predicate::str::contains("cannot")));
+}
+
+#[test]
+fn test_multi_file_filename_flag_rejected() {
+    // --filename is only meaningful for stdin ('-'). When multiple file
+    // arguments are given, the flag must be rejected with a clear error.
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("file1.ts"), "function f1() {}").unwrap();
+    fs::write(temp.path().join("file2.ts"), "function f2() {}").unwrap();
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("--filename=main.rs")
+        .arg(temp.path().join("file1.ts"))
+        .arg(temp.path().join("file2.ts"))
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("--filename")
+                .or(predicate::str::contains("stdin")),
+        );
 }
 
 // ============================================================================
