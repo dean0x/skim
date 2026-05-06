@@ -269,7 +269,7 @@ fn run_with_source(
     };
 
     // Step 9: Build result
-    let result = HeatmapResult {
+    let mut result = HeatmapResult {
         version: 1,
         generated_at: format_epoch(now_epoch),
         repository: repo_root,
@@ -280,6 +280,9 @@ fn run_with_source(
         excluded_patterns,
         warnings,
     };
+
+    // Apply --top N limit to files
+    result.files.truncate(config.top_n);
 
     // Step 10: Render
     let elapsed = start_time.elapsed();
@@ -632,7 +635,7 @@ OPTIONS:
     --last <N>                    Analyze last N commits
     --window <PRESET>             Named window: sprint|month|quarter|half|year|all
     --path <DIR>                  Scope analysis to files under this path
-    --json                        Output JSON instead of human-readable text
+    --json, --format json         Output JSON instead of human-readable text
     --top <N>                     Maximum files to display (default: 20)
     --no-exclude                  Disable default exclusion patterns (lock files, build dirs, etc.)
     --exclude <PATTERN>           Add extra glob pattern to exclude (repeatable)
