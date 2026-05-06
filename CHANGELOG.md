@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`skim heatmap` subcommand** — Git history risk and coupling analysis. Mines git log to produce 6 metrics: file churn, co-change coupling (blast radius), stability scores, author concentration (bus factor), fix-after-touch risk, and module encapsulation health. Supports adaptive dual windowing (max of 90 days / 200 commits), auto-exclusion of lock files and build artifacts, JSON and text output, and path scoping. 87 new tests.
+
 ### Changed
 
 ### Fixed

@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ✅ **PHASE 3 COMPLETE** (100% of original roadmap)
 
 **What's Complete (Phases 1 & 2):**
-- ✅ Full Rust project with comprehensive test suite (3,103 tests passing)
+- ✅ Full Rust project with comprehensive test suite (3,190 tests passing)
 - ✅ 17 languages supported: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Markdown, JSON, YAML, TOML
 - ✅ 4 transformation modes: structure, signatures, types, full
 - ✅ CLI with stdin/stdout streaming support
@@ -159,6 +159,7 @@ cargo fmt -- --check           # Format check
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`, `--no-truncate`)
 - `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
 - `stats` — Token analytics dashboard with per-session tracking (`--since`, `--format json`, `--verbose`, `--clear`)
+- `heatmap` — Git history risk/coupling analysis: churn, co-change coupling, stability scores, author concentration, fix-after-touch, module encapsulation (`--json`, `--since`, `--last`, `--window`, `--path`, `--top`)
 
 **Multi-category dispatchers:**
 - `cargo` — Rust toolchain compression: test, build, clippy, audit, nextest
@@ -568,7 +569,7 @@ Cross-platform builds require different GitHub Actions runners:
 5. Create test fixtures
 6. Validate AST access works
 
-**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 3,103 tests passing. See README.md for full usage guide.
+**NOTE:** All phases complete (100%). Phase 3 features (multi-file glob, caching, parallel processing, token counting) are fully implemented and tested with 3,190 tests passing. See README.md for full usage guide.
 
 ### Critical First File: `src/parser.rs`
 
