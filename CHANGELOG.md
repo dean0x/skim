@@ -17,6 +17,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+## [2.8.0] - 2026-05-07
+
+Flat dispatch, Crush agent, multi-file args. 3,103 tests passing (up from 3,002 in v2.7.0).
+
+### Breaking Changes
+
+- **Flat dispatch CLI syntax** — Tool names are now top-level subcommands instead of being grouped under family prefixes (#158). The old `skim <family> <tool>` syntax is removed. Hooks auto-adapt — no user action needed for rewrite rules.
+
+  **Migration Guide:**
+
+  | v2.7.x | v2.8.0 |
+  |---|---|
+  | `skim test cargo` | `skim cargo test` |
+  | `skim test vitest` | `skim vitest` |
+  | `skim test pytest` | `skim pytest` |
+  | `skim test jest` | `skim jest` |
+  | `skim test go` | `skim go test` |
+  | `skim build cargo` | `skim cargo build` |
+  | `skim build clippy` | `skim cargo clippy` |
+  | `skim build tsc` | `skim tsc` |
+  | `skim lint eslint` | `skim eslint` |
+  | `skim lint ruff` | `skim ruff` |
+  | `skim lint biome` | `skim biome` |
+  | `skim pkg npm audit` | `skim npm audit` |
+  | `skim pkg pip install` | `skim pip install` |
+  | `skim file find .` | `skim find .` |
+  | `skim file ls` | `skim ls` |
+  | `skim file grep pattern` | `skim grep pattern` |
+  | `skim infra gh pr view` | `skim gh pr view` |
+  | `skim infra curl` | `skim curl` |
+  | `skim infra aws` | `skim aws` |
+
+- **OpenCode agent removed** — `skim init --agent opencode` is no longer supported. Use `skim init --agent crush` instead (#160).
+
+### Added
+- **Multiple file args** — CLI now accepts multiple file arguments and absolute glob paths (`skim src/main.rs src/lib.rs`, `skim /absolute/**/*.ts`) (#161)
+- **Session ID sidecar** — fallback attribution for analytics when session ID is not available from the agent hook (#159)
+- **Crush agent support** — `skim init --agent crush` installs hooks for the Crush AI agent; `HookProtocol` extended with config lifecycle methods (#160)
+
+### Changed
+- **Init guidance refactored** — prescriptive decision table replaced with principle-based agent guidance for clearer, more maintainable hook installation output (b79f6e3)
+- **Dispatch architecture rewritten** — family-grouped subcommands (`test`, `build`, `lint`, `pkg`, `file`, `infra`) replaced with flat dispatch where tool names (`cargo`, `vitest`, `eslint`, `npm`, `find`, `gh`) are top-level subcommands (#158)
+
+### Fixed
+- **Clippy lint scoping** — `allow(unwrap/expect/panic)` attributes scoped to inline `#[cfg(test)]` modules in rskim-core, not the entire crate (#162)
+
+### Removed
+- **OpenCode agent** — removed from `HookProtocol` implementations; `skim init --agent opencode` no longer supported (#160)
+
+### Testing
+- 3,103 tests passing (up from 3,002 in v2.7.0)
+
 ## [2.7.0] - 2026-05-01
 
 Line numbers, session tracking, output sanitization. 3,002 tests passing (up from 2,883 in v2.6.0).
@@ -845,6 +897,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.8.0** (2026-05-07): Flat dispatch, Crush agent, multi-file args (3,103 tests)
 - **2.7.0** (2026-05-01): Line numbers, session tracking, output sanitization (3,002 tests)
 - **2.6.0** (2026-04-27): Terminal UX overhaul, non-interactive init, plugin ecosystem removal (2,883 tests)
 - **2.5.1** (2026-04-20): Hook safety, SKIM_PASSTHROUGH bypass, npx fallback, 5 new parsers (2,800 tests)
