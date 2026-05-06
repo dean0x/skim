@@ -33,6 +33,12 @@ pub(crate) struct HeatmapConfig {
     pub(crate) window_preset: Option<String>,
     /// Limit analysis to last N commits.
     pub(crate) last_n: Option<usize>,
+    /// True when using dual default windowing.
+    pub(crate) dual_mode: bool,
+    /// Epoch of the 90-day time window (for dual mode reporting).
+    pub(crate) dual_time_since: Option<u64>,
+    /// Epoch of the 200-commit window (for dual mode reporting).
+    pub(crate) dual_count_since: Option<u64>,
 }
 
 impl Default for HeatmapConfig {
@@ -49,6 +55,9 @@ impl Default for HeatmapConfig {
             debug: false,
             window_preset: None,
             last_n: None,
+            dual_mode: false,
+            dual_time_since: None,
+            dual_count_since: None,
         }
     }
 }

@@ -123,7 +123,10 @@ pub(crate) fn compute_coupling(
         if confidence < threshold {
             continue;
         }
-        let sup = support_count.get(&(a.clone(), b.clone())).copied().unwrap_or(0);
+        let sup = support_count
+            .get(&(a.clone(), b.clone()))
+            .copied()
+            .unwrap_or(0);
         if sup < min_support {
             continue;
         }
@@ -222,9 +225,8 @@ pub(crate) fn compute_stability(
             } else {
                 0.0
             };
-            // Exponential decay: recent = exp(-days/30). Invert: older = higher component.
-            let recency_component = 1.0 - (-days_since / 30.0_f64).exp();
-            let recency_component = recency_component.clamp(0.0, 1.0);
+            // Recent files are riskier: exp(-days/30) → 1.0 today, ~0 after months.
+            let recency_component = (-days_since / 30.0_f64).exp().clamp(0.0, 1.0);
 
             let fix_count = file_fix_count.get(&path).copied().unwrap_or(0);
             let volatility_component = if commit_count == 0 {
@@ -617,9 +619,9 @@ mod tests {
     }
 
     #[test]
-    fn test_stability_high_for_old_stable_file() {
+    fn test_stability_moderate_for_max_churn_old_file() {
         let fix_re = build_fix_regex();
-        // One commit, old (365 days ago), no fix keywords
+        // One commit, old (365 days ago), no fix keywords, but max churn (1/1)
         let old_ts = 0u64;
         let now = 365 * 86400u64;
         let commits = vec![make_commit(
@@ -631,12 +633,11 @@ mod tests {
         )];
         let result = compute_stability(&commits, &fix_re, 1, now);
         let score = result["stable.rs"];
-        // Old file with 1 commit should have a reasonable score
-        // Churn = 1/1 = 1.0, recency ≈ 1.0 (very old), volatility = 0
-        // penalty = 40 + 35 + 0 = 75, score = 25
+        // Churn = 1/1 = 1.0 → penalty 40, recency ≈ 0 (old), volatility = 0
+        // penalty ≈ 40, score ≈ 60
         assert!(
-            score <= 30,
-            "expected low score for churned+old file, got {score}"
+            score >= 50 && score <= 70,
+            "expected moderate score for max-churn but old file, got {score}"
         );
     }
 

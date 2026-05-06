@@ -47,7 +47,9 @@ fn preset_to_since_secs(preset: &str) -> Option<u64> {
         "sprint" => Some(now.saturating_sub(14 * 86400)),
         "month" => Some(now.saturating_sub(30 * 86400)),
         "quarter" => Some(now.saturating_sub(90 * 86400)),
+        "half" => Some(now.saturating_sub(180 * 86400)),
         "year" => Some(now.saturating_sub(365 * 86400)),
+        "all" => Some(0),
         _ => None,
     }
 }
@@ -112,8 +114,26 @@ fn run_with_source(
         );
     }
 
+    if config.debug {
+        eprintln!("[heatmap] repo root: {repo_root}");
+    }
+
     // Step 2: Resolve effective config (presets and --last)
     let effective_config = resolve_effective_config(config, git, &mut warnings)?;
+
+    if config.debug {
+        let mode = if effective_config.dual_mode {
+            "dual"
+        } else if config.last_n.is_some() {
+            "count"
+        } else {
+            "time"
+        };
+        eprintln!("[heatmap] window mode: {mode}");
+        if let Some(since) = effective_config.since {
+            eprintln!("[heatmap] since epoch: {since} ({})", format_epoch(since));
+        }
+    }
 
     // Step 3: Fetch commits
     let raw_commits = match source.fetch_commits(&effective_config) {
@@ -129,6 +149,10 @@ fn run_with_source(
         }
     };
 
+    if config.debug {
+        eprintln!("[heatmap] raw commits fetched: {}", raw_commits.len());
+    }
+
     if raw_commits.is_empty() {
         eprintln!("skim heatmap: No commits found in repository");
         return Ok(ExitCode::FAILURE);
@@ -136,6 +160,7 @@ fn run_with_source(
 
     // Step 4: Apply exclusions
     let exclude_set = build_exclude_set(config.no_exclude, &config.extra_excludes);
+    let raw_commit_count = raw_commits.len();
     let mut commits = raw_commits;
     for commit in &mut commits {
         commit
@@ -144,6 +169,14 @@ fn run_with_source(
     }
     // Remove commits that are now file-less after exclusion
     commits.retain(|c| !c.files.is_empty());
+
+    if config.debug {
+        eprintln!(
+            "[heatmap] commits after exclusion: {} ({} excluded)",
+            commits.len(),
+            raw_commit_count - commits.len()
+        );
+    }
 
     if commits.is_empty() {
         eprintln!("skim heatmap: No analyzable files after exclusions");
@@ -166,6 +199,17 @@ fn run_with_source(
     let (blast_radius_map, coupling_graph) =
         compute_coupling(&commits, config.coupling_threshold, 3);
     let modules = compute_encapsulation(&commits, 3);
+
+    if config.debug {
+        let compute_elapsed = start_time.elapsed();
+        eprintln!(
+            "[heatmap] metrics computed in {:.1}ms — {} files, {} coupling edges, {} modules",
+            compute_elapsed.as_secs_f64() * 1000.0,
+            churn_map.len(),
+            coupling_graph.len(),
+            modules.len(),
+        );
+    }
 
     // Step 6: Assemble FileMetrics
     let mut all_paths: HashSet<String> = HashSet::new();
@@ -207,8 +251,8 @@ fn run_with_source(
         })
         .collect();
 
-    // Sort by churn descending for consistent output
-    file_metrics.sort_by(|a, b| b.churn.commits.cmp(&a.churn.commits));
+    // Sort by stability_score ascending (riskiest first)
+    file_metrics.sort_by(|a, b| a.stability_score.cmp(&b.stability_score));
 
     // Step 7: Build window info
     let window_info = build_window_info(&effective_config, commits.len());
@@ -321,16 +365,27 @@ fn resolve_effective_config(
             effective.since = Some(since);
         } else {
             warnings.push(format!(
-                "Unknown window preset '{preset}' — valid: sprint, month, quarter, year. Analyzing all history."
+                "Unknown window preset '{preset}' — valid: sprint, month, quarter, half, year, all. Analyzing all history."
             ));
         }
     } else {
-        // Dual default: 90 days
+        // Dual default: max(last 90 days, last 200 commits)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        effective.since = Some(now.saturating_sub(90 * 86400));
+        let time_since = now.saturating_sub(90 * 86400);
+
+        let count_since = match source.fetch_commit_count_since(200) {
+            Ok(Some(ts)) => ts,
+            _ => time_since, // fallback to time-based if lookup fails
+        };
+
+        // Use whichever captures more history (lower epoch = more history)
+        effective.since = Some(time_since.min(count_since));
+        effective.dual_mode = true;
+        effective.dual_time_since = Some(time_since);
+        effective.dual_count_since = Some(count_since);
     }
 
     Ok(effective)
@@ -341,14 +396,16 @@ fn resolve_effective_config(
 // ============================================================================
 
 fn build_window_info(config: &HeatmapConfig, commits_analyzed: usize) -> WindowInfo {
-    let mode = if let Some(ref preset) = config.window_preset {
+    let mode = if config.dual_mode {
+        "dual".to_string()
+    } else if let Some(ref preset) = config.window_preset {
         preset.clone()
-    } else if let Some(n) = config.last_n {
-        format!("last-{n}")
-    } else if let Some(since) = config.since {
-        format!("since-{since}")
+    } else if config.last_n.is_some() {
+        "count".to_string()
+    } else if config.since.is_some() {
+        "time".to_string()
     } else {
-        "90d".to_string()
+        "dual".to_string()
     };
 
     let since_str = config
@@ -361,14 +418,27 @@ fn build_window_info(config: &HeatmapConfig, commits_analyzed: usize) -> WindowI
         .unwrap_or_default()
         .as_secs();
 
+    let (effective_strategy, time_commits, count_commits) = if config.dual_mode {
+        let time_since = config.dual_time_since.unwrap_or(0);
+        let count_since = config.dual_count_since.unwrap_or(0);
+        let strategy = if time_since <= count_since {
+            "time"
+        } else {
+            "count"
+        };
+        (Some(strategy.to_string()), None, None)
+    } else {
+        (None, None, None)
+    };
+
     WindowInfo {
         mode,
         since: since_str,
         until: format_epoch(now_epoch),
         commits_analyzed,
-        time_commits: None,
-        count_commits: None,
-        effective_strategy: None,
+        time_commits,
+        count_commits,
+        effective_strategy,
     }
 }
 
@@ -476,16 +546,25 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
             continue;
         }
 
+        // --format VALUE
+        if let Some(val) = extract_value(args, &mut i, "--format") {
+            if val == "json" {
+                config.format_json = true;
+            } else {
+                anyhow::bail!("--format only supports 'json', got: {val}");
+            }
+            continue;
+        }
+
         // Boolean flags
         match arg {
-            "--json" | "--format=json" => config.format_json = true,
+            "--json" => config.format_json = true,
             "--no-exclude" => config.no_exclude = true,
             "--debug" => config.debug = true,
             other => {
                 if other.starts_with('-') {
                     anyhow::bail!("unknown flag: {other}");
                 }
-                // Positional argument — currently unused
             }
         }
 
@@ -551,7 +630,7 @@ USAGE:
 OPTIONS:
     --since <VALUE>               Analyze commits since epoch (seconds) or duration (30d, 2w, 24h)
     --last <N>                    Analyze last N commits
-    --window <PRESET>             Named window: sprint (14d), month (30d), quarter (90d), year (365d)
+    --window <PRESET>             Named window: sprint|month|quarter|half|year|all
     --path <DIR>                  Scope analysis to files under this path
     --json                        Output JSON instead of human-readable text
     --top <N>                     Maximum files to display (default: 20)
@@ -565,8 +644,10 @@ OPTIONS:
 WINDOW PRESETS:
     sprint     14 days
     month      30 days
-    quarter    90 days (default when no window specified)
+    quarter    90 days
+    half       180 days
     year       365 days
+    all        No time limit (analyze entire history)
 
 EXAMPLES:
     skim heatmap                           # Analyze last 90 days

@@ -89,7 +89,11 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     out.push('\n');
 
     // Blast Radius (coupling)
-    section_header(&mut out, "Blast Radius (coupling above threshold):", use_color);
+    section_header(
+        &mut out,
+        "Blast Radius (coupling above threshold):",
+        use_color,
+    );
     let mut files_with_coupling: Vec<_> = result
         .files
         .iter()
