@@ -556,9 +556,11 @@ fn main() -> ExitCode {
 
 /// File/directory/glob/stdin processing pipeline.
 ///
-/// Parses CLI args via clap, validates constraints, then delegates to
-/// the appropriate processor (stdin, directory, glob, single file, or
-/// explicit multi-file list).
+/// Parses CLI args via clap, validates constraints, then routes to
+/// the appropriate processor based on argument count:
+/// - 0 args → usage error
+/// - 1 arg  → `process_single_arg` (stdin, directory, glob, or single file)
+/// - N args → explicit multi-file list (no stdin mixing allowed)
 fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
@@ -599,43 +601,14 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
         session_id: analytics.session_id.clone(),
     };
 
-    // === Single-argument path (existing behaviour, unchanged) ===
     if args.files.len() == 1 {
-        let file = &args.files[0];
-
-        if file == "-" {
-            let result = process::process_stdin(process_options, args.filename.as_deref())?;
-            process::write_result_and_stats(&result, args.show_stats)?;
-            record_file_analytics(
-                analytics.enabled,
-                &result,
-                "skim -",
-                &args,
-                analytics.session_id.as_deref(),
-            );
-            return Ok(());
-        }
-
-        let path = PathBuf::from(file);
-
-        if path.is_dir() {
-            return multi::process_directory(&path, multi_options);
-        }
-
-        if multi::has_glob_pattern(file) {
-            return multi::process_glob(file, multi_options);
-        }
-
-        let result = process::process_file(&path, process_options)?;
-        process::write_result_and_stats(&result, args.show_stats)?;
-        record_file_analytics(
-            analytics.enabled,
-            &result,
-            &format!("skim {file}"),
+        return process_single_arg(
+            &args.files[0],
             &args,
-            analytics.session_id.as_deref(),
+            analytics,
+            process_options,
+            multi_options,
         );
-        return Ok(());
     }
 
     // === Multiple arguments: `skim file1.ts file2.ts` ===
@@ -653,6 +626,55 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
     // plain file → add directly.  All results are gathered into a single Vec
     // and processed together via process_files.
     multi::process_explicit_files(&args.files, multi_options)
+}
+
+/// Dispatch a single argument to the appropriate processor.
+///
+/// Handles four cases in priority order:
+/// 1. `-`       → read from stdin
+/// 2. directory → recursive directory walk
+/// 3. glob      → glob pattern expansion
+/// 4. file path → single file processing
+fn process_single_arg(
+    file: &str,
+    args: &Args,
+    analytics: &analytics::AnalyticsConfig,
+    process_options: process::ProcessOptions,
+    multi_options: multi::MultiFileOptions,
+) -> anyhow::Result<()> {
+    if file == "-" {
+        let result = process::process_stdin(process_options, args.filename.as_deref())?;
+        process::write_result_and_stats(&result, args.show_stats)?;
+        record_file_analytics(
+            analytics.enabled,
+            &result,
+            "skim -",
+            args,
+            analytics.session_id.as_deref(),
+        );
+        return Ok(());
+    }
+
+    let path = PathBuf::from(file);
+
+    if path.is_dir() {
+        return multi::process_directory(&path, multi_options);
+    }
+
+    if multi::has_glob_pattern(file) {
+        return multi::process_glob(file, multi_options);
+    }
+
+    let result = process::process_file(&path, process_options)?;
+    process::write_result_and_stats(&result, args.show_stats)?;
+    record_file_analytics(
+        analytics.enabled,
+        &result,
+        &format!("skim {file}"),
+        args,
+        analytics.session_id.as_deref(),
+    );
+    Ok(())
 }
 
 /// Record token analytics for file operations (single file or stdin).

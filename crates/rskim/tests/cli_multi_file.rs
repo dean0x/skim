@@ -102,14 +102,16 @@ fn test_multi_file_shows_headers() {
         .clone();
 
     let stdout = String::from_utf8_lossy(&output);
-    // Each file should appear as a "// {path}" header comment
+    // Headers are emitted as "// {full path}" — check the exact prefix+path.
+    let header_a = format!("// {}", temp.path().join("a.ts").display());
+    let header_b = format!("// {}", temp.path().join("b.ts").display());
     assert!(
-        stdout.contains("// ") && stdout.contains("a.ts"),
-        "Expected '// ...a.ts' header, got:\n{stdout}"
+        stdout.contains(&header_a),
+        "Expected header '{header_a}', got:\n{stdout}"
     );
     assert!(
-        stdout.contains("// ") && stdout.contains("b.ts"),
-        "Expected '// ...b.ts' header, got:\n{stdout}"
+        stdout.contains(&header_b),
+        "Expected header '{header_b}', got:\n{stdout}"
     );
 }
 
@@ -229,10 +231,7 @@ fn test_multi_file_filename_flag_rejected() {
         .arg(temp.path().join("file2.ts"))
         .assert()
         .failure()
-        .stderr(
-            predicate::str::contains("--filename")
-                .or(predicate::str::contains("stdin")),
-        );
+        .stderr(predicate::str::contains("--filename").or(predicate::str::contains("stdin")));
 }
 
 // ============================================================================
