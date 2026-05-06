@@ -624,6 +624,7 @@ fn strip_rust_return_type(function_node: Node, ranges: &mut Vec<(usize, usize)>)
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::{Mode, Parser, TransformConfig};

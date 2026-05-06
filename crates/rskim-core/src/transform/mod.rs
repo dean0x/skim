@@ -400,6 +400,7 @@ pub(crate) fn reconcile_line_map_after_truncation(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

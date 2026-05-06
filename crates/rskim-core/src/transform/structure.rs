@@ -620,6 +620,7 @@ pub(crate) fn extract_markdown_headers_with_spans(
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod offset_map_tests {
     use super::compute_source_line_map_from_offset_map;
 
@@ -916,6 +917,7 @@ mod offset_map_tests {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod markdown_line_map_tests {
     use super::extract_markdown_headers_with_spans;
     use crate::{Language, Parser};

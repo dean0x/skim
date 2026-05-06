@@ -403,6 +403,7 @@ pub(crate) fn trim_and_normalize(source: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
