@@ -441,7 +441,7 @@ pub fn supported_languages() -> &'static [Language] {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used)] // Allow expect in tests - it's acceptable for test code to panic on unexpected errors
 mod tests {
     use super::*;
 
