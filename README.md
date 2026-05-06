@@ -61,22 +61,22 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 
-### Test Output Compression (`skim test`)
-- Parses and compresses output from cargo, go, vitest, jest, pytest
+### Test Output Compression
+- `skim cargo test`, `skim pytest`, `skim vitest`, `skim jest`, `skim go test`
 - Extracts failures, assertions, pass/fail counts while stripping noise
 - Three-tier degradation from structured parse to regex fallback to passthrough
 
-### Build Output Compression (`skim build`)
-- Parses cargo, clippy, tsc build output
+### Build Output Compression
+- `skim cargo build`, `skim cargo clippy`, `skim tsc`
 - Extracts errors, warnings, and summaries
 
-### Lint Output Compression (`skim lint`)
-- Parses ESLint, Ruff, mypy, golangci-lint, prettier, rustfmt, biome, dprint, oxlint, black, gofmt output
+### Lint Output Compression
+- `skim eslint`, `skim ruff`, `skim mypy`, `skim golangci`, `skim prettier`, `skim rustfmt`, `skim biome`, `skim dprint`, `skim oxlint`, `skim black`, `skim gofmt`
 - Extracts errors and warnings with severity grouping
 - Three-tier degradation from structured parse to regex fallback to passthrough
 
-### Package Manager Compression (`skim pkg`)
-- Parses npm, pnpm, pip, cargo audit/install/outdated output
+### Package Manager Compression
+- `skim npm`, `skim pnpm`, `skim pip`, `skim cargo audit`
 - Extracts vulnerabilities, version conflicts, and dependency issues
 
 ### Git Output Compression (`skim git`)
@@ -557,7 +557,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.7.0 — Stable
+**Current**: v2.8.0 — Stable
 
 ✅ **Core — Code Reading (17 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
@@ -586,7 +586,7 @@ cargo bench
 
 ✅ **Distribution:**
 - cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
-- 3,002 tests passing, 14.6ms performance (3x under target)
+- 3,103 tests passing, 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
