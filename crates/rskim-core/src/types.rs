@@ -862,6 +862,7 @@ impl Parser {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
 mod tests {
     use super::*;
 

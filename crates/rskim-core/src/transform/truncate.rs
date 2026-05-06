@@ -467,6 +467,7 @@ where
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // Unwrapping and panics are acceptable in tests
 mod tests {
     use super::*;
 
