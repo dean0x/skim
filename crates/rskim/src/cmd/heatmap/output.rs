@@ -44,8 +44,17 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     }
     out.push('\n');
 
-    // Top Churn
-    section_header(&mut out, "Top Churn:");
+    render_top_churn(&mut out, result, top_n);
+    render_blast_radius(&mut out, result, top_n);
+    render_fix_risk(&mut out, result, top_n);
+    render_module_health(&mut out, result, top_n);
+    render_bus_factor(&mut out, result, top_n);
+
+    out
+}
+
+fn render_top_churn(out: &mut String, result: &HeatmapResult, top_n: usize) {
+    section_header(out, "Top Churn:");
     let mut files_by_churn: Vec<_> = result.files.iter().collect();
     files_by_churn.sort_by_key(|f| std::cmp::Reverse(f.churn.commits));
 
@@ -71,9 +80,10 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
         }
     }
     out.push('\n');
+}
 
-    // Blast Radius (coupling)
-    section_header(&mut out, "Blast Radius (coupling above threshold):");
+fn render_blast_radius(out: &mut String, result: &HeatmapResult, top_n: usize) {
+    section_header(out, "Blast Radius (coupling above threshold):");
     let mut files_with_coupling: Vec<_> = result
         .files
         .iter()
@@ -104,9 +114,10 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
         }
     }
     out.push('\n');
+}
 
-    // Fix Risk
-    section_header(&mut out, "Fix Risk (> 20%):");
+fn render_fix_risk(out: &mut String, result: &HeatmapResult, top_n: usize) {
+    section_header(out, "Fix Risk (> 20%):");
     let mut fix_risk_files: Vec<_> = result
         .files
         .iter()
@@ -134,9 +145,10 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
         }
     }
     out.push('\n');
+}
 
-    // Module Health
-    section_header(&mut out, "Module Health:");
+fn render_module_health(out: &mut String, result: &HeatmapResult, top_n: usize) {
+    section_header(out, "Module Health:");
     if result.modules.is_empty() {
         out.push_str("  (no modules with enough data)\n");
     } else {
@@ -159,9 +171,10 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
         }
     }
     out.push('\n');
+}
 
-    // Bus Factor Risk
-    section_header(&mut out, "Bus Factor Risk:");
+fn render_bus_factor(out: &mut String, result: &HeatmapResult, top_n: usize) {
+    section_header(out, "Bus Factor Risk:");
     let bus_factor_files: Vec<_> = result
         .files
         .iter()
@@ -181,8 +194,6 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
         }
     }
     out.push('\n');
-
-    out
 }
 
 fn section_header(out: &mut String, title: &str) {
