@@ -153,27 +153,25 @@ impl CliGitSource {
 
 impl GitDataSource for CliGitSource {
     fn is_git_repo(&self) -> bool {
-        CliGitSource::is_git_repo(self)
+        self.is_git_repo()
     }
 
     fn get_repo_root(&self) -> anyhow::Result<String> {
-        CliGitSource::get_repo_root(self)
+        self.get_repo_root()
     }
 
     fn detect_shallow_clone(&self) -> bool {
-        CliGitSource::detect_shallow_clone(self)
+        self.detect_shallow_clone()
     }
 
     fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>> {
-        CliGitSource::fetch_commit_count_since(self, n)
+        self.fetch_commit_count_since(n)
     }
 
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitRecord>> {
         let owned_args = self.build_git_log_args(config);
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-
         let output = self.runner.run("git", &args).map_err(git_not_found)?;
-
         parse_git_log_output(&output.stdout)
     }
 }
