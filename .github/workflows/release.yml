@@ -325,14 +325,28 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+
           # Publish rskim-core first (rskim depends on it)
-          cargo publish -p rskim-core --allow-dirty || {
-            echo "Warning: rskim-core publish failed (may already exist)"
-          }
-          # Wait for crates.io to index the new version
+          CORE_PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/rskim-core/${VERSION}" \
+            -H "User-Agent: skim-release-workflow" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('version') else 'no')" 2>/dev/null || echo "no")
+          if [ "$CORE_PUBLISHED" = "yes" ]; then
+            echo "rskim-core ${VERSION} already published on crates.io — skipping"
+          else
+            cargo publish -p rskim-core --allow-dirty
+          fi
+
+          # Wait for crates.io to index the new version before publishing rskim
           sleep 30
-          # Then publish rskim
-          cargo publish -p rskim --allow-dirty
+
+          # Publish rskim
+          RSKIM_PUBLISHED=$(curl -sf "https://crates.io/api/v1/crates/rskim/${VERSION}" \
+            -H "User-Agent: skim-release-workflow" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('version') else 'no')" 2>/dev/null || echo "no")
+          if [ "$RSKIM_PUBLISHED" = "yes" ]; then
+            echo "rskim ${VERSION} already published on crates.io — skipping"
+          else
+            cargo publish -p rskim --allow-dirty
+          fi
 
   publish-npm:
     name: Publish npm packages
@@ -391,20 +405,29 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
           for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-x64 cli-linux-arm64 cli-linux-x64-musl cli-linux-arm64-musl cli-win32-x64; do
-            echo "Publishing @rskim/$pkg..."
-            npm publish ./npm/$pkg --access public || {
-              echo "Warning: Failed to publish @rskim/$pkg (may already exist)"
-            }
+            echo "Publishing @rskim/$pkg@${VERSION}..."
+            PUBLISHED=$(npm view "@rskim/${pkg}@${VERSION}" version 2>/dev/null || true)
+            if [ "$PUBLISHED" = "$VERSION" ]; then
+              echo "@rskim/${pkg}@${VERSION} already published — skipping"
+            else
+              npm publish "./npm/$pkg" --access public
+            fi
           done
 
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm publish ./npm/rskim --access public || {
-            echo "Warning: Failed to publish rskim (may already exist)"
-          }
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          echo "Publishing rskim@${VERSION}..."
+          PUBLISHED=$(npm view "rskim@${VERSION}" version 2>/dev/null || true)
+          if [ "$PUBLISHED" = "$VERSION" ]; then
+            echo "rskim@${VERSION} already published — skipping"
+          else
+            npm publish ./npm/rskim --access public
+          fi
 
   trigger-homebrew:
     name: Trigger Homebrew update
