@@ -28,7 +28,8 @@ use metrics::{
 };
 use output::{render_json, render_text};
 use types::{
-    AuthorMetrics, FileMetrics, FixRiskMetrics, HeatmapConfig, HeatmapResult, WindowInfo,
+    AuthorMetrics, CommitRecord, FileMetrics, FixRiskMetrics, HeatmapConfig, HeatmapResult,
+    WindowInfo,
 };
 
 // ============================================================================
@@ -184,10 +185,78 @@ fn run_with_source(
         return Ok(ExitCode::FAILURE);
     }
 
-    // Step 5: Compute metrics (now_epoch captured once in Step 2, reused here)
+    // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
+    let mut result = compute_heatmap(
+        commits,
+        config,
+        &effective_config,
+        now_epoch,
+        repo_root,
+        warnings,
+        config.debug,
+    );
+
+    // Apply --top N limit to files
+    result.files.truncate(config.top_n);
+
+    // Step 10: Render
+    let elapsed = start_time.elapsed();
+    let mut stdout = io::stdout().lock();
+
+    if config.format_json {
+        let json = render_json(&result)?;
+        writeln!(stdout, "{json}")?;
+    } else {
+        let text = render_text(&result, config.top_n);
+        write!(stdout, "{text}")?;
+    }
+
+    // Step 11: Fire-and-forget analytics
+    let rec = RecordingContext {
+        enabled: analytics.enabled,
+        command_type: CommandType::Heatmap,
+        parse_tier: None,
+        session_id: analytics.session_id.as_deref(),
+    };
+    crate::analytics::try_record_command(
+        rec,
+        String::new(), // no raw text for heatmap
+        String::new(), // no compressed text
+        "skim heatmap".to_string(),
+        elapsed,
+    );
+
+    Ok(ExitCode::SUCCESS)
+}
+
+// ============================================================================
+// Pure metric computation (Steps 5-9)
+// ============================================================================
+
+/// Compute all six risk metrics from commits and assemble a `HeatmapResult`.
+///
+/// This is a pure function — no I/O, no side effects. All git I/O is handled
+/// by the callers (Steps 1-4 in `run_with_source`). Accepting `now_epoch` as a
+/// parameter (instead of calling `SystemTime::now()` here) keeps the function
+/// deterministic and testable.
+///
+/// `debug` controls whether timing is emitted to stderr.
+fn compute_heatmap(
+    commits: Vec<CommitRecord>,
+    config: &HeatmapConfig,
+    effective_config: &HeatmapConfig,
+    now_epoch: u64,
+    repository: String,
+    warnings: Vec<String>,
+    debug: bool,
+) -> HeatmapResult {
+    use std::time::Instant;
+
+    let t0 = Instant::now();
     let fix_regex = build_fix_regex();
 
+    // Step 5: Compute metrics
     let churn_map = compute_churn(&commits);
     let max_churn = churn_map.values().map(|m| m.commits).max().unwrap_or(1);
     let stability_map = compute_stability(&commits, &fix_regex, max_churn, now_epoch);
@@ -197,11 +266,11 @@ fn run_with_source(
         compute_coupling(&commits, config.coupling_threshold, 3);
     let modules = compute_encapsulation(&commits, 3);
 
-    if config.debug {
-        let compute_elapsed = start_time.elapsed();
+    if debug {
+        let elapsed = t0.elapsed();
         eprintln!(
             "[skim:heatmap] metrics computed in {:.1}ms — {} files, {} coupling edges, {} modules",
-            compute_elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 1000.0,
             churn_map.len(),
             coupling_graph.len(),
             modules.len(),
@@ -243,7 +312,7 @@ fn run_with_source(
     file_metrics.sort_by(|a, b| a.stability_score.cmp(&b.stability_score));
 
     // Step 7: Build window info
-    let window_info = build_window_info(&effective_config, commits.len(), now_epoch);
+    let window_info = build_window_info(effective_config, commits.len(), now_epoch);
 
     // Step 8: Get excluded patterns for output
     let excluded_patterns: Vec<String> = if config.no_exclude {
@@ -257,49 +326,17 @@ fn run_with_source(
     };
 
     // Step 9: Build result
-    let mut result = HeatmapResult {
+    HeatmapResult {
         version: 1,
         generated_at: format_epoch(now_epoch),
-        repository: repo_root,
+        repository,
         window: window_info,
         files: file_metrics,
         modules,
         coupling_graph,
         excluded_patterns,
         warnings,
-    };
-
-    // Apply --top N limit to files
-    result.files.truncate(config.top_n);
-
-    // Step 10: Render
-    let elapsed = start_time.elapsed();
-    let mut stdout = io::stdout().lock();
-
-    if config.format_json {
-        let json = render_json(&result)?;
-        writeln!(stdout, "{json}")?;
-    } else {
-        let text = render_text(&result, config.top_n);
-        write!(stdout, "{text}")?;
     }
-
-    // Step 11: Fire-and-forget analytics
-    let rec = RecordingContext {
-        enabled: analytics.enabled,
-        command_type: CommandType::Heatmap,
-        parse_tier: None,
-        session_id: analytics.session_id.as_deref(),
-    };
-    crate::analytics::try_record_command(
-        rec,
-        String::new(), // no raw text for heatmap
-        String::new(), // no compressed text
-        "skim heatmap".to_string(),
-        elapsed,
-    );
-
-    Ok(ExitCode::SUCCESS)
 }
 
 // ============================================================================
