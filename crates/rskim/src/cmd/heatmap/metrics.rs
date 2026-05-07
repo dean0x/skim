@@ -373,10 +373,10 @@ pub(crate) fn compute_fix_after_touch(
                 (proximity_set.len() as f64 / total as f64) * 100.0
             };
 
-            // Union: commits flagged by either signal
-            let keyword_set: HashSet<usize> =
-                indices.iter().copied().filter(|&i| is_fix[i]).collect();
-            let union_count = keyword_set.union(&proximity_set).count();
+            // Union: fix commits (keyword) ∪ non-fix commits followed by a fix (proximity).
+            // The two sets are disjoint by construction (proximity_set only contains non-fix
+            // indices), so union_count = keyword_count + proximity_set.len().
+            let union_count = keyword_count + proximity_set.len();
             let combined_pct = (union_count as f64 / total as f64) * 100.0;
 
             (
@@ -622,8 +622,14 @@ mod tests {
         // With threshold=0.0 and min_support=1, any pair would be included if generated.
         // The large-commit cap means zero pairs should appear.
         let (blast, graph) = compute_coupling(&commits, 0.0, 1);
-        assert!(blast.is_empty(), "large commit must not generate coupling pairs");
-        assert!(graph.is_empty(), "large commit must not generate graph edges");
+        assert!(
+            blast.is_empty(),
+            "large commit must not generate coupling pairs"
+        );
+        assert!(
+            graph.is_empty(),
+            "large commit must not generate graph edges"
+        );
     }
 
     // -----------------------------------------------------------------------

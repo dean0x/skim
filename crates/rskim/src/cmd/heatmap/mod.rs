@@ -133,7 +133,10 @@ fn run_with_source(
         };
         eprintln!("[skim:heatmap] window mode: {mode}");
         if let Some(since) = effective_config.since {
-            eprintln!("[skim:heatmap] since epoch: {since} ({})", format_epoch(since));
+            eprintln!(
+                "[skim:heatmap] since epoch: {since} ({})",
+                format_epoch(since)
+            );
         }
     }
 
@@ -194,7 +197,6 @@ fn run_with_source(
         now_epoch,
         repo_root,
         warnings,
-        config.debug,
     );
 
     // Apply --top N limit to files
@@ -240,8 +242,6 @@ fn run_with_source(
 /// by the callers (Steps 1-4 in `run_with_source`). Accepting `now_epoch` as a
 /// parameter (instead of calling `SystemTime::now()` here) keeps the function
 /// deterministic and testable.
-///
-/// `debug` controls whether timing is emitted to stderr.
 fn compute_heatmap(
     commits: Vec<CommitRecord>,
     config: &HeatmapConfig,
@@ -249,7 +249,6 @@ fn compute_heatmap(
     now_epoch: u64,
     repository: String,
     warnings: Vec<String>,
-    debug: bool,
 ) -> HeatmapResult {
     use std::time::Instant;
 
@@ -266,7 +265,7 @@ fn compute_heatmap(
         compute_coupling(&commits, config.coupling_threshold, 3);
     let modules = compute_encapsulation(&commits, 3);
 
-    if debug {
+    if config.debug {
         let elapsed = t0.elapsed();
         eprintln!(
             "[skim:heatmap] metrics computed in {:.1}ms — {} files, {} coupling edges, {} modules",
@@ -442,7 +441,7 @@ fn build_window_info(
         .map(format_epoch)
         .unwrap_or_else(|| "all".to_string());
 
-    let (effective_strategy, time_commits, count_commits) = if config.dual_mode {
+    let effective_strategy = if config.dual_mode {
         let time_since = config.dual_time_since.unwrap_or(0);
         let count_since = config.dual_count_since.unwrap_or(0);
         let strategy = if time_since <= count_since {
@@ -450,9 +449,9 @@ fn build_window_info(
         } else {
             "count"
         };
-        (Some(strategy.to_string()), None, None)
+        Some(strategy.to_string())
     } else {
-        (None, None, None)
+        None
     };
 
     WindowInfo {
@@ -460,8 +459,8 @@ fn build_window_info(
         since: since_str,
         until: format_epoch(now_epoch),
         commits_analyzed,
-        time_commits,
-        count_commits,
+        time_commits: None,
+        count_commits: None,
         effective_strategy,
     }
 }
@@ -627,9 +626,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
                 }
                 // Positional (non-flag) argument — `skim heatmap` takes no
                 // positional args; suggest --path if the user meant a directory.
-                anyhow::bail!(
-                    "unexpected argument: '{other}'. Did you mean --path={other}?"
-                );
+                anyhow::bail!("unexpected argument: '{other}'. Did you mean --path={other}?");
             }
         }
 
@@ -871,7 +868,10 @@ mod tests {
         let result = parse_args(&["--fix-window=0".to_string()]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("--fix-window must be at least 1"), "got: {msg}");
+        assert!(
+            msg.contains("--fix-window must be at least 1"),
+            "got: {msg}"
+        );
     }
 
     #[test]
