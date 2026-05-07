@@ -27,7 +27,7 @@ use metrics::{
     compute_fix_after_touch, compute_stability,
 };
 use output::{render_json, render_text};
-use types::{CommitRecord, FileMetrics, HeatmapConfig, HeatmapResult, WindowInfo};
+use types::{CommitRecord, FileMetrics, HeatmapConfig, HeatmapResult, ResolvedWindow, WindowInfo};
 
 // ============================================================================
 // Window presets
@@ -118,10 +118,11 @@ fn run_with_source(
         .as_secs();
 
     // Step 2: Resolve effective config (presets and --last)
-    let effective_config = resolve_effective_config(config, source, &mut warnings, now_epoch)?;
+    let (effective_config, window) =
+        resolve_effective_config(config, source, &mut warnings, now_epoch)?;
 
     if config.debug {
-        let mode = if effective_config.dual_mode {
+        let mode = if window.dual_mode {
             "dual"
         } else if config.last_n.is_some() {
             "count"
@@ -129,7 +130,7 @@ fn run_with_source(
             "time"
         };
         eprintln!("[skim:heatmap] window mode: {mode}");
-        if let Some(since) = effective_config.since {
+        if let Some(since) = window.since {
             eprintln!(
                 "[skim:heatmap] since epoch: {since} ({})",
                 format_epoch(since)
@@ -187,14 +188,7 @@ fn run_with_source(
 
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
-    let mut result = compute_heatmap(
-        commits,
-        config,
-        &effective_config,
-        now_epoch,
-        repo_root,
-        warnings,
-    );
+    let mut result = compute_heatmap(commits, config, &window, now_epoch, repo_root, warnings);
 
     // Apply --top N limit to files
     result.files.truncate(config.top_n);
@@ -247,7 +241,7 @@ const MIN_SUPPORT_THRESHOLD: usize = 3;
 fn compute_heatmap(
     commits: Vec<CommitRecord>,
     config: &HeatmapConfig,
-    effective_config: &HeatmapConfig,
+    window: &ResolvedWindow,
     now_epoch: u64,
     repository: String,
     warnings: Vec<String>,
@@ -304,7 +298,7 @@ fn compute_heatmap(
     file_metrics.sort_by_key(|f| f.stability_score);
 
     // Step 7: Build window info
-    let window_info = build_window_info(effective_config, commits.len(), now_epoch);
+    let window_info = build_window_info(window, commits.len(), now_epoch);
 
     // Step 8: Get excluded patterns for output
     let excluded_patterns: Vec<String> = if config.no_exclude {
@@ -338,13 +332,25 @@ fn compute_heatmap(
 /// Resolve the effective `HeatmapConfig` by applying presets and `--last`.
 ///
 /// Precedence: `--since` > `--last` > `--window` preset > dual default.
+///
+/// Returns a tuple of:
+/// - `HeatmapConfig` with `since` set to the resolved epoch (used by `fetch_commits`)
+/// - `ResolvedWindow` carrying window metadata (mode, dual fields) for `build_window_info`
 fn resolve_effective_config(
     config: &HeatmapConfig,
     source: &dyn GitDataSource,
     warnings: &mut Vec<String>,
     now_epoch: u64,
-) -> anyhow::Result<HeatmapConfig> {
+) -> anyhow::Result<(HeatmapConfig, ResolvedWindow)> {
     let mut effective = config.clone();
+    let mut window = ResolvedWindow {
+        since: None,
+        dual_mode: false,
+        dual_time_since: None,
+        dual_count_since: None,
+        window_preset: config.window_preset.clone(),
+        last_n: config.last_n,
+    };
 
     // Count explicit time-selection flags
     let explicit_count = [
@@ -366,11 +372,13 @@ fn resolve_effective_config(
     if let Some(since) = config.since {
         // Already set — highest precedence
         effective.since = Some(since);
+        window.since = Some(since);
     } else if let Some(n) = config.last_n {
         // --last N: find the timestamp of the Nth commit
         match source.fetch_commit_count_since(n) {
             Ok(Some(ts)) => {
                 effective.since = Some(ts);
+                window.since = Some(ts);
             }
             Ok(None) => {
                 warnings.push(format!(
@@ -384,6 +392,7 @@ fn resolve_effective_config(
     } else if let Some(ref preset) = config.window_preset {
         if let Some(since) = preset_to_since_secs(preset, now_epoch) {
             effective.since = Some(since);
+            window.since = Some(since);
         } else {
             warnings.push(format!(
                 "Unknown window preset '{preset}' — valid: sprint, month, quarter, half, year, all. Analyzing all history."
@@ -399,13 +408,15 @@ fn resolve_effective_config(
         };
 
         // Use whichever captures more history (lower epoch = more history)
-        effective.since = Some(time_since.min(count_since));
-        effective.dual_mode = true;
-        effective.dual_time_since = Some(time_since);
-        effective.dual_count_since = Some(count_since);
+        let resolved_since = time_since.min(count_since);
+        effective.since = Some(resolved_since);
+        window.since = Some(resolved_since);
+        window.dual_mode = true;
+        window.dual_time_since = Some(time_since);
+        window.dual_count_since = Some(count_since);
     }
 
-    Ok(effective)
+    Ok((effective, window))
 }
 
 // ============================================================================
@@ -413,30 +424,30 @@ fn resolve_effective_config(
 // ============================================================================
 
 fn build_window_info(
-    config: &HeatmapConfig,
+    window: &ResolvedWindow,
     commits_analyzed: usize,
     now_epoch: u64,
 ) -> WindowInfo {
-    let mode = if config.dual_mode {
+    let mode = if window.dual_mode {
         "dual".to_string()
-    } else if let Some(ref preset) = config.window_preset {
+    } else if let Some(ref preset) = window.window_preset {
         preset.clone()
-    } else if config.last_n.is_some() {
+    } else if window.last_n.is_some() {
         "count".to_string()
-    } else if config.since.is_some() {
+    } else if window.since.is_some() {
         "time".to_string()
     } else {
         "dual".to_string()
     };
 
-    let since_str = config
+    let since_str = window
         .since
         .map(format_epoch)
         .unwrap_or_else(|| "all".to_string());
 
-    let effective_strategy = if config.dual_mode {
-        let time_since = config.dual_time_since.unwrap_or(0);
-        let count_since = config.dual_count_since.unwrap_or(0);
+    let effective_strategy = if window.dual_mode {
+        let time_since = window.dual_time_since.unwrap_or(0);
+        let count_since = window.dual_count_since.unwrap_or(0);
         let strategy = if time_since <= count_since {
             "time"
         } else {
@@ -909,21 +920,30 @@ mod tests {
     // build_window_info
     // -----------------------------------------------------------------------
 
-    fn base_config() -> HeatmapConfig {
-        HeatmapConfig::default()
+    fn base_window() -> ResolvedWindow {
+        ResolvedWindow {
+            since: None,
+            dual_mode: false,
+            dual_time_since: None,
+            dual_count_since: None,
+            window_preset: None,
+            last_n: None,
+        }
     }
 
     const NOW: u64 = 1_704_067_200; // 2024-01-01
 
     #[test]
     fn test_build_window_info_dual_mode() {
-        let mut config = base_config();
-        config.dual_mode = true;
-        // time_since <= count_since → effective_strategy = "time"
-        config.dual_time_since = Some(1_000_000);
-        config.dual_count_since = Some(2_000_000);
+        let window = ResolvedWindow {
+            dual_mode: true,
+            // time_since <= count_since → effective_strategy = "time"
+            dual_time_since: Some(1_000_000),
+            dual_count_since: Some(2_000_000),
+            ..base_window()
+        };
 
-        let info = build_window_info(&config, 42, NOW);
+        let info = build_window_info(&window, 42, NOW);
 
         assert_eq!(info.mode, "dual");
         assert_eq!(info.commits_analyzed, 42);
@@ -932,13 +952,15 @@ mod tests {
 
     #[test]
     fn test_build_window_info_dual_mode_count_wins() {
-        let mut config = base_config();
-        config.dual_mode = true;
-        // time_since > count_since → effective_strategy = "count"
-        config.dual_time_since = Some(2_000_000);
-        config.dual_count_since = Some(1_000_000);
+        let window = ResolvedWindow {
+            dual_mode: true,
+            // time_since > count_since → effective_strategy = "count"
+            dual_time_since: Some(2_000_000),
+            dual_count_since: Some(1_000_000),
+            ..base_window()
+        };
 
-        let info = build_window_info(&config, 10, NOW);
+        let info = build_window_info(&window, 10, NOW);
 
         assert_eq!(info.mode, "dual");
         assert_eq!(info.effective_strategy.as_deref(), Some("count"));
@@ -946,10 +968,12 @@ mod tests {
 
     #[test]
     fn test_build_window_info_preset_mode() {
-        let mut config = base_config();
-        config.window_preset = Some("quarter".to_string());
+        let window = ResolvedWindow {
+            window_preset: Some("quarter".to_string()),
+            ..base_window()
+        };
 
-        let info = build_window_info(&config, 50, NOW);
+        let info = build_window_info(&window, 50, NOW);
 
         assert_eq!(info.mode, "quarter");
         assert!(info.effective_strategy.is_none());
@@ -957,10 +981,12 @@ mod tests {
 
     #[test]
     fn test_build_window_info_count_mode() {
-        let mut config = base_config();
-        config.last_n = Some(200);
+        let window = ResolvedWindow {
+            last_n: Some(200),
+            ..base_window()
+        };
 
-        let info = build_window_info(&config, 200, NOW);
+        let info = build_window_info(&window, 200, NOW);
 
         assert_eq!(info.mode, "count");
         assert!(info.effective_strategy.is_none());
@@ -968,10 +994,12 @@ mod tests {
 
     #[test]
     fn test_build_window_info_time_mode() {
-        let mut config = base_config();
-        config.since = Some(1_700_000_000);
+        let window = ResolvedWindow {
+            since: Some(1_700_000_000),
+            ..base_window()
+        };
 
-        let info = build_window_info(&config, 77, NOW);
+        let info = build_window_info(&window, 77, NOW);
 
         assert_eq!(info.mode, "time");
         assert_eq!(info.since, "2023-11-14"); // epoch 1_700_000_000
@@ -982,9 +1010,9 @@ mod tests {
     fn test_build_window_info_default_falls_back_to_dual() {
         // No flags set → falls through to the "dual" fallback mode string.
         // dual_mode=false, so effective_strategy is None (only set in the dual_mode branch).
-        let config = base_config();
+        let window = base_window();
 
-        let info = build_window_info(&config, 0, NOW);
+        let info = build_window_info(&window, 0, NOW);
 
         assert_eq!(info.mode, "dual");
         assert!(info.effective_strategy.is_none());
@@ -992,18 +1020,18 @@ mod tests {
 
     #[test]
     fn test_build_window_info_no_since_shows_all() {
-        let config = base_config();
+        let window = base_window();
 
-        let info = build_window_info(&config, 0, NOW);
+        let info = build_window_info(&window, 0, NOW);
 
         assert_eq!(info.since, "all");
     }
 
     #[test]
     fn test_build_window_info_commits_analyzed_passthrough() {
-        let config = base_config();
+        let window = base_window();
 
-        let info = build_window_info(&config, 999, NOW);
+        let info = build_window_info(&window, 999, NOW);
 
         assert_eq!(info.commits_analyzed, 999);
     }

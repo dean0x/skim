@@ -9,6 +9,10 @@ use serde::Serialize;
 // ============================================================================
 
 /// Parsed CLI flags for `skim heatmap`.
+///
+/// Contains raw user input only. Window resolution metadata (dual mode, since
+/// epochs) is separated into [`ResolvedWindow`] to avoid polluting this struct
+/// with derived state.
 #[derive(Debug, Clone)]
 pub(crate) struct HeatmapConfig {
     /// Epoch seconds — only analyze commits since this timestamp.
@@ -33,12 +37,6 @@ pub(crate) struct HeatmapConfig {
     pub(crate) window_preset: Option<String>,
     /// Limit analysis to last N commits.
     pub(crate) last_n: Option<usize>,
-    /// True when using dual default windowing.
-    pub(crate) dual_mode: bool,
-    /// Epoch of the 90-day time window (for dual mode reporting).
-    pub(crate) dual_time_since: Option<u64>,
-    /// Epoch of the 200-commit window (for dual mode reporting).
-    pub(crate) dual_count_since: Option<u64>,
 }
 
 impl Default for HeatmapConfig {
@@ -55,11 +53,30 @@ impl Default for HeatmapConfig {
             debug: false,
             window_preset: None,
             last_n: None,
-            dual_mode: false,
-            dual_time_since: None,
-            dual_count_since: None,
         }
     }
+}
+
+/// Resolved window metadata produced by [`super::resolve_effective_config`].
+///
+/// Separates derived window state from raw CLI input (`HeatmapConfig`), so
+/// `HeatmapConfig` remains a pure user-input struct and window metadata is
+/// never confused with CLI flags.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedWindow {
+    /// The effective `--since` epoch (may differ from `HeatmapConfig::since`
+    /// after preset/dual resolution).
+    pub(crate) since: Option<u64>,
+    /// True when using dual default windowing (no explicit flag was set).
+    pub(crate) dual_mode: bool,
+    /// Epoch of the 90-day time window (populated in dual mode only).
+    pub(crate) dual_time_since: Option<u64>,
+    /// Epoch of the 200-commit window (populated in dual mode only).
+    pub(crate) dual_count_since: Option<u64>,
+    /// Named window preset string (e.g. "sprint"), if one was used.
+    pub(crate) window_preset: Option<String>,
+    /// Last-N commit count, if `--last` was used.
+    pub(crate) last_n: Option<usize>,
 }
 
 // ============================================================================
