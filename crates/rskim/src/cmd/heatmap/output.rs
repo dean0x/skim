@@ -120,9 +120,7 @@ fn render_fix_risk(out: &mut String, result: &HeatmapResult, top_n: usize) {
         .iter()
         .filter(|f| f.fix_risk.combined_pct > 20.0 && !f.fix_risk.insufficient_data)
         .collect();
-    fix_risk_files.sort_by(|a, b| {
-        b.fix_risk.combined_pct.total_cmp(&a.fix_risk.combined_pct)
-    });
+    fix_risk_files.sort_by(|a, b| b.fix_risk.combined_pct.total_cmp(&a.fix_risk.combined_pct));
 
     if fix_risk_files.is_empty() {
         out.push_str("  (no files above threshold)\n");
