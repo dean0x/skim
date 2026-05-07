@@ -308,7 +308,7 @@ fn compute_heatmap(
         .collect();
 
     // Sort by stability_score ascending (riskiest first)
-    file_metrics.sort_by(|a, b| a.stability_score.cmp(&b.stability_score));
+    file_metrics.sort_by_key(|f| f.stability_score);
 
     // Step 7: Build window info
     let window_info = build_window_info(effective_config, commits.len(), now_epoch);

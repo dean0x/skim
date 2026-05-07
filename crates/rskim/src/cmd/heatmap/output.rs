@@ -47,7 +47,7 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     // Top Churn
     section_header(&mut out, "Top Churn:");
     let mut files_by_churn: Vec<_> = result.files.iter().collect();
-    files_by_churn.sort_by(|a, b| b.churn.commits.cmp(&a.churn.commits));
+    files_by_churn.sort_by_key(|f| std::cmp::Reverse(f.churn.commits));
 
     if files_by_churn.is_empty() {
         out.push_str("  (no files)\n");
