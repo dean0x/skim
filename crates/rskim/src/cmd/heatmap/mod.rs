@@ -73,26 +73,36 @@ pub(crate) fn run(
     run_with_source(&git_source, &config, analytics)
 }
 
-/// Orchestration with injected data source (enables testing).
+/// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
+struct PreparedCommits {
+    commits: Vec<CommitRecord>,
+    window: ResolvedWindow,
+    now_epoch: u64,
+    repo_root: String,
+    warnings: Vec<String>,
+}
+
+/// Execute Steps 1–4 of the heatmap pipeline (git I/O + exclusions).
 ///
-/// All git I/O is routed through `source` — infra checks (repo detection, root,
-/// shallow clone, commit count) and the commit fetch all use the same trait object.
-fn run_with_source(
+/// Returns `Ok(None)` for all early-exit conditions (not a git repo, no commits,
+/// all commits excluded). Callers treat `None` as a `ExitCode::FAILURE` signal.
+/// Returns `Ok(Some(PreparedCommits))` when the pipeline should proceed to
+/// metric computation.
+fn prepare_commits(
     source: &dyn GitDataSource,
     config: &HeatmapConfig,
-    analytics: &crate::analytics::AnalyticsConfig,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<Option<PreparedCommits>> {
     // Step 1: Validate git environment
     if !source.is_git_repo() {
         eprintln!("skim heatmap: Not a git repository");
-        return Ok(ExitCode::FAILURE);
+        return Ok(None);
     }
 
     let repo_root = match source.get_repo_root() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("skim heatmap: {e}");
-            return Ok(ExitCode::FAILURE);
+            return Ok(None);
         }
     };
 
@@ -148,7 +158,7 @@ fn run_with_source(
             } else {
                 eprintln!("skim heatmap: failed to fetch git log: {msg}");
             }
-            return Ok(ExitCode::FAILURE);
+            return Ok(None);
         }
     };
 
@@ -158,7 +168,7 @@ fn run_with_source(
 
     if raw_commits.is_empty() {
         eprintln!("skim heatmap: No commits found in repository");
-        return Ok(ExitCode::FAILURE);
+        return Ok(None);
     }
 
     // Step 4: Apply exclusions
@@ -183,8 +193,39 @@ fn run_with_source(
 
     if commits.is_empty() {
         eprintln!("skim heatmap: No analyzable files after exclusions");
-        return Ok(ExitCode::FAILURE);
+        return Ok(None);
     }
+
+    Ok(Some(PreparedCommits {
+        commits,
+        window,
+        now_epoch,
+        repo_root,
+        warnings,
+    }))
+}
+
+/// Orchestration with injected data source (enables testing).
+///
+/// All git I/O is routed through `source` — infra checks (repo detection, root,
+/// shallow clone, commit count) and the commit fetch all use the same trait object.
+fn run_with_source(
+    source: &dyn GitDataSource,
+    config: &HeatmapConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    let prepared = match prepare_commits(source, config)? {
+        Some(p) => p,
+        None => return Ok(ExitCode::FAILURE),
+    };
+
+    let PreparedCommits {
+        commits,
+        window,
+        now_epoch,
+        repo_root,
+        warnings,
+    } = prepared;
 
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
