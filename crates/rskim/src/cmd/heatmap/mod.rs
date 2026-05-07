@@ -238,10 +238,11 @@ fn run_with_source(
 
 /// Compute all six risk metrics from commits and assemble a `HeatmapResult`.
 ///
-/// This is a pure function — no I/O, no side effects. All git I/O is handled
-/// by the callers (Steps 1-4 in `run_with_source`). Accepting `now_epoch` as a
-/// parameter (instead of calling `SystemTime::now()` here) keeps the function
-/// deterministic and testable.
+/// No git I/O — all repository data is pre-fetched by callers (Steps 1-4 in
+/// `run_with_source`). Accepting `now_epoch` as a parameter (instead of calling
+/// `SystemTime::now()` here) keeps metric computation deterministic and testable.
+///
+/// Debug timing is emitted to stderr when `config.debug` is enabled.
 fn compute_heatmap(
     commits: Vec<CommitRecord>,
     config: &HeatmapConfig,
@@ -459,8 +460,6 @@ fn build_window_info(
         since: since_str,
         until: format_epoch(now_epoch),
         commits_analyzed,
-        time_commits: None,
-        count_commits: None,
         effective_strategy,
     }
 }
@@ -912,5 +911,112 @@ mod tests {
     fn test_parse_args_fix_window() {
         let config = parse_args(&["--fix-window=10".to_string()]).unwrap();
         assert_eq!(config.fix_window, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_window_info
+    // -----------------------------------------------------------------------
+
+    fn base_config() -> HeatmapConfig {
+        HeatmapConfig::default()
+    }
+
+    const NOW: u64 = 1_704_067_200; // 2024-01-01
+
+    #[test]
+    fn test_build_window_info_dual_mode() {
+        let mut config = base_config();
+        config.dual_mode = true;
+        // time_since <= count_since → effective_strategy = "time"
+        config.dual_time_since = Some(1_000_000);
+        config.dual_count_since = Some(2_000_000);
+
+        let info = build_window_info(&config, 42, NOW);
+
+        assert_eq!(info.mode, "dual");
+        assert_eq!(info.commits_analyzed, 42);
+        assert_eq!(info.effective_strategy.as_deref(), Some("time"));
+    }
+
+    #[test]
+    fn test_build_window_info_dual_mode_count_wins() {
+        let mut config = base_config();
+        config.dual_mode = true;
+        // time_since > count_since → effective_strategy = "count"
+        config.dual_time_since = Some(2_000_000);
+        config.dual_count_since = Some(1_000_000);
+
+        let info = build_window_info(&config, 10, NOW);
+
+        assert_eq!(info.mode, "dual");
+        assert_eq!(info.effective_strategy.as_deref(), Some("count"));
+    }
+
+    #[test]
+    fn test_build_window_info_preset_mode() {
+        let mut config = base_config();
+        config.window_preset = Some("quarter".to_string());
+
+        let info = build_window_info(&config, 50, NOW);
+
+        assert_eq!(info.mode, "quarter");
+        assert!(info.effective_strategy.is_none());
+    }
+
+    #[test]
+    fn test_build_window_info_count_mode() {
+        let mut config = base_config();
+        config.last_n = Some(200);
+
+        let info = build_window_info(&config, 200, NOW);
+
+        assert_eq!(info.mode, "count");
+        assert!(info.effective_strategy.is_none());
+    }
+
+    #[test]
+    fn test_build_window_info_time_mode() {
+        let mut config = base_config();
+        config.since = Some(1_700_000_000);
+
+        let info = build_window_info(&config, 77, NOW);
+
+        assert_eq!(info.mode, "time");
+        assert_eq!(info.since, "2023-11-14"); // epoch 1_700_000_000
+        assert!(info.effective_strategy.is_none());
+    }
+
+    #[test]
+    fn test_build_window_info_default_falls_back_to_dual() {
+        // No flags set → dual fallback branch
+        let config = base_config();
+
+        let info = build_window_info(&config, 0, NOW);
+
+        assert_eq!(info.mode, "dual");
+        // No dual_time_since/dual_count_since configured → effective_strategy still present
+        // (dual_mode=false here hits the else branch which produces None for effective_strategy)
+        // Wait: dual_mode=false, so effective_strategy is None in the non-dual-mode branch.
+        // The mode string comes from the final else → "dual", but effective_strategy is None
+        // because we only set effective_strategy inside `if config.dual_mode`.
+        assert!(info.effective_strategy.is_none());
+    }
+
+    #[test]
+    fn test_build_window_info_no_since_shows_all() {
+        let config = base_config();
+
+        let info = build_window_info(&config, 0, NOW);
+
+        assert_eq!(info.since, "all");
+    }
+
+    #[test]
+    fn test_build_window_info_commits_analyzed_passthrough() {
+        let config = base_config();
+
+        let info = build_window_info(&config, 999, NOW);
+
+        assert_eq!(info.commits_analyzed, 999);
     }
 }

@@ -111,8 +111,6 @@ pub(crate) struct WindowInfo {
     pub(crate) since: String,
     pub(crate) until: String,
     pub(crate) commits_analyzed: usize,
-    pub(crate) time_commits: Option<usize>,
-    pub(crate) count_commits: Option<usize>,
     pub(crate) effective_strategy: Option<String>,
 }
 
