@@ -135,7 +135,7 @@ pub(crate) struct ChurnMetrics {
 }
 
 /// Author diversity metrics for a file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct AuthorMetrics {
     /// Unique author count (authors with >5% of commits).
     pub(crate) count: usize,
@@ -156,6 +156,20 @@ pub(crate) struct FixRiskMetrics {
     pub(crate) combined_pct: f64,
     /// True when <2 commits — not enough data.
     pub(crate) insufficient_data: bool,
+}
+
+impl Default for FixRiskMetrics {
+    fn default() -> Self {
+        Self {
+            keyword_pct: 0.0,
+            proximity_pct: 0.0,
+            combined_pct: 0.0,
+            // Default to `true` so callers that skip the lookup (no history) are
+            // marked as having insufficient data rather than misleadingly showing
+            // zero-risk metrics.
+            insufficient_data: true,
+        }
+    }
 }
 
 /// A coupling entry in a file's blast radius.

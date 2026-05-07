@@ -27,10 +27,7 @@ use metrics::{
     compute_fix_after_touch, compute_stability,
 };
 use output::{render_json, render_text};
-use types::{
-    AuthorMetrics, CommitRecord, FileMetrics, FixRiskMetrics, HeatmapConfig, HeatmapResult,
-    WindowInfo,
-};
+use types::{CommitRecord, FileMetrics, HeatmapConfig, HeatmapResult, WindowInfo};
 
 // ============================================================================
 // Window presets
@@ -284,17 +281,8 @@ fn compute_heatmap(
         .into_iter()
         .map(|(path, churn)| {
             let stability_score = stability_map.get(&path).copied().unwrap_or(100);
-            let authors = author_map.get(&path).cloned().unwrap_or(AuthorMetrics {
-                count: 0,
-                top_author_pct: 0.0,
-                single_owner_risk: false,
-            });
-            let fix_risk = fix_risk_map.get(&path).cloned().unwrap_or(FixRiskMetrics {
-                keyword_pct: 0.0,
-                proximity_pct: 0.0,
-                combined_pct: 0.0,
-                insufficient_data: true,
-            });
+            let authors = author_map.get(&path).cloned().unwrap_or_default();
+            let fix_risk = fix_risk_map.get(&path).cloned().unwrap_or_default();
             let blast_radius = blast_radius_map.get(&path).cloned().unwrap_or_default();
 
             FileMetrics {
