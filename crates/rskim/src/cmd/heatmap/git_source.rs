@@ -26,7 +26,27 @@ fn git_not_found(e: anyhow::Error) -> anyhow::Error {
 ///
 /// The only implementation is [`CliGitSource`]; the trait enables unit-testing
 /// the orchestration logic in `mod.rs` without spawning a real git process.
+///
+/// Infra methods (`is_git_repo`, `get_repo_root`, `detect_shallow_clone`,
+/// `fetch_commit_count_since`) are included so `run_with_source` can accept a
+/// single `&dyn GitDataSource` instead of splitting into a concrete `&CliGitSource`
+/// for infrastructure and a trait object for data fetch.
 pub(crate) trait GitDataSource {
+    /// Return `true` when the cwd is inside a git repository.
+    fn is_git_repo(&self) -> bool;
+
+    /// Return the repository root path.
+    fn get_repo_root(&self) -> anyhow::Result<String>;
+
+    /// Return `true` when the repo is a shallow clone.
+    fn detect_shallow_clone(&self) -> bool;
+
+    /// Fetch the Unix timestamp of the Nth-oldest commit within the last `n` commits.
+    ///
+    /// Returns `None` when the repo has fewer than `n` commits.
+    fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>>;
+
+    /// Fetch commit records according to `config`.
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitRecord>>;
 }
 
@@ -108,36 +128,49 @@ impl CliGitSource {
     }
 
     /// Build the git log arg list from a config.
-    fn build_git_log_args<'a>(
-        &self,
-        config: &HeatmapConfig,
-        extra: &'a mut Vec<String>,
-    ) -> Vec<&'a str> {
-        // The base args that don't vary.
-        extra.push("log".to_string());
-        extra.push("--format=COMMIT:%H|%aN|%ad|%s".to_string());
-        extra.push("--numstat".to_string());
-        extra.push("--no-merges".to_string());
-        extra.push("--date=unix".to_string());
-        extra.push("-M".to_string());
+    fn build_git_log_args(&self, config: &HeatmapConfig) -> Vec<String> {
+        let mut args = vec![
+            "log".to_string(),
+            "--format=COMMIT:%H|%aN|%ad|%s".to_string(),
+            "--numstat".to_string(),
+            "--no-merges".to_string(),
+            "--date=unix".to_string(),
+            "-M".to_string(),
+        ];
 
         if let Some(since) = config.since {
-            extra.push(format!("--since={since}"));
+            args.push(format!("--since={since}"));
         }
 
         if let Some(ref path) = config.path {
-            extra.push("--".to_string());
-            extra.push(path.clone());
+            args.push("--".to_string());
+            args.push(path.clone());
         }
 
-        extra.iter().map(String::as_str).collect()
+        args
     }
 }
 
 impl GitDataSource for CliGitSource {
+    fn is_git_repo(&self) -> bool {
+        CliGitSource::is_git_repo(self)
+    }
+
+    fn get_repo_root(&self) -> anyhow::Result<String> {
+        CliGitSource::get_repo_root(self)
+    }
+
+    fn detect_shallow_clone(&self) -> bool {
+        CliGitSource::detect_shallow_clone(self)
+    }
+
+    fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>> {
+        CliGitSource::fetch_commit_count_since(self, n)
+    }
+
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitRecord>> {
-        let mut owned_args: Vec<String> = Vec::new();
-        let args = self.build_git_log_args(config, &mut owned_args);
+        let owned_args = self.build_git_log_args(config);
+        let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
 
         let output = self.runner.run("git", &args).map_err(git_not_found)?;
 

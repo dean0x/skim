@@ -14,7 +14,6 @@ mod metrics;
 mod output;
 mod types;
 
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,8 +28,7 @@ use metrics::{
 };
 use output::{render_json, render_text};
 use types::{
-    AuthorMetrics, ChurnMetrics, FileMetrics, FixRiskMetrics, HeatmapConfig, HeatmapResult,
-    WindowInfo,
+    AuthorMetrics, FileMetrics, FixRiskMetrics, HeatmapConfig, HeatmapResult, WindowInfo,
 };
 
 // ============================================================================
@@ -38,17 +36,13 @@ use types::{
 // ============================================================================
 
 /// Map a named preset to `--since` epoch seconds offset.
-fn preset_to_since_secs(preset: &str) -> Option<u64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+fn preset_to_since_secs(preset: &str, now_epoch: u64) -> Option<u64> {
     match preset {
-        "sprint" => Some(now.saturating_sub(14 * 86400)),
-        "month" => Some(now.saturating_sub(30 * 86400)),
-        "quarter" => Some(now.saturating_sub(90 * 86400)),
-        "half" => Some(now.saturating_sub(180 * 86400)),
-        "year" => Some(now.saturating_sub(365 * 86400)),
+        "sprint" => Some(now_epoch.saturating_sub(14 * 86400)),
+        "month" => Some(now_epoch.saturating_sub(30 * 86400)),
+        "quarter" => Some(now_epoch.saturating_sub(90 * 86400)),
+        "half" => Some(now_epoch.saturating_sub(180 * 86400)),
+        "year" => Some(now_epoch.saturating_sub(365 * 86400)),
         "all" => Some(0),
         _ => None,
     }
@@ -78,26 +72,25 @@ pub(crate) fn run(
     };
 
     let git_source = CliGitSource::new();
-    run_with_source(&git_source, &git_source, &config, analytics)
+    run_with_source(&git_source, &config, analytics)
 }
 
 /// Orchestration with injected data source (enables testing).
 ///
-/// `git` handles infrastructure checks (repo detection, root, shallow clone,
-/// commit count). `source` handles the actual commit fetch and may be a test double.
+/// All git I/O is routed through `source` — infra checks (repo detection, root,
+/// shallow clone, commit count) and the commit fetch all use the same trait object.
 fn run_with_source(
-    git: &CliGitSource,
     source: &dyn GitDataSource,
     config: &HeatmapConfig,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     // Step 1: Validate git environment
-    if !git.is_git_repo() {
+    if !source.is_git_repo() {
         eprintln!("skim heatmap: Not a git repository");
         return Ok(ExitCode::FAILURE);
     }
 
-    let repo_root = match git.get_repo_root() {
+    let repo_root = match source.get_repo_root() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("skim heatmap: {e}");
@@ -107,7 +100,7 @@ fn run_with_source(
 
     let mut warnings: Vec<String> = Vec::new();
 
-    if git.detect_shallow_clone() {
+    if source.detect_shallow_clone() {
         warnings.push(
             "Shallow clone detected — history may be incomplete, metrics may be skewed."
                 .to_string(),
@@ -115,11 +108,19 @@ fn run_with_source(
     }
 
     if config.debug {
-        eprintln!("[heatmap] repo root: {repo_root}");
+        eprintln!("[skim:heatmap] repo root: {repo_root}");
     }
 
+    // Capture a single clock snapshot for all window-resolution helpers so that
+    // preset_to_since_secs, resolve_effective_config, and build_window_info all
+    // use the same value (Issue 1: temporal consistency).
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     // Step 2: Resolve effective config (presets and --last)
-    let effective_config = resolve_effective_config(config, git, &mut warnings)?;
+    let effective_config = resolve_effective_config(config, source, &mut warnings, now_epoch)?;
 
     if config.debug {
         let mode = if effective_config.dual_mode {
@@ -129,9 +130,9 @@ fn run_with_source(
         } else {
             "time"
         };
-        eprintln!("[heatmap] window mode: {mode}");
+        eprintln!("[skim:heatmap] window mode: {mode}");
         if let Some(since) = effective_config.since {
-            eprintln!("[heatmap] since epoch: {since} ({})", format_epoch(since));
+            eprintln!("[skim:heatmap] since epoch: {since} ({})", format_epoch(since));
         }
     }
 
@@ -150,7 +151,7 @@ fn run_with_source(
     };
 
     if config.debug {
-        eprintln!("[heatmap] raw commits fetched: {}", raw_commits.len());
+        eprintln!("[skim:heatmap] raw commits fetched: {}", raw_commits.len());
     }
 
     if raw_commits.is_empty() {
@@ -172,7 +173,7 @@ fn run_with_source(
 
     if config.debug {
         eprintln!(
-            "[heatmap] commits after exclusion: {} ({} excluded)",
+            "[skim:heatmap] commits after exclusion: {} ({} excluded)",
             commits.len(),
             raw_commit_count - commits.len()
         );
@@ -183,13 +184,9 @@ fn run_with_source(
         return Ok(ExitCode::FAILURE);
     }
 
-    // Step 5: Compute metrics
+    // Step 5: Compute metrics (now_epoch captured once in Step 2, reused here)
     let start_time = std::time::Instant::now();
     let fix_regex = build_fix_regex();
-    let now_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
 
     let churn_map = compute_churn(&commits);
     let max_churn = churn_map.values().map(|m| m.commits).max().unwrap_or(1);
@@ -203,7 +200,7 @@ fn run_with_source(
     if config.debug {
         let compute_elapsed = start_time.elapsed();
         eprintln!(
-            "[heatmap] metrics computed in {:.1}ms — {} files, {} coupling edges, {} modules",
+            "[skim:heatmap] metrics computed in {:.1}ms — {} files, {} coupling edges, {} modules",
             compute_elapsed.as_secs_f64() * 1000.0,
             churn_map.len(),
             coupling_graph.len(),
@@ -212,20 +209,11 @@ fn run_with_source(
     }
 
     // Step 6: Assemble FileMetrics
-    let mut all_paths: HashSet<String> = HashSet::new();
-    for commit in &commits {
-        for f in &commit.files {
-            all_paths.insert(f.path.clone());
-        }
-    }
-
-    let mut file_metrics: Vec<FileMetrics> = all_paths
+    // `churn_map` already contains every path seen across all commits; no need
+    // to rebuild a separate HashSet from the commit list.
+    let mut file_metrics: Vec<FileMetrics> = churn_map
         .into_iter()
-        .map(|path| {
-            let churn = churn_map.get(&path).cloned().unwrap_or(ChurnMetrics {
-                commits: 0,
-                rate: 0.0,
-            });
+        .map(|(path, churn)| {
             let stability_score = stability_map.get(&path).copied().unwrap_or(100);
             let authors = author_map.get(&path).cloned().unwrap_or(AuthorMetrics {
                 count: 0,
@@ -255,17 +243,17 @@ fn run_with_source(
     file_metrics.sort_by(|a, b| a.stability_score.cmp(&b.stability_score));
 
     // Step 7: Build window info
-    let window_info = build_window_info(&effective_config, commits.len());
+    let window_info = build_window_info(&effective_config, commits.len(), now_epoch);
 
     // Step 8: Get excluded patterns for output
     let excluded_patterns: Vec<String> = if config.no_exclude {
         Vec::new()
     } else {
-        excludes::DEFAULT_EXCLUDES
-            .iter()
-            .map(|s| s.to_string())
-            .chain(config.extra_excludes.iter().cloned())
-            .collect()
+        let capacity = excludes::DEFAULT_EXCLUDES.len() + config.extra_excludes.len();
+        let mut patterns = Vec::with_capacity(capacity);
+        patterns.extend(excludes::DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
+        patterns.extend(config.extra_excludes.iter().cloned());
+        patterns
     };
 
     // Step 9: Build result
@@ -323,8 +311,9 @@ fn run_with_source(
 /// Precedence: `--since` > `--last` > `--window` preset > dual default.
 fn resolve_effective_config(
     config: &HeatmapConfig,
-    source: &CliGitSource,
+    source: &dyn GitDataSource,
     warnings: &mut Vec<String>,
+    now_epoch: u64,
 ) -> anyhow::Result<HeatmapConfig> {
     let mut effective = config.clone();
 
@@ -364,7 +353,7 @@ fn resolve_effective_config(
             }
         }
     } else if let Some(ref preset) = config.window_preset {
-        if let Some(since) = preset_to_since_secs(preset) {
+        if let Some(since) = preset_to_since_secs(preset, now_epoch) {
             effective.since = Some(since);
         } else {
             warnings.push(format!(
@@ -373,11 +362,7 @@ fn resolve_effective_config(
         }
     } else {
         // Dual default: max(last 90 days, last 200 commits)
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let time_since = now.saturating_sub(90 * 86400);
+        let time_since = now_epoch.saturating_sub(90 * 86400);
 
         let count_since = match source.fetch_commit_count_since(200) {
             Ok(Some(ts)) => ts,
@@ -398,7 +383,11 @@ fn resolve_effective_config(
 // Window info construction
 // ============================================================================
 
-fn build_window_info(config: &HeatmapConfig, commits_analyzed: usize) -> WindowInfo {
+fn build_window_info(
+    config: &HeatmapConfig,
+    commits_analyzed: usize,
+    now_epoch: u64,
+) -> WindowInfo {
     let mode = if config.dual_mode {
         "dual".to_string()
     } else if let Some(ref preset) = config.window_preset {
@@ -415,11 +404,6 @@ fn build_window_info(config: &HeatmapConfig, commits_analyzed: usize) -> WindowI
         .since
         .map(format_epoch)
         .unwrap_or_else(|| "all".to_string());
-
-    let now_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
 
     let (effective_strategy, time_commits, count_commits) = if config.dual_mode {
         let time_since = config.dual_time_since.unwrap_or(0);
@@ -480,13 +464,38 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 /// Parse CLI args into `HeatmapConfig`.
 ///
-/// Follows the manual flag-parsing pattern used by `stats.rs`.
+/// Follows the manual flag-parsing pattern used by `stats.rs` and `discover.rs`.
+/// Initialises `config.debug` from the process-wide debug flag so that
+/// `SKIM_DEBUG=1` (initialised by `main()` before dispatch) is honoured automatically.
 fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
-    let mut config = HeatmapConfig::default();
+    let mut config = HeatmapConfig {
+        // Inherit SKIM_DEBUG / --debug flag set by main() before subcommand dispatch.
+        debug: crate::debug::is_debug_enabled(),
+        ..HeatmapConfig::default()
+    };
     let mut i = 0;
+
+    // Value-taking flags — used to detect when a flag is passed without a value
+    // (e.g. `skim heatmap --since`) before extract_value calls so the error is
+    // actionable rather than falling through to "unknown flag: --since".
+    const VALUE_FLAGS: &[&str] = &[
+        "--since",
+        "--path",
+        "--top",
+        "--window",
+        "--last",
+        "--exclude",
+        "--coupling-threshold",
+        "--fix-window",
+        "--format",
+    ];
 
     while i < args.len() {
         let arg = args[i].as_str();
+
+        if VALUE_FLAGS.contains(&arg) && i + 1 >= args.len() {
+            anyhow::bail!("{arg} requires a value");
+        }
 
         // --since=VALUE or --since VALUE
         if let Some(val) = extract_value(args, &mut i, "--since") {
@@ -503,9 +512,13 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
 
         // --top
         if let Some(val) = extract_value(args, &mut i, "--top") {
-            config.top_n = val
+            let n: usize = val
                 .parse()
                 .map_err(|_| anyhow::anyhow!("--top requires a positive integer"))?;
+            if n == 0 {
+                anyhow::bail!("--top must be at least 1");
+            }
+            config.top_n = n;
             continue;
         }
 
@@ -543,9 +556,13 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
 
         // --fix-window
         if let Some(val) = extract_value(args, &mut i, "--fix-window") {
-            config.fix_window = val
+            let n: usize = val
                 .parse()
                 .map_err(|_| anyhow::anyhow!("--fix-window requires a positive integer"))?;
+            if n == 0 {
+                anyhow::bail!("--fix-window must be at least 1");
+            }
+            config.fix_window = n;
             continue;
         }
 
@@ -563,11 +580,19 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
         match arg {
             "--json" => config.format_json = true,
             "--no-exclude" => config.no_exclude = true,
-            "--debug" => config.debug = true,
+            "--debug" => {
+                config.debug = true;
+                crate::debug::force_enable_debug();
+            }
             other => {
                 if other.starts_with('-') {
                     anyhow::bail!("unknown flag: {other}");
                 }
+                // Positional (non-flag) argument — `skim heatmap` takes no
+                // positional args; suggest --path if the user meant a directory.
+                anyhow::bail!(
+                    "unexpected argument: '{other}'. Did you mean --path={other}?"
+                );
             }
         }
 
@@ -778,18 +803,55 @@ mod tests {
 
     #[test]
     fn test_preset_to_since_secs_sprint() {
-        let since = preset_to_since_secs("sprint").unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let since = preset_to_since_secs("sprint", now).unwrap();
         let diff = now - since;
         assert!(diff >= 13 * 86400 && diff <= 15 * 86400);
     }
 
     #[test]
     fn test_preset_to_since_secs_unknown() {
-        assert!(preset_to_since_secs("unknown-preset").is_none());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(preset_to_since_secs("unknown-preset", now).is_none());
+    }
+
+    #[test]
+    fn test_parse_args_top_zero_errors() {
+        let result = parse_args(&["--top=0".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("--top must be at least 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parse_args_fix_window_zero_errors() {
+        let result = parse_args(&["--fix-window=0".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("--fix-window must be at least 1"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parse_args_since_missing_value_errors() {
+        let result = parse_args(&["--since".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("--since requires a value"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parse_args_unexpected_positional_errors() {
+        let result = parse_args(&["src/".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unexpected argument"), "got: {msg}");
+        assert!(msg.contains("--path=src/"), "got: {msg}");
     }
 
     #[test]

@@ -59,10 +59,21 @@ pub(crate) fn compute_churn(commits: &[CommitRecord]) -> HashMap<String, ChurnMe
 // Metric 2: Coupling
 // ============================================================================
 
+/// Maximum number of files in a commit that participates in coupling pair generation.
+///
+/// Commits touching more than this many files (e.g. large reformats) still count
+/// toward `weighted_total` for each file, but are skipped for pair enumeration.
+/// This caps worst-case pair allocations at 50*49 = 2450 per commit instead of
+/// unbounded O(n^2).
+const COUPLING_MAX_FILES: usize = 50;
+
 /// Compute file coupling from commit co-occurrences.
 ///
 /// Weights each pair's contribution by `1.0 / sqrt(files_in_commit)` to
 /// discount large commits (e.g. reformatting all files at once).
+///
+/// Commits with more than [`COUPLING_MAX_FILES`] files are excluded from pair
+/// enumeration (but still contribute to each file's `weighted_total`).
 ///
 /// Returns:
 /// - per-file blast radius map: `HashMap<String, Vec<CouplingEntry>>`
@@ -72,28 +83,24 @@ pub(crate) fn compute_coupling(
     threshold: f64,
     min_support: usize,
 ) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
-    // co_occurrences[(a, b)] = weighted sum of commits where a and b appear together
-    let mut co_occur: HashMap<(String, String), f64> = HashMap::new();
+    // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b)
+    let mut co_occur: HashMap<(String, String), (f64, usize)> = HashMap::new();
     // weighted_total[a] = weighted sum of commits touching a
     let mut weighted_total: HashMap<String, f64> = HashMap::new();
-    // support[(a,b)] = raw commit count (for filtering)
-    let mut support_count: HashMap<(String, String), usize> = HashMap::new();
 
     for commit in commits {
         let files: Vec<&str> = commit.files.iter().map(|f| f.path.as_str()).collect();
         let n = files.len();
-        if n < 2 {
-            // A single-file commit contributes to weighted_total but not coupling
-            for f in &files {
-                let w = 1.0 / (n as f64).sqrt();
-                *weighted_total.entry(f.to_string()).or_insert(0.0) += w;
-            }
-            continue;
-        }
         let weight = 1.0 / (n as f64).sqrt();
 
+        // Every commit contributes to weighted_total for its files
         for f in &files {
             *weighted_total.entry(f.to_string()).or_insert(0.0) += weight;
+        }
+
+        // Skip large commits for pair enumeration to avoid O(n^2) blowup
+        if !(2..=COUPLING_MAX_FILES).contains(&n) {
+            continue;
         }
 
         // All ordered pairs (a, b) where a != b
@@ -102,10 +109,10 @@ pub(crate) fn compute_coupling(
                 if i == j {
                     continue;
                 }
-                let a = files[i].to_string();
-                let b = files[j].to_string();
-                *support_count.entry((a.clone(), b.clone())).or_insert(0) += 1;
-                *co_occur.entry((a, b)).or_insert(0.0) += weight;
+                let key = (files[i].to_string(), files[j].to_string());
+                let entry = co_occur.entry(key).or_insert((0.0, 0));
+                entry.0 += weight;
+                entry.1 += 1;
             }
         }
     }
@@ -114,7 +121,7 @@ pub(crate) fn compute_coupling(
     let mut blast_radius: HashMap<String, Vec<CouplingEntry>> = HashMap::new();
     let mut graph_edges: HashMap<(String, String), (f64, usize)> = HashMap::new();
 
-    for ((a, b), weighted_co) in &co_occur {
+    for ((a, b), (weighted_co, sup)) in &co_occur {
         let total_a = weighted_total.get(a).copied().unwrap_or(0.0);
         if total_a == 0.0 {
             continue;
@@ -123,11 +130,7 @@ pub(crate) fn compute_coupling(
         if confidence < threshold {
             continue;
         }
-        let sup = support_count
-            .get(&(a.clone(), b.clone()))
-            .copied()
-            .unwrap_or(0);
-        if sup < min_support {
+        if *sup < min_support {
             continue;
         }
 
@@ -137,7 +140,7 @@ pub(crate) fn compute_coupling(
             .push(CouplingEntry {
                 path: b.clone(),
                 confidence,
-                support: sup,
+                support: *sup,
             });
 
         // De-duplicate edges: only store canonical (smaller, larger) pair
@@ -146,7 +149,7 @@ pub(crate) fn compute_coupling(
         } else {
             (b.clone(), a.clone())
         };
-        let entry = graph_edges.entry(edge_key).or_insert((0.0, sup));
+        let entry = graph_edges.entry(edge_key).or_insert((0.0, *sup));
         if confidence > entry.0 {
             entry.0 = confidence;
         }
@@ -393,6 +396,24 @@ pub(crate) fn compute_fix_after_touch(
 // Metric 6: Encapsulation
 // ============================================================================
 
+/// Extract the top-level directory component from a file path.
+///
+/// Returns `None` for root-level files (no directory component), e.g. `Makefile`.
+/// Returns `Some("src")` for `src/lib.rs`, `Some("tests")` for `tests/foo.rs`.
+fn extract_top_dir(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    // Require at least one parent directory (not root-level files)
+    let parent = p.parent()?;
+    let s = parent.to_string_lossy();
+    if s.is_empty() || s == "." {
+        return None;
+    }
+    // Return the first path component as the module name
+    p.components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str().map(String::from))
+}
+
 /// Compute module encapsulation health.
 ///
 /// For each directory, counts commits that touch ONLY that directory vs.
@@ -414,36 +435,16 @@ pub(crate) fn compute_encapsulation(
         let dirs: HashSet<String> = commit
             .files
             .iter()
-            .filter_map(|f| {
-                let p = std::path::Path::new(&f.path);
-                p.parent().and_then(|parent| {
-                    let s = parent.to_string_lossy();
-                    if s.is_empty() || s == "." {
-                        None
-                    } else {
-                        // Use first component only for top-level dir grouping
-                        p.components()
-                            .next()
-                            .and_then(|c| c.as_os_str().to_str().map(String::from))
-                    }
-                })
-            })
+            .filter_map(|f| extract_top_dir(&f.path))
             .collect();
 
         // Track files per module
         for file in &commit.files {
-            if let Some(dir) = std::path::Path::new(&file.path)
-                .components()
-                .next()
-                .and_then(|c| c.as_os_str().to_str().map(String::from))
-            {
-                if dir != file.path {
-                    // Skip root-level files
-                    module_files
-                        .entry(dir.clone())
-                        .or_default()
-                        .insert(file.path.clone());
-                }
+            if let Some(dir) = extract_top_dir(&file.path) {
+                module_files
+                    .entry(dir)
+                    .or_default()
+                    .insert(file.path.clone());
             }
         }
 
@@ -605,6 +606,24 @@ mod tests {
         assert!(!a_entries.is_empty());
         assert_eq!(a_entries[0].path, "b.rs");
         assert!(!graph.is_empty());
+    }
+
+    #[test]
+    fn test_coupling_large_commit_excluded_from_pairs() {
+        // Build a commit with COUPLING_MAX_FILES + 1 files — must not generate pairs,
+        // but the files should still appear in weighted_total (so they are not lost
+        // from the churn perspective).
+        let many_files: Vec<String> = (0..=COUPLING_MAX_FILES)
+            .map(|i| format!("file_{i}.rs"))
+            .collect();
+        let file_refs: Vec<&str> = many_files.iter().map(String::as_str).collect();
+        let commits = vec![make_commit("h1", "A", 1, "m", &file_refs)];
+
+        // With threshold=0.0 and min_support=1, any pair would be included if generated.
+        // The large-commit cap means zero pairs should appear.
+        let (blast, graph) = compute_coupling(&commits, 0.0, 1);
+        assert!(blast.is_empty(), "large commit must not generate coupling pairs");
+        assert!(graph.is_empty(), "large commit must not generate graph edges");
     }
 
     // -----------------------------------------------------------------------
@@ -815,5 +834,21 @@ mod tests {
         for window in result.windows(2) {
             assert!(window[0].encapsulation_pct <= window[1].encapsulation_pct);
         }
+    }
+
+    #[test]
+    fn test_extract_top_dir_root_level_file() {
+        assert_eq!(extract_top_dir("Makefile"), None);
+        assert_eq!(extract_top_dir("README.md"), None);
+    }
+
+    #[test]
+    fn test_extract_top_dir_nested_file() {
+        assert_eq!(extract_top_dir("src/lib.rs"), Some("src".to_string()));
+        assert_eq!(
+            extract_top_dir("src/cmd/heatmap/mod.rs"),
+            Some("src".to_string())
+        );
+        assert_eq!(extract_top_dir("tests/foo.rs"), Some("tests".to_string()));
     }
 }
