@@ -83,10 +83,12 @@ pub(crate) fn compute_coupling(
     threshold: f64,
     min_support: usize,
 ) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
-    // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b)
-    let mut co_occur: HashMap<(String, String), (f64, usize)> = HashMap::new();
+    // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b).
+    // &str keys borrow from CommitRecord.files[].path — valid for entire function
+    // because `commits` (and therefore all CommitRecords) outlive these maps.
+    let mut co_occur: HashMap<(&str, &str), (f64, usize)> = HashMap::new();
     // weighted_total[a] = weighted sum of commits touching a
-    let mut weighted_total: HashMap<String, f64> = HashMap::new();
+    let mut weighted_total: HashMap<&str, f64> = HashMap::new();
 
     for commit in commits {
         let files: Vec<&str> = commit.files.iter().map(|f| f.path.as_str()).collect();
@@ -95,7 +97,7 @@ pub(crate) fn compute_coupling(
 
         // Every commit contributes to weighted_total for its files
         for f in &files {
-            *weighted_total.entry(f.to_string()).or_insert(0.0) += weight;
+            *weighted_total.entry(f).or_insert(0.0) += weight;
         }
 
         // Skip large commits for pair enumeration to avoid O(n^2) blowup
@@ -103,13 +105,13 @@ pub(crate) fn compute_coupling(
             continue;
         }
 
-        // All ordered pairs (a, b) where a != b
+        // All ordered pairs (a, b) where a != b — zero allocations in the hot path
         for i in 0..n {
             for j in 0..n {
                 if i == j {
                     continue;
                 }
-                let key = (files[i].to_string(), files[j].to_string());
+                let key = (files[i], files[j]);
                 let entry = co_occur.entry(key).or_insert((0.0, 0));
                 entry.0 += weight;
                 entry.1 += 1;
@@ -117,11 +119,12 @@ pub(crate) fn compute_coupling(
         }
     }
 
-    // Build blast_radius per file and global graph
+    // Build blast_radius per file and global graph — .to_string() only here,
+    // when building the owned output structures.
     let mut blast_radius: HashMap<String, Vec<CouplingEntry>> = HashMap::new();
     let mut graph_edges: HashMap<(String, String), (f64, usize)> = HashMap::new();
 
-    for ((a, b), (weighted_co, sup)) in &co_occur {
+    for (&(a, b), &(weighted_co, sup)) in &co_occur {
         let total_a = weighted_total.get(a).copied().unwrap_or(0.0);
         if total_a == 0.0 {
             continue;
@@ -130,26 +133,26 @@ pub(crate) fn compute_coupling(
         if confidence < threshold {
             continue;
         }
-        if *sup < min_support {
+        if sup < min_support {
             continue;
         }
 
         blast_radius
-            .entry(a.clone())
+            .entry(a.to_string())
             .or_default()
             .push(CouplingEntry {
-                path: b.clone(),
+                path: b.to_string(),
                 confidence,
-                support: *sup,
+                support: sup,
             });
 
         // De-duplicate edges: only store canonical (smaller, larger) pair
         let edge_key = if a <= b {
-            (a.clone(), b.clone())
+            (a.to_string(), b.to_string())
         } else {
-            (b.clone(), a.clone())
+            (b.to_string(), a.to_string())
         };
-        let entry = graph_edges.entry(edge_key).or_insert((0.0, *sup));
+        let entry = graph_edges.entry(edge_key).or_insert((0.0, sup));
         if confidence > entry.0 {
             entry.0 = confidence;
         }
