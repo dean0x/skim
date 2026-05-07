@@ -233,6 +233,10 @@ fn run_with_source(
 // Pure metric computation (Steps 5-9)
 // ============================================================================
 
+/// Minimum number of co-occurrences required before a coupling pair or module
+/// is included in results. Prevents noise from one-off coincidences.
+const MIN_SUPPORT_THRESHOLD: usize = 3;
+
 /// Compute all six risk metrics from commits and assemble a `HeatmapResult`.
 ///
 /// No git I/O — all repository data is pre-fetched by callers (Steps 1-4 in
@@ -260,8 +264,8 @@ fn compute_heatmap(
     let author_map = compute_authors(&commits);
     let fix_risk_map = compute_fix_after_touch(&commits, &fix_regex, config.fix_window);
     let (blast_radius_map, coupling_graph) =
-        compute_coupling(&commits, config.coupling_threshold, 3);
-    let modules = compute_encapsulation(&commits, 3);
+        compute_coupling(&commits, config.coupling_threshold, MIN_SUPPORT_THRESHOLD);
+    let modules = compute_encapsulation(&commits, MIN_SUPPORT_THRESHOLD);
 
     if config.debug {
         let elapsed = t0.elapsed();
