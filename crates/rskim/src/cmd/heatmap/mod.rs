@@ -214,18 +214,16 @@ fn run_with_source(
     config: &HeatmapConfig,
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    let prepared = match prepare_commits(source, config)? {
-        Some(p) => p,
-        None => return Ok(ExitCode::FAILURE),
-    };
-
     let PreparedCommits {
         commits,
         window,
         now_epoch,
         repo_root,
         warnings,
-    } = prepared;
+    } = match prepare_commits(source, config)? {
+        Some(p) => p,
+        None => return Ok(ExitCode::FAILURE),
+    };
 
     // Steps 5-9: Compute metrics and assemble result
     let start_time = std::time::Instant::now();
@@ -420,8 +418,8 @@ fn resolve_effective_config(
         config.last_n.is_some(),
         config.window_preset.is_some(),
     ]
-    .iter()
-    .filter(|&&b| b)
+    .into_iter()
+    .filter(|b| *b)
     .count();
 
     if explicit_count > 1 {

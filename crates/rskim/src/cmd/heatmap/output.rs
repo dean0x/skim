@@ -89,13 +89,10 @@ fn render_blast_radius(out: &mut String, result: &HeatmapResult, top_n: usize) {
         .iter()
         .filter(|f| !f.blast_radius.is_empty())
         .collect();
-    // sort_by (not sort_by_key): f64 fields require partial_cmp because f64 does not implement Ord.
     files_with_coupling.sort_by(|a, b| {
         let a_conf = a.blast_radius.first().map(|e| e.confidence).unwrap_or(0.0);
         let b_conf = b.blast_radius.first().map(|e| e.confidence).unwrap_or(0.0);
-        b_conf
-            .partial_cmp(&a_conf)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b_conf.total_cmp(&a_conf)
     });
 
     if files_with_coupling.is_empty() {
@@ -124,10 +121,7 @@ fn render_fix_risk(out: &mut String, result: &HeatmapResult, top_n: usize) {
         .filter(|f| f.fix_risk.combined_pct > 20.0 && !f.fix_risk.insufficient_data)
         .collect();
     fix_risk_files.sort_by(|a, b| {
-        b.fix_risk
-            .combined_pct
-            .partial_cmp(&a.fix_risk.combined_pct)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.fix_risk.combined_pct.total_cmp(&a.fix_risk.combined_pct)
     });
 
     if fix_risk_files.is_empty() {

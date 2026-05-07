@@ -160,11 +160,7 @@ pub(crate) fn compute_coupling(
 
     // Sort each blast radius by confidence descending
     for entries in blast_radius.values_mut() {
-        entries.sort_by(|x, y| {
-            y.confidence
-                .partial_cmp(&x.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        entries.sort_by(|x, y| y.confidence.total_cmp(&x.confidence));
     }
 
     let coupling_graph: Vec<CouplingEdge> = graph_edges
@@ -492,11 +488,7 @@ pub(crate) fn compute_encapsulation(
         .collect();
 
     // Sort by encapsulation_pct ascending (worst first)
-    results.sort_by(|a, b| {
-        a.encapsulation_pct
-            .partial_cmp(&b.encapsulation_pct)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(|a, b| a.encapsulation_pct.total_cmp(&b.encapsulation_pct));
 
     results
 }
