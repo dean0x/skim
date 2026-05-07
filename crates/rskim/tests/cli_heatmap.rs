@@ -45,20 +45,30 @@ fn git_commit(dir: &Path, filename: &str, content: &str, message: &str, timestam
     }
     std::fs::write(&file_path, content).expect("write file");
 
-    StdCommand::new("git")
+    let add_out = StdCommand::new("git")
         .args(["add", filename])
         .current_dir(dir)
         .output()
         .expect("git add");
+    assert!(
+        add_out.status.success(),
+        "git add failed for {filename}: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
 
     let ts = format!("{timestamp}");
-    StdCommand::new("git")
+    let commit_out = StdCommand::new("git")
         .args(["commit", "-m", message])
         .env("GIT_AUTHOR_DATE", &ts)
         .env("GIT_COMMITTER_DATE", &ts)
         .current_dir(dir)
         .output()
         .expect("git commit");
+    assert!(
+        commit_out.status.success(),
+        "git commit failed for {message}: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
 }
 
 /// Commit multiple files at once.
@@ -69,21 +79,31 @@ fn git_commit_files(dir: &Path, files: &[(&str, &str)], message: &str, timestamp
             std::fs::create_dir_all(parent).ok();
         }
         std::fs::write(&file_path, content).expect("write file");
-        StdCommand::new("git")
+        let add_out = StdCommand::new("git")
             .args(["add", filename])
             .current_dir(dir)
             .output()
             .expect("git add");
+        assert!(
+            add_out.status.success(),
+            "git add failed for {filename}: {}",
+            String::from_utf8_lossy(&add_out.stderr)
+        );
     }
 
     let ts = format!("{timestamp}");
-    StdCommand::new("git")
+    let commit_out = StdCommand::new("git")
         .args(["commit", "-m", message])
         .env("GIT_AUTHOR_DATE", &ts)
         .env("GIT_COMMITTER_DATE", &ts)
         .current_dir(dir)
         .output()
         .expect("git commit");
+    assert!(
+        commit_out.status.success(),
+        "git commit failed for {message}: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
 }
 
 /// Current Unix timestamp minus a few days — within the default 90-day window.
@@ -365,7 +385,8 @@ fn test_heatmap_since_filters_commits() {
         .current_dir(dir.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("new.rs").or(predicate::str::contains("new2.rs")));
+        .stdout(predicate::str::contains("new.rs").or(predicate::str::contains("new2.rs")))
+        .stdout(predicate::str::contains("old.rs").not());
 }
 
 // ============================================================================
@@ -375,6 +396,7 @@ fn test_heatmap_since_filters_commits() {
 #[test]
 fn test_heatmap_window_sprint_preset() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // create_test_repo uses recent_ts() (7 days ago), well within sprint (14 days)
     create_test_repo(dir.path());
 
     Command::cargo_bin("skim")
@@ -382,9 +404,7 @@ fn test_heatmap_window_sprint_preset() {
         .args(["heatmap", "--window=sprint"])
         .current_dir(dir.path())
         .assert()
-        // Either succeeds (commits in window) or fails with "No commits found"
-        // depending on the commit timestamps vs now
-        .stderr(predicate::str::is_empty().or(predicate::str::contains("No commits")));
+        .success();
 }
 
 // ============================================================================
@@ -403,19 +423,19 @@ fn test_heatmap_path_scope() {
         .output()
         .expect("spawn skim heatmap");
 
-    // May succeed or fail depending on git behavior, but should not crash
+    assert!(
+        output.status.success(),
+        "expected exit 0 for --path=src/, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    if output.status.success() && !stdout.is_empty() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
-        if parsed != serde_json::Value::Null {
-            // All file paths should be under src/
-            if let Some(files) = parsed["files"].as_array() {
-                for file in files {
-                    let path = file["path"].as_str().unwrap_or("");
-                    assert!(path.starts_with("src/"), "path outside src/: {path}");
-                }
-            }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("expected valid JSON output");
+    // All file paths should be under src/
+    if let Some(files) = parsed["files"].as_array() {
+        for file in files {
+            let path = file["path"].as_str().unwrap_or("");
+            assert!(path.starts_with("src/"), "path outside src/: {path}");
         }
     }
 }
@@ -443,29 +463,35 @@ fn test_heatmap_no_exclude_includes_lock_files() {
         .output()
         .expect("spawn skim heatmap (no excludes)");
 
-    if output_no_exclude.status.success() {
-        let stdout = String::from_utf8(output_no_exclude.stdout).unwrap();
-        // With --no-exclude, Cargo.lock should appear in the files
-        assert!(
-            stdout.contains("Cargo.lock"),
-            "expected Cargo.lock in --no-exclude output"
-        );
-    }
+    assert!(
+        output_no_exclude.status.success(),
+        "expected exit 0 with --no-exclude, stderr: {}",
+        String::from_utf8_lossy(&output_no_exclude.stderr)
+    );
+    let stdout_no_exclude = String::from_utf8(output_no_exclude.stdout).unwrap();
+    // With --no-exclude, Cargo.lock should appear in the files
+    assert!(
+        stdout_no_exclude.contains("Cargo.lock"),
+        "expected Cargo.lock in --no-exclude output"
+    );
 
-    if output_with_exclude.status.success() {
-        let stdout = String::from_utf8(output_with_exclude.stdout).unwrap();
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&stdout) {
-            // Default excludes should filter Cargo.lock out of the analyzed files
-            if let Some(files) = parsed["files"].as_array() {
-                let has_lockfile = files
-                    .iter()
-                    .any(|f| f["path"].as_str().unwrap_or("").contains("Cargo.lock"));
-                assert!(
-                    !has_lockfile,
-                    "Cargo.lock should not appear in files with default excludes"
-                );
-            }
-        }
+    assert!(
+        output_with_exclude.status.success(),
+        "expected exit 0 with default excludes, stderr: {}",
+        String::from_utf8_lossy(&output_with_exclude.stderr)
+    );
+    let stdout_with_exclude = String::from_utf8(output_with_exclude.stdout).unwrap();
+    let parsed = serde_json::from_str::<serde_json::Value>(&stdout_with_exclude)
+        .expect("expected valid JSON with default excludes");
+    // Default excludes should filter Cargo.lock out of the analyzed files
+    if let Some(files) = parsed["files"].as_array() {
+        let has_lockfile = files
+            .iter()
+            .any(|f| f["path"].as_str().unwrap_or("").contains("Cargo.lock"));
+        assert!(
+            !has_lockfile,
+            "Cargo.lock should not appear in files with default excludes"
+        );
     }
 }
 
@@ -510,19 +536,23 @@ fn test_heatmap_single_commit_repo() {
         .output()
         .expect("spawn skim heatmap");
 
-    if output.status.success() {
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-        // Files should be present
-        let files = parsed["files"].as_array().unwrap();
-        assert!(!files.is_empty());
-        // Single commit file should have insufficient_data = true
-        let fix_risk = &files[0]["fix_risk"];
-        assert_eq!(
-            fix_risk["insufficient_data"], true,
-            "single-commit file should have insufficient_data=true"
-        );
-    }
+    assert!(
+        output.status.success(),
+        "expected exit 0 for single-commit repo, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("expected valid JSON output");
+    // Files should be present
+    let files = parsed["files"].as_array().unwrap();
+    assert!(!files.is_empty());
+    // Single commit file should have insufficient_data = true
+    let fix_risk = &files[0]["fix_risk"];
+    assert_eq!(
+        fix_risk["insufficient_data"], true,
+        "single-commit file should have insufficient_data=true"
+    );
 }
 
 // ============================================================================
@@ -555,24 +585,36 @@ fn test_heatmap_top_flag_limits_output() {
         .output()
         .expect("spawn skim heatmap");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "expected exit 0 for --json --top=3, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    // Top 3 filter is on rendering, not data — files array may have all files
-    // but the text output should only show 3
-    let _ = parsed["files"].as_array().unwrap().len(); // just verifying it parses
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("expected valid JSON output");
+    // In JSON mode, --top=3 truncates the files array to at most 3 entries
+    let files = parsed["files"].as_array().unwrap();
+    assert!(
+        files.len() <= 3,
+        "expected at most 3 files in JSON output with --top=3, got {}",
+        files.len()
+    );
 
-    // Text output with --top=3 should show at most 3 churn entries
+    // Text output with --top=3 should succeed and show Top Churn section
     let text_output = Command::cargo_bin("skim")
         .unwrap()
         .args(["heatmap", "--top=3"])
         .current_dir(dir.path())
         .output()
         .expect("spawn skim heatmap text");
-    if text_output.status.success() {
-        let text = String::from_utf8(text_output.stdout).unwrap();
-        assert!(text.contains("Top Churn"));
-    }
+    assert!(
+        text_output.status.success(),
+        "expected exit 0 for text --top=3, stderr: {}",
+        String::from_utf8_lossy(&text_output.stderr)
+    );
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text.contains("Top Churn"));
 }
 
 // ============================================================================

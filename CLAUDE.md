@@ -159,6 +159,8 @@ cargo fmt -- --check           # Format check
 - `learn` — Detect CLI error-retry patterns in agent sessions and generate correction rules (`--generate`, `--agent`, `--dry-run`, `--no-truncate`)
 - `rewrite` — Rewrite developer commands into skim equivalents (`--hook` for agent integration)
 - `stats` — Token analytics dashboard with per-session tracking (`--since`, `--format json`, `--verbose`, `--clear`)
+
+**Analysis:**
 - `heatmap` — Git history risk/coupling analysis: churn, co-change coupling, stability scores, author concentration, fix-after-touch, module encapsulation (`--json`, `--since`, `--last`, `--window`, `--path`, `--top`)
 
 **Multi-category dispatchers:**
