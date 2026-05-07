@@ -79,6 +79,7 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
         .iter()
         .filter(|f| !f.blast_radius.is_empty())
         .collect();
+    // sort_by (not sort_by_key): f64 fields require partial_cmp because f64 does not implement Ord.
     files_with_coupling.sort_by(|a, b| {
         let a_conf = a.blast_radius.first().map(|e| e.confidence).unwrap_or(0.0);
         let b_conf = b.blast_radius.first().map(|e| e.confidence).unwrap_or(0.0);
@@ -212,8 +213,6 @@ mod tests {
                 since: "2024-10-01".to_string(),
                 until: "2025-01-01".to_string(),
                 commits_analyzed: 10,
-                time_commits: None,
-                count_commits: None,
                 effective_strategy: None,
             },
             files: vec![FileMetrics {
@@ -334,7 +333,8 @@ mod tests {
     #[test]
     fn test_text_respects_top_n() {
         let mut result = make_result();
-        // Add many files
+        // Add 30 files with commits 1..=30 so file29.rs (30 commits) is highest-churn,
+        // file28.rs (29) second, file27.rs (28) third, and file0.rs (1 commit) is lowest.
         for i in 0..30 {
             result.files.push(FileMetrics {
                 path: format!("file{i}.rs"),
@@ -358,11 +358,31 @@ mod tests {
             });
         }
         let text = render_text(&result, 3);
-        // Should only show 3 entries in Top Churn
+
+        // Count guard: at most 3 entries rendered in Top Churn section.
         let churn_count = text.matches("commits  ").count();
         assert!(
             churn_count <= 3,
             "expected at most 3 churn entries, got {churn_count}"
+        );
+
+        // Sort-order guard: the three highest-churn files must appear; the lowest must not.
+        // This catches an ascending-vs-descending sort bug that the count check cannot.
+        assert!(
+            text.contains("file29.rs"),
+            "expected highest-churn file (file29.rs, 30 commits) to appear in top-3"
+        );
+        assert!(
+            text.contains("file28.rs"),
+            "expected second-highest-churn file (file28.rs, 29 commits) to appear in top-3"
+        );
+        assert!(
+            text.contains("file27.rs"),
+            "expected third-highest-churn file (file27.rs, 28 commits) to appear in top-3"
+        );
+        assert!(
+            !text.contains("file0.rs"),
+            "expected lowest-churn file (file0.rs, 1 commit) to be excluded from top-3"
         );
     }
 
