@@ -656,27 +656,37 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
         }
 
         // Boolean flags
-        match arg {
-            "--json" => config.format_json = true,
-            "--no-exclude" => config.no_exclude = true,
-            "--debug" => {
-                config.debug = true;
-                crate::debug::force_enable_debug();
-            }
-            other => {
-                if other.starts_with('-') {
-                    anyhow::bail!("unknown flag: {other}");
-                }
-                // Positional (non-flag) argument — `skim heatmap` takes no
-                // positional args; suggest --path if the user meant a directory.
-                anyhow::bail!("unexpected argument: '{other}'. Did you mean --path={other}?");
-            }
+        if apply_boolean_flag(&mut config, arg)? {
+            i += 1;
+            continue;
         }
 
-        i += 1;
+        if arg.starts_with('-') {
+            anyhow::bail!("unknown flag: {arg}");
+        }
+        // Positional (non-flag) argument — `skim heatmap` takes no
+        // positional args; suggest --path if the user meant a directory.
+        anyhow::bail!("unexpected argument: '{arg}'. Did you mean --path={arg}?");
     }
 
     Ok(config)
+}
+
+/// Apply a recognised boolean flag to `config`.
+///
+/// Returns `Ok(true)` if the flag was recognised and applied, `Ok(false)` if
+/// the flag is unknown (caller falls through to the unknown-flag error).
+fn apply_boolean_flag(config: &mut HeatmapConfig, flag: &str) -> anyhow::Result<bool> {
+    match flag {
+        "--json" => config.format_json = true,
+        "--no-exclude" => config.no_exclude = true,
+        "--debug" => {
+            config.debug = true;
+            crate::debug::force_enable_debug();
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// Extract a `--flag VALUE` or `--flag=VALUE` pair, advancing `i`.
