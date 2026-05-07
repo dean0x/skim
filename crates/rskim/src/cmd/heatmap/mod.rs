@@ -628,10 +628,13 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
 
         // --last
         if let Some(val) = extract_value(args, &mut i, "--last") {
-            config.last_n = Some(
-                val.parse()
-                    .map_err(|_| anyhow::anyhow!("--last requires a positive integer"))?,
-            );
+            let n: usize = val
+                .parse()
+                .map_err(|_| anyhow::anyhow!("--last requires a positive integer"))?;
+            if n == 0 {
+                anyhow::bail!("--last must be at least 1");
+            }
+            config.last_n = Some(n);
             continue;
         }
 
@@ -944,6 +947,14 @@ mod tests {
             msg.contains("--fix-window must be at least 1"),
             "got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_parse_args_last_zero_errors() {
+        let result = parse_args(&["--last=0".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("--last must be at least 1"), "got: {msg}");
     }
 
     #[test]
