@@ -778,7 +778,53 @@ mod tests {
         let result = compute_fix_after_touch(&commits, &fix_re, 5);
         let m = &result["a.rs"];
         assert!(!m.insufficient_data);
-        assert!(m.proximity_pct > 0.0);
+        // total=2, proximity_set={0}, proximity_pct = 1/2*100 = 50%
+        assert!((m.proximity_pct - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fix_risk_combined_both_signals() {
+        // Exercises the disjointness optimization: keyword_count + proximity_set.len().
+        //
+        // commit 0 (idx 0): feat touching a.rs → non-fix
+        // commit 1 (idx 1): fix touching a.rs  → keyword hit; also within window of idx 0
+        //                                         so idx 0 enters proximity_set
+        // commit 2 (idx 2): feat touching a.rs → non-fix (outside window trailing edge)
+        //
+        // Expected for a.rs (total=3):
+        //   keyword_count = 1  → keyword_pct  = 1/3*100 ≈ 33.33%
+        //   proximity_set = {0} (size 1) → proximity_pct = 1/3*100 ≈ 33.33%
+        //   union_count   = 2  → combined_pct = 2/3*100 ≈ 66.67%
+        let commits = vec![
+            make_commit("h1", "Alice", 1, "feat: add",        &["a.rs"]),
+            make_commit("h2", "Alice", 2, "fix: bug in a",    &["a.rs"]),
+            make_commit("h3", "Alice", 3, "feat: more work",  &["a.rs"]),
+        ];
+        let fix_re = build_fix_regex();
+        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let m = &result["a.rs"];
+
+        assert!(!m.insufficient_data);
+
+        let expected_keyword_pct  = 100.0 / 3.0; // 33.33…
+        let expected_proximity_pct = 100.0 / 3.0; // 33.33…
+        let expected_combined_pct  = 200.0 / 3.0; // 66.67…
+
+        assert!(
+            (m.keyword_pct - expected_keyword_pct).abs() < 1e-9,
+            "keyword_pct: expected {expected_keyword_pct}, got {}",
+            m.keyword_pct
+        );
+        assert!(
+            (m.proximity_pct - expected_proximity_pct).abs() < 1e-9,
+            "proximity_pct: expected {expected_proximity_pct}, got {}",
+            m.proximity_pct
+        );
+        assert!(
+            (m.combined_pct - expected_combined_pct).abs() < 1e-9,
+            "combined_pct: expected {expected_combined_pct}, got {}",
+            m.combined_pct
+        );
     }
 
     // -----------------------------------------------------------------------
