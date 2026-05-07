@@ -1,18 +1,13 @@
 //! Rendering layer for `skim heatmap` output.
 //!
 //! Two formats: JSON (via serde_json) and human-readable text (via colored).
+//!
+//! Color handling: the `colored` crate automatically respects `NO_COLOR`,
+//! `TERM=dumb`, and non-TTY output. No manual `NO_COLOR` detection is needed.
 
 use colored::Colorize;
 
 use super::types::HeatmapResult;
-
-// ============================================================================
-// NO_COLOR detection
-// ============================================================================
-
-fn no_color() -> bool {
-    std::env::var("NO_COLOR").is_ok()
-}
 
 // ============================================================================
 // JSON output
@@ -28,20 +23,18 @@ pub(crate) fn render_json(result: &HeatmapResult) -> anyhow::Result<String> {
 // ============================================================================
 
 /// Render the heatmap result as a human-readable text report.
+///
+/// Color application is unconditional: the `colored` crate strips ANSI codes
+/// automatically when `NO_COLOR` is set or stdout is not a TTY.
 pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     let mut out = String::new();
-    let use_color = !no_color();
 
     // Header
     let header = format!(
         "─── Heatmap: {} ({} commits, {} window) ───",
         result.repository, result.window.commits_analyzed, result.window.mode
     );
-    if use_color {
-        out.push_str(&header.bold().to_string());
-    } else {
-        out.push_str(&header);
-    }
+    out.push_str(&header.bold().to_string());
     out.push('\n');
 
     if !result.warnings.is_empty() {
@@ -52,7 +45,7 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     out.push('\n');
 
     // Top Churn
-    section_header(&mut out, "Top Churn:", use_color);
+    section_header(&mut out, "Top Churn:");
     let mut files_by_churn: Vec<_> = result.files.iter().collect();
     files_by_churn.sort_by(|a, b| b.churn.commits.cmp(&a.churn.commits));
 
@@ -62,38 +55,25 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
         for fm in files_by_churn.iter().take(top_n) {
             let rate_pct = fm.churn.rate * 100.0;
             let stability = fm.stability_score;
-            let line = format!(
-                "  {:4} commits  {:5.1}% rate  stability {:3}  {}",
-                fm.churn.commits, rate_pct, stability, fm.path
-            );
-            if use_color {
-                let churn_str = format!("{:4}", fm.churn.commits).yellow().to_string();
-                let rate_str = format!("{rate_pct:5.1}%").to_string();
-                let stab_str = if stability < 40 {
-                    format!("{stability:3}").red().to_string()
-                } else if stability < 70 {
-                    format!("{stability:3}").yellow().to_string()
-                } else {
-                    format!("{stability:3}").green().to_string()
-                };
-                out.push_str(&format!(
-                    "  {churn_str} commits  {rate_str} rate  stability {stab_str}  {}\n",
-                    fm.path
-                ));
+            let churn_str = format!("{:4}", fm.churn.commits).yellow().to_string();
+            let rate_str = format!("{rate_pct:5.1}%");
+            let stab_str = if stability < 40 {
+                format!("{stability:3}").red().to_string()
+            } else if stability < 70 {
+                format!("{stability:3}").yellow().to_string()
             } else {
-                out.push_str(&line);
-                out.push('\n');
-            }
+                format!("{stability:3}").green().to_string()
+            };
+            out.push_str(&format!(
+                "  {churn_str} commits  {rate_str} rate  stability {stab_str}  {}\n",
+                fm.path
+            ));
         }
     }
     out.push('\n');
 
     // Blast Radius (coupling)
-    section_header(
-        &mut out,
-        "Blast Radius (coupling above threshold):",
-        use_color,
-    );
+    section_header(&mut out, "Blast Radius (coupling above threshold):");
     let mut files_with_coupling: Vec<_> = result
         .files
         .iter()
@@ -114,25 +94,18 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
             out.push_str(&format!("  {}\n", fm.path));
             for entry in fm.blast_radius.iter().take(5) {
                 let conf_pct = entry.confidence * 100.0;
-                if use_color {
-                    let conf_str = format!("{conf_pct:5.1}%").cyan().to_string();
-                    out.push_str(&format!(
-                        "    → {} ({conf_str} confidence, {} support)\n",
-                        entry.path, entry.support
-                    ));
-                } else {
-                    out.push_str(&format!(
-                        "    → {} ({conf_pct:5.1}% confidence, {} support)\n",
-                        entry.path, entry.support
-                    ));
-                }
+                let conf_str = format!("{conf_pct:5.1}%").cyan().to_string();
+                out.push_str(&format!(
+                    "    → {} ({conf_str} confidence, {} support)\n",
+                    entry.path, entry.support
+                ));
             }
         }
     }
     out.push('\n');
 
     // Fix Risk
-    section_header(&mut out, "Fix Risk (> 20%):", use_color);
+    section_header(&mut out, "Fix Risk (> 20%):");
     let mut fix_risk_files: Vec<_> = result
         .files
         .iter()
@@ -152,59 +125,42 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
             let combined = fm.fix_risk.combined_pct;
             let kw = fm.fix_risk.keyword_pct;
             let prox = fm.fix_risk.proximity_pct;
-            if use_color {
-                let combined_str = format!("{combined:5.1}%").red().to_string();
-                out.push_str(&format!(
-                    "  {} combined={combined_str} keyword={kw:5.1}% proximity={prox:5.1}%\n",
-                    fm.path
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  {} combined={combined:5.1}% keyword={kw:5.1}% proximity={prox:5.1}%\n",
-                    fm.path
-                ));
-            }
+            let combined_str = format!("{combined:5.1}%").red().to_string();
+            out.push_str(&format!(
+                "  {} combined={combined_str} keyword={kw:5.1}% proximity={prox:5.1}%\n",
+                fm.path
+            ));
         }
     }
     out.push('\n');
 
     // Module Health
-    section_header(&mut out, "Module Health:", use_color);
+    section_header(&mut out, "Module Health:");
     if result.modules.is_empty() {
         out.push_str("  (no modules with enough data)\n");
     } else {
         for module in result.modules.iter().take(top_n) {
             let pct = module.encapsulation_pct;
-            if use_color {
-                let pct_str = if pct < 50.0 {
-                    format!("{pct:5.1}%").red().to_string()
-                } else if pct < 75.0 {
-                    format!("{pct:5.1}%").yellow().to_string()
-                } else {
-                    format!("{pct:5.1}%").green().to_string()
-                };
-                out.push_str(&format!(
-                    "  {} encapsulation={pct_str} files={} commits={} cross={}\n",
-                    module.path,
-                    module.files_count,
-                    module.total_commits,
-                    module.cross_boundary_commits
-                ));
+            let pct_str = if pct < 50.0 {
+                format!("{pct:5.1}%").red().to_string()
+            } else if pct < 75.0 {
+                format!("{pct:5.1}%").yellow().to_string()
             } else {
-                out.push_str(&format!(
-                    "  {} encapsulation={pct:5.1}% files={} commits={} cross={}\n",
-                    module.path,
-                    module.files_count,
-                    module.total_commits,
-                    module.cross_boundary_commits
-                ));
-            }
+                format!("{pct:5.1}%").green().to_string()
+            };
+            out.push_str(&format!(
+                "  {} encapsulation={pct_str} files={} commits={} cross={}\n",
+                module.path,
+                module.files_count,
+                module.total_commits,
+                module.cross_boundary_commits
+            ));
         }
     }
     out.push('\n');
 
     // Bus Factor Risk
-    section_header(&mut out, "Bus Factor Risk:", use_color);
+    section_header(&mut out, "Bus Factor Risk:");
     let bus_factor_files: Vec<_> = result
         .files
         .iter()
@@ -216,18 +172,11 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     } else {
         for fm in bus_factor_files.iter().take(top_n) {
             let pct = fm.authors.top_author_pct;
-            if use_color {
-                let pct_str = format!("{pct:5.1}%").red().to_string();
-                out.push_str(&format!(
-                    "  {} top-author={pct_str} authors={}\n",
-                    fm.path, fm.authors.count
-                ));
-            } else {
-                out.push_str(&format!(
-                    "  {} top-author={pct:5.1}% authors={}\n",
-                    fm.path, fm.authors.count
-                ));
-            }
+            let pct_str = format!("{pct:5.1}%").red().to_string();
+            out.push_str(&format!(
+                "  {} top-author={pct_str} authors={}\n",
+                fm.path, fm.authors.count
+            ));
         }
     }
     out.push('\n');
@@ -235,12 +184,8 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     out
 }
 
-fn section_header(out: &mut String, title: &str, use_color: bool) {
-    if use_color {
-        out.push_str(&title.bold().underline().to_string());
-    } else {
-        out.push_str(title);
-    }
+fn section_header(out: &mut String, title: &str) {
+    out.push_str(&title.bold().underline().to_string());
     out.push('\n');
 }
 
@@ -418,6 +363,40 @@ mod tests {
         assert!(
             churn_count <= 3,
             "expected at most 3 churn entries, got {churn_count}"
+        );
+    }
+
+    #[test]
+    fn test_text_empty_files_shows_placeholder() {
+        let mut result = make_result();
+        result.files.clear();
+        let text = render_text(&result, 20);
+        assert!(
+            text.contains("(no files)"),
+            "expected '(no files)' placeholder in Top Churn section"
+        );
+        assert!(
+            text.contains("(no coupling above threshold)"),
+            "expected '(no coupling above threshold)' placeholder in Blast Radius section"
+        );
+        assert!(
+            text.contains("(no files above threshold)"),
+            "expected '(no files above threshold)' placeholder in Fix Risk section"
+        );
+        assert!(
+            text.contains("(no single-owner risk detected)"),
+            "expected '(no single-owner risk detected)' placeholder in Bus Factor section"
+        );
+    }
+
+    #[test]
+    fn test_text_empty_modules_shows_placeholder() {
+        let mut result = make_result();
+        result.modules.clear();
+        let text = render_text(&result, 20);
+        assert!(
+            text.contains("(no modules with enough data)"),
+            "expected '(no modules with enough data)' placeholder in Module Health section"
         );
     }
 }
