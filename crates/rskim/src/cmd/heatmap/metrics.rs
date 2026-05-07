@@ -357,26 +357,28 @@ pub(crate) fn compute_fix_after_touch(
             let non_fix_indices: Vec<usize> =
                 indices.iter().copied().filter(|&i| !is_fix[i]).collect();
 
-            // Build proximity set (non-fix indices followed by a fix within window)
-            let proximity_set: HashSet<usize> = non_fix_indices
+            // Count non-fix indices followed by a fix within window (no need to
+            // materialise a set — uniqueness is guaranteed because each non-fix
+            // index appears at most once in non_fix_indices).
+            let proximity_count: usize = non_fix_indices
                 .iter()
                 .copied()
                 .filter(|&idx| {
                     let upper = (idx + 1 + window).min(commits.len());
                     ((idx + 1)..upper).any(|j| is_fix[j] && index_set.contains(&j))
                 })
-                .collect();
+                .count();
 
             let proximity_pct = if non_fix_indices.is_empty() {
                 0.0
             } else {
-                (proximity_set.len() as f64 / total as f64) * 100.0
+                (proximity_count as f64 / total as f64) * 100.0
             };
 
             // Union: fix commits (keyword) ∪ non-fix commits followed by a fix (proximity).
-            // The two sets are disjoint by construction (proximity_set only contains non-fix
-            // indices), so union_count = keyword_count + proximity_set.len().
-            let union_count = keyword_count + proximity_set.len();
+            // The two sets are disjoint by construction (proximity_count only counts non-fix
+            // indices), so union_count = keyword_count + proximity_count.
+            let union_count = keyword_count + proximity_count;
             let combined_pct = (union_count as f64 / total as f64) * 100.0;
 
             (
