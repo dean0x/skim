@@ -988,17 +988,13 @@ mod tests {
 
     #[test]
     fn test_build_window_info_default_falls_back_to_dual() {
-        // No flags set → dual fallback branch
+        // No flags set → falls through to the "dual" fallback mode string.
+        // dual_mode=false, so effective_strategy is None (only set in the dual_mode branch).
         let config = base_config();
 
         let info = build_window_info(&config, 0, NOW);
 
         assert_eq!(info.mode, "dual");
-        // No dual_time_since/dual_count_since configured → effective_strategy still present
-        // (dual_mode=false here hits the else branch which produces None for effective_strategy)
-        // Wait: dual_mode=false, so effective_strategy is None in the non-dual-mode branch.
-        // The mode string comes from the final else → "dual", but effective_strategy is None
-        // because we only set effective_strategy inside `if config.dual_mode`.
         assert!(info.effective_strategy.is_none());
     }
 

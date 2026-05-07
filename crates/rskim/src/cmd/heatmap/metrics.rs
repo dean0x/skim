@@ -796,9 +796,9 @@ mod tests {
         //   proximity_set = {0} (size 1) → proximity_pct = 1/3*100 ≈ 33.33%
         //   union_count   = 2  → combined_pct = 2/3*100 ≈ 66.67%
         let commits = vec![
-            make_commit("h1", "Alice", 1, "feat: add",        &["a.rs"]),
-            make_commit("h2", "Alice", 2, "fix: bug in a",    &["a.rs"]),
-            make_commit("h3", "Alice", 3, "feat: more work",  &["a.rs"]),
+            make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
+            make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
+            make_commit("h3", "Alice", 3, "feat: more work", &["a.rs"]),
         ];
         let fix_re = build_fix_regex();
         let result = compute_fix_after_touch(&commits, &fix_re, 5);
@@ -806,9 +806,9 @@ mod tests {
 
         assert!(!m.insufficient_data);
 
-        let expected_keyword_pct  = 100.0 / 3.0; // 33.33…
+        let expected_keyword_pct = 100.0 / 3.0; // 33.33…
         let expected_proximity_pct = 100.0 / 3.0; // 33.33…
-        let expected_combined_pct  = 200.0 / 3.0; // 66.67…
+        let expected_combined_pct = 200.0 / 3.0; // 66.67…
 
         assert!(
             (m.keyword_pct - expected_keyword_pct).abs() < 1e-9,
