@@ -433,18 +433,22 @@ pub(crate) fn compute_encapsulation(
     let mut module_stats: HashMap<String, (usize, usize)> = HashMap::new();
 
     for commit in commits {
-        // Collect unique top-level directories for this commit
-        let dirs: HashSet<String> = commit
+        // Precompute top-level directory for each file once to avoid calling
+        // extract_top_dir twice per file (once for dirs, once for module_files).
+        let file_dirs: Vec<Option<String>> = commit
             .files
             .iter()
-            .filter_map(|f| extract_top_dir(&f.path))
+            .map(|f| extract_top_dir(&f.path))
             .collect();
 
+        // Collect unique top-level directories for this commit
+        let dirs: HashSet<&str> = file_dirs.iter().filter_map(|d| d.as_deref()).collect();
+
         // Track files per module
-        for file in &commit.files {
-            if let Some(dir) = extract_top_dir(&file.path) {
+        for (file, dir) in commit.files.iter().zip(file_dirs.iter()) {
+            if let Some(ref d) = dir {
                 module_files
-                    .entry(dir)
+                    .entry(d.clone())
                     .or_default()
                     .insert(file.path.clone());
             }
@@ -453,7 +457,7 @@ pub(crate) fn compute_encapsulation(
         // Cross-boundary = commit touches >1 module
         let is_cross = dirs.len() > 1;
         for dir in &dirs {
-            let entry = module_stats.entry(dir.clone()).or_insert((0, 0));
+            let entry = module_stats.entry(dir.to_string()).or_insert((0, 0));
             entry.0 += 1;
             if is_cross {
                 entry.1 += 1;
