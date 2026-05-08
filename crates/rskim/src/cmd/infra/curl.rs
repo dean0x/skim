@@ -98,19 +98,15 @@ fn resolve_http_status(
     header_items_from_i: &[InfraItem],
     http_status_from_verbose: Option<&str>,
 ) -> Option<String> {
-    if !header_items_from_i.is_empty() {
-        header_items_from_i
-            .iter()
-            .find(|i| i.label == "status")
-            .and_then(|i| {
-                // Extract just the code from e.g. "HTTP/1.1 200 OK"
-                let code = i.value.split_whitespace().nth(1).unwrap_or("");
-                if code.is_empty() { None } else { Some(code.to_string()) }
-            })
-            .or_else(|| http_status_from_verbose.map(str::to_string))
-    } else {
-        http_status_from_verbose.map(str::to_string)
-    }
+    header_items_from_i
+        .iter()
+        .find(|i| i.label == "status")
+        .and_then(|i| {
+            // Extract just the code from e.g. "HTTP/1.1 200 OK"
+            let code = i.value.split_whitespace().nth(1).unwrap_or("");
+            if code.is_empty() { None } else { Some(code.to_string()) }
+        })
+        .or_else(|| http_status_from_verbose.map(str::to_string))
 }
 
 /// Three-tier parse function for curl output.
