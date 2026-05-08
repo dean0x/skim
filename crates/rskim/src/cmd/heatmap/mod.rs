@@ -94,9 +94,8 @@ fn resolve_diff_files(
     git_source: &CliGitSource,
     config: &mut HeatmapConfig,
 ) -> anyhow::Result<Option<ExitCode>> {
-    let base = match config.diff_base.take() {
-        Some(b) => b,
-        None => return Ok(None),
+    let Some(base) = config.diff_base.take() else {
+        return Ok(None);
     };
 
     match git_source.fetch_diff_files(&base) {
@@ -362,10 +361,8 @@ fn apply_file_scope(result: &mut HeatmapResult, files: &[String]) {
 
     // Filter modules: keep only modules whose top-level directory contains a
     // targeted file.  Modules use top-level directory names (e.g. "src",
-    // "tests") produced by `extract_top_dir`, so we must extract the first
-    // path component — not the immediate parent — to match correctly.
-    // Using `rsplit_once('/')` would yield the *deepest* parent directory
-    // (e.g. "src/cmd/heatmap") which never matches a module named "src".
+    // "tests") produced by `extract_top_dir`, so we extract the first path
+    // component to align with those names regardless of nesting depth.
     let target_dirs: HashSet<&str> = files
         .iter()
         .filter_map(|f| f.split_once('/').map(|(top, _)| top))
