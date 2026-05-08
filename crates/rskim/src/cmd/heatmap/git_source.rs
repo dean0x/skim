@@ -66,67 +66,6 @@ impl CliGitSource {
         }
     }
 
-    /// Return `true` when the cwd is inside a git repository.
-    pub(crate) fn is_git_repo(&self) -> bool {
-        match self
-            .runner
-            .run("git", &["rev-parse", "--is-inside-work-tree"])
-        {
-            Ok(out) => out.exit_code == Some(0),
-            Err(_) => false,
-        }
-    }
-
-    /// Return the repository root path.
-    pub(crate) fn get_repo_root(&self) -> anyhow::Result<String> {
-        let out = self
-            .runner
-            .run("git", &["rev-parse", "--show-toplevel"])
-            .map_err(git_not_found)?;
-        Ok(out.stdout.trim().to_string())
-    }
-
-    /// Return `true` when the repo is a shallow clone.
-    pub(crate) fn detect_shallow_clone(&self) -> bool {
-        match self
-            .runner
-            .run("git", &["rev-parse", "--is-shallow-repository"])
-        {
-            Ok(out) => out.stdout.trim() == "true",
-            Err(_) => false,
-        }
-    }
-
-    /// Fetch the Unix timestamp of the Nth-oldest commit within the last `n` commits.
-    ///
-    /// Returns `None` when the repo has fewer than `n` commits.
-    pub(crate) fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>> {
-        if n == 0 {
-            return Ok(None);
-        }
-        let skip = n.saturating_sub(1).to_string();
-        let n_str = n.to_string();
-        let out = self.runner.run(
-            "git",
-            &[
-                "log",
-                "--format=%ad",
-                "--date=unix",
-                "-n",
-                &n_str,
-                "--skip",
-                &skip,
-            ],
-        )?;
-        let trimmed = out.stdout.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        // trimmed is non-empty; first line is the timestamp
-        let ts: u64 = trimmed.lines().next().unwrap_or("").parse().unwrap_or(0);
-        Ok((ts > 0).then_some(ts))
-    }
-
     /// Build the git log arg list from a config.
     fn build_git_log_args(&self, config: &HeatmapConfig) -> Vec<String> {
         let mut args = vec![
@@ -181,19 +120,58 @@ impl CliGitSource {
 
 impl GitDataSource for CliGitSource {
     fn is_git_repo(&self) -> bool {
-        self.is_git_repo()
+        match self
+            .runner
+            .run("git", &["rev-parse", "--is-inside-work-tree"])
+        {
+            Ok(out) => out.exit_code == Some(0),
+            Err(_) => false,
+        }
     }
 
     fn get_repo_root(&self) -> anyhow::Result<String> {
-        self.get_repo_root()
+        let out = self
+            .runner
+            .run("git", &["rev-parse", "--show-toplevel"])
+            .map_err(git_not_found)?;
+        Ok(out.stdout.trim().to_string())
     }
 
     fn detect_shallow_clone(&self) -> bool {
-        self.detect_shallow_clone()
+        match self
+            .runner
+            .run("git", &["rev-parse", "--is-shallow-repository"])
+        {
+            Ok(out) => out.stdout.trim() == "true",
+            Err(_) => false,
+        }
     }
 
     fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>> {
-        self.fetch_commit_count_since(n)
+        if n == 0 {
+            return Ok(None);
+        }
+        let skip = n.saturating_sub(1).to_string();
+        let n_str = n.to_string();
+        let out = self.runner.run(
+            "git",
+            &[
+                "log",
+                "--format=%ad",
+                "--date=unix",
+                "-n",
+                &n_str,
+                "--skip",
+                &skip,
+            ],
+        )?;
+        let trimmed = out.stdout.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        // trimmed is non-empty; first line is the timestamp
+        let ts: u64 = trimmed.lines().next().unwrap_or("").parse().unwrap_or(0);
+        Ok((ts > 0).then_some(ts))
     }
 
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitRecord>> {

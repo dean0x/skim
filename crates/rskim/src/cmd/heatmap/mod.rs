@@ -72,12 +72,12 @@ pub(crate) fn run(
     let git_source = CliGitSource::new();
 
     // Resolve --diff to concrete file list
-    if let Some(ref base) = config.diff_base.clone() {
+    if let Some(base) = config.diff_base.take() {
         if !git_source.is_git_repo() {
             eprintln!("not a git repository (or any parent up to mount point /)");
             return Ok(ExitCode::FAILURE);
         }
-        match git_source.fetch_diff_files(base) {
+        match git_source.fetch_diff_files(&base) {
             Ok(files) if files.is_empty() => {
                 eprintln!("no files changed vs '{base}'");
                 return Ok(ExitCode::FAILURE);
@@ -90,7 +90,6 @@ pub(crate) fn run(
                     }
                 }
                 config.files = files;
-                config.diff_base = None;
             }
             Err(e) => {
                 eprintln!("skim heatmap: {e}");

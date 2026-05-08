@@ -510,7 +510,7 @@ fn test_heatmap_coupling_threshold_flag_accepted() {
         .args(["heatmap", "--coupling-threshold=0.1"])
         .current_dir(dir.path())
         .assert()
-        .code(predicate::in_iter([0i32, 1i32])); // success or no-commits-found failure
+        .success();
 }
 
 // ============================================================================
@@ -810,7 +810,7 @@ fn test_heatmap_no_targets_unchanged() {
     assert!(output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(
-        json.get("file_targets").is_none() || json["file_targets"].is_null(),
+        json.get("file_targets").is_none(),
         "file_targets should be absent when no targets given: {json}"
     );
 }
