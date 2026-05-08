@@ -210,20 +210,11 @@ fn try_split_header_body(stdout: &str) -> Option<(Vec<InfraItem>, &str)> {
         }
 
         // HTTP status line
-        if let Some(caps) = RE_HTTP_STATUS_LINE.captures(line) {
-            let code = &caps[1];
-            let reason = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("").trim();
-            let status_value = if reason.is_empty() {
-                // Try to reconstruct: HTTP/version code reason
-                line.to_string()
-            } else {
-                line.to_string()
-            };
+        if RE_HTTP_STATUS_LINE.is_match(line) {
             items.push(InfraItem {
                 label: "status".to_string(),
-                value: status_value,
+                value: line.to_string(),
             });
-            let _ = code; // used for status composition above
             continue;
         }
 

@@ -38,10 +38,7 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
 /// Inject `-u` (unified diff) if not already present.
 fn prepare_args(args: &mut Vec<String>) {
     let already_has_unified = args.iter().any(|a| {
-        a == "-u"
-            || a == "--unified"
-            || a.starts_with("-U")
-            || a.starts_with("--unified=")
+        a == "-u" || a == "--unified" || a.starts_with("-U") || a.starts_with("--unified=")
     });
     if !already_has_unified {
         // Insert at the beginning so it precedes file arguments
@@ -89,6 +86,26 @@ struct FileStat {
     deletions: usize,
 }
 
+/// Flush the current in-progress file stat into `out` and reset all accumulators.
+fn flush_current(
+    current_path: &mut Option<String>,
+    insertions: &mut usize,
+    deletions: &mut usize,
+    in_hunk: &mut bool,
+    out: &mut Vec<FileStat>,
+) {
+    if let Some(path) = current_path.take() {
+        out.push(FileStat {
+            path,
+            insertions: *insertions,
+            deletions: *deletions,
+        });
+    }
+    *insertions = 0;
+    *deletions = 0;
+    *in_hunk = false;
+}
+
 fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
     if stdout.trim().is_empty() {
         return None;
@@ -104,17 +121,13 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         // `diff -ru` recursive header line: "diff -ru dir1/file dir2/file"
         // This precedes the --- / +++ headers; skip it but use it as a hint
         if line.starts_with("diff ") && !line.starts_with("diff --git ") {
-            // Flush current file if any
-            if let Some(path) = current_path.take() {
-                file_stats.push(FileStat {
-                    path,
-                    insertions: current_insertions,
-                    deletions: current_deletions,
-                });
-            }
-            current_insertions = 0;
-            current_deletions = 0;
-            in_hunk = false;
+            flush_current(
+                &mut current_path,
+                &mut current_insertions,
+                &mut current_deletions,
+                &mut in_hunk,
+                &mut file_stats,
+            );
             continue;
         }
 
@@ -125,25 +138,15 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         // Git-format diffs are identified by the `diff --git` line, not by
         // the `a/` prefix in `---` / `+++` lines.
         if let Some(rest) = line.strip_prefix("--- ") {
-            // Flush current file
-            if let Some(path) = current_path.take() {
-                file_stats.push(FileStat {
-                    path,
-                    insertions: current_insertions,
-                    deletions: current_deletions,
-                });
-            }
-            current_insertions = 0;
-            current_deletions = 0;
-            in_hunk = false;
-
+            flush_current(
+                &mut current_path,
+                &mut current_insertions,
+                &mut current_deletions,
+                &mut in_hunk,
+                &mut file_stats,
+            );
             // Extract path (strip optional tab+timestamp suffix)
-            let path = rest
-                .split('\t')
-                .next()
-                .unwrap_or(rest)
-                .trim()
-                .to_string();
+            let path = rest.split('\t').next().unwrap_or(rest).trim().to_string();
             current_path = Some(path);
             continue;
         }
@@ -152,12 +155,7 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         if let Some(rest) = line.strip_prefix("+++ ") {
             // If the old path was /dev/null, use the new path
             if current_path.as_deref() == Some("/dev/null") {
-                let path = rest
-                    .split('\t')
-                    .next()
-                    .unwrap_or(rest)
-                    .trim()
-                    .to_string();
+                let path = rest.split('\t').next().unwrap_or(rest).trim().to_string();
                 current_path = Some(path);
             }
             continue;
@@ -182,13 +180,13 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
     }
 
     // Flush last file
-    if let Some(path) = current_path.take() {
-        file_stats.push(FileStat {
-            path,
-            insertions: current_insertions,
-            deletions: current_deletions,
-        });
-    }
+    flush_current(
+        &mut current_path,
+        &mut current_insertions,
+        &mut current_deletions,
+        &mut in_hunk,
+        &mut file_stats,
+    );
 
     if file_stats.is_empty() {
         return None;
@@ -313,7 +311,10 @@ mod tests {
         assert!(entry.contains('-'), "Entry should show deletions: {entry}");
         // Footer shows total change summary
         let footer = result.footer.as_ref().unwrap();
-        assert!(footer.contains("changed"), "Footer should show files changed");
+        assert!(
+            footer.contains("changed"),
+            "Footer should show files changed"
+        );
     }
 
     #[test]

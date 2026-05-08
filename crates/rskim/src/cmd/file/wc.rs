@@ -28,8 +28,7 @@ static RE_WC_FULL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$").unwrap());
 
 /// Matches single-stat wc output: count filename (e.g., `wc -l`)
-static RE_WC_SINGLE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\d+)\s+(.+)$").unwrap());
+static RE_WC_SINGLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\d+)\s+(.+)$").unwrap());
 
 /// Run `skim wc [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
@@ -114,17 +113,18 @@ fn try_parse_wc(stdout: &str) -> Option<FileResult> {
     if total_count == 0 && entries.is_empty() && footer_entry.is_none() {
         // Try bare number (stdin mode)
         let trimmed = stdout.trim();
-        if trimmed.chars().all(|c| c.is_ascii_digit() || c.is_whitespace()) {
-            let count_str = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !count_str.is_empty() {
-                return Some(FileResult::new(
-                    "wc".to_string(),
-                    1,
-                    1,
-                    vec![count_str],
-                    None,
-                ));
-            }
+        if !trimmed.is_empty()
+            && trimmed
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_whitespace())
+        {
+            return Some(FileResult::new(
+                "wc".to_string(),
+                1,
+                1,
+                vec![trimmed.to_string()],
+                None,
+            ));
         }
         return None;
     }
@@ -242,7 +242,10 @@ mod tests {
         let input = load_fixture("wc_small.txt");
         let result = try_parse_wc(&input).unwrap();
         let rendered = format!("{result}");
-        assert!(rendered.contains("wc "), "Header should start with tool name");
+        assert!(
+            rendered.contains("wc "),
+            "Header should start with tool name"
+        );
         assert!(
             rendered.contains("src/main.rs"),
             "Entries should appear in output"
