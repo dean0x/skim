@@ -78,6 +78,9 @@ const SET_COOKIE_HEADER: &str = "set-cookie";
 /// Authorization header value is always redacted.
 const AUTH_HEADER: &str = "authorization";
 
+/// Proxy-Authorization carries the same credential material as Authorization.
+const PROXY_AUTH_HEADER: &str = "proxy-authorization";
+
 /// Run `skim curl [args...]`.
 pub(crate) fn run(
     args: &[String],
@@ -85,6 +88,29 @@ pub(crate) fn run(
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for curl — flags are too varied
     run_infra_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+}
+
+/// Determine the effective HTTP status code string from the two possible sources.
+///
+/// Precedence: `-i` header items first (the parsed response headers are authoritative),
+/// falling back to the verbose stderr status if the `-i` block did not carry one.
+fn resolve_http_status(
+    header_items_from_i: &[InfraItem],
+    http_status_from_verbose: Option<&str>,
+) -> Option<String> {
+    if !header_items_from_i.is_empty() {
+        header_items_from_i
+            .iter()
+            .find(|i| i.label == "status")
+            .and_then(|i| {
+                // Extract just the code from e.g. "HTTP/1.1 200 OK"
+                let code = i.value.split_whitespace().nth(1).unwrap_or("");
+                if code.is_empty() { None } else { Some(code.to_string()) }
+            })
+            .or_else(|| http_status_from_verbose.map(str::to_string))
+    } else {
+        http_status_from_verbose.map(str::to_string)
+    }
 }
 
 /// Three-tier parse function for curl output.
@@ -105,20 +131,8 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
         };
 
     // Determine effective HTTP status
-    let http_status = if !header_items_from_i.is_empty() {
-        // Status came from -i headers
-        header_items_from_i
-            .iter()
-            .find(|i| i.label == "status")
-            .map(|i| {
-                // Extract just the code from "HTTP/1.1 200 OK"
-                i.value.split_whitespace().nth(1).unwrap_or("").to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .or_else(|| http_status_from_verbose.clone())
-    } else {
-        http_status_from_verbose.clone()
-    };
+    let http_status =
+        resolve_http_status(&header_items_from_i, http_status_from_verbose.as_deref());
 
     // 6C: Strip write-out trailing status code from body.
     // Only allocate a new String when a write-out suffix is actually stripped.
@@ -183,7 +197,7 @@ fn merge_header_items(header_items: Vec<InfraItem>, result: &mut InfraResult) {
 /// - `Some(item)` — emit this item into the output list
 /// - `None` — header was counted (Set-Cookie) or silently dropped (unknown)
 fn classify_header(name: &str, value: &str, set_cookie_count: &mut usize) -> Option<InfraItem> {
-    if name.eq_ignore_ascii_case(AUTH_HEADER) {
+    if name.eq_ignore_ascii_case(AUTH_HEADER) || name.eq_ignore_ascii_case(PROXY_AUTH_HEADER) {
         Some(InfraItem {
             label: name.to_string(),
             value: "***".to_string(),
@@ -837,6 +851,40 @@ mod tests {
         );
     }
 
+    // ---- resolve_http_status tests ----
+
+    #[test]
+    fn test_resolve_http_status_prefers_i_headers() {
+        let items = vec![
+            InfraItem { label: "status".to_string(), value: "HTTP/1.1 200 OK".to_string() },
+        ];
+        let result = resolve_http_status(&items, Some("404"));
+        assert_eq!(result.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn test_resolve_http_status_falls_back_to_verbose() {
+        // Empty header_items_from_i → fall back to verbose status
+        let result = resolve_http_status(&[], Some("201"));
+        assert_eq!(result.as_deref(), Some("201"));
+    }
+
+    #[test]
+    fn test_resolve_http_status_none_when_both_absent() {
+        let result = resolve_http_status(&[], None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_http_status_i_without_status_item_falls_back() {
+        // header_items_from_i is non-empty but contains no "status" label
+        let items = vec![
+            InfraItem { label: "content-type".to_string(), value: "application/json".to_string() },
+        ];
+        let result = resolve_http_status(&items, Some("302"));
+        assert_eq!(result.as_deref(), Some("302"));
+    }
+
     // ---- 6A: Header extraction tests ----
 
     #[test]
@@ -886,6 +934,29 @@ mod tests {
     }
 
     #[test]
+    fn test_header_extraction_redacts_proxy_auth() {
+        // Proxy-Authorization carries identical credential material to Authorization
+        // and must always be redacted.
+        let input =
+            "HTTP/1.1 200 OK\nProxy-Authorization: Basic dXNlcjpwYXNz\n\n{\"ok\":true}\n";
+        let result = try_split_header_body(input);
+        assert!(result.is_some());
+        let (items, _) = result.unwrap();
+        let proxy_auth = items
+            .iter()
+            .find(|i| i.label.eq_ignore_ascii_case("Proxy-Authorization"));
+        assert!(
+            proxy_auth.is_some(),
+            "Proxy-Authorization header should be present in output (as redacted)"
+        );
+        assert_eq!(
+            proxy_auth.unwrap().value,
+            "***",
+            "Proxy-Authorization value must be redacted"
+        );
+    }
+
+    #[test]
     fn test_header_extraction_set_cookie_count() {
         let input = load_fixture("curl_headers_body.txt");
         let (items, _) = try_split_header_body(&input).unwrap();
@@ -914,6 +985,50 @@ mod tests {
         assert!(
             body.trim().contains('{'),
             "Body should be from the 200 response"
+        );
+    }
+
+    /// Regression guard for the CRLF byte-offset drift bug.
+    ///
+    /// The old `find_last_http_response_start` iterated with `str::lines()`, which
+    /// strips `\r` from `\r\n` lines. Each CRLF line caused the reconstructed byte
+    /// offset to drift by 1, producing an incorrect body split on redirect chains
+    /// with CRLF line endings. The current implementation scans bytes directly and
+    /// must handle CRLF cleanly.
+    #[test]
+    fn test_redirect_chain_crlf_takes_last() {
+        // Redirect chain with CRLF line endings throughout.
+        // Under the old str::lines()-based implementation each header line would cause
+        // a +1 byte drift, pushing the split point into the body JSON and corrupting it.
+        let input = concat!(
+            "HTTP/1.1 301 Moved Permanently\r\n",
+            "Location: https://example.com/new-path\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: application/json\r\n",
+            "Content-Length: 27\r\n",
+            "\r\n",
+            "{\"status\":\"ok\",\"moved\":true}\r\n",
+        );
+
+        let result = try_split_header_body(input);
+        assert!(result.is_some(), "CRLF redirect chain should parse");
+        let (items, body) = result.unwrap();
+
+        let status = items.iter().find(|i| i.label == "status").unwrap();
+        assert!(
+            status.value.contains("200"),
+            "Should use last response status (200) with CRLF endings, got: {}",
+            status.value
+        );
+        assert!(
+            body.trim_start_matches("\r\n").starts_with('{'),
+            "Body should be the JSON from the 200 response (not corrupted by offset drift), got: {body:?}"
+        );
+        assert!(
+            body.contains("ok"),
+            "Body JSON content should be intact, got: {body:?}"
         );
     }
 
