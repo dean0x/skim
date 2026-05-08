@@ -181,18 +181,17 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
     // Flush last file
     state.flush_current();
 
-    let file_stats = state.file_stats;
-
-    if file_stats.is_empty() {
+    if state.file_stats.is_empty() {
         return None;
     }
 
-    let file_count = file_stats.len();
-    let total_insertions: usize = file_stats.iter().map(|f| f.insertions).sum();
-    let total_deletions: usize = file_stats.iter().map(|f| f.deletions).sum();
+    let file_count = state.file_stats.len();
+    let total_insertions: usize = state.file_stats.iter().map(|f| f.insertions).sum();
+    let total_deletions: usize = state.file_stats.iter().map(|f| f.deletions).sum();
 
     let shown = file_count.min(MAX_DISPLAY_ENTRIES);
-    let entries: Vec<String> = file_stats
+    let entries: Vec<String> = state
+        .file_stats
         .iter()
         .take(MAX_DISPLAY_ENTRIES)
         .map(|f| format!("{}: +{}, -{}", f.path, f.insertions, f.deletions))

@@ -101,7 +101,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
         if let Some((header_items, body)) = try_split_header_body(&output.stdout) {
             (Cow::Borrowed(body), header_items)
         } else {
-            (Cow::Borrowed(output.stdout.as_str()), Vec::new())
+            (Cow::Borrowed(&output.stdout), Vec::new())
         };
 
     // Determine effective HTTP status
@@ -183,17 +183,15 @@ fn merge_header_items(header_items: Vec<InfraItem>, result: &mut InfraResult) {
 /// - `Some(item)` — emit this item into the output list
 /// - `None` — header was counted (Set-Cookie) or silently dropped (unknown)
 fn classify_header(name: &str, value: &str, set_cookie_count: &mut usize) -> Option<InfraItem> {
-    let name_lower = name.to_lowercase();
-
-    if name_lower == AUTH_HEADER {
+    if name.eq_ignore_ascii_case(AUTH_HEADER) {
         Some(InfraItem {
             label: name.to_string(),
             value: "***".to_string(),
         })
-    } else if name_lower == SET_COOKIE_HEADER {
+    } else if name.eq_ignore_ascii_case(SET_COOKIE_HEADER) {
         *set_cookie_count += 1;
         None
-    } else if KEY_HEADERS.contains(&name_lower.as_str()) {
+    } else if KEY_HEADERS.iter().any(|&h| name.eq_ignore_ascii_case(h)) {
         Some(InfraItem {
             label: name.to_string(),
             value: value.to_string(),
