@@ -295,11 +295,9 @@ fn find_last_http_response_start(text: &str) -> usize {
 
     // Scan for \nHTTP/ — works for both \n and \r\n line endings because
     // the byte immediately after \n is the start of the next line.
-    let needle = b"\nHTTP/";
     let bytes = text.as_bytes();
-    let mut search_from = 0usize;
-    while let Some(rel) = bytes[search_from..].windows(needle.len()).position(|w| w == needle) {
-        let abs = search_from + rel + 1; // +1: skip the leading \n; abs points at 'H'
+    for pos in memchr::memmem::find_iter(bytes, b"\nHTTP/") {
+        let abs = pos + 1; // +1: skip the leading \n; abs points at 'H'
         // Match only the first line at this position (regex has $ anchor).
         let line_end = text[abs..]
             .find('\n')
@@ -309,7 +307,6 @@ fn find_last_http_response_start(text: &str) -> usize {
         if RE_HTTP_STATUS_LINE.is_match(candidate) {
             last_pos = abs;
         }
-        search_from = abs + 1;
     }
 
     last_pos
