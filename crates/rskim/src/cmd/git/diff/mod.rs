@@ -8,12 +8,12 @@ mod ast;
 mod parse;
 mod render;
 mod source;
-pub(crate) mod types;
+pub(super) mod types;
 
 // Re-export for show.rs (sibling of diff/ within cmd/git/).
 // AD-GIT-6: Raising visibility to pub(in crate::cmd::git) enables show.rs to
 // reuse the diff pipeline without duplicating parsing or rendering logic.
-pub(crate) use parse::parse_unified_diff;
+pub(in crate::cmd::git) use parse::parse_unified_diff;
 pub(in crate::cmd::git) use render::render_diff_file;
 
 use std::process::ExitCode;
