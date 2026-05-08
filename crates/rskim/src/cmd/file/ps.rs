@@ -173,6 +173,16 @@ mod tests {
     }
 
     #[test]
+    fn test_tier1_ps_minimal() {
+        let input = load_fixture("ps_minimal.txt");
+        let result = try_parse_ps(&input);
+        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
+        let result = result.unwrap();
+        assert_eq!(result.total_count, 2, "2 processes in ps_minimal.txt");
+        assert!(result.entries[0].contains("PID"), "Header preserved");
+    }
+
+    #[test]
     fn test_tier3_empty_passthrough() {
         let output = make_output("", 1);
         let result = parse_impl(&output);
