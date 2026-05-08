@@ -11,7 +11,7 @@ use crate::output::canonical::DiffFileStatus;
 /// by `parse_unified_diff`. Widening is required at the field level so that `show.rs`
 /// can consume hunk data without a duplicate type definition.
 #[derive(Debug, Clone)]
-pub(in crate::cmd::git) struct DiffHunk<'a> {
+pub(crate) struct DiffHunk<'a> {
     /// Start line in the old file (1-indexed).
     /// Used for line number rendering (removed lines) and hunk-to-node overlap.
     pub old_start: usize,
@@ -33,7 +33,7 @@ pub(in crate::cmd::git) struct DiffHunk<'a> {
 /// `show.rs` can iterate over `FileDiff` entries returned by `parse_unified_diff`
 /// without requiring a parallel data model in the show handler.
 #[derive(Debug, Clone)]
-pub(in crate::cmd::git) struct FileDiff<'a> {
+pub(crate) struct FileDiff<'a> {
     /// File path (new path for renames/adds, old path for deletes)
     pub path: String,
     /// Original path for renames (old name)
