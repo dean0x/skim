@@ -1,7 +1,7 @@
 //! Declarative rewrite rule table.
 //!
-//! 100 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (7),
-//! LINT (38), PKG (18), INFRA (14), FILE_OPS (9).
+//! 107 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (7),
+//! LINT (38), PKG (18), INFRA (14), FILE_OPS (16).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
@@ -812,7 +812,7 @@ const INFRA_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// FILE_OPS rules (9)
+// FILE_OPS rules (16)
 // ============================================================================
 
 const FILE_OPS_RULES: &[RewriteRule] = &[
@@ -867,6 +867,71 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         prefix: &["rg"],
         rewrite_to: &["skim", "rg"],
         skip_if_flag_prefix: &["--json", "-c", "--count", "-l", "--files"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+    },
+    // wc
+    RewriteRule {
+        prefix: &["wc"],
+        rewrite_to: &["skim", "wc"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+    },
+    // du
+    RewriteRule {
+        prefix: &["du"],
+        rewrite_to: &["skim", "du"],
+        skip_if_flag_prefix: &["--help", "--version", "-0", "--null"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+    },
+    // df
+    RewriteRule {
+        prefix: &["df"],
+        rewrite_to: &["skim", "df"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: false,
+    },
+    // ps
+    RewriteRule {
+        prefix: &["ps"],
+        rewrite_to: &["skim", "ps"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+    },
+    // env
+    RewriteRule {
+        prefix: &["env"],
+        rewrite_to: &["skim", "env"],
+        skip_if_flag_prefix: &["--help", "--version", "-i", "-u", "-S"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+    },
+    // printenv
+    RewriteRule {
+        prefix: &["printenv"],
+        rewrite_to: &["skim", "printenv"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+    },
+    // diff
+    RewriteRule {
+        prefix: &["diff"],
+        rewrite_to: &["skim", "diff"],
+        skip_if_flag_prefix: &[
+            "--help",
+            "--version",
+            "-y",
+            "--side-by-side",
+            "-q",
+            "--brief",
+            "-e",
+            "--ed",
+        ],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
     },
@@ -943,8 +1008,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(14) + FILE_OPS(9)
-    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 14 + 9;
+    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(14) + FILE_OPS(16)
+    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 14 + 16;
 
     #[test]
     fn test_rule_count_matches_expected() {

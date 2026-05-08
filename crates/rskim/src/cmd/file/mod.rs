@@ -1,7 +1,7 @@
 //! File operations handler — dispatches to file tool parsers (#116)
 //!
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
-//! `find`, `grep`, `ls`, `rg`, `tree`.
+//! `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc`.
 
 pub(crate) mod df;
 pub(crate) mod diff;
@@ -24,7 +24,9 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known file tools that the file handler can dispatch to.
-const KNOWN_TOOLS: &[&str] = &["find", "grep", "ls", "rg", "tree"];
+const KNOWN_TOOLS: &[&str] = &[
+    "df", "diff", "du", "env", "find", "grep", "ls", "printenv", "ps", "rg", "tree", "wc",
+];
 
 /// Maximum path/match entries shown in output (truncation cap).
 pub(crate) const MAX_DISPLAY_ENTRIES: usize = 100;
@@ -61,11 +63,17 @@ pub(crate) fn run(
     };
 
     match tool_name.as_str() {
+        "df" => df::run(tool_args, &ctx),
+        "diff" => diff::run(tool_args, &ctx),
+        "du" => du::run(tool_args, &ctx),
+        "env" | "printenv" => env::run(tool_args, &ctx),
         "find" => find::run(tool_args, &ctx),
         "grep" => grep::run(tool_args, &ctx),
         "ls" => ls::run(tool_args, &ctx, "ls"),
+        "ps" => ps::run(tool_args, &ctx),
         "rg" => rg::run(tool_args, &ctx),
         "tree" => ls::run(tool_args, &ctx, "tree"),
+        "wc" => wc::run(tool_args, &ctx),
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
             eprintln!(
