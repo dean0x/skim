@@ -214,7 +214,8 @@ fn test_heatmap_help_contains_flag_names() {
         .stdout(predicate::str::contains("--top"))
         .stdout(predicate::str::contains("--no-exclude"))
         .stdout(predicate::str::contains("--coupling-threshold"))
-        .stdout(predicate::str::contains("--fix-window"));
+        .stdout(predicate::str::contains("--fix-window"))
+        .stdout(predicate::str::contains("--diff"));
 }
 
 // ============================================================================
@@ -510,7 +511,7 @@ fn test_heatmap_coupling_threshold_flag_accepted() {
         .args(["heatmap", "--coupling-threshold=0.1"])
         .current_dir(dir.path())
         .assert()
-        .code(predicate::in_iter([0i32, 1i32])); // success or no-commits-found failure
+        .success();
 }
 
 // ============================================================================
@@ -652,4 +653,276 @@ fn test_heatmap_registered_in_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("heatmap"));
+}
+
+// ============================================================================
+// File targeting
+// ============================================================================
+
+#[test]
+fn test_heatmap_explicit_files() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--json")
+        .arg("src/main.rs")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Only targeted file in results
+    let files = json["files"].as_array().unwrap();
+    assert!(
+        files
+            .iter()
+            .all(|f| f["path"].as_str().unwrap() == "src/main.rs"),
+        "unexpected files: {files:?}"
+    );
+
+    // file_targets present
+    let targets = json["file_targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].as_str().unwrap(), "src/main.rs");
+}
+
+#[test]
+fn test_heatmap_explicit_files_text_header() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("src/main.rs")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("scoped to 1 files"),
+        "header missing scope: {stdout}"
+    );
+}
+
+#[test]
+fn test_heatmap_diff_and_files_mutual_exclusion() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--diff")
+        .arg("main")
+        .arg("src/file.rs")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot combine --diff"));
+}
+
+#[test]
+fn test_heatmap_diff_bad_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--diff")
+        .arg("nonexistent-branch")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "base branch 'nonexistent-branch' not found",
+        ));
+}
+
+#[test]
+fn test_heatmap_file_not_in_history() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--json")
+        .arg("nonexistent.rs")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = json["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| {
+            let s = w.as_str().unwrap();
+            s.contains("nonexistent.rs") && s.contains("not found in git history")
+        }),
+        "expected warning not found in: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_heatmap_files_no_top_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--json")
+        .arg("src/main.rs")
+        .arg("src/lib.rs")
+        .arg("tests/test_lib.rs")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let targets = json["file_targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 3);
+}
+
+#[test]
+fn test_heatmap_no_targets_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--json")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json.get("file_targets").is_none(),
+        "file_targets should be absent when no targets given: {json}"
+    );
+}
+
+#[test]
+fn test_heatmap_diff_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    // Create a branch from the current state
+    StdCommand::new("git")
+        .args(["checkout", "-b", "feature-test"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Add a new file on the branch
+    git_commit(
+        dir.path(),
+        "src/new_file.rs",
+        "fn new() {}",
+        "add new file",
+        recent_ts(),
+    );
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--diff")
+        .arg("main")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The diff output should include the scope annotation
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("scoped to"),
+        "should show scoped header: {stdout}"
+    );
+}
+
+#[test]
+fn test_heatmap_diff_no_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    create_test_repo(dir.path());
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--diff")
+        .arg("HEAD")
+        .current_dir(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no files changed vs 'HEAD'"));
+}
+
+#[test]
+fn test_heatmap_coupling_preserved_with_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let ts = recent_ts();
+
+    git_init(dir.path());
+    // Create coupled files — always committed together
+    for i in 0..6u64 {
+        git_commit_files(
+            dir.path(),
+            &[
+                ("src/config.rs", &format!("// v{i}\nfn config() {{}}")),
+                ("src/main.rs", &format!("// v{i}\nfn main() {{}}")),
+            ],
+            &format!("update pair {i}"),
+            ts + i * 86400,
+        );
+    }
+    // Additional solo commits to make coupling < 1.0
+    git_commit(
+        dir.path(),
+        "src/main.rs",
+        "// solo",
+        "solo main",
+        ts + 7 * 86400,
+    );
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .arg("heatmap")
+        .arg("--json")
+        .arg("src/main.rs")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Coupling graph should include edge between main.rs and config.rs
+    let coupling = json["coupling_graph"].as_array().unwrap();
+    let has_config_edge = coupling.iter().any(|e| {
+        let a = e["a"].as_str().unwrap();
+        let b = e["b"].as_str().unwrap();
+        (a == "src/main.rs" && b == "src/config.rs") || (a == "src/config.rs" && b == "src/main.rs")
+    });
+    assert!(
+        has_config_edge,
+        "coupling graph should include config.rs edge: {coupling:?}"
+    );
 }

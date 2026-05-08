@@ -66,8 +66,60 @@ impl CliGitSource {
         }
     }
 
-    /// Return `true` when the cwd is inside a git repository.
-    pub(crate) fn is_git_repo(&self) -> bool {
+    /// Build the git log arg list from a config.
+    fn build_git_log_args(&self, config: &HeatmapConfig) -> Vec<String> {
+        let mut args = vec![
+            "log".to_string(),
+            "--format=COMMIT:%H|%aN|%ad|%s".to_string(),
+            "--numstat".to_string(),
+            "--no-merges".to_string(),
+            "--date=unix".to_string(),
+            "-M".to_string(),
+        ];
+
+        if let Some(since) = config.since {
+            args.push(format!("--since={since}"));
+        }
+
+        if let Some(ref path) = config.path {
+            args.push("--".to_string());
+            args.push(path.clone());
+        }
+
+        args
+    }
+
+    /// Resolve files changed between `base` and HEAD using three-dot diff.
+    ///
+    /// Uses `git diff --name-only <base>...HEAD` so that only commits reachable
+    /// from HEAD but not from `base` are included.
+    pub(crate) fn fetch_diff_files(&self, base: &str) -> anyhow::Result<Vec<String>> {
+        let arg = format!("{base}...HEAD");
+        let out = self
+            .runner
+            .run("git", &["diff", "--name-only", &arg])
+            .map_err(git_not_found)?;
+
+        if out.exit_code != Some(0) {
+            let stderr = out.stderr.trim();
+            if stderr.contains("unknown revision") || stderr.contains("bad revision") {
+                anyhow::bail!("base branch '{base}' not found");
+            }
+            anyhow::bail!("git diff failed: {stderr}");
+        }
+
+        Ok(out
+            .stdout
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+            .collect())
+    }
+}
+
+impl GitDataSource for CliGitSource {
+    fn is_git_repo(&self) -> bool {
         match self
             .runner
             .run("git", &["rev-parse", "--is-inside-work-tree"])
@@ -77,8 +129,7 @@ impl CliGitSource {
         }
     }
 
-    /// Return the repository root path.
-    pub(crate) fn get_repo_root(&self) -> anyhow::Result<String> {
+    fn get_repo_root(&self) -> anyhow::Result<String> {
         let out = self
             .runner
             .run("git", &["rev-parse", "--show-toplevel"])
@@ -86,8 +137,7 @@ impl CliGitSource {
         Ok(out.stdout.trim().to_string())
     }
 
-    /// Return `true` when the repo is a shallow clone.
-    pub(crate) fn detect_shallow_clone(&self) -> bool {
+    fn detect_shallow_clone(&self) -> bool {
         match self
             .runner
             .run("git", &["rev-parse", "--is-shallow-repository"])
@@ -97,10 +147,7 @@ impl CliGitSource {
         }
     }
 
-    /// Fetch the Unix timestamp of the Nth-oldest commit within the last `n` commits.
-    ///
-    /// Returns `None` when the repo has fewer than `n` commits.
-    pub(crate) fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>> {
+    fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>> {
         if n == 0 {
             return Ok(None);
         }
@@ -125,47 +172,6 @@ impl CliGitSource {
         // trimmed is non-empty; first line is the timestamp
         let ts: u64 = trimmed.lines().next().unwrap_or("").parse().unwrap_or(0);
         Ok((ts > 0).then_some(ts))
-    }
-
-    /// Build the git log arg list from a config.
-    fn build_git_log_args(&self, config: &HeatmapConfig) -> Vec<String> {
-        let mut args = vec![
-            "log".to_string(),
-            "--format=COMMIT:%H|%aN|%ad|%s".to_string(),
-            "--numstat".to_string(),
-            "--no-merges".to_string(),
-            "--date=unix".to_string(),
-            "-M".to_string(),
-        ];
-
-        if let Some(since) = config.since {
-            args.push(format!("--since={since}"));
-        }
-
-        if let Some(ref path) = config.path {
-            args.push("--".to_string());
-            args.push(path.clone());
-        }
-
-        args
-    }
-}
-
-impl GitDataSource for CliGitSource {
-    fn is_git_repo(&self) -> bool {
-        self.is_git_repo()
-    }
-
-    fn get_repo_root(&self) -> anyhow::Result<String> {
-        self.get_repo_root()
-    }
-
-    fn detect_shallow_clone(&self) -> bool {
-        self.detect_shallow_clone()
-    }
-
-    fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>> {
-        self.fetch_commit_count_since(n)
     }
 
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitRecord>> {

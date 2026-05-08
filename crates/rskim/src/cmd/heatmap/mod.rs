@@ -60,7 +60,7 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let config = match parse_args(args) {
+    let mut config = match parse_args(args) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("skim heatmap: {e}");
@@ -70,7 +70,60 @@ pub(crate) fn run(
     };
 
     let git_source = CliGitSource::new();
+
+    // Resolve --diff to concrete file list
+    if let Some(exit) = resolve_diff_files(&git_source, &mut config)? {
+        return Ok(exit);
+    }
+
     run_with_source(&git_source, &config, analytics)
+}
+
+/// Resolve `--diff` to a concrete file list, mutating `config.files`.
+///
+/// Returns `Some(ExitCode::FAILURE)` for any early-exit condition so that `run()`
+/// can propagate it directly. Returns `Ok(None)` when resolution succeeded and the
+/// caller should continue.
+///
+/// Path correctness: git diff output is repo-root-relative, so deleted-file
+/// detection uses [`CliGitSource::get_repo_root`] to build absolute paths rather
+/// than relying on cwd. The `is_git_repo()` guard is intentionally omitted — if
+/// the cwd is not inside a repository, `fetch_diff_files` will return an error
+/// with a clear message, and `prepare_commits` already handles the non-repo case.
+fn resolve_diff_files(
+    git_source: &CliGitSource,
+    config: &mut HeatmapConfig,
+) -> anyhow::Result<Option<ExitCode>> {
+    let Some(base) = config.diff_base.take() else {
+        return Ok(None);
+    };
+
+    match git_source.fetch_diff_files(&base) {
+        Ok(files) if files.is_empty() => {
+            eprintln!("skim heatmap: no files changed vs '{base}'");
+            Ok(Some(ExitCode::FAILURE))
+        }
+        Ok(files) => {
+            // Detect deleted files for annotation. git diff output is repo-root-relative,
+            // so resolve paths against the repo root to avoid cwd-dependent failures.
+            let root = git_source.get_repo_root().unwrap_or_default();
+            for f in &files {
+                let abs = std::path::Path::new(&root).join(f);
+                if !abs.exists() {
+                    eprintln!(
+                        "skim heatmap: warning: file '{}' deleted on current branch",
+                        f
+                    );
+                }
+            }
+            config.files = files;
+            Ok(None)
+        }
+        Err(e) => {
+            eprintln!("skim heatmap: {e}");
+            Ok(Some(ExitCode::FAILURE))
+        }
+    }
 }
 
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
@@ -229,8 +282,21 @@ fn run_with_source(
     let start_time = std::time::Instant::now();
     let mut result = compute_heatmap(commits, config, &window, now_epoch, repo_root, warnings);
 
+    // Apply file-targeting display filter (after full metric computation)
+    if !config.files.is_empty() {
+        apply_file_scope(&mut result, &config.files);
+    }
+
+    // Compute display top_n: when files are explicitly targeted and --top
+    // was not given, show all targeted files rather than the global default.
+    let display_top_n = if !config.files.is_empty() && !config.top_explicit {
+        config.files.len()
+    } else {
+        config.top_n
+    };
+
     // Apply --top N limit to files
-    result.files.truncate(config.top_n);
+    result.files.truncate(display_top_n);
 
     // Step 10: Render
     let elapsed = start_time.elapsed();
@@ -240,7 +306,7 @@ fn run_with_source(
         let json = render_json(&result)?;
         writeln!(stdout, "{json}")?;
     } else {
-        let text = render_text(&result, config.top_n);
+        let text = render_text(&result, display_top_n);
         write!(stdout, "{text}")?;
     }
 
@@ -260,6 +326,55 @@ fn run_with_source(
     );
 
     Ok(ExitCode::SUCCESS)
+}
+
+// ============================================================================
+// File-scope display filter (Step 5-alt)
+// ============================================================================
+
+/// Filter heatmap results to only include targeted files.
+///
+/// Filtering happens AFTER metric computation to preserve coupling accuracy.
+/// Coupling graph retains edges where at least one endpoint is targeted
+/// (blast radius view).
+fn apply_file_scope(result: &mut HeatmapResult, files: &[String]) {
+    use std::collections::HashSet;
+
+    let target_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
+
+    // Warn about targets not found in results
+    let result_paths: HashSet<&str> = result.files.iter().map(|f| f.path.as_str()).collect();
+    for target in &target_set {
+        if !result_paths.contains(target) {
+            result
+                .warnings
+                .push(format!("targeted file '{target}' not found in git history"));
+        }
+    }
+
+    // Filter files
+    result
+        .files
+        .retain(|f| target_set.contains(f.path.as_str()));
+
+    // Filter coupling graph: keep edges where at least one endpoint is targeted
+    result
+        .coupling_graph
+        .retain(|e| target_set.contains(e.a.as_str()) || target_set.contains(e.b.as_str()));
+
+    // Filter modules: keep only modules whose top-level directory contains a
+    // targeted file.  Modules use top-level directory names (e.g. "src",
+    // "tests") produced by `extract_top_dir`, so we extract the first path
+    // component to align with those names regardless of nesting depth.
+    let target_dirs: HashSet<&str> = files
+        .iter()
+        .filter_map(|f| f.split_once('/').map(|(top, _)| top))
+        .collect();
+    result
+        .modules
+        .retain(|m| target_dirs.contains(m.path.as_str()));
+
+    result.file_targets = Some(files.to_vec());
 }
 
 // ============================================================================
@@ -382,6 +497,7 @@ fn compute_heatmap(
         coupling_graph,
         excluded_patterns,
         warnings,
+        file_targets: None,
     }
 }
 
@@ -586,6 +702,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
         "--coupling-threshold",
         "--fix-window",
         "--format",
+        "--diff",
     ];
 
     while i < args.len() {
@@ -617,6 +734,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
                 anyhow::bail!("--top must be at least 1");
             }
             config.top_n = n;
+            config.top_explicit = true;
             continue;
         }
 
@@ -677,6 +795,12 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
             continue;
         }
 
+        // --diff VALUE
+        if let Some(val) = extract_value(args, &mut i, "--diff") {
+            config.diff_base = Some(val);
+            continue;
+        }
+
         // Boolean flags
         if apply_boolean_flag(&mut config, arg)? {
             i += 1;
@@ -686,9 +810,22 @@ fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
         if arg.starts_with('-') {
             anyhow::bail!("unknown flag: {arg}");
         }
-        // Positional (non-flag) argument — `skim heatmap` takes no
-        // positional args; suggest --path if the user meant a directory.
-        anyhow::bail!("unexpected argument: '{arg}'. Did you mean --path={arg}?");
+        // Positional (non-flag) argument — file target.
+        config.files.push(arg.to_string());
+        i += 1;
+        continue;
+    }
+
+    // Post-parse validation
+    if config.diff_base.is_some() && !config.files.is_empty() {
+        anyhow::bail!("cannot combine --diff with explicit file arguments");
+    }
+
+    // Normalize file paths: strip leading ./
+    for f in &mut config.files {
+        if let Some(stripped) = f.strip_prefix("./") {
+            *f = stripped.to_string();
+        }
     }
 
     Ok(config)
@@ -762,13 +899,14 @@ fn print_help() {
 skim heatmap — git history risk and coupling analysis
 
 USAGE:
-    skim heatmap [OPTIONS]
+    skim heatmap [OPTIONS] [FILE...]
 
 OPTIONS:
     --since <VALUE>               Analyze commits since epoch (seconds) or duration (30d, 2w, 24h)
     --last <N>                    Analyze last N commits
     --window <PRESET>             Named window: sprint|month|quarter|half|year|all
     --path <DIR>                  Scope analysis to files under this path
+    --diff <BASE>                 Show only files changed vs BASE (three-dot diff)
     --json, --format json         Output JSON instead of human-readable text
     --top <N>                     Maximum files to display (default: 20)
     --no-exclude                  Disable default exclusion patterns (lock files, build dirs, etc.)
@@ -786,6 +924,17 @@ WINDOW PRESETS:
     year       365 days
     all        No time limit (analyze entire history)
 
+FILE TARGETING:
+    Positional file arguments and --diff scope the OUTPUT, not the git history.
+    Metrics are computed on full commit history for accuracy — coupling and
+    fix-risk scores reflect the complete picture, then display is narrowed.
+
+    --path scopes the git log itself (commit-level filter). File targeting and
+    --path compose: --path limits which commits are analyzed, file arguments
+    limit which results are shown.
+
+    --diff and explicit file arguments are mutually exclusive.
+
 EXAMPLES:
     skim heatmap                           # Analyze last 90 days
     skim heatmap --last 200                # Analyze last 200 commits
@@ -795,6 +944,9 @@ EXAMPLES:
     skim heatmap --path src/               # Scope to src/ directory
     skim heatmap --no-exclude              # Include lock files and build artifacts
     skim heatmap --coupling-threshold 0.3  # Lower coupling threshold
+    skim heatmap src/main.rs               # Scope output to one file
+    skim heatmap --diff main               # Show files changed vs main
+    skim heatmap --path src/ src/main.rs   # Combine path + file scoping
 
 METRICS:
     Top Churn          Files changed most frequently
@@ -966,12 +1118,73 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_args_unexpected_positional_errors() {
-        let result = parse_args(&["src/".to_string()]);
+    fn test_parse_args_positional_files() {
+        let config = parse_args(&["src/main.rs".to_string(), "src/lib.rs".to_string()]).unwrap();
+        assert_eq!(config.files, vec!["src/main.rs", "src/lib.rs"]);
+    }
+
+    #[test]
+    fn test_parse_args_diff_flag() {
+        let config = parse_args(&["--diff".to_string(), "main".to_string()]).unwrap();
+        assert_eq!(config.diff_base, Some("main".to_string()));
+    }
+
+    #[test]
+    fn test_parse_args_diff_equals() {
+        let config = parse_args(&["--diff=develop".to_string()]).unwrap();
+        assert_eq!(config.diff_base, Some("develop".to_string()));
+    }
+
+    #[test]
+    fn test_parse_args_diff_and_files_mutual_exclusion() {
+        let result = parse_args(&[
+            "--diff".to_string(),
+            "main".to_string(),
+            "file.rs".to_string(),
+        ]);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("unexpected argument"), "got: {msg}");
-        assert!(msg.contains("--path=src/"), "got: {msg}");
+        assert!(msg.contains("cannot combine --diff"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parse_args_file_path_normalization() {
+        let config = parse_args(&["./src/main.rs".to_string()]).unwrap();
+        assert_eq!(config.files, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn test_parse_args_top_explicit_flag() {
+        let config = parse_args(&["--top".to_string(), "5".to_string()]).unwrap();
+        assert!(config.top_explicit);
+    }
+
+    #[test]
+    fn test_parse_args_top_implicit_by_default() {
+        let config = parse_args(&[]).unwrap();
+        assert!(!config.top_explicit);
+    }
+
+    #[test]
+    fn test_parse_args_diff_without_value() {
+        let result = parse_args(&["--diff".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("requires a value"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parse_args_files_with_other_flags() {
+        let config = parse_args(&[
+            "--since".to_string(),
+            "30d".to_string(),
+            "src/main.rs".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(config.files, vec!["src/main.rs"]);
+        assert!(config.format_json);
+        assert!(config.since.is_some());
     }
 
     #[test]
@@ -1115,5 +1328,185 @@ mod tests {
         let info = build_window_info(&window, 999, NOW);
 
         assert_eq!(info.commits_analyzed, 999);
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_file_scope
+    // -----------------------------------------------------------------------
+
+    fn make_test_result() -> HeatmapResult {
+        use types::{
+            AuthorMetrics, ChurnMetrics, CouplingEdge, FileMetrics, FixRiskMetrics, ModuleHealth,
+            WindowInfo,
+        };
+        HeatmapResult {
+            version: 1,
+            generated_at: "2025-01-01".to_string(),
+            repository: "test".to_string(),
+            window: WindowInfo {
+                mode: "90d".to_string(),
+                since: "2024-10-01".to_string(),
+                until: "2025-01-01".to_string(),
+                commits_analyzed: 10,
+                effective_strategy: None,
+            },
+            files: vec![
+                FileMetrics {
+                    path: "src/main.rs".to_string(),
+                    churn: ChurnMetrics {
+                        commits: 5,
+                        rate: 0.5,
+                    },
+                    stability_score: 42,
+                    authors: AuthorMetrics::default(),
+                    fix_risk: FixRiskMetrics::default(),
+                    blast_radius: vec![],
+                },
+                FileMetrics {
+                    path: "src/lib.rs".to_string(),
+                    churn: ChurnMetrics {
+                        commits: 3,
+                        rate: 0.3,
+                    },
+                    stability_score: 60,
+                    authors: AuthorMetrics::default(),
+                    fix_risk: FixRiskMetrics::default(),
+                    blast_radius: vec![],
+                },
+                FileMetrics {
+                    path: "tests/test.rs".to_string(),
+                    churn: ChurnMetrics {
+                        commits: 2,
+                        rate: 0.2,
+                    },
+                    stability_score: 80,
+                    authors: AuthorMetrics::default(),
+                    fix_risk: FixRiskMetrics::default(),
+                    blast_radius: vec![],
+                },
+            ],
+            modules: vec![
+                ModuleHealth {
+                    path: "src".to_string(),
+                    encapsulation_pct: 80.0,
+                    files_count: 2,
+                    total_commits: 8,
+                    cross_boundary_commits: 1,
+                },
+                ModuleHealth {
+                    path: "tests".to_string(),
+                    encapsulation_pct: 90.0,
+                    files_count: 1,
+                    total_commits: 2,
+                    cross_boundary_commits: 0,
+                },
+            ],
+            coupling_graph: vec![
+                CouplingEdge {
+                    a: "src/main.rs".to_string(),
+                    b: "src/lib.rs".to_string(),
+                    confidence: 0.8,
+                    support: 4,
+                },
+                CouplingEdge {
+                    a: "tests/test.rs".to_string(),
+                    b: "src/lib.rs".to_string(),
+                    confidence: 0.6,
+                    support: 3,
+                },
+            ],
+            excluded_patterns: vec![],
+            warnings: vec![],
+            file_targets: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_file_scope_filters_files() {
+        let mut result = make_test_result();
+        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn test_apply_file_scope_filters_coupling() {
+        let mut result = make_test_result();
+        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        // Edge with src/main.rs kept, edge without any target dropped
+        assert_eq!(result.coupling_graph.len(), 1);
+        assert_eq!(result.coupling_graph[0].a, "src/main.rs");
+    }
+
+    #[test]
+    fn test_apply_file_scope_filters_modules() {
+        let mut result = make_test_result();
+        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        assert_eq!(result.modules.len(), 1);
+        assert_eq!(result.modules[0].path, "src");
+    }
+
+    #[test]
+    fn test_apply_file_scope_warns_missing() {
+        let mut result = make_test_result();
+        apply_file_scope(&mut result, &["nonexistent.rs".to_string()]);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| { w.contains("nonexistent.rs") && w.contains("not found in git history") }));
+    }
+
+    #[test]
+    fn test_apply_file_scope_sets_file_targets() {
+        let mut result = make_test_result();
+        apply_file_scope(&mut result, &["src/main.rs".to_string()]);
+        assert_eq!(result.file_targets, Some(vec!["src/main.rs".to_string()]));
+    }
+
+    /// Regression test for deeply-nested file targets.
+    ///
+    /// When a targeted file lives multiple levels deep (e.g.
+    /// `src/cmd/heatmap/mod.rs`), the module filter must match it against the
+    /// top-level module `"src"` — not the immediate parent `"src/cmd/heatmap"`.
+    /// The previous `rsplit_once('/')` implementation extracted the deepest
+    /// parent directory and would incorrectly drop the `"src"` module.
+    #[test]
+    fn test_apply_file_scope_filters_modules_deeply_nested() {
+        use types::{AuthorMetrics, ChurnMetrics, FileMetrics, FixRiskMetrics, ModuleHealth};
+        let mut result = make_test_result();
+        // Replace the file list with a single deeply-nested path
+        result.files = vec![FileMetrics {
+            path: "src/cmd/heatmap/mod.rs".to_string(),
+            churn: ChurnMetrics {
+                commits: 1,
+                rate: 0.1,
+            },
+            stability_score: 50,
+            authors: AuthorMetrics::default(),
+            fix_risk: FixRiskMetrics::default(),
+            blast_radius: vec![],
+        }];
+        // Add a matching deeply-nested module entry to the modules list
+        result.modules.push(ModuleHealth {
+            path: "src/cmd".to_string(),
+            encapsulation_pct: 70.0,
+            files_count: 1,
+            total_commits: 1,
+            cross_boundary_commits: 0,
+        });
+
+        apply_file_scope(&mut result, &["src/cmd/heatmap/mod.rs".to_string()]);
+
+        // The top-level "src" module must be retained; "tests" must be dropped;
+        // the "src/cmd" entry (not a valid top-level module) must also be dropped.
+        let module_paths: Vec<&str> = result.modules.iter().map(|m| m.path.as_str()).collect();
+        assert!(
+            module_paths.contains(&"src"),
+            "expected 'src' module to be retained for deeply-nested target, got: {module_paths:?}"
+        );
+        assert!(
+            !module_paths.contains(&"tests"),
+            "expected 'tests' module to be dropped, got: {module_paths:?}"
+        );
     }
 }

@@ -37,6 +37,12 @@ pub(crate) struct HeatmapConfig {
     pub(crate) window_preset: Option<String>,
     /// Limit analysis to last N commits.
     pub(crate) last_n: Option<usize>,
+    /// Explicit file targets — scope display to these paths.
+    pub(crate) files: Vec<String>,
+    /// Base branch/ref for `--diff` three-dot diff.
+    pub(crate) diff_base: Option<String>,
+    /// True when `--top` was explicitly passed (vs. implied by file targeting).
+    pub(crate) top_explicit: bool,
 }
 
 impl Default for HeatmapConfig {
@@ -53,6 +59,9 @@ impl Default for HeatmapConfig {
             debug: false,
             window_preset: None,
             last_n: None,
+            files: Vec::new(),
+            diff_base: None,
+            top_explicit: false,
         }
     }
 }
@@ -119,6 +128,9 @@ pub(crate) struct HeatmapResult {
     pub(crate) coupling_graph: Vec<CouplingEdge>,
     pub(crate) excluded_patterns: Vec<String>,
     pub(crate) warnings: Vec<String>,
+    /// Files targeted by `--diff` or positional args (present only when scoped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) file_targets: Option<Vec<String>>,
 }
 
 /// Information about the analysis window.
