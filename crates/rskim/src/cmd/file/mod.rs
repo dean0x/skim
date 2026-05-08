@@ -3,10 +3,14 @@
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
 //! `find`, `grep`, `ls`, `rg`, `tree`.
 
+pub(crate) mod df;
+pub(crate) mod du;
 pub(crate) mod find;
 pub(crate) mod grep;
 pub(crate) mod ls;
+pub(crate) mod ps;
 pub(crate) mod rg;
+pub(crate) mod wc;
 
 use std::process::ExitCode;
 
