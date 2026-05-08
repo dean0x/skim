@@ -30,9 +30,13 @@ pub(crate) fn render_text(result: &HeatmapResult, top_n: usize) -> String {
     let mut out = String::new();
 
     // Header
+    let scope_suffix = match &result.file_targets {
+        Some(targets) => format!(" (scoped to {} files)", targets.len()),
+        None => String::new(),
+    };
     let header = format!(
-        "─── Heatmap: {} ({} commits, {} window) ───",
-        result.repository, result.window.commits_analyzed, result.window.mode
+        "─── Heatmap: {} ({} commits, {} window){} ───",
+        result.repository, result.window.commits_analyzed, result.window.mode, scope_suffix
     );
     out.push_str(&header.bold().to_string());
     out.push('\n');
@@ -257,6 +261,7 @@ mod tests {
             }],
             excluded_patterns: vec!["Cargo.lock".to_string()],
             warnings: vec![],
+            file_targets: None,
         }
     }
 
