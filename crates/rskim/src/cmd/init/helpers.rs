@@ -205,6 +205,26 @@ skim <file> --mode=types         # type definitions only
 skim <file> --mode=signatures    # function/method signatures only
 skim <file> --mode=pseudo        # logic without syntactic noise
 ```
+
+### Heatmap — Git History Risk Analysis
+
+`skim heatmap` analyzes git history to surface risk hotspots: high-churn files,
+tightly coupled file pairs, fix-after-touch patterns, module boundary violations,
+and bus-factor concentration. Run it when you need to understand where risk lives
+in a codebase before starting work.
+
+**When to use heatmap:**
+- Before a refactoring task — identify which files are risky to change
+- When triaging bugs — find files with high fix density
+- Exploring an unfamiliar codebase — understand coupling and ownership patterns
+- Before code review — check if the changed files are high-risk hotspots
+
+```
+skim heatmap                     # default: last 90 days, text output
+skim heatmap --json              # structured JSON for programmatic use
+skim heatmap --path src/lib/     # scope to a subdirectory
+skim heatmap --window sprint     # last 14 days only
+```
 <!-- skim-end -->"#,
         version = version
     )
@@ -329,6 +349,10 @@ mod tests {
         assert!(!content.contains("SKIM_PASSTHROUGH"));
         // No rskim mention in guidance body
         assert!(!content.contains("rskim"));
+        // Heatmap section present with key content
+        assert!(content.contains("Heatmap"));
+        assert!(content.contains("skim heatmap"));
+        assert!(content.contains("risk"));
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod completions;
 mod discover;
 mod file;
 mod git;
+mod heatmap;
 mod hook_log;
 mod hooks;
 mod infra;
@@ -154,6 +155,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "completions",
     "discover",
     "git",
+    "heatmap",
     "init",
     "learn",
     "log",
@@ -700,6 +702,7 @@ pub(crate) fn dispatch(
         "completions" => completions::run(args, analytics),
         "discover" => discover::run(args, analytics),
         "git" => git::run(args, analytics),
+        "heatmap" => heatmap::run(args, analytics),
         "init" => init::run(args, analytics),
         "learn" => learn::run(args, analytics),
         "log" => log::run(args, analytics),

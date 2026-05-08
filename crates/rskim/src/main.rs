@@ -194,6 +194,7 @@ SUBCOMMANDS:\n  \
     gh / aws / curl / wget                   Infrastructure tool compression\n  \
     find / grep / ls / rg / tree             File operation compression\n  \
     git                                      Git output compression (diff, status, log, ...)\n  \
+    heatmap                                  Git history risk/coupling analysis\n  \
     log                                      Log output compression\n  \
     agents                                   Show detected AI agents\n  \
     completions <SHELL>                      Generate shell completions\n  \
