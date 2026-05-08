@@ -86,24 +86,39 @@ struct FileStat {
     deletions: usize,
 }
 
-/// Flush the current in-progress file stat into `out` and reset all accumulators.
-fn flush_current(
-    current_path: &mut Option<String>,
-    insertions: &mut usize,
-    deletions: &mut usize,
-    in_hunk: &mut bool,
-    out: &mut Vec<FileStat>,
-) {
-    if let Some(path) = current_path.take() {
-        out.push(FileStat {
-            path,
-            insertions: *insertions,
-            deletions: *deletions,
-        });
+/// Mutable accumulator state for the standalone unified diff parser.
+struct DiffParserState {
+    file_stats: Vec<FileStat>,
+    current_path: Option<String>,
+    current_insertions: usize,
+    current_deletions: usize,
+    in_hunk: bool,
+}
+
+impl DiffParserState {
+    fn new() -> Self {
+        Self {
+            file_stats: Vec::new(),
+            current_path: None,
+            current_insertions: 0,
+            current_deletions: 0,
+            in_hunk: false,
+        }
     }
-    *insertions = 0;
-    *deletions = 0;
-    *in_hunk = false;
+
+    /// Flush the current in-progress file stat and reset all accumulators.
+    fn flush_current(&mut self) {
+        if let Some(path) = self.current_path.take() {
+            self.file_stats.push(FileStat {
+                path,
+                insertions: self.current_insertions,
+                deletions: self.current_deletions,
+            });
+        }
+        self.current_insertions = 0;
+        self.current_deletions = 0;
+        self.in_hunk = false;
+    }
 }
 
 fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
@@ -111,23 +126,13 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         return None;
     }
 
-    let mut file_stats: Vec<FileStat> = Vec::new();
-    let mut current_path: Option<String> = None;
-    let mut current_insertions = 0usize;
-    let mut current_deletions = 0usize;
-    let mut in_hunk = false;
+    let mut state = DiffParserState::new();
 
     for line in stdout.lines() {
         // `diff -ru` recursive header line: "diff -ru dir1/file dir2/file"
         // This precedes the --- / +++ headers; skip it but use it as a hint
         if line.starts_with("diff ") && !line.starts_with("diff --git ") {
-            flush_current(
-                &mut current_path,
-                &mut current_insertions,
-                &mut current_deletions,
-                &mut in_hunk,
-                &mut file_stats,
-            );
+            state.flush_current();
             continue;
         }
 
@@ -138,55 +143,45 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         // Git-format diffs are identified by the `diff --git` line, not by
         // the `a/` prefix in `---` / `+++` lines.
         if let Some(rest) = line.strip_prefix("--- ") {
-            flush_current(
-                &mut current_path,
-                &mut current_insertions,
-                &mut current_deletions,
-                &mut in_hunk,
-                &mut file_stats,
-            );
+            state.flush_current();
             // Extract path (strip optional tab+timestamp suffix)
             let path = rest.split('\t').next().unwrap_or(rest).trim().to_string();
-            current_path = Some(path);
+            state.current_path = Some(path);
             continue;
         }
 
         // `+++ path\tdate` — confirms the new-file side; update path if `---` was /dev/null
         if let Some(rest) = line.strip_prefix("+++ ") {
             // If the old path was /dev/null, use the new path
-            if current_path.as_deref() == Some("/dev/null") {
+            if state.current_path.as_deref() == Some("/dev/null") {
                 let path = rest.split('\t').next().unwrap_or(rest).trim().to_string();
-                current_path = Some(path);
+                state.current_path = Some(path);
             }
             continue;
         }
 
         // `@@ ... @@` hunk header — entering a hunk
         if line.starts_with("@@ ") {
-            in_hunk = true;
+            state.in_hunk = true;
             continue;
         }
 
-        if !in_hunk {
+        if !state.in_hunk {
             continue;
         }
 
         // Count insertions and deletions (not the +++ / --- header lines)
         if line.starts_with('+') {
-            current_insertions += 1;
+            state.current_insertions += 1;
         } else if line.starts_with('-') {
-            current_deletions += 1;
+            state.current_deletions += 1;
         }
     }
 
     // Flush last file
-    flush_current(
-        &mut current_path,
-        &mut current_insertions,
-        &mut current_deletions,
-        &mut in_hunk,
-        &mut file_stats,
-    );
+    state.flush_current();
+
+    let file_stats = state.file_stats;
 
     if file_stats.is_empty() {
         return None;
