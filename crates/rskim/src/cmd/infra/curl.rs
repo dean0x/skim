@@ -13,6 +13,7 @@
 //! - **6C**: Write-out format (`-w`) — trailing 3-digit status code stripped from body
 //! - **6D**: Verbose stderr enhancement — extracts response headers from `< header:` lines
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -94,13 +95,13 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     let (http_status_from_verbose, verbose_header_items) = extract_verbose_metadata(&output.stderr);
     extra_header_items.extend(verbose_header_items);
 
-    // 6A: Try to split `-i` header/body output
-    let (body_text, header_items_from_i) =
+    // 6A: Try to split `-i` header/body output.
+    // Use Cow to borrow when no stripping is needed, own only when headers are present.
+    let (body_text, header_items_from_i): (Cow<'_, str>, Vec<InfraItem>) =
         if let Some((header_items, body)) = try_split_header_body(&output.stdout) {
-            // Merge http_status_from_verbose only if not already in header items
-            (body.to_string(), header_items)
+            (Cow::Borrowed(body), header_items)
         } else {
-            (output.stdout.clone(), Vec::new())
+            (Cow::Borrowed(output.stdout.as_str()), Vec::new())
         };
 
     // Determine effective HTTP status
@@ -119,13 +120,14 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
         http_status_from_verbose.clone()
     };
 
-    // 6C: Strip write-out trailing status code from body
-    let (body_text, writeout_item) = if let Some((wo, stripped)) = try_extract_writeout(&body_text)
-    {
-        (stripped.to_string(), Some(wo))
-    } else {
-        (body_text, None)
-    };
+    // 6C: Strip write-out trailing status code from body.
+    // Only allocate a new String when a write-out suffix is actually stripped.
+    let (body_text, writeout_item) =
+        if let Some((wo, stripped)) = try_extract_writeout(body_text.as_ref()) {
+            (Cow::Owned(stripped.to_string()), Some(wo))
+        } else {
+            (body_text, None)
+        };
 
     // Build initial items from -i headers (if any)
     let mut header_items: Vec<InfraItem> = header_items_from_i;
@@ -135,19 +137,8 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     }
 
     // Tier 1: Try JSON parse
-    if let Some(mut result) = try_parse_json(&body_text, http_status.as_deref()) {
-        // Prepend header items before JSON items
-        if !header_items.is_empty() {
-            let mut merged = header_items;
-            // Remove duplicate status from JSON result (already in header_items)
-            let json_items: Vec<InfraItem> = result
-                .items
-                .drain(..)
-                .filter(|i| i.label != "status")
-                .collect();
-            merged.extend(json_items);
-            result.items = merged;
-        }
+    if let Some(mut result) = try_parse_json(body_text.as_ref(), http_status.as_deref()) {
+        merge_header_items(header_items, &mut result);
         return ParseResult::Full(result);
     }
 
@@ -155,16 +146,7 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 
     // Tier 2: regex fallback
     if let Some(mut result) = try_parse_regex(&combined) {
-        if !header_items.is_empty() {
-            let mut merged = header_items;
-            let regex_items: Vec<InfraItem> = result
-                .items
-                .drain(..)
-                .filter(|i| i.label != "status")
-                .collect();
-            merged.extend(regex_items);
-            result.items = merged;
-        }
+        merge_header_items(header_items, &mut result);
         return ParseResult::Degraded(
             result,
             vec!["curl: structured parse failed, using regex".to_string()],
@@ -172,6 +154,53 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     }
 
     ParseResult::Passthrough(combined.into_owned())
+}
+
+/// Prepend `header_items` before `result.items`, deduplicating the `status` label
+/// (the status is already present in `header_items` when `-i` mode is used, so any
+/// duplicate `status` item emitted by the JSON/regex tier is dropped).
+fn merge_header_items(header_items: Vec<InfraItem>, result: &mut InfraResult) {
+    if header_items.is_empty() {
+        return;
+    }
+    let tier_items: Vec<InfraItem> = result
+        .items
+        .drain(..)
+        .filter(|i| i.label != "status")
+        .collect();
+    result.items = header_items;
+    result.items.extend(tier_items);
+}
+
+// ============================================================================
+// Shared header classification logic (6A + 6D)
+// ============================================================================
+
+/// Classify a single response header into an `InfraItem`, updating `set_cookie_count`
+/// for Set-Cookie headers (which are counted rather than emitted verbatim).
+///
+/// Returns:
+/// - `Some(item)` — emit this item into the output list
+/// - `None` — header was counted (Set-Cookie) or silently dropped (unknown)
+fn classify_header(name: &str, value: &str, set_cookie_count: &mut usize) -> Option<InfraItem> {
+    let name_lower = name.to_lowercase();
+
+    if name_lower == AUTH_HEADER {
+        Some(InfraItem {
+            label: name.to_string(),
+            value: "***".to_string(),
+        })
+    } else if name_lower == SET_COOKIE_HEADER {
+        *set_cookie_count += 1;
+        None
+    } else if KEY_HEADERS.contains(&name_lower.as_str()) {
+        Some(InfraItem {
+            label: name.to_string(),
+            value: value.to_string(),
+        })
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -222,20 +251,8 @@ fn try_split_header_body(stdout: &str) -> Option<(Vec<InfraItem>, &str)> {
         if let Some(caps) = RE_HEADER_LINE.captures(line) {
             let name = &caps[1];
             let value = caps[2].trim();
-            let name_lower = name.to_lowercase();
-
-            if name_lower == AUTH_HEADER {
-                items.push(InfraItem {
-                    label: name.to_string(),
-                    value: "***".to_string(),
-                });
-            } else if name_lower == SET_COOKIE_HEADER {
-                set_cookie_count += 1;
-            } else if KEY_HEADERS.contains(&name_lower.as_str()) {
-                items.push(InfraItem {
-                    label: name.to_string(),
-                    value: value.to_string(),
-                });
+            if let Some(item) = classify_header(name, value, &mut set_cookie_count) {
+                items.push(item);
             }
         }
     }
@@ -255,17 +272,38 @@ fn try_split_header_body(stdout: &str) -> Option<(Vec<InfraItem>, &str)> {
 ///
 /// For redirect chains, this skips earlier responses and returns the start
 /// of the final response's headers.
+///
+/// Uses direct byte scanning for `\nHTTP/` and `\r\nHTTP/` substrings rather
+/// than iterating with `str::lines()`. `str::lines()` strips `\r` from `\r\n`
+/// lines, causing the reconstructed byte offset to drift by 1 per CRLF line and
+/// producing incorrect body splits for redirect chains.
 fn find_last_http_response_start(text: &str) -> usize {
     let mut last_pos = 0usize;
-    let mut byte_offset = 0usize;
 
-    for line in text.lines() {
-        let line_trimmed = line.trim_end_matches('\r');
-        if RE_HTTP_STATUS_LINE.is_match(line_trimmed) {
-            last_pos = byte_offset;
-        }
-        byte_offset += line.len() + 1; // +1 for newline
+    // The first line is a candidate if the text opens with HTTP/.
+    if text.starts_with("HTTP/") {
+        last_pos = 0;
     }
+
+    // Scan for \nHTTP/ — works for both \n and \r\n line endings because
+    // the byte immediately after \n is the start of the next line.
+    let needle = b"\nHTTP/";
+    let bytes = text.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = bytes[search_from..].windows(needle.len()).position(|w| w == needle) {
+        let abs = search_from + rel + 1; // +1: skip the leading \n; abs points at 'H'
+        // Match only the first line at this position (regex has $ anchor).
+        let line_end = text[abs..]
+            .find('\n')
+            .map(|i| abs + i)
+            .unwrap_or(text.len());
+        let candidate = text[abs..line_end].trim_end_matches('\r');
+        if RE_HTTP_STATUS_LINE.is_match(candidate) {
+            last_pos = abs;
+        }
+        search_from = abs + 1;
+    }
+
     last_pos
 }
 
@@ -420,20 +458,8 @@ fn extract_verbose_metadata(stderr: &str) -> (Option<String>, Vec<InfraItem>) {
             if let Some(caps) = RE_HEADER_LINE.captures(rest) {
                 let name = &caps[1];
                 let value = caps[2].trim();
-                let name_lower = name.to_lowercase();
-
-                if name_lower == AUTH_HEADER {
-                    header_items.push(InfraItem {
-                        label: name.to_string(),
-                        value: "***".to_string(),
-                    });
-                } else if name_lower == SET_COOKIE_HEADER {
-                    set_cookie_count += 1;
-                } else if KEY_HEADERS.contains(&name_lower.as_str()) {
-                    header_items.push(InfraItem {
-                        label: name.to_string(),
-                        value: value.to_string(),
-                    });
+                if let Some(item) = classify_header(name, value, &mut set_cookie_count) {
+                    header_items.push(item);
                 }
             }
         }
