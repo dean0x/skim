@@ -72,33 +72,56 @@ pub(crate) fn run(
     let git_source = CliGitSource::new();
 
     // Resolve --diff to concrete file list
-    if let Some(base) = config.diff_base.take() {
-        if !git_source.is_git_repo() {
-            eprintln!("not a git repository (or any parent up to mount point /)");
-            return Ok(ExitCode::FAILURE);
-        }
-        match git_source.fetch_diff_files(&base) {
-            Ok(files) if files.is_empty() => {
-                eprintln!("no files changed vs '{base}'");
-                return Ok(ExitCode::FAILURE);
-            }
-            Ok(files) => {
-                // Detect deleted files for annotation
-                for f in &files {
-                    if !std::path::Path::new(f).exists() {
-                        eprintln!("warning: file '{}' deleted on current branch", f);
-                    }
-                }
-                config.files = files;
-            }
-            Err(e) => {
-                eprintln!("skim heatmap: {e}");
-                return Ok(ExitCode::FAILURE);
-            }
-        }
+    if let Some(exit) = resolve_diff_files(&git_source, &mut config)? {
+        return Ok(exit);
     }
 
     run_with_source(&git_source, &config, analytics)
+}
+
+/// Resolve `--diff` to a concrete file list, mutating `config.files`.
+///
+/// Returns `Some(ExitCode::FAILURE)` for any early-exit condition so that `run()`
+/// can propagate it directly. Returns `Ok(None)` when resolution succeeded and the
+/// caller should continue.
+///
+/// Path correctness: git diff output is repo-root-relative, so deleted-file
+/// detection uses [`CliGitSource::get_repo_root`] to build absolute paths rather
+/// than relying on cwd. The `is_git_repo()` guard is intentionally omitted — if
+/// the cwd is not inside a repository, `fetch_diff_files` will return an error
+/// with a clear message, and `prepare_commits` already handles the non-repo case.
+fn resolve_diff_files(
+    git_source: &CliGitSource,
+    config: &mut HeatmapConfig,
+) -> anyhow::Result<Option<ExitCode>> {
+    let base = match config.diff_base.take() {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    match git_source.fetch_diff_files(&base) {
+        Ok(files) if files.is_empty() => {
+            eprintln!("skim heatmap: no files changed vs '{base}'");
+            Ok(Some(ExitCode::FAILURE))
+        }
+        Ok(files) => {
+            // Detect deleted files for annotation. git diff output is repo-root-relative,
+            // so resolve paths against the repo root to avoid cwd-dependent failures.
+            let root = git_source.get_repo_root().unwrap_or_default();
+            for f in &files {
+                let abs = std::path::Path::new(&root).join(f);
+                if !abs.exists() {
+                    eprintln!("skim heatmap: warning: file '{}' deleted on current branch", f);
+                }
+            }
+            config.files = files;
+            Ok(None)
+        }
+        Err(e) => {
+            eprintln!("skim heatmap: {e}");
+            Ok(Some(ExitCode::FAILURE))
+        }
+    }
 }
 
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
@@ -337,10 +360,15 @@ fn apply_file_scope(result: &mut HeatmapResult, files: &[String]) {
         .coupling_graph
         .retain(|e| target_set.contains(e.a.as_str()) || target_set.contains(e.b.as_str()));
 
-    // Filter modules: keep only modules containing targeted files
+    // Filter modules: keep only modules whose top-level directory contains a
+    // targeted file.  Modules use top-level directory names (e.g. "src",
+    // "tests") produced by `extract_top_dir`, so we must extract the first
+    // path component — not the immediate parent — to match correctly.
+    // Using `rsplit_once('/')` would yield the *deepest* parent directory
+    // (e.g. "src/cmd/heatmap") which never matches a module named "src".
     let target_dirs: HashSet<&str> = files
         .iter()
-        .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
+        .filter_map(|f| f.split_once('/').map(|(top, _)| top))
         .collect();
     result
         .modules
@@ -1433,5 +1461,49 @@ mod tests {
         let mut result = make_test_result();
         apply_file_scope(&mut result, &["src/main.rs".to_string()]);
         assert_eq!(result.file_targets, Some(vec!["src/main.rs".to_string()]));
+    }
+
+    /// Regression test for deeply-nested file targets.
+    ///
+    /// When a targeted file lives multiple levels deep (e.g.
+    /// `src/cmd/heatmap/mod.rs`), the module filter must match it against the
+    /// top-level module `"src"` — not the immediate parent `"src/cmd/heatmap"`.
+    /// The previous `rsplit_once('/')` implementation extracted the deepest
+    /// parent directory and would incorrectly drop the `"src"` module.
+    #[test]
+    fn test_apply_file_scope_filters_modules_deeply_nested() {
+        use types::{ChurnMetrics, AuthorMetrics, FixRiskMetrics, FileMetrics, ModuleHealth};
+        let mut result = make_test_result();
+        // Replace the file list with a single deeply-nested path
+        result.files = vec![FileMetrics {
+            path: "src/cmd/heatmap/mod.rs".to_string(),
+            churn: ChurnMetrics { commits: 1, rate: 0.1 },
+            stability_score: 50,
+            authors: AuthorMetrics::default(),
+            fix_risk: FixRiskMetrics::default(),
+            blast_radius: vec![],
+        }];
+        // Add a matching deeply-nested module entry to the modules list
+        result.modules.push(ModuleHealth {
+            path: "src/cmd".to_string(),
+            encapsulation_pct: 70.0,
+            files_count: 1,
+            total_commits: 1,
+            cross_boundary_commits: 0,
+        });
+
+        apply_file_scope(&mut result, &["src/cmd/heatmap/mod.rs".to_string()]);
+
+        // The top-level "src" module must be retained; "tests" must be dropped;
+        // the "src/cmd" entry (not a valid top-level module) must also be dropped.
+        let module_paths: Vec<&str> = result.modules.iter().map(|m| m.path.as_str()).collect();
+        assert!(
+            module_paths.contains(&"src"),
+            "expected 'src' module to be retained for deeply-nested target, got: {module_paths:?}"
+        );
+        assert!(
+            !module_paths.contains(&"tests"),
+            "expected 'tests' module to be dropped, got: {module_paths:?}"
+        );
     }
 }
