@@ -104,7 +104,11 @@ fn resolve_http_status(
         .and_then(|i| {
             // Extract just the code from e.g. "HTTP/1.1 200 OK"
             let code = i.value.split_whitespace().nth(1).unwrap_or("");
-            if code.is_empty() { None } else { Some(code.to_string()) }
+            if code.is_empty() {
+                None
+            } else {
+                Some(code.to_string())
+            }
         })
         .or_else(|| http_status_from_verbose.map(str::to_string))
 }
@@ -298,7 +302,7 @@ fn find_last_http_response_start(text: &str) -> usize {
     let bytes = text.as_bytes();
     for pos in memchr::memmem::find_iter(bytes, b"\nHTTP/") {
         let abs = pos + 1; // +1: skip the leading \n; abs points at 'H'
-        // Match only the first line at this position (regex has $ anchor).
+                           // Match only the first line at this position (regex has $ anchor).
         let line_end = text[abs..]
             .find('\n')
             .map(|i| abs + i)
@@ -848,9 +852,10 @@ mod tests {
 
     #[test]
     fn test_resolve_http_status_prefers_i_headers() {
-        let items = vec![
-            InfraItem { label: "status".to_string(), value: "HTTP/1.1 200 OK".to_string() },
-        ];
+        let items = vec![InfraItem {
+            label: "status".to_string(),
+            value: "HTTP/1.1 200 OK".to_string(),
+        }];
         let result = resolve_http_status(&items, Some("404"));
         assert_eq!(result.as_deref(), Some("200"));
     }
@@ -871,9 +876,10 @@ mod tests {
     #[test]
     fn test_resolve_http_status_i_without_status_item_falls_back() {
         // header_items_from_i is non-empty but contains no "status" label
-        let items = vec![
-            InfraItem { label: "content-type".to_string(), value: "application/json".to_string() },
-        ];
+        let items = vec![InfraItem {
+            label: "content-type".to_string(),
+            value: "application/json".to_string(),
+        }];
         let result = resolve_http_status(&items, Some("302"));
         assert_eq!(result.as_deref(), Some("302"));
     }
@@ -930,8 +936,7 @@ mod tests {
     fn test_header_extraction_redacts_proxy_auth() {
         // Proxy-Authorization carries identical credential material to Authorization
         // and must always be redacted.
-        let input =
-            "HTTP/1.1 200 OK\nProxy-Authorization: Basic dXNlcjpwYXNz\n\n{\"ok\":true}\n";
+        let input = "HTTP/1.1 200 OK\nProxy-Authorization: Basic dXNlcjpwYXNz\n\n{\"ok\":true}\n";
         let result = try_split_header_body(input);
         assert!(result.is_some());
         let (items, _) = result.unwrap();
