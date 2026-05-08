@@ -149,6 +149,34 @@ impl CliGitSource {
 
         args
     }
+
+    /// Resolve files changed between `base` and HEAD using three-dot diff.
+    ///
+    /// Uses `git diff --name-only <base>...HEAD` so that only commits reachable
+    /// from HEAD but not from `base` are included.
+    pub(crate) fn fetch_diff_files(&self, base: &str) -> anyhow::Result<Vec<String>> {
+        let arg = format!("{base}...HEAD");
+        let out = self
+            .runner
+            .run("git", &["diff", "--name-only", &arg])
+            .map_err(git_not_found)?;
+
+        if out.exit_code != Some(0) {
+            let stderr = out.stderr.trim();
+            if stderr.contains("unknown revision") || stderr.contains("bad revision") {
+                anyhow::bail!("base branch '{base}' not found");
+            }
+            anyhow::bail!("git diff failed: {stderr}");
+        }
+
+        Ok(out
+            .stdout
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+            .collect())
+    }
 }
 
 impl GitDataSource for CliGitSource {
