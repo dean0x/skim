@@ -28,6 +28,17 @@ pub(super) struct RewriteRule {
     /// Set true for: file-listing commands (`ls`, `grep`, `find`, `rg`) whose
     /// output is commonly piped to filters.  SEE: AD-RW-2.
     pub(super) exclude_pipe_source: bool,
+    /// When true, skip rewriting if any argument after the prefix contains `=`.
+    ///
+    /// Required for the `env` command: `env LANG=C sort file.txt` uses
+    /// `LANG=C` as a per-invocation env-var assignment passed to `env`, not as
+    /// a shell-level env-var prefix.  The standard `strip_env_vars` stripping
+    /// cannot catch this because `env` itself is the command token — the
+    /// `VAR=val` tokens appear *after* the command, not before it.
+    ///
+    /// Bare `env` (no `=`-containing args) is still rewritten normally.
+    /// Set true only on the `env` rule.
+    pub(super) skip_if_middle_contains_eq: bool,
 }
 
 #[derive(Debug)]
