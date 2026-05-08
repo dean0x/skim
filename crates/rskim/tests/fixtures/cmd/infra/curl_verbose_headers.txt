@@ -1,0 +1,12 @@
+* Connected to api.example.com (93.184.216.34) port 443
+> GET /api/v1/users HTTP/2
+> Host: api.example.com
+> Authorization: Bearer sk-secret-token
+>
+< HTTP/2 200
+< content-type: application/json
+< x-ratelimit-remaining: 42
+< x-ratelimit-limit: 100
+< set-cookie: sid=abc; Path=/
+< set-cookie: token=xyz; Path=/
+<

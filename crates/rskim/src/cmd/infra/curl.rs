@@ -1,4 +1,4 @@
-//! curl parser with three-tier degradation (#116).
+//! curl parser with three-tier degradation and hardened response handling (#116, #169).
 //!
 //! Executes `curl` and parses the output into structured `InfraResult`.
 //!
@@ -6,6 +6,12 @@
 //! - **Tier 1 (Full)**: Detect JSON body in output and parse it
 //! - **Tier 2 (Degraded)**: Strip verbose lines, extract HTTP status
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation
+//!
+//! Hardening additions (#169):
+//! - **6A**: Header extraction for `-i` mode (HTTP/x.x status + response headers)
+//! - **6B**: Error body awareness — 4xx/5xx responses surface error messages first
+//! - **6C**: Write-out format (`-w`) — trailing 3-digit status code stripped from body
+//! - **6D**: Verbose stderr enhancement — extracts response headers from `< header:` lines
 
 use std::sync::LazyLock;
 
@@ -33,12 +39,43 @@ const MAX_ITEMS: usize = 100;
 /// preventing unbounded allocation on pathological or adversarial responses.
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
+// ============================================================================
+// 6D: Verbose stderr regex (existing + new header extraction)
+// ============================================================================
+
 static RE_CURL_HTTP_STATUS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^< HTTP/[\d.]+ (\d{3})\s*(.*)").unwrap());
 
 /// Matches lines that are curl verbose metadata (not response body).
 /// Uses literal space instead of \s so indented body content is preserved.
 static RE_CURL_VERBOSE_LINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[*><{} ]").unwrap());
+
+// ============================================================================
+// 6A: Header extraction for -i mode
+// ============================================================================
+
+/// Matches the HTTP status line (first line in `-i` output).
+static RE_HTTP_STATUS_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^HTTP/[\d.]+ (\d{3})(?:\s+(.*))?$").unwrap());
+
+/// Matches a response header line: `Name: value`.
+static RE_HEADER_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([A-Za-z][\w-]+):\s*(.+)$").unwrap());
+
+/// Key headers to surface when parsing response headers (6A/6D).
+const KEY_HEADERS: &[&str] = &[
+    "content-type",
+    "location",
+    "content-length",
+    "x-ratelimit-remaining",
+    "x-ratelimit-limit",
+];
+
+/// Set-Cookie is counted, not echoed verbatim.
+const SET_COOKIE_HEADER: &str = "set-cookie";
+
+/// Authorization header value is always redacted.
+const AUTH_HEADER: &str = "authorization";
 
 /// Run `skim curl [args...]`.
 pub(crate) fn run(
@@ -51,16 +88,83 @@ pub(crate) fn run(
 
 /// Three-tier parse function for curl output.
 fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
-    // Check stderr for HTTP status (curl -v outputs headers to stderr)
-    let http_status = extract_http_status(&output.stderr);
+    let mut extra_header_items: Vec<InfraItem> = Vec::new();
 
-    if let Some(result) = try_parse_json(&output.stdout, http_status.as_deref()) {
+    // 6D: Check stderr for verbose response headers (curl -v)
+    let (http_status_from_verbose, verbose_header_items) = extract_verbose_metadata(&output.stderr);
+    extra_header_items.extend(verbose_header_items);
+
+    // 6A: Try to split `-i` header/body output
+    let (body_text, header_items_from_i) =
+        if let Some((header_items, body)) = try_split_header_body(&output.stdout) {
+            // Merge http_status_from_verbose only if not already in header items
+            (body.to_string(), header_items)
+        } else {
+            (output.stdout.clone(), Vec::new())
+        };
+
+    // Determine effective HTTP status
+    let http_status = if !header_items_from_i.is_empty() {
+        // Status came from -i headers
+        header_items_from_i
+            .iter()
+            .find(|i| i.label == "status")
+            .map(|i| {
+                // Extract just the code from "HTTP/1.1 200 OK"
+                i.value.split_whitespace().nth(1).unwrap_or("").to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .or_else(|| http_status_from_verbose.clone())
+    } else {
+        http_status_from_verbose.clone()
+    };
+
+    // 6C: Strip write-out trailing status code from body
+    let (body_text, writeout_item) = if let Some((wo, stripped)) = try_extract_writeout(&body_text)
+    {
+        (stripped.to_string(), Some(wo))
+    } else {
+        (body_text, None)
+    };
+
+    // Build initial items from -i headers (if any)
+    let mut header_items: Vec<InfraItem> = header_items_from_i;
+    header_items.extend(extra_header_items);
+    if let Some(wo) = writeout_item {
+        header_items.push(wo);
+    }
+
+    // Tier 1: Try JSON parse
+    if let Some(mut result) = try_parse_json(&body_text, http_status.as_deref()) {
+        // Prepend header items before JSON items
+        if !header_items.is_empty() {
+            let mut merged = header_items;
+            // Remove duplicate status from JSON result (already in header_items)
+            let json_items: Vec<InfraItem> = result
+                .items
+                .drain(..)
+                .filter(|i| i.label != "status")
+                .collect();
+            merged.extend(json_items);
+            result.items = merged;
+        }
         return ParseResult::Full(result);
     }
 
     let combined = combine_stdout_stderr(output);
 
-    if let Some(result) = try_parse_regex(&combined) {
+    // Tier 2: regex fallback
+    if let Some(mut result) = try_parse_regex(&combined) {
+        if !header_items.is_empty() {
+            let mut merged = header_items;
+            let regex_items: Vec<InfraItem> = result
+                .items
+                .drain(..)
+                .filter(|i| i.label != "status")
+                .collect();
+            merged.extend(regex_items);
+            result.items = merged;
+        }
         return ParseResult::Degraded(
             result,
             vec!["curl: structured parse failed, using regex".to_string()],
@@ -68,6 +172,283 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     }
 
     ParseResult::Passthrough(combined.into_owned())
+}
+
+// ============================================================================
+// 6A: Header extraction for -i / -iL mode
+// ============================================================================
+
+/// Split `-i` style output into (header_items, body_text).
+///
+/// For redirect chains (`-iL`), only the LAST HTTP response's headers are used.
+/// Returns `None` if the output does not start with an HTTP status line.
+fn try_split_header_body(stdout: &str) -> Option<(Vec<InfraItem>, &str)> {
+    // Must start with an HTTP status line
+    let first_line = stdout.lines().next()?.trim();
+    if !RE_HTTP_STATUS_LINE.is_match(first_line) {
+        return None;
+    }
+
+    // For redirect chains, find the LAST HTTP/ status line and use that response.
+    // We split on blank lines; each blank line separates header block from body.
+    // Multiple `HTTP/` lines indicate a redirect chain.
+    let last_http_pos = find_last_http_response_start(stdout);
+    let from = &stdout[last_http_pos..];
+
+    // Split at first blank line (handles \r\n and \n)
+    let body_start = find_body_start(from)?;
+    let headers_section = &from[..body_start.0];
+    let body_text = &from[body_start.1..]; // skip the blank line itself
+
+    let mut items: Vec<InfraItem> = Vec::new();
+    let mut set_cookie_count = 0usize;
+
+    for line in headers_section.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // HTTP status line
+        if let Some(caps) = RE_HTTP_STATUS_LINE.captures(line) {
+            let code = &caps[1];
+            let reason = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("").trim();
+            let status_value = if reason.is_empty() {
+                // Try to reconstruct: HTTP/version code reason
+                line.to_string()
+            } else {
+                line.to_string()
+            };
+            items.push(InfraItem {
+                label: "status".to_string(),
+                value: status_value,
+            });
+            let _ = code; // used for status composition above
+            continue;
+        }
+
+        // Regular header line
+        if let Some(caps) = RE_HEADER_LINE.captures(line) {
+            let name = &caps[1];
+            let value = caps[2].trim();
+            let name_lower = name.to_lowercase();
+
+            if name_lower == AUTH_HEADER {
+                items.push(InfraItem {
+                    label: name.to_string(),
+                    value: "***".to_string(),
+                });
+            } else if name_lower == SET_COOKIE_HEADER {
+                set_cookie_count += 1;
+            } else if KEY_HEADERS.contains(&name_lower.as_str()) {
+                items.push(InfraItem {
+                    label: name.to_string(),
+                    value: value.to_string(),
+                });
+            }
+        }
+    }
+
+    // Add Set-Cookie count if any cookies were present
+    if set_cookie_count > 0 {
+        items.push(InfraItem {
+            label: "Set-Cookie".to_string(),
+            value: format!("({set_cookie_count} values)"),
+        });
+    }
+
+    Some((items, body_text))
+}
+
+/// Find the byte offset of the last `HTTP/` status line in `text`.
+///
+/// For redirect chains, this skips earlier responses and returns the start
+/// of the final response's headers.
+fn find_last_http_response_start(text: &str) -> usize {
+    let mut last_pos = 0usize;
+    let mut byte_offset = 0usize;
+
+    for line in text.lines() {
+        let line_trimmed = line.trim_end_matches('\r');
+        if RE_HTTP_STATUS_LINE.is_match(line_trimmed) {
+            last_pos = byte_offset;
+        }
+        byte_offset += line.len() + 1; // +1 for newline
+    }
+    last_pos
+}
+
+/// Find the byte range of the first blank line in `text`.
+///
+/// Returns `Some((blank_start, body_start))` where:
+/// - `blank_start` is where the blank line begins
+/// - `body_start` is where the body text begins (after the blank line)
+///
+/// Handles both `\n\n` and `\r\n\r\n`.
+fn find_body_start(text: &str) -> Option<(usize, usize)> {
+    // Look for \r\n\r\n first (HTTP/1.1 style)
+    if let Some(pos) = text.find("\r\n\r\n") {
+        return Some((pos, pos + 4));
+    }
+    // Fall back to \n\n
+    if let Some(pos) = text.find("\n\n") {
+        return Some((pos, pos + 2));
+    }
+    None
+}
+
+// ============================================================================
+// 6B: Error message extraction for 4xx/5xx responses
+// ============================================================================
+
+/// Extract a human-readable error message from a JSON error response.
+///
+/// Priority order:
+/// 1. `json["error"]["message"]` (nested object)
+/// 2. `json["error"]` (if string)
+/// 3. `json["message"]`
+/// 4. `json["detail"]`
+/// 5. `json["errors"]` (if array — reports count)
+/// 6. `json["error_description"]`
+fn extract_error_message(json: &Value) -> Option<String> {
+    // 1. Nested error object with message field
+    if let Some(err_obj) = json.get("error").and_then(|e| e.as_object()) {
+        if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+            return Some(truncate_message(msg));
+        }
+    }
+
+    // 2. error as string
+    if let Some(err_str) = json.get("error").and_then(|e| e.as_str()) {
+        return Some(truncate_message(err_str));
+    }
+
+    // 3. message field
+    if let Some(msg) = json.get("message").and_then(|m| m.as_str()) {
+        return Some(truncate_message(msg));
+    }
+
+    // 4. detail field
+    if let Some(detail) = json.get("detail").and_then(|d| d.as_str()) {
+        return Some(truncate_message(detail));
+    }
+
+    // 5. errors array — report count
+    if let Some(errs) = json.get("errors").and_then(|e| e.as_array()) {
+        return Some(format!("{} errors", errs.len()));
+    }
+
+    // 6. error_description
+    if let Some(desc) = json.get("error_description").and_then(|d| d.as_str()) {
+        return Some(truncate_message(desc));
+    }
+
+    None
+}
+
+fn truncate_message(msg: &str) -> String {
+    if msg.len() > 200 {
+        format!("{}...", &msg[..200])
+    } else {
+        msg.to_string()
+    }
+}
+
+// ============================================================================
+// 6C: Write-out format detection
+// ============================================================================
+
+/// Check if the last non-empty line of `text` is a bare 3-digit HTTP status code.
+///
+/// If so, returns `(InfraItem { label: "write_out", value: code }, rest_of_text)`.
+fn try_extract_writeout(text: &str) -> Option<(InfraItem, &str)> {
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Find the last non-empty line
+    let last_newline = trimmed.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let last_line = trimmed[last_newline..].trim();
+
+    // Check if it's a bare 3-digit number
+    if last_line.len() == 3 && last_line.chars().all(|c| c.is_ascii_digit()) {
+        let body_end = trimmed[..last_newline].trim_end().len();
+        // Body is everything before the last line, trimmed
+        let body = &text[..body_end];
+        let item = InfraItem {
+            label: "write_out".to_string(),
+            value: last_line.to_string(),
+        };
+        return Some((item, body));
+    }
+
+    None
+}
+
+// ============================================================================
+// 6D: Verbose stderr header extraction (replaces extract_http_status)
+// ============================================================================
+
+/// Extract HTTP status and key response headers from curl verbose stderr output.
+///
+/// Lines matching `^< HTTP/` give the status.
+/// Lines matching `^< Header: value` give response headers.
+///
+/// Returns `(http_status, header_items)`.
+fn extract_verbose_metadata(stderr: &str) -> (Option<String>, Vec<InfraItem>) {
+    let mut http_status: Option<String> = None;
+    let mut header_items: Vec<InfraItem> = Vec::new();
+    let mut set_cookie_count = 0usize;
+
+    for line in stderr.lines() {
+        // HTTP status line: `< HTTP/2 200` or `< HTTP/1.1 200 OK`
+        if let Some(caps) = RE_CURL_HTTP_STATUS.captures(line) {
+            let code = &caps[1];
+            let reason = caps[2].trim();
+            http_status = Some(if reason.is_empty() {
+                code.to_string()
+            } else {
+                format!("{code} {reason}")
+            });
+            // Reset headers for each new HTTP response (redirect chains)
+            header_items.clear();
+            set_cookie_count = 0;
+            continue;
+        }
+
+        // Response header lines: `< Header-Name: value`
+        if let Some(rest) = line.strip_prefix("< ") {
+            if let Some(caps) = RE_HEADER_LINE.captures(rest) {
+                let name = &caps[1];
+                let value = caps[2].trim();
+                let name_lower = name.to_lowercase();
+
+                if name_lower == AUTH_HEADER {
+                    header_items.push(InfraItem {
+                        label: name.to_string(),
+                        value: "***".to_string(),
+                    });
+                } else if name_lower == SET_COOKIE_HEADER {
+                    set_cookie_count += 1;
+                } else if KEY_HEADERS.contains(&name_lower.as_str()) {
+                    header_items.push(InfraItem {
+                        label: name.to_string(),
+                        value: value.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    if set_cookie_count > 0 {
+        header_items.push(InfraItem {
+            label: "Set-Cookie".to_string(),
+            value: format!("({set_cookie_count} values)"),
+        });
+    }
+
+    (http_status, header_items)
 }
 
 // ============================================================================
@@ -127,6 +508,9 @@ fn json_value_to_string(val: &Value) -> String {
 }
 
 /// Parse JSON body from curl response and summarize (slim dispatcher).
+///
+/// 6B: When http_status indicates 4xx/5xx, extract the error message and
+/// use it as the summary.
 fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -146,6 +530,11 @@ fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult
         });
     }
 
+    // 6B: error awareness for 4xx/5xx
+    let is_error = http_status
+        .map(|s| s.starts_with('4') || s.starts_with('5'))
+        .unwrap_or(false);
+
     let summary_str = match &json_val {
         Value::Array(arr) => {
             let (summary, extra) = summarize_json_array(arr);
@@ -160,6 +549,12 @@ fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult
             summary
         }
         Value::Object(map) => {
+            let error_msg = if is_error {
+                extract_error_message(&json_val)
+            } else {
+                None
+            };
+
             let (summary, extra) = summarize_json_object(map);
             items.extend(extra);
             // Truncation notice when source object exceeds MAX_OBJECT_KEYS
@@ -169,7 +564,14 @@ fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult
                     value: format!("showing {MAX_OBJECT_KEYS} of {} keys", map.len()),
                 });
             }
-            summary
+
+            // 6B: override summary with error message for error responses
+            if let Some(err) = error_msg {
+                let status_prefix = http_status.unwrap_or("ERROR");
+                format!("ERROR {status_prefix}: {err}")
+            } else {
+                summary
+            }
         }
         _ => return None,
     };
@@ -185,22 +587,6 @@ fn try_parse_json(stdout: &str, http_status: Option<&str>) -> Option<InfraResult
 // ============================================================================
 // Tier 2: verbose output fallback
 // ============================================================================
-
-/// Extract HTTP status line from curl verbose stderr output.
-fn extract_http_status(stderr: &str) -> Option<String> {
-    for line in stderr.lines() {
-        if let Some(caps) = RE_CURL_HTTP_STATUS.captures(line) {
-            let code = &caps[1];
-            let reason = caps[2].trim();
-            return Some(if reason.is_empty() {
-                code.to_string()
-            } else {
-                format!("{code} {reason}")
-            });
-        }
-    }
-    None
-}
 
 /// Parse curl verbose output by extracting non-verbose lines.
 fn try_parse_regex(text: &str) -> Option<InfraResult> {
@@ -264,6 +650,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
     }
 
+    fn make_output(stdout: &str, stderr: &str, exit_code: i32) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: Some(exit_code),
+            duration: std::time::Duration::ZERO,
+        }
+    }
+
+    // ---- Pre-existing tests (must remain passing) ----
+
     #[test]
     fn test_tier1_curl_json_response() {
         let input = load_fixture("curl_json_response.txt");
@@ -291,12 +688,7 @@ mod tests {
     #[test]
     fn test_parse_impl_produces_full() {
         let input = load_fixture("curl_json_response.txt");
-        let output = CommandOutput {
-            stdout: input,
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(&input, "", 0);
         let result = parse_impl(&output);
         assert!(
             result.is_full(),
@@ -307,14 +699,7 @@ mod tests {
 
     #[test]
     fn test_parse_impl_garbage_produces_passthrough() {
-        // Output with no JSON and no HTTP status lines falls through to passthrough
-        // (empty stdout, empty stderr, non-zero exit)
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(7),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output("", "", 7);
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -326,7 +711,6 @@ mod tests {
     #[test]
     fn test_tier2_preserves_indented_body_content() {
         // Regression: RE_CURL_VERBOSE_LINE must not drop tab-indented lines.
-        // \s was incorrectly filtering indented body content in Tier 2.
         let text = "< HTTP/1.1 200 OK\n<\n\t<html>\n\t<body>hello</body>\n";
         let result = try_parse_regex(text);
         let result = result.unwrap();
@@ -344,7 +728,6 @@ mod tests {
 
     #[test]
     fn test_tier1_max_items_cap() {
-        // Build a JSON object with more than MAX_ITEMS fields to verify truncation.
         let fields: String = (0..200)
             .map(|i| format!("\"key{i}\": \"val{i}\""))
             .collect::<Vec<_>>()
@@ -390,16 +773,11 @@ mod tests {
 
     #[test]
     fn test_parse_impl_text_produces_degraded() {
-        // Tier 2 input: curl verbose output with HTTP status in stderr and no JSON
-        // in stdout. The `< HTTP/...` line triggers try_parse_verbose (Tier 2) but
-        // try_parse_json_body returns None because stdout is not valid JSON.
-        let output = CommandOutput {
-            stdout: String::new(),
-            stderr: "* Connected to api.example.com\n> GET / HTTP/1.1\n< HTTP/1.1 200 OK\n<\n"
-                .to_string(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        };
+        let output = make_output(
+            "",
+            "* Connected to api.example.com\n> GET / HTTP/1.1\n< HTTP/1.1 200 OK\n<\n",
+            0,
+        );
         let result = parse_impl(&output);
         assert!(
             result.is_degraded(),
@@ -408,7 +786,6 @@ mod tests {
         );
     }
 
-    /// Object with 6 keys must show all 6 keys (cap raised from 5 to MAX_OBJECT_KEYS).
     #[test]
     fn test_summarize_json_object_shows_up_to_max_keys() {
         let json: serde_json::Value =
@@ -423,7 +800,6 @@ mod tests {
         );
     }
 
-    /// Object with more than MAX_OBJECT_KEYS fields must produce a truncated notice.
     #[test]
     fn test_summarize_json_object_truncation_notice() {
         let fields: String = (0..=MAX_OBJECT_KEYS)
@@ -436,6 +812,220 @@ mod tests {
             result.items.iter().any(|i| i.label == "truncated"),
             "Must produce truncated notice for >{MAX_OBJECT_KEYS} keys: {:?}",
             result.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- 6A: Header extraction tests ----
+
+    #[test]
+    fn test_header_extraction_i_mode() {
+        let input = load_fixture("curl_headers_body.txt");
+        let result = try_split_header_body(&input);
+        assert!(result.is_some(), "Expected header/body split to succeed");
+        let (items, body) = result.unwrap();
+        assert!(
+            items.iter().any(|i| i.label == "status"),
+            "Should have status item"
+        );
+        assert!(
+            items.iter().any(|i| i.label == "Content-Type"),
+            "Should have Content-Type item"
+        );
+        assert!(
+            body.trim().starts_with('{'),
+            "Body should be the JSON part, got: {body}"
+        );
+    }
+
+    #[test]
+    fn test_header_extraction_http2() {
+        // HTTP/2 status line (no reason phrase)
+        let input = "HTTP/2 200\ncontent-type: application/json\n\n{\"ok\":true}\n";
+        let result = try_split_header_body(input);
+        assert!(result.is_some(), "HTTP/2 status should be recognized");
+        let (items, _body) = result.unwrap();
+        assert!(items.iter().any(|i| i.label == "status"));
+    }
+
+    #[test]
+    fn test_header_extraction_redacts_auth() {
+        let input = "HTTP/1.1 200 OK\nAuthorization: Bearer secret-token\n\n{\"ok\":true}\n";
+        let result = try_split_header_body(input);
+        assert!(result.is_some());
+        let (items, _) = result.unwrap();
+        let auth = items.iter().find(|i| i.label == "Authorization");
+        // Note: Authorization is a response header (unusual but possible)
+        if let Some(auth_item) = auth {
+            assert_eq!(
+                auth_item.value, "***",
+                "Authorization value should be redacted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_header_extraction_set_cookie_count() {
+        let input = load_fixture("curl_headers_body.txt");
+        let (items, _) = try_split_header_body(&input).unwrap();
+        let cookie = items.iter().find(|i| i.label == "Set-Cookie");
+        assert!(cookie.is_some(), "Set-Cookie should be counted");
+        let val = &cookie.unwrap().value;
+        assert!(
+            val.contains("2"),
+            "There are 2 Set-Cookie headers in the fixture, got: {val}"
+        );
+    }
+
+    #[test]
+    fn test_redirect_chain_takes_last() {
+        let input = load_fixture("curl_redirect_chain.txt");
+        let result = try_split_header_body(&input);
+        assert!(result.is_some(), "Redirect chain should parse");
+        let (items, body) = result.unwrap();
+        // Should take the LAST HTTP response (200 OK)
+        let status = items.iter().find(|i| i.label == "status").unwrap();
+        assert!(
+            status.value.contains("200"),
+            "Should use last response status (200), got: {}",
+            status.value
+        );
+        assert!(
+            body.trim().contains('{'),
+            "Body should be from the 200 response"
+        );
+    }
+
+    // ---- 6B: Error body awareness tests ----
+
+    #[test]
+    fn test_tier1_curl_error_4xx_json() {
+        let input = load_fixture("curl_error_4xx.txt");
+        // Parse with 404 status
+        let result = try_parse_json(&input, Some("404"));
+        assert!(result.is_some(), "Should parse 4xx JSON response");
+        let result = result.unwrap();
+        // Summary should be error-oriented
+        assert!(
+            result.summary.contains("ERROR"),
+            "4xx summary should contain ERROR, got: {}",
+            result.summary
+        );
+    }
+
+    #[test]
+    fn test_tier1_curl_error_5xx_json() {
+        let input = load_fixture("curl_error_5xx.txt");
+        let result = try_parse_json(&input, Some("500"));
+        assert!(result.is_some(), "Should parse 5xx JSON response");
+        let result = result.unwrap();
+        assert!(
+            result.summary.contains("ERROR"),
+            "5xx summary should contain ERROR, got: {}",
+            result.summary
+        );
+    }
+
+    #[test]
+    fn test_error_message_extraction_priority() {
+        // Priority 1: error.message (nested)
+        let j1: Value =
+            serde_json::from_str(r#"{"error":{"message":"nested msg","code":404}}"#).unwrap();
+        assert_eq!(extract_error_message(&j1).unwrap(), "nested msg");
+
+        // Priority 2: error as string (when error is not an object)
+        let j2: Value = serde_json::from_str(r#"{"error":"simple error"}"#).unwrap();
+        assert_eq!(extract_error_message(&j2).unwrap(), "simple error");
+
+        // Priority 3: message
+        let j3: Value = serde_json::from_str(r#"{"message":"top-level msg"}"#).unwrap();
+        assert_eq!(extract_error_message(&j3).unwrap(), "top-level msg");
+
+        // Priority 4: detail
+        let j4: Value = serde_json::from_str(r#"{"detail":"detail msg"}"#).unwrap();
+        assert_eq!(extract_error_message(&j4).unwrap(), "detail msg");
+
+        // Priority 5: errors array count
+        let j5: Value = serde_json::from_str(r#"{"errors":["a","b","c"]}"#).unwrap();
+        assert_eq!(extract_error_message(&j5).unwrap(), "3 errors");
+
+        // Priority 6: error_description
+        let j6: Value = serde_json::from_str(r#"{"error_description":"oauth error"}"#).unwrap();
+        assert_eq!(extract_error_message(&j6).unwrap(), "oauth error");
+    }
+
+    // ---- 6C: Write-out tests ----
+
+    #[test]
+    fn test_writeout_extraction() {
+        let input = load_fixture("curl_writeout.txt");
+        let result = try_extract_writeout(&input);
+        assert!(result.is_some(), "Should detect write-out status code");
+        let (item, body) = result.unwrap();
+        assert_eq!(item.label, "write_out");
+        assert_eq!(item.value, "200");
+        assert!(
+            body.trim().contains('{'),
+            "Body should be the JSON part, got: {body}"
+        );
+    }
+
+    // ---- 6D: Verbose stderr tests ----
+
+    #[test]
+    fn test_verbose_response_headers() {
+        let stderr = load_fixture("curl_verbose_headers.txt");
+        let (status, items) = extract_verbose_metadata(&stderr);
+        assert!(
+            status.is_some(),
+            "Should extract HTTP status from verbose output"
+        );
+        assert!(
+            status.as_deref().unwrap().contains("200"),
+            "Status should be 200, got: {:?}",
+            status
+        );
+        assert!(
+            items.iter().any(|i| i.label == "content-type"),
+            "Should extract content-type header"
+        );
+        // set-cookie should be counted
+        let cookie = items.iter().find(|i| i.label == "Set-Cookie");
+        assert!(cookie.is_some(), "Set-Cookie should be counted");
+        let val = &cookie.unwrap().value;
+        assert!(val.contains("2"), "There are 2 set-cookie headers");
+    }
+
+    // ---- Additional coverage ----
+
+    #[test]
+    fn test_tier1_curl_json_array() {
+        let input = load_fixture("curl_json_array.txt");
+        let result = try_parse_json(&input, None);
+        assert!(result.is_some(), "Should parse JSON array response");
+        let result = result.unwrap();
+        assert!(
+            result.summary.contains("array"),
+            "Summary should mention array, got: {}",
+            result.summary
+        );
+        assert!(
+            result.items.iter().any(|i| i.label == "count"),
+            "Should have count item for array"
+        );
+    }
+
+    #[test]
+    fn test_html_body_falls_to_tier2() {
+        let input = load_fixture("curl_html_response.txt");
+        let output = make_output(&input, "", 0);
+        let result = parse_impl(&output);
+        // HTML is not valid JSON, so Tier 1 fails.
+        // try_parse_regex would find no HTTP status lines either, so falls to passthrough.
+        // Either Degraded or Passthrough is acceptable for HTML input.
+        assert!(
+            !result.is_full(),
+            "HTML body should not produce Full JSON result, got {}",
+            result.tier_name()
         );
     }
 }

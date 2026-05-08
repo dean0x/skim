@@ -1,0 +1,1 @@
+{"error":"not_found","message":"Resource does not exist","detail":"ID 12345 was not found in the database"}
