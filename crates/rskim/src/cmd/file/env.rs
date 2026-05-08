@@ -11,7 +11,8 @@
 //!
 //! Keys are redacted when:
 //! - Key ends with `_TOKEN`, `_SECRET`, `_PASSWORD`, `_API_KEY`, `_SECRET_KEY`,
-//!   `_PRIVATE_KEY`, `_CREDENTIAL`, or `_AUTH` (case-insensitive)
+//!   `_PRIVATE_KEY`, `_ENCRYPTION_KEY`, `_SIGNING_KEY`, `_ACCESS_KEY`, `_HMAC_KEY`,
+//!   `_CREDENTIAL`, or `_AUTH` (case-insensitive)
 //! - Key matches the exact sensitive-key set (AWS_ACCESS_KEY_ID, GITHUB_TOKEN, etc.)
 //!
 //! URL credentials (scheme://user:pass@host) are replaced with `***:***` in values.
@@ -53,11 +54,12 @@ const SENSITIVE_EXACT: &[&str] = &[
     "SENDGRID_API_KEY",
 ];
 
-/// Key suffixes (uppercase) that indicate sensitive values.
+/// Key suffixes that indicate sensitive values (stored uppercase, matched case-insensitively).
 ///
 /// `_KEY` was removed to avoid false positives on non-secret identifiers such as
 /// `REGISTRY_KEY`, `PRIMARY_KEY`, and `SORT_KEY`. Specific compound suffixes
-/// (`_API_KEY`, `_SECRET_KEY`, `_PRIVATE_KEY`) are used instead.
+/// (`_API_KEY`, `_SECRET_KEY`, `_PRIVATE_KEY`, `_ENCRYPTION_KEY`, `_SIGNING_KEY`,
+/// `_ACCESS_KEY`, `_HMAC_KEY`) are used instead to cover real crypto/signing secrets.
 const SENSITIVE_SUFFIXES: &[&str] = &[
     "_TOKEN",
     "_SECRET",
@@ -65,6 +67,10 @@ const SENSITIVE_SUFFIXES: &[&str] = &[
     "_API_KEY",
     "_SECRET_KEY",
     "_PRIVATE_KEY",
+    "_ENCRYPTION_KEY",
+    "_SIGNING_KEY",
+    "_ACCESS_KEY",
+    "_HMAC_KEY",
     "_CREDENTIAL",
     "_AUTH",
 ];
@@ -159,10 +165,14 @@ fn is_sensitive_key(key: &str) -> bool {
         return true;
     }
 
-    // Suffix check — zero allocation: compare trailing slice case-insensitively
+    // Suffix check — zero allocation: compare trailing slice case-insensitively.
+    // Guard with `is_char_boundary` before byte-slicing to avoid a panic when
+    // `key.len() - suffix.len()` falls mid-UTF-8 codepoint (non-ASCII env keys).
     SENSITIVE_SUFFIXES.iter().any(|suffix| {
+        let offset = key.len().wrapping_sub(suffix.len());
         key.len() >= suffix.len()
-            && key[key.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+            && key.is_char_boundary(offset)
+            && key[offset..].eq_ignore_ascii_case(suffix)
     })
 }
 
@@ -369,6 +379,53 @@ mod tests {
             result.entries[0], "github_token=***",
             "Lowercase github_token should still be redacted"
         );
+    }
+
+    #[test]
+    fn test_case_insensitive_suffix_match() {
+        // Verifies the suffix path (not the exact-match path) works case-insensitively.
+        // "my_app_password" is not in SENSITIVE_EXACT, so it must be caught by the
+        // suffix "_PASSWORD" even though the key is entirely lowercase.
+        let input = "my_app_password=hunter2\n";
+        let result = try_parse_env(input).unwrap();
+        assert_eq!(
+            result.entries[0], "my_app_password=***",
+            "Lowercase suffix _password should be redacted via case-insensitive suffix match"
+        );
+    }
+
+    #[test]
+    fn test_no_panic_on_non_ascii_key() {
+        // Non-ASCII env key: byte length of the key may not align with suffix byte
+        // boundaries, which previously caused a panic in byte-slice indexing.
+        // "clé_TOKEN" — "clé" contains a 2-byte UTF-8 sequence (é = U+00E9).
+        let input = "cl\u{00e9}_TOKEN=secret\n";
+        let result = try_parse_env(input).unwrap();
+        assert_eq!(
+            result.entries[0], "cl\u{00e9}_TOKEN=***",
+            "Non-ASCII key ending with _TOKEN should be redacted without panic"
+        );
+    }
+
+    #[test]
+    fn test_redacts_new_compound_key_suffixes() {
+        // Verify the four compound suffixes added for crypto/signing secrets.
+        // These are PREFIXED keys ending with the compound suffix, e.g. APP_ENCRYPTION_KEY.
+        // Bare names like ENCRYPTION_KEY (no prefix) would need to be in SENSITIVE_EXACT.
+        let cases = [
+            ("APP_ENCRYPTION_KEY=enc-val", "APP_ENCRYPTION_KEY=***"),
+            ("SERVICE_SIGNING_KEY=sign-val", "SERVICE_SIGNING_KEY=***"),
+            ("AWS_ACCESS_KEY=access-val", "AWS_ACCESS_KEY=***"),
+            ("APP_HMAC_KEY=hmac-val", "APP_HMAC_KEY=***"),
+        ];
+        for (input_line, expected) in &cases {
+            let result = try_parse_env(&format!("{input_line}\n")).unwrap();
+            assert_eq!(
+                result.entries[0], *expected,
+                "Expected {expected}, got {}",
+                result.entries[0]
+            );
+        }
     }
 
     #[test]
