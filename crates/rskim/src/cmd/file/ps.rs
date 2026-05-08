@@ -113,8 +113,7 @@ mod tests {
 
     fn make_large_ps() -> String {
         let mut lines = vec![
-            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND"
-                .to_string(),
+            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND".to_string(),
         ];
         for i in 1..=160 {
             lines.push(format!(

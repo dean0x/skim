@@ -339,7 +339,14 @@ fn extract_error_message(json: &Value) -> Option<String> {
 
 fn truncate_message(msg: &str) -> String {
     if msg.len() > 200 {
-        format!("{}...", &msg[..200])
+        // Find a char boundary at or before byte 200 to avoid panicking on multi-byte UTF-8.
+        let end = msg
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= 200)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &msg[..end])
     } else {
         msg.to_string()
     }

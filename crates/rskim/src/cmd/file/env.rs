@@ -35,9 +35,8 @@ const CONFIG: FileToolConfig<'static> = FileToolConfig {
 };
 
 /// Regex to detect and redact URL credentials: scheme://user:pass@host
-static RE_URL_CREDS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(://)[^:@/]+:[^@/]+(@)").unwrap()
-});
+static RE_URL_CREDS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(://)[^:@/]+:[^@/]+(@)").unwrap());
 
 /// Exact set of well-known sensitive key names (uppercase).
 const SENSITIVE_EXACT: &[&str] = &[
@@ -151,7 +150,9 @@ fn is_sensitive_key(key: &str) -> bool {
     }
 
     // Suffix check
-    SENSITIVE_SUFFIXES.iter().any(|suffix| upper.ends_with(suffix))
+    SENSITIVE_SUFFIXES
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
 }
 
 /// Replace `scheme://user:pass@host` credentials with `***:***`.
@@ -267,7 +268,10 @@ mod tests {
             .iter()
             .find(|e| e.starts_with("DATABASE_URL="))
             .expect("DATABASE_URL should be present");
-        assert_eq!(db_entry, "DATABASE_URL=***", "DATABASE_URL exact match redacts entirely");
+        assert_eq!(
+            db_entry, "DATABASE_URL=***",
+            "DATABASE_URL exact match redacts entirely"
+        );
 
         // REDIS_URL has URL credentials → partial redaction
         let redis_entry = result
