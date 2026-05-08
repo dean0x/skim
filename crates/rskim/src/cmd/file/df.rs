@@ -159,4 +159,48 @@ mod tests {
             result.tier_name()
         );
     }
+
+    #[test]
+    fn test_tier1_df_truncates_large() {
+        // Build a df output with 150+ filesystem lines, exceeding MAX_DISPLAY_ENTRIES (100).
+        let mut lines = String::new();
+        lines.push_str("Filesystem     1K-blocks      Used Available Use% Mounted on\n");
+        for i in 0..=MAX_DISPLAY_ENTRIES {
+            lines.push_str(&format!(
+                "/dev/sd{i}     103081248  45234120  52583660  47% /mnt/disk{i}\n"
+            ));
+        }
+        let result = try_parse_df(&lines).unwrap();
+        // More than MAX_DISPLAY_ENTRIES filesystem lines were fed in.
+        assert!(
+            result.total_count > MAX_DISPLAY_ENTRIES,
+            "total_count should exceed MAX_DISPLAY_ENTRIES"
+        );
+        // shown_count is the number of data rows actually stored in entries (excluding header).
+        assert_eq!(
+            result.shown_count, MAX_DISPLAY_ENTRIES,
+            "shown_count should be capped at MAX_DISPLAY_ENTRIES"
+        );
+        assert!(
+            result.footer.is_some(),
+            "A footer indicating truncation should be present"
+        );
+        let footer = result.footer.as_ref().unwrap();
+        assert!(
+            footer.contains("more"),
+            "Footer should mention the omitted count, got: {footer}"
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_produces_full() {
+        let input = load_fixture("df_basic.txt");
+        let output = make_output(&input, 0);
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "parse_impl with exit code 0 and valid df output should return Full, got {}",
+            result.tier_name()
+        );
+    }
 }

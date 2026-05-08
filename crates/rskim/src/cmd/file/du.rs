@@ -173,4 +173,16 @@ mod tests {
             result.tier_name()
         );
     }
+
+    #[test]
+    fn test_parse_impl_produces_full() {
+        let input = load_fixture("du_small.txt");
+        let output = make_output(&input, 0);
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "parse_impl with exit code 0 and valid du output should return Full, got {}",
+            result.tier_name()
+        );
+    }
 }
