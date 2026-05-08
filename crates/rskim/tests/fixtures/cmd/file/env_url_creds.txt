@@ -1,0 +1,6 @@
+DATABASE_URL=postgres://myuser:mypassword@db.example.com:5432/production
+REDIS_URL=redis://default:redis_pass123@redis.example.com:6379
+MONGODB_URI=mongodb://admin:mongoPass@mongo.example.com:27017/mydb
+AMQP_URL=amqp://guest:guest@rabbitmq.example.com:5672
+SAFE_URL=https://example.com/api/v1
+NO_CREDS_URL=redis://redis.example.com:6379

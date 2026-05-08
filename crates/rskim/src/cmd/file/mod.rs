@@ -5,6 +5,7 @@
 
 pub(crate) mod df;
 pub(crate) mod du;
+pub(crate) mod env;
 pub(crate) mod find;
 pub(crate) mod grep;
 pub(crate) mod ls;
