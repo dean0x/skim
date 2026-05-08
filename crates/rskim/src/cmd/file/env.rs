@@ -10,8 +10,8 @@
 //! # Redaction rules
 //!
 //! Keys are redacted when:
-//! - Key (uppercased) ends with `_TOKEN`, `_SECRET`, `_PASSWORD`, `_KEY`,
-//!   `_CREDENTIAL`, or `_AUTH`
+//! - Key ends with `_TOKEN`, `_SECRET`, `_PASSWORD`, `_API_KEY`, `_SECRET_KEY`,
+//!   `_PRIVATE_KEY`, `_CREDENTIAL`, or `_AUTH` (case-insensitive)
 //! - Key matches the exact sensitive-key set (AWS_ACCESS_KEY_ID, GITHUB_TOKEN, etc.)
 //!
 //! URL credentials (scheme://user:pass@host) are replaced with `***:***` in values.
@@ -54,11 +54,17 @@ const SENSITIVE_EXACT: &[&str] = &[
 ];
 
 /// Key suffixes (uppercase) that indicate sensitive values.
+///
+/// `_KEY` was removed to avoid false positives on non-secret identifiers such as
+/// `REGISTRY_KEY`, `PRIMARY_KEY`, and `SORT_KEY`. Specific compound suffixes
+/// (`_API_KEY`, `_SECRET_KEY`, `_PRIVATE_KEY`) are used instead.
 const SENSITIVE_SUFFIXES: &[&str] = &[
     "_TOKEN",
     "_SECRET",
     "_PASSWORD",
-    "_KEY",
+    "_API_KEY",
+    "_SECRET_KEY",
+    "_PRIVATE_KEY",
     "_CREDENTIAL",
     "_AUTH",
 ];
@@ -141,18 +147,23 @@ fn try_parse_env(stdout: &str) -> Option<FileResult> {
 }
 
 /// Return true if the key should have its value redacted.
+///
+/// Uses `eq_ignore_ascii_case` throughout to avoid `to_uppercase()` heap allocations
+/// on every env variable (issue 3d).
 fn is_sensitive_key(key: &str) -> bool {
-    let upper = key.to_uppercase();
-
-    // Exact match check
-    if SENSITIVE_EXACT.contains(&upper.as_str()) {
+    // Exact match check — zero allocation
+    if SENSITIVE_EXACT
+        .iter()
+        .any(|exact| key.eq_ignore_ascii_case(exact))
+    {
         return true;
     }
 
-    // Suffix check
-    SENSITIVE_SUFFIXES
-        .iter()
-        .any(|suffix| upper.ends_with(suffix))
+    // Suffix check — zero allocation: compare trailing slice case-insensitively
+    SENSITIVE_SUFFIXES.iter().any(|suffix| {
+        key.len() >= suffix.len()
+            && key[key.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    })
 }
 
 /// Replace `scheme://user:pass@host` credentials with `***:***`.
@@ -225,9 +236,37 @@ mod tests {
 
     #[test]
     fn test_redacts_suffix_key() {
-        let input = "SIGNING_KEY=abcdef1234\n";
+        // _KEY alone is no longer a sensitive suffix; _API_KEY and _SECRET_KEY are.
+        let input = "SIGNING_API_KEY=abcdef1234\n";
         let result = try_parse_env(input).unwrap();
-        assert_eq!(result.entries[0], "SIGNING_KEY=***");
+        assert_eq!(result.entries[0], "SIGNING_API_KEY=***");
+    }
+
+    #[test]
+    fn test_redacts_secret_key_suffix() {
+        let input = "MY_SECRET_KEY=abcdef1234\n";
+        let result = try_parse_env(input).unwrap();
+        assert_eq!(result.entries[0], "MY_SECRET_KEY=***");
+    }
+
+    #[test]
+    fn test_redacts_private_key_suffix() {
+        let input = "RSA_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n";
+        let result = try_parse_env(input).unwrap();
+        assert_eq!(result.entries[0], "RSA_PRIVATE_KEY=***");
+    }
+
+    #[test]
+    fn test_no_false_positive_registry_key() {
+        // REGISTRY_KEY ends with _KEY but NOT with _API_KEY, _SECRET_KEY, or _PRIVATE_KEY.
+        // It must NOT be redacted.
+        let input = "REGISTRY_KEY=HKLM\\\\Software\\\\Example\n";
+        let result = try_parse_env(input).unwrap();
+        assert!(
+            result.entries[0].starts_with("REGISTRY_KEY=HKLM"),
+            "REGISTRY_KEY should NOT be redacted, got: {}",
+            result.entries[0]
+        );
     }
 
     #[test]
@@ -339,6 +378,18 @@ mod tests {
         assert!(
             result.is_passthrough(),
             "Empty output should be passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_produces_full() {
+        let input = load_fixture("env_basic.txt");
+        let output = make_output(&input, 0);
+        let result = parse_impl(&output);
+        assert!(
+            result.is_full(),
+            "parse_impl with exit code 0 and valid env output should return Full, got {}",
             result.tier_name()
         );
     }
