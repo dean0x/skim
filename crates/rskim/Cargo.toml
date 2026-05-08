@@ -27,6 +27,7 @@ tiktoken-rs = { workspace = true }
 thiserror = { workspace = true }
 clap_complete = { workspace = true }
 strip-ansi-escapes = { workspace = true }
+memchr = "2.8.0"
 regex = { workspace = true }
 rusqlite = { workspace = true }
 colored = { workspace = true }

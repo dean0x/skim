@@ -1,0 +1,12 @@
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root         1  0.0  0.1 169328 11564 ?        Ss   May01   0:05 /sbin/init
+root         2  0.0  0.0      0     0 ?        S    May01   0:00 [kthreadd]
+root         3  0.0  0.0      0     0 ?        I<   May01   0:00 [rcu_gp]
+dean      1234  0.5  1.2 4567890 98765 pts/0   Sl   10:00   1:23 /usr/bin/code
+dean      2345  0.1  0.3 234567 24567 pts/1    S+   10:05   0:12 vim src/main.rs
+dean      3456  2.0  0.5 345678 45678 pts/2    R+   10:10   0:45 cargo test
+www       4567  0.3  0.8 567890 67890 ?        S    May01   5:23 nginx: worker
+www       4568  0.3  0.8 567890 67891 ?        S    May01   5:24 nginx: worker
+postgres  5678  0.1  0.4 456789 34567 ?        Ss   May01   2:34 postgres: main
+redis     6789  0.0  0.1 123456 12345 ?        Ssl  May01   1:12 redis-server
+dean      7890  0.0  0.0  12345  4567 pts/3    R+   10:15   0:00 ps aux

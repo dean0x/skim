@@ -688,3 +688,52 @@ fn test_non_passthrough_env_still_rewrites() {
         "Unrelated env var must not suppress rewrite"
     );
 }
+
+// ========================================================================
+// env command VAR=val guard (issue batch-b)
+// ========================================================================
+
+/// `env LANG=C sort file.txt` must NOT be rewritten: the `LANG=C` token is a
+/// per-invocation env-var assignment passed to `sort`, not printenv output.
+/// Rewriting to `skim env LANG=C sort file.txt` would execute printenv instead
+/// of setting LANG and running sort.
+#[test]
+fn test_env_var_assignment_arg_skips_rewrite() {
+    assert_eq!(
+        would_rewrite("env LANG=C sort file.txt"),
+        None,
+        "env LANG=C sort file.txt must not be rewritten — VAR=val arg signals command invocation"
+    );
+}
+
+/// Multiple VAR=val args also skip rewriting.
+#[test]
+fn test_env_multiple_var_assignment_args_skip_rewrite() {
+    assert_eq!(
+        would_rewrite("env LANG=C LC_ALL=C sort file.txt"),
+        None,
+        "env with multiple VAR=val args must not be rewritten"
+    );
+}
+
+/// Bare `env` (no args — print all env vars) still rewrites normally.
+#[test]
+fn test_bare_env_still_rewrites() {
+    assert_eq!(
+        would_rewrite("env"),
+        Some("skim env".to_string()),
+        "bare env must still rewrite — no VAR=val arg present"
+    );
+}
+
+/// `env -i CMD` (with only flag args, no VAR=val) still rewrites.
+/// Note: `-i` is in skip_if_flag_prefix, so this should return None via the
+/// existing flag-skip path — not the new eq-guard path.
+#[test]
+fn test_env_minus_i_skips_via_flag_guard() {
+    assert_eq!(
+        would_rewrite("env -i bash"),
+        None,
+        "env -i must not be rewritten — -i is in skip_if_flag_prefix"
+    );
+}

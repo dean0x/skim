@@ -192,11 +192,18 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "gh",
     "wget",
     // File operations
+    "df",
+    "diff",
+    "du",
+    "env",
     "find",
     "grep",
     "ls",
+    "printenv",
+    "ps",
     "rg",
     "tree",
+    "wc",
 ];
 
 /// Check whether `name` is a registered subcommand.
@@ -720,7 +727,8 @@ pub(crate) fn dispatch(
         | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
         "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
         "aws" | "curl" | "gh" | "wget" => infra::run(&prepend(subcommand, args), analytics),
-        "find" | "grep" | "ls" | "rg" | "tree" => file::run(&prepend(subcommand, args), analytics),
+        "df" | "diff" | "du" | "env" | "find" | "grep" | "ls" | "printenv" | "ps" | "rg"
+        | "tree" | "wc" => file::run(&prepend(subcommand, args), analytics),
 
         _ => {
             let safe = sanitize_for_display(subcommand);

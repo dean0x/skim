@@ -117,6 +117,16 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
             continue;
         }
 
+        // Guard: skip when the rule requires no `=`-containing middle tokens
+        // but at least one is present.  This prevents `env LANG=C sort` from
+        // being rewritten to `skim env LANG=C sort`, which breaks semantics
+        // because the `VAR=val` tokens are env-var assignments for the child
+        // command, not skim-processable output.
+        if rule.skip_if_middle_contains_eq && middle.iter().any(|t| t.contains('=')) {
+            skipped = true;
+            continue;
+        }
+
         if skipped {
             // A more-specific rule was skipped by its flag — no rewrite.
             // Report this rule's pipe exclusion flag so pipe-context callers

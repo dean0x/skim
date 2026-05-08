@@ -1,7 +1,7 @@
 //! Declarative rewrite rule table.
 //!
-//! 100 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (7),
-//! LINT (38), PKG (18), INFRA (14), FILE_OPS (9).
+//! 107 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (7),
+//! LINT (38), PKG (18), INFRA (14), FILE_OPS (16).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
@@ -35,6 +35,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["cargo", "test"],
@@ -42,6 +43,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // python (longest prefix first)
     RewriteRule {
@@ -50,6 +52,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["python", "-m", "pytest"],
@@ -57,6 +60,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // npx
     RewriteRule {
@@ -65,6 +69,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npx", "jest"],
@@ -72,6 +77,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // bare commands
     RewriteRule {
@@ -80,6 +86,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["vitest"],
@@ -87,6 +94,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["jest"],
@@ -94,6 +102,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["go", "test"],
@@ -101,6 +110,7 @@ const TEST_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
 ];
 
@@ -115,6 +125,7 @@ const BUILD_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["cargo", "build"],
@@ -122,6 +133,7 @@ const BUILD_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // npx
     RewriteRule {
@@ -130,6 +142,7 @@ const BUILD_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // tsc bare
     RewriteRule {
@@ -138,6 +151,7 @@ const BUILD_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
 ];
 
@@ -152,6 +166,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // DESIGN NOTE (AD-RW-4, extended 2026-04-11): `--stat`, `--name-only` removed
     // from skip list. These are Group B flags (already-compact output).
@@ -177,6 +192,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--shortstat", "--numstat", "--name-status", "--check"],
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["git", "fetch"],
@@ -184,6 +200,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--dry-run", "-q", "--quiet"],
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // DESIGN NOTE (AD-RW-4): `--format` and `--pretty` removed from skip list.
     // The log handler (log.rs) already detects these flags and calls
@@ -195,6 +212,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // git show — new rule (AD-GIT-5, updated 2026-04-11)
     //
@@ -213,6 +231,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // git commit (B.7)
     //
@@ -226,6 +245,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--help"],
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // git push (B.8)
     //
@@ -239,6 +259,7 @@ const GIT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--help"],
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
 ];
 
@@ -254,6 +275,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format", "-f"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["eslint"],
@@ -261,6 +283,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format", "-f"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // ruff (longest prefix first)
     //
@@ -273,6 +296,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["ruff", "format"],
@@ -280,6 +304,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["ruff", "check"],
@@ -287,6 +312,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output-format"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["ruff"],
@@ -294,6 +320,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output-format"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // mypy (longest prefix first: python3 -m mypy, python -m mypy, mypy)
     RewriteRule {
@@ -302,6 +329,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["python", "-m", "mypy"],
@@ -309,6 +337,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["mypy"],
@@ -316,6 +345,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // golangci-lint
     RewriteRule {
@@ -324,6 +354,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--out-format"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["golangci-lint"],
@@ -331,6 +362,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--out-format"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // prettier (longest prefix first: npx prettier, prettier)
     //
@@ -343,6 +375,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npx", "prettier", "-w"],
@@ -350,6 +383,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["prettier", "--write"],
@@ -357,6 +391,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["prettier", "-w"],
@@ -364,6 +399,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npx", "prettier", "--check"],
@@ -371,6 +407,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["prettier", "--check"],
@@ -378,6 +415,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // rustfmt (longest prefix first)
     RewriteRule {
@@ -386,6 +424,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["cargo", "fmt", "--check"],
@@ -393,6 +432,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["rustfmt", "--check"],
@@ -400,6 +440,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // black
     RewriteRule {
@@ -408,6 +449,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--diff"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["black"],
@@ -415,6 +457,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--diff"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // gofmt (longest prefix first)
     RewriteRule {
@@ -423,6 +466,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gofmt", "-d"],
@@ -430,6 +474,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gofmt"],
@@ -437,6 +482,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-w"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // biome (longest prefix first)
     RewriteRule {
@@ -445,6 +491,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--reporter"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["biome", "check"],
@@ -452,6 +499,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--reporter"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npx", "biome", "format"],
@@ -459,6 +507,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["biome", "format"],
@@ -466,6 +515,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npx", "biome", "lint"],
@@ -473,6 +523,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--reporter"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["biome", "lint"],
@@ -480,6 +531,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--reporter"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npx", "biome"],
@@ -487,6 +539,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--reporter"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["biome"],
@@ -494,6 +547,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--reporter"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // dprint (longest prefix first)
     RewriteRule {
@@ -502,6 +556,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["dprint", "fmt"],
@@ -509,6 +564,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["dprint"],
@@ -516,6 +572,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // oxlint
     RewriteRule {
@@ -524,6 +581,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["oxlint"],
@@ -531,6 +589,7 @@ const LINT_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
 ];
 
@@ -546,6 +605,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // npm (canonical + aliases)
     RewriteRule {
@@ -554,6 +614,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npm", "install"],
@@ -561,6 +622,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npm", "i"],
@@ -568,6 +630,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npm", "ci"],
@@ -575,6 +638,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npm", "outdated"],
@@ -582,6 +646,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npm", "list"],
@@ -589,6 +654,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["npm", "ls"],
@@ -596,6 +662,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // pnpm
     RewriteRule {
@@ -604,6 +671,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pnpm", "install"],
@@ -611,6 +679,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pnpm", "i"],
@@ -618,6 +687,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pnpm", "outdated"],
@@ -625,6 +695,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // pip (canonical + pip3 aliases)
     RewriteRule {
@@ -633,6 +704,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pip", "check"],
@@ -640,6 +712,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pip", "list"],
@@ -647,6 +720,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pip3", "install"],
@@ -654,6 +728,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pip3", "check"],
@@ -661,6 +736,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["pip3", "list"],
@@ -668,6 +744,7 @@ const PKG_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--format"],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
 ];
 
@@ -693,6 +770,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--web", "--watch", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gh", "pr", "view"],
@@ -700,6 +778,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gh", "pr", "list"],
@@ -707,6 +786,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gh", "issue", "view"],
@@ -714,6 +794,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gh", "issue", "list"],
@@ -721,6 +802,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gh", "run", "view"],
@@ -728,6 +810,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--web", "--log", "--log-failed", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // gh run watch (B.5) — streaming output compression
     //
@@ -739,6 +822,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--help"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gh", "run", "list"],
@@ -746,6 +830,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // gh release view (B.6) — structured release metadata
     //
@@ -757,6 +842,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--help", "--web", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["gh", "release", "list"],
@@ -764,6 +850,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // gh api (B.4) — REST/GraphQL response compression
     //
@@ -776,6 +863,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--help", "--jq", "--template"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // aws
     RewriteRule {
@@ -784,6 +872,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--output"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // curl
     RewriteRule {
@@ -800,6 +889,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         ],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // wget
     RewriteRule {
@@ -808,11 +898,12 @@ const INFRA_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-O", "-q", "--quiet"],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
 ];
 
 // ============================================================================
-// FILE_OPS rules (9)
+// FILE_OPS rules (16)
 // ============================================================================
 
 const FILE_OPS_RULES: &[RewriteRule] = &[
@@ -823,6 +914,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-exec", "-delete", "-printf", "-print0"],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
     },
     // ls (verbose/recursive only)
     RewriteRule {
@@ -831,6 +923,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["ls", "-R"],
@@ -838,6 +931,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &[],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // tree
     RewriteRule {
@@ -846,6 +940,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-J", "--json"],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // grep (recursive only)
     RewriteRule {
@@ -854,6 +949,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-c", "--count", "-l"],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     RewriteRule {
         prefix: &["grep", "-r"],
@@ -861,6 +957,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["-c", "--count", "-l"],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
     },
     // rg — pipe-source excluded so `rg pat | head` is not rewritten (AD-RW-2)
     RewriteRule {
@@ -869,6 +966,82 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--json", "-c", "--count", "-l", "--files"],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
+    },
+    // wc
+    RewriteRule {
+        prefix: &["wc"],
+        rewrite_to: &["skim", "wc"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
+    },
+    // du
+    RewriteRule {
+        prefix: &["du"],
+        rewrite_to: &["skim", "du"],
+        skip_if_flag_prefix: &["--help", "--version", "-0", "--null"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
+    },
+    // df
+    RewriteRule {
+        prefix: &["df"],
+        rewrite_to: &["skim", "df"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    // ps
+    RewriteRule {
+        prefix: &["ps"],
+        rewrite_to: &["skim", "ps"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
+    },
+    // env
+    RewriteRule {
+        prefix: &["env"],
+        rewrite_to: &["skim", "env"],
+        skip_if_flag_prefix: &["--help", "--version", "-i", "-u", "-S"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+        // `env VAR=val cmd` passes VAR=val to the child process; rewriting
+        // would route to `skim env` which only handles printenv-style output.
+        // Bare `env` (no `=` args) is still rewritten.  SEE: issue batch-b.
+        skip_if_middle_contains_eq: true,
+    },
+    // printenv
+    RewriteRule {
+        prefix: &["printenv"],
+        rewrite_to: &["skim", "printenv"],
+        skip_if_flag_prefix: &["--help", "--version"],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
+    },
+    // diff
+    RewriteRule {
+        prefix: &["diff"],
+        rewrite_to: &["skim", "diff"],
+        skip_if_flag_prefix: &[
+            "--help",
+            "--version",
+            "-y",
+            "--side-by-side",
+            "-q",
+            "--brief",
+            "-e",
+            "--ed",
+        ],
+        category: RewriteCategory::FileOps,
+        exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
     },
     // ls catch-all (B.1) — DESIGN NOTE (AD-RW-2)
     //
@@ -885,6 +1058,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--help", "--version", "-V"],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
     },
     // grep catch-all (B.2) — DESIGN NOTE (AD-RW-2)
     //
@@ -899,6 +1073,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         skip_if_flag_prefix: &["--help", "--version", "-V"],
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
+        skip_if_middle_contains_eq: false,
     },
 ];
 
@@ -943,8 +1118,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(14) + FILE_OPS(9)
-    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 14 + 9;
+    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(14) + FILE_OPS(16)
+    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 14 + 16;
 
     #[test]
     fn test_rule_count_matches_expected() {

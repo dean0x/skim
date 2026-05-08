@@ -1,0 +1,6 @@
+Filesystem     1K-blocks      Used Available Use% Mounted on
+/dev/sda1      103081248  45234120  52583660  47% /
+tmpfs            4043340         0   4043340   0% /dev/shm
+/dev/sdb1      515928320 234567890 255012430  48% /home
+/dev/sdc1      103081248  78901234  18916546  81% /var
+tmpfs            4043340      1234   4042106   1% /run

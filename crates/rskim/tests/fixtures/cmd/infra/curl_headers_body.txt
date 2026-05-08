@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 42
+X-RateLimit-Remaining: 58
+X-RateLimit-Limit: 60
+Set-Cookie: session=abc123; Path=/
+Set-Cookie: csrf=xyz789; Path=/
+
+{"status":"ok","data":{"user":"dean","role":"admin"}}

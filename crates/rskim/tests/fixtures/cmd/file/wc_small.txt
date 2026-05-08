@@ -1,0 +1,6 @@
+       5      10      50 src/main.rs
+      20      45     300 src/lib.rs
+      15      30     200 src/utils.rs
+       8      16     100 src/config.rs
+      12      28     180 src/parser.rs
+      60     129     830 total
