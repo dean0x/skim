@@ -1,0 +1,17 @@
+--- a/src/main.rs	2026-05-01 10:00:00.000000000 +0000
++++ b/src/main.rs	2026-05-01 10:05:00.000000000 +0000
+@@ -1,7 +1,8 @@
+ use std::io;
++use std::fs;
+
+ fn main() {
+-    println!("Hello, world!");
++    println!("Hello, skim!");
++    println!("Version 2.0");
+     io::stdout().flush().unwrap();
+ }
+@@ -10,4 +11,3 @@
+ fn helper() {
+-    // old comment
+     do_work();
+ }

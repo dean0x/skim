@@ -4,6 +4,7 @@
 //! `find`, `grep`, `ls`, `rg`, `tree`.
 
 pub(crate) mod df;
+pub(crate) mod diff;
 pub(crate) mod du;
 pub(crate) mod env;
 pub(crate) mod find;
