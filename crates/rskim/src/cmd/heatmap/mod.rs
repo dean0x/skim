@@ -110,7 +110,10 @@ fn resolve_diff_files(
             for f in &files {
                 let abs = std::path::Path::new(&root).join(f);
                 if !abs.exists() {
-                    eprintln!("skim heatmap: warning: file '{}' deleted on current branch", f);
+                    eprintln!(
+                        "skim heatmap: warning: file '{}' deleted on current branch",
+                        f
+                    );
                 }
             }
             config.files = files;
@@ -1469,12 +1472,15 @@ mod tests {
     /// parent directory and would incorrectly drop the `"src"` module.
     #[test]
     fn test_apply_file_scope_filters_modules_deeply_nested() {
-        use types::{ChurnMetrics, AuthorMetrics, FixRiskMetrics, FileMetrics, ModuleHealth};
+        use types::{AuthorMetrics, ChurnMetrics, FileMetrics, FixRiskMetrics, ModuleHealth};
         let mut result = make_test_result();
         // Replace the file list with a single deeply-nested path
         result.files = vec![FileMetrics {
             path: "src/cmd/heatmap/mod.rs".to_string(),
-            churn: ChurnMetrics { commits: 1, rate: 0.1 },
+            churn: ChurnMetrics {
+                commits: 1,
+                rate: 0.1,
+            },
             stability_score: 50,
             authors: AuthorMetrics::default(),
             fix_risk: FixRiskMetrics::default(),
