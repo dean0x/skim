@@ -214,7 +214,8 @@ fn test_heatmap_help_contains_flag_names() {
         .stdout(predicate::str::contains("--top"))
         .stdout(predicate::str::contains("--no-exclude"))
         .stdout(predicate::str::contains("--coupling-threshold"))
-        .stdout(predicate::str::contains("--fix-window"));
+        .stdout(predicate::str::contains("--fix-window"))
+        .stdout(predicate::str::contains("--diff"));
 }
 
 // ============================================================================
