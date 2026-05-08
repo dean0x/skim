@@ -9,8 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`skim heatmap` subcommand** — Git history risk and coupling analysis. Mines git log to produce 6 metrics: file churn, co-change coupling (blast radius), stability scores, author concentration (bus factor), fix-after-touch risk, and module encapsulation health. Supports adaptive dual windowing (max of 90 days / 200 commits), auto-exclusion of lock files and build artifacts, JSON and text output, and path scoping. 87 new tests.
-
 ### Changed
 
 ### Fixed
@@ -18,6 +16,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Testing
+
+## [2.9.0] - 2026-05-08
+
+Heatmap analysis, system utility parsers, curl hardening. 3,310 tests passing (up from 3,103 in v2.8.0).
+
+### Added
+- **`skim heatmap` subcommand** — Git history risk and coupling analysis. Mines git log to produce 6 metrics: file churn, co-change coupling (blast radius), stability scores, author concentration (bus factor), fix-after-touch risk, and module encapsulation health. Supports adaptive dual windowing (max of 90 days / 200 commits), auto-exclusion of lock files and build artifacts, JSON and text output, and path scoping. 87 new tests (#163)
+- **Heatmap file targeting** — positional file args, `--diff` flag for changed-files-only analysis, display filter for focusing output on specific paths (#171)
+- **System utility parsers** — `df`, `du`, `env`, `printenv`, `ps`, `wc`, `diff`, `rg`, `tree` output compression via flat dispatch subcommands (#166)
+
+### Changed
+- **Curl parser hardened** — error status detection, redirect chain compression, HTML body truncation, verbose header filtering, write-out format support (#169)
+
+### Fixed
+- **CI release workflow** — fail hard on real publish errors, skip gracefully on already-published versions (#165)
+
+### Testing
+- 3,310 tests passing (up from 3,103 in v2.8.0)
 
 ## [2.8.0] - 2026-05-07
 
@@ -899,6 +915,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.9.0** (2026-05-08): Heatmap analysis, system utility parsers, curl hardening (3,310 tests)
 - **2.8.0** (2026-05-07): Flat dispatch, Crush agent, multi-file args (3,103 tests)
 - **2.7.0** (2026-05-01): Line numbers, session tracking, output sanitization (3,002 tests)
 - **2.6.0** (2026-04-27): Terminal UX overhaul, non-interactive init, plugin ecosystem removal (2,883 tests)
