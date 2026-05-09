@@ -45,6 +45,7 @@ pub(crate) enum CommandType {
     FileOps,
     Log,
     Heatmap,
+    Db,
 }
 
 impl CommandType {
@@ -60,6 +61,7 @@ impl CommandType {
             CommandType::FileOps => "fileops",
             CommandType::Log => "log",
             CommandType::Heatmap => "heatmap",
+            CommandType::Db => "db",
         }
     }
 }

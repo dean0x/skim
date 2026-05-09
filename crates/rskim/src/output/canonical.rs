@@ -684,6 +684,161 @@ impl fmt::Display for InfraResult {
 }
 
 // ============================================================================
+// DbResult types
+// ============================================================================
+
+/// Maximum rows rendered in a DbResult table.
+const MAX_DB_ROWS: usize = 100;
+
+/// Maximum column width before value is truncated with `…`.
+const MAX_COL_WIDTH: usize = 40;
+
+/// Result of a database tool query (psql, mysql, sqlite3, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DbResult {
+    pub(crate) tool: String,
+    pub(crate) query_summary: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<String>>,
+    pub(crate) row_count: usize,
+    pub(crate) truncated: bool,
+    #[serde(default, skip_serializing)]
+    rendered: String,
+}
+
+impl DbResult {
+    pub(crate) fn new(
+        tool: String,
+        query_summary: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        row_count: usize,
+        truncated: bool,
+    ) -> Self {
+        let rendered = Self::render(&tool, &query_summary, &columns, &rows, row_count, truncated);
+        Self {
+            tool,
+            query_summary,
+            columns,
+            rows,
+            row_count,
+            truncated,
+            rendered,
+        }
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization).
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            self.rendered = Self::render(
+                &self.tool,
+                &self.query_summary,
+                &self.columns,
+                &self.rows,
+                self.row_count,
+                self.truncated,
+            );
+        }
+    }
+
+    fn render(
+        tool: &str,
+        _query_summary: &str,
+        columns: &[String],
+        rows: &[Vec<String>],
+        row_count: usize,
+        truncated: bool,
+    ) -> String {
+        use std::fmt::Write;
+
+        let trunc_label = if truncated { " (truncated)" } else { "" };
+        let mut output = format!("{tool} query {row_count} rows{trunc_label}");
+
+        if columns.is_empty() {
+            return output;
+        }
+
+        // Compute column widths: max(header_len, max_value_len), capped at MAX_COL_WIDTH.
+        let display_rows: Vec<Vec<String>> = rows
+            .iter()
+            .take(MAX_DB_ROWS)
+            .map(|row| {
+                row.iter()
+                    .map(|v| {
+                        if v.chars().count() > MAX_COL_WIDTH {
+                            let mut s: String = v.chars().take(MAX_COL_WIDTH - 1).collect();
+                            s.push('…');
+                            s
+                        } else {
+                            v.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let widths: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                let header_len = col.chars().count().min(MAX_COL_WIDTH);
+                let max_val = display_rows
+                    .iter()
+                    .map(|row| row.get(i).map(|v| v.chars().count()).unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                header_len.max(max_val)
+            })
+            .collect();
+
+        // Header row
+        let _ = write!(output, "\n ");
+        for (i, col) in columns.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(output, " | ");
+            }
+            let w = widths[i];
+            let _ = write!(output, "{col:<w$}");
+        }
+
+        // Separator
+        let _ = write!(output, "\n ");
+        for (i, &w) in widths.iter().enumerate() {
+            if i > 0 {
+                let _ = write!(output, "+");
+            }
+            let _ = write!(output, "{}", "-".repeat(w + if i > 0 { 2 } else { 0 }));
+        }
+
+        // Data rows
+        for row in &display_rows {
+            let _ = write!(output, "\n ");
+            for (i, &w) in widths.iter().enumerate() {
+                if i > 0 {
+                    let _ = write!(output, " | ");
+                }
+                let val = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                let _ = write!(output, "{val:<w$}");
+            }
+        }
+
+        output
+    }
+}
+
+impl AsRef<str> for DbResult {
+    fn as_ref(&self) -> &str {
+        &self.rendered
+    }
+}
+
+impl fmt::Display for DbResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.rendered)
+    }
+}
+
+// ============================================================================
 // DiffResult types
 // ============================================================================
 
@@ -1639,6 +1794,103 @@ mod tests {
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
         assert!(result.as_ref().contains("curl GET 200 OK"));
+    }
+
+    // ========================================================================
+    // DbResult tests
+    // ========================================================================
+
+    #[test]
+    fn test_db_result_header_line() {
+        let result = DbResult::new(
+            "psql".to_string(),
+            "SELECT * FROM users".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+            vec![vec!["1".to_string(), "Alice".to_string()]],
+            1,
+            false,
+        );
+        let display = format!("{result}");
+        assert!(display.starts_with("psql query 1 rows\n"));
+        assert!(display.contains("id"));
+        assert!(display.contains("name"));
+        assert!(display.contains("Alice"));
+    }
+
+    #[test]
+    fn test_db_result_truncated_label() {
+        let result = DbResult::new(
+            "mysql".to_string(),
+            "SELECT".to_string(),
+            vec![],
+            vec![],
+            200,
+            true,
+        );
+        let display = format!("{result}");
+        assert!(display.contains("(truncated)"));
+    }
+
+    #[test]
+    fn test_db_result_no_columns_no_separator() {
+        let result = DbResult::new(
+            "sqlite3".to_string(),
+            "UPDATE".to_string(),
+            vec![],
+            vec![],
+            0,
+            false,
+        );
+        let display = format!("{result}");
+        assert_eq!(display, "sqlite3 query 0 rows");
+    }
+
+    #[test]
+    fn test_db_result_col_width_capped() {
+        let long_val = "a".repeat(50); // > MAX_COL_WIDTH=40
+        let result = DbResult::new(
+            "psql".to_string(),
+            "SELECT".to_string(),
+            vec!["col".to_string()],
+            vec![vec![long_val]],
+            1,
+            false,
+        );
+        let display = format!("{result}");
+        // Value should be truncated with ellipsis
+        assert!(display.contains('…'));
+    }
+
+    #[test]
+    fn test_db_result_serde_roundtrip() {
+        let original = DbResult::new(
+            "psql".to_string(),
+            "SELECT 1".to_string(),
+            vec!["n".to_string()],
+            vec![vec!["1".to_string()]],
+            1,
+            false,
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let mut deserialized: DbResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(format!("{original}"), format!("{deserialized}"));
+    }
+
+    #[test]
+    fn test_db_result_ensure_rendered_recomputes() {
+        let mut result = DbResult {
+            tool: "psql".to_string(),
+            query_summary: "SELECT 1".to_string(),
+            columns: vec!["n".to_string()],
+            rows: vec![vec!["42".to_string()]],
+            row_count: 1,
+            truncated: false,
+            rendered: String::new(),
+        };
+        assert_eq!(result.as_ref(), "");
+        result.ensure_rendered();
+        assert!(result.as_ref().contains("psql query 1 rows"));
     }
 
     #[test]

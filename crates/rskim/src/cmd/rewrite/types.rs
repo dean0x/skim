@@ -13,6 +13,7 @@ pub(super) enum RewriteCategory {
     Pkg,
     Infra,
     FileOps,
+    Db,
 }
 
 pub(super) struct RewriteRule {

@@ -63,13 +63,13 @@ static RE_LOG_STACK_TRACE: LazyLock<Regex> =
 // ============================================================================
 
 #[derive(Debug, Default)]
-struct LogFlags {
-    no_dedup: bool,
-    keep_timestamps: bool,
-    keep_debug: bool,
-    debug_only: bool,
-    show_stats: bool,
-    json_output: bool,
+pub(crate) struct LogFlags {
+    pub(crate) no_dedup: bool,
+    pub(crate) keep_timestamps: bool,
+    pub(crate) keep_debug: bool,
+    pub(crate) debug_only: bool,
+    pub(crate) show_stats: bool,
+    pub(crate) json_output: bool,
 }
 
 fn parse_flags(args: &[String]) -> LogFlags {
@@ -234,7 +234,7 @@ pub(super) fn command() -> clap::Command {
 // ============================================================================
 
 /// Compress log lines into a structured ParseResult<LogResult>.
-fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
+pub(crate) fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
     // Try Tier 1: structured JSON logs
     if let Some(result) = try_parse_json_logs(input, flags) {
         return ParseResult::Full(result);
