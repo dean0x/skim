@@ -1,0 +1,25 @@
++----+----------+---------------------+
+| id | username | email               |
++----+----------+---------------------+
+|  1 | alice    | alice@example.com   |
+|  2 | bob      | bob@example.com     |
+|  3 | charlie  | charlie@example.com |
+|  4 | diana    | diana@example.com   |
+|  5 | eve      | eve@example.com     |
+|  6 | frank    | frank@example.com   |
+|  7 | grace    | grace@example.com   |
+|  8 | henry    | henry@example.com   |
+|  9 | iris     | iris@example.com    |
+| 10 | jack     | jack@example.com    |
+| 11 | kate     | kate@example.com    |
+| 12 | liam     | liam@example.com    |
+| 13 | mia      | mia@example.com     |
+| 14 | noah     | noah@example.com    |
+| 15 | olivia   | olivia@example.com  |
+| 16 | paul     | paul@example.com    |
+| 17 | quinn    | quinn@example.com   |
+| 18 | rachel   | rachel@example.com  |
+| 19 | steve    | steve@example.com   |
+| 20 | tanya    | tanya@example.com   |
++----+----------+---------------------+
+20 rows in set (0.01 sec)

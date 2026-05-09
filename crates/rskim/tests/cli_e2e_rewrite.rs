@@ -1569,3 +1569,207 @@ fn test_rewrite_npx_oxlint() {
         .success()
         .stdout(predicate::str::contains("skim oxlint"));
 }
+
+// ============================================================================
+// Infra: docker rewrite rules (#117)
+// ============================================================================
+
+#[test]
+fn test_rewrite_docker_ps() {
+    skim_cmd()
+        .args(["rewrite", "docker", "ps"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim docker ps"));
+}
+
+#[test]
+fn test_rewrite_docker_images() {
+    skim_cmd()
+        .args(["rewrite", "docker", "images"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim docker images"));
+}
+
+#[test]
+fn test_rewrite_docker_build() {
+    skim_cmd()
+        .args(["rewrite", "docker", "build", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim docker build ."));
+}
+
+#[test]
+fn test_rewrite_docker_compose_ps() {
+    skim_cmd()
+        .args(["rewrite", "docker", "compose", "ps"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim docker compose ps"));
+}
+
+#[test]
+fn test_rewrite_docker_compose_logs() {
+    skim_cmd()
+        .args(["rewrite", "docker", "compose", "logs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim docker compose logs"));
+}
+
+#[test]
+fn test_rewrite_docker_ps_skip_format() {
+    // --format skips rewrite
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "docker",
+            "ps",
+            "--format",
+            "table {{.ID}}",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// Infra: kubectl rewrite rules (#117)
+// ============================================================================
+
+#[test]
+fn test_rewrite_kubectl_get() {
+    skim_cmd()
+        .args(["rewrite", "kubectl", "get", "pods"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim kubectl get pods"));
+}
+
+#[test]
+fn test_rewrite_kubectl_describe() {
+    skim_cmd()
+        .args(["rewrite", "kubectl", "describe", "pod", "foo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim kubectl describe pod foo"));
+}
+
+#[test]
+fn test_rewrite_kubectl_logs() {
+    skim_cmd()
+        .args(["rewrite", "kubectl", "logs", "pod"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim kubectl logs pod"));
+}
+
+#[test]
+fn test_rewrite_kubectl_get_skip_output() {
+    // -o yaml skips rewrite
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "kubectl",
+            "get",
+            "pods",
+            "-o",
+            "yaml",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_kubectl_logs_skip_follow() {
+    // -f skips rewrite
+    skim_cmd()
+        .args(["rewrite", "--suggest", "kubectl", "logs", "-f", "pod"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// Infra: terraform rewrite rules (#117)
+// ============================================================================
+
+#[test]
+fn test_rewrite_terraform_plan() {
+    skim_cmd()
+        .args(["rewrite", "terraform", "plan"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim terraform plan"));
+}
+
+#[test]
+fn test_rewrite_terraform_apply() {
+    skim_cmd()
+        .args(["rewrite", "terraform", "apply"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim terraform apply"));
+}
+
+#[test]
+fn test_rewrite_terraform_apply_skip_auto_approve() {
+    // -auto-approve skips rewrite (safety guard)
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "terraform",
+            "apply",
+            "-auto-approve",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// DB: rewrite rules (#117)
+// ============================================================================
+
+#[test]
+fn test_rewrite_psql_c() {
+    skim_cmd()
+        .args(["rewrite", "psql", "-c", "SELECT 1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim psql -c"));
+}
+
+#[test]
+fn test_rewrite_mysql_e() {
+    skim_cmd()
+        .args(["rewrite", "mysql", "-e", "SELECT 1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim mysql -e"));
+}
+
+#[test]
+fn test_rewrite_sqlite3() {
+    skim_cmd()
+        .args(["rewrite", "sqlite3", "test.db", "SELECT 1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim sqlite3"));
+}
+
+#[test]
+fn test_rewrite_psql_bare_no_rewrite() {
+    // Bare `psql` without -c has no rule → no rewrite
+    skim_cmd()
+        .args(["rewrite", "--suggest", "psql"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}

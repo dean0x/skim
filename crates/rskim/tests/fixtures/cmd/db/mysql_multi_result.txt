@@ -1,0 +1,8 @@
+id	username	email
+1	alice	alice@example.com
+2	bob	bob@example.com
+3	charlie	charlie@example.com
+
+id	product	price
+101	widget	9.99
+102	gadget	24.99
