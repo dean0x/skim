@@ -1,10 +1,7 @@
-//! Infrastructure tool handler — dispatches to infra parsers (#116, #131)
+//! Infrastructure tool handler — dispatches to infra parsers (#116, #117, #131)
 //!
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
-//! `aws`, `curl`, `gh`, `wget`.
-//!
-//! The `gh` handler supports list commands (`pr list`, `issue list`, `run list`)
-//! and view commands (`issue view`, `pr view`, `pr checks`, `run view`).
+//! `aws`, `curl`, `docker`, `gh`, `kubectl`, `terraform`, `wget`.
 
 pub(crate) mod aws;
 pub(crate) mod curl;

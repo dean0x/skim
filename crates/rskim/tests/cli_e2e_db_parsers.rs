@@ -222,6 +222,21 @@ fn test_sqlite3_stdin_tier1() {
 }
 
 // ============================================================================
+// sqlite3: empty result (header only, no data rows)
+// ============================================================================
+
+#[test]
+fn test_sqlite3_stdin_empty_result() {
+    let fixture = include_str!("fixtures/cmd/db/sqlite3_empty.txt");
+    skim_cmd()
+        .args(["sqlite3"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sqlite3 query 0 rows"));
+}
+
+// ============================================================================
 // sqlite3: Tier 3 — Passthrough on schema dump (no pipes)
 // ============================================================================
 
