@@ -89,9 +89,10 @@ pub(crate) fn parse_logs(output: &CommandOutput) -> ParseResult<InfraResult> {
         ParseResult::Full(log_result) => {
             ParseResult::Full(log_result_to_infra(log_result, "docker", "compose logs"))
         }
-        ParseResult::Degraded(log_result, warnings) => {
-            ParseResult::Degraded(log_result_to_infra(log_result, "docker", "compose logs"), warnings)
-        }
+        ParseResult::Degraded(log_result, warnings) => ParseResult::Degraded(
+            log_result_to_infra(log_result, "docker", "compose logs"),
+            warnings,
+        ),
         ParseResult::Passthrough(raw) => ParseResult::Passthrough(raw),
     }
 }

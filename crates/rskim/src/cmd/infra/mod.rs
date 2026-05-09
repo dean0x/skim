@@ -276,7 +276,10 @@ pub(crate) fn log_result_to_infra(
     tool: &str,
     operation: &str,
 ) -> InfraResult {
-    let summary = format!("{} lines, {} unique", log_result.total_lines, log_result.unique_messages);
+    let summary = format!(
+        "{} lines, {} unique",
+        log_result.total_lines, log_result.unique_messages
+    );
     let items = vec![crate::output::canonical::InfraItem {
         label: "log".to_string(),
         value: log_result.to_string(),
