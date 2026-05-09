@@ -1,0 +1,6 @@
+NAME                                        READY   STATUS             RESTARTS   AGE
+web-deployment-7d9b4b8f6c-xkj9p             1/1     Running            0          2d
+api-deployment-5f8c9d7b6a-mnt4q             1/1     Running            2          2d
+worker-deployment-3e7d8c5b4a-pqr7s          1/1     Running            0          1d
+db-migration-4f9e0d6c5b-uvw8t               0/1     Completed          0          3h
+crash-pod-6b0f1e7d6c-xyz9u                  0/1     CrashLoopBackOff   15         45m

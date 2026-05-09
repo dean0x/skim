@@ -10,6 +10,8 @@ pub(crate) mod aws;
 pub(crate) mod curl;
 pub(crate) mod docker;
 pub(crate) mod gh;
+pub(crate) mod kubectl;
+pub(crate) mod terraform;
 pub(crate) mod wget;
 
 use std::process::ExitCode;
@@ -20,7 +22,15 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known infra tools that the infra handler can dispatch to.
-const KNOWN_TOOLS: &[&str] = &["aws", "curl", "docker", "gh", "wget"];
+const KNOWN_TOOLS: &[&str] = &[
+    "aws",
+    "curl",
+    "docker",
+    "gh",
+    "kubectl",
+    "terraform",
+    "wget",
+];
 
 /// Entry point for `skim <tool> [args...]` (infra handler).
 ///
@@ -55,6 +65,8 @@ pub(crate) fn run(
         "curl" => curl::run(tool_args, &ctx),
         "docker" => docker::run(tool_args, &ctx),
         "gh" => gh::run(tool_args, &ctx),
+        "kubectl" => kubectl::run(tool_args, &ctx),
+        "terraform" => terraform::run(tool_args, &ctx),
         "wget" => wget::run(tool_args, &ctx),
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
