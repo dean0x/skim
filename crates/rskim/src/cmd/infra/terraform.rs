@@ -18,7 +18,6 @@ use serde_json::Value;
 
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
-use crate::runner::CommandOutput;
 
 use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
 
@@ -184,9 +183,7 @@ fn try_parse_text(text: &str, subcmd: &str) -> Option<InfraResult> {
         .captures(text)
         .or_else(|| RE_APPLY_SUMMARY.captures(text));
 
-    let Some(caps) = summary_caps else {
-        return None;
-    };
+    let caps = summary_caps?;
 
     let add: u64 = caps[1].parse().unwrap_or(0);
     let change: u64 = caps[2].parse().unwrap_or(0);

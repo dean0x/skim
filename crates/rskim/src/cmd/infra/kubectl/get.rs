@@ -72,15 +72,11 @@ fn try_parse_json(text: &str) -> Option<InfraResult> {
     let kind = obj["kind"].as_str().unwrap_or("Unknown");
 
     // List resource
-    if kind.ends_with("List") {
+    if let Some(item_kind) = kind.strip_suffix("List") {
         let items = obj["items"].as_array()?;
         let count = items.len();
-        let item_kind = &kind[..kind.len() - 4]; // strip "List"
 
-        let result_items: Vec<InfraItem> = items
-            .iter()
-            .map(|item| extract_resource_item(item))
-            .collect();
+        let result_items: Vec<InfraItem> = items.iter().map(extract_resource_item).collect();
 
         return Some(InfraResult::new(
             "kubectl".to_string(),

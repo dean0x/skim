@@ -8,6 +8,7 @@
 mod agents;
 mod build;
 mod completions;
+mod db;
 mod discover;
 mod file;
 mod git;
@@ -194,6 +195,10 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "kubectl",
     "terraform",
     "wget",
+    // Database
+    "mysql",
+    "psql",
+    "sqlite3",
     // File operations
     "df",
     "diff",
@@ -489,10 +494,18 @@ where
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
     }
 
-    let output = CommandOutput {
-        stdout: crate::output::strip_ansi(&output.stdout),
-        stderr: crate::output::strip_ansi(&output.stderr),
-        ..output
+    // DB family output must NOT be ANSI-stripped: strip_ansi_escapes treats
+    // ASCII control codes (including \t = 0x09) as part of escape sequences and
+    // drops them. TSV output (mysql batch mode) would lose its tab separators,
+    // causing all DB parsers to fall through to Passthrough.
+    let output = if family == "db" {
+        output
+    } else {
+        CommandOutput {
+            stdout: crate::output::strip_ansi(&output.stdout),
+            stderr: crate::output::strip_ansi(&output.stderr),
+            ..output
+        }
     };
 
     let result = parse(&output, args);
@@ -732,6 +745,7 @@ pub(crate) fn dispatch(
         "aws" | "curl" | "docker" | "gh" | "kubectl" | "terraform" | "wget" => {
             infra::run(&prepend(subcommand, args), analytics)
         }
+        "mysql" | "psql" | "sqlite3" => db::run(&prepend(subcommand, args), analytics),
         "df" | "diff" | "du" | "env" | "find" | "grep" | "ls" | "printenv" | "ps" | "rg"
         | "tree" | "wc" => file::run(&prepend(subcommand, args), analytics),
 

@@ -71,7 +71,7 @@ fn try_parse_json_array(text: &str) -> Option<InfraResult> {
             .unwrap_or_default();
 
         let label = format!("{id} [{status}]");
-        let mut value = format!("{image}");
+        let mut value = image.to_string();
         if !ip.is_empty() {
             value.push_str(&format!(" ip={ip}"));
         }
