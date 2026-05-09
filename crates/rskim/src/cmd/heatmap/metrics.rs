@@ -445,7 +445,7 @@ pub(crate) fn compute_encapsulation(
 
         // Track files per module
         for (file, dir) in commit.files.iter().zip(file_dirs.iter()) {
-            if let Some(ref d) = dir {
+            if let Some(d) = dir {
                 module_files
                     .entry(d.clone())
                     .or_default()

@@ -617,13 +617,15 @@ mod tests {
     #[test]
     fn test_env_override_path() {
         // Use a temp path that does not exist -- detect() should return None
-        std::env::set_var("SKIM_CURSOR_DB_PATH", "/tmp/nonexistent_skim_test.vscdb");
+        // SAFETY: test-only mutation; single-threaded test environment
+        unsafe { std::env::set_var("SKIM_CURSOR_DB_PATH", "/tmp/nonexistent_skim_test.vscdb") };
         let provider = CursorProvider::detect();
         assert!(
             provider.is_none(),
             "detect() should return None for non-existent file"
         );
-        std::env::remove_var("SKIM_CURSOR_DB_PATH");
+        // SAFETY: test-only mutation; single-threaded test environment
+        unsafe { std::env::remove_var("SKIM_CURSOR_DB_PATH") };
     }
 
     #[test]

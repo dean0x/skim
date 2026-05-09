@@ -1,7 +1,7 @@
 [package]
 name = "rskim-core"
 version = "2.9.0"
-edition = "2021"
+edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "Core library for the most intelligent context optimization engine for coding agents"

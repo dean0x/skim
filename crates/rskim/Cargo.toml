@@ -1,7 +1,7 @@
 [package]
 name = "rskim"
 version = "2.9.0"
-edition = "2021"
+edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
 description = "The most intelligent context optimization engine for coding agents. Code-aware AST parsing, command rewriting, output compression."
