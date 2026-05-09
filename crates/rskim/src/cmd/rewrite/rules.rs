@@ -1,7 +1,7 @@
 //! Declarative rewrite rule table.
 //!
-//! 107 rules grouped into 7 category arrays: TEST (10), BUILD (4), GIT (7),
-//! LINT (38), PKG (18), INFRA (14), FILE_OPS (16).
+//! 122 rules grouped into 8 category arrays: TEST (10), BUILD (4), GIT (7),
+//! LINT (38), PKG (18), INFRA (26), FILE_OPS (16), DB (3).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
@@ -900,6 +900,147 @@ const INFRA_RULES: &[RewriteRule] = &[
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
     },
+    // docker compose (3-token prefix first — must precede 2-token docker rules)
+    //
+    // DESIGN NOTE: 3-token prefix rules listed first so `docker compose ps`
+    // matches before the 2-token `docker ps` rule. The engine processes rules
+    // in order, so longer prefixes take precedence when listed first.
+    RewriteRule {
+        prefix: &["docker", "compose", "ps"],
+        rewrite_to: &["skim", "docker", "compose", "ps"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["docker", "compose", "logs"],
+        rewrite_to: &["skim", "docker", "compose", "logs"],
+        skip_if_flag_prefix: &["-f", "--follow"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    // docker (2-token prefix)
+    RewriteRule {
+        prefix: &["docker", "ps"],
+        rewrite_to: &["skim", "docker", "ps"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["docker", "images"],
+        rewrite_to: &["skim", "docker", "images"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["docker", "build"],
+        rewrite_to: &["skim", "docker", "build"],
+        skip_if_flag_prefix: &["--push", "--load"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["docker", "inspect"],
+        rewrite_to: &["skim", "docker", "inspect"],
+        skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["docker", "logs"],
+        rewrite_to: &["skim", "docker", "logs"],
+        skip_if_flag_prefix: &["-f", "--follow"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    // kubectl
+    RewriteRule {
+        prefix: &["kubectl", "get"],
+        rewrite_to: &["skim", "kubectl", "get"],
+        skip_if_flag_prefix: &["-o", "--output", "-w", "--watch"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["kubectl", "describe"],
+        rewrite_to: &["skim", "kubectl", "describe"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["kubectl", "logs"],
+        rewrite_to: &["skim", "kubectl", "logs"],
+        skip_if_flag_prefix: &["-f", "--follow"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    // terraform
+    RewriteRule {
+        prefix: &["terraform", "plan"],
+        rewrite_to: &["skim", "terraform", "plan"],
+        skip_if_flag_prefix: &["-destroy"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    RewriteRule {
+        prefix: &["terraform", "apply"],
+        rewrite_to: &["skim", "terraform", "apply"],
+        skip_if_flag_prefix: &["-auto-approve", "-destroy"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+];
+
+// ============================================================================
+// DB rules (3)
+// ============================================================================
+
+const DB_RULES: &[RewriteRule] = &[
+    // psql: rewrite `psql -c "..."` → `skim psql -c "..."`
+    // Bare `psql` (interactive) is NOT rewritten — no `-c` means interactive mode.
+    RewriteRule {
+        prefix: &["psql", "-c"],
+        rewrite_to: &["skim", "psql", "-c"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Db,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    // mysql: rewrite `mysql -e "..."` → `skim mysql -e "..."`
+    // Bare `mysql` (interactive) is NOT rewritten.
+    RewriteRule {
+        prefix: &["mysql", "-e"],
+        rewrite_to: &["skim", "mysql", "-e"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Db,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
+    // sqlite3: rewrite `sqlite3 db.sqlite "..."` → `skim sqlite3 db.sqlite "..."`
+    // Skip `-interactive` flag (explicit interactive mode).
+    RewriteRule {
+        prefix: &["sqlite3"],
+        rewrite_to: &["skim", "sqlite3"],
+        skip_if_flag_prefix: &["-interactive"],
+        category: RewriteCategory::Db,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+    },
 ];
 
 // ============================================================================
@@ -1096,11 +1237,12 @@ static ALL_RULES_VEC: LazyLock<Vec<&'static RewriteRule>> = LazyLock::new(|| {
         .chain(PKG_RULES.iter())
         .chain(INFRA_RULES.iter())
         .chain(FILE_OPS_RULES.iter())
+        .chain(DB_RULES.iter())
         .collect()
 });
 
 /// Iterate over all rewrite rules in priority order: TEST → BUILD → GIT →
-/// LINT → PKG → INFRA → FILE_OPS.
+/// LINT → PKG → INFRA → FILE_OPS → DB.
 ///
 /// The engine must see longer/more-specific prefixes before shorter ones
 /// within the same leading token. Each category array maintains that invariant
@@ -1118,8 +1260,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(14) + FILE_OPS(16)
-    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 14 + 16;
+    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(26) + FILE_OPS(16) + DB(3)
+    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 26 + 16 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {
