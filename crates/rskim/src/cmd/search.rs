@@ -42,7 +42,7 @@ pub(crate) fn run(
 // ============================================================================
 
 fn print_help() {
-    eprintln!(
+    println!(
         "\
 Usage: skim search [OPTIONS] <QUERY>
 

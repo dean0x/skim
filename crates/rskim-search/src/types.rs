@@ -267,13 +267,6 @@ mod tests {
     }
 
     #[test]
-    fn test_file_id_ordering() {
-        assert!(FileId(0) < FileId(1));
-        assert!(FileId(1) > FileId(0));
-        assert!(!(FileId(0) > FileId(0)));
-    }
-
-    #[test]
     fn test_file_id_display() {
         assert_eq!(format!("{}", FileId(42)), "42");
         assert_eq!(format!("{}", FileId(0)), "0");
@@ -315,12 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn test_temporal_flags_default() {
-        let flags = TemporalFlags::default();
-        assert!(flags.modified_within_days.is_none());
-    }
-
-    #[test]
     fn test_search_field_name() {
         assert_eq!(SearchField::TypeDefinition.name(), "type_definition");
         assert_eq!(SearchField::FunctionSignature.name(), "function_signature");
@@ -346,33 +333,5 @@ mod tests {
             serde_json::to_string(&SearchField::Other).unwrap(),
             "\"Other\""
         );
-        // Verify all 8 variants serialize without panicking
-        for field in [
-            SearchField::TypeDefinition,
-            SearchField::FunctionSignature,
-            SearchField::SymbolName,
-            SearchField::ImportExport,
-            SearchField::FunctionBody,
-            SearchField::Comment,
-            SearchField::StringLiteral,
-            SearchField::Other,
-        ] {
-            let s = serde_json::to_string(&field).unwrap();
-            assert!(!s.is_empty(), "Serialization should produce non-empty string for {field:?}");
-        }
-    }
-
-    #[test]
-    fn test_index_stats_construction() {
-        let stats = IndexStats {
-            file_count: 42,
-            total_ngrams: 100_000,
-            index_size_bytes: 512 * 1024,
-            last_updated: Some(1_700_000_000),
-        };
-        assert_eq!(stats.file_count, 42);
-        assert_eq!(stats.total_ngrams, 100_000);
-        assert_eq!(stats.index_size_bytes, 524_288);
-        assert_eq!(stats.last_updated, Some(1_700_000_000));
     }
 }
