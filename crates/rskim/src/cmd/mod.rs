@@ -189,7 +189,10 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     // Infrastructure
     "aws",
     "curl",
+    "docker",
     "gh",
+    "kubectl",
+    "terraform",
     "wget",
     // File operations
     "df",
@@ -726,7 +729,9 @@ pub(crate) fn dispatch(
         "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "mypy" | "oxlint"
         | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
         "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
-        "aws" | "curl" | "gh" | "wget" => infra::run(&prepend(subcommand, args), analytics),
+        "aws" | "curl" | "docker" | "gh" | "kubectl" | "terraform" | "wget" => {
+            infra::run(&prepend(subcommand, args), analytics)
+        }
         "df" | "diff" | "du" | "env" | "find" | "grep" | "ls" | "printenv" | "ps" | "rg"
         | "tree" | "wc" => file::run(&prepend(subcommand, args), analytics),
 

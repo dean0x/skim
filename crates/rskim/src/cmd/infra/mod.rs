@@ -8,6 +8,7 @@
 
 pub(crate) mod aws;
 pub(crate) mod curl;
+pub(crate) mod docker;
 pub(crate) mod gh;
 pub(crate) mod wget;
 
@@ -19,7 +20,7 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known infra tools that the infra handler can dispatch to.
-const KNOWN_TOOLS: &[&str] = &["aws", "curl", "gh", "wget"];
+const KNOWN_TOOLS: &[&str] = &["aws", "curl", "docker", "gh", "wget"];
 
 /// Entry point for `skim <tool> [args...]` (infra handler).
 ///
@@ -52,6 +53,7 @@ pub(crate) fn run(
     match tool_name.as_str() {
         "aws" => aws::run(tool_args, &ctx),
         "curl" => curl::run(tool_args, &ctx),
+        "docker" => docker::run(tool_args, &ctx),
         "gh" => gh::run(tool_args, &ctx),
         "wget" => wget::run(tool_args, &ctx),
         _ => {
