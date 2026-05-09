@@ -126,14 +126,11 @@ fn try_parse_tabular(text: &str) -> Option<InfraResult> {
 
         let name = line[..name_end.min(line.len())].trim().to_string();
         let status = if status_start < line.len() {
-            // Status column until next column (RESTARTS)
-            let end = line.len();
-            let s = line[status_start.min(line.len())..end]
+            line[status_start.min(line.len())..]
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
-                .to_string();
-            s
+                .to_string()
         } else {
             String::new()
         };

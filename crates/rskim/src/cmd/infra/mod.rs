@@ -244,6 +244,46 @@ pub(crate) fn build_streaming_label(
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
+/// Passthrough parser — returns raw combined stdout+stderr unchanged.
+///
+/// Used as the default arm in docker and kubectl dispatch when no sub-parser
+/// matches the subcommand.
+pub(crate) fn passthrough_parse(output: &CommandOutput) -> ParseResult<InfraResult> {
+    let combined = combine_stdout_stderr(output);
+    ParseResult::Passthrough(combined.into_owned())
+}
+
+/// Inject `--format json` into args unless a format flag is already present.
+///
+/// Shared by parsers that support `--format json` (docker ps, docker images).
+/// Checks for both `--format` and `--format=<value>` forms.
+pub(crate) fn inject_format_json(args: &mut Vec<String>) {
+    let has_format = args
+        .iter()
+        .any(|a| a == "--format" || a.starts_with("--format="));
+    if !has_format {
+        args.push("--format".to_string());
+        args.push("json".to_string());
+    }
+}
+
+/// Convert a `LogResult` into an `InfraResult` for a given tool and operation.
+///
+/// Shared by docker/logs, docker/compose, and kubectl/logs so they don't each
+/// duplicate this mapping.
+pub(crate) fn log_result_to_infra(
+    log_result: crate::output::canonical::LogResult,
+    tool: &str,
+    operation: &str,
+) -> InfraResult {
+    let summary = format!("{} lines, {} unique", log_result.total_lines, log_result.unique_messages);
+    let items = vec![crate::output::canonical::InfraItem {
+        label: "log".to_string(),
+        value: log_result.to_string(),
+    }];
+    InfraResult::new(tool.to_string(), operation.to_string(), summary, items)
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================

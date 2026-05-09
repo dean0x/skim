@@ -10,7 +10,7 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::combine_stdout_stderr;
+use super::{combine_stdout_stderr, log_result_to_infra};
 
 /// Three-tier parse function for `docker compose ps` output.
 ///
@@ -86,30 +86,14 @@ pub(crate) fn parse_logs(output: &CommandOutput) -> ParseResult<InfraResult> {
 
     let flags = LogFlags::default();
     match compress_log(text, &flags) {
-        ParseResult::Full(log_result) => ParseResult::Full(compose_log_to_infra(log_result)),
+        ParseResult::Full(log_result) => {
+            ParseResult::Full(log_result_to_infra(log_result, "docker", "compose logs"))
+        }
         ParseResult::Degraded(log_result, warnings) => {
-            ParseResult::Degraded(compose_log_to_infra(log_result), warnings)
+            ParseResult::Degraded(log_result_to_infra(log_result, "docker", "compose logs"), warnings)
         }
         ParseResult::Passthrough(raw) => ParseResult::Passthrough(raw),
     }
-}
-
-fn compose_log_to_infra(log_result: crate::output::canonical::LogResult) -> InfraResult {
-    let total = log_result.total_lines;
-    let unique = log_result.unique_messages;
-    let summary = format!("{total} lines, {unique} unique");
-
-    let items = vec![InfraItem {
-        label: "log".to_string(),
-        value: log_result.to_string(),
-    }];
-
-    InfraResult::new(
-        "docker".to_string(),
-        "compose logs".to_string(),
-        summary,
-        items,
-    )
 }
 
 // ============================================================================

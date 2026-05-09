@@ -17,11 +17,11 @@ pub(crate) mod logs;
 
 use std::process::ExitCode;
 
-use crate::output::canonical::InfraResult;
-use crate::output::ParseResult;
-use crate::runner::CommandOutput;
+use super::{run_infra_tool, InfraToolConfig};
 
-use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
+/// Re-exports for sub-module use.
+pub(super) use super::combine_stdout_stderr;
+pub(super) use super::log_result_to_infra;
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "kubectl",
@@ -43,12 +43,6 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
             describe::parse_impl,
         ),
         "logs" => run_infra_tool(CONFIG, args, ctx, logs::prepare_args, logs::parse_impl),
-        _ => run_infra_tool(CONFIG, args, ctx, |_| {}, passthrough_parse),
+        _ => run_infra_tool(CONFIG, args, ctx, |_| {}, super::passthrough_parse),
     }
-}
-
-/// Passthrough parser — returns raw combined output unchanged.
-fn passthrough_parse(output: &CommandOutput) -> ParseResult<InfraResult> {
-    let combined = combine_stdout_stderr(output);
-    ParseResult::Passthrough(combined.into_owned())
 }

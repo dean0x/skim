@@ -26,14 +26,12 @@ pub(crate) mod ps;
 
 use std::process::ExitCode;
 
-use crate::output::canonical::InfraResult;
-use crate::output::ParseResult;
-use crate::runner::CommandOutput;
-
-use super::{combine_stdout_stderr as infra_combine, run_infra_tool, InfraToolConfig};
+use super::{run_infra_tool, InfraToolConfig};
 
 /// Re-export for sub-module use.
 pub(super) use super::combine_stdout_stderr;
+pub(super) use super::inject_format_json;
+pub(super) use super::log_result_to_infra;
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "docker",
@@ -64,15 +62,6 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
         ("logs", _) => run_infra_tool(CONFIG, args, ctx, logs::prepare_args, logs::parse_impl),
         ("compose", "ps") => run_infra_tool(CONFIG, args, ctx, |_| {}, compose::parse_ps),
         ("compose", "logs") => run_infra_tool(CONFIG, args, ctx, |_| {}, compose::parse_logs),
-        _ => {
-            // Passthrough: run the command unchanged, emit raw output
-            run_infra_tool(CONFIG, args, ctx, |_| {}, passthrough_parse)
-        }
+        _ => run_infra_tool(CONFIG, args, ctx, |_| {}, super::passthrough_parse),
     }
-}
-
-/// Passthrough parser — returns raw combined output unchanged.
-fn passthrough_parse(output: &CommandOutput) -> ParseResult<InfraResult> {
-    let combined = infra_combine(output);
-    ParseResult::Passthrough(combined.into_owned())
 }

@@ -14,7 +14,7 @@ use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::combine_stdout_stderr;
+use super::{combine_stdout_stderr, inject_format_json};
 
 /// Matches the `docker images` tabular header line.
 static RE_IMAGES_HEADER: LazyLock<Regex> =
@@ -22,13 +22,7 @@ static RE_IMAGES_HEADER: LazyLock<Regex> =
 
 /// Inject `--format json` unless the user already specified a format.
 pub(crate) fn prepare_args(args: &mut Vec<String>) {
-    let has_format = args
-        .iter()
-        .any(|a| a == "--format" || a.starts_with("--format="));
-    if !has_format {
-        args.push("--format".to_string());
-        args.push("json".to_string());
-    }
+    inject_format_json(args);
 }
 
 /// Three-tier parse function for `docker images` output.

@@ -9,11 +9,11 @@
 //! the rendered log summary text as the InfraResult value.
 
 use crate::cmd::log::{compress_log, LogFlags};
-use crate::output::canonical::{InfraItem, InfraResult};
+use crate::output::canonical::InfraResult;
 use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
-use super::combine_stdout_stderr;
+use super::{combine_stdout_stderr, log_result_to_infra};
 
 /// No-op: `docker logs` has no `--format` flag.
 ///
@@ -38,27 +38,13 @@ pub(crate) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     let flags = LogFlags::default();
     match compress_log(text, &flags) {
         ParseResult::Full(log_result) => {
-            ParseResult::Full(log_result_to_infra(log_result, "docker"))
+            ParseResult::Full(log_result_to_infra(log_result, "docker", "logs"))
         }
         ParseResult::Degraded(log_result, warnings) => {
-            ParseResult::Degraded(log_result_to_infra(log_result, "docker"), warnings)
+            ParseResult::Degraded(log_result_to_infra(log_result, "docker", "logs"), warnings)
         }
         ParseResult::Passthrough(raw) => ParseResult::Passthrough(raw),
     }
-}
-
-/// Convert a `LogResult` into an `InfraResult` for the docker tool.
-fn log_result_to_infra(log_result: crate::output::canonical::LogResult, tool: &str) -> InfraResult {
-    let total = log_result.total_lines;
-    let unique = log_result.unique_messages;
-    let summary = format!("{total} lines, {unique} unique");
-
-    let items = vec![InfraItem {
-        label: "log".to_string(),
-        value: log_result.to_string(),
-    }];
-
-    InfraResult::new(tool.to_string(), "logs".to_string(), summary, items)
 }
 
 // ============================================================================

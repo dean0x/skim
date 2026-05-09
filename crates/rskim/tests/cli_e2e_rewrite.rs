@@ -1773,3 +1773,13 @@ fn test_rewrite_psql_bare_no_rewrite() {
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
 }
+
+#[test]
+fn test_rewrite_mysql_bare_no_rewrite() {
+    // Bare `mysql` without -e has no rule → no rewrite (batch-mode-only safety)
+    skim_cmd()
+        .args(["rewrite", "--suggest", "mysql"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
