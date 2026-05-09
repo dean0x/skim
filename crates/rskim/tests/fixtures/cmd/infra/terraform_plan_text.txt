@@ -1,0 +1,32 @@
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+  ~ update in-place
+  - destroy
+
+Terraform will perform the following actions:
+
+  # aws_instance.web_server will be created
+  + resource "aws_instance" "web_server" {
+      + ami           = "ami-0c94855ba95c71c99"
+      + instance_type = "t3.micro"
+    }
+
+  # aws_security_group.web_sg will be created
+  + resource "aws_security_group" "web_sg" {
+      + name        = "web-security-group"
+      + description = "Security group for web server"
+    }
+
+  # aws_s3_bucket.data will be updated in-place
+  ~ resource "aws_s3_bucket" "data" {
+      ~ tags = {
+          + "Environment" = "production"
+        }
+    }
+
+Plan: 2 to add, 1 to change, 0 to destroy.
+
+Note: You didn't use the -out option to save this plan, so Terraform can't
+guarantee to take exactly these actions if you run "terraform apply" now.
