@@ -190,12 +190,11 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
         }
 
         // Try run header
-        if summary.is_empty() {
-            if let Some(caps) = RE_GH_RUN_HEADER.captures(line) {
+        if summary.is_empty()
+            && let Some(caps) = RE_GH_RUN_HEADER.captures(line) {
                 summary = format!("#{}: {}", &caps[2], &caps[1]);
                 continue;
             }
-        }
 
         // Try job line
         if let Some(caps) = RE_GH_RUN_JOB.captures(line) {

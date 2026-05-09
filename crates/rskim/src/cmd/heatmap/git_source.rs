@@ -223,11 +223,10 @@ pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord
         } else {
             // Numstat line: additions\tdeletions\tpath
             // Binary files: - - path
-            if let Some(record) = current.as_mut() {
-                if let Some(file_change) = parse_numstat_line(line) {
+            if let Some(record) = current.as_mut()
+                && let Some(file_change) = parse_numstat_line(line) {
                     record.files.push(file_change);
                 }
-            }
         }
     }
 
@@ -274,8 +273,8 @@ fn parse_numstat_line(line: &str) -> Option<FileChange> {
 /// Resolve a git rename path like `{old => new}` or `dir/{old => new}/file`.
 fn resolve_rename(raw: &str) -> String {
     // Find `{...}` brace pair
-    if let (Some(open), Some(close)) = (raw.find('{'), raw.rfind('}')) {
-        if open < close {
+    if let (Some(open), Some(close)) = (raw.find('{'), raw.rfind('}'))
+        && open < close {
             let prefix = &raw[..open];
             let suffix = &raw[close + 1..];
             let inner = &raw[open + 1..close];
@@ -286,7 +285,6 @@ fn resolve_rename(raw: &str) -> String {
                 return format!("{prefix}{new_part}{suffix}");
             }
         }
-    }
     raw.to_string()
 }
 

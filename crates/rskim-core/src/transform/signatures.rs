@@ -152,13 +152,13 @@ fn collect_signatures_with_kinds_and_lines(
 
     let kind = node.kind();
 
-    if is_signature_node(kind, node_types) {
-        if let Some(sig) = extract_signature(node, source, node_types)? {
-            let static_kind = to_static_node_kind(kind);
-            // 1-indexed source line where this signature starts
-            let source_start_line = node.start_position().row + 1;
-            signatures.push((sig, static_kind, source_start_line));
-        }
+    if is_signature_node(kind, node_types)
+        && let Some(sig) = extract_signature(node, source, node_types)?
+    {
+        let static_kind = to_static_node_kind(kind);
+        // 1-indexed source line where this signature starts
+        let source_start_line = node.start_position().row + 1;
+        signatures.push((sig, static_kind, source_start_line));
     }
 
     let mut cursor = node.walk();

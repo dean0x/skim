@@ -77,11 +77,10 @@ fn collect_codex_files(
             }
 
             // Symlink traversal guard
-            if let Ok(canonical_path) = path.canonicalize() {
-                if !canonical_path.starts_with(canonical_root) {
+            if let Ok(canonical_path) = path.canonicalize()
+                && !canonical_path.starts_with(canonical_root) {
                     continue;
                 }
-            }
 
             if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
                 results.push((path, modified));

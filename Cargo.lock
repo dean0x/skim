@@ -1169,6 +1169,7 @@ dependencies = [
  "rayon",
  "regex",
  "rskim-core",
+ "rskim-search",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1206,6 +1207,17 @@ dependencies = [
  "tree-sitter-sequel",
  "tree-sitter-swift",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "rskim-search"
+version = "0.1.0"
+dependencies = [
+ "rskim-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tree-sitter",
 ]
 
 [[package]]

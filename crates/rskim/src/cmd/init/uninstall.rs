@@ -121,8 +121,8 @@ fn run_uninstall_for_agent(
     }
 
     // Integrity check (#57): warn if hook script has been modified since install
-    if script_exists {
-        if let Ok(false) = crate::cmd::integrity::verify_script_integrity(
+    if script_exists
+        && let Ok(false) = crate::cmd::integrity::verify_script_integrity(
             &config_dir,
             agent.cli_name(),
             &hook_script_path,
@@ -135,7 +135,6 @@ fn run_uninstall_for_agent(
             // --force provided: proceed despite tamper, but inform user
             eprintln!("warning: hook script has been modified (proceeding with --force)");
         }
-    }
 
     // Interactive confirmation
     if !flags.yes {

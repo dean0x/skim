@@ -183,11 +183,9 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     if let Some(sid) = session_id
         .as_deref()
         .filter(|sid| crate::analytics::is_safe_session_id(sid))
-    {
-        if let Some(dir) = crate::cmd::resolve_cache_dir() {
+        && let Some(dir) = crate::cmd::resolve_cache_dir() {
             crate::cmd::session_sidecar::write_session_id(sid, &dir);
         }
-    }
 
     // If already starts with "skim " — already rewritten, passthrough
     if command.starts_with("skim ") {
@@ -270,11 +268,10 @@ fn resolve_hook_config_dir(agent: AgentKind) -> Option<std::path::PathBuf> {
 /// Updates the stamp file as a side effect.
 pub(super) fn should_warn_today(stamp_path: &std::path::Path) -> bool {
     let today = today_date_string();
-    if let Ok(contents) = std::fs::read_to_string(stamp_path) {
-        if contents.trim() == today {
+    if let Ok(contents) = std::fs::read_to_string(stamp_path)
+        && contents.trim() == today {
             return false;
         }
-    }
     let _ = std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
     let _ = std::fs::write(stamp_path, &today);
     true
@@ -382,8 +379,8 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
 
     // Rotate if the log exceeds the size limit (best-effort).
     // Shift scheme: delete .3, rename .2 -> .3, .1 -> .2, current -> .1.
-    if let Ok(meta) = std::fs::metadata(&log_path) {
-        if meta.len() >= AUDIT_LOG_MAX_BYTES {
+    if let Ok(meta) = std::fs::metadata(&log_path)
+        && meta.len() >= AUDIT_LOG_MAX_BYTES {
             for i in (1..AUDIT_LOG_MAX_ARCHIVES).rev() {
                 let from = audit_archive_path(&log_path, i);
                 let to = audit_archive_path(&log_path, i + 1);
@@ -392,7 +389,6 @@ fn audit_hook(original: &str, matched: bool, rewritten: &str) {
             let archive_1 = audit_archive_path(&log_path, 1);
             let _ = std::fs::rename(&log_path, &archive_1);
         }
-    }
 
     // Build JSON line
     let entry = serde_json::json!({

@@ -25,6 +25,7 @@ mod pkg;
 mod rewrite;
 mod session;
 pub(crate) mod session_sidecar;
+mod search;
 mod stats;
 mod test;
 pub(crate) mod ux;
@@ -161,6 +162,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "learn",
     "log",
     "rewrite",
+    "search",
     "stats",
     // Multi-category dispatchers
     "cargo",
@@ -740,6 +742,7 @@ pub(crate) fn dispatch(
         "learn" => learn::run(args, analytics),
         "log" => log::run(args, analytics),
         "rewrite" => rewrite::run(args, analytics),
+        "search" => search::run(args, analytics),
         "stats" => stats::run(args, analytics),
 
         // Multi-category dispatchers

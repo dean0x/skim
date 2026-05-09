@@ -551,12 +551,11 @@ fn strip_python_self_param(
                 let mut inner_cursor = child.walk();
                 // Binding required: the iterator borrows `inner_cursor`, and without
                 // a named binding the temporary outlives the mutable borrow (E0597).
-                let found = child
+                child
                     .children(&mut inner_cursor)
                     .next()
                     .and_then(|first_child| first_child.utf8_text(source_bytes).ok())
-                    .is_some_and(|t| matches!(t, "self" | "cls"));
-                found
+                    .is_some_and(|t| matches!(t, "self" | "cls"))
             }
             _ => false,
         };
@@ -578,14 +577,14 @@ fn extend_past_trailing_comma(
     index: usize,
     source_bytes: &[u8],
 ) -> usize {
-    if let Some(next) = children.get(index + 1) {
-        if next.kind() == "," {
-            let comma_end = next.end_byte();
-            if comma_end < source_bytes.len() && source_bytes[comma_end] == b' ' {
-                return comma_end + 1;
-            }
-            return comma_end;
+    if let Some(next) = children.get(index + 1)
+        && next.kind() == ","
+    {
+        let comma_end = next.end_byte();
+        if comma_end < source_bytes.len() && source_bytes[comma_end] == b' ' {
+            return comma_end + 1;
         }
+        return comma_end;
     }
     end
 }

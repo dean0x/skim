@@ -122,11 +122,10 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
             .and_then(|arr| {
                 arr.iter().find_map(|entry| {
                     // Try to get GHSA from the url field.
-                    if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
-                        if let Some(caps) = RE_GHSA.captures(url) {
+                    if let Some(url) = entry.get("url").and_then(|u| u.as_str())
+                        && let Some(caps) = RE_GHSA.captures(url) {
                             return Some(caps[1].to_string());
                         }
-                    }
                     // Fall back to numeric source → NPM-{source}.
                     entry
                         .get("source")

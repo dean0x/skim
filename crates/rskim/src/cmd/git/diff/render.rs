@@ -107,11 +107,10 @@ pub(in crate::cmd::git) fn render_diff_file(
 
     // Obtain a cached parser from the thread-local pool and attempt AST rendering.
     let ast_result = PARSERS.with_borrow_mut(|cache| {
-        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(lang) {
-            if let Ok(p) = rskim_core::Parser::new(lang) {
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(lang)
+            && let Ok(p) = rskim_core::Parser::new(lang) {
                 e.insert(p);
             }
-        }
         let parser = cache.get_mut(&lang)?;
         try_ast_render(file_diff, global_flags, args, diff_mode, parser, ln_width)
     });
@@ -213,13 +212,11 @@ fn render_changed_only(
 
     for (idx, range) in changed_ranges.iter().enumerate() {
         // Emit parent header if this is a nested node
-        if let Some(ref ctx) = range.parent_context {
-            if emitted_parent_headers.insert(ctx.header_line) {
-                if let Some(line) = source_lines.get(ctx.header_line - 1) {
+        if let Some(ref ctx) = range.parent_context
+            && emitted_parent_headers.insert(ctx.header_line)
+                && let Some(line) = source_lines.get(ctx.header_line - 1) {
                     let _ = writeln!(output, " {:>ln_width$} {line}", ctx.header_line);
                 }
-            }
-        }
 
         // Clip the render range to exclude parent boundary lines that are
         // emitted separately (header above, close brace below).  When a
@@ -259,11 +256,10 @@ fn render_changed_only(
             let is_last = last_index_for_parent
                 .get(&ctx.header_line)
                 .is_some_and(|&last_idx| last_idx == idx);
-            if is_last {
-                if let Some(line) = source_lines.get(ctx.close_line - 1) {
+            if is_last
+                && let Some(line) = source_lines.get(ctx.close_line - 1) {
                     let _ = writeln!(output, " {:>ln_width$} {line}", ctx.close_line);
                 }
-            }
         }
     }
 }
@@ -403,11 +399,10 @@ fn render_container_with_mode(
     }
 
     // Emit closing brace
-    if node_end > node_start {
-        if let Some(line) = ctx.source_lines.get(node_end - 1) {
+    if node_end > node_start
+        && let Some(line) = ctx.source_lines.get(node_end - 1) {
             let _ = writeln!(output, " {:>ln_width$} {line}", node_end);
         }
-    }
 }
 
 /// Render an unchanged node at the appropriate mode level.

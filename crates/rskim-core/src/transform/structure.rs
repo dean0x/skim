@@ -295,12 +295,12 @@ fn collect_body_replacements(
     let kind = node.kind();
 
     // Check if this is a function/method with a body
-    if matches_function_node(kind, node_types) {
-        if let Some(body) = find_body_node(node) {
-            let start = body.start_byte();
-            let end = body.end_byte();
-            replacements.insert((start, end), " {...}");
-        }
+    if matches_function_node(kind, node_types)
+        && let Some(body) = find_body_node(node)
+    {
+        let start = body.start_byte();
+        let end = body.end_byte();
+        replacements.insert((start, end), " {...}");
     }
 
     // Recursively process children with incremented depth

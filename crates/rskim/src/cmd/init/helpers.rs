@@ -33,11 +33,10 @@ pub(crate) fn resolve_config_dir_for_agent(
     }
 
     // Check agent-specific env override
-    if agent == AgentKind::ClaudeCode {
-        if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+    if agent == AgentKind::ClaudeCode
+        && let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
             return Ok(PathBuf::from(dir));
         }
-    }
 
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;

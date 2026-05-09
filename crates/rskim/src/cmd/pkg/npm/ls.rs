@@ -67,8 +67,8 @@ fn try_parse_ls_json(stdout: &str) -> Option<PkgResult> {
     for (name, dep) in deps {
         let version = dep.get("version").and_then(|v| v.as_str()).unwrap_or("?");
 
-        if let Some(problems) = dep.get("problems").and_then(|v| v.as_array()) {
-            if !problems.is_empty() {
+        if let Some(problems) = dep.get("problems").and_then(|v| v.as_array())
+            && !problems.is_empty() {
                 flagged += 1;
                 for problem in problems {
                     if let Some(msg) = problem.as_str() {
@@ -76,7 +76,6 @@ fn try_parse_ls_json(stdout: &str) -> Option<PkgResult> {
                     }
                 }
             }
-        }
     }
 
     Some(PkgResult::new(

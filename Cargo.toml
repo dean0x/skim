@@ -2,6 +2,7 @@
 members = [
     "crates/rskim-core",
     "crates/rskim",
+    "crates/rskim-search",
 ]
 resolver = "2"
 

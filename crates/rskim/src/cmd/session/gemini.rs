@@ -60,15 +60,14 @@ impl SessionProvider for GeminiCliProvider {
             }
 
             // Verify resolved path stays within the gemini directory (symlink traversal guard)
-            if let Ok(canonical_path) = path.canonicalize() {
-                if !canonical_path.starts_with(&canonical_root) {
+            if let Ok(canonical_path) = path.canonicalize()
+                && !canonical_path.starts_with(&canonical_root) {
                     eprintln!(
                         "warning: skipping file outside gemini dir: {}",
                         path.display()
                     );
                     continue;
                 }
-            }
 
             let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
                 Ok(t) => t,
@@ -83,11 +82,10 @@ impl SessionProvider for GeminiCliProvider {
             };
 
             // Apply time filter
-            if let Some(since) = filter.since {
-                if modified < since {
+            if let Some(since) = filter.since
+                && modified < since {
                     continue;
                 }
-            }
 
             let session_id = path
                 .file_stem()

@@ -185,12 +185,10 @@ fn cleanup_stale_rate_limited(sessions_dir: &Path) {
                 .duration_since(mtime)
                 .unwrap_or(Duration::MAX)
         })
-    {
-        if age < CLEANUP_RATE_LIMIT {
+        && age < CLEANUP_RATE_LIMIT {
             // Cleaned up recently — skip.
             return;
         }
-    }
 
     cleanup_stale(sessions_dir);
 

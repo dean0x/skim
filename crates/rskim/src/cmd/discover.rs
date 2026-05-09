@@ -215,8 +215,8 @@ fn analyze_invocations(
                     // Accumulate non-rewritable prefix counts when debug is enabled.
                     // Responsibility lives in the caller, not classify_bash_command,
                     // so the classification function stays pure and easily testable.
-                    if let Some(ref mut counts) = non_rewritable_counts {
-                        if !info.has_rewrite {
+                    if let Some(ref mut counts) = non_rewritable_counts
+                        && !info.has_rewrite {
                             let prefix: String = command
                                 .split_whitespace()
                                 .take(3)
@@ -226,7 +226,6 @@ fn analyze_invocations(
                                 *counts.entry(prefix).or_insert(0) += 1;
                             }
                         }
-                    }
                     bash_commands.push(info);
                 }
             }

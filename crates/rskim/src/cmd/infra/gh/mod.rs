@@ -164,11 +164,10 @@ pub(crate) fn parse_impl_with_auto_detect(output: &CommandOutput) -> ParseResult
 
     // JSON object — auto-detect by discriminating fields
     if trimmed.starts_with('{') && trimmed.len() <= MAX_JSON_BYTES {
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(result) = try_parse_view_json_auto(&obj) {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && let Some(result) = try_parse_view_json_auto(&obj) {
                 return ParseResult::Full(result);
             }
-        }
         // Unknown JSON object shape → passthrough (e.g., gh api responses)
         let combined = combine_stdout_stderr(output);
         return ParseResult::Passthrough(combined.into_owned());

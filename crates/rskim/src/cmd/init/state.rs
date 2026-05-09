@@ -56,8 +56,8 @@ pub(super) fn detect_state(
     let mut hook_version = None;
 
     let parsed_settings = read_settings_json(&settings_path);
-    if let Some(ref json) = parsed_settings {
-        if let Some(arr) = json
+    if let Some(ref json) = parsed_settings
+        && let Some(arr) = json
             .get("hooks")
             .and_then(|h| h.get(protocol.hook_event_key()))
             .and_then(|v| v.as_array())
@@ -73,7 +73,6 @@ pub(super) fn detect_state(
                 }
             }
         }
-    }
 
     // Scan for existing non-skim hooks (plugin collision detection)
     let existing_hooks = scan_existing_hooks(

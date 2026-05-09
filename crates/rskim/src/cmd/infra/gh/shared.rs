@@ -162,12 +162,11 @@ pub fn parse_view_text(text: &str, operation: &str) -> Option<InfraResult> {
         if line.is_empty() {
             continue;
         }
-        if summary.is_empty() {
-            if let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
+        if summary.is_empty()
+            && let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
                 summary = format!("#{}: {}", &caps[2], &caps[1]);
                 continue;
             }
-        }
         if let Some(caps) = RE_GH_VIEW_FIELD.captures(line) {
             items.push(InfraItem {
                 label: caps[1].to_lowercase(),
@@ -290,11 +289,10 @@ where
     let trimmed = output.stdout.trim();
 
     // Tier 1: JSON
-    if is_json_input(trimmed) && trimmed.len() <= MAX_JSON_BYTES {
-        if let Some(result) = try_json(trimmed) {
+    if is_json_input(trimmed) && trimmed.len() <= MAX_JSON_BYTES
+        && let Some(result) = try_json(trimmed) {
             return ParseResult::Full(result);
         }
-    }
 
     let combined = combine_stdout_stderr(output);
 

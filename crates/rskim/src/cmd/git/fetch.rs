@@ -184,15 +184,14 @@ fn classify_lines<'a>(lines: impl Iterator<Item = &'a str>) -> FetchCategories {
         }
 
         // Regular update (abc..def ref -> origin/ref)
-        if trimmed.contains("->") && (trimmed.contains("..") || trimmed.contains("...")) {
-            if let Some(name) = extract_updated_ref(trimmed) {
+        if trimmed.contains("->") && (trimmed.contains("..") || trimmed.contains("..."))
+            && let Some(name) = extract_updated_ref(trimmed) {
                 if let Some(ref sub) = current_submodule {
                     cats.add_submodule_entry(sub, format!("updated: {name}"));
                 } else {
                     cats.updated.push(name);
                 }
             }
-        }
     }
 
     cats

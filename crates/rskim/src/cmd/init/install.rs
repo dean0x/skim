@@ -412,8 +412,8 @@ fn remove_skim_entries_from_event(settings: &mut serde_json::Value, event_key: &
         return false;
     };
 
-    if let Some(hooks_obj) = obj.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        if let Some(arr) = hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
+    if let Some(hooks_obj) = obj.get_mut("hooks").and_then(|h| h.as_object_mut())
+        && let Some(arr) = hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
             let before = arr.len();
             arr.retain(|entry| !has_skim_hook_entry(entry));
             let removed = arr.len() < before;
@@ -425,7 +425,6 @@ fn remove_skim_entries_from_event(settings: &mut serde_json::Value, event_key: &
             }
             return removed;
         }
-    }
     false
 }
 
@@ -586,8 +585,8 @@ fn resolve_instruction_path(
 /// Returns `Ok(None)` when the file should be skipped (too large or unreadable),
 /// which is treated as a soft warning rather than a hard error.
 fn read_existing_safely(path: &std::path::Path) -> anyhow::Result<Option<String>> {
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_INSTRUCTION_FILE_SIZE {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_INSTRUCTION_FILE_SIZE {
             eprintln!(
                 "  warning: {} is too large ({} bytes), skipping guidance",
                 path.display(),
@@ -595,7 +594,6 @@ fn read_existing_safely(path: &std::path::Path) -> anyhow::Result<Option<String>
             );
             return Ok(None);
         }
-    }
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
         Err(e) => {
@@ -841,13 +839,12 @@ fn clean_legacy_cursorrules() -> anyhow::Result<()> {
     }
     // S2: apply resolve_real_settings_path so symlinks are handled consistently
     let legacy = super::helpers::resolve_real_settings_path(&legacy)?;
-    if let Ok(content) = std::fs::read_to_string(&legacy) {
-        if let Some(cleaned) = strip_skim_section(&content) {
+    if let Ok(content) = std::fs::read_to_string(&legacy)
+        && let Some(cleaned) = strip_skim_section(&content) {
             // Leave the file in place even when cleaned is empty (user may own it).
             atomic_write_stripped(&legacy, &cleaned)?;
             println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
         }
-    }
     Ok(())
 }
 

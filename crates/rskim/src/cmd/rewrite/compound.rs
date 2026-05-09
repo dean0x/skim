@@ -276,8 +276,8 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
         }
 
         // Only recognise operators at the top-level (paren depth 0).
-        if paren_depth == 0 {
-            if let Some((op, advance)) = scan_operator(&chars, i, len) {
+        if paren_depth == 0
+            && let Some((op, advance)) = scan_operator(&chars, i, len) {
                 push_segment(
                     input,
                     &byte_offsets,
@@ -291,7 +291,6 @@ pub(super) fn split_compound(input: &str) -> CompoundSplitResult {
                 current_start = byte_offsets[i.min(len)];
                 continue;
             }
-        }
 
         i += 1;
     }

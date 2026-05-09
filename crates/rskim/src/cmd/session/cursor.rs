@@ -80,11 +80,10 @@ impl SessionProvider for CursorProvider {
 
         // Apply time filter against the database file's mtime (we cannot
         // reliably get per-session timestamps from the KV table).
-        if let Some(since) = filter.since {
-            if file_modified < since {
+        if let Some(since) = filter.since
+            && file_modified < since {
                 return Ok(Vec::new());
             }
-        }
 
         let mut sessions: Vec<SessionFile> = rows
             .into_iter()

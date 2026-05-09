@@ -84,8 +84,8 @@ pub(super) fn collect_hunks<'a>(lines: &[&'a str], start: usize) -> (Vec<DiffHun
     while i < lines.len() && !lines[i].starts_with("diff --git ") {
         let line = lines[i];
 
-        if line.starts_with("@@") {
-            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
+        if line.starts_with("@@")
+            && let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
                 let mut patch_lines: Vec<&'a str> = Vec::new();
                 i += 1;
 
@@ -114,7 +114,6 @@ pub(super) fn collect_hunks<'a>(lines: &[&'a str], start: usize) -> (Vec<DiffHun
                 });
                 continue;
             }
-        }
         i += 1;
     }
 
