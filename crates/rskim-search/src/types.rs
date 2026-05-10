@@ -478,11 +478,7 @@ mod tests {
             let serde_str = serde_json::to_string(&v).unwrap();
             // serde wraps in quotes; name() does not
             let serde_inner = serde_str.trim_matches('"');
-            assert_eq!(
-                serde_inner,
-                v.name(),
-                "serde and name() disagree for {v:?}"
-            );
+            assert_eq!(serde_inner, v.name(), "serde and name() disagree for {v:?}");
         }
     }
 
