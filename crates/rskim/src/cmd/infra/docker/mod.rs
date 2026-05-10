@@ -39,10 +39,17 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     install_hint: "Install Docker: https://docs.docker.com/get-docker/",
 };
 
+/// Global docker flags that accept a value in the following token.
+///
+/// Used by [`super::find_subcommand_index`] to skip global flags before the
+/// actual subcommand when dispatching (e.g. `docker --host tcp://h:2376 ps`).
+const DOCKER_VALUE_FLAGS: &[&str] = &["--host", "-H", "--context", "--config", "--log-level", "-l"];
+
 /// Run `skim docker [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
-    let action = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let sub_idx = super::find_subcommand_index(args, DOCKER_VALUE_FLAGS);
+    let subcmd = args.get(sub_idx).map(|s| s.as_str()).unwrap_or("");
+    let action = args.get(sub_idx + 1).map(|s| s.as_str()).unwrap_or("");
 
     match (subcmd, action) {
         ("ps", _) | ("container", "ls") => {

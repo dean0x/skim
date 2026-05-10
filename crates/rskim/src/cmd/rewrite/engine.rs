@@ -101,14 +101,59 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
     let mut skipped = false;
 
     for rule in rules::all_rules() {
-        if before_sep.len() < rule.prefix.len() {
-            continue;
-        }
-        if before_sep[..rule.prefix.len()] != *rule.prefix {
+        // --- Primary match path: strict prefix match (fast path) ---
+        let strict_match = before_sep.len() >= rule.prefix.len()
+            && before_sep[..rule.prefix.len()] == *rule.prefix;
+
+        // --- Secondary match path: global-flag-aware match ---
+        //
+        // When a rule has `global_value_flags`, also try matching `prefix[0]`
+        // at position 0, then skipping global flags in the remaining tokens to
+        // find the subcommand.  This handles `kubectl -n ns get pods` where
+        // global flags appear between the binary name and the subcommand.
+        //
+        // Only attempted when strict_match fails AND global_value_flags is non-empty,
+        // so it adds zero overhead to rules that don't use it.
+        let global_middle: Option<&[&str]>;
+        let matched = if strict_match {
+            global_middle = None;
+            true
+        } else if !rule.global_value_flags.is_empty()
+            && !rule.prefix.is_empty()
+            && !before_sep.is_empty()
+            && before_sep[0] == rule.prefix[0]
+        {
+            // Skip global value flags starting from position 1 to find the subcommand.
+            let skip = find_subcommand_in_tokens(&before_sep[1..], rule.global_value_flags);
+            let sub_start = 1 + skip;
+            let remaining = &before_sep[sub_start..];
+            // Check that the remaining prefix elements (all except prefix[0])
+            // match at the subcommand position.
+            let suffix_prefix = &rule.prefix[1..];
+            if remaining.len() >= suffix_prefix.len()
+                && remaining[..suffix_prefix.len()] == *suffix_prefix
+            {
+                global_middle = Some(&remaining[suffix_prefix.len()..]);
+                true
+            } else {
+                global_middle = None;
+                false
+            }
+        } else {
+            global_middle = None;
+            false
+        };
+
+        if !matched {
             continue;
         }
 
-        let middle = &before_sep[rule.prefix.len()..];
+        // `middle` is the tokens after the prefix match (used for skip checks).
+        let middle: &[&str] = if strict_match {
+            &before_sep[rule.prefix.len()..]
+        } else {
+            global_middle.unwrap_or(&[])
+        };
 
         if should_skip_by_flag(middle, rule.skip_if_flag_prefix) {
             // Skip this rule but continue iterating so a catch-all rule can
@@ -127,6 +172,28 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
             continue;
         }
 
+        // Fix 4: require_flag guard — at least one of the required flags must
+        // be present somewhere after the prefix.  Used to distinguish
+        // `psql -c "SQL"` (batch, safe to rewrite) from `psql -h host -d db`
+        // (interactive, must not rewrite).
+        if !rule.require_flag.is_empty() {
+            let all_tokens_after_cmd = if strict_match {
+                middle
+            } else {
+                // For global-flag-aware matches, search in the full set of
+                // tokens after prefix[0] so flags before the subcommand are
+                // also considered.
+                &before_sep[1..]
+            };
+            let has_required = all_tokens_after_cmd
+                .iter()
+                .any(|tok| rule.require_flag.iter().any(|f| tok == f));
+            if !has_required {
+                skipped = true;
+                continue;
+            }
+        }
+
         if skipped {
             // A more-specific rule was skipped by its flag — no rewrite.
             // Report this rule's pipe exclusion flag so pipe-context callers
@@ -138,18 +205,38 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
         }
 
         // Normal match — build rewrite output.
-        let output: Vec<String> = env_vars
-            .iter()
-            .chain(rule.rewrite_to.iter())
-            .map(|s| s.to_string())
-            .chain(toolchain.map(String::from))
-            .chain(
-                middle
-                    .iter()
-                    .chain(separator_and_after.iter())
-                    .map(|s| s.to_string()),
-            )
-            .collect();
+        // For global-flag matches, preserve the original token order so that
+        // global flags remain in the output (e.g. `kubectl -n ns get pods`
+        // → `skim kubectl -n ns get pods`).
+        let output: Vec<String> = if strict_match {
+            env_vars
+                .iter()
+                .chain(rule.rewrite_to.iter())
+                .map(|s| s.to_string())
+                .chain(toolchain.map(String::from))
+                .chain(
+                    middle
+                        .iter()
+                        .chain(separator_and_after.iter())
+                        .map(|s| s.to_string()),
+                )
+                .collect()
+        } else {
+            // Global-flag match: emit rewrite_to[0] (the `skim` token) +
+            // all original tokens (binary name + global flags + subcommand +
+            // subcommand args) so that global flags are preserved in their
+            // original positions.
+            env_vars
+                .iter()
+                .map(|s| s.to_string())
+                .chain(std::iter::once(rule.rewrite_to[0].to_string()))
+                .chain(toolchain.map(String::from))
+                // Emit the full original before_sep: binary name, global flags,
+                // subcommand, and any remaining args.
+                .chain(before_sep.iter().map(|s| s.to_string()))
+                .chain(separator_and_after.iter().map(|s| s.to_string()))
+                .collect()
+        };
 
         return TableMatchResult {
             rewrite: Some(RewriteResult {
@@ -166,6 +253,42 @@ pub(super) fn try_table_match_full(tokens: &[&str]) -> TableMatchResult {
         rewrite: custom,
         pipe_excluded: false,
     }
+}
+
+/// Skip global flags in a token slice to find the subcommand index.
+///
+/// Returns the index (within `tokens`) of the first non-flag token.  Tokens
+/// listed in `value_flags` are treated as value-consuming: the flag and the
+/// immediately following token are both skipped.  Tokens that start with `--`
+/// and contain `=` are treated as self-contained `--flag=value` tokens and
+/// skipped without consuming an extra token.  All other flag tokens (start
+/// with `-`) are skipped as boolean flags.
+///
+/// Used for global-flag-aware rewrite matching (Fix 3, rules with
+/// `global_value_flags`).
+fn find_subcommand_in_tokens(tokens: &[&str], value_flags: &[&str]) -> usize {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        let tok = tokens[idx];
+        // Self-contained `--flag=value` form — skip, no extra token.
+        if tok.starts_with("--") && tok.contains('=') {
+            idx += 1;
+            continue;
+        }
+        // Value-consuming flag — skip flag + following value token.
+        if value_flags.contains(&tok) {
+            idx += 2;
+            continue;
+        }
+        // Boolean flag — skip without consuming a value.
+        if tok.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        // Non-flag token: this is the subcommand position.
+        return idx;
+    }
+    tokens.len()
 }
 
 /// Return `true` if any env-var token is `SKIM_PASSTHROUGH` with a truthy value.

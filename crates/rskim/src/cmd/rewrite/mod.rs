@@ -335,9 +335,38 @@ pub(crate) fn run(
     _analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     // Handle --help / -h
-    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        print_help();
-        return Ok(ExitCode::SUCCESS);
+    //
+    // `-h` is only treated as a help request when it appears before any
+    // positional (non-flag) token.  Once a positional token is seen the
+    // remaining tokens belong to the command being rewritten — e.g.
+    // `skim rewrite --suggest psql -h localhost` must NOT print help.
+    {
+        let mut saw_positional = false;
+        let mut want_help = false;
+        for a in args {
+            match a.as_str() {
+                "--help" => {
+                    want_help = true;
+                    break;
+                }
+                "-h" if !saw_positional => {
+                    want_help = true;
+                    break;
+                }
+                // Known rewrite own-flags that take no value — skip them.
+                "--suggest" | "--hook" => {}
+                // Any other non-flag token is a positional (the start of the
+                // command being rewritten).
+                s if !s.starts_with('-') => {
+                    saw_positional = true;
+                }
+                _ => {}
+            }
+        }
+        if want_help {
+            print_help();
+            return Ok(ExitCode::SUCCESS);
+        }
     }
 
     // Hook mode: run as agent PreToolUse hook (#44)

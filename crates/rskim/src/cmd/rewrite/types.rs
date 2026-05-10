@@ -40,6 +40,36 @@ pub(super) struct RewriteRule {
     /// Bare `env` (no `=`-containing args) is still rewritten normally.
     /// Set true only on the `env` rule.
     pub(super) skip_if_middle_contains_eq: bool,
+    /// Global flags that precede the subcommand in the command line.
+    ///
+    /// When non-empty, the engine skips these flags (and their values where
+    /// required) before matching the remaining prefix elements against the
+    /// token stream.  This handles cases like `kubectl -n namespace get pods`
+    /// or `docker --host tcp://host:port ps` where global flags appear between
+    /// the tool name and its subcommand.
+    ///
+    /// Each element is either:
+    /// - A value-consuming flag (e.g. `"--context"`, `"-n"`) — the engine
+    ///   skips both the flag and the following token.
+    /// - A boolean flag (starts with `-` but not listed here) — skipped with
+    ///   no following token consumed.
+    ///
+    /// Empty slice (`&[]`) disables global-flag skipping (default behaviour).
+    pub(super) global_value_flags: &'static [&'static str],
+    /// Flags that must be present somewhere after the prefix for the rewrite
+    /// to fire.
+    ///
+    /// When non-empty, the engine checks that at least one token in `middle`
+    /// (the tokens after the matched prefix) equals one of these flag values.
+    /// If none match, the rule is skipped.
+    ///
+    /// Use case: `psql` requires `-c` / `--command` to be present (batch mode);
+    /// `mysql` requires `-e` / `--execute`.  Without this check a bare `psql`
+    /// would be rewritten, which would intercept interactive sessions.
+    ///
+    /// Empty slice (`&[]`) disables the check (default behaviour — any
+    /// invocation matching the prefix is rewritten).
+    pub(super) require_flag: &'static [&'static str],
 }
 
 #[derive(Debug)]

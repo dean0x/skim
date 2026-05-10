@@ -36,6 +36,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["cargo", "test"],
@@ -44,6 +46,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // python (longest prefix first)
     RewriteRule {
@@ -53,6 +57,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["python", "-m", "pytest"],
@@ -61,6 +67,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // npx
     RewriteRule {
@@ -70,6 +78,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npx", "jest"],
@@ -78,6 +88,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // bare commands
     RewriteRule {
@@ -87,6 +99,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["vitest"],
@@ -95,6 +109,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["jest"],
@@ -103,6 +119,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["go", "test"],
@@ -111,6 +129,8 @@ const TEST_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Test,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
 ];
 
@@ -126,6 +146,8 @@ const BUILD_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["cargo", "build"],
@@ -134,6 +156,8 @@ const BUILD_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // npx
     RewriteRule {
@@ -143,6 +167,8 @@ const BUILD_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // tsc bare
     RewriteRule {
@@ -152,6 +178,8 @@ const BUILD_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
 ];
 
@@ -167,6 +195,8 @@ const GIT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // DESIGN NOTE (AD-RW-4, extended 2026-04-11): `--stat`, `--name-only` removed
     // from skip list. These are Group B flags (already-compact output).
@@ -193,6 +223,8 @@ const GIT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["git", "fetch"],
@@ -201,6 +233,8 @@ const GIT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // DESIGN NOTE (AD-RW-4): `--format` and `--pretty` removed from skip list.
     // The log handler (log.rs) already detects these flags and calls
@@ -213,6 +247,8 @@ const GIT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // git show — new rule (AD-GIT-5, updated 2026-04-11)
     //
@@ -232,6 +268,8 @@ const GIT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // git commit (B.7)
     //
@@ -246,6 +284,8 @@ const GIT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // git push (B.8)
     //
@@ -260,6 +300,8 @@ const GIT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Git,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
 ];
 
@@ -276,6 +318,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["eslint"],
@@ -284,6 +328,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // ruff (longest prefix first)
     //
@@ -297,6 +343,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["ruff", "format"],
@@ -305,6 +353,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["ruff", "check"],
@@ -313,6 +363,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["ruff"],
@@ -321,6 +373,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // mypy (longest prefix first: python3 -m mypy, python -m mypy, mypy)
     RewriteRule {
@@ -330,6 +384,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["python", "-m", "mypy"],
@@ -338,6 +394,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["mypy"],
@@ -346,6 +404,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // golangci-lint
     RewriteRule {
@@ -355,6 +415,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["golangci-lint"],
@@ -363,6 +425,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // prettier (longest prefix first: npx prettier, prettier)
     //
@@ -376,6 +440,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npx", "prettier", "-w"],
@@ -384,6 +450,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["prettier", "--write"],
@@ -392,6 +460,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["prettier", "-w"],
@@ -400,6 +470,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npx", "prettier", "--check"],
@@ -408,6 +480,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["prettier", "--check"],
@@ -416,6 +490,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // rustfmt (longest prefix first)
     RewriteRule {
@@ -425,6 +501,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["cargo", "fmt", "--check"],
@@ -433,6 +511,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["rustfmt", "--check"],
@@ -441,6 +521,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // black
     RewriteRule {
@@ -450,6 +532,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["black"],
@@ -458,6 +542,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // gofmt (longest prefix first)
     RewriteRule {
@@ -467,6 +553,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gofmt", "-d"],
@@ -475,6 +563,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gofmt"],
@@ -483,6 +573,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // biome (longest prefix first)
     RewriteRule {
@@ -492,6 +584,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["biome", "check"],
@@ -500,6 +594,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npx", "biome", "format"],
@@ -508,6 +604,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["biome", "format"],
@@ -516,6 +614,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npx", "biome", "lint"],
@@ -524,6 +624,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["biome", "lint"],
@@ -532,6 +634,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npx", "biome"],
@@ -540,6 +644,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["biome"],
@@ -548,6 +654,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // dprint (longest prefix first)
     RewriteRule {
@@ -557,6 +665,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["dprint", "fmt"],
@@ -565,6 +675,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["dprint"],
@@ -573,6 +685,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // oxlint
     RewriteRule {
@@ -582,6 +696,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["oxlint"],
@@ -590,6 +706,8 @@ const LINT_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
 ];
 
@@ -606,6 +724,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // npm (canonical + aliases)
     RewriteRule {
@@ -615,6 +735,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npm", "install"],
@@ -623,6 +745,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npm", "i"],
@@ -631,6 +755,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npm", "ci"],
@@ -639,6 +765,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npm", "outdated"],
@@ -647,6 +775,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npm", "list"],
@@ -655,6 +785,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["npm", "ls"],
@@ -663,6 +795,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // pnpm
     RewriteRule {
@@ -672,6 +806,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pnpm", "install"],
@@ -680,6 +816,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pnpm", "i"],
@@ -688,6 +826,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pnpm", "outdated"],
@@ -696,6 +836,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // pip (canonical + pip3 aliases)
     RewriteRule {
@@ -705,6 +847,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pip", "check"],
@@ -713,6 +857,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pip", "list"],
@@ -721,6 +867,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pip3", "install"],
@@ -729,6 +877,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pip3", "check"],
@@ -737,6 +887,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["pip3", "list"],
@@ -745,6 +897,8 @@ const PKG_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
 ];
 
@@ -771,6 +925,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gh", "pr", "view"],
@@ -779,6 +935,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gh", "pr", "list"],
@@ -787,6 +945,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gh", "issue", "view"],
@@ -795,6 +955,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gh", "issue", "list"],
@@ -803,6 +965,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gh", "run", "view"],
@@ -811,6 +975,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // gh run watch (B.5) — streaming output compression
     //
@@ -823,6 +989,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gh", "run", "list"],
@@ -831,6 +999,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // gh release view (B.6) — structured release metadata
     //
@@ -843,6 +1013,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["gh", "release", "list"],
@@ -851,6 +1023,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // gh api (B.4) — REST/GraphQL response compression
     //
@@ -864,6 +1038,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // aws
     RewriteRule {
@@ -873,6 +1049,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // curl
     RewriteRule {
@@ -890,6 +1068,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // wget
     RewriteRule {
@@ -899,12 +1079,20 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // docker compose (3-token prefix first — must precede 2-token docker rules)
     //
     // DESIGN NOTE: 3-token prefix rules listed first so `docker compose ps`
     // matches before the 2-token `docker ps` rule. The engine processes rules
     // in order, so longer prefixes take precedence when listed first.
+    //
+    // DESIGN NOTE (Fix 3): docker supports global flags between the binary
+    // name and the subcommand, e.g. `docker --host tcp://host:2376 ps` or
+    // `docker -H unix:///var/run/docker.sock ps`.  `global_value_flags`
+    // lists flags that consume the following token so the engine can skip
+    // them when matching the subcommand position.
     RewriteRule {
         prefix: &["docker", "compose", "ps"],
         rewrite_to: &["skim", "docker", "compose", "ps"],
@@ -912,6 +1100,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["docker", "compose", "logs"],
@@ -920,6 +1110,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        require_flag: &[],
     },
     // docker (2-token prefix)
     RewriteRule {
@@ -929,6 +1121,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["docker", "images"],
@@ -937,6 +1131,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["docker", "build"],
@@ -945,6 +1141,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["docker", "inspect"],
@@ -953,6 +1151,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["docker", "logs"],
@@ -961,8 +1161,16 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        require_flag: &[],
     },
     // kubectl
+    //
+    // DESIGN NOTE (Fix 3): kubectl supports global flags between the binary
+    // name and the subcommand, e.g. `kubectl -n mynamespace get pods` or
+    // `kubectl --context prod get pods`.  `global_value_flags` lists flags
+    // that consume the following token so the engine can skip them to find
+    // the real subcommand position.
     RewriteRule {
         prefix: &["kubectl", "get"],
         rewrite_to: &["skim", "kubectl", "get"],
@@ -970,6 +1178,23 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[
+            "--context",
+            "-n",
+            "--namespace",
+            "--kubeconfig",
+            "--server",
+            "--as",
+            "--as-group",
+            "-v",
+            "--v",
+            "--request-timeout",
+            "--cache-dir",
+            "--cluster",
+            "--token",
+            "--user",
+        ],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["kubectl", "describe"],
@@ -978,6 +1203,23 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[
+            "--context",
+            "-n",
+            "--namespace",
+            "--kubeconfig",
+            "--server",
+            "--as",
+            "--as-group",
+            "-v",
+            "--v",
+            "--request-timeout",
+            "--cache-dir",
+            "--cluster",
+            "--token",
+            "--user",
+        ],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["kubectl", "logs"],
@@ -986,8 +1228,33 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[
+            "--context",
+            "-n",
+            "--namespace",
+            "--kubeconfig",
+            "--server",
+            "--as",
+            "--as-group",
+            "-v",
+            "--v",
+            "--request-timeout",
+            "--cache-dir",
+            "--cluster",
+            "--token",
+            "--user",
+        ],
+        require_flag: &[],
     },
     // terraform
+    //
+    // DESIGN NOTE (Fix 3): terraform supports `-chdir=<dir>` as a global
+    // flag before the subcommand (e.g. `terraform -chdir=infra plan`).
+    // Since `-chdir` uses the `=` form exclusively in terraform, it is
+    // handled as a bool-flag skip (the `=value` part is attached, so no
+    // separate token to consume).  Listed in `global_value_flags` for
+    // completeness but the attached-value form is skipped by the
+    // `starts_with("--") && contains('=')` guard in the engine.
     RewriteRule {
         prefix: &["terraform", "plan"],
         rewrite_to: &["skim", "terraform", "plan"],
@@ -995,6 +1262,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["-chdir"],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["terraform", "apply"],
@@ -1003,6 +1272,8 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &["-chdir"],
+        require_flag: &[],
     },
 ];
 
@@ -1011,25 +1282,39 @@ const INFRA_RULES: &[RewriteRule] = &[
 // ============================================================================
 
 const DB_RULES: &[RewriteRule] = &[
-    // psql: rewrite `psql -c "..."` → `skim psql -c "..."`
-    // Bare `psql` (interactive) is NOT rewritten — no `-c` means interactive mode.
+    // psql: rewrite `psql ... -c "..."` → `skim psql ... -c "..."`
+    //
+    // DESIGN NOTE (Fix 4): Prefix broadened from `["psql", "-c"]` to just
+    // `["psql"]` so that `psql -h host -d mydb -c "SELECT 1"` is captured
+    // (the -c flag appears after connection flags, not immediately after psql).
+    // The `require_flag` guard ensures the rewrite only fires when `-c` or
+    // `--command` is present, preserving the invariant that bare `psql`
+    // (interactive sessions) are never rewritten.
     RewriteRule {
-        prefix: &["psql", "-c"],
-        rewrite_to: &["skim", "psql", "-c"],
+        prefix: &["psql"],
+        rewrite_to: &["skim", "psql"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Db,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &["-c", "--command"],
     },
-    // mysql: rewrite `mysql -e "..."` → `skim mysql -e "..."`
-    // Bare `mysql` (interactive) is NOT rewritten.
+    // mysql: rewrite `mysql ... -e "..."` → `skim mysql ... -e "..."`
+    //
+    // DESIGN NOTE (Fix 4): Prefix broadened from `["mysql", "-e"]` to just
+    // `["mysql"]` so that `mysql -h host -u user -e "SELECT 1"` is captured.
+    // The `require_flag` guard ensures the rewrite only fires when `-e` or
+    // `--execute` is present.
     RewriteRule {
-        prefix: &["mysql", "-e"],
-        rewrite_to: &["skim", "mysql", "-e"],
+        prefix: &["mysql"],
+        rewrite_to: &["skim", "mysql"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Db,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &["-e", "--execute"],
     },
     // sqlite3: rewrite `sqlite3 db.sqlite "..."` → `skim sqlite3 db.sqlite "..."`
     //
@@ -1050,6 +1335,8 @@ const DB_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Db,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
 ];
 
@@ -1066,6 +1353,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // ls (verbose/recursive only)
     RewriteRule {
@@ -1075,6 +1364,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["ls", "-R"],
@@ -1083,6 +1374,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // tree
     RewriteRule {
@@ -1092,6 +1385,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // grep (recursive only)
     RewriteRule {
@@ -1101,6 +1396,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     RewriteRule {
         prefix: &["grep", "-r"],
@@ -1109,6 +1406,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // rg — pipe-source excluded so `rg pat | head` is not rewritten (AD-RW-2)
     RewriteRule {
@@ -1118,6 +1417,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // wc
     RewriteRule {
@@ -1127,6 +1428,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // du
     RewriteRule {
@@ -1136,6 +1439,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // df
     RewriteRule {
@@ -1145,6 +1450,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // ps
     RewriteRule {
@@ -1154,6 +1461,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // env
     RewriteRule {
@@ -1166,6 +1475,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         // would route to `skim env` which only handles printenv-style output.
         // Bare `env` (no `=` args) is still rewritten.  SEE: issue batch-b.
         skip_if_middle_contains_eq: true,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // printenv
     RewriteRule {
@@ -1175,6 +1486,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // diff
     RewriteRule {
@@ -1193,6 +1506,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // ls catch-all (B.1) — DESIGN NOTE (AD-RW-2)
     //
@@ -1210,6 +1525,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
     // grep catch-all (B.2) — DESIGN NOTE (AD-RW-2)
     //
@@ -1225,6 +1542,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         category: RewriteCategory::FileOps,
         exclude_pipe_source: true,
         skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
     },
 ];
 

@@ -1759,13 +1759,7 @@ fn test_rewrite_terraform_plan_skip_destroy() {
     // `-destroy` generates a destroy plan — skip rewrite so agents see the
     // full destroy plan output rather than a compressed summary.
     skim_cmd()
-        .args([
-            "rewrite",
-            "--suggest",
-            "terraform",
-            "plan",
-            "-destroy",
-        ])
+        .args(["rewrite", "--suggest", "terraform", "plan", "-destroy"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -1775,13 +1769,7 @@ fn test_rewrite_terraform_plan_skip_destroy() {
 fn test_rewrite_terraform_apply_skip_destroy() {
     // `-destroy` applies a destroy plan — skip rewrite (same reason as plan).
     skim_cmd()
-        .args([
-            "rewrite",
-            "--suggest",
-            "terraform",
-            "apply",
-            "-destroy",
-        ])
+        .args(["rewrite", "--suggest", "terraform", "apply", "-destroy"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -1865,4 +1853,112 @@ fn test_rewrite_sqlite3_interactive_flag_skipped() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// Fix 4: psql/mysql require_flag — broadened prefix + require_flag guard
+// ============================================================================
+
+#[test]
+fn test_rewrite_psql_with_host_and_c_rewrites() {
+    // `psql -h localhost -d mydb -c "SELECT 1"` — broadened prefix fires
+    // because -c is present even with other flags before it.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "psql", "-h", "localhost", "-d", "mydb", "-c", "SELECT 1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_rewrite_psql_no_c_flag_no_rewrite() {
+    // `psql -h localhost -d mydb` — no -c means interactive mode → NO rewrite.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "psql", "-h", "localhost", "-d", "mydb"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_psql_long_command_flag_rewrites() {
+    // `psql mydb --command "SELECT 1"` — --command is also accepted.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "psql", "mydb", "--command", "SELECT 1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_rewrite_mysql_with_host_and_e_rewrites() {
+    // `mysql -h localhost -u user -e "SELECT 1"` — broadened prefix fires.
+    skim_cmd()
+        .args([
+            "rewrite", "--suggest", "mysql", "-h", "localhost", "-u", "user", "-e", "SELECT 1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_rewrite_mysql_no_e_flag_no_rewrite() {
+    // `mysql -h localhost -u user` — no -e means interactive mode → NO rewrite.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "mysql", "-h", "localhost", "-u", "user"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+// ============================================================================
+// Fix 3: kubectl global flags before subcommand
+// ============================================================================
+
+#[test]
+fn test_rewrite_kubectl_namespace_before_get() {
+    // `kubectl -n mynamespace get pods` — global -n flag before subcommand.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "kubectl", "-n", "mynamespace", "get", "pods"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_rewrite_kubectl_context_before_get() {
+    // `kubectl --context production get pods` — --context before subcommand.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "kubectl", "--context", "production", "get", "pods"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_rewrite_kubectl_no_global_flags_still_rewrites() {
+    // `kubectl get pods` — no global flags, normal match still works.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "kubectl", "get", "pods"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_rewrite_docker_host_before_ps() {
+    // `docker --host tcp://remote:2376 ps` — global --host flag before subcommand.
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "docker",
+            "--host",
+            "tcp://remote:2376",
+            "ps",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
 }
