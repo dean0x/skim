@@ -15,6 +15,7 @@ use std::ops::Range;
 // to JSON for `--json` CLI output. rskim-core types do not need serde — they are
 // internal transformation types that never cross a serialization boundary.
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 // ============================================================================
 // File Identifier
@@ -102,7 +103,7 @@ impl SearchField {
 /// Time-based filter flags for scoping search results.
 ///
 /// All fields are optional — absent means no temporal constraint.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemporalFlags {
     /// Restrict results to files modified within the given number of days.
     pub modified_within_days: Option<u32>,
@@ -116,11 +117,16 @@ pub struct TemporalFlags {
 ///
 /// Constructed via [`SearchQuery::new`] and then configured by setting fields.
 /// This type is the primary input to [`SearchLayer::search`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchQuery {
     /// The text to search for
     pub text: String,
-    /// Optional language filter (restrict to files of this language)
+    /// Optional language filter (restrict to files of this language).
+    ///
+    /// NOTE: `rskim_core::Language` does not implement `Serialize`/`Deserialize`
+    /// so this field is skipped during serialization. Language filters are applied
+    /// at query construction time and are not round-tripped through JSON.
+    #[serde(skip)]
     pub lang: Option<rskim_core::Language>,
     /// Optional AST pattern string (layer-defined syntax)
     pub ast_pattern: Option<String>,
@@ -176,7 +182,7 @@ pub struct SearchResult {
 // ============================================================================
 
 /// Summary statistics for a search index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexStats {
     /// Number of files currently indexed
     pub file_count: u32,
@@ -221,6 +227,13 @@ pub trait LayerBuilder: Send {
 
     /// Finalise the builder and produce a queryable [`SearchLayer`].
     ///
+    /// Consuming `self` is intentional: the build phase is separate from the
+    /// query phase to keep `SearchLayer` implementations immutable and
+    /// thread-safe. Incremental indexing (updating an existing layer after
+    /// individual file changes) is intentionally deferred to a separate
+    /// `IncrementalBuilder` trait in a future Wave. For now, re-index by
+    /// constructing a new builder and calling `build` again.
+    ///
     /// # Errors
     /// Returns [`SearchError`] if the index cannot be constructed.
     fn build(self) -> Result<Box<dyn SearchLayer>>
@@ -241,6 +254,11 @@ pub trait LayerBuilder: Send {
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
     /// The grammar rule name for this node (e.g. `"function_definition"`).
+    ///
+    /// **Constraint**: must be a compile-time constant (`&'static str`). Tree-sitter
+    /// grammars expose node kinds as `&'static str` naturally. Non-tree-sitter
+    /// parsers (JSON, YAML, TOML) should use fixed string literals (e.g.
+    /// `"json_object"`) rather than dynamically allocated strings.
     pub kind: &'static str,
     /// Byte range of this node within the source file.
     pub byte_range: Range<usize>,
@@ -266,7 +284,7 @@ pub trait FieldClassifier: Send + Sync {
 // ============================================================================
 
 /// Errors that can occur during search index construction or querying.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error)]
 pub enum SearchError {
     /// Propagated error from the rskim-core library
     #[error("Core error: {0}")]
@@ -657,5 +675,84 @@ mod tests {
             classifier.classify(&unknown_node, "#[derive(Debug)]"),
             SearchField::Other
         );
+    }
+
+    /// Verifies that a concrete SearchLayer implementation can be written and
+    /// used with SearchQuery/SearchResult. Guards the trait's API contract:
+    /// layers must be constructable without I/O and must return typed results.
+    #[test]
+    fn test_search_layer_contract() {
+        struct EmptyLayer;
+
+        impl SearchLayer for EmptyLayer {
+            fn search(&self, _query: &SearchQuery) -> Result<Vec<SearchResult>> {
+                Ok(vec![])
+            }
+
+            fn name(&self) -> &str {
+                "empty"
+            }
+        }
+
+        let layer = EmptyLayer;
+        let query = SearchQuery::new("anything");
+        let results = layer.search(&query).unwrap();
+        assert!(results.is_empty());
+        assert_eq!(layer.name(), "empty");
+    }
+
+    /// Verifies that a concrete LayerBuilder implementation can be written and
+    /// used to index files and produce a SearchLayer. Guards the trait's API
+    /// contract: builders must accept add_file and build into a queryable layer.
+    #[test]
+    fn test_layer_builder_contract() {
+        struct NoopBuilder {
+            file_count: u32,
+        }
+
+        impl LayerBuilder for NoopBuilder {
+            fn add_file(
+                &mut self,
+                _id: FileId,
+                _content: &str,
+                _lang: rskim_core::Language,
+            ) -> Result<()> {
+                self.file_count += 1;
+                Ok(())
+            }
+
+            fn build(self) -> Result<Box<dyn SearchLayer>> {
+                struct BuiltLayer {
+                    file_count: u32,
+                }
+
+                impl SearchLayer for BuiltLayer {
+                    fn search(&self, _query: &SearchQuery) -> Result<Vec<SearchResult>> {
+                        Ok(vec![])
+                    }
+
+                    fn name(&self) -> &str {
+                        "noop"
+                    }
+                }
+
+                Ok(Box::new(BuiltLayer {
+                    file_count: self.file_count,
+                }))
+            }
+        }
+
+        let mut builder = NoopBuilder { file_count: 0 };
+        builder
+            .add_file(FileId(0), "fn main() {}", rskim_core::Language::Rust)
+            .unwrap();
+        builder
+            .add_file(FileId(1), "def hello(): pass", rskim_core::Language::Python)
+            .unwrap();
+
+        let layer = builder.build().unwrap();
+        assert_eq!(layer.name(), "noop");
+        let results = layer.search(&SearchQuery::new("hello")).unwrap();
+        assert!(results.is_empty());
     }
 }
