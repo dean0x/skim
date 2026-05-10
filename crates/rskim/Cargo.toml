@@ -44,6 +44,10 @@ tree-sitter = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# Compile-time canary: ensures rskim-search's public API surface remains valid
+# as a downstream consumer. API breakage surfaces here before re-adding as a
+# runtime dependency.
+rskim-search = { version = "0.1.0", path = "../rskim-search" }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
