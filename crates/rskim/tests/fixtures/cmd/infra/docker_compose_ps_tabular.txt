@@ -1,0 +1,4 @@
+NAME                         IMAGE               COMMAND                  SERVICE             CREATED             STATUS              PORTS
+myproject_web_1              nginx:alpine        "/docker-entrypoint.…"   web                 2 hours ago         Up 2 hours          0.0.0.0:80->80/tcp
+myproject_db_1               postgres:15-alpine  "docker-entrypoint.s…"   db                  2 hours ago         Up 2 hours          5432/tcp
+myproject_redis_1            redis:7-alpine      "docker-entrypoint.s…"   redis               2 hours ago         Up 2 hours          6379/tcp
