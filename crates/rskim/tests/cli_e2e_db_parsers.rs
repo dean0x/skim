@@ -338,3 +338,32 @@ fn test_mysql_h_flag_not_intercepted_as_help() {
         "-h must not trigger help text; got stdout: {stdout}"
     );
 }
+
+// ============================================================================
+// Infra handler: -h/-H flag must NOT be intercepted as help
+// ============================================================================
+
+#[test]
+fn test_docker_h_flag_not_intercepted_as_help() {
+    // `skim docker -H unix:///tmp/docker.sock ps` — -H means --host, not help.
+    let output = skim_cmd()
+        .args(["docker", "-H", "unix:///tmp/docker.sock", "ps"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Available tools:"),
+        "-H must not trigger help text; got stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_kubectl_h_flag_not_intercepted_as_help() {
+    // `skim kubectl -h` — the infra handler only checks --help, not -h.
+    let output = skim_cmd().args(["kubectl", "-h"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Available tools:"),
+        "-h must not trigger skim help text; got stdout: {stdout}"
+    );
+}

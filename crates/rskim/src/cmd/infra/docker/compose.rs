@@ -5,6 +5,10 @@
 //!   Tier 2: Tabular text (`NAME  IMAGE  ...` header + rows, legacy compose)
 //!   Tier 3: Passthrough (unrecognised format)
 //! - `compose logs` delegates to the shared log compression pipeline.
+//!
+//! **Known limitation:** Only `docker compose` (v2, plugin form) is supported.
+//! The standalone `docker-compose` binary (v1) was deprecated in July 2023 and
+//! reached end-of-life. Users should migrate to `docker compose` (space-separated).
 
 use std::sync::LazyLock;
 
