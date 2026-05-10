@@ -769,12 +769,91 @@ pub(crate) fn dispatch(
 ///
 /// Centralises the label format so streaming and non-streaming code paths
 /// cannot drift.  `rest` is the pre-joined argument string (may be empty).
+///
+/// For the `"db"` family, sensitive flags (passwords, usernames, hostnames)
+/// are redacted before the label is stored.  DB commands frequently embed
+/// credentials in positional flags (`-p S3cret`, `--password=S3cret`,
+/// `-U admin`, `--user=admin`, `-h myhost`, `--host=myhost`), and these
+/// must not persist to the analytics SQLite database.
 pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) -> String {
     if rest.is_empty() {
         format!("skim {family} {program}")
+    } else if family == "db" {
+        let scrubbed = scrub_db_args(rest);
+        format!("skim {family} {program} {scrubbed}")
     } else {
         format!("skim {family} {program} {rest}")
     }
+}
+
+/// Scrub credential values from a DB tool argument string.
+///
+/// DB CLIs accept credentials as flag-value pairs.  This function replaces the
+/// value of every sensitive flag with `[REDACTED]` so that analytics labels
+/// never persist passwords, usernames, or hostnames to disk.
+///
+/// # Flags redacted
+///
+/// | Short form  | Long form        | Tools      |
+/// |-------------|------------------|------------|
+/// | `-p`        | `--password`     | mysql      |
+/// | `-P`        | (none)           | mysql port |
+/// | `-U`        | `--username`     | psql       |
+/// | `-u`        | `--user`         | mysql      |
+/// | `-h`        | `--host`         | psql/mysql |
+/// | `-W`        | `--password`     | psql       |
+///
+/// Both space-separated (`-p S3cret`) and equals-joined (`--password=S3cret`)
+/// forms are redacted.
+///
+/// # Design
+///
+/// Operates on the pre-joined argument string (one token at a time after
+/// splitting on whitespace) because that is what the call site produces.
+/// This avoids a separate allocation path for every DB command invocation.
+///
+/// SQL query arguments (positional, no flag prefix) are preserved verbatim —
+/// only known sensitive flag values are redacted.
+pub(crate) fn scrub_db_args(args: &str) -> String {
+    /// Flags whose *immediately following* space-separated token is a credential.
+    const SENSITIVE_FLAGS: &[&str] = &[
+        "-p", "-P", "-U", "-u", "-h", "-W", "--password", "--user", "--username", "--host",
+    ];
+
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let tok = tokens[i];
+
+        // Handle `--flag=value` form: redact the value portion.
+        if let Some(eq_pos) = tok.find('=') {
+            let flag = &tok[..eq_pos];
+            if SENSITIVE_FLAGS.contains(&flag) {
+                out.push("[REDACTED]");
+                i += 1;
+                continue;
+            }
+        }
+
+        // Handle space-separated `-p value` or `--password value` form.
+        if SENSITIVE_FLAGS.contains(&tok) {
+            out.push(tok);
+            i += 1;
+            // Redact the following value token if present.
+            if i < tokens.len() {
+                out.push("[REDACTED]");
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push(tok);
+        i += 1;
+    }
+
+    out.join(" ")
 }
 
 // ============================================================================
@@ -1119,5 +1198,109 @@ mod tests {
             err_msg.contains("Unknown subcommand"),
             "error message should mention 'Unknown subcommand', got: {err_msg}"
         );
+    }
+
+    // ========================================================================
+    // scrub_db_args tests
+    // ========================================================================
+
+    #[test]
+    fn test_scrub_db_args_mysql_short_password() {
+        // `mysql -u root -p S3cret -e 'SELECT 1'` — space-separated short flag
+        let input = "-u root -p S3cret -e SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("root"),
+            "username after -u must be redacted: {result}"
+        );
+        assert!(
+            !result.contains("S3cret"),
+            "password after -p must be redacted: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED]"),
+            "redaction marker must appear: {result}"
+        );
+        // SQL query must be preserved
+        assert!(result.contains("SELECT"), "SQL must be preserved: {result}");
+    }
+
+    #[test]
+    fn test_scrub_db_args_psql_equals_form() {
+        // `psql --host=myhost --username=admin -c 'SELECT 1'`
+        let input = "--host=myhost --username=admin -c SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("myhost"),
+            "--host=value must be redacted: {result}"
+        );
+        assert!(
+            !result.contains("admin"),
+            "--username=value must be redacted: {result}"
+        );
+        assert!(result.contains("-c"), "non-sensitive flag preserved: {result}");
+        assert!(result.contains("SELECT"), "SQL must be preserved: {result}");
+    }
+
+    #[test]
+    fn test_scrub_db_args_no_credentials_unchanged() {
+        // `-e 'SELECT 1'` contains no credential flags — returned as-is.
+        let input = "-e SELECT 1 FROM users";
+        let result = scrub_db_args(input);
+        assert_eq!(result, input, "args with no credentials must be unchanged");
+    }
+
+    #[test]
+    fn test_scrub_db_args_empty_string() {
+        assert_eq!(scrub_db_args(""), "");
+    }
+
+    #[test]
+    fn test_scrub_db_args_dangling_sensitive_flag() {
+        // Sensitive flag at end of arg string with no following value.
+        let input = "-c SELECT 1 -p";
+        let result = scrub_db_args(input);
+        assert!(result.contains("-p"), "dangling flag kept: {result}");
+        // No [REDACTED] since there was no following token to redact.
+        // The flag itself is not a secret; only the value after it is.
+        assert!(!result.contains("[REDACTED]"), "no token to redact: {result}");
+    }
+
+    // ========================================================================
+    // format_analytics_label with db family scrubs credentials
+    // ========================================================================
+
+    #[test]
+    fn test_format_analytics_label_db_scrubs_credentials() {
+        // Simulate: skim db psql -h myhost -U admin -c SELECT 1
+        let label = format_analytics_label("db", "psql", "-h myhost -U admin -c SELECT 1");
+        assert!(
+            !label.contains("myhost"),
+            "hostname must be redacted from db analytics label: {label}"
+        );
+        assert!(
+            !label.contains("admin"),
+            "username must be redacted from db analytics label: {label}"
+        );
+        assert!(
+            label.contains("[REDACTED]"),
+            "redaction marker must be present: {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_non_db_not_scrubbed() {
+        // For non-db families the args are forwarded verbatim.
+        let label = format_analytics_label("infra", "kubectl", "get pods -n myns");
+        assert!(
+            label.contains("myns"),
+            "non-db family must not scrub args: {label}"
+        );
+    }
+
+    #[test]
+    fn test_format_analytics_label_db_empty_rest() {
+        let label = format_analytics_label("db", "psql", "");
+        assert_eq!(label, "skim db psql");
     }
 }

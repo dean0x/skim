@@ -1636,6 +1636,27 @@ fn test_rewrite_docker_ps_skip_format() {
         .stdout(predicate::str::contains("\"match\":false"));
 }
 
+#[test]
+fn test_rewrite_docker_build_skip_push() {
+    // --push uploads to registry — skip rewrite to avoid interfering with
+    // push semantics in the skim handler.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "docker", "build", "--push", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_docker_build_skip_load() {
+    // --load loads the built image into the local docker daemon — skip rewrite.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "docker", "build", "--load", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
 // ============================================================================
 // Infra: kubectl rewrite rules (#117)
 // ============================================================================
@@ -1733,6 +1754,39 @@ fn test_rewrite_terraform_apply_skip_auto_approve() {
         .stdout(predicate::str::contains("\"match\":false"));
 }
 
+#[test]
+fn test_rewrite_terraform_plan_skip_destroy() {
+    // `-destroy` generates a destroy plan — skip rewrite so agents see the
+    // full destroy plan output rather than a compressed summary.
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "terraform",
+            "plan",
+            "-destroy",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_terraform_apply_skip_destroy() {
+    // `-destroy` applies a destroy plan — skip rewrite (same reason as plan).
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "terraform",
+            "apply",
+            "-destroy",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
 // ============================================================================
 // DB: rewrite rules (#117)
 // ============================================================================
@@ -1779,6 +1833,35 @@ fn test_rewrite_mysql_bare_no_rewrite() {
     // Bare `mysql` without -e has no rule → no rewrite (batch-mode-only safety)
     skim_cmd()
         .args(["rewrite", "--suggest", "mysql"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":false"));
+}
+
+#[test]
+fn test_rewrite_sqlite3_bare_with_db_file_rewrites() {
+    // `sqlite3 mydb.sqlite` (db-file only, no SQL) IS rewritten. This is safe
+    // in agent contexts because the hook runs with piped stdin: sqlite3 reads
+    // EOF immediately and exits without entering interactive mode.
+    skim_cmd()
+        .args(["rewrite", "--suggest", "sqlite3", "mydb.sqlite"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"match\":true"));
+}
+
+#[test]
+fn test_rewrite_sqlite3_interactive_flag_skipped() {
+    // `-interactive` forces interactive mode regardless of stdin state — skip
+    // rewrite to avoid hanging in non-TTY contexts.
+    skim_cmd()
+        .args([
+            "rewrite",
+            "--suggest",
+            "sqlite3",
+            "mydb.sqlite",
+            "-interactive",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));

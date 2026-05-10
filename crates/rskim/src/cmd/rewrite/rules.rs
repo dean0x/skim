@@ -1032,7 +1032,17 @@ const DB_RULES: &[RewriteRule] = &[
         skip_if_middle_contains_eq: false,
     },
     // sqlite3: rewrite `sqlite3 db.sqlite "..."` → `skim sqlite3 db.sqlite "..."`
-    // Skip `-interactive` flag (explicit interactive mode).
+    //
+    // Single-token prefix (just `sqlite3`) is intentional and safe for agent
+    // contexts.  Unlike psql (requires `-c`) and mysql (requires `-e`), sqlite3
+    // has no mandatory batch-mode flag: it enters batch mode simply when stdin
+    // is not a TTY.  In agent contexts (Claude Code, Cursor, Codex, etc.) the
+    // hook always runs with piped stdin — sqlite3 reads EOF immediately and exits
+    // without prompting.  This means `sqlite3 mydb.sqlite` through the rewrite
+    // hook is non-interactive even with only a db-file argument.
+    //
+    // Explicit `-interactive` flag is still excluded as a defensive guard for
+    // any invocation that forces interactive mode regardless of stdin state.
     RewriteRule {
         prefix: &["sqlite3"],
         rewrite_to: &["skim", "sqlite3"],
