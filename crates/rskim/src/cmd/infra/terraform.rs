@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
 
-use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
+use super::{combine_stdout_stderr, passthrough_parse, run_infra_tool, InfraToolConfig};
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "terraform",
@@ -207,10 +207,6 @@ fn try_parse_text(text: &str, subcmd: &str) -> Option<InfraResult> {
     ))
 }
 
-fn passthrough_parse(output: &crate::runner::CommandOutput) -> ParseResult<InfraResult> {
-    let combined = combine_stdout_stderr(output);
-    ParseResult::Passthrough(combined.into_owned())
-}
 
 // ============================================================================
 // Unit tests

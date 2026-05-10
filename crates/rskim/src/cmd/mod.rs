@@ -831,17 +831,18 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
     ];
 
     let tokens: Vec<&str> = args.split_whitespace().collect();
-    let mut out: Vec<&str> = Vec::with_capacity(tokens.len());
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
     let mut i = 0;
 
     while i < tokens.len() {
         let tok = tokens[i];
 
-        // Handle `--flag=value` form: redact the value portion.
+        // Handle `--flag=value` form: emit `--flag=[REDACTED]` to preserve the
+        // flag name in the analytics label (consistent with the space-separated path).
         if let Some(eq_pos) = tok.find('=') {
             let flag = &tok[..eq_pos];
             if SENSITIVE_FLAGS.contains(&flag) {
-                out.push("[REDACTED]");
+                out.push(format!("{flag}=[REDACTED]"));
                 i += 1;
                 continue;
             }
@@ -849,17 +850,17 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
 
         // Handle space-separated `-p value` or `--password value` form.
         if SENSITIVE_FLAGS.contains(&tok) {
-            out.push(tok);
+            out.push(tok.to_string());
             i += 1;
             // Redact the following value token if present.
             if i < tokens.len() {
-                out.push("[REDACTED]");
+                out.push("[REDACTED]".to_string());
                 i += 1;
             }
             continue;
         }
 
-        out.push(tok);
+        out.push(tok.to_string());
         i += 1;
     }
 
@@ -1247,6 +1248,15 @@ mod tests {
         assert!(
             !result.contains("admin"),
             "--username=value must be redacted: {result}"
+        );
+        // Flag names must be preserved (--host=[REDACTED], not just [REDACTED]).
+        assert!(
+            result.contains("--host="),
+            "flag name --host must be retained: {result}"
+        );
+        assert!(
+            result.contains("--username="),
+            "flag name --username must be retained: {result}"
         );
         assert!(result.contains("-c"), "non-sensitive flag preserved: {result}");
         assert!(result.contains("SELECT"), "SQL must be preserved: {result}");
