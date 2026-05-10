@@ -162,6 +162,7 @@ pub(crate) fn run_linter(
             show_stats: ctx.show_stats,
             output_format: ctx.output_format(),
             family: "lint",
+            skip_ansi_strip: false,
             rec: crate::analytics::RecordingContext {
                 enabled: ctx.analytics_enabled,
                 command_type: crate::analytics::CommandType::Lint,

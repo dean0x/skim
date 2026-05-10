@@ -130,6 +130,10 @@ pub(crate) fn run_db_tool(
             show_stats: ctx.show_stats,
             output_format: ctx.output_format(),
             family: "db",
+            // DB tools emit tab-separated (TSV) output; stripping ANSI would
+            // drop tab characters and break the TSV parser. See ParsedCommandConfig
+            // docs for full explanation.
+            skip_ansi_strip: true,
             rec: crate::analytics::RecordingContext {
                 enabled: ctx.analytics_enabled,
                 command_type: crate::analytics::CommandType::Db,

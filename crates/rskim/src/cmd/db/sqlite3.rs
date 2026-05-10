@@ -26,7 +26,7 @@ use crate::runner::CommandOutput;
 use super::{run_db_tool, DbToolConfig};
 use crate::cmd::user_has_flag;
 
-pub(crate) const CONFIG: DbToolConfig<'static> = DbToolConfig {
+const CONFIG: DbToolConfig<'static> = DbToolConfig {
     program: "sqlite3",
     env_overrides: &[],
     install_hint: "Install SQLite: https://www.sqlite.org/download.html",

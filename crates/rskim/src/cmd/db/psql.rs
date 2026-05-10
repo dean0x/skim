@@ -24,7 +24,7 @@ use crate::runner::CommandOutput;
 
 use super::{run_db_tool, DbToolConfig};
 
-pub(crate) const CONFIG: DbToolConfig<'static> = DbToolConfig {
+const CONFIG: DbToolConfig<'static> = DbToolConfig {
     program: "psql",
     env_overrides: &[("PAGER", "cat"), ("PGPAGER", "cat")],
     install_hint: "Install PostgreSQL: https://www.postgresql.org/download/",

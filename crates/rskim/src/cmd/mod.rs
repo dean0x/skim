@@ -373,6 +373,14 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// name and made the analytics dashboard ambiguous when multiple families share
     /// tool names (e.g., `cargo` appears in both `build` and `pkg`). (PF-022)
     pub family: &'a str,
+    /// When `true`, skip ANSI escape stripping on the raw command output.
+    ///
+    /// `strip_ansi_escapes` treats ASCII control codes — including `\t` (0x09) —
+    /// as part of escape sequences and drops them. DB tools emit tab-separated
+    /// (TSV) output; stripping would remove tab separators and cause all DB
+    /// parsers to fall through to Passthrough. Set `true` in `run_db_tool`,
+    /// `false` for all other families.
+    pub skip_ansi_strip: bool,
     /// Recording context constructed once by the family dispatcher.
     /// `run_parsed_command_with_mode` annotates `parse_tier` via
     /// `rec.with_tier(result.tier_name())` before passing to `try_record_command`.
@@ -473,6 +481,7 @@ where
         show_stats,
         output_format,
         family,
+        skip_ansi_strip,
         rec,
     } = config;
 
@@ -494,11 +503,12 @@ where
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
     }
 
-    // DB family output must NOT be ANSI-stripped: strip_ansi_escapes treats
-    // ASCII control codes (including \t = 0x09) as part of escape sequences and
-    // drops them. TSV output (mysql batch mode) would lose its tab separators,
-    // causing all DB parsers to fall through to Passthrough.
-    let output = if family == "db" {
+    // Some tools must NOT have ANSI escape sequences stripped: strip_ansi_escapes
+    // treats ASCII control codes — including \t (0x09) — as part of escape
+    // sequences and drops them. DB tools emit tab-separated (TSV) output; stripping
+    // would remove tab separators and cause all DB parsers to fall through to
+    // Passthrough. Callers signal this via `config.skip_ansi_strip`.
+    let output = if skip_ansi_strip {
         output
     } else {
         CommandOutput {

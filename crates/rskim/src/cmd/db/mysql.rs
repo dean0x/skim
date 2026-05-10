@@ -27,7 +27,7 @@ use crate::runner::CommandOutput;
 
 use super::{run_db_tool, DbToolConfig};
 
-pub(crate) const CONFIG: DbToolConfig<'static> = DbToolConfig {
+const CONFIG: DbToolConfig<'static> = DbToolConfig {
     program: "mysql",
     env_overrides: &[("MYSQL_PAGER", "cat"), ("PAGER", "cat")],
     install_hint: "Install MySQL client: https://dev.mysql.com/downloads/",

@@ -77,6 +77,7 @@ pub(crate) fn run(
             show_stats,
             output_format: OutputFormat::default(),
             family: "test",
+            skip_ansi_strip: false,
             rec,
         },
         move |output, _args| parse_impl(output, is_nextest),
