@@ -182,11 +182,7 @@ pub(crate) fn compute_line_starts(bytes: &[u8]) -> Vec<usize> {
     std::iter::once(0)
         .chain(bytes.iter().enumerate().filter_map(
             |(i, &b)| {
-                if b == b'\n' {
-                    Some(i + 1)
-                } else {
-                    None
-                }
+                if b == b'\n' { Some(i + 1) } else { None }
             },
         ))
         .collect()
@@ -584,7 +580,7 @@ mod tests {
         // `: int` starts after "def foo(a"
         let a_end = 9usize; // byte after 'a'
         let colon_int_end = a_end + ": int".len(); // 14
-                                                   // " -> str" starts at 14; ranges remove ": int" and " -> str", producing "def foo(a):"
+        // " -> str" starts at 14; ranges remove ": int" and " -> str", producing "def foo(a):"
         let arrow_end = colon_int_end + " -> str".len(); // 21
         let ranges = [(a_end, colon_int_end), (colon_int_end, arrow_end)];
         let map = compute_line_map_from_removed_ranges(source, &ranges);

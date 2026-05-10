@@ -363,10 +363,12 @@ fn test_rewrite_hook_agent_claude_code_explicit() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-    assert!(json["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap()
-        .contains("skim cargo test"));
+    assert!(
+        json["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("skim cargo test")
+    );
 }
 
 #[test]

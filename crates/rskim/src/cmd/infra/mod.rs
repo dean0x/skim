@@ -13,9 +13,9 @@ pub(crate) mod wget;
 
 use std::process::ExitCode;
 
-use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
-use crate::output::canonical::InfraResult;
+use super::{ParsedCommandConfig, extract_show_stats, run_parsed_command_with_mode};
 use crate::output::ParseResult;
+use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
 
 /// Known infra tools that the infra handler can dispatch to.

@@ -8,11 +8,11 @@
 
 use std::process::ExitCode;
 
-use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
+use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{run_file_tool, FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
+use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES, run_file_tool};
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {
     program: "ps",

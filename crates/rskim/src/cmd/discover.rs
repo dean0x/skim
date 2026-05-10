@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{ContentArrangement, Table};
 
-use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
+use super::session::{self, AgentKind, ToolInput, ToolInvocation, parse_duration_ago};
 
 /// Run the discover subcommand.
 pub(crate) fn run(
@@ -216,16 +216,17 @@ fn analyze_invocations(
                     // Responsibility lives in the caller, not classify_bash_command,
                     // so the classification function stays pure and easily testable.
                     if let Some(ref mut counts) = non_rewritable_counts
-                        && !info.has_rewrite {
-                            let prefix: String = command
-                                .split_whitespace()
-                                .take(3)
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            if !prefix.is_empty() {
-                                *counts.entry(prefix).or_insert(0) += 1;
-                            }
+                        && !info.has_rewrite
+                    {
+                        let prefix: String = command
+                            .split_whitespace()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !prefix.is_empty() {
+                            *counts.entry(prefix).or_insert(0) += 1;
                         }
+                    }
                     bash_commands.push(info);
                 }
             }

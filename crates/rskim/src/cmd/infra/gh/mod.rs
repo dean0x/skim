@@ -51,17 +51,17 @@ pub(super) mod streaming;
 // Re-export everything from `shared` so that submodule `use super::…` imports
 // continue to resolve without any changes to the sub-parser files.
 pub(super) use shared::{
+    MAX_BODY_LINES, MAX_COMMENTS, MAX_ITEMS, MAX_JSON_BYTES, MAX_STEP_DETAIL, RE_GH_CHECK_SYMBOL,
+    RE_GH_CHECK_TAB, RE_GH_RUN_HEADER, RE_GH_RUN_JOB, RE_GH_TAB_ROW, RE_GH_VIEW_FIELD,
     extract_comments, inject_json_fields, parse_view_text, three_tier_parse, truncate_body,
-    try_parse_json_object, MAX_BODY_LINES, MAX_COMMENTS, MAX_ITEMS, MAX_JSON_BYTES,
-    MAX_STEP_DETAIL, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, RE_GH_RUN_HEADER, RE_GH_RUN_JOB,
-    RE_GH_TAB_ROW, RE_GH_VIEW_FIELD,
+    try_parse_json_object,
 };
 
-use crate::output::canonical::InfraResult;
 use crate::output::ParseResult;
+use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
+use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "gh",
@@ -165,9 +165,10 @@ pub(crate) fn parse_impl_with_auto_detect(output: &CommandOutput) -> ParseResult
     // JSON object — auto-detect by discriminating fields
     if trimmed.starts_with('{') && trimmed.len() <= MAX_JSON_BYTES {
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed)
-            && let Some(result) = try_parse_view_json_auto(&obj) {
-                return ParseResult::Full(result);
-            }
+            && let Some(result) = try_parse_view_json_auto(&obj)
+        {
+            return ParseResult::Full(result);
+        }
         // Unknown JSON object shape → passthrough (e.g., gh api responses)
         let combined = combine_stdout_stderr(output);
         return ParseResult::Passthrough(combined.into_owned());

@@ -25,11 +25,7 @@ pub(crate) fn fail_mark() -> colored::ColoredString {
 /// separate success/failure branches. Respects `NO_COLOR` via the `colored`
 /// crate (D7).
 pub(crate) fn check_mark(ok: bool) -> colored::ColoredString {
-    if ok {
-        success_mark()
-    } else {
-        fail_mark()
-    }
+    if ok { success_mark() } else { fail_mark() }
 }
 
 /// Create a stderr-bound indeterminate spinner with the given message.
@@ -186,11 +182,7 @@ pub(crate) fn column_budget(term_width: u16, overhead: usize) -> usize {
 /// `if config.no_truncate { 0 } else { terminal_width() }` pattern in
 /// discover and learn (S2).
 pub(crate) fn resolve_term_width(no_truncate: bool) -> u16 {
-    if no_truncate {
-        0
-    } else {
-        terminal_width()
-    }
+    if no_truncate { 0 } else { terminal_width() }
 }
 
 /// Print a comfy-table to stdout with each line indented by `indent` spaces.

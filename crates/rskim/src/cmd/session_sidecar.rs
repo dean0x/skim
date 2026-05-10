@@ -185,10 +185,11 @@ fn cleanup_stale_rate_limited(sessions_dir: &Path) {
                 .duration_since(mtime)
                 .unwrap_or(Duration::MAX)
         })
-        && age < CLEANUP_RATE_LIMIT {
-            // Cleaned up recently — skip.
-            return;
-        }
+        && age < CLEANUP_RATE_LIMIT
+    {
+        // Cleaned up recently — skip.
+        return;
+    }
 
     cleanup_stale(sessions_dir);
 
@@ -229,11 +230,7 @@ fn get_ppid() -> Option<u32> {
     // SAFETY: getppid() is always safe to call — it has no preconditions and
     // always succeeds. The result is a valid non-negative PID on success.
     let ppid = unsafe { libc::getppid() };
-    if ppid <= 0 {
-        None
-    } else {
-        Some(ppid as u32)
-    }
+    if ppid <= 0 { None } else { Some(ppid as u32) }
 }
 
 #[cfg(not(unix))]
@@ -255,11 +252,7 @@ fn parent_of(pid: u32) -> Option<u32> {
     let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
     // fields[0] = state, fields[1] = ppid
     let ppid: u32 = fields.get(1)?.parse().ok()?;
-    if ppid == 0 {
-        None
-    } else {
-        Some(ppid)
-    }
+    if ppid == 0 { None } else { Some(ppid) }
 }
 
 /// Return the parent PID of `pid` on macOS using `proc_pidinfo(PROC_PIDTASKALLINFO)`.
@@ -298,11 +291,7 @@ fn parent_of(pid: u32) -> Option<u32> {
     }
 
     let ppid = info.pbsd.pbi_ppid;
-    if ppid == 0 {
-        None
-    } else {
-        Some(ppid)
-    }
+    if ppid == 0 { None } else { Some(ppid) }
 }
 
 /// Fallback for non-Linux, non-macOS Unix (e.g., FreeBSD, Windows).
@@ -341,7 +330,7 @@ mod tests {
     /// Set the mtime of a file to `SystemTime::now() - age` using the `filetime`
     /// crate (the standard portable approach for tests).
     fn set_file_age(path: &Path, age: Duration) {
-        use filetime::{set_file_mtime, FileTime};
+        use filetime::{FileTime, set_file_mtime};
         let target_mtime = SystemTime::now()
             .checked_sub(age)
             .unwrap_or(SystemTime::UNIX_EPOCH);

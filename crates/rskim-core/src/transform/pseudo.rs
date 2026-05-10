@@ -11,8 +11,8 @@ use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
 
 use super::minimal::{
-    adjust_range_for_line_removal, is_removable_comment, remove_ranges, trim_and_normalize,
-    MAX_AST_DEPTH, MAX_AST_NODES,
+    MAX_AST_DEPTH, MAX_AST_NODES, adjust_range_for_line_removal, is_removable_comment,
+    remove_ranges, trim_and_normalize,
 };
 use super::{compute_line_map_from_removed_ranges, normalize_line_map_blanks};
 
@@ -1045,8 +1045,7 @@ mod tests {
     #[test]
     fn test_rust_pseudo_trait_return_type() {
         // BUG 4: Rust trait method return types were not stripped
-        let source =
-            "pub trait Compute {\n    fn compute(&self, value: i32) -> i32;\n    fn reset(&mut self);\n}\n";
+        let source = "pub trait Compute {\n    fn compute(&self, value: i32) -> i32;\n    fn reset(&mut self);\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
             !result.contains("-> i32"),

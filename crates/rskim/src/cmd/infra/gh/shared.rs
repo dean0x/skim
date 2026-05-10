@@ -26,8 +26,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
@@ -163,10 +163,11 @@ pub fn parse_view_text(text: &str, operation: &str) -> Option<InfraResult> {
             continue;
         }
         if summary.is_empty()
-            && let Some(caps) = RE_GH_VIEW_HEADER.captures(line) {
-                summary = format!("#{}: {}", &caps[2], &caps[1]);
-                continue;
-            }
+            && let Some(caps) = RE_GH_VIEW_HEADER.captures(line)
+        {
+            summary = format!("#{}: {}", &caps[2], &caps[1]);
+            continue;
+        }
         if let Some(caps) = RE_GH_VIEW_FIELD.captures(line) {
             items.push(InfraItem {
                 label: caps[1].to_lowercase(),
@@ -289,10 +290,12 @@ where
     let trimmed = output.stdout.trim();
 
     // Tier 1: JSON
-    if is_json_input(trimmed) && trimmed.len() <= MAX_JSON_BYTES
-        && let Some(result) = try_json(trimmed) {
-            return ParseResult::Full(result);
-        }
+    if is_json_input(trimmed)
+        && trimmed.len() <= MAX_JSON_BYTES
+        && let Some(result) = try_json(trimmed)
+    {
+        return ParseResult::Full(result);
+    }
 
     let combined = combine_stdout_stderr(output);
 

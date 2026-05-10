@@ -16,8 +16,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::run_parsed_command;
-use crate::output::canonical::BuildResult;
 use crate::output::ParseResult;
+use crate::output::canonical::BuildResult;
 use crate::runner::CommandOutput;
 
 // ============================================================================

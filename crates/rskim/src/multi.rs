@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use rskim_core::Language;
 
-use crate::process::{process_file, report_token_stats, ProcessOptions};
+use crate::process::{ProcessOptions, process_file, report_token_stats};
 
 /// Options for multi-file processing
 #[derive(Debug, Clone)]

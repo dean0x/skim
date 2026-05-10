@@ -8,13 +8,13 @@
 use std::collections::BTreeMap;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
+use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 use super::{
-    build_file_result, run_file_tool, try_parse_file_line_content, FileToolConfig, MAX_FILES_SHOWN,
-    MAX_INPUT_LINES, MAX_MATCHES_PER_FILE,
+    FileToolConfig, MAX_FILES_SHOWN, MAX_INPUT_LINES, MAX_MATCHES_PER_FILE, build_file_result,
+    run_file_tool, try_parse_file_line_content,
 };
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {

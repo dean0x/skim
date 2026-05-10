@@ -15,9 +15,10 @@ pub(super) fn resolve_work_tree(global_flags: &[String]) -> Option<PathBuf> {
         let flag = &global_flags[i];
 
         if (flag == "-C" || flag == "--work-tree")
-            && let Some(val) = global_flags.get(i + 1) {
-                return Some(PathBuf::from(val));
-            }
+            && let Some(val) = global_flags.get(i + 1)
+        {
+            return Some(PathBuf::from(val));
+        }
 
         if let Some(val) = flag.strip_prefix("--work-tree=") {
             return Some(PathBuf::from(val));

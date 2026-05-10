@@ -29,8 +29,8 @@ use install::run_install;
 use uninstall::run_uninstall;
 
 pub(crate) use helpers::resolve_config_dir_for_agent;
-pub(crate) use state::has_skim_hook_entry;
 pub(crate) use state::MAX_SETTINGS_SIZE;
+pub(crate) use state::has_skim_hook_entry;
 
 /// Run the `init` subcommand.
 pub(crate) fn run(

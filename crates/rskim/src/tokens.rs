@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use std::sync::OnceLock;
-use tiktoken_rs::{cl100k_base, CoreBPE};
+use tiktoken_rs::{CoreBPE, cl100k_base};
 
 /// Global tokenizer instance (lazy-initialized on first use)
 static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();

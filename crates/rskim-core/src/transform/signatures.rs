@@ -7,7 +7,7 @@
 use crate::transform::minimal::MAX_AST_DEPTH;
 use crate::transform::structure::extract_markdown_headers_with_spans;
 use crate::transform::truncate::NodeSpan;
-use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
+use crate::transform::utils::{FunctionNodeTypes, to_static_node_kind};
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
 

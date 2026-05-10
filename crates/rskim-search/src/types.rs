@@ -203,12 +203,7 @@ pub trait LayerBuilder: Send {
     ///
     /// # Errors
     /// Returns [`SearchError`] if the content cannot be parsed or indexed.
-    fn add_file(
-        &mut self,
-        id: FileId,
-        content: &str,
-        lang: rskim_core::Language,
-    ) -> Result<()>;
+    fn add_file(&mut self, id: FileId, content: &str, lang: rskim_core::Language) -> Result<()>;
 
     /// Finalise the builder and produce a queryable [`SearchLayer`].
     ///
@@ -312,7 +307,10 @@ mod tests {
         let core_err = rskim_core::SkimError::ParseError("x".into());
         let search_err = SearchError::from(core_err);
         let display = format!("{search_err}");
-        assert!(display.contains("x"), "Display should propagate core message, got: {display}");
+        assert!(
+            display.contains("x"),
+            "Display should propagate core message, got: {display}"
+        );
     }
 
     #[test]

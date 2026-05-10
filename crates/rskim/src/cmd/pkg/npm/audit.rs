@@ -16,8 +16,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::runner::CommandOutput;
 
 use super::combine_output;
@@ -123,9 +123,10 @@ fn try_parse_audit_json(stdout: &str) -> Option<PkgResult> {
                 arr.iter().find_map(|entry| {
                     // Try to get GHSA from the url field.
                     if let Some(url) = entry.get("url").and_then(|u| u.as_str())
-                        && let Some(caps) = RE_GHSA.captures(url) {
-                            return Some(caps[1].to_string());
-                        }
+                        && let Some(caps) = RE_GHSA.captures(url)
+                    {
+                        return Some(caps[1].to_string());
+                    }
                     // Fall back to numeric source → NPM-{source}.
                     entry
                         .get("source")

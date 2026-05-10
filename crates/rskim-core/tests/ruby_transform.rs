@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
 
-use rskim_core::{transform, Language, Mode};
+use rskim_core::{Language, Mode, transform};
 
 const SIMPLE_RB: &str = include_str!("../../../tests/fixtures/ruby/simple.rb");
 const CLASS_RB: &str = include_str!("../../../tests/fixtures/ruby/class.rb");

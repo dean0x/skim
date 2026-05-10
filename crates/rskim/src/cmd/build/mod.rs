@@ -11,8 +11,8 @@ pub(crate) mod tsc;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crate::output::canonical::BuildResult;
 use crate::output::ParseResult;
+use crate::output::canonical::BuildResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
 // ============================================================================

@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
 
-use rskim_core::{transform, Language, Mode};
+use rskim_core::{Language, Mode, transform};
 
 const SIMPLE_SQL: &str = include_str!("../../../tests/fixtures/sql/simple.sql");
 const SCHEMA_SQL: &str = include_str!("../../../tests/fixtures/sql/schema.sql");

@@ -18,9 +18,9 @@ use std::process::ExitCode;
 
 use std::collections::BTreeMap;
 
-use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
-use crate::output::canonical::FileResult;
+use super::{ParsedCommandConfig, extract_show_stats, run_parsed_command_with_mode};
 use crate::output::ParseResult;
+use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 /// Known file tools that the file handler can dispatch to.

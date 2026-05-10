@@ -17,13 +17,13 @@
 //! Falls back to regex-based parsing of `gh issue view` text output when JSON
 //! is unavailable. Extracts title, state, and visible fields.
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::{
-    extract_comments, inject_json_fields, parse_view_text, three_tier_parse, truncate_body,
-    try_parse_json_object, MAX_BODY_LINES, MAX_COMMENTS,
+    MAX_BODY_LINES, MAX_COMMENTS, extract_comments, inject_json_fields, parse_view_text,
+    three_tier_parse, truncate_body, try_parse_json_object,
 };
 
 /// JSON fields to inject for `gh issue view`.

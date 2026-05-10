@@ -7,7 +7,7 @@
 use crate::transform::compute_line_starts;
 use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::transform::truncate::NodeSpan;
-use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
+use crate::transform::utils::{FunctionNodeTypes, to_static_node_kind};
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};

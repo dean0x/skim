@@ -522,7 +522,7 @@ mod tests {
     fn test_remove_ranges_non_char_boundary() {
         // Multi-byte UTF-8 character: the euro sign takes 3 bytes
         let source = "a\u{20AC}b"; // "a" + euro sign (3 bytes) + "b" = 5 bytes total
-                                   // Byte 2 is in the middle of the euro sign (bytes 1..4)
+        // Byte 2 is in the middle of the euro sign (bytes 1..4)
         let ranges = vec![(2, 4)];
         let result = remove_ranges(source, &ranges);
         assert!(result.is_err());

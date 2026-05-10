@@ -21,14 +21,14 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::{
-    inject_flag_before_separator, run_parsed_command_with_mode, should_read_stdin, user_has_flag,
-    OutputFormat, ParsedCommandConfig,
+    OutputFormat, ParsedCommandConfig, inject_flag_before_separator, run_parsed_command_with_mode,
+    should_read_stdin, user_has_flag,
 };
-use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
+use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::runner::CommandOutput;
 
-use super::shared::{scrape_failures, TestKind};
+use super::shared::{TestKind, scrape_failures};
 
 // Static regex patterns compiled once via LazyLock (avoids per-call compilation).
 static RE_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());
@@ -285,14 +285,13 @@ fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
         // If we're in a STDOUT capture block, accumulate lines.
         // Use trim_end() instead of trim() to preserve leading whitespace
         // in assertion messages and formatted output.
-        if in_stdout_block
-            && let Some((_, ref mut captured)) = current_stdout_capture {
-                if !captured.is_empty() {
-                    captured.push('\n');
-                }
-                captured.push_str(line.trim_end());
-                continue;
+        if in_stdout_block && let Some((_, ref mut captured)) = current_stdout_capture {
+            if !captured.is_empty() {
+                captured.push('\n');
             }
+            captured.push_str(line.trim_end());
+            continue;
+        }
 
         // Reset stdout block on non-indented lines that aren't part of capture
         if !trimmed.is_empty()
@@ -365,13 +364,14 @@ fn try_parse_nextest(stdout: &str) -> Option<TestResult> {
 
         // Parse summary line: "Summary [0.010s] N tests run: N passed, N failed, N skipped"
         if trimmed.starts_with("Summary")
-            && let Some(summary) = parse_nextest_summary(trimmed) {
-                summary_found = true;
-                total_passed = summary.0;
-                total_failed = summary.1;
-                total_skipped = summary.2;
-                duration_ms = summary.3;
-            }
+            && let Some(summary) = parse_nextest_summary(trimmed)
+        {
+            summary_found = true;
+            total_passed = summary.0;
+            total_failed = summary.1;
+            total_skipped = summary.2;
+            duration_ms = summary.3;
+        }
     }
 
     // Finalize any pending stdout capture
@@ -409,12 +409,13 @@ fn extract_nextest_name(rest: &str) -> Option<String> {
     let rest = rest.trim();
     // Skip the duration bracket: [0.003s]
     if let Some(after_bracket) = rest.strip_prefix('[')
-        && let Some(pos) = after_bracket.find(']') {
-            let name = after_bracket[pos + 1..].trim();
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
+        && let Some(pos) = after_bracket.find(']')
+    {
+        let name = after_bracket[pos + 1..].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
         }
+    }
     None
 }
 
@@ -430,13 +431,15 @@ fn parse_nextest_summary(line: &str) -> Option<(usize, usize, usize, Option<u64>
 
     // Extract duration from brackets
     if let Some(start) = line.find('[')
-        && let Some(end) = line.find(']') {
-            let dur_str = line[start + 1..end].trim();
-            if let Some(secs_str) = dur_str.strip_suffix('s')
-                && let Ok(secs) = secs_str.trim().parse::<f64>() {
-                    duration_ms = Some((secs * 1000.0) as u64);
-                }
+        && let Some(end) = line.find(']')
+    {
+        let dur_str = line[start + 1..end].trim();
+        if let Some(secs_str) = dur_str.strip_suffix('s')
+            && let Ok(secs) = secs_str.trim().parse::<f64>()
+        {
+            duration_ms = Some((secs * 1000.0) as u64);
         }
+    }
 
     // Parse "N passed", "N failed", "N skipped" from the summary.
     // Uses static LazyLock regexes to avoid per-call compilation.

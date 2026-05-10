@@ -23,8 +23,8 @@
 //! → `failing`; else any PENDING|QUEUED|IN_PROGRESS → `pending`; else
 //! `passing`; `none` if statusCheckRollup is null, missing, or empty.
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::{
@@ -35,8 +35,7 @@ use super::{
 ///
 /// Superset of issue view fields with PR-specific additions.
 /// Includes `isDraft`, `mergeable`, and `statusCheckRollup` for AD-INFRA-9 always-render.
-const PR_VIEW_FIELDS: &str =
-    "number,title,state,body,labels,assignees,author,headRefName,baseRefName,additions,deletions,changedFiles,comments,isDraft,mergeable,statusCheckRollup";
+const PR_VIEW_FIELDS: &str = "number,title,state,body,labels,assignees,author,headRefName,baseRefName,additions,deletions,changedFiles,comments,isDraft,mergeable,statusCheckRollup";
 
 /// Inject `--json` for PR view if not already present.
 pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {

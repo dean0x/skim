@@ -72,11 +72,7 @@ fn detect_cursor(home: Option<&Path>) -> AgentStatus {
     // config_dir() handles macOS vs Linux detection internally
     let state_path = home.and_then(|h| {
         let path = AgentKind::Cursor.config_dir(h);
-        if path.is_dir() {
-            Some(path)
-        } else {
-            None
-        }
+        if path.is_dir() { Some(path) } else { None }
     });
 
     let detected = state_path.is_some();

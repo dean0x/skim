@@ -4,8 +4,8 @@
 
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in benchmarks
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use rskim_core::{transform, truncate_to_token_budget, Language, Mode};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use rskim_core::{Language, Mode, transform, truncate_to_token_budget};
 
 // ============================================================================
 // Benchmark Fixtures

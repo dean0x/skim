@@ -7,11 +7,11 @@
 //! - **Tier 1 (Full)**: Parse `file:line:content` format, group by file
 //! - **Tier 2 (Passthrough)**: Raw output
 
-use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
+use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{run_file_tool, try_parse_file_line_content, FileToolConfig};
+use super::{FileToolConfig, run_file_tool, try_parse_file_line_content};
 
 const CONFIG: FileToolConfig<'static> = FileToolConfig {
     program: "grep",

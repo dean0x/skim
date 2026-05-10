@@ -19,8 +19,8 @@ use regex::Regex;
 
 use super::run_parsed_command;
 use crate::cmd::{inject_flag_before_separator, user_has_flag};
-use crate::output::canonical::BuildResult;
 use crate::output::ParseResult;
+use crate::output::canonical::BuildResult;
 use crate::runner::CommandOutput;
 
 // ============================================================================

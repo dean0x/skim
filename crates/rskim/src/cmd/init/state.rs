@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use super::flags::InitFlags;
-use super::helpers::{resolve_config_dir_for_agent, HOOK_SCRIPT_NAME};
-use crate::cmd::hooks::{protocol_for_agent, HookProtocol};
+use super::helpers::{HOOK_SCRIPT_NAME, resolve_config_dir_for_agent};
+use crate::cmd::hooks::{HookProtocol, protocol_for_agent};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
@@ -61,18 +61,18 @@ pub(super) fn detect_state(
             .get("hooks")
             .and_then(|h| h.get(protocol.hook_event_key()))
             .and_then(|v| v.as_array())
-        {
-            for entry in arr {
-                if protocol.is_skim_entry(entry) {
-                    hook_installed = true;
-                    hook_version = extract_hook_version_from_entry(
-                        entry,
-                        &config_dir,
-                        hook_script_contents.as_deref(),
-                    );
-                }
+    {
+        for entry in arr {
+            if protocol.is_skim_entry(entry) {
+                hook_installed = true;
+                hook_version = extract_hook_version_from_entry(
+                    entry,
+                    &config_dir,
+                    hook_script_contents.as_deref(),
+                );
             }
         }
+    }
 
     // Scan for existing non-skim hooks (plugin collision detection)
     let existing_hooks = scan_existing_hooks(

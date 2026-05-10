@@ -15,8 +15,8 @@
 //! through to the text-tier on JSON with `null` publishedAt and tries
 //! the text/regex tier (which reads the `Published` field from table output).
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::{inject_json_fields, three_tier_parse, try_parse_json_object};

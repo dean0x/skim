@@ -3,12 +3,12 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use super::flags::{detect_installed_agents, resolve_single_agent, DetectionEnv, InitFlags};
+use super::flags::{DetectionEnv, InitFlags, detect_installed_agents, resolve_single_agent};
 use super::helpers::{
-    atomic_write_settings, check_mark, load_or_create_settings, resolve_real_settings_path,
-    HOOK_SCRIPT_NAME, SETTINGS_BACKUP,
+    HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, load_or_create_settings,
+    resolve_real_settings_path,
 };
-use super::state::{detect_state, has_skim_hook_entry, read_settings_json, DetectedState};
+use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
@@ -413,18 +413,19 @@ fn remove_skim_entries_from_event(settings: &mut serde_json::Value, event_key: &
     };
 
     if let Some(hooks_obj) = obj.get_mut("hooks").and_then(|h| h.as_object_mut())
-        && let Some(arr) = hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
-            let before = arr.len();
-            arr.retain(|entry| !has_skim_hook_entry(entry));
-            let removed = arr.len() < before;
-            if arr.is_empty() {
-                hooks_obj.remove(event_key);
-            }
-            if hooks_obj.is_empty() {
-                obj.remove("hooks");
-            }
-            return removed;
+        && let Some(arr) = hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut())
+    {
+        let before = arr.len();
+        arr.retain(|entry| !has_skim_hook_entry(entry));
+        let removed = arr.len() < before;
+        if arr.is_empty() {
+            hooks_obj.remove(event_key);
         }
+        if hooks_obj.is_empty() {
+            obj.remove("hooks");
+        }
+        return removed;
+    }
     false
 }
 
@@ -586,14 +587,15 @@ fn resolve_instruction_path(
 /// which is treated as a soft warning rather than a hard error.
 fn read_existing_safely(path: &std::path::Path) -> anyhow::Result<Option<String>> {
     if let Ok(meta) = std::fs::metadata(path)
-        && meta.len() > MAX_INSTRUCTION_FILE_SIZE {
-            eprintln!(
-                "  warning: {} is too large ({} bytes), skipping guidance",
-                path.display(),
-                meta.len()
-            );
-            return Ok(None);
-        }
+        && meta.len() > MAX_INSTRUCTION_FILE_SIZE
+    {
+        eprintln!(
+            "  warning: {} is too large ({} bytes), skipping guidance",
+            path.display(),
+            meta.len()
+        );
+        return Ok(None);
+    }
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
         Err(e) => {
@@ -840,11 +842,12 @@ fn clean_legacy_cursorrules() -> anyhow::Result<()> {
     // S2: apply resolve_real_settings_path so symlinks are handled consistently
     let legacy = super::helpers::resolve_real_settings_path(&legacy)?;
     if let Ok(content) = std::fs::read_to_string(&legacy)
-        && let Some(cleaned) = strip_skim_section(&content) {
-            // Leave the file in place even when cleaned is empty (user may own it).
-            atomic_write_stripped(&legacy, &cleaned)?;
-            println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
-        }
+        && let Some(cleaned) = strip_skim_section(&content)
+    {
+        // Leave the file in place even when cleaned is empty (user may own it).
+        atomic_write_stripped(&legacy, &cleaned)?;
+        println!("  {} Cleaned legacy .cursorrules markers", check_mark(true));
+    }
     Ok(())
 }
 

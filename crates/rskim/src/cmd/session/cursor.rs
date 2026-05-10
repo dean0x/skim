@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
-use super::types::*;
 use super::SessionProvider;
+use super::types::*;
 
 /// Maximum database file size: 100 MB.
 const MAX_DB_SIZE: u64 = 100 * 1024 * 1024;
@@ -81,9 +81,10 @@ impl SessionProvider for CursorProvider {
         // Apply time filter against the database file's mtime (we cannot
         // reliably get per-session timestamps from the KV table).
         if let Some(since) = filter.since
-            && file_modified < since {
-                return Ok(Vec::new());
-            }
+            && file_modified < since
+        {
+            return Ok(Vec::new());
+        }
 
         let mut sessions: Vec<SessionFile> = rows
             .into_iter()

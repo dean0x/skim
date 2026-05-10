@@ -5,9 +5,10 @@ use std::path::Path;
 /// Replace home directory prefix with ~ for display.
 pub(super) fn tilde_path(path: &Path) -> String {
     if let Some(home) = dirs::home_dir()
-        && let Ok(stripped) = path.strip_prefix(&home) {
-            return format!("~/{}", stripped.display());
-        }
+        && let Ok(stripped) = path.strip_prefix(&home)
+    {
+        return format!("~/{}", stripped.display());
+    }
     path.display().to_string()
 }
 

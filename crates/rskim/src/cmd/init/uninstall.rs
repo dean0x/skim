@@ -1,11 +1,11 @@
 //! Uninstall flow for `skim init` (B10).
 
 use super::flags::{
-    detect_installed_agents, resolve_agent, resolve_single_agent, DetectionEnv, InitFlags,
+    DetectionEnv, InitFlags, detect_installed_agents, resolve_agent, resolve_single_agent,
 };
 use super::helpers::{
-    atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
-    resolve_config_dir_for_agent, resolve_real_settings_path, HOOK_SCRIPT_NAME,
+    HOOK_SCRIPT_NAME, atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
+    resolve_config_dir_for_agent, resolve_real_settings_path,
 };
 use super::state::{has_skim_hook_entry, read_settings_json};
 use crate::cmd::hooks::protocol_for_agent;
@@ -126,15 +126,16 @@ fn run_uninstall_for_agent(
             &config_dir,
             agent.cli_name(),
             &hook_script_path,
-        ) {
-            if !flags.force {
-                eprintln!("warning: hook script has been modified since installation");
-                eprintln!("hint: use --force to uninstall anyway");
-                return Ok(std::process::ExitCode::FAILURE);
-            }
-            // --force provided: proceed despite tamper, but inform user
-            eprintln!("warning: hook script has been modified (proceeding with --force)");
+        )
+    {
+        if !flags.force {
+            eprintln!("warning: hook script has been modified since installation");
+            eprintln!("hint: use --force to uninstall anyway");
+            return Ok(std::process::ExitCode::FAILURE);
         }
+        // --force provided: proceed despite tamper, but inform user
+        eprintln!("warning: hook script has been modified (proceeding with --force)");
+    }
 
     // Interactive confirmation
     if !flags.yes {

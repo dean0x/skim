@@ -4,7 +4,7 @@
 //! fits within a caller-specified token budget, with a final line-truncation
 //! fallback.
 
-use rskim_core::{truncate_to_token_budget, Language, Mode, TransformConfig};
+use rskim_core::{Language, Mode, TransformConfig, truncate_to_token_budget};
 
 use crate::tokens;
 
@@ -329,10 +329,12 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no transformation mode produced output"),);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no transformation mode produced output"),
+        );
     }
 
     // ── Serde cascade path tests ────────────────────────────────────────
@@ -423,9 +425,11 @@ mod tests {
         let result = cascade_for_token_budget(Mode::Full, &trunc, 100, Language::Toml, transform);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no transformation mode produced output"),);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no transformation mode produced output"),
+        );
     }
 }

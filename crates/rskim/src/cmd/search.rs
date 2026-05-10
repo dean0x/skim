@@ -64,3 +64,35 @@ Examples:
   skim search --ast \"function_declaration\" --json"
     );
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::ExitCode;
+
+    /// Stub analytics config for tests — analytics disabled, no cost override.
+    const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
+        enabled: false,
+        input_cost_per_mtok: None,
+        session_id: None,
+    };
+
+    #[test]
+    fn test_search_help_returns_success() {
+        // Empty args → print help → ExitCode::SUCCESS
+        let result = run(&[], &TEST_ANALYTICS).unwrap();
+        assert_eq!(result, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_search_unimplemented_returns_failure() {
+        // Query arg provided → not yet implemented → ExitCode::FAILURE
+        let args = vec!["fn parse".to_string()];
+        let result = run(&args, &TEST_ANALYTICS).unwrap();
+        assert_eq!(result, ExitCode::FAILURE);
+    }
+}

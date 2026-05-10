@@ -620,10 +620,12 @@ fn test_hook_cargo_test_match() {
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
-    assert!(json["hookSpecificOutput"]["updatedInput"]["command"]
-        .as_str()
-        .unwrap()
-        .contains("skim cargo test"));
+    assert!(
+        json["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("skim cargo test")
+    );
 }
 
 #[test]
