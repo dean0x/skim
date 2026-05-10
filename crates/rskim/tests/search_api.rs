@@ -16,10 +16,6 @@ use rskim_search::{
     SearchLayer, SearchQuery, SearchResult, TemporalFlags,
 };
 
-// ============================================================================
-// FileId
-// ============================================================================
-
 #[test]
 fn file_id_constructs_and_compares() {
     let a = FileId(0);
@@ -28,10 +24,6 @@ fn file_id_constructs_and_compares() {
     assert_ne!(a, b);
     assert!(a < b);
 }
-
-// ============================================================================
-// SearchQuery
-// ============================================================================
 
 #[test]
 fn search_query_new_has_no_filters() {
@@ -62,10 +54,6 @@ fn search_query_with_all_filters() {
     assert_eq!(tf.modified_within_days, Some(30));
 }
 
-// ============================================================================
-// SearchField
-// ============================================================================
-
 #[test]
 fn search_field_name_is_stable() {
     assert_eq!(SearchField::TypeDefinition.name(), "type_definition");
@@ -77,10 +65,6 @@ fn search_field_name_is_stable() {
     assert_eq!(SearchField::StringLiteral.name(), "string_literal");
     assert_eq!(SearchField::Other.name(), "other");
 }
-
-// ============================================================================
-// SearchError
-// ============================================================================
 
 #[test]
 fn search_error_invalid_query_display() {
@@ -111,10 +95,6 @@ fn search_error_from_core_error() {
     );
 }
 
-// ============================================================================
-// IndexStats
-// ============================================================================
-
 #[test]
 fn index_stats_fields_accessible() {
     let stats = IndexStats {
@@ -128,10 +108,6 @@ fn index_stats_fields_accessible() {
     assert_eq!(stats.index_size_bytes, 4096);
     assert_eq!(stats.last_updated, Some(1_700_000_000));
 }
-
-// ============================================================================
-// NodeInfo + FieldClassifier trait
-// ============================================================================
 
 /// Concrete FieldClassifier that a downstream consumer can implement.
 /// Validates the trait's API contract is usable without tree-sitter.
@@ -185,10 +161,6 @@ fn field_classifier_can_be_implemented_without_tree_sitter() {
     );
 }
 
-// ============================================================================
-// SearchLayer + LayerBuilder traits (object-safety checks)
-// ============================================================================
-
 /// Validates SearchLayer is object-safe: a Box<dyn SearchLayer> can be formed.
 /// This guards against accidental breaking of the object-safety contract.
 fn _assert_search_layer_is_object_safe(_layer: Box<dyn SearchLayer>) {}
@@ -196,10 +168,6 @@ fn _assert_search_layer_is_object_safe(_layer: Box<dyn SearchLayer>) {}
 /// Validates LayerBuilder object-safety for the add_file method (build has
 /// `where Self: Sized` so it's excluded from the vtable, as intended).
 fn _assert_layer_builder_add_file_is_dyn_safe(_builder: &mut dyn LayerBuilder) {}
-
-// ============================================================================
-// SearchResult construction
-// ============================================================================
 
 #[test]
 fn search_result_fields_accessible() {

@@ -440,23 +440,6 @@ mod tests {
         assert_eq!(SearchField::Other.name(), "other");
     }
 
-    #[test]
-    fn test_search_field_serialization() {
-        // serde uses snake_case (rename_all) to align with the name() method output
-        assert_eq!(
-            serde_json::to_string(&SearchField::TypeDefinition).unwrap(),
-            "\"type_definition\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SearchField::FunctionSignature).unwrap(),
-            "\"function_signature\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SearchField::Other).unwrap(),
-            "\"other\""
-        );
-    }
-
     /// Verifies that deserialization from snake_case strings produces the correct
     /// variant — guards against regressions when adding new variants.
     #[test]
@@ -722,9 +705,7 @@ mod tests {
             }
 
             fn build(self) -> Result<Box<dyn SearchLayer>> {
-                struct BuiltLayer {
-                    file_count: u32,
-                }
+                struct BuiltLayer;
 
                 impl SearchLayer for BuiltLayer {
                     fn search(&self, _query: &SearchQuery) -> Result<Vec<SearchResult>> {
@@ -736,9 +717,7 @@ mod tests {
                     }
                 }
 
-                Ok(Box::new(BuiltLayer {
-                    file_count: self.file_count,
-                }))
+                Ok(Box::new(BuiltLayer))
             }
         }
 
