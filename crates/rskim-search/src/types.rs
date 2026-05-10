@@ -66,6 +66,20 @@ pub enum SearchField {
 
 impl SearchField {
     /// Returns the snake_case name of this field variant.
+    ///
+    /// # Rationale for exhaustive match
+    ///
+    /// This duplicates the strings that `#[serde(rename_all = "snake_case")]`
+    /// would produce, but the duplication is intentional:
+    ///
+    /// - **Compile-time enforcement**: adding a variant without updating this
+    ///   match is a compile error, whereas forgetting to test a new serde
+    ///   serialization would be silent.
+    /// - **Zero allocation**: returns `&'static str` without going through
+    ///   `serde_json`. Useful in hot paths (e.g. BM25F field weighting loops).
+    ///
+    /// The test `test_search_field_serde_agrees_with_name` verifies that both
+    /// sources of truth stay in sync.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -214,13 +228,53 @@ pub trait LayerBuilder: Send {
         Self: Sized;
 }
 
-/// Classifier that maps a tree-sitter AST node to a [`SearchField`].
+/// Language-neutral representation of an AST node for field classification.
+///
+/// Captures exactly what [`FieldClassifier`] needs from a parsed node so that
+/// `rskim-search` does not expose tree-sitter as part of its public API. Callers
+/// (in `rskim-core` or in tree-sitter-specific indexing code) convert their
+/// concrete node type to `NodeInfo` before calling [`FieldClassifier::classify`].
+///
+/// This keeps the Strategy Pattern in `Language::transform_source()` intact:
+/// non-tree-sitter languages (JSON, YAML, TOML) can implement `FieldClassifier`
+/// without depending on the tree-sitter crate.
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    /// The grammar rule name for this node (e.g. `"function_definition"`).
+    pub kind: &'static str,
+    /// Byte range of this node within the source file.
+    pub byte_range: Range<usize>,
+    /// Number of named children this node has.
+    pub named_child_count: usize,
+}
+
+impl NodeInfo {
+    /// Construct a `NodeInfo` from a tree-sitter [`tree_sitter::Node`].
+    ///
+    /// Keeps tree-sitter as an implementation detail: call-sites in tree-sitter
+    /// indexers use this constructor; the rest of `rskim-search` only sees
+    /// `NodeInfo`.
+    #[must_use]
+    pub fn from_ts_node(node: &tree_sitter::Node<'_>) -> Self {
+        Self {
+            kind: node.kind(),
+            byte_range: node.byte_range(),
+            named_child_count: node.named_child_count(),
+        }
+    }
+}
+
+/// Classifier that maps an AST node to a [`SearchField`].
+///
+/// Accepts [`NodeInfo`] rather than a concrete tree-sitter node so that
+/// non-tree-sitter languages (JSON, YAML, TOML) can implement this trait
+/// without depending on the tree-sitter crate.
 ///
 /// Implementations should be thread-safe so they can be shared across indexing
 /// workers.
 pub trait FieldClassifier: Send + Sync {
     /// Classify the given `node` within its `source` file.
-    fn classify(&self, node: &tree_sitter::Node<'_>, source: &str) -> SearchField;
+    fn classify(&self, node: &NodeInfo, source: &str) -> SearchField;
 }
 
 // ============================================================================
@@ -414,5 +468,141 @@ mod tests {
             serde_json::to_string(&SearchField::Other).unwrap(),
             "\"other\""
         );
+    }
+
+    /// Verifies that deserialization from snake_case strings produces the correct
+    /// variant — guards against regressions when adding new variants.
+    #[test]
+    fn test_search_field_deserialization() {
+        let cases: &[(&str, SearchField)] = &[
+            ("\"type_definition\"", SearchField::TypeDefinition),
+            ("\"function_signature\"", SearchField::FunctionSignature),
+            ("\"symbol_name\"", SearchField::SymbolName),
+            ("\"import_export\"", SearchField::ImportExport),
+            ("\"function_body\"", SearchField::FunctionBody),
+            ("\"comment\"", SearchField::Comment),
+            ("\"string_literal\"", SearchField::StringLiteral),
+            ("\"other\"", SearchField::Other),
+        ];
+        for (json, expected) in cases {
+            let got: SearchField = serde_json::from_str(json).unwrap();
+            assert_eq!(got, *expected, "failed for input {json}");
+        }
+    }
+
+    /// Verifies that `name()` and serde both produce the same string for every
+    /// variant, so the two sources of truth cannot drift apart silently.
+    #[test]
+    fn test_search_field_serde_agrees_with_name() {
+        let variants = [
+            SearchField::TypeDefinition,
+            SearchField::FunctionSignature,
+            SearchField::SymbolName,
+            SearchField::ImportExport,
+            SearchField::FunctionBody,
+            SearchField::Comment,
+            SearchField::StringLiteral,
+            SearchField::Other,
+        ];
+        for v in variants {
+            let serde_str = serde_json::to_string(&v).unwrap();
+            // serde wraps in quotes; name() does not
+            let serde_inner = serde_str.trim_matches('"');
+            assert_eq!(
+                serde_inner,
+                v.name(),
+                "serde and name() disagree for {v:?}"
+            );
+        }
+    }
+
+    /// Roundtrip test for SearchResult: serialize to JSON then deserialize back
+    /// into SearchResult, verifying the Deserialize impl matches the Serialize
+    /// impl field-by-field.
+    #[test]
+    fn test_search_result_roundtrip() {
+        let original = SearchResult {
+            file_id: FileId(7),
+            score: 0.42,
+            line_range: 3..15,
+            match_positions: vec![0..4, 8..12],
+            field: SearchField::SymbolName,
+            snippet: Some("let foo = bar".to_string()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: SearchResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.file_id, original.file_id);
+        assert!((restored.score - original.score).abs() < f64::EPSILON);
+        assert_eq!(restored.line_range, original.line_range);
+        assert_eq!(restored.match_positions, original.match_positions);
+        assert_eq!(restored.field, original.field);
+        assert_eq!(restored.snippet, original.snippet);
+    }
+
+    /// Roundtrip test for SearchResult with a null snippet.
+    #[test]
+    fn test_search_result_roundtrip_null_snippet() {
+        let original = SearchResult {
+            file_id: FileId(0),
+            score: 1.0,
+            line_range: 0..1,
+            match_positions: vec![],
+            field: SearchField::Other,
+            snippet: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: SearchResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.file_id, original.file_id);
+        assert_eq!(restored.snippet, None);
+        assert_eq!(restored.field, SearchField::Other);
+    }
+
+    /// Basic serialization test for IndexStats — ensures all fields are present
+    /// and correctly named in the JSON output.
+    #[test]
+    fn test_index_stats_serialization() {
+        let stats = IndexStats {
+            file_count: 42,
+            total_ngrams: 1_000_000,
+            index_size_bytes: 512 * 1024,
+            last_updated: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["file_count"], serde_json::json!(42));
+        assert_eq!(v["total_ngrams"], serde_json::json!(1_000_000u64));
+        assert_eq!(v["index_size_bytes"], serde_json::json!(512u64 * 1024));
+        assert_eq!(v["last_updated"], serde_json::json!(1_700_000_000u64));
+    }
+
+    /// IndexStats with no last_updated should serialize last_updated as null.
+    #[test]
+    fn test_index_stats_serialization_no_last_updated() {
+        let stats = IndexStats {
+            file_count: 0,
+            total_ngrams: 0,
+            index_size_bytes: 0,
+            last_updated: None,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["last_updated"], serde_json::Value::Null);
+        assert_eq!(v["file_count"], serde_json::json!(0));
+    }
+
+    /// NodeInfo can be constructed directly with correct field values.
+    #[test]
+    fn test_node_info_construction() {
+        let info = NodeInfo {
+            kind: "function_definition",
+            byte_range: 10..50,
+            named_child_count: 3,
+        };
+        assert_eq!(info.kind, "function_definition");
+        assert_eq!(info.byte_range, 10..50);
+        assert_eq!(info.named_child_count, 3);
     }
 }
