@@ -85,32 +85,25 @@ mod tests {
 
     #[test]
     fn test_search_help_returns_success() {
-        // Empty args → print help → ExitCode::SUCCESS
         let result = run(&[], &TEST_ANALYTICS).unwrap();
         assert_eq!(result, ExitCode::SUCCESS);
     }
 
     #[test]
     fn test_search_help_flag_returns_success() {
-        // --help flag → print help → ExitCode::SUCCESS
-        let args = vec!["--help".to_string()];
-        let result = run(&args, &TEST_ANALYTICS).unwrap();
+        let result = run(&["--help".to_string()], &TEST_ANALYTICS).unwrap();
         assert_eq!(result, ExitCode::SUCCESS);
     }
 
     #[test]
     fn test_search_short_help_flag_returns_success() {
-        // -h flag → print help → ExitCode::SUCCESS
-        let args = vec!["-h".to_string()];
-        let result = run(&args, &TEST_ANALYTICS).unwrap();
+        let result = run(&["-h".to_string()], &TEST_ANALYTICS).unwrap();
         assert_eq!(result, ExitCode::SUCCESS);
     }
 
     #[test]
     fn test_search_unimplemented_returns_failure() {
-        // Query arg provided → not yet implemented → ExitCode::FAILURE
-        let args = vec!["fn parse".to_string()];
-        let result = run(&args, &TEST_ANALYTICS).unwrap();
+        let result = run(&["fn parse".to_string()], &TEST_ANALYTICS).unwrap();
         assert_eq!(result, ExitCode::FAILURE);
     }
 }

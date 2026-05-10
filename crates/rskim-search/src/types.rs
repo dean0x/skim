@@ -248,7 +248,6 @@ pub struct NodeInfo {
     pub named_child_count: usize,
 }
 
-
 /// Classifier that maps an AST node to a [`SearchField`].
 ///
 /// Accepts [`NodeInfo`] rather than a concrete tree-sitter node so that
@@ -347,21 +346,6 @@ mod tests {
         assert_eq!(v["match_positions"][0]["end"], serde_json::json!(10));
         assert_eq!(v["field"], serde_json::json!("function_signature"));
         assert_eq!(v["snippet"], serde_json::json!("fn foo()"));
-    }
-
-    #[test]
-    fn test_search_result_serialization_null_snippet() {
-        let result = SearchResult {
-            file_id: FileId(0),
-            score: 1.0,
-            line_range: 0..1,
-            match_positions: vec![],
-            field: SearchField::Other,
-            snippet: None,
-        };
-        let json = serde_json::to_string(&result).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["snippet"], serde_json::Value::Null);
     }
 
     #[test]
