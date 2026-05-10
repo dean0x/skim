@@ -11,16 +11,21 @@
 use std::fmt;
 use std::ops::Range;
 
+// Search types derive Serialize/Deserialize because search results are serialized
+// to JSON for `--json` CLI output. rskim-core types do not need serde — they are
+// internal transformation types that never cross a serialization boundary.
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // File Identifier
 // ============================================================================
 
-/// Opaque numeric identifier for a file in the search index.
+/// Transparent numeric wrapper for a file in the search index, providing type
+/// safety to prevent accidental misuse of IDs as raw integers.
 ///
-/// Using a newtype (rather than bare u32) prevents accidental misuse of IDs
-/// as raw integers. Implements ordering so indices can use FileId as a map key.
+/// The inner field is `pub` by design: index builders need to construct
+/// `FileId` values directly for posting-list efficiency. Implements ordering
+/// so indices can use `FileId` as a map key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FileId(pub u32);
 
@@ -39,6 +44,7 @@ impl fmt::Display for FileId {
 /// Determines which structural region of a source file a match appears in.
 /// Used to weight search results and filter queries to specific code regions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchField {
     /// Type definitions: structs, enums, interfaces, type aliases
     TypeDefinition,
@@ -60,6 +66,7 @@ pub enum SearchField {
 
 impl SearchField {
     /// Returns the snake_case name of this field variant.
+    #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::TypeDefinition => "type_definition",
@@ -113,6 +120,7 @@ pub struct SearchQuery {
 
 impl SearchQuery {
     /// Create a new query with the given search text and no filters.
+    #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -321,17 +329,18 @@ mod tests {
 
     #[test]
     fn test_search_field_serialization() {
+        // serde uses snake_case (rename_all) to align with the name() method output
         assert_eq!(
             serde_json::to_string(&SearchField::TypeDefinition).unwrap(),
-            "\"TypeDefinition\""
+            "\"type_definition\""
         );
         assert_eq!(
             serde_json::to_string(&SearchField::FunctionSignature).unwrap(),
-            "\"FunctionSignature\""
+            "\"function_signature\""
         );
         assert_eq!(
             serde_json::to_string(&SearchField::Other).unwrap(),
-            "\"Other\""
+            "\"other\""
         );
     }
 }

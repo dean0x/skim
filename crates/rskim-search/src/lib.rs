@@ -11,7 +11,10 @@
 
 mod types;
 
-pub use types::*;
+pub use types::{
+    FieldClassifier, FileId, IndexStats, LayerBuilder, Result, SearchError, SearchField,
+    SearchLayer, SearchQuery, SearchResult, TemporalFlags,
+};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
