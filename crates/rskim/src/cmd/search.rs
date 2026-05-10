@@ -1,11 +1,12 @@
 //! Search subcommand — code search via layered n-gram indexing.
 //!
 //! This is a CLI stub wiring the `search` subcommand into the dispatch table.
-//! The full search implementation lives in `rskim-search` library crate.
+//! The full search implementation will be provided by the `rskim-search` library
+//! crate (dependency not yet wired in).
 //!
 //! # Architecture
 //!
-//! All I/O lives here (this file). Business logic lives in:
+//! All I/O lives here (this file). Business logic will live in:
 //! - `rskim-search` crate: types, traits, indexing layer implementations
 //!
 //! Search is not yet implemented; this stub allows the subcommand to be
@@ -70,6 +71,7 @@ Examples:
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::process::ExitCode;
@@ -85,6 +87,22 @@ mod tests {
     fn test_search_help_returns_success() {
         // Empty args → print help → ExitCode::SUCCESS
         let result = run(&[], &TEST_ANALYTICS).unwrap();
+        assert_eq!(result, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_search_help_flag_returns_success() {
+        // --help flag → print help → ExitCode::SUCCESS
+        let args = vec!["--help".to_string()];
+        let result = run(&args, &TEST_ANALYTICS).unwrap();
+        assert_eq!(result, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_search_short_help_flag_returns_success() {
+        // -h flag → print help → ExitCode::SUCCESS
+        let args = vec!["-h".to_string()];
+        let result = run(&args, &TEST_ANALYTICS).unwrap();
         assert_eq!(result, ExitCode::SUCCESS);
     }
 
