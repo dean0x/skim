@@ -30,7 +30,7 @@ pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    if args.is_empty() || args.iter().any(|a| a == "--help") {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }

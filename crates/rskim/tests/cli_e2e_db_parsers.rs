@@ -282,3 +282,59 @@ fn test_sqlite3_stdin_json_flag() {
         "JSON must have row_count=20"
     );
 }
+
+// ============================================================================
+// Fix 1: -h flag conflict — must NOT trigger help in db handlers
+// ============================================================================
+
+#[test]
+fn test_psql_h_flag_not_intercepted_as_help() {
+    // `skim psql -h localhost` — -h means host, not help.
+    // The handler must NOT print help; it must attempt to run psql instead.
+    // Since psql may not be installed, we allow any exit code.
+    // The key assertion is that the help text is NOT printed to stdout.
+    let output = skim_cmd()
+        .args(["psql", "-h", "localhost"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // If help were printed we'd see "Available tools:" — must NOT be present.
+    assert!(
+        !stdout.contains("Available tools:"),
+        "-h must not trigger help text; got stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Run database tools"),
+        "-h must not trigger help text; got stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_psql_long_help_still_prints_help() {
+    // `skim psql --help` must still show the help text.
+    skim_cmd()
+        .args(["psql", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Available tools:"));
+}
+
+#[test]
+fn test_mysql_h_flag_not_intercepted_as_help() {
+    // `skim mysql -h localhost` — -h means host, not help.
+    // The handler must NOT print help; it must attempt to run mysql instead.
+    // Since mysql may not be installed, we allow any exit code.
+    let output = skim_cmd()
+        .args(["mysql", "-h", "localhost"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Available tools:"),
+        "-h must not trigger help text; got stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Run database tools"),
+        "-h must not trigger help text; got stdout: {stdout}"
+    );
+}

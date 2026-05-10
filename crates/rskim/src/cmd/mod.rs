@@ -824,11 +824,32 @@ pub(crate) fn format_analytics_label(family: &str, program: &str, rest: &str) ->
 ///
 /// SQL query arguments (positional, no flag prefix) are preserved verbatim —
 /// only known sensitive flag values are redacted.
+///
+/// Handles:
+/// 1. Connection string URIs (`postgresql://user:pass@host`, `mysql://user:pass@host`)
+/// 2. `--flag=value` form for sensitive and config-file flags
+/// 3. Attached short flags with no space: `-pPassword`, `-uroot`, `-Uadmin`
+/// 4. Space-separated sensitive flags: `-p secret`, `--password secret`
+/// 5. `--defaults-file` / `--defaults-extra-file` MySQL config file flags
+/// 6. `-P` (port) is NOT redacted — it is not a credential
 pub(crate) fn scrub_db_args(args: &str) -> String {
     /// Flags whose *immediately following* space-separated token is a credential.
+    /// Note: `-P` (port) intentionally omitted — it is not a credential.
     const SENSITIVE_FLAGS: &[&str] = &[
-        "-p", "-P", "-U", "-u", "-h", "-W", "--password", "--user", "--username", "--host",
+        "-p",
+        "-U",
+        "-u",
+        "-h",
+        "-W",
+        "--password",
+        "--user",
+        "--username",
+        "--host",
     ];
+    /// Short flags that may have their value *attached* with no space (e.g. `-pS3cret`).
+    const ATTACHED_PREFIXES: &[&str] = &["-p", "-u", "-U"];
+    /// MySQL config-file flags whose value (path) must also be redacted.
+    const CONFIG_FILE_FLAGS: &[&str] = &["--defaults-file", "--defaults-extra-file"];
 
     let tokens: Vec<&str> = args.split_whitespace().collect();
     let mut out: Vec<String> = Vec::with_capacity(tokens.len());
@@ -837,19 +858,42 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
     while i < tokens.len() {
         let tok = tokens[i];
 
-        // Handle `--flag=value` form: emit `--flag=[REDACTED]` to preserve the
-        // flag name in the analytics label (consistent with the space-separated path).
+        // 1. Connection string URIs: postgresql://user:pass@host, mysql://user:pass@host
+        if (tok.starts_with("postgresql://")
+            || tok.starts_with("postgres://")
+            || tok.starts_with("mysql://"))
+            && tok.contains('@')
+        {
+            out.push("[REDACTED_URI]".to_string());
+            i += 1;
+            continue;
+        }
+
+        // 2. `--flag=value` form (sensitive flags and config-file flags)
         if let Some(eq_pos) = tok.find('=') {
             let flag = &tok[..eq_pos];
-            if SENSITIVE_FLAGS.contains(&flag) {
+            if SENSITIVE_FLAGS.contains(&flag) || CONFIG_FILE_FLAGS.contains(&flag) {
                 out.push(format!("{flag}=[REDACTED]"));
                 i += 1;
                 continue;
             }
         }
 
-        // Handle space-separated `-p value` or `--password value` form.
-        if SENSITIVE_FLAGS.contains(&tok) {
+        // 3. Attached short flags: -pPassword, -uroot, -Uadmin (no space between flag and value)
+        //    Only applies to single-dash (short) flags that are NOT `--` prefixed.
+        if !tok.starts_with("--") {
+            if let Some(&prefix) = ATTACHED_PREFIXES
+                .iter()
+                .find(|&&p| tok.starts_with(p) && tok.len() > p.len())
+            {
+                out.push(format!("{prefix}[REDACTED]"));
+                i += 1;
+                continue;
+            }
+        }
+
+        // 4. Space-separated sensitive flags and config-file flags
+        if SENSITIVE_FLAGS.contains(&tok) || CONFIG_FILE_FLAGS.contains(&tok) {
             out.push(tok.to_string());
             i += 1;
             // Redact the following value token if present.
@@ -1258,7 +1302,10 @@ mod tests {
             result.contains("--username="),
             "flag name --username must be retained: {result}"
         );
-        assert!(result.contains("-c"), "non-sensitive flag preserved: {result}");
+        assert!(
+            result.contains("-c"),
+            "non-sensitive flag preserved: {result}"
+        );
         assert!(result.contains("SELECT"), "SQL must be preserved: {result}");
     }
 
@@ -1283,7 +1330,10 @@ mod tests {
         assert!(result.contains("-p"), "dangling flag kept: {result}");
         // No [REDACTED] since there was no following token to redact.
         // The flag itself is not a secret; only the value after it is.
-        assert!(!result.contains("[REDACTED]"), "no token to redact: {result}");
+        assert!(
+            !result.contains("[REDACTED]"),
+            "no token to redact: {result}"
+        );
     }
 
     // ========================================================================
@@ -1322,5 +1372,125 @@ mod tests {
     fn test_format_analytics_label_db_empty_rest() {
         let label = format_analytics_label("db", "psql", "");
         assert_eq!(label, "skim db psql");
+    }
+
+    // ========================================================================
+    // Fix 2: credential scrubbing gaps
+    // ========================================================================
+
+    #[test]
+    fn test_scrub_db_args_mysql_attached_password() {
+        // `-pS3cret -e SELECT 1` — password attached to -p with no space
+        let input = "-pS3cret -e SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("S3cret"),
+            "attached password must be redacted: {result}"
+        );
+        assert!(
+            result.contains("-p[REDACTED]"),
+            "redacted form must preserve flag name: {result}"
+        );
+        assert!(result.contains("SELECT"), "SQL must be preserved: {result}");
+    }
+
+    #[test]
+    fn test_scrub_db_args_attached_user() {
+        // `-uroot -pS3cret -e SELECT 1` — both user and password attached with no space
+        let input = "-uroot -pS3cret -e SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("root"),
+            "attached username must be redacted: {result}"
+        );
+        assert!(
+            !result.contains("S3cret"),
+            "attached password must be redacted: {result}"
+        );
+        assert!(result.contains("SELECT"), "SQL must be preserved: {result}");
+    }
+
+    #[test]
+    fn test_scrub_db_args_connection_uri_psql() {
+        // `postgresql://admin:hunter2@db.prod:5432/myapp -c SELECT 1`
+        let input = "postgresql://admin:hunter2@db.prod:5432/myapp -c SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("admin"),
+            "username in URI must be redacted: {result}"
+        );
+        assert!(
+            !result.contains("hunter2"),
+            "password in URI must be redacted: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED_URI]"),
+            "URI redaction marker must appear: {result}"
+        );
+        assert!(result.contains("SELECT"), "SQL must be preserved: {result}");
+    }
+
+    #[test]
+    fn test_scrub_db_args_connection_uri_mysql() {
+        // `mysql://root:password@localhost/db -e SHOW TABLES`
+        let input = "mysql://root:password@localhost/db -e SHOW TABLES";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("password"),
+            "password in URI must be redacted: {result}"
+        );
+        assert!(
+            result.contains("[REDACTED_URI]"),
+            "URI redaction marker must appear: {result}"
+        );
+        assert!(
+            result.contains("SHOW TABLES"),
+            "SQL must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_db_args_defaults_file_equals() {
+        // `--defaults-file=/home/user/.my.cnf -e SELECT 1`
+        let input = "--defaults-file=/home/user/.my.cnf -e SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("/home/user/.my.cnf"),
+            "config file path must be redacted: {result}"
+        );
+        assert!(
+            result.contains("--defaults-file=[REDACTED]"),
+            "flag name must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_db_args_defaults_file_space() {
+        // `--defaults-file /home/user/.my.cnf -e SELECT 1`
+        let input = "--defaults-file /home/user/.my.cnf -e SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            !result.contains("/home/user/.my.cnf"),
+            "config file path in space-sep form must be redacted: {result}"
+        );
+        assert!(
+            result.contains("--defaults-file"),
+            "flag name must be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_scrub_db_args_port_not_redacted() {
+        // `-P 3306 -e SELECT 1` — port is not a credential and must be preserved
+        let input = "-P 3306 -e SELECT 1";
+        let result = scrub_db_args(input);
+        assert!(
+            result.contains("3306"),
+            "port number must NOT be redacted: {result}"
+        );
+        assert!(
+            !result.contains("[REDACTED]"),
+            "no redaction should occur for port: {result}"
+        );
     }
 }

@@ -37,7 +37,7 @@ pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    if args.is_empty() || args.iter().any(|a| a == "--help") {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
@@ -239,6 +239,39 @@ pub(crate) fn build_streaming_label(
     super::format_analytics_label(family, program, &rest)
 }
 
+/// Skip global flags in an args slice to find the first subcommand index.
+///
+/// Returns the index of the first non-flag token within `args`.
+/// `value_flags` lists flags that consume the following token as a value
+/// (e.g. `"-n"`, `"--namespace"` for kubectl), so both the flag and its
+/// value are skipped.  Tokens matching `--flag=value` form are skipped
+/// without consuming a second token.  All other flag tokens are skipped
+/// as boolean flags.
+///
+/// Used by kubectl and docker handlers so that `kubectl -n ns get pods`
+/// dispatches correctly to the `get` sub-parser rather than seeing `-n`
+/// as the subcommand.
+pub(crate) fn find_subcommand_index(args: &[String], value_flags: &[&str]) -> usize {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg.starts_with("--") && arg.contains('=') {
+            idx += 1;
+            continue;
+        }
+        if value_flags.iter().any(|&f| arg == f) {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return idx;
+    }
+    args.len()
+}
+
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
@@ -413,5 +446,64 @@ mod tests {
         let (filtered, is_json) = super::extract_infra_json_flag(&args);
         assert!(is_json);
         assert_eq!(filtered, vec!["gh", "run", "--json", "fields"]);
+    }
+
+    // ========================================================================
+    // find_subcommand_index tests (Fix 3)
+    // ========================================================================
+
+    const KUBECTL_VALUE_FLAGS: &[&str] =
+        &["--context", "-n", "--namespace", "--kubeconfig", "--server"];
+
+    #[test]
+    fn test_find_subcommand_index_no_global_flags() {
+        let args: Vec<String> = vec!["get".into(), "pods".into()];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 0);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_namespace_short() {
+        // `kubectl -n mynamespace get pods` → subcmd at index 2
+        let args: Vec<String> = vec![
+            "-n".into(),
+            "mynamespace".into(),
+            "get".into(),
+            "pods".into(),
+        ];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 2);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_namespace_long() {
+        // `kubectl --namespace production get pods` → subcmd at index 2
+        let args: Vec<String> = vec!["--namespace".into(), "production".into(), "get".into()];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 2);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_context_and_namespace() {
+        // `kubectl --context prod -n ns get pods` → subcmd at index 4
+        let args: Vec<String> = vec![
+            "--context".into(),
+            "prod".into(),
+            "-n".into(),
+            "ns".into(),
+            "get".into(),
+            "pods".into(),
+        ];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 4);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_equals_form_skipped() {
+        // `kubectl --context=prod get pods` → subcmd at index 1
+        let args: Vec<String> = vec!["--context=prod".into(), "get".into(), "pods".into()];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 1);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_empty_args() {
+        let args: Vec<String> = vec![];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 0);
     }
 }
