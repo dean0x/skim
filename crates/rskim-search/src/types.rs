@@ -141,7 +141,7 @@ impl SearchQuery {
 ///
 /// NOTE: Does NOT derive `PartialEq` because `score: f64` cannot implement it
 /// reliably (NaN != NaN). Use exact field comparisons in tests.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     /// The file containing this match
     pub file_id: FileId,
@@ -294,12 +294,35 @@ mod tests {
             line_range: 10..20,
             match_positions: vec![5..10],
             field: SearchField::FunctionSignature,
+            snippet: Some("fn foo()".to_string()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["file_id"], serde_json::json!(1));
+        assert!((v["score"].as_f64().unwrap() - 0.95).abs() < f64::EPSILON);
+        // Range<usize> serializes as {start: N, end: N}
+        assert_eq!(v["line_range"]["start"], serde_json::json!(10));
+        assert_eq!(v["line_range"]["end"], serde_json::json!(20));
+        assert_eq!(v["match_positions"][0]["start"], serde_json::json!(5));
+        assert_eq!(v["match_positions"][0]["end"], serde_json::json!(10));
+        assert_eq!(v["field"], serde_json::json!("function_signature"));
+        assert_eq!(v["snippet"], serde_json::json!("fn foo()"));
+    }
+
+    #[test]
+    fn test_search_result_serialization_null_snippet() {
+        let result = SearchResult {
+            file_id: FileId(0),
+            score: 1.0,
+            line_range: 0..1,
+            match_positions: vec![],
+            field: SearchField::Other,
             snippet: None,
         };
         let json = serde_json::to_string(&result).unwrap();
-        // snippet serializes as null when None
-        assert!(json.contains("\"snippet\":null"));
-        assert!(json.contains("\"score\":0.95"));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["snippet"], serde_json::Value::Null);
     }
 
     #[test]
@@ -311,6 +334,68 @@ mod tests {
             display.contains("x"),
             "Display should propagate core message, got: {display}"
         );
+    }
+
+    #[test]
+    fn test_search_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let search_err = SearchError::from(io_err);
+        let display = format!("{search_err}");
+        assert!(
+            display.starts_with("IO error:"),
+            "Display should start with 'IO error:', got: {display}"
+        );
+        assert!(
+            display.contains("file missing"),
+            "Display should contain the IO message, got: {display}"
+        );
+    }
+
+    #[test]
+    fn test_search_error_display_variants() {
+        let corrupted = SearchError::IndexCorrupted("bad checksum".to_string());
+        let display = format!("{corrupted}");
+        assert_eq!(display, "Index corrupted: bad checksum");
+
+        let invalid = SearchError::InvalidQuery("empty query".to_string());
+        let display = format!("{invalid}");
+        assert_eq!(display, "Invalid query: empty query");
+
+        let not_found = SearchError::FileNotFound(FileId(42));
+        let display = format!("{not_found}");
+        assert_eq!(display, "File not found in index: 42");
+    }
+
+    #[test]
+    fn test_search_query_empty_string() {
+        let q = SearchQuery::new("");
+        assert_eq!(q.text, "");
+        assert!(q.lang.is_none());
+        assert!(q.ast_pattern.is_none());
+        assert!(q.temporal_flags.is_none());
+        assert!(q.limit.is_none());
+        assert!(q.offset.is_none());
+    }
+
+    #[test]
+    fn test_search_query_with_filters() {
+        let q = SearchQuery {
+            text: "find_me".to_string(),
+            lang: Some(rskim_core::Language::Rust),
+            ast_pattern: Some("fn_def".to_string()),
+            temporal_flags: Some(TemporalFlags {
+                modified_within_days: Some(7),
+            }),
+            limit: Some(10),
+            offset: Some(5),
+        };
+        assert_eq!(q.text, "find_me");
+        assert_eq!(q.lang, Some(rskim_core::Language::Rust));
+        assert_eq!(q.ast_pattern.as_deref(), Some("fn_def"));
+        let tf = q.temporal_flags.unwrap();
+        assert_eq!(tf.modified_within_days, Some(7));
+        assert_eq!(q.limit, Some(10));
+        assert_eq!(q.offset, Some(5));
     }
 
     #[test]
