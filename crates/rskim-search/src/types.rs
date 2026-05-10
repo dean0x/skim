@@ -248,21 +248,6 @@ pub struct NodeInfo {
     pub named_child_count: usize,
 }
 
-impl NodeInfo {
-    /// Construct a `NodeInfo` from a tree-sitter [`tree_sitter::Node`].
-    ///
-    /// Keeps tree-sitter as an implementation detail: call-sites in tree-sitter
-    /// indexers use this constructor; the rest of `rskim-search` only sees
-    /// `NodeInfo`.
-    #[must_use]
-    pub fn from_ts_node(node: &tree_sitter::Node<'_>) -> Self {
-        Self {
-            kind: node.kind(),
-            byte_range: node.byte_range(),
-            named_child_count: node.named_child_count(),
-        }
-    }
-}
 
 /// Classifier that maps an AST node to a [`SearchField`].
 ///
@@ -555,8 +540,11 @@ mod tests {
         let restored: SearchResult = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.file_id, original.file_id);
+        assert!((restored.score - original.score).abs() < f64::EPSILON);
+        assert_eq!(restored.line_range, original.line_range);
+        assert_eq!(restored.match_positions, original.match_positions);
+        assert_eq!(restored.field, original.field);
         assert_eq!(restored.snippet, None);
-        assert_eq!(restored.field, SearchField::Other);
     }
 
     /// Basic serialization test for IndexStats — ensures all fields are present
@@ -593,16 +581,97 @@ mod tests {
         assert_eq!(v["file_count"], serde_json::json!(0));
     }
 
-    /// NodeInfo can be constructed directly with correct field values.
+    /// Roundtrip test for IndexStats: serialize to JSON then deserialize back,
+    /// verifying the Deserialize impl matches the Serialize impl field-by-field.
+    /// IndexStats will be persisted/loaded from index files, so roundtrip
+    /// correctness matters independently of serialization correctness.
     #[test]
-    fn test_node_info_construction() {
-        let info = NodeInfo {
-            kind: "function_definition",
-            byte_range: 10..50,
+    fn test_index_stats_roundtrip() {
+        let original = IndexStats {
+            file_count: 42,
+            total_ngrams: 1_000_000,
+            index_size_bytes: 512 * 1024,
+            last_updated: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: IndexStats = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.file_count, original.file_count);
+        assert_eq!(restored.total_ngrams, original.total_ngrams);
+        assert_eq!(restored.index_size_bytes, original.index_size_bytes);
+        assert_eq!(restored.last_updated, original.last_updated);
+    }
+
+    /// Roundtrip test for IndexStats with no last_updated.
+    #[test]
+    fn test_index_stats_roundtrip_no_last_updated() {
+        let original = IndexStats {
+            file_count: 0,
+            total_ngrams: 0,
+            index_size_bytes: 0,
+            last_updated: None,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: IndexStats = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.file_count, original.file_count);
+        assert_eq!(restored.total_ngrams, original.total_ngrams);
+        assert_eq!(restored.index_size_bytes, original.index_size_bytes);
+        assert_eq!(restored.last_updated, None);
+    }
+
+    /// Verifies that a concrete FieldClassifier implementation can be written
+    /// and used with NodeInfo. Guards the trait's API contract: classifiers must
+    /// be constructable without tree-sitter, using only NodeInfo fields.
+    #[test]
+    fn test_field_classifier_concrete_impl() {
+        struct KindClassifier;
+
+        impl FieldClassifier for KindClassifier {
+            fn classify(&self, node: &NodeInfo, _source: &str) -> SearchField {
+                match node.kind {
+                    "function_definition" | "function_item" => SearchField::FunctionSignature,
+                    "struct_item" | "class_definition" | "type_alias" => {
+                        SearchField::TypeDefinition
+                    }
+                    "import_declaration" | "use_declaration" => SearchField::ImportExport,
+                    "line_comment" | "block_comment" => SearchField::Comment,
+                    "string_literal" => SearchField::StringLiteral,
+                    _ => SearchField::Other,
+                }
+            }
+        }
+
+        let classifier = KindClassifier;
+
+        let fn_node = NodeInfo {
+            kind: "function_item",
+            byte_range: 0..50,
             named_child_count: 3,
         };
-        assert_eq!(info.kind, "function_definition");
-        assert_eq!(info.byte_range, 10..50);
-        assert_eq!(info.named_child_count, 3);
+        assert_eq!(
+            classifier.classify(&fn_node, "fn foo() {}"),
+            SearchField::FunctionSignature
+        );
+
+        let struct_node = NodeInfo {
+            kind: "struct_item",
+            byte_range: 0..30,
+            named_child_count: 2,
+        };
+        assert_eq!(
+            classifier.classify(&struct_node, "struct Foo { x: u32 }"),
+            SearchField::TypeDefinition
+        );
+
+        let unknown_node = NodeInfo {
+            kind: "attribute_item",
+            byte_range: 0..10,
+            named_child_count: 1,
+        };
+        assert_eq!(
+            classifier.classify(&unknown_node, "#[derive(Debug)]"),
+            SearchField::Other
+        );
     }
 }

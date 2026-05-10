@@ -12,6 +12,6 @@
 mod types;
 
 pub use types::{
-    FieldClassifier, FileId, IndexStats, LayerBuilder, Result, SearchError, SearchField,
+    FieldClassifier, FileId, IndexStats, LayerBuilder, NodeInfo, Result, SearchError, SearchField,
     SearchLayer, SearchQuery, SearchResult, TemporalFlags,
 };

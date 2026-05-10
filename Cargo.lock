@@ -1217,7 +1217,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "tree-sitter",
 ]
 
 [[package]]

@@ -12,7 +12,6 @@ publish = false
 rskim-core = { version = "2.9.0", path = "../rskim-core" }
 thiserror = { workspace = true }
 serde = { workspace = true }
-tree-sitter = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
