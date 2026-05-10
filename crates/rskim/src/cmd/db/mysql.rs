@@ -21,11 +21,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::output::canonical::DbResult;
 use crate::output::ParseResult;
+use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use super::{run_db_tool, DbToolConfig};
+use super::{DbToolConfig, run_db_tool};
 
 const CONFIG: DbToolConfig<'static> = DbToolConfig {
     program: "mysql",

@@ -16,10 +16,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 
-use super::{combine_stdout_stderr, passthrough_parse, run_infra_tool, InfraToolConfig};
+use super::{InfraToolConfig, combine_stdout_stderr, passthrough_parse, run_infra_tool};
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "terraform",

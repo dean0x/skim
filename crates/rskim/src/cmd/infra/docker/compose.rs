@@ -15,9 +15,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::cmd::log::{compress_log, LogFlags};
-use crate::output::canonical::{InfraItem, InfraResult};
+use crate::cmd::log::{LogFlags, compress_log};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::{combine_stdout_stderr, log_result_to_infra};

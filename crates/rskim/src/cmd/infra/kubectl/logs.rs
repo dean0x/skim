@@ -3,9 +3,9 @@
 //! Delegates to the shared log compression pipeline (`compress_log`).
 //! Converts `ParseResult<LogResult>` → `ParseResult<InfraResult>`.
 
-use crate::cmd::log::{compress_log, LogFlags};
-use crate::output::canonical::InfraResult;
+use crate::cmd::log::{LogFlags, compress_log};
 use crate::output::ParseResult;
+use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
 
 use super::{combine_stdout_stderr, log_result_to_infra};
