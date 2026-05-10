@@ -36,6 +36,9 @@ pub(crate) fn run(
     }
 
     let (filtered_args, show_stats) = extract_show_stats(args);
+    // DB tools don't use --json <value> semantics (unlike gh), so the simple
+    // extract_json_flag is correct here — it treats --json as a boolean flag,
+    // not a key=value pair like extract_infra_json_flag does.
     let (filtered_args, json_output) = extract_json_flag(&filtered_args);
 
     let Some((tool_name, tool_args)) = filtered_args.split_first() else {

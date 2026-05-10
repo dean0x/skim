@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`skim docker` subcommand** — Docker output compression for `ps`, `images`, `inspect`, `build`, `logs`, `compose` via three-tier degradation. Previously added in Part 1 (#117)
 - **`skim kubectl` subcommand** — Kubernetes output compression for `get`, `describe`, `logs`. Injects `-o json` for `get` (skipped for watch/existing format flags). Previously added in Part 1 (#117)
 - **`skim terraform` subcommand** — Terraform output compression for `plan` and `apply`: Tier 1 (NDJSON from `-json`), Tier 2 (regex on human-readable text). Safety invariant: never injects `-json` for plan/apply to preserve interactive approval prompts. Previously added in Part 1 (#117)
-- **15 new rewrite rules** — Docker (ps, images, build, compose ps, compose logs), kubectl (get, describe, logs), terraform (plan, apply), psql (-c), mysql (-e), sqlite3. Total: 122 rules across 8 categories (#117)
+- **15 new rewrite rules** — Docker (ps, images, build, inspect, logs, compose ps, compose logs), kubectl (get, describe, logs), terraform (plan, apply), psql (-c), mysql (-e), sqlite3. Total: 122 rules across 8 categories (#117)
 
 ### Changed
 
@@ -25,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Testing
-- 3,440 tests passing (up from 3,310 in v2.9.0)
-- 13 new E2E parser tests: psql (tier 1, empty, tier 2, tier 3, JSON), mysql (tier 1 TSV, tier 2 bordered, tier 3, empty set, JSON), sqlite3 (tier 1, tier 3 schema, JSON)
+- 3,442 tests passing (up from 3,310 in v2.9.0)
+- 14 new E2E parser tests: psql (tier 1, empty, tier 2, tier 3, JSON), mysql (tier 1 TSV, tier 2 bordered, tier 3, empty set, JSON), sqlite3 (tier 1, empty, tier 3 schema, JSON)
 - 19 new E2E rewrite tests: docker (5 positive, 1 skip), kubectl (3 positive, 2 skip), terraform (2 positive, 1 skip), DB tools (3 positive, 1 skip)
 
 ## [2.9.0] - 2026-05-08
