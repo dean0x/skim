@@ -906,6 +906,34 @@ const PKG_RULES: &[RewriteRule] = &[
 // INFRA rules (26)
 // ============================================================================
 
+/// Docker global value-consuming flags used by all seven docker rules.
+///
+/// These flags accept the following token as a value (e.g. `--host tcp://...`),
+/// so the rewrite engine must skip both the flag and its value when locating
+/// the subcommand token.  SEE: DESIGN NOTE (Fix 3) in the rule definitions.
+const DOCKER_GLOBAL_FLAGS: &[&str] =
+    &["--host", "-H", "--context", "--config", "--log-level", "-l"];
+
+/// Kubectl global value-consuming flags used by all three kubectl rules.
+///
+/// SEE: DESIGN NOTE (Fix 3) in the rule definitions.
+const KUBECTL_GLOBAL_FLAGS: &[&str] = &[
+    "--context",
+    "-n",
+    "--namespace",
+    "--kubeconfig",
+    "--server",
+    "--as",
+    "--as-group",
+    "-v",
+    "--v",
+    "--request-timeout",
+    "--cache-dir",
+    "--cluster",
+    "--token",
+    "--user",
+];
+
 const INFRA_RULES: &[RewriteRule] = &[
     // gh (longest prefix first)
     //
@@ -1090,7 +1118,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     //
     // DESIGN NOTE (Fix 3): docker supports global flags between the binary
     // name and the subcommand, e.g. `docker --host tcp://host:2376 ps` or
-    // `docker -H unix:///var/run/docker.sock ps`.  `global_value_flags`
+    // `docker -H unix:///var/run/docker.sock ps`.  `DOCKER_GLOBAL_FLAGS`
     // lists flags that consume the following token so the engine can skip
     // them when matching the subcommand position.
     RewriteRule {
@@ -1100,7 +1128,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        global_value_flags: DOCKER_GLOBAL_FLAGS,
         require_flag: &[],
     },
     RewriteRule {
@@ -1110,7 +1138,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        global_value_flags: DOCKER_GLOBAL_FLAGS,
         require_flag: &[],
     },
     // docker (2-token prefix)
@@ -1121,7 +1149,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        global_value_flags: DOCKER_GLOBAL_FLAGS,
         require_flag: &[],
     },
     RewriteRule {
@@ -1131,7 +1159,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        global_value_flags: DOCKER_GLOBAL_FLAGS,
         require_flag: &[],
     },
     RewriteRule {
@@ -1141,7 +1169,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        global_value_flags: DOCKER_GLOBAL_FLAGS,
         require_flag: &[],
     },
     RewriteRule {
@@ -1151,7 +1179,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        global_value_flags: DOCKER_GLOBAL_FLAGS,
         require_flag: &[],
     },
     RewriteRule {
@@ -1161,14 +1189,14 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &["--host", "-H", "--context", "--config", "--log-level", "-l"],
+        global_value_flags: DOCKER_GLOBAL_FLAGS,
         require_flag: &[],
     },
     // kubectl
     //
     // DESIGN NOTE (Fix 3): kubectl supports global flags between the binary
     // name and the subcommand, e.g. `kubectl -n mynamespace get pods` or
-    // `kubectl --context prod get pods`.  `global_value_flags` lists flags
+    // `kubectl --context prod get pods`.  `KUBECTL_GLOBAL_FLAGS` lists flags
     // that consume the following token so the engine can skip them to find
     // the real subcommand position.
     RewriteRule {
@@ -1178,22 +1206,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &[
-            "--context",
-            "-n",
-            "--namespace",
-            "--kubeconfig",
-            "--server",
-            "--as",
-            "--as-group",
-            "-v",
-            "--v",
-            "--request-timeout",
-            "--cache-dir",
-            "--cluster",
-            "--token",
-            "--user",
-        ],
+        global_value_flags: KUBECTL_GLOBAL_FLAGS,
         require_flag: &[],
     },
     RewriteRule {
@@ -1203,22 +1216,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &[
-            "--context",
-            "-n",
-            "--namespace",
-            "--kubeconfig",
-            "--server",
-            "--as",
-            "--as-group",
-            "-v",
-            "--v",
-            "--request-timeout",
-            "--cache-dir",
-            "--cluster",
-            "--token",
-            "--user",
-        ],
+        global_value_flags: KUBECTL_GLOBAL_FLAGS,
         require_flag: &[],
     },
     RewriteRule {
@@ -1228,22 +1226,7 @@ const INFRA_RULES: &[RewriteRule] = &[
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
-        global_value_flags: &[
-            "--context",
-            "-n",
-            "--namespace",
-            "--kubeconfig",
-            "--server",
-            "--as",
-            "--as-group",
-            "-v",
-            "--v",
-            "--request-timeout",
-            "--cache-dir",
-            "--cluster",
-            "--token",
-            "--user",
-        ],
+        global_value_flags: KUBECTL_GLOBAL_FLAGS,
         require_flag: &[],
     },
     // terraform

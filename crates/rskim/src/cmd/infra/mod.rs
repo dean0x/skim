@@ -31,8 +31,8 @@ const KNOWN_TOOLS: &[&str] = &[
 
 /// Entry point for `skim <tool> [args...]` (infra handler).
 ///
-/// If no tool is specified or `--help` / `-h` is passed, prints usage
-/// and exits. Otherwise dispatches to the tool-specific handler.
+/// If no tool is specified or `--help` is passed, prints usage and exits.
+/// Otherwise dispatches to the tool-specific handler.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,

@@ -1864,7 +1864,17 @@ fn test_rewrite_psql_with_host_and_c_rewrites() {
     // `psql -h localhost -d mydb -c "SELECT 1"` — broadened prefix fires
     // because -c is present even with other flags before it.
     skim_cmd()
-        .args(["rewrite", "--suggest", "psql", "-h", "localhost", "-d", "mydb", "-c", "SELECT 1"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "psql",
+            "-h",
+            "localhost",
+            "-d",
+            "mydb",
+            "-c",
+            "SELECT 1",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":true"));
@@ -1874,7 +1884,15 @@ fn test_rewrite_psql_with_host_and_c_rewrites() {
 fn test_rewrite_psql_no_c_flag_no_rewrite() {
     // `psql -h localhost -d mydb` — no -c means interactive mode → NO rewrite.
     skim_cmd()
-        .args(["rewrite", "--suggest", "psql", "-h", "localhost", "-d", "mydb"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "psql",
+            "-h",
+            "localhost",
+            "-d",
+            "mydb",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -1884,7 +1902,14 @@ fn test_rewrite_psql_no_c_flag_no_rewrite() {
 fn test_rewrite_psql_long_command_flag_rewrites() {
     // `psql mydb --command "SELECT 1"` — --command is also accepted.
     skim_cmd()
-        .args(["rewrite", "--suggest", "psql", "mydb", "--command", "SELECT 1"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "psql",
+            "mydb",
+            "--command",
+            "SELECT 1",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":true"));
@@ -1895,7 +1920,15 @@ fn test_rewrite_mysql_with_host_and_e_rewrites() {
     // `mysql -h localhost -u user -e "SELECT 1"` — broadened prefix fires.
     skim_cmd()
         .args([
-            "rewrite", "--suggest", "mysql", "-h", "localhost", "-u", "user", "-e", "SELECT 1",
+            "rewrite",
+            "--suggest",
+            "mysql",
+            "-h",
+            "localhost",
+            "-u",
+            "user",
+            "-e",
+            "SELECT 1",
         ])
         .assert()
         .success()
@@ -1906,7 +1939,15 @@ fn test_rewrite_mysql_with_host_and_e_rewrites() {
 fn test_rewrite_mysql_no_e_flag_no_rewrite() {
     // `mysql -h localhost -u user` — no -e means interactive mode → NO rewrite.
     skim_cmd()
-        .args(["rewrite", "--suggest", "mysql", "-h", "localhost", "-u", "user"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "mysql",
+            "-h",
+            "localhost",
+            "-u",
+            "user",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":false"));
@@ -1920,7 +1961,15 @@ fn test_rewrite_mysql_no_e_flag_no_rewrite() {
 fn test_rewrite_kubectl_namespace_before_get() {
     // `kubectl -n mynamespace get pods` — global -n flag before subcommand.
     skim_cmd()
-        .args(["rewrite", "--suggest", "kubectl", "-n", "mynamespace", "get", "pods"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "kubectl",
+            "-n",
+            "mynamespace",
+            "get",
+            "pods",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":true"));
@@ -1930,7 +1979,15 @@ fn test_rewrite_kubectl_namespace_before_get() {
 fn test_rewrite_kubectl_context_before_get() {
     // `kubectl --context production get pods` — --context before subcommand.
     skim_cmd()
-        .args(["rewrite", "--suggest", "kubectl", "--context", "production", "get", "pods"])
+        .args([
+            "rewrite",
+            "--suggest",
+            "kubectl",
+            "--context",
+            "production",
+            "get",
+            "pods",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"match\":true"));

@@ -24,8 +24,10 @@ const KNOWN_TOOLS: &[&str] = &["mysql", "psql", "sqlite3"];
 
 /// Entry point for `skim <tool> [args...]` (db handler).
 ///
-/// If no tool is specified or `--help` / `-h` is passed, prints usage
-/// and exits. Otherwise dispatches to the tool-specific handler.
+/// If no tool is specified or `--help` is passed, prints usage and exits.
+/// `-h` is intentionally NOT intercepted here: DB tools use `-h` as a
+/// hostname flag (`psql -h localhost`, `mysql -h host`). Otherwise
+/// dispatches to the tool-specific handler.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
