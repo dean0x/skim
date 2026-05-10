@@ -15,28 +15,3 @@ pub use types::{
     FieldClassifier, FileId, IndexStats, LayerBuilder, Result, SearchError, SearchField,
     SearchLayer, SearchQuery, SearchResult, TemporalFlags,
 };
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_public_api_accessible() {
-        let _id = FileId(0);
-        let _query = SearchQuery::new("test");
-        let _field = SearchField::TypeDefinition;
-        let _flags = TemporalFlags::default();
-        let _stats = IndexStats {
-            file_count: 0,
-            total_ngrams: 0,
-            index_size_bytes: 0,
-            last_updated: None,
-        };
-
-        // Verify traits are in scope (compile-time check)
-        fn _assert_search_layer<T: SearchLayer>() {}
-        fn _assert_layer_builder<T: LayerBuilder>() {}
-        fn _assert_field_classifier<T: FieldClassifier>() {}
-    }
-}

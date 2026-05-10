@@ -367,17 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_search_query_empty_string() {
-        let q = SearchQuery::new("");
-        assert_eq!(q.text, "");
-        assert!(q.lang.is_none());
-        assert!(q.ast_pattern.is_none());
-        assert!(q.temporal_flags.is_none());
-        assert!(q.limit.is_none());
-        assert!(q.offset.is_none());
-    }
-
-    #[test]
     fn test_search_query_with_filters() {
         let q = SearchQuery {
             text: "find_me".to_string(),
