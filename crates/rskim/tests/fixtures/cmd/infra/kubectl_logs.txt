@@ -1,0 +1,9 @@
+2024-01-15T10:00:01Z INFO Starting web server
+2024-01-15T10:00:01Z INFO Loading configuration
+2024-01-15T10:00:02Z INFO Listening on :80
+2024-01-15T10:01:00Z INFO GET /health 200 1ms
+2024-01-15T10:01:00Z INFO GET /health 200 1ms
+2024-01-15T10:01:00Z INFO GET /health 200 1ms
+2024-01-15T10:02:00Z INFO GET /api/v1/users 200 45ms
+2024-01-15T10:03:00Z WARN Slow query detected: 150ms
+2024-01-15T10:04:00Z ERROR Failed to connect to upstream service

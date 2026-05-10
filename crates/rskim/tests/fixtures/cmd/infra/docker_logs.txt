@@ -1,0 +1,13 @@
+2024-01-15T10:00:01Z INFO Starting application
+2024-01-15T10:00:01Z INFO Loading configuration from /app/config.yaml
+2024-01-15T10:00:02Z INFO Database connection established
+2024-01-15T10:00:02Z DEBUG Connection pool initialized with 10 connections
+2024-01-15T10:00:03Z INFO Server listening on 0.0.0.0:8000
+2024-01-15T10:01:05Z INFO GET /health 200 OK (2ms)
+2024-01-15T10:01:05Z INFO GET /health 200 OK (2ms)
+2024-01-15T10:01:05Z INFO GET /health 200 OK (2ms)
+2024-01-15T10:02:10Z INFO GET /api/users 200 OK (45ms)
+2024-01-15T10:03:15Z WARN Rate limit approaching: 90/100 requests
+2024-01-15T10:04:20Z ERROR Database query timeout after 5000ms
+2024-01-15T10:04:21Z INFO Retrying database connection
+2024-01-15T10:04:22Z INFO Database connection re-established

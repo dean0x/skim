@@ -148,6 +148,7 @@ pub(crate) fn run_file_tool(
             show_stats: ctx.show_stats,
             output_format: ctx.output_format(),
             family: "file",
+            skip_ansi_strip: false,
             rec: crate::analytics::RecordingContext {
                 enabled: ctx.analytics_enabled,
                 command_type: crate::analytics::CommandType::FileOps,

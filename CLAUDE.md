@@ -174,7 +174,8 @@ cargo fmt -- --check           # Format check
 - `tsc` — TypeScript build output compression
 - `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`, `oxlint`, `prettier`, `ruff`, `rustfmt` — Lint/formatter output compression
 - `npm`, `pnpm`, `pip` — Package manager output compression
-- `aws`, `curl`, `gh`, `wget` — Infrastructure tool output compression
+- `aws`, `curl`, `docker`, `gh`, `kubectl`, `terraform`, `wget` — Infrastructure/container tool output compression (three-tier degradation, `--json`)
+- `mysql`, `psql`, `sqlite3` — Database query output compression (three-tier degradation, `--json`)
 - `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc` — File operations output compression
 
 ### Environment Variables

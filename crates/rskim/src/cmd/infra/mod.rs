@@ -1,14 +1,14 @@
-//! Infrastructure tool handler — dispatches to infra parsers (#116, #131)
+//! Infrastructure tool handler — dispatches to infra parsers (#116, #117, #131)
 //!
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
-//! `aws`, `curl`, `gh`, `wget`.
-//!
-//! The `gh` handler supports list commands (`pr list`, `issue list`, `run list`)
-//! and view commands (`issue view`, `pr view`, `pr checks`, `run view`).
+//! `aws`, `curl`, `docker`, `gh`, `kubectl`, `terraform`, `wget`.
 
 pub(crate) mod aws;
 pub(crate) mod curl;
+pub(crate) mod docker;
 pub(crate) mod gh;
+pub(crate) mod kubectl;
+pub(crate) mod terraform;
 pub(crate) mod wget;
 
 use std::process::ExitCode;
@@ -19,17 +19,25 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known infra tools that the infra handler can dispatch to.
-const KNOWN_TOOLS: &[&str] = &["aws", "curl", "gh", "wget"];
+const KNOWN_TOOLS: &[&str] = &[
+    "aws",
+    "curl",
+    "docker",
+    "gh",
+    "kubectl",
+    "terraform",
+    "wget",
+];
 
 /// Entry point for `skim <tool> [args...]` (infra handler).
 ///
-/// If no tool is specified or `--help` / `-h` is passed, prints usage
-/// and exits. Otherwise dispatches to the tool-specific handler.
+/// If no tool is specified or `--help` is passed, prints usage and exits.
+/// Otherwise dispatches to the tool-specific handler.
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+    if args.is_empty() || args.iter().any(|a| a == "--help") {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
@@ -52,7 +60,10 @@ pub(crate) fn run(
     match tool_name.as_str() {
         "aws" => aws::run(tool_args, &ctx),
         "curl" => curl::run(tool_args, &ctx),
+        "docker" => docker::run(tool_args, &ctx),
         "gh" => gh::run(tool_args, &ctx),
+        "kubectl" => kubectl::run(tool_args, &ctx),
+        "terraform" => terraform::run(tool_args, &ctx),
         "wget" => wget::run(tool_args, &ctx),
         _ => {
             let safe_tool = super::sanitize_for_display(tool_name);
@@ -176,6 +187,7 @@ pub(crate) fn run_infra_tool(
             show_stats: ctx.show_stats,
             output_format: ctx.output_format(),
             family: "infra",
+            skip_ansi_strip: false,
             rec: crate::analytics::RecordingContext {
                 enabled: ctx.analytics_enabled,
                 command_type: crate::analytics::CommandType::Infra,
@@ -227,8 +239,84 @@ pub(crate) fn build_streaming_label(
     super::format_analytics_label(family, program, &rest)
 }
 
+/// Skip global flags in an args slice to find the first subcommand index.
+///
+/// Returns the index of the first non-flag token within `args`.
+/// `value_flags` lists flags that consume the following token as a value
+/// (e.g. `"-n"`, `"--namespace"` for kubectl), so both the flag and its
+/// value are skipped.  Tokens matching `--flag=value` form are skipped
+/// without consuming a second token.  All other flag tokens are skipped
+/// as boolean flags.
+///
+/// Used by kubectl and docker handlers so that `kubectl -n ns get pods`
+/// dispatches correctly to the `get` sub-parser rather than seeing `-n`
+/// as the subcommand.
+pub(crate) fn find_subcommand_index(args: &[String], value_flags: &[&str]) -> usize {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg.starts_with("--") && arg.contains('=') {
+            idx += 1;
+            continue;
+        }
+        if value_flags.iter().any(|&f| arg == f) {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return idx;
+    }
+    args.len()
+}
+
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
+
+/// Passthrough parser — returns raw combined stdout+stderr unchanged.
+///
+/// Used as the default arm in docker and kubectl dispatch when no sub-parser
+/// matches the subcommand.
+pub(crate) fn passthrough_parse(output: &CommandOutput) -> ParseResult<InfraResult> {
+    let combined = combine_stdout_stderr(output);
+    ParseResult::Passthrough(combined.into_owned())
+}
+
+/// Inject `--format json` into args unless a format flag is already present.
+///
+/// Shared by parsers that support `--format json` (docker ps, docker images).
+/// Checks for both `--format` and `--format=<value>` forms.
+pub(crate) fn inject_format_json(args: &mut Vec<String>) {
+    let has_format = args
+        .iter()
+        .any(|a| a == "--format" || a.starts_with("--format="));
+    if !has_format {
+        args.push("--format".to_string());
+        args.push("json".to_string());
+    }
+}
+
+/// Convert a `LogResult` into an `InfraResult` for a given tool and operation.
+///
+/// Shared by docker/logs, docker/compose, and kubectl/logs so they don't each
+/// duplicate this mapping.
+pub(crate) fn log_result_to_infra(
+    log_result: crate::output::canonical::LogResult,
+    tool: &str,
+    operation: &str,
+) -> InfraResult {
+    let summary = format!(
+        "{} lines, {} unique",
+        log_result.total_lines, log_result.unique_messages
+    );
+    let items = vec![crate::output::canonical::InfraItem {
+        label: "log".to_string(),
+        value: log_result.to_string(),
+    }];
+    InfraResult::new(tool.to_string(), operation.to_string(), summary, items)
+}
 
 // ============================================================================
 // Unit tests
@@ -358,5 +446,64 @@ mod tests {
         let (filtered, is_json) = super::extract_infra_json_flag(&args);
         assert!(is_json);
         assert_eq!(filtered, vec!["gh", "run", "--json", "fields"]);
+    }
+
+    // ========================================================================
+    // find_subcommand_index tests (Fix 3)
+    // ========================================================================
+
+    const KUBECTL_VALUE_FLAGS: &[&str] =
+        &["--context", "-n", "--namespace", "--kubeconfig", "--server"];
+
+    #[test]
+    fn test_find_subcommand_index_no_global_flags() {
+        let args: Vec<String> = vec!["get".into(), "pods".into()];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 0);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_namespace_short() {
+        // `kubectl -n mynamespace get pods` → subcmd at index 2
+        let args: Vec<String> = vec![
+            "-n".into(),
+            "mynamespace".into(),
+            "get".into(),
+            "pods".into(),
+        ];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 2);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_namespace_long() {
+        // `kubectl --namespace production get pods` → subcmd at index 2
+        let args: Vec<String> = vec!["--namespace".into(), "production".into(), "get".into()];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 2);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_context_and_namespace() {
+        // `kubectl --context prod -n ns get pods` → subcmd at index 4
+        let args: Vec<String> = vec![
+            "--context".into(),
+            "prod".into(),
+            "-n".into(),
+            "ns".into(),
+            "get".into(),
+            "pods".into(),
+        ];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 4);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_equals_form_skipped() {
+        // `kubectl --context=prod get pods` → subcmd at index 1
+        let args: Vec<String> = vec!["--context=prod".into(), "get".into(), "pods".into()];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 1);
+    }
+
+    #[test]
+    fn test_find_subcommand_index_empty_args() {
+        let args: Vec<String> = vec![];
+        assert_eq!(super::find_subcommand_index(&args, KUBECTL_VALUE_FLAGS), 0);
     }
 }

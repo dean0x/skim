@@ -1,0 +1,76 @@
+[
+    {
+        "Id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "Created": "2024-01-15T10:00:00.123456789Z",
+        "Path": "/docker-entrypoint.sh",
+        "Args": ["nginx", "-g", "daemon off;"],
+        "State": {
+            "Status": "running",
+            "Running": true,
+            "Paused": false,
+            "Restarting": false,
+            "OOMKilled": false,
+            "Dead": false,
+            "Pid": 12345,
+            "ExitCode": 0,
+            "Error": "",
+            "StartedAt": "2024-01-15T10:00:01Z",
+            "FinishedAt": "0001-01-01T00:00:00Z"
+        },
+        "Image": "sha256:abc123def456",
+        "Name": "/web-proxy",
+        "RestartCount": 0,
+        "Driver": "overlay2",
+        "Platform": "linux",
+        "HostConfig": {
+            "Binds": null,
+            "NetworkMode": "bridge",
+            "PortBindings": {
+                "80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "80"}]
+            },
+            "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0}
+        },
+        "Config": {
+            "Hostname": "a1b2c3d4e5f6",
+            "Domainname": "",
+            "User": "",
+            "AttachStdin": false,
+            "AttachStdout": false,
+            "AttachStderr": false,
+            "ExposedPorts": {"80/tcp": {}},
+            "Tty": false,
+            "OpenStdin": false,
+            "StdinOnce": false,
+            "Env": ["NGINX_VERSION=1.25.3", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+            "Cmd": ["nginx", "-g", "daemon off;"],
+            "Image": "nginx:latest",
+            "Volumes": null,
+            "WorkingDir": "",
+            "Entrypoint": ["/docker-entrypoint.sh"],
+            "Labels": {"maintainer": "NGINX Docker Maintainers"}
+        },
+        "NetworkSettings": {
+            "Bridge": "",
+            "IPAddress": "172.17.0.2",
+            "IPPrefixLen": 16,
+            "MacAddress": "02:42:ac:11:00:02",
+            "Networks": {
+                "bridge": {
+                    "IPAMConfig": null,
+                    "IPAddress": "172.17.0.2",
+                    "Gateway": "172.17.0.1"
+                }
+            }
+        },
+        "Mounts": [
+            {
+                "Type": "bind",
+                "Source": "/host/nginx.conf",
+                "Destination": "/etc/nginx/nginx.conf",
+                "Mode": "ro",
+                "RW": false,
+                "Propagation": "rprivate"
+            }
+        ]
+    }
+]

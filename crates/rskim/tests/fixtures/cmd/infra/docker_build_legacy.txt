@@ -1,0 +1,34 @@
+Sending build context to Docker daemon  48.13kB
+Step 1/8 : FROM python:3.11-slim
+ ---> a8f4d0e12345
+Step 2/8 : WORKDIR /app
+ ---> Running in b9f5e1f23456
+Removing intermediate container b9f5e1f23456
+ ---> c0f6f2g34567
+Step 3/8 : COPY requirements.txt .
+ ---> d1f7g3h45678
+Step 4/8 : RUN pip install --no-cache-dir -r requirements.txt
+ ---> Running in e2f8h4i56789
+Collecting flask==2.3.3
+  Downloading Flask-2.3.3-py3-none-any.whl (96 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 96.1/96.1 kB 5.2 MB/s eta 0:00:00
+Installing collected packages: flask
+Successfully installed flask-2.3.3
+Removing intermediate container e2f8h4i56789
+ ---> f3f9i5j67890
+Step 5/8 : COPY . .
+ ---> g4faj6k78901
+Step 6/8 : ENV FLASK_APP=app.py
+ ---> Running in h5fbk7l89012
+Removing intermediate container h5fbk7l89012
+ ---> i6fcl8m90123
+Step 7/8 : EXPOSE 8000
+ ---> Running in j7fdm9n01234
+Removing intermediate container j7fdm9n01234
+ ---> k8fen0o12345
+Step 8/8 : CMD ["python", "-m", "flask", "run", "--host=0.0.0.0", "--port=8000"]
+ ---> Running in l9ffo1p23456
+Removing intermediate container l9ffo1p23456
+ ---> m0fgp2q34567
+Successfully built m0fgp2q34567
+Successfully tagged myapp:latest

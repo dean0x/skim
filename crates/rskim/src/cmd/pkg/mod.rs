@@ -109,6 +109,7 @@ where
             show_stats,
             output_format: crate::cmd::OutputFormat::default(),
             family: "pkg",
+            skip_ansi_strip: false,
             rec,
         },
         |output, _args| parse_fn(output),

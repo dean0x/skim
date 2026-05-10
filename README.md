@@ -571,7 +571,8 @@ cargo bench
 - Git: status, diff, log
 - File tools: find, ls, tree, grep, rg
 - Log: JSON structured + plaintext dedup, debug filtering, stack trace collapsing
-- Infra: gh, aws, curl, wget
+- Infra: gh, aws, curl, wget, docker, kubectl, terraform
+- Database: psql, mysql, sqlite3
 - Three-tier degradation: Structured → Regex → Passthrough
 
 ✅ **Agent Integration:**
