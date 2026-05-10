@@ -52,8 +52,11 @@ pub(crate) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 }
 
 fn try_parse_ndjson(text: &str) -> Option<InfraResult> {
-    let first_json = text.lines().find(|l| l.trim().starts_with('{'))?;
-    serde_json::from_str::<Value>(first_json.trim()).ok()?;
+    // Quick format check: bail early if no line looks like a JSON object.
+    // The actual parse happens in the main loop below.
+    if !text.lines().any(|l| l.trim().starts_with('{')) {
+        return None;
+    }
 
     let mut items: Vec<InfraItem> = Vec::new();
     let mut count = 0usize;
@@ -82,6 +85,10 @@ fn try_parse_ndjson(text: &str) -> Option<InfraResult> {
         let label = format!("{repo}:{tag}");
         let value = format!("{id} ({size})");
         items.push(InfraItem { label, value });
+    }
+
+    if count == 0 {
+        return None;
     }
 
     Some(InfraResult::new(

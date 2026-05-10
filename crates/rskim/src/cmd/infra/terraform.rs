@@ -105,12 +105,11 @@ fn parse_terraform_output(
 }
 
 fn try_parse_ndjson(text: &str, subcmd: &str) -> Option<InfraResult> {
-    // Must have valid JSON lines
-    let first_json = text.lines().find(|l| {
-        let t = l.trim();
-        t.starts_with('{')
-    })?;
-    serde_json::from_str::<Value>(first_json.trim()).ok()?;
+    // Quick format check: bail early if no line looks like a JSON object.
+    // The actual parse happens in the main loop below.
+    if !text.lines().any(|l| l.trim().starts_with('{')) {
+        return None;
+    }
 
     let mut add = 0u64;
     let mut change = 0u64;
