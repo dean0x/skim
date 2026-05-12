@@ -702,4 +702,46 @@ mod tests {
             "expected 'tests' module to be dropped, got: {module_paths:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Analytics recording
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn test_record_heatmap_analytics_insights_label() {
+        use std::time::Duration;
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        let _ = crate::analytics::AnalyticsDb::open(tmp.path()).unwrap();
+
+        std::env::set_var("SKIM_ANALYTICS_DB", &db_path);
+
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: true,
+            input_cost_per_mtok: None,
+            session_id: None,
+        };
+
+        record_heatmap_analytics(
+            &analytics,
+            "skim heatmap --insights",
+            Duration::from_millis(42),
+        );
+        crate::analytics::flush_pending();
+
+        let db = crate::analytics::AnalyticsDb::open(tmp.path()).unwrap();
+        let cmds = db.query_by_original_cmd(None).unwrap();
+        assert!(
+            cmds.iter()
+                .any(|c| c.original_cmd == "skim heatmap --insights"),
+            "expected 'skim heatmap --insights' in recorded commands, got: {:?}",
+            cmds.iter().map(|c| &c.original_cmd).collect::<Vec<_>>()
+        );
+
+        std::env::remove_var("SKIM_ANALYTICS_DB");
+    }
 }
