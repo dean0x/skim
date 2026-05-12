@@ -422,7 +422,7 @@ mod tests {
             .as_secs();
         let since = config.since.unwrap();
         let diff = now - since;
-        assert!(diff >= 29 * 86400 && diff <= 31 * 86400);
+        assert!((29 * 86400..=31 * 86400).contains(&diff));
     }
 
     #[test]

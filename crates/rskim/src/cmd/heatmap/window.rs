@@ -232,7 +232,7 @@ mod tests {
             .as_secs();
         let since = preset_to_since_secs("sprint", now).unwrap();
         let diff = now - since;
-        assert!(diff >= 13 * 86400 && diff <= 15 * 86400);
+        assert!((13 * 86400..=15 * 86400).contains(&diff));
     }
 
     #[test]
