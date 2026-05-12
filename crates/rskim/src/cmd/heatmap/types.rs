@@ -43,6 +43,8 @@ pub(crate) struct HeatmapConfig {
     pub(crate) diff_base: Option<String>,
     /// True when `--top` was explicitly passed (vs. implied by file targeting).
     pub(crate) top_explicit: bool,
+    /// Show only threshold-filtered one-liner insights.
+    pub(crate) insights: bool,
 }
 
 impl Default for HeatmapConfig {
@@ -62,6 +64,7 @@ impl Default for HeatmapConfig {
             files: Vec::new(),
             diff_base: None,
             top_explicit: false,
+            insights: false,
         }
     }
 }
@@ -229,4 +232,58 @@ pub(crate) struct ModuleHealth {
     pub(crate) files_count: usize,
     pub(crate) total_commits: usize,
     pub(crate) cross_boundary_commits: usize,
+}
+
+// ============================================================================
+// Insights types
+// ============================================================================
+
+/// Insight severity level for threshold-filtered findings.
+///
+/// Ord is derived so Critical < Warning (sorts critical first when ascending).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) enum Severity {
+    /// Highest severity — file meets critical threshold.
+    Critical,
+    /// Moderate severity — file meets warning threshold.
+    Warning,
+}
+
+/// A single threshold-filtered finding.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Insight {
+    pub(crate) severity: Severity,
+    pub(crate) category: String,
+    pub(crate) file: String,
+    pub(crate) message: String,
+    pub(crate) metric_value: f64,
+}
+
+/// Standalone insights result (separate from HeatmapResult — does NOT add fields to it).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InsightsResult {
+    pub(crate) version: u8,
+    pub(crate) repository: String,
+    pub(crate) window: WindowInfo,
+    pub(crate) insights: Vec<Insight>,
+    pub(crate) top_files: Vec<CompactFileEntry>,
+    pub(crate) flagged_modules: Vec<CompactModuleEntry>,
+}
+
+/// Condensed file entry for [`InsightsResult`].
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CompactFileEntry {
+    pub(crate) path: String,
+    pub(crate) stability: u8,
+    pub(crate) churn_commits: usize,
+    pub(crate) fix_risk_pct: f64,
+    pub(crate) bus_factor_risk: bool,
+}
+
+/// Flagged module entry for [`InsightsResult`].
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CompactModuleEntry {
+    pub(crate) path: String,
+    pub(crate) encapsulation_pct: f64,
+    pub(crate) cross_boundary: usize,
 }

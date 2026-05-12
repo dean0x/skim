@@ -10,6 +10,7 @@
 
 mod excludes;
 mod git_source;
+mod insights;
 mod metrics;
 mod output;
 mod types;
@@ -22,11 +23,12 @@ use crate::analytics::{CommandType, RecordingContext};
 
 use excludes::{build_exclude_set, should_exclude};
 use git_source::{CliGitSource, GitDataSource};
+use insights::{build_insights_result, compute_insights};
 use metrics::{
     build_fix_regex, compute_authors, compute_churn, compute_coupling, compute_encapsulation,
     compute_fix_after_touch, compute_stability,
 };
-use output::{render_json, render_text};
+use output::{render_insights_json, render_insights_text, render_json, render_text};
 use types::{CommitRecord, FileMetrics, HeatmapConfig, HeatmapResult, ResolvedWindow, WindowInfo};
 
 // ============================================================================
@@ -295,12 +297,40 @@ fn run_with_source(
         config.top_n
     };
 
-    // Apply --top N limit to files
-    result.files.truncate(display_top_n);
-
     // Step 10: Render
     let elapsed = start_time.elapsed();
     let mut stdout = io::stdout().lock();
+
+    // Insights early-return (before truncation — insights use full dataset)
+    if config.insights {
+        let insights = compute_insights(&result);
+        if config.format_json {
+            let insights_result = build_insights_result(&result, insights);
+            let json = render_insights_json(&insights_result)?;
+            writeln!(stdout, "{json}")?;
+        } else {
+            let text = render_insights_text(&result, &insights);
+            write!(stdout, "{text}")?;
+        }
+        // Analytics still recorded
+        let rec = RecordingContext {
+            enabled: analytics.enabled,
+            command_type: CommandType::Heatmap,
+            parse_tier: None,
+            session_id: analytics.session_id.as_deref(),
+        };
+        crate::analytics::try_record_command(
+            rec,
+            String::new(),
+            String::new(),
+            "skim heatmap --insights".to_string(),
+            elapsed,
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Apply --top N limit to files (not needed for insights)
+    result.files.truncate(display_top_n);
 
     if config.format_json {
         let json = render_json(&result)?;
@@ -839,6 +869,7 @@ fn apply_boolean_flag(config: &mut HeatmapConfig, flag: &str) -> anyhow::Result<
     match flag {
         "--json" => config.format_json = true,
         "--no-exclude" => config.no_exclude = true,
+        "--insights" => config.insights = true,
         "--debug" => {
             config.debug = true;
             crate::debug::force_enable_debug();
@@ -913,6 +944,7 @@ OPTIONS:
     --exclude <PATTERN>           Add extra glob pattern to exclude (repeatable)
     --coupling-threshold <FLOAT>  Coupling confidence threshold (default: 0.5)
     --fix-window <N>              Proximity window for fix-after-touch detection (default: 5)
+    --insights                    Show only notable findings (threshold-filtered insights)
     --debug                       Enable debug output
     -h, --help                    Show this help message
 
@@ -947,6 +979,9 @@ EXAMPLES:
     skim heatmap src/main.rs               # Scope output to one file
     skim heatmap --diff main               # Show files changed vs main
     skim heatmap --path src/ src/main.rs   # Combine path + file scoping
+    skim heatmap --insights                # One-liner findings only
+    skim heatmap --insights --json         # Insights as JSON (agent-friendly)
+    skim heatmap --insights src/main.rs    # Insights for specific file
 
 METRICS:
     Top Churn          Files changed most frequently
@@ -1508,5 +1543,31 @@ mod tests {
             !module_paths.contains(&"tests"),
             "expected 'tests' module to be dropped, got: {module_paths:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Insights flag parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_args_insights_flag() {
+        let config = parse_args(&["--insights".to_string()]).unwrap();
+        assert!(
+            config.insights,
+            "--insights should set config.insights=true"
+        );
+    }
+
+    #[test]
+    fn test_parse_args_insights_with_json() {
+        let config = parse_args(&["--insights".to_string(), "--json".to_string()]).unwrap();
+        assert!(config.insights, "--insights should be set");
+        assert!(config.format_json, "--json should be set");
+    }
+
+    #[test]
+    fn test_parse_args_insights_default_false() {
+        let config = parse_args(&[]).unwrap();
+        assert!(!config.insights, "insights should default to false");
     }
 }
