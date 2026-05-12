@@ -39,12 +39,13 @@ const COUPLING_WARNING: f64 = 0.8;
 /// Push a Critical or Warning insight based on two thresholds.
 ///
 /// For metrics where **lower** is worse (stability, encapsulation), pass
-/// `critical_bound < warning_bound` and use `<` comparisons.  For metrics
-/// where **higher** is worse (fix-risk, coupling), pass
-/// `critical_bound > warning_bound` and use `>` comparisons.
+/// `worse_than_critical = value < CRITICAL_BOUND` and
+/// `worse_than_warning  = value < WARNING_BOUND`.
+/// For metrics where **higher** is worse (fix-risk, coupling), flip the
+/// comparisons (`value > BOUND`).
 ///
-/// `worse_than_critical` / `worse_than_warning` are predicates supplied by
-/// the caller so each metric can use its own comparison direction.
+/// `messages` is `(critical_msg, warning_msg)` to stay under clippy's 7-arg
+/// limit while keeping the helper free of allocations at the call site.
 fn check_threshold(
     insights: &mut Vec<Insight>,
     file: &str,
@@ -52,9 +53,9 @@ fn check_threshold(
     metric_value: f64,
     worse_than_critical: bool,
     worse_than_warning: bool,
-    critical_message: String,
-    warning_message: String,
+    messages: (String, String),
 ) {
+    let (critical_message, warning_message) = messages;
     if worse_than_critical {
         insights.push(Insight {
             severity: Severity::Critical,
@@ -97,8 +98,10 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
             f64::from(stability),
             stability < STABILITY_CRITICAL,
             stability < STABILITY_WARNING,
-            format!("critically unstable (score {}/100)", stability),
-            format!("moderate instability (score {}/100)", stability),
+            (
+                format!("critically unstable (score {}/100)", stability),
+                format!("moderate instability (score {}/100)", stability),
+            ),
         );
 
         // Fix risk — skip if insufficient data (higher combined_pct = worse)
@@ -111,8 +114,10 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
                 combined,
                 combined > FIX_RISK_CRITICAL,
                 combined > FIX_RISK_WARNING,
-                format!("high fix-risk ({combined:.1}% combined)"),
-                format!("elevated fix-risk ({combined:.1}% combined)"),
+                (
+                    format!("high fix-risk ({combined:.1}% combined)"),
+                    format!("elevated fix-risk ({combined:.1}% combined)"),
+                ),
             );
         }
 
@@ -158,8 +163,10 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
             pct,
             pct < ENCAPSULATION_CRITICAL,
             pct < ENCAPSULATION_WARNING,
-            format!("poor encapsulation ({pct:.1}%)"),
-            format!("weak encapsulation ({pct:.1}%)"),
+            (
+                format!("poor encapsulation ({pct:.1}%)"),
+                format!("weak encapsulation ({pct:.1}%)"),
+            ),
         );
     }
 
