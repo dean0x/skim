@@ -84,36 +84,36 @@ pub(super) fn collect_hunks<'a>(lines: &[&'a str], start: usize) -> (Vec<DiffHun
     while i < lines.len() && !lines[i].starts_with("diff --git ") {
         let line = lines[i];
 
-        if line.starts_with("@@") {
-            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line) {
-                let mut patch_lines: Vec<&'a str> = Vec::new();
-                i += 1;
+        if line.starts_with("@@")
+            && let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(line)
+        {
+            let mut patch_lines: Vec<&'a str> = Vec::new();
+            i += 1;
 
-                while i < lines.len() {
-                    let patch_line = lines[i];
-                    if patch_line.starts_with("diff --git ") || patch_line.starts_with("@@") {
-                        break;
-                    }
-                    // Only keep actual patch lines (+, -, space, or \ no newline)
-                    if patch_line.starts_with('+')
-                        || patch_line.starts_with('-')
-                        || patch_line.starts_with(' ')
-                        || patch_line.starts_with('\\')
-                    {
-                        patch_lines.push(patch_line);
-                    }
-                    i += 1;
+            while i < lines.len() {
+                let patch_line = lines[i];
+                if patch_line.starts_with("diff --git ") || patch_line.starts_with("@@") {
+                    break;
                 }
-
-                hunks.push(DiffHunk {
-                    old_start,
-                    old_count,
-                    new_start,
-                    new_count,
-                    patch_lines,
-                });
-                continue;
+                // Only keep actual patch lines (+, -, space, or \ no newline)
+                if patch_line.starts_with('+')
+                    || patch_line.starts_with('-')
+                    || patch_line.starts_with(' ')
+                    || patch_line.starts_with('\\')
+                {
+                    patch_lines.push(patch_line);
+                }
+                i += 1;
             }
+
+            hunks.push(DiffHunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                patch_lines,
+            });
+            continue;
         }
         i += 1;
     }

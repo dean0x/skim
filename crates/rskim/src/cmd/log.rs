@@ -16,8 +16,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::output::canonical::{LogEntry, LogResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{LogEntry, LogResult};
 
 /// Maximum input lines before truncation.
 const MAX_INPUT_LINES: usize = 100_000;
@@ -1033,9 +1033,11 @@ mod tests {
         let (filtered, hidden) = filter_debug_entries(entries, &flags);
         assert_eq!(hidden, 0);
         assert_eq!(filtered.len(), 2);
-        assert!(filtered
-            .iter()
-            .all(|(l, _)| { matches!(l.as_deref(), Some("DEBUG") | Some("TRACE")) }));
+        assert!(
+            filtered
+                .iter()
+                .all(|(l, _)| { matches!(l.as_deref(), Some("DEBUG") | Some("TRACE")) })
+        );
     }
 
     #[test]

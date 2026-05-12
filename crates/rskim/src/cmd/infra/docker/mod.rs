@@ -26,7 +26,7 @@ pub(crate) mod ps;
 
 use std::process::ExitCode;
 
-use super::{run_infra_tool, InfraToolConfig};
+use super::{InfraToolConfig, run_infra_tool};
 
 /// Re-export for sub-module use.
 pub(super) use super::combine_stdout_stderr;

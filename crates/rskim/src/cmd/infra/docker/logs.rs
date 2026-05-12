@@ -8,9 +8,9 @@
 //! Converts `ParseResult<LogResult>` → `ParseResult<InfraResult>` using
 //! the rendered log summary text as the InfraResult value.
 
-use crate::cmd::log::{compress_log, LogFlags};
-use crate::output::canonical::InfraResult;
+use crate::cmd::log::{LogFlags, compress_log};
 use crate::output::ParseResult;
+use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
 
 use super::{combine_stdout_stderr, log_result_to_infra};

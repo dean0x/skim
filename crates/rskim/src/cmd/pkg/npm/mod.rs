@@ -14,7 +14,7 @@ mod outdated;
 use std::process::ExitCode;
 
 // Re-exported from parent so submodules can access via `super::`.
-use super::{combine_output, run_pkg_subcommand, PkgSubcommandConfig};
+use super::{PkgSubcommandConfig, combine_output, run_pkg_subcommand};
 
 /// Run `skim npm <subcmd> [args...]`.
 ///

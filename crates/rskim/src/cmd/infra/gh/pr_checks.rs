@@ -37,11 +37,11 @@
 //! Format: `"{status} ({duration}) — {url}"` for failing checks with a URL.
 //! For checks without a URL (JSON tier), the URL field is omitted.
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{three_tier_parse, MAX_ITEMS, MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB};
+use super::{MAX_ITEMS, MAX_JSON_BYTES, RE_GH_CHECK_SYMBOL, RE_GH_CHECK_TAB, three_tier_parse};
 
 /// A single parsed check entry, shared across text and JSON parse paths.
 ///

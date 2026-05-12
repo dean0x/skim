@@ -17,13 +17,13 @@
 //! link to the failing job log without requiring a follow-up `gh run view --job`
 //! invocation. Passing jobs omit the URL to reduce noise.
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
 use super::{
-    inject_json_fields, three_tier_parse, try_parse_json_object, MAX_STEP_DETAIL, RE_GH_RUN_HEADER,
-    RE_GH_RUN_JOB, RE_GH_VIEW_FIELD,
+    MAX_STEP_DETAIL, RE_GH_RUN_HEADER, RE_GH_RUN_JOB, RE_GH_VIEW_FIELD, inject_json_fields,
+    three_tier_parse, try_parse_json_object,
 };
 
 /// JSON fields to inject for `gh run view`.
@@ -190,11 +190,11 @@ fn try_parse_text(text: &str) -> Option<InfraResult> {
         }
 
         // Try run header
-        if summary.is_empty() {
-            if let Some(caps) = RE_GH_RUN_HEADER.captures(line) {
-                summary = format!("#{}: {}", &caps[2], &caps[1]);
-                continue;
-            }
+        if summary.is_empty()
+            && let Some(caps) = RE_GH_RUN_HEADER.captures(line)
+        {
+            summary = format!("#{}: {}", &caps[2], &caps[1]);
+            continue;
         }
 
         // Try job line

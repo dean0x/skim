@@ -14,11 +14,11 @@
 //! - **Tier 3 (Passthrough)**: Raw stdout+stderr concatenation.
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{three_tier_parse, MAX_ITEMS, MAX_JSON_BYTES, RE_GH_TAB_ROW};
+use super::{MAX_ITEMS, MAX_JSON_BYTES, RE_GH_TAB_ROW, three_tier_parse};
 
 /// Inject `--json` fields for list commands if not already present.
 ///

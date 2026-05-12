@@ -26,7 +26,7 @@ use regex::Regex;
 
 use crate::cmd::{combine_output, user_has_flag};
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
-use crate::output::{strip_ansi, ParseResult};
+use crate::output::{ParseResult, strip_ansi};
 use crate::runner::{CommandOutput, CommandRunner};
 
 use super::shared::{self, try_read_stdin};

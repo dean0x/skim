@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 
 use super::streaming::{
-    run_streamed_spawned, run_streamed_stdin, StreamConfig, StreamTotals, StreamingParser,
+    StreamConfig, StreamTotals, StreamingParser, run_streamed_spawned, run_streamed_stdin,
 };
 
 // ============================================================================

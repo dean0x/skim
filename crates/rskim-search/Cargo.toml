@@ -1,0 +1,31 @@
+[package]
+name = "rskim-search"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "Code search foundation library for skim"
+repository = "https://github.com/dean0x/skim"
+publish = false
+
+[dependencies]
+# rskim-core provides Language (for type-safe lang filtering in SearchQuery) and
+# SkimError (for SearchError::Core interop). The transitive tree-sitter grammar
+# dependencies are acceptable: Wave 1 search layers will require language-aware
+# AST parsing, making rskim-core a natural runtime dependency at that point.
+rskim-core = { version = "2.9.0", path = "../rskim-core" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[lib]
+name = "rskim_search"
+path = "src/lib.rs"

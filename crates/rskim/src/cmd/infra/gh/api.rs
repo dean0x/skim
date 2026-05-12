@@ -43,11 +43,11 @@
 //! base64-encoded file contents.  We replace it with a placeholder
 //! `<base64 N bytes>` to keep the output compact.
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, MAX_JSON_BYTES};
+use super::{MAX_JSON_BYTES, combine_stdout_stderr};
 
 // ============================================================================
 // Constants
@@ -126,21 +126,19 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     }
 
     // JSON object.
-    if trimmed.starts_with('{') {
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(result) = try_parse_json_object(&obj) {
-                return ParseResult::Full(result);
-            }
-        }
+    if trimmed.starts_with('{')
+        && let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(result) = try_parse_json_object(&obj)
+    {
+        return ParseResult::Full(result);
     }
 
     // JSON array.
-    if trimmed.starts_with('[') {
-        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(result) = try_parse_json_array(&arr) {
-                return ParseResult::Full(result);
-            }
-        }
+    if trimmed.starts_with('[')
+        && let Ok(arr) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(result) = try_parse_json_array(&arr)
+    {
+        return ParseResult::Full(result);
     }
 
     // Passthrough.
@@ -191,13 +189,13 @@ fn try_parse_json_object(obj: &serde_json::Value) -> Option<InfraResult> {
 
     // Contents endpoint -- replace base64 content field.
     let mut patched_obj = obj.clone();
-    if let Some(content) = patched_obj.get_mut("content") {
-        if let Some(b64) = content.as_str() {
-            // Remove whitespace (base64 may have newlines from gh api).
-            let clean_b64: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
-            let byte_count = base64_decoded_len(&clean_b64);
-            *content = serde_json::Value::String(format!("<base64 {byte_count} bytes>"));
-        }
+    if let Some(content) = patched_obj.get_mut("content")
+        && let Some(b64) = content.as_str()
+    {
+        // Remove whitespace (base64 may have newlines from gh api).
+        let clean_b64: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let byte_count = base64_decoded_len(&clean_b64);
+        *content = serde_json::Value::String(format!("<base64 {byte_count} bytes>"));
     }
 
     // Compact generic REST object.

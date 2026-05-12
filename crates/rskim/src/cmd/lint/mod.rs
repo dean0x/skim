@@ -19,9 +19,9 @@ pub(crate) mod rustfmt;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use super::{extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig};
-use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
+use super::{ParsedCommandConfig, extract_show_stats, run_parsed_command_with_mode};
 use crate::output::ParseResult;
+use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
 /// Known linters that the lint handler can dispatch to.

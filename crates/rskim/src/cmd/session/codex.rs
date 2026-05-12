@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::types::{AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation, ToolResult};
 use super::SessionProvider;
+use super::types::{AgentKind, SessionFile, TimeFilter, ToolInput, ToolInvocation, ToolResult};
 
 /// Maximum session file size: 100 MB.
 const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
@@ -77,10 +77,10 @@ fn collect_codex_files(
             }
 
             // Symlink traversal guard
-            if let Ok(canonical_path) = path.canonicalize() {
-                if !canonical_path.starts_with(canonical_root) {
-                    continue;
-                }
+            if let Ok(canonical_path) = path.canonicalize()
+                && !canonical_path.starts_with(canonical_root)
+            {
+                continue;
             }
 
             if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {

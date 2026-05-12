@@ -17,11 +17,11 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::output::ParseResult;
+use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, group_issues, LinterConfig};
+use super::{LinterConfig, combine_stdout_stderr, group_issues};
 
 const CONFIG: LinterConfig<'static> = LinterConfig {
     program: "dprint",

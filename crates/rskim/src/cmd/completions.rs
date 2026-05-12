@@ -7,7 +7,7 @@
 use std::io;
 use std::process::ExitCode;
 
-use clap::{value_parser, Arg, Command};
+use clap::{Arg, Command, value_parser};
 use clap_complete::Shell;
 
 /// Run the `completions` subcommand.

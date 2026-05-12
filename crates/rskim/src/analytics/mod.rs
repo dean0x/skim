@@ -942,7 +942,9 @@ pub(crate) fn flush_pending() {
         Ok(g) => g,
         Err(poisoned) => {
             if crate::debug::is_debug_enabled() {
-                eprintln!("[skim:debug] analytics: PENDING_THREADS mutex was poisoned during flush; recovering");
+                eprintln!(
+                    "[skim:debug] analytics: PENDING_THREADS mutex was poisoned during flush; recovering"
+                );
             }
             poisoned.into_inner()
         }
@@ -1722,7 +1724,7 @@ mod tests {
         drain_registry(); // ensure clean state
 
         flush_pending(); // must not panic
-                         // registry must still be empty afterwards
+        // registry must still be empty afterwards
         let len = PENDING_THREADS
             .lock()
             .unwrap_or_else(|e| e.into_inner())

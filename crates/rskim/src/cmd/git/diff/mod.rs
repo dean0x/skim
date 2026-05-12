@@ -20,7 +20,7 @@ use std::process::ExitCode;
 
 use rayon::prelude::*;
 
-use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
+use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
 

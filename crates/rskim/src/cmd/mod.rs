@@ -23,6 +23,7 @@ mod lint;
 mod log;
 mod pkg;
 mod rewrite;
+mod search;
 mod session;
 pub(crate) mod session_sidecar;
 mod stats;
@@ -161,6 +162,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "learn",
     "log",
     "rewrite",
+    "search",
     "stats",
     // Multi-category dispatchers
     "cargo",
@@ -740,6 +742,7 @@ pub(crate) fn dispatch(
         "learn" => learn::run(args, analytics),
         "log" => log::run(args, analytics),
         "rewrite" => rewrite::run(args, analytics),
+        "search" => search::run(args, analytics),
         "stats" => stats::run(args, analytics),
 
         // Multi-category dispatchers
@@ -881,15 +884,14 @@ pub(crate) fn scrub_db_args(args: &str) -> String {
 
         // 3. Attached short flags: -pPassword, -uroot, -Uadmin (no space between flag and value)
         //    Only applies to single-dash (short) flags that are NOT `--` prefixed.
-        if !tok.starts_with("--") {
-            if let Some(&prefix) = ATTACHED_PREFIXES
+        if !tok.starts_with("--")
+            && let Some(&prefix) = ATTACHED_PREFIXES
                 .iter()
                 .find(|&&p| tok.starts_with(p) && tok.len() > p.len())
-            {
-                out.push(format!("{prefix}[REDACTED]"));
-                i += 1;
-                continue;
-            }
+        {
+            out.push(format!("{prefix}[REDACTED]"));
+            i += 1;
+            continue;
         }
 
         // 4. Space-separated sensitive flags and config-file flags

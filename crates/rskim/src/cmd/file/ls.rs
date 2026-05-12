@@ -18,11 +18,11 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::FileResult;
 use crate::output::ParseResult;
+use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{run_file_tool, FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
+use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES, run_file_tool};
 
 /// Maximum byte length of JSON input accepted for Tier 1 tree JSON parsing.
 ///

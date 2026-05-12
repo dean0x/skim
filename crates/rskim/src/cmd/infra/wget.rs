@@ -13,11 +13,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
+use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "wget",

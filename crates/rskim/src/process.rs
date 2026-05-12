@@ -8,8 +8,8 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
 use rskim_core::{
-    detect_language_from_path, transform_auto_with_config, transform_with_config,
-    transform_with_line_map, Language, Mode, TransformConfig,
+    Language, Mode, TransformConfig, detect_language_from_path, transform_auto_with_config,
+    transform_with_config, transform_with_line_map,
 };
 
 use crate::{cache, cascade, cascade::TruncationOptions, tokens};

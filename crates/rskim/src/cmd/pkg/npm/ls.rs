@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::runner::CommandOutput;
 
 use super::combine_output;
@@ -67,13 +67,13 @@ fn try_parse_ls_json(stdout: &str) -> Option<PkgResult> {
     for (name, dep) in deps {
         let version = dep.get("version").and_then(|v| v.as_str()).unwrap_or("?");
 
-        if let Some(problems) = dep.get("problems").and_then(|v| v.as_array()) {
-            if !problems.is_empty() {
-                flagged += 1;
-                for problem in problems {
-                    if let Some(msg) = problem.as_str() {
-                        details.push(format!("{name}@{version}: {msg}"));
-                    }
+        if let Some(problems) = dep.get("problems").and_then(|v| v.as_array())
+            && !problems.is_empty()
+        {
+            flagged += 1;
+            for problem in problems {
+                if let Some(msg) = problem.as_str() {
+                    details.push(format!("{name}@{version}: {msg}"));
                 }
             }
         }

@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use comfy_table::presets::UTF8_FULL_CONDENSED;
 use comfy_table::{ContentArrangement, Table};
 
-use super::session::{self, parse_duration_ago, AgentKind, ToolInput, ToolInvocation};
+use super::session::{self, AgentKind, ToolInput, ToolInvocation, parse_duration_ago};
 
 /// Run the learn subcommand.
 pub(crate) fn run(

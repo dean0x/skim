@@ -1450,10 +1450,11 @@ mod tests {
     fn test_apply_file_scope_warns_missing() {
         let mut result = make_test_result();
         apply_file_scope(&mut result, &["nonexistent.rs".to_string()]);
-        assert!(result
-            .warnings
-            .iter()
-            .any(|w| { w.contains("nonexistent.rs") && w.contains("not found in git history") }));
+        assert!(
+            result.warnings.iter().any(|w| {
+                w.contains("nonexistent.rs") && w.contains("not found in git history")
+            })
+        );
     }
 
     #[test]

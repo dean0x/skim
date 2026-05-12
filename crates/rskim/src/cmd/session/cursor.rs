@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
-use super::types::*;
 use super::SessionProvider;
+use super::types::*;
 
 /// Maximum database file size: 100 MB.
 const MAX_DB_SIZE: u64 = 100 * 1024 * 1024;
@@ -80,10 +80,10 @@ impl SessionProvider for CursorProvider {
 
         // Apply time filter against the database file's mtime (we cannot
         // reliably get per-session timestamps from the KV table).
-        if let Some(since) = filter.since {
-            if file_modified < since {
-                return Ok(Vec::new());
-            }
+        if let Some(since) = filter.since
+            && file_modified < since
+        {
+            return Ok(Vec::new());
         }
 
         let mut sessions: Vec<SessionFile> = rows
@@ -617,13 +617,15 @@ mod tests {
     #[test]
     fn test_env_override_path() {
         // Use a temp path that does not exist -- detect() should return None
-        std::env::set_var("SKIM_CURSOR_DB_PATH", "/tmp/nonexistent_skim_test.vscdb");
+        // SAFETY: test-only mutation; single-threaded test environment
+        unsafe { std::env::set_var("SKIM_CURSOR_DB_PATH", "/tmp/nonexistent_skim_test.vscdb") };
         let provider = CursorProvider::detect();
         assert!(
             provider.is_none(),
             "detect() should return None for non-existent file"
         );
-        std::env::remove_var("SKIM_CURSOR_DB_PATH");
+        // SAFETY: test-only mutation; single-threaded test environment
+        unsafe { std::env::remove_var("SKIM_CURSOR_DB_PATH") };
     }
 
     #[test]

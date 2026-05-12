@@ -7,7 +7,7 @@
 use crate::transform::compute_line_starts;
 use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::transform::truncate::NodeSpan;
-use crate::transform::utils::{to_static_node_kind, FunctionNodeTypes};
+use crate::transform::utils::{FunctionNodeTypes, to_static_node_kind};
 use crate::{Language, Result, SkimError, TransformConfig};
 use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
@@ -295,12 +295,12 @@ fn collect_body_replacements(
     let kind = node.kind();
 
     // Check if this is a function/method with a body
-    if matches_function_node(kind, node_types) {
-        if let Some(body) = find_body_node(node) {
-            let start = body.start_byte();
-            let end = body.end_byte();
-            replacements.insert((start, end), " {...}");
-        }
+    if matches_function_node(kind, node_types)
+        && let Some(body) = find_body_node(node)
+    {
+        let start = body.start_byte();
+        let end = body.end_byte();
+        replacements.insert((start, end), " {...}");
     }
 
     // Recursively process children with incremented depth

@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)] // Unwrapping is acceptable in tests
 
-use rskim_core::{transform, Language, Mode};
+use rskim_core::{Language, Mode, transform};
 
 const SIMPLE_KT: &str = include_str!("../../../tests/fixtures/kotlin/Simple.kt");
 const DATA_CLASS_KT: &str = include_str!("../../../tests/fixtures/kotlin/DataClass.kt");
@@ -215,8 +215,7 @@ fn test_kotlin_minimal_preserves_doc_comments() {
 
 #[test]
 fn test_kotlin_minimal_strips_regular_comments() {
-    let source =
-        "// This is a regular comment\npackage com.example\n\nfun main() {\n    // inside body\n}\n";
+    let source = "// This is a regular comment\npackage com.example\n\nfun main() {\n    // inside body\n}\n";
     let result = transform(source, Language::Kotlin, Mode::Minimal).unwrap();
     assert!(
         !result.contains("regular comment"),

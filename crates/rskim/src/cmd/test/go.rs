@@ -12,8 +12,8 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::cmd::{combine_output, inject_flag_before_separator};
-use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
+use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::runner::{CommandOutput, CommandRunner};
 
 use super::shared::{self, try_read_stdin};

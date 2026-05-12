@@ -9,8 +9,8 @@
 use std::process::ExitCode;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{PkgOperation, PkgResult};
 use crate::runner::CommandOutput;
 
 // ============================================================================

@@ -19,11 +19,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::output::canonical::DbResult;
 use crate::output::ParseResult;
+use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use super::{run_db_tool, DbToolConfig};
+use super::{DbToolConfig, run_db_tool};
 use crate::cmd::user_has_flag;
 
 const CONFIG: DbToolConfig<'static> = DbToolConfig {

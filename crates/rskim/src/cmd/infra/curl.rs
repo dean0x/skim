@@ -19,11 +19,11 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::output::canonical::{InfraItem, InfraResult};
 use crate::output::ParseResult;
+use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{combine_stdout_stderr, run_infra_tool, InfraToolConfig};
+use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
 
 const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "curl",
@@ -302,7 +302,7 @@ fn find_last_http_response_start(text: &str) -> usize {
     let bytes = text.as_bytes();
     for pos in memchr::memmem::find_iter(bytes, b"\nHTTP/") {
         let abs = pos + 1; // +1: skip the leading \n; abs points at 'H'
-                           // Match only the first line at this position (regex has $ anchor).
+        // Match only the first line at this position (regex has $ anchor).
         let line_end = text[abs..]
             .find('\n')
             .map(|i| abs + i)
@@ -350,10 +350,10 @@ fn find_body_start(text: &str) -> Option<(usize, usize)> {
 /// 6. `json["error_description"]`
 fn extract_error_message(json: &Value) -> Option<String> {
     // 1. Nested error object with message field
-    if let Some(err_obj) = json.get("error").and_then(|e| e.as_object()) {
-        if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
-            return Some(truncate_message(msg));
-        }
+    if let Some(err_obj) = json.get("error").and_then(|e| e.as_object())
+        && let Some(msg) = err_obj.get("message").and_then(|m| m.as_str())
+    {
+        return Some(truncate_message(msg));
     }
 
     // 2. error as string
@@ -463,13 +463,13 @@ fn extract_verbose_metadata(stderr: &str) -> (Option<String>, Vec<InfraItem>) {
         }
 
         // Response header lines: `< Header-Name: value`
-        if let Some(rest) = line.strip_prefix("< ") {
-            if let Some(caps) = RE_HEADER_LINE.captures(rest) {
-                let name = &caps[1];
-                let value = caps[2].trim();
-                if let Some(item) = classify_header(name, value, &mut set_cookie_count) {
-                    header_items.push(item);
-                }
+        if let Some(rest) = line.strip_prefix("< ")
+            && let Some(caps) = RE_HEADER_LINE.captures(rest)
+        {
+            let name = &caps[1];
+            let value = caps[2].trim();
+            if let Some(item) = classify_header(name, value, &mut set_cookie_count) {
+                header_items.push(item);
             }
         }
     }

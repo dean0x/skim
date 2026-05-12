@@ -6,8 +6,8 @@
 #![allow(clippy::expect_used)] // Expect is acceptable in tests
 
 use rskim_core::{
-    transform, transform_auto, transform_with_config, truncate_to_token_budget, Language, Mode,
-    TransformConfig,
+    Language, Mode, TransformConfig, transform, transform_auto, transform_with_config,
+    truncate_to_token_budget,
 };
 use std::path::Path;
 

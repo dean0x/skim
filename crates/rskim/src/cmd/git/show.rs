@@ -48,14 +48,14 @@ use std::process::ExitCode;
 
 use rskim_core::{Language, TransformConfig};
 
-use crate::cmd::{extract_output_format, user_has_flag, OutputFormat};
+use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
 
 use rayon::prelude::*;
 
 use super::diff::{
-    parse_unified_diff, render_diff_file, DiffMode, MAX_AST_FILE_COUNT, PARALLEL_THRESHOLD,
+    DiffMode, MAX_AST_FILE_COUNT, PARALLEL_THRESHOLD, parse_unified_diff, render_diff_file,
 };
 use super::{build_analytics_label, finalize_git_output_owned, map_exit_code, run_passthrough};
 

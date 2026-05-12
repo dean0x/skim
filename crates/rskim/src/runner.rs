@@ -185,10 +185,10 @@ impl CommandRunner {
 
                 // Strategy 2: ./node_modules/.bin/{program}
                 let local_bin = format!("./node_modules/.bin/{program}");
-                if std::path::Path::new(&local_bin).exists() {
-                    if let Ok(out) = self.run_with_env(&local_bin, args, env_vars) {
-                        return Ok(out);
-                    }
+                if std::path::Path::new(&local_bin).exists()
+                    && let Ok(out) = self.run_with_env(&local_bin, args, env_vars)
+                {
+                    return Ok(out);
                 }
 
                 // Strategy 3: npx --no-install {program}

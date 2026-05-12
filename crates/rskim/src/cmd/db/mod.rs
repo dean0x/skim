@@ -13,10 +13,10 @@ pub(crate) mod sqlite3;
 use std::process::ExitCode;
 
 use super::{
-    extract_json_flag, extract_show_stats, run_parsed_command_with_mode, ParsedCommandConfig,
+    ParsedCommandConfig, extract_json_flag, extract_show_stats, run_parsed_command_with_mode,
 };
-use crate::output::canonical::DbResult;
 use crate::output::ParseResult;
+use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
 /// Known DB tools that the db handler can dispatch to.

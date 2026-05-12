@@ -33,10 +33,10 @@ pub(crate) fn resolve_config_dir_for_agent(
     }
 
     // Check agent-specific env override
-    if agent == AgentKind::ClaudeCode {
-        if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-            return Ok(PathBuf::from(dir));
-        }
+    if agent == AgentKind::ClaudeCode
+        && let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+    {
+        return Ok(PathBuf::from(dir));
     }
 
     let home =
@@ -302,7 +302,9 @@ pub(super) fn print_help() {
     println!("  --project           Install to project-level config directory");
     println!("  --agent <name>      Target agent (default: claude-code)");
     println!("                      Supported: claude-code, cursor, gemini, copilot, codex, crush");
-    println!("  --yes, -y           Skip confirmation (uninstall only; install is always non-interactive)");
+    println!(
+        "  --yes, -y           Skip confirmation (uninstall only; install is always non-interactive)"
+    );
     println!("  --dry-run           Print actions without writing");
     println!("  --uninstall         Remove hook and clean up");
     println!("  --no-guidance       Skip injecting guidance into agent instruction file");

@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::types::*;
 use super::SessionProvider;
+use super::types::*;
 
 /// Maximum session file size (100 MB) to prevent unbounded reads.
 const MAX_SESSION_SIZE: u64 = 100 * 1024 * 1024;
@@ -60,14 +60,14 @@ impl SessionProvider for GeminiCliProvider {
             }
 
             // Verify resolved path stays within the gemini directory (symlink traversal guard)
-            if let Ok(canonical_path) = path.canonicalize() {
-                if !canonical_path.starts_with(&canonical_root) {
-                    eprintln!(
-                        "warning: skipping file outside gemini dir: {}",
-                        path.display()
-                    );
-                    continue;
-                }
+            if let Ok(canonical_path) = path.canonicalize()
+                && !canonical_path.starts_with(&canonical_root)
+            {
+                eprintln!(
+                    "warning: skipping file outside gemini dir: {}",
+                    path.display()
+                );
+                continue;
             }
 
             let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
@@ -83,10 +83,10 @@ impl SessionProvider for GeminiCliProvider {
             };
 
             // Apply time filter
-            if let Some(since) = filter.since {
-                if modified < since {
-                    continue;
-                }
+            if let Some(since) = filter.since
+                && modified < since
+            {
+                continue;
             }
 
             let session_id = path

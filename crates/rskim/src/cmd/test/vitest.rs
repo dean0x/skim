@@ -16,11 +16,11 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::cmd::user_has_flag;
-use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::output::ParseResult;
+use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 use crate::runner::CommandRunner;
 
-use super::shared::{self, scrape_failures, try_read_stdin, TestKind};
+use super::shared::{self, TestKind, scrape_failures, try_read_stdin};
 
 // ============================================================================
 // Public entry point
