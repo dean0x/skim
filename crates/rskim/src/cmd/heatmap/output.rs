@@ -489,7 +489,6 @@ mod tests {
 
     #[test]
     fn test_insights_text_contains_findings() {
-        let result = make_result();
         let insights = vec![
             make_insight(
                 Severity::Critical,
@@ -521,7 +520,6 @@ mod tests {
 
     #[test]
     fn test_insights_text_empty_state() {
-        let result = make_result();
         let insights: Vec<Insight> = vec![];
         let text = render_insights_text(&insights);
         assert!(
