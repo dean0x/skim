@@ -99,6 +99,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - **Module health** — directory encapsulation scores (cross-boundary coupling violations)
 - Configurable time windows: `--window sprint` (14d), `--last 200`, `--since 30d`, or full history
 - File targeting with positional args and `--diff` to scope output without skewing metrics
+- `--insights` for threshold-filtered findings only (CRITICAL/WARNING severity one-liners)
 - `--json` for machine-readable output, `--path` to scope to a subdirectory
 
 ### Intelligence
@@ -591,6 +592,7 @@ cargo bench
 - MCP server mode for agent-native workflows
 
 ✅ **Analytics & Intelligence:**
+- `skim heatmap` — git history risk analysis (churn, coupling, bus factor, fix density)
 - `skim stats` — persistent SQLite dashboard with cost estimation
 - `skim discover` — missed optimization finder across agent sessions
 - `skim learn` — CLI error pattern detection and correction rules
