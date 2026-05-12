@@ -139,6 +139,114 @@ skim file.ts --show-stats
 -V, --version   Print version
 ```
 
+## Subcommands
+
+### skim heatmap
+
+Analyzes git commit history to surface risk hotspots: high-churn files, tightly coupled file pairs, fix-after-touch patterns, bus-factor concentration, and module boundary violations.
+
+```bash
+skim heatmap [OPTIONS] [FILE...]
+```
+
+#### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Stability Score | Composite risk score (0–100, lower = riskier). Combines churn, recency, and fix density. |
+| Churn | Number of commits touching the file within the analysis window. |
+| Blast Radius | Files that tend to change together (coupling). High coupling = high blast radius. |
+| Fix Risk | Percentage of commits that are fixes, or followed by a fix within the proximity window. |
+| Bus Factor | Single-author concentration risk. Flags files where one author holds >80% of commits. |
+| Module Health | Encapsulation score for top-level directories. Measures cross-boundary coupling. |
+
+#### Time Windows
+
+| Flag | Description |
+|------|-------------|
+| (default) | Dual mode: max(last 90 days, last 200 commits). Captures whichever window is wider. |
+| `--window sprint` | Last 14 days |
+| `--window month` | Last 30 days |
+| `--window quarter` | Last 90 days |
+| `--window half` | Last 180 days |
+| `--window year` | Last 365 days |
+| `--window all` | Entire repository history |
+
+The default **dual mode** is designed for repositories of any age: it avoids under-counting on small repos (fewer than 200 commits) while still bounding analysis on large repos.
+
+#### File Targeting
+
+Positional file arguments and `--diff` scope the **output**, not the git history. Metrics are computed on the full commit history for accuracy — coupling and fix-risk scores reflect the complete picture, then the display is narrowed.
+
+- **Positional args**: `skim heatmap src/main.rs` — show results only for that file
+- **`--path <DIR>`**: Scope the git log itself (commit-level filter). Composable with file args.
+- **`--diff <BASE>`**: Show only files changed vs `BASE` (three-dot diff). Mutually exclusive with positional file args.
+
+#### Insights Mode
+
+`--insights` emits only threshold-filtered CRITICAL/WARNING findings, one per line. Use when you want a quick list of hotspots without the full table.
+
+```bash
+skim heatmap --insights           # Text findings
+skim heatmap --insights --json    # JSON array (agent-friendly)
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--since <VALUE>` | — | Analyze commits since epoch (seconds) or duration (`30d`, `2w`, `24h`) |
+| `--last <N>` | — | Analyze last N commits |
+| `--window <PRESET>` | — | Named window preset (see table above) |
+| `--path <DIR>` | — | Scope git log to files under this directory |
+| `--diff <BASE>` | — | Show only files changed vs BASE |
+| `--json`, `--format json` | false | Emit JSON instead of human-readable text |
+| `--top <N>` | 20 | Maximum number of files to display |
+| `--no-exclude` | false | Disable default exclusion patterns (lock files, build dirs) |
+| `--exclude <PATTERN>` | — | Add extra glob pattern to exclude (repeatable) |
+| `--coupling-threshold <FLOAT>` | 0.5 | Coupling confidence threshold (0.0–1.0) |
+| `--fix-window <N>` | 5 | Proximity window for fix-after-touch detection (commit count) |
+| `--insights` | false | Show only threshold-filtered findings |
+| `--debug` | false | Enable debug output to stderr |
+| `-h`, `--help` | — | Show help message |
+
+#### Examples
+
+```bash
+# Default: analyze last 90 days (dual mode)
+skim heatmap
+
+# Analyze last 200 commits
+skim heatmap --last 200
+
+# Analyze last sprint
+skim heatmap --window sprint
+
+# Analyze last 30 days using duration syntax
+skim heatmap --since 30d
+
+# JSON output for programmatic consumption
+skim heatmap --json
+
+# Scope analysis to src/ directory
+skim heatmap --path src/
+
+# Show only files changed vs main branch
+skim heatmap --diff main
+
+# Show results for a specific file (full metric history, display narrowed)
+skim heatmap src/main.rs
+
+# Combine path-scope with file-scope
+skim heatmap --path src/ src/main.rs
+
+# Threshold-filtered insights only
+skim heatmap --insights
+
+# Insights as JSON for agent pipelines
+skim heatmap --insights --json
+```
+
 ## Common Usage Patterns
 
 ### Single File Processing
