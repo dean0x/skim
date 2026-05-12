@@ -211,13 +211,14 @@ const HEADER_WIDTH: usize = 76;
 pub(crate) fn render_insights_text(insights: &[Insight]) -> String {
     let mut out = String::new();
 
-    // Header line: "── Insights ─────────────────────────────────────────────────────────────"
+    // Header line: "─── Insights ───────────────────────────────────────────────────────────"
+    // Matches the symmetric triple-dash bold pattern used by render_text().
     let label = " Insights ";
-    let prefix = "──";
+    let prefix = "───";
     let suffix_len = HEADER_WIDTH.saturating_sub(prefix.len() + label.len());
     let suffix = "─".repeat(suffix_len);
     let header = format!("{prefix}{label}{suffix}");
-    out.push_str(&header);
+    out.push_str(&header.bold().to_string());
     out.push('\n');
     out.push('\n'); // blank line after header
 
@@ -231,7 +232,10 @@ pub(crate) fn render_insights_text(insights: &[Insight]) -> String {
             Severity::Critical => "CRITICAL ".red().bold().to_string(),
             Severity::Warning => "WARNING  ".yellow().bold().to_string(),
         };
-        out.push_str(&format!("  {severity_str}  {}\n", insight.message));
+        out.push_str(&format!(
+            "  {severity_str}  {}: {}\n",
+            insight.file, insight.message
+        ));
     }
 
     out
@@ -252,7 +256,7 @@ mod tests {
     use super::*;
     use crate::cmd::heatmap::types::{
         AuthorMetrics, ChurnMetrics, CouplingEdge, CouplingEntry, FileMetrics, FixRiskMetrics,
-        ModuleHealth, WindowInfo,
+        InsightCategory, ModuleHealth, WindowInfo,
     };
 
     fn make_result() -> HeatmapResult {
@@ -477,10 +481,15 @@ mod tests {
     // Insights rendering tests
     // -----------------------------------------------------------------------
 
-    fn make_insight(severity: Severity, category: &str, file: &str, msg: &str) -> Insight {
+    fn make_insight(
+        severity: Severity,
+        category: InsightCategory,
+        file: &str,
+        msg: &str,
+    ) -> Insight {
         Insight {
             severity,
-            category: category.to_string(),
+            category,
             file: file.to_string(),
             message: msg.to_string(),
             metric_value: 42.0,
@@ -492,15 +501,15 @@ mod tests {
         let insights = vec![
             make_insight(
                 Severity::Critical,
-                "stability",
+                InsightCategory::Stability,
                 "a.rs",
-                "a.rs: critically unstable (score 22/100)",
+                "critically unstable (score 22/100)",
             ),
             make_insight(
                 Severity::Warning,
-                "fix-risk",
+                InsightCategory::FixRisk,
                 "b.rs",
-                "b.rs: elevated fix-risk (40.0% combined)",
+                "elevated fix-risk (40.0% combined)",
             ),
         ];
         let text = render_insights_text(&insights);
@@ -544,9 +553,9 @@ mod tests {
             },
             insights: vec![make_insight(
                 Severity::Critical,
-                "stability",
+                InsightCategory::Stability,
                 "a.rs",
-                "a.rs: critically unstable (score 22/100)",
+                "critically unstable (score 22/100)",
             )],
             top_files: vec![CompactFileEntry {
                 path: "a.rs".to_string(),
