@@ -309,23 +309,10 @@ fn run_with_source(
             let json = render_insights_json(&insights_result)?;
             writeln!(stdout, "{json}")?;
         } else {
-            let text = render_insights_text(&result, &insights);
+            let text = render_insights_text(&insights);
             write!(stdout, "{text}")?;
         }
-        // Analytics still recorded
-        let rec = RecordingContext {
-            enabled: analytics.enabled,
-            command_type: CommandType::Heatmap,
-            parse_tier: None,
-            session_id: analytics.session_id.as_deref(),
-        };
-        crate::analytics::try_record_command(
-            rec,
-            String::new(),
-            String::new(),
-            "skim heatmap --insights".to_string(),
-            elapsed,
-        );
+        record_heatmap_analytics(analytics, "skim heatmap --insights", elapsed);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -341,21 +328,24 @@ fn run_with_source(
     }
 
     // Step 11: Fire-and-forget analytics
+    record_heatmap_analytics(analytics, "skim heatmap", elapsed);
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Fire-and-forget analytics recording for heatmap commands.
+fn record_heatmap_analytics(
+    analytics: &crate::analytics::AnalyticsConfig,
+    command: &str,
+    elapsed: std::time::Duration,
+) {
     let rec = RecordingContext {
         enabled: analytics.enabled,
         command_type: CommandType::Heatmap,
         parse_tier: None,
         session_id: analytics.session_id.as_deref(),
     };
-    crate::analytics::try_record_command(
-        rec,
-        String::new(), // no raw text for heatmap
-        String::new(), // no compressed text
-        "skim heatmap".to_string(),
-        elapsed,
-    );
-
-    Ok(ExitCode::SUCCESS)
+    crate::analytics::try_record_command(rec, String::new(), String::new(), command.to_string(), elapsed);
 }
 
 // ============================================================================

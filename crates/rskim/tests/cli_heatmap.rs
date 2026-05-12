@@ -661,7 +661,7 @@ fn test_heatmap_registered_in_help() {
 
 #[test]
 fn test_heatmap_explicit_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -693,7 +693,7 @@ fn test_heatmap_explicit_files() {
 
 #[test]
 fn test_heatmap_explicit_files_text_header() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -714,7 +714,7 @@ fn test_heatmap_explicit_files_text_header() {
 
 #[test]
 fn test_heatmap_diff_and_files_mutual_exclusion() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     Command::cargo_bin("skim")
@@ -731,7 +731,7 @@ fn test_heatmap_diff_and_files_mutual_exclusion() {
 
 #[test]
 fn test_heatmap_diff_bad_ref() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     Command::cargo_bin("skim")
@@ -749,7 +749,7 @@ fn test_heatmap_diff_bad_ref() {
 
 #[test]
 fn test_heatmap_file_not_in_history() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -775,7 +775,7 @@ fn test_heatmap_file_not_in_history() {
 
 #[test]
 fn test_heatmap_files_no_top_truncation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -797,7 +797,7 @@ fn test_heatmap_files_no_top_truncation() {
 
 #[test]
 fn test_heatmap_no_targets_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -818,7 +818,7 @@ fn test_heatmap_no_targets_unchanged() {
 
 #[test]
 fn test_heatmap_diff_flag() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     // Create a branch from the current state
@@ -861,7 +861,7 @@ fn test_heatmap_diff_flag() {
 
 #[test]
 fn test_heatmap_diff_no_changes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     Command::cargo_bin("skim")
@@ -877,7 +877,7 @@ fn test_heatmap_diff_no_changes() {
 
 #[test]
 fn test_heatmap_coupling_preserved_with_targets() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     let ts = recent_ts();
 
     git_init(dir.path());

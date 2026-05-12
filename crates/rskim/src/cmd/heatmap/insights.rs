@@ -170,11 +170,9 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
 /// Higher badness = worse = should appear first.
 fn sort_key(insight: &Insight) -> f64 {
     match insight.category.as_str() {
-        // Lower stability = worse → invert so larger sort key = worse
-        "stability" => 100.0 - insight.metric_value,
-        // Lower encapsulation = worse → invert
-        "encapsulation" => 100.0 - insight.metric_value,
-        // Higher fix_risk, bus_factor, coupling = worse → use as-is
+        // Lower score = worse for these → invert so larger sort key = worse
+        "stability" | "encapsulation" => 100.0 - insight.metric_value,
+        // Higher value = worse for fix_risk, bus_factor, coupling → use as-is
         _ => insight.metric_value,
     }
 }

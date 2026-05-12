@@ -208,7 +208,7 @@ const HEADER_WIDTH: usize = 76;
 ///
 /// Color application is unconditional — the `colored` crate strips ANSI codes
 /// when `NO_COLOR` is set or stdout is not a TTY.
-pub(crate) fn render_insights_text(_result: &HeatmapResult, insights: &[Insight]) -> String {
+pub(crate) fn render_insights_text(insights: &[Insight]) -> String {
     let mut out = String::new();
 
     // Header line: "── Insights ─────────────────────────────────────────────────────────────"
@@ -478,7 +478,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_insight(severity: Severity, category: &str, file: &str, msg: &str) -> Insight {
-        use crate::cmd::heatmap::types::Insight;
         Insight {
             severity,
             category: category.to_string(),
@@ -505,7 +504,7 @@ mod tests {
                 "b.rs: elevated fix-risk (40.0% combined)",
             ),
         ];
-        let text = render_insights_text(&result, &insights);
+        let text = render_insights_text(&insights);
         assert!(
             text.contains("Insights"),
             "expected Insights header in output"
@@ -524,7 +523,7 @@ mod tests {
     fn test_insights_text_empty_state() {
         let result = make_result();
         let insights: Vec<Insight> = vec![];
-        let text = render_insights_text(&result, &insights);
+        let text = render_insights_text(&insights);
         assert!(
             text.contains("(no notable findings)"),
             "expected empty-state message, got: {text}"
