@@ -1,0 +1,31 @@
+[package]
+name = "rskim-research"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "rskim-research"
+path = "src/main.rs"
+
+[dependencies]
+rskim-core = { version = "2.9.0", path = "../rskim-core" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+rayon = { workspace = true }
+ignore = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+indicatif = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"

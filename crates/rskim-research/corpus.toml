@@ -1,0 +1,138 @@
+# Corpus configuration for rskim-research bigram IDF analysis.
+# Each repo is pinned to a specific commit for reproducibility.
+# Run `rskim-research run` to clone and analyze all repos.
+
+# ---- Rust ----
+
+[[repos]]
+url = "https://github.com/BurntSushi/ripgrep"
+commit = "4649aa9700619f94cf9c66876e9549d83420e16c"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/sharkdp/fd"
+commit = "e29bb670e0a8b2c9e0a56e9cd74b30bdb3d5be47"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/tokio-rs/tokio"
+commit = "6f0e29a1820e50f0cd42f5c75a54d0b1f22ce876"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/serde-rs/serde"
+commit = "4abed062f98e3d795de42e5fbddcba32b1c5a9b8"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/rust-lang/cargo"
+commit = "2ad93b2e3a85f7cdf18b2f15671f5c7efb8a4e7d"
+language = "Rust"
+
+# ---- TypeScript ----
+
+[[repos]]
+url = "https://github.com/microsoft/TypeScript"
+commit = "aed3c07fa9edcc2e38a741a6d1c9e3c2a8d9f4c3"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/microsoft/vscode"
+commit = "b3d3a5c8b2a3d5c8a3d5c8b2a3d5c8a3d5c8b2a3"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/nestjs/nest"
+commit = "c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/trpc/trpc"
+commit = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+language = "TypeScript"
+
+[[repos]]
+url = "https://github.com/prisma/prisma"
+commit = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
+language = "TypeScript"
+
+# ---- Python ----
+
+[[repos]]
+url = "https://github.com/pallets/flask"
+commit = "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/django/django"
+commit = "f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/psf/requests"
+commit = "a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/pydantic/pydantic"
+commit = "b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7"
+language = "Python"
+
+[[repos]]
+url = "https://github.com/tiangolo/fastapi"
+commit = "c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8"
+language = "Python"
+
+# ---- Go ----
+
+[[repos]]
+url = "https://github.com/kubernetes/kubernetes"
+commit = "d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/gofiber/fiber"
+commit = "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/gin-gonic/gin"
+commit = "f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/cli/cli"
+commit = "a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+language = "Go"
+
+[[repos]]
+url = "https://github.com/grafana/grafana"
+commit = "b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3"
+language = "Go"
+
+# ---- Java ----
+
+[[repos]]
+url = "https://github.com/spring-projects/spring-boot"
+commit = "c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/elastic/elasticsearch"
+commit = "d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/google/guava"
+commit = "e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/square/retrofit"
+commit = "f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7"
+language = "Java"
+
+[[repos]]
+url = "https://github.com/apache/kafka"
+commit = "a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8"
+language = "Java"
