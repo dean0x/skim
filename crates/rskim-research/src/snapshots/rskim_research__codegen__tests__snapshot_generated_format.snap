@@ -64,6 +64,6 @@ mod tests {
 
     #[test]
     fn default_weight_is_positive() {
-        assert!(DEFAULT_WEIGHT > 0.0, "DEFAULT_WEIGHT must be positive");
+        const { assert!(DEFAULT_WEIGHT > 0.0) };
     }
 }

@@ -209,7 +209,7 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
     writeln!(buf, "    fn default_weight_is_positive() {{")?;
     writeln!(
         buf,
-        "        assert!(DEFAULT_WEIGHT > 0.0, \"DEFAULT_WEIGHT must be positive\");"
+        "        const {{ assert!(DEFAULT_WEIGHT > 0.0) }};"
     )?;
     writeln!(buf, "    }}")?;
     writeln!(buf, "}}")?;
