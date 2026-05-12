@@ -11,7 +11,7 @@ use super::types::{HeatmapConfig, ResolvedWindow, WindowInfo};
 // ============================================================================
 
 /// Map a named preset to `--since` epoch seconds offset.
-pub(super) fn preset_to_since_secs(preset: &str, now_epoch: u64) -> Option<u64> {
+fn preset_to_since_secs(preset: &str, now_epoch: u64) -> Option<u64> {
     match preset {
         "sprint" => Some(now_epoch.saturating_sub(14 * 86400)),
         "month" => Some(now_epoch.saturating_sub(30 * 86400)),
@@ -51,14 +51,9 @@ pub(super) fn resolve_effective_config(
     };
 
     // Count explicit time-selection flags
-    let explicit_count = [
-        config.since.is_some(),
-        config.last_n.is_some(),
-        config.window_preset.is_some(),
-    ]
-    .into_iter()
-    .filter(|b| *b)
-    .count();
+    let explicit_count = usize::from(config.since.is_some())
+        + usize::from(config.last_n.is_some())
+        + usize::from(config.window_preset.is_some());
 
     if explicit_count > 1 {
         warnings.push(

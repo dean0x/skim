@@ -19,7 +19,7 @@ mod window;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::analytics::{CommandType, RecordingContext};
 
@@ -413,8 +413,6 @@ fn compute_heatmap(
     repository: String,
     warnings: Vec<String>,
 ) -> HeatmapResult {
-    use std::time::Instant;
-
     let t0 = Instant::now();
     let fix_regex = build_fix_regex();
 

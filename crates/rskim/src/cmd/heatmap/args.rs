@@ -215,7 +215,7 @@ pub(super) fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
 ///
 /// Returns `Ok(true)` if the flag was recognised and applied, `Ok(false)` if
 /// the flag is unknown (caller falls through to the unknown-flag error).
-pub(super) fn apply_boolean_flag(config: &mut HeatmapConfig, flag: &str) -> anyhow::Result<bool> {
+fn apply_boolean_flag(config: &mut HeatmapConfig, flag: &str) -> anyhow::Result<bool> {
     match flag {
         "--json" => config.format_json = true,
         "--no-exclude" => config.no_exclude = true,
@@ -233,7 +233,7 @@ pub(super) fn apply_boolean_flag(config: &mut HeatmapConfig, flag: &str) -> anyh
 ///
 /// Returns `Some(value_string)` on match, `None` otherwise. Advances `i`
 /// past the consumed argument(s).
-pub(super) fn extract_value(args: &[String], i: &mut usize, flag: &str) -> Option<String> {
+fn extract_value(args: &[String], i: &mut usize, flag: &str) -> Option<String> {
     let arg = args[*i].as_str();
     let equals_prefix = format!("{flag}=");
 
@@ -256,7 +256,7 @@ pub(super) fn extract_value(args: &[String], i: &mut usize, flag: &str) -> Optio
 
 /// Parse a `--since` value: accepts epoch seconds (integer) or duration strings
 /// like "30d", "2w", "24h".
-pub(super) fn parse_since_value(val: &str) -> anyhow::Result<u64> {
+fn parse_since_value(val: &str) -> anyhow::Result<u64> {
     // Try plain integer (epoch seconds)
     if let Ok(epoch) = val.parse::<u64>() {
         return Ok(epoch);
