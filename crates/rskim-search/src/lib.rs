@@ -10,8 +10,10 @@
 //! CLI/binary code in `crates/rskim/src/cmd/search.rs` handles all I/O.
 
 mod types;
+pub mod weights;
 
 pub use types::{
     FieldClassifier, FileId, IndexStats, LayerBuilder, NodeInfo, Result, SearchError, SearchField,
     SearchLayer, SearchQuery, SearchResult, TemporalFlags,
 };
+pub use weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT, bigram_weight};

@@ -10,6 +10,8 @@ expression: source
 //!
 //! DO NOT EDIT MANUALLY — re-run `rskim-research codegen` to regenerate.
 
+#![allow(clippy::excessive_precision)]
+
 /// Sorted (bigram_key, idf_weight) pairs.
 ///
 /// The table is sorted ascending by bigram key, enabling O(log n) binary search.

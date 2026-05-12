@@ -24,12 +24,12 @@ const EXCLUDED_EXTENSIONS: &[&str] = &["json", "yaml", "yml", "toml", "md", "mar
 const TARGET_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "py", "go", "java"];
 
 /// Abstraction over file loading — enables testing without network access.
-pub(crate) trait FileSource: Send + Sync {
+pub trait FileSource: Send + Sync {
     fn fetch_files(&self, repo: &RepoEntry) -> anyhow::Result<Vec<SourceFile>>;
 }
 
 /// Production file source that clones repos from GitHub.
-pub(crate) struct GitCloneSource {
+pub struct GitCloneSource {
     pub corpus_dir: PathBuf,
 }
 
@@ -121,10 +121,12 @@ fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
         }
 
         // Skip files that are too large.
-        if let Ok(metadata) = entry.metadata() {
-            if metadata.len() > MAX_FILE_SIZE {
-                continue;
-            }
+        if entry
+            .metadata()
+            .map(|m| m.len() > MAX_FILE_SIZE)
+            .unwrap_or(false)
+        {
+            continue;
         }
 
         // Detect language from extension.
@@ -162,7 +164,7 @@ fn walk_and_load(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
 }
 
 /// Test file source that reads from a fixture directory.
-pub(crate) struct FixtureSource {
+pub struct FixtureSource {
     pub fixture_dir: PathBuf,
 }
 

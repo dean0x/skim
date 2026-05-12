@@ -188,16 +188,16 @@ mod tests {
     /// Build a small synthetic weight table for testing.
     fn synthetic_weights() -> Vec<(u16, f32)> {
         let mut w: Vec<(u16, f32)> = vec![
-            (encode_bigram(b'f', b'n'), 8.0),   // "fn" — very selective
-            (encode_bigram(b'n', b' '), 3.0),   // "n " — moderate
-            (encode_bigram(b' ', b'p'), 5.0),   // " p" — selective
-            (encode_bigram(b'p', b'a'), 4.0),   // "pa" — moderate
-            (encode_bigram(b'a', b'r'), 2.0),   // "ar" — common
-            (encode_bigram(b'r', b's'), 3.5),   // "rs" — moderate
-            (encode_bigram(b'i', b'm'), 6.0),   // "im" — selective
-            (encode_bigram(b'm', b'p'), 5.5),   // "mp" — selective
-            (encode_bigram(b'p', b'l'), 4.5),   // "pl"
-            (encode_bigram(b'l', b' '), 2.5),   // "l "
+            (encode_bigram(b'f', b'n'), 8.0), // "fn" — very selective
+            (encode_bigram(b'n', b' '), 3.0), // "n " — moderate
+            (encode_bigram(b' ', b'p'), 5.0), // " p" — selective
+            (encode_bigram(b'p', b'a'), 4.0), // "pa" — moderate
+            (encode_bigram(b'a', b'r'), 2.0), // "ar" — common
+            (encode_bigram(b'r', b's'), 3.5), // "rs" — moderate
+            (encode_bigram(b'i', b'm'), 6.0), // "im" — selective
+            (encode_bigram(b'm', b'p'), 5.5), // "mp" — selective
+            (encode_bigram(b'p', b'l'), 4.5), // "pl"
+            (encode_bigram(b'l', b' '), 2.5), // "l "
         ];
         w.sort_by_key(|&(k, _)| k);
         w

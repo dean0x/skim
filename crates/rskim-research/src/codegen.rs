@@ -107,6 +107,10 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
         "//! DO NOT EDIT MANUALLY — re-run `rskim-research codegen` to regenerate."
     )?;
     writeln!(buf)?;
+    // Suppress excessive_precision lint — the exact float representation is intentional
+    // in machine-generated const data.
+    writeln!(buf, "#![allow(clippy::excessive_precision)]")?;
+    writeln!(buf)?;
     writeln!(buf, "/// Sorted (bigram_key, idf_weight) pairs.")?;
     writeln!(buf, "///")?;
     writeln!(
@@ -117,10 +121,7 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
         buf,
         "/// Each bigram key encodes two bytes: `key = (byte1 << 8) | byte2`."
     )?;
-    writeln!(
-        buf,
-        "pub const BIGRAM_WEIGHTS: &[(u16, f32)] = &["
-    )?;
+    writeln!(buf, "pub const BIGRAM_WEIGHTS: &[(u16, f32)] = &[")?;
 
     for w in &table.weights {
         let display = bigram_to_display(w.bigram);
@@ -146,26 +147,11 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
         "/// Returns `None` if the bigram is absent from the table."
     )?;
     writeln!(buf, "#[must_use]")?;
-    writeln!(
-        buf,
-        "pub fn bigram_weight(bigram: u16) -> Option<f32> {{"
-    )?;
-    writeln!(
-        buf,
-        "    BIGRAM_WEIGHTS"
-    )?;
-    writeln!(
-        buf,
-        "        .binary_search_by_key(&bigram, |&(k, _)| k)"
-    )?;
-    writeln!(
-        buf,
-        "        .ok()"
-    )?;
-    writeln!(
-        buf,
-        "        .map(|idx| BIGRAM_WEIGHTS[idx].1)"
-    )?;
+    writeln!(buf, "pub fn bigram_weight(bigram: u16) -> Option<f32> {{")?;
+    writeln!(buf, "    BIGRAM_WEIGHTS")?;
+    writeln!(buf, "        .binary_search_by_key(&bigram, |&(k, _)| k)")?;
+    writeln!(buf, "        .ok()")?;
+    writeln!(buf, "        .map(|idx| BIGRAM_WEIGHTS[idx].1)")?;
     writeln!(buf, "}}")?;
     writeln!(buf)?;
     writeln!(buf, "#[cfg(test)]")?;
@@ -208,7 +194,10 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
         buf,
         "        // If the table is non-empty, the first entry must be findable."
     )?;
-    writeln!(buf, "        if let Some(&(key, idf)) = BIGRAM_WEIGHTS.first() {{")?;
+    writeln!(
+        buf,
+        "        if let Some(&(key, idf)) = BIGRAM_WEIGHTS.first() {{"
+    )?;
     writeln!(
         buf,
         "            assert_eq!(bigram_weight(key), Some(idf));"

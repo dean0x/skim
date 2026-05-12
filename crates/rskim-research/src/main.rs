@@ -9,13 +9,7 @@
 //! - `codegen`: read JSON weight table, generate weights.rs for rskim-search
 //! - `validate`: read JSON weight table, run border-weight validation report
 
-mod clone;
-mod codegen;
-mod config;
-mod extract;
-mod idf;
-mod types;
-mod validate;
+use rskim_research::{clone, codegen, config, extract, idf, types, validate};
 
 use std::path::PathBuf;
 
@@ -158,14 +152,18 @@ fn cmd_run(
 
     progress.finish_with_message("done");
 
-    eprintln!("Loaded {} source files. Extracting bigrams...", all_files.len());
+    eprintln!(
+        "Loaded {} source files. Extracting bigrams...",
+        all_files.len()
+    );
 
     let (df_map, corpus_stats) = extract::extract_bigrams_from_corpus(&all_files);
     let total_docs = corpus_stats.total_files;
 
     eprintln!(
         "Corpus: {} unique files, {} unique bigrams. Computing IDF...",
-        total_docs, df_map.len()
+        total_docs,
+        df_map.len()
     );
 
     let weights = idf::compute_weight_table(&df_map, total_docs, threshold);
@@ -181,7 +179,9 @@ fn cmd_run(
 
     eprintln!(
         "Validation — uniform: {:.4}, border-weighted: {:.4}, improvement: {:.1}%",
-        validation.uniform_selectivity, validation.border_weighted_selectivity, validation.improvement_pct
+        validation.uniform_selectivity,
+        validation.border_weighted_selectivity,
+        validation.improvement_pct
     );
 
     // Determine output path.
@@ -218,9 +218,8 @@ fn cmd_codegen(json_path: Option<PathBuf>, workspace_root: Option<PathBuf>) -> a
         None => codegen::find_workspace_root().context("auto-detecting workspace root")?,
     };
 
-    let json_path = json_path.unwrap_or_else(|| {
-        workspace_root.join("crates/rskim-search/data/bigram_weights.json")
-    });
+    let json_path = json_path
+        .unwrap_or_else(|| workspace_root.join("crates/rskim-search/data/bigram_weights.json"));
 
     let output_path = workspace_root.join("crates/rskim-search/src/weights.rs");
 
@@ -259,9 +258,18 @@ fn cmd_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
     println!("Total entries:        {}", table.weights.len());
     println!("Total corpus files:   {}", table.corpus_stats.total_files);
     println!();
-    println!("Uniform selectivity:        {:.6}", validation.uniform_selectivity);
-    println!("Border-weighted selectivity:{:.6}", validation.border_weighted_selectivity);
-    println!("Improvement:                {:.2}%", validation.improvement_pct);
+    println!(
+        "Uniform selectivity:        {:.6}",
+        validation.uniform_selectivity
+    );
+    println!(
+        "Border-weighted selectivity:{:.6}",
+        validation.border_weighted_selectivity
+    );
+    println!(
+        "Improvement:                {:.2}%",
+        validation.improvement_pct
+    );
 
     Ok(())
 }
