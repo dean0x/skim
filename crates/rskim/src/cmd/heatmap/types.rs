@@ -2,7 +2,7 @@
 //!
 //! No logic, no I/O. Pure data model.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // CLI configuration
@@ -249,11 +249,26 @@ pub(crate) enum Severity {
     Warning,
 }
 
+/// Category of a threshold-filtered finding.
+///
+/// Using an enum (instead of `String`) gives compile-time exhaustiveness in
+/// `sort_key` and eliminates `.to_string()` allocations at each insight push.
+/// Serialised as kebab-case so JSON output is unchanged (`"fix-risk"`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InsightCategory {
+    Stability,
+    FixRisk,
+    BusFactor,
+    Coupling,
+    Encapsulation,
+}
+
 /// A single threshold-filtered finding.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Insight {
     pub(crate) severity: Severity,
-    pub(crate) category: String,
+    pub(crate) category: InsightCategory,
     pub(crate) file: String,
     pub(crate) message: String,
     pub(crate) metric_value: f64,

@@ -3,8 +3,11 @@
 //! Pure functions, no I/O. Scans [`HeatmapResult`] against hardcoded thresholds
 //! and produces a sorted [`Vec<Insight>`] and an [`InsightsResult`] for rendering.
 
+use std::collections::HashSet;
+
 use super::types::{
-    CompactFileEntry, CompactModuleEntry, HeatmapResult, Insight, InsightsResult, Severity,
+    CompactFileEntry, CompactModuleEntry, HeatmapResult, Insight, InsightCategory, InsightsResult,
+    Severity,
 };
 
 // ============================================================================
@@ -30,6 +33,48 @@ const ENCAPSULATION_WARNING: f64 = 60.0;
 const COUPLING_WARNING: f64 = 0.8;
 
 // ============================================================================
+// Internal helpers
+// ============================================================================
+
+/// Push a Critical or Warning insight based on two thresholds.
+///
+/// For metrics where **lower** is worse (stability, encapsulation), pass
+/// `critical_bound < warning_bound` and use `<` comparisons.  For metrics
+/// where **higher** is worse (fix-risk, coupling), pass
+/// `critical_bound > warning_bound` and use `>` comparisons.
+///
+/// `worse_than_critical` / `worse_than_warning` are predicates supplied by
+/// the caller so each metric can use its own comparison direction.
+fn check_threshold(
+    insights: &mut Vec<Insight>,
+    file: &str,
+    category: InsightCategory,
+    metric_value: f64,
+    worse_than_critical: bool,
+    worse_than_warning: bool,
+    critical_message: String,
+    warning_message: String,
+) {
+    if worse_than_critical {
+        insights.push(Insight {
+            severity: Severity::Critical,
+            category,
+            file: file.to_string(),
+            message: critical_message,
+            metric_value,
+        });
+    } else if worse_than_warning {
+        insights.push(Insight {
+            severity: Severity::Warning,
+            category,
+            file: file.to_string(),
+            message: warning_message,
+            metric_value,
+        });
+    }
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -43,66 +88,43 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
     let mut insights: Vec<Insight> = Vec::new();
 
     for file in &result.files {
-        // Stability
+        // Stability (lower score = worse)
         let stability = file.stability_score;
-        if stability < STABILITY_CRITICAL {
-            insights.push(Insight {
-                severity: Severity::Critical,
-                category: "stability".to_string(),
-                file: file.path.clone(),
-                message: format!(
-                    "{}: critically unstable (score {}/100)",
-                    file.path, stability
-                ),
-                metric_value: f64::from(stability),
-            });
-        } else if stability < STABILITY_WARNING {
-            insights.push(Insight {
-                severity: Severity::Warning,
-                category: "stability".to_string(),
-                file: file.path.clone(),
-                message: format!(
-                    "{}: moderate instability (score {}/100)",
-                    file.path, stability
-                ),
-                metric_value: f64::from(stability),
-            });
-        }
+        check_threshold(
+            &mut insights,
+            &file.path,
+            InsightCategory::Stability,
+            f64::from(stability),
+            stability < STABILITY_CRITICAL,
+            stability < STABILITY_WARNING,
+            format!("critically unstable (score {}/100)", stability),
+            format!("moderate instability (score {}/100)", stability),
+        );
 
-        // Fix risk (skip if insufficient data)
+        // Fix risk — skip if insufficient data (higher combined_pct = worse)
         if !file.fix_risk.insufficient_data {
             let combined = file.fix_risk.combined_pct;
-            if combined > FIX_RISK_CRITICAL {
-                insights.push(Insight {
-                    severity: Severity::Critical,
-                    category: "fix-risk".to_string(),
-                    file: file.path.clone(),
-                    message: format!("{}: high fix-risk ({combined:.1}% combined)", file.path),
-                    metric_value: combined,
-                });
-            } else if combined > FIX_RISK_WARNING {
-                insights.push(Insight {
-                    severity: Severity::Warning,
-                    category: "fix-risk".to_string(),
-                    file: file.path.clone(),
-                    message: format!("{}: elevated fix-risk ({combined:.1}% combined)", file.path),
-                    metric_value: combined,
-                });
-            }
+            check_threshold(
+                &mut insights,
+                &file.path,
+                InsightCategory::FixRisk,
+                combined,
+                combined > FIX_RISK_CRITICAL,
+                combined > FIX_RISK_WARNING,
+                format!("high fix-risk ({combined:.1}% combined)"),
+                format!("elevated fix-risk ({combined:.1}% combined)"),
+            );
         }
 
-        // Bus factor
+        // Bus factor (boolean risk — always Warning when flagged)
         if file.authors.single_owner_risk {
             let pct = file.authors.top_author_pct;
             let count = file.authors.count;
             insights.push(Insight {
                 severity: Severity::Warning,
-                category: "bus-factor".to_string(),
+                category: InsightCategory::BusFactor,
                 file: file.path.clone(),
-                message: format!(
-                    "{}: bus-factor risk ({pct:.1}%, {count} author(s))",
-                    file.path
-                ),
+                message: format!("bus-factor risk ({pct:.1}%, {count} author(s))"),
                 metric_value: pct,
             });
         }
@@ -114,11 +136,11 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
                 let support = entry.support;
                 insights.push(Insight {
                     severity: Severity::Warning,
-                    category: "coupling".to_string(),
+                    category: InsightCategory::Coupling,
                     file: file.path.clone(),
                     message: format!(
-                        "{}: tightly coupled with {} ({conf_pct:.1}% confidence, {support} co-changes)",
-                        file.path, entry.path
+                        "tightly coupled with {} ({conf_pct:.1}% confidence, {support} co-changes)",
+                        entry.path
                     ),
                     metric_value: entry.confidence,
                 });
@@ -126,37 +148,25 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
         }
     }
 
-    // Module encapsulation
+    // Module encapsulation (lower pct = worse)
     for module in &result.modules {
         let pct = module.encapsulation_pct;
-        if pct < ENCAPSULATION_CRITICAL {
-            insights.push(Insight {
-                severity: Severity::Critical,
-                category: "encapsulation".to_string(),
-                file: module.path.clone(),
-                message: format!("{}: poor encapsulation ({pct:.1}%)", module.path),
-                metric_value: pct,
-            });
-        } else if pct < ENCAPSULATION_WARNING {
-            insights.push(Insight {
-                severity: Severity::Warning,
-                category: "encapsulation".to_string(),
-                file: module.path.clone(),
-                message: format!("{}: weak encapsulation ({pct:.1}%)", module.path),
-                metric_value: pct,
-            });
-        }
+        check_threshold(
+            &mut insights,
+            &module.path,
+            InsightCategory::Encapsulation,
+            pct,
+            pct < ENCAPSULATION_CRITICAL,
+            pct < ENCAPSULATION_WARNING,
+            format!("poor encapsulation ({pct:.1}%)"),
+            format!("weak encapsulation ({pct:.1}%)"),
+        );
     }
 
     // Sort: Critical first (ascending severity), then by metric_value descending
     // within same severity.
-    // For stability, lower score = worse. We invert stability metric for descending
-    // sort (worst stability is smallest value, so we negate to sort desc).
     insights.sort_by(|a, b| {
         a.severity.cmp(&b.severity).then_with(|| {
-            // For severity descending by metric: higher = worse except stability/encapsulation
-            // where lower = worse. The metric_value is already stored as the raw metric,
-            // so we need category-aware comparison.
             let a_sort = sort_key(a);
             let b_sort = sort_key(b);
             b_sort.total_cmp(&a_sort)
@@ -169,11 +179,13 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
 /// Convert an insight's metric_value to a "badness" score for descending sort.
 /// Higher badness = worse = should appear first.
 fn sort_key(insight: &Insight) -> f64 {
-    match insight.category.as_str() {
+    match insight.category {
         // Lower score = worse for these → invert so larger sort key = worse
-        "stability" | "encapsulation" => 100.0 - insight.metric_value,
+        InsightCategory::Stability | InsightCategory::Encapsulation => 100.0 - insight.metric_value,
         // Higher value = worse for fix-risk, bus-factor, coupling → use as-is
-        _ => insight.metric_value,
+        InsightCategory::FixRisk | InsightCategory::BusFactor | InsightCategory::Coupling => {
+            insight.metric_value
+        }
     }
 }
 
@@ -186,17 +198,26 @@ pub(crate) fn build_insights_result(
         version: 1,
         repository: result.repository.clone(),
         window: result.window.clone(),
-        insights,
-        top_files: build_compact_files(result),
+        top_files: build_compact_files(result, &insights),
         flagged_modules: build_flagged_modules(result),
+        insights,
     }
 }
 
-/// Condense all files to [`CompactFileEntry`] (5-field summary).
-pub(crate) fn build_compact_files(result: &HeatmapResult) -> Vec<CompactFileEntry> {
+/// Condense files to [`CompactFileEntry`], keeping only those that appear in
+/// at least one insight.  This bounds the `top_files` list to the set of
+/// flagged files rather than mapping the entire repository.
+pub(crate) fn build_compact_files(
+    result: &HeatmapResult,
+    insights: &[Insight],
+) -> Vec<CompactFileEntry> {
+    // Build a set of file paths referenced by at least one insight.
+    let flagged: HashSet<&str> = insights.iter().map(|i| i.file.as_str()).collect();
+
     result
         .files
         .iter()
+        .filter(|f| flagged.contains(f.path.as_str()))
         .map(|f| CompactFileEntry {
             path: f.path.clone(),
             stability: f.stability_score,
@@ -230,8 +251,8 @@ pub(crate) fn build_flagged_modules(result: &HeatmapResult) -> Vec<CompactModule
 mod tests {
     use super::*;
     use crate::cmd::heatmap::types::{
-        AuthorMetrics, ChurnMetrics, CouplingEdge, CouplingEntry, FileMetrics, FixRiskMetrics,
-        ModuleHealth, WindowInfo,
+        AuthorMetrics, ChurnMetrics, CouplingEntry, FileMetrics, FixRiskMetrics, ModuleHealth,
+        WindowInfo,
     };
 
     // -----------------------------------------------------------------------
@@ -325,10 +346,16 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
-        assert_eq!(insights[0].category, "stability");
+        assert_eq!(insights[0].category, InsightCategory::Stability);
         assert!(
             insights[0].message.contains("critically unstable"),
             "message: {}",
+            insights[0].message
+        );
+        // Message must NOT contain the file path (rendering layer adds it)
+        assert!(
+            !insights[0].message.contains("a.rs"),
+            "message should not embed file path: {}",
             insights[0].message
         );
     }
@@ -342,7 +369,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].category, "stability");
+        assert_eq!(insights[0].category, InsightCategory::Stability);
         assert!(insights[0].message.contains("moderate instability"));
     }
 
@@ -370,7 +397,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
-        assert_eq!(insights[0].category, "fix-risk");
+        assert_eq!(insights[0].category, InsightCategory::FixRisk);
         assert!(insights[0].message.contains("high fix-risk"));
     }
 
@@ -383,7 +410,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].category, "fix-risk");
+        assert_eq!(insights[0].category, InsightCategory::FixRisk);
         assert!(insights[0].message.contains("elevated fix-risk"));
     }
 
@@ -424,7 +451,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].category, "bus-factor");
+        assert_eq!(insights[0].category, InsightCategory::BusFactor);
         assert!(insights[0].message.contains("bus-factor risk"));
     }
 
@@ -449,7 +476,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
-        assert_eq!(insights[0].category, "encapsulation");
+        assert_eq!(insights[0].category, InsightCategory::Encapsulation);
         assert!(insights[0].message.contains("poor encapsulation"));
     }
 
@@ -460,7 +487,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].category, "encapsulation");
+        assert_eq!(insights[0].category, InsightCategory::Encapsulation);
         assert!(insights[0].message.contains("weak encapsulation"));
     }
 
@@ -500,7 +527,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].category, "coupling");
+        assert_eq!(insights[0].category, InsightCategory::Coupling);
         assert!(insights[0].message.contains("tightly coupled with b.rs"));
     }
 
@@ -594,21 +621,52 @@ mod tests {
             insights.len() >= 2,
             "same file can have multiple insights: stability + fix-risk"
         );
-        let categories: Vec<&str> = insights.iter().map(|i| i.category.as_str()).collect();
-        assert!(categories.contains(&"stability"));
-        assert!(categories.contains(&"fix-risk"));
+        let categories: Vec<InsightCategory> = insights.iter().map(|i| i.category).collect();
+        assert!(categories.contains(&InsightCategory::Stability));
+        assert!(categories.contains(&InsightCategory::FixRisk));
     }
 
     // -----------------------------------------------------------------------
-    // build_compact_files
+    // build_compact_files — only flagged files included
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_compact_files() {
+    fn test_build_compact_files_only_flagged() {
+        let mut result = make_empty_result();
+        // a.rs triggers a stability insight; b.rs is clean
+        result.files.push(make_file(
+            "src/main.rs",
+            39,
+            0.0,
+            true,
+            false,
+            50.0,
+            2,
+            vec![],
+        ));
+        result.files.push(make_file(
+            "src/clean.rs",
+            80,
+            0.0,
+            true,
+            false,
+            50.0,
+            2,
+            vec![],
+        ));
+        let insights = compute_insights(&result);
+        let compact = build_compact_files(&result, &insights);
+        // Only src/main.rs has an insight; src/clean.rs must be excluded
+        assert_eq!(compact.len(), 1, "only flagged files should appear");
+        assert_eq!(compact[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn test_build_compact_files_fields() {
         let mut result = make_empty_result();
         result.files.push(make_file(
             "src/main.rs",
-            75,
+            39,
             25.0,
             false,
             true,
@@ -616,13 +674,37 @@ mod tests {
             1,
             vec![],
         ));
-        let compact = build_compact_files(&result);
+        let insights = compute_insights(&result);
+        let compact = build_compact_files(&result, &insights);
         assert_eq!(compact.len(), 1);
         assert_eq!(compact[0].path, "src/main.rs");
-        assert_eq!(compact[0].stability, 75);
+        assert_eq!(compact[0].stability, 39);
         assert_eq!(compact[0].churn_commits, 5);
         assert!((compact[0].fix_risk_pct - 25.0).abs() < 1e-9);
         assert!(compact[0].bus_factor_risk);
+    }
+
+    #[test]
+    fn test_build_compact_files_empty_insights() {
+        let mut result = make_empty_result();
+        // All clean files — no insights → top_files must be empty
+        result.files.push(make_file(
+            "src/clean.rs",
+            80,
+            0.0,
+            true,
+            false,
+            50.0,
+            2,
+            vec![],
+        ));
+        let insights = compute_insights(&result);
+        assert!(insights.is_empty());
+        let compact = build_compact_files(&result, &insights);
+        assert!(
+            compact.is_empty(),
+            "no insights → no top_files in compact output"
+        );
     }
 
     // -----------------------------------------------------------------------
