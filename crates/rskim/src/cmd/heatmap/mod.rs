@@ -345,7 +345,13 @@ fn record_heatmap_analytics(
         parse_tier: None,
         session_id: analytics.session_id.as_deref(),
     };
-    crate::analytics::try_record_command(rec, String::new(), String::new(), command.to_string(), elapsed);
+    crate::analytics::try_record_command(
+        rec,
+        String::new(),
+        String::new(),
+        command.to_string(),
+        elapsed,
+    );
 }
 
 // ============================================================================
