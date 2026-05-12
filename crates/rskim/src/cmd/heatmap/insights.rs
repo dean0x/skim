@@ -75,7 +75,7 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
             if combined > FIX_RISK_CRITICAL {
                 insights.push(Insight {
                     severity: Severity::Critical,
-                    category: "fix_risk".to_string(),
+                    category: "fix-risk".to_string(),
                     file: file.path.clone(),
                     message: format!("{}: high fix-risk ({combined:.1}% combined)", file.path),
                     metric_value: combined,
@@ -83,7 +83,7 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
             } else if combined > FIX_RISK_WARNING {
                 insights.push(Insight {
                     severity: Severity::Warning,
-                    category: "fix_risk".to_string(),
+                    category: "fix-risk".to_string(),
                     file: file.path.clone(),
                     message: format!("{}: elevated fix-risk ({combined:.1}% combined)", file.path),
                     metric_value: combined,
@@ -97,7 +97,7 @@ pub(crate) fn compute_insights(result: &HeatmapResult) -> Vec<Insight> {
             let count = file.authors.count;
             insights.push(Insight {
                 severity: Severity::Warning,
-                category: "bus_factor".to_string(),
+                category: "bus-factor".to_string(),
                 file: file.path.clone(),
                 message: format!(
                     "{}: bus-factor risk ({pct:.1}%, {count} author(s))",
@@ -172,7 +172,7 @@ fn sort_key(insight: &Insight) -> f64 {
     match insight.category.as_str() {
         // Lower score = worse for these → invert so larger sort key = worse
         "stability" | "encapsulation" => 100.0 - insight.metric_value,
-        // Higher value = worse for fix_risk, bus_factor, coupling → use as-is
+        // Higher value = worse for fix-risk, bus-factor, coupling → use as-is
         _ => insight.metric_value,
     }
 }
@@ -370,7 +370,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Critical);
-        assert_eq!(insights[0].category, "fix_risk");
+        assert_eq!(insights[0].category, "fix-risk");
         assert!(insights[0].message.contains("high fix-risk"));
     }
 
@@ -383,7 +383,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].category, "fix_risk");
+        assert_eq!(insights[0].category, "fix-risk");
         assert!(insights[0].message.contains("elevated fix-risk"));
     }
 
@@ -424,7 +424,7 @@ mod tests {
         let insights = compute_insights(&result);
         assert_eq!(insights.len(), 1);
         assert_eq!(insights[0].severity, Severity::Warning);
-        assert_eq!(insights[0].category, "bus_factor");
+        assert_eq!(insights[0].category, "bus-factor");
         assert!(insights[0].message.contains("bus-factor risk"));
     }
 
@@ -592,11 +592,11 @@ mod tests {
         let insights = compute_insights(&result);
         assert!(
             insights.len() >= 2,
-            "same file can have multiple insights: stability + fix_risk"
+            "same file can have multiple insights: stability + fix-risk"
         );
         let categories: Vec<&str> = insights.iter().map(|i| i.category.as_str()).collect();
         assert!(categories.contains(&"stability"));
-        assert!(categories.contains(&"fix_risk"));
+        assert!(categories.contains(&"fix-risk"));
     }
 
     // -----------------------------------------------------------------------

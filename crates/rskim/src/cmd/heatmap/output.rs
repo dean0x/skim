@@ -498,7 +498,7 @@ mod tests {
             ),
             make_insight(
                 Severity::Warning,
-                "fix_risk",
+                "fix-risk",
                 "b.rs",
                 "b.rs: elevated fix-risk (40.0% combined)",
             ),
