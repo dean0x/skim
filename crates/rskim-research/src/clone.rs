@@ -57,34 +57,60 @@ fn extract_repo_name(url: &str) -> anyhow::Result<String> {
 }
 
 fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
-    // Full clone so we can checkout a specific commit.
-    let status = std::process::Command::new("git")
+    let dest_str = dest
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("dest path is not valid UTF-8: {}", dest.display()))?;
+
+    // Try shallow clone first for speed.
+    let shallow_ok = std::process::Command::new("git")
         .args(["clone", "--depth", "1", url])
         .arg(dest)
         .status()
-        .context("running git clone")?;
+        .context("running git clone")?
+        .success();
+
+    if shallow_ok {
+        // Shallow clone succeeded — check if the pinned commit is reachable.
+        let checkout_ok = std::process::Command::new("git")
+            .args(["-C", dest_str, "cat-file", "-t", commit])
+            .status()
+            .context("checking if pinned commit exists in shallow clone")?
+            .success();
+
+        if checkout_ok {
+            let status = std::process::Command::new("git")
+                .args(["-C", dest_str, "checkout", commit])
+                .status()
+                .context("running git checkout on shallow clone")?;
+            if status.success() {
+                return Ok(());
+            }
+        }
+
+        // Pinned commit not in shallow clone — remove and do full clone.
+        std::fs::remove_dir_all(dest)
+            .with_context(|| format!("removing shallow clone at {}", dest.display()))?;
+    }
+
+    // Full clone to access the pinned commit.
+    let status = std::process::Command::new("git")
+        .args(["clone", url])
+        .arg(dest)
+        .status()
+        .context("running full git clone")?;
 
     if !status.success() {
-        // Depth-1 clone may not include the pinned commit; try full clone.
-        let status = std::process::Command::new("git")
-            .args(["clone", url])
-            .arg(dest)
-            .status()
-            .context("running full git clone")?;
+        anyhow::bail!("git clone failed for {url}");
+    }
 
-        if !status.success() {
-            anyhow::bail!("git clone failed for {url}");
-        }
+    // Checkout the pinned commit.
+    let status = std::process::Command::new("git")
+        .args(["-C", dest_str, "checkout", commit])
+        .status()
+        .context("running git checkout")?;
 
-        // Checkout the pinned commit.
-        let status = std::process::Command::new("git")
-            .args(["-C", dest.to_str().unwrap_or("."), "checkout", commit])
-            .status()
-            .context("running git checkout")?;
-
-        if !status.success() {
-            anyhow::bail!("git checkout {commit} failed in {}", dest.display());
-        }
+    if !status.success() {
+        anyhow::bail!("git checkout {commit} failed in {}", dest.display());
     }
 
     Ok(())

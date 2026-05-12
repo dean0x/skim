@@ -78,6 +78,8 @@ fn validate_repo(index: usize, repo: &RepoEntry) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     fn write_temp_toml(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {

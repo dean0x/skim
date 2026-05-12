@@ -63,11 +63,9 @@ pub fn content_hash(content: &str) -> [u8; 32] {
 /// bigram `u16` key to the number of unique files that contain it.
 #[must_use]
 pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, CorpusStats) {
-    use std::collections::HashMap as LangMap;
-
     let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
     let mut df_map: HashMap<u16, u32> = HashMap::new();
-    let mut lang_counts: LangMap<String, u32> = LangMap::new();
+    let mut lang_counts: HashMap<String, u32> = HashMap::new();
     let mut total_files_seen: u32 = 0;
     let mut unique_file_count: u32 = 0;
     let mut total_bigrams: u64 = 0;
