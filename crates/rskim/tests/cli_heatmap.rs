@@ -1060,7 +1060,8 @@ fn test_insights_empty_repo() {
     );
 
     // With only 1 commit, the tool might succeed or fail depending on min threshold.
-    // We just verify there's no panic and output is valid if success.
+    // Both outcomes are valid; assert specific behavior on each path so a panic or
+    // unexpected output is caught rather than silently passing.
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["heatmap", "--insights"])
@@ -1071,13 +1072,19 @@ fn test_insights_empty_repo() {
 
     if output.status.success() {
         let stdout = String::from_utf8(output.stdout).unwrap();
-        // Either findings or empty-state message
+        // Either findings or empty-state message — any other output is a regression.
         assert!(
             stdout.contains("Insights") || stdout.contains("no notable findings"),
-            "expected Insights output, got: {stdout}"
+            "expected Insights header or empty-state message on success, got: {stdout}"
+        );
+    } else {
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        // On failure the tool must emit a known diagnostic — not a panic or silent crash.
+        assert!(
+            stderr.contains("No commits") || stderr.contains("No analyzable"),
+            "expected known diagnostic on non-zero exit, got stderr: {stderr}"
         );
     }
-    // If it exits non-zero (e.g., "No analyzable commits"), that's also acceptable
 }
 
 #[test]
