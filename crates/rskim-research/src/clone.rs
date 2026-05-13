@@ -49,11 +49,74 @@ impl FileSource for GitCloneSource {
 }
 
 fn extract_repo_name(url: &str) -> anyhow::Result<String> {
-    url.rsplit('/')
+    let name = url
+        .rsplit('/')
         .next()
         .map(|s| s.trim_end_matches(".git").to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("cannot extract repo name from URL: {url}"))
+        .ok_or_else(|| anyhow::anyhow!("cannot extract repo name from URL: {url}"))?;
+
+    // Reject names that would escape the corpus directory via path traversal.
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("unsafe repo name extracted from URL (path traversal): {name:?}");
+    }
+
+    Ok(name)
+}
+
+/// Timeout for any single `git` subprocess (seconds).
+const GIT_SUBPROCESS_TIMEOUT_SECS: u64 = 300;
+
+/// Spawn a `git` command and wait for it to finish, killing it if it exceeds
+/// `GIT_SUBPROCESS_TIMEOUT_SECS`.  Returns `Ok(true)` on success, `Ok(false)`
+/// on non-zero exit, and `Err` if the process could not be spawned or the
+/// timeout expired.
+fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+
+    // Move blocking `wait()` onto a background thread so the main thread can
+    // enforce the deadline without using any unstable API.
+    let (tx, rx) = mpsc::channel();
+    // We need to pass ownership of the child into the thread but also retain a
+    // handle to kill it on timeout.  `Child::try_wait` / `kill` require `&mut
+    // Child` so we use a raw id + a flag instead: after the timeout we kill via
+    // the retained handle and the thread will see the child exit.
+    //
+    // Strategy: pass child to thread, keep pid for kill via a second channel.
+    let child_id = child.id();
+    std::thread::spawn(move || {
+        let result = child.wait();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(GIT_SUBPROCESS_TIMEOUT_SECS)) {
+        Ok(Ok(status)) => Ok(status.success()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("{label} wait error: {e}")),
+        Err(_timeout) => {
+            // Kill the process using its pid via a platform-appropriate signal.
+            // `std::process::Command` does not give us back the `Child` after
+            // handing it to the thread, so we use the raw pid.
+            #[cfg(unix)]
+            {
+                // SAFETY: kill(2) is always safe to call with a valid pid.
+                unsafe {
+                    libc::kill(child_id as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // On Windows, TerminateProcess via taskkill is the safest
+                // portable option available without the Child handle.
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &child_id.to_string()])
+                    .status();
+            }
+            anyhow::bail!("{label} timed out after {GIT_SUBPROCESS_TIMEOUT_SECS}s");
+        }
+    }
 }
 
 fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
@@ -61,13 +124,24 @@ fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("dest path is not valid UTF-8: {}", dest.display()))?;
 
+    // Hardened git clone flags:
+    //   - credential.helper=''  : suppress credential prompts (fail fast on auth errors)
+    //   - transfer.fsckObjects=true : reject corrupted/malicious objects
+    let security_args = [
+        "-c",
+        "credential.helper=",
+        "-c",
+        "transfer.fsckObjects=true",
+    ];
+
     // Try shallow clone first for speed.
-    let shallow_ok = std::process::Command::new("git")
+    let mut shallow_cmd = std::process::Command::new("git");
+    shallow_cmd
+        .args(security_args)
         .args(["clone", "--depth", "1", url])
-        .arg(dest)
-        .status()
-        .context("running git clone")?
-        .success();
+        .arg(dest);
+    let shallow_ok =
+        git_run_with_timeout(shallow_cmd, "git clone --depth 1").context("running git clone")?;
 
     if shallow_ok {
         // Shallow clone succeeded — check if the pinned commit is reachable.
@@ -93,13 +167,15 @@ fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
     }
 
     // Full clone to access the pinned commit.
-    let status = std::process::Command::new("git")
+    let mut full_cmd = std::process::Command::new("git");
+    full_cmd
+        .args(security_args)
         .args(["clone", url])
-        .arg(dest)
-        .status()
-        .context("running full git clone")?;
+        .arg(dest);
+    let ok =
+        git_run_with_timeout(full_cmd, "git clone (full)").context("running full git clone")?;
 
-    if !status.success() {
+    if !ok {
         anyhow::bail!("git clone failed for {url}");
     }
 
@@ -297,5 +373,60 @@ mod tests {
         });
         // Just verifying it compiles as a trait object.
         let _ = source.fetch_files(&dummy_repo());
+    }
+
+    // --- extract_repo_name validation tests ---
+
+    #[test]
+    fn extract_repo_name_normal_url() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/myrepo.git").unwrap(),
+            "myrepo"
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_no_git_suffix() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/myrepo").unwrap(),
+            "myrepo"
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_rejects_dot_dot() {
+        assert!(
+            extract_repo_name("https://github.com/owner/..").is_err(),
+            "'..' should be rejected as path traversal"
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_rejects_single_dot() {
+        assert!(
+            extract_repo_name("https://github.com/owner/.").is_err(),
+            "'.' should be rejected as path traversal"
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_rejects_slash_in_name() {
+        // Constructed URL where last segment itself contains a slash-like char
+        // after URL decoding — reject any embedded slash or backslash.
+        assert!(
+            extract_repo_name("https://github.com/owner/a/b").is_err() == false,
+            "'b' is the last segment and is safe"
+        );
+        // Backslash in the extracted name is the real concern.
+        // Simulate by passing a raw string that yields a backslash via rsplit('/').
+        assert!(
+            extract_repo_name("https://github.com/owner/a\\b").is_err(),
+            "backslash in repo name should be rejected"
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_empty_url() {
+        assert!(extract_repo_name("").is_err(), "empty URL should fail");
     }
 }

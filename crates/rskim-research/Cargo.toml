@@ -2,6 +2,10 @@
 name = "rskim-research"
 version = "0.1.0"
 edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "Empirical bigram IDF weight table generator for rskim-search"
+repository = "https://github.com/dean0x/skim"
 publish = false
 
 [[bin]]
@@ -28,6 +32,9 @@ tempfile = { workspace = true }
 anyhow = { workspace = true }
 indicatif = { workspace = true }
 sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
