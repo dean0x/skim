@@ -3,6 +3,7 @@ members = [
     "crates/rskim-core",
     "crates/rskim",
     "crates/rskim-search",
+    "crates/rskim-research",
 ]
 resolver = "2"
 
@@ -37,6 +38,7 @@ serde_json = "1.0"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 tiktoken-rs = "0.7"
+clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 strip-ansi-escapes = "0.2"
 regex = "1"

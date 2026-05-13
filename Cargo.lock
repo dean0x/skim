@@ -1210,6 +1210,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rskim-research"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ignore",
+ "indicatif",
+ "insta",
+ "libc",
+ "rayon",
+ "rskim-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "rskim-search"
 version = "0.1.0"
 dependencies = [
