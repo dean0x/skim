@@ -266,15 +266,22 @@ pub fn extract_query_ngrams_with_weights(query: &str, weights: &[(u16, f32)]) ->
 
     // Greedy covering set.
     let mut covered = vec![false; bytes.len()];
+    let mut uncovered_count = bytes.len();
     let mut selected: Vec<(Ngram, f32)> = Vec::new();
 
     for (ngram, w, pos) in candidates {
         if !covered[pos] || !covered[pos + 1] {
-            covered[pos] = true;
-            covered[pos + 1] = true;
+            if !covered[pos] {
+                covered[pos] = true;
+                uncovered_count -= 1;
+            }
+            if !covered[pos + 1] {
+                covered[pos + 1] = true;
+                uncovered_count -= 1;
+            }
             selected.push((ngram, w));
         }
-        if covered.iter().all(|&c| c) {
+        if uncovered_count == 0 {
             break;
         }
     }
