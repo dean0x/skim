@@ -195,9 +195,7 @@ pub fn extract_ngrams_with_weights(text: &str, weights: &[(u16, f32)]) -> Vec<(N
         *entry = entry.max(w);
     }
 
-    map.into_iter()
-        .map(|(key, w)| (Ngram(key), w))
-        .collect()
+    map.into_iter().map(|(key, w)| (Ngram(key), w)).collect()
 }
 
 /// Extract weighted bigrams from `text` using the production [`BIGRAM_WEIGHTS`] table.
@@ -233,10 +231,7 @@ pub fn extract_ngrams(text: &str) -> Vec<(Ngram, f32)> {
 ///
 /// Never panics — byte scanning is infallible.
 #[must_use]
-pub fn extract_query_ngrams_with_weights(
-    query: &str,
-    weights: &[(u16, f32)],
-) -> Vec<(Ngram, f32)> {
+pub fn extract_query_ngrams_with_weights(query: &str, weights: &[(u16, f32)]) -> Vec<(Ngram, f32)> {
     debug_assert!(
         weights.windows(2).all(|w| w[0].0 <= w[1].0),
         "weights must be sorted by key"

@@ -175,7 +175,10 @@ fn extract_whitespace_only() {
 fn border_ranges_fn_parse() {
     let ranges = token_border_ranges("fn parse");
     assert!(is_border_bigram(0, &ranges), "pos 0 'fn' — border");
-    assert!(is_border_bigram(1, &ranges), "pos 1 'n ' overlaps 'fn' border");
+    assert!(
+        is_border_bigram(1, &ranges),
+        "pos 1 'n ' overlaps 'fn' border"
+    );
     assert!(is_border_bigram(2, &ranges), "pos 2 ' p' starts 'parse'");
 }
 
@@ -331,7 +334,10 @@ fn query_extract_higher_idf_preferred() {
 fn query_extract_cjk_no_panic() {
     let w = synthetic_weights();
     let result = extract_query_ngrams_with_weights("你好世界", &w);
-    assert!(!result.is_empty(), "CJK query must yield byte-level bigrams");
+    assert!(
+        !result.is_empty(),
+        "CJK query must yield byte-level bigrams"
+    );
 }
 
 // ── Cycle 5: Convenience API wiring ──────────────────────────────────────
@@ -348,7 +354,10 @@ fn extract_ngrams_uses_production_weights() {
 #[test]
 fn extract_query_ngrams_uses_production_weights() {
     let result = extract_query_ngrams("fn main()");
-    assert!(!result.is_empty(), "production weights must yield query results");
+    assert!(
+        !result.is_empty(),
+        "production weights must yield query results"
+    );
     for pair in result.windows(2) {
         assert!(pair[0].1 >= pair[1].1, "must be sorted descending");
     }
