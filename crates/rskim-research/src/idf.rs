@@ -8,8 +8,14 @@ use crate::types::BigramWeight;
 ///
 /// Returns a value ≥ 1.0. Universal bigrams (df ≈ N) score near 1.0;
 /// rare bigrams (df = 1 in a large corpus) score near ln(N) + 1.
+///
+/// # Panics (debug only)
+///
+/// Panics in debug builds if `total_docs == 0`, which would produce `NEG_INFINITY`.
+/// Callers must ensure the corpus is non-empty before invoking this function.
 #[must_use]
 pub fn compute_idf(df: u32, total_docs: u32) -> f32 {
+    debug_assert!(total_docs > 0, "total_docs must be > 0; got 0 — caller must guard against empty corpus");
     ((total_docs as f64) / ((df + 1) as f64)).ln() as f32 + 1.0
 }
 
@@ -17,12 +23,18 @@ pub fn compute_idf(df: u32, total_docs: u32) -> f32 {
 ///
 /// Bigrams with IDF below `threshold` are excluded. The result is sorted
 /// by bigram key ascending (enabling binary search).
+///
+/// Returns an empty vec immediately if `total_docs == 0` (no corpus to compute
+/// IDF from).
 #[must_use]
 pub fn compute_weight_table(
     df_map: &HashMap<u16, u32>,
     total_docs: u32,
     threshold: f32,
 ) -> Vec<BigramWeight> {
+    if total_docs == 0 {
+        return Vec::new();
+    }
     let mut weights: Vec<BigramWeight> = df_map
         .iter()
         .filter_map(|(&bigram, &df)| {
@@ -40,9 +52,12 @@ pub fn compute_weight_table(
     weights
 }
 
-/// Look up the IDF weight of a bigram in a sorted weight table.
+/// Compute the cumulative IDF selectivity score for a query string.
 ///
-/// Returns `None` if the bigram is not in the table.
+/// Splits `query` into overlapping byte bigrams, looks each up in the sorted
+/// `weights` table by binary search, and returns the sum of matched IDF values.
+/// Bigrams absent from the table contribute 0.0. Returns 0.0 for queries
+/// shorter than 2 bytes.
 #[must_use]
 pub fn selectivity(query: &str, weights: &[(u16, f32)]) -> f64 {
     let bytes = query.as_bytes();
@@ -116,6 +131,15 @@ mod tests {
         // Only the rare bigram should be present
         assert_eq!(table.len(), 1);
         assert_eq!(table[0].bigram, encode_bigram(b'x', b'y'));
+    }
+
+    #[test]
+    fn weight_table_empty_when_total_docs_is_zero() {
+        let mut df_map = HashMap::new();
+        df_map.insert(encode_bigram(b'a', b'b'), 1u32);
+        // total_docs == 0 must not produce NEG_INFINITY — returns empty vec immediately.
+        let table = compute_weight_table(&df_map, 0, 0.0);
+        assert!(table.is_empty(), "expected empty table for zero-doc corpus");
     }
 
     #[test]

@@ -55,9 +55,9 @@ pub fn generate_weights_rs(json_path: &Path, output_path: &Path) -> anyhow::Resu
         anyhow::bail!("weight table is empty");
     }
     for w in &table.weights {
-        if w.idf <= 0.0 {
+        if !w.idf.is_finite() || w.idf <= 0.0 {
             anyhow::bail!(
-                "invalid IDF {} for bigram 0x{:04X} — all IDF values must be positive",
+                "invalid IDF {} for bigram 0x{:04X} — all IDF values must be finite and positive",
                 w.idf,
                 w.bigram
             );
@@ -298,6 +298,66 @@ mod tests {
 
         let err = generate_weights_rs(&json_path, &out_path).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("parsing"));
+    }
+
+    #[test]
+    fn version_zero_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("weights.json");
+        let out_path = dir.path().join("weights.rs");
+
+        let table = WeightTable {
+            version: 0,
+            generated_at: "unix:0".to_string(),
+            corpus_stats: CorpusStats {
+                total_files: 10,
+                total_bigrams: 500,
+                unique_bigrams: 1,
+                deduplicated_files: 0,
+                language_breakdown: vec![],
+            },
+            weights: vec![BigramWeight { bigram: 0x666E, idf: 8.5 }],
+        };
+
+        let json = serde_json::to_string(&table).unwrap();
+        std::fs::write(&json_path, json).unwrap();
+
+        let err = generate_weights_rs(&json_path, &out_path).unwrap_err();
+        assert!(
+            err.to_string().contains("version must be > 0"),
+            "expected version error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn negative_idf_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("weights.json");
+        let out_path = dir.path().join("weights.rs");
+
+        let table = WeightTable {
+            version: 1,
+            generated_at: "unix:0".to_string(),
+            corpus_stats: CorpusStats {
+                total_files: 10,
+                total_bigrams: 500,
+                unique_bigrams: 1,
+                deduplicated_files: 0,
+                language_breakdown: vec![],
+            },
+            weights: vec![BigramWeight { bigram: 0x666E, idf: -1.5 }],
+        };
+
+        let json = serde_json::to_string(&table).unwrap();
+        std::fs::write(&json_path, json).unwrap();
+
+        let err = generate_weights_rs(&json_path, &out_path).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid IDF"),
+            "expected invalid IDF error, got: {}",
+            err
+        );
     }
 
     #[test]
