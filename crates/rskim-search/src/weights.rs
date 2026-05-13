@@ -16135,7 +16135,21 @@ pub const BIGRAM_WEIGHTS: &[(u16, f32)] = &[
 /// Default weight for bigrams not in the table.
 pub const DEFAULT_WEIGHT: f32 = 1.0;
 
-/// Look up the IDF weight of a bigram by binary search.
+/// Look up the IDF weight for `key` in any sorted `(key, weight)` slice.
+///
+/// Falls back to [`DEFAULT_WEIGHT`] when `key` is absent from the table.
+/// The caller must ensure the slice is sorted ascending by key.
+#[must_use]
+#[inline]
+pub fn lookup_weight(key: u16, weights: &[(u16, f32)]) -> f32 {
+    weights
+        .binary_search_by_key(&key, |&(k, _)| k)
+        .ok()
+        .map(|idx| weights[idx].1)
+        .unwrap_or(DEFAULT_WEIGHT)
+}
+
+/// Look up the IDF weight of a bigram by binary search against [`BIGRAM_WEIGHTS`].
 ///
 /// Returns `None` if the bigram is absent from the table.
 #[must_use]

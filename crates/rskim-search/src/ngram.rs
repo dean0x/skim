@@ -18,7 +18,11 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT};
+use crate::weights::{lookup_weight, BIGRAM_WEIGHTS};
+
+// Re-export DEFAULT_WEIGHT so tests can reach it via `use super::*`.
+#[cfg(test)]
+use crate::weights::DEFAULT_WEIGHT;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -100,18 +104,6 @@ impl fmt::Display for Ngram {
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Look up the IDF weight for a bigram key in a sorted `(key, weight)` slice.
-///
-/// Falls back to [`DEFAULT_WEIGHT`] when the key is absent.
-#[inline]
-fn lookup_weight(key: u16, weights: &[(u16, f32)]) -> f32 {
-    weights
-        .binary_search_by_key(&key, |&(k, _)| k)
-        .ok()
-        .map(|idx| weights[idx].1)
-        .unwrap_or(DEFAULT_WEIGHT)
-}
-
 /// Compute token-border byte ranges for `query`.
 ///
 /// For each whitespace-delimited token starting at byte offset `start` with
@@ -162,6 +154,9 @@ fn token_border_ranges(query: &str) -> Vec<(usize, usize)> {
 ///
 /// A bigram at position `p` covers bytes `[p, p+1]`.  It overlaps `[lo, hi)` when
 /// `p + 1 >= lo && p < hi`.
+///
+/// Used only in tests; production code uses the O(1) border bitmap instead.
+#[cfg(test)]
 #[inline]
 fn is_border_bigram(bigram_pos: usize, border_ranges: &[(usize, usize)]) -> bool {
     border_ranges
