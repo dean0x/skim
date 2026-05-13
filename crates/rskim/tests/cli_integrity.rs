@@ -24,7 +24,8 @@ fn skim_init_cmd(config_dir: &std::path::Path) -> Command {
 fn skim_rewrite_hook_cmd(config_dir: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("skim").unwrap();
     cmd.args(["rewrite", "--hook"])
-        .env("CLAUDE_CONFIG_DIR", config_dir.as_os_str());
+        .env("CLAUDE_CONFIG_DIR", config_dir.as_os_str())
+        .env_remove("SKIM_PASSTHROUGH");
     cmd
 }
 

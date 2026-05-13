@@ -224,6 +224,8 @@ skim heatmap                     # default: last 90 days, text output
 skim heatmap --json              # structured JSON for programmatic use
 skim heatmap --path src/lib/     # scope to a subdirectory
 skim heatmap --window sprint     # last 14 days only
+skim heatmap --insights          # threshold-filtered findings only
+skim heatmap --insights --json   # insights as JSON (agent-friendly)
 ```
 <!-- skim-end -->"#,
         version = version

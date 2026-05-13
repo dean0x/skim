@@ -1,6 +1,6 @@
 [package]
 name = "rskim-core"
-version = "2.9.0"
+version = "2.10.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"

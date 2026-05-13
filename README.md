@@ -1,8 +1,8 @@
 # Skim: The Most Intelligent Context Optimization Engine for Coding Agents
 
-> **Code skimming. Command rewriting. Test, build, and git output compression. Token budget cascading.** 17 languages. 14ms for 3,000 lines. Built in Rust.
+> **Code skimming. Command rewriting. Test, build, and git output compression. Codebase heatmap. Token budget cascading.** 17 languages. 14ms for 3,000 lines. Built in Rust.
 
-Other tools filter terminal noise. Skim understands your code. It parses ASTs across 17 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, and raw commands. 14ms for 3,000 lines. 48x faster on cache hits.
+Other tools filter terminal noise. Skim understands your code. It parses ASTs across 17 languages, strips implementation while preserving architecture, then optimizes every other type of context your agent consumes: test output, build errors, git diffs, raw commands, and codebase heatmaps. 14ms for 3,000 lines. 48x faster on cache hits.
 
 [![Website](https://img.shields.io/badge/Website-skim-e87040)](https://dean0x.github.io/x/skim/)
 [![CI](https://github.com/dean0x/skim/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/skim/actions/workflows/ci.yml)
@@ -90,6 +90,17 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
   - Three-tier degradation: AST-aware render → raw hunk render → guardrail passthrough
 - Compresses `git status` and `git log` with flag-aware passthrough
 - All subcommands support `--json` for machine-readable output
+
+### Codebase Heatmap (`skim heatmap`)
+- **Churn hotspots** — files changed most frequently, ranked by commit count
+- **Blast radius** — file coupling detection: files that consistently change together
+- **Fix risk** — files with high fix-commit density or fix-after-touch patterns
+- **Bus factor** — files with a single dominant author (>80% of commits)
+- **Module health** — directory encapsulation scores (cross-boundary coupling violations)
+- Configurable time windows: `--window sprint` (14d), `--last 200`, `--since 30d`, or full history
+- File targeting with positional args and `--diff` to scope output without skewing metrics
+- `--insights` for threshold-filtered findings only (CRITICAL/WARNING severity one-liners)
+- `--json` for machine-readable output, `--path` to scope to a subdirectory
 
 ### Intelligence
 - `skim discover` scans agent session history for optimization opportunities
@@ -557,7 +568,7 @@ cargo bench
 
 ## Project Status
 
-**Current**: v2.9.0 — Stable
+**Current**: v2.10.0 — Stable
 
 ✅ **Core — Code Reading (17 languages):**
 - TypeScript/JavaScript/Python/Rust/Go/Java/C/C++/C#/Ruby/SQL/Markdown/JSON/YAML/TOML
@@ -581,13 +592,14 @@ cargo bench
 - MCP server mode for agent-native workflows
 
 ✅ **Analytics & Intelligence:**
+- `skim heatmap` — git history risk analysis (churn, coupling, bus factor, fix density)
 - `skim stats` — persistent SQLite dashboard with cost estimation
 - `skim discover` — missed optimization finder across agent sessions
 - `skim learn` — CLI error pattern detection and correction rules
 
 ✅ **Distribution:**
 - cargo (`cargo install rskim`), npm (`npx rskim`), Homebrew (`brew install dean0x/tap/skim`)
-- 3,310 tests passing, 14.6ms performance (3x under target)
+- 3,558 tests passing, 14.6ms performance (3x under target)
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 

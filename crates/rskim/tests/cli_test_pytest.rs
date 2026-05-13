@@ -9,6 +9,12 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::process;
 
+fn skim_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd
+}
+
 // ============================================================================
 // Help and subcommand routing
 // ============================================================================
@@ -46,8 +52,7 @@ fn test_skim_pytest_help() {
 #[test]
 fn test_piped_all_pass() {
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .args(["pytest"])
         .write_stdin(fixture)
         .assert()
@@ -59,8 +64,7 @@ fn test_piped_all_pass() {
 #[test]
 fn test_piped_with_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .args(["pytest"])
         .write_stdin(fixture)
         .assert()
@@ -73,8 +77,7 @@ fn test_piped_with_failures() {
 #[test]
 fn test_piped_mixed() {
     let fixture = include_str!("fixtures/cmd/test/pytest_mixed.txt");
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .args(["pytest"])
         .write_stdin(fixture)
         .assert()
@@ -87,8 +90,7 @@ fn test_piped_mixed() {
 #[test]
 fn test_piped_all_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_all_fail.txt");
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .args(["pytest"])
         .write_stdin(fixture)
         .assert()
@@ -139,8 +141,7 @@ fn test_piped_passthrough_mode_skips_compression() {
 #[test]
 fn test_failure_context_appended_on_failures() {
     let fixture = include_str!("fixtures/cmd/test/pytest_fail.txt");
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .args(["pytest"])
         .write_stdin(fixture)
         .assert()
@@ -153,8 +154,7 @@ fn test_failure_context_appended_on_failures() {
 #[test]
 fn test_failure_context_absent_on_all_pass() {
     let fixture = include_str!("fixtures/cmd/test/pytest_pass.txt");
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .args(["pytest"])
         .write_stdin(fixture)
         .assert()
@@ -193,8 +193,7 @@ fn test_real_pytest_if_available() {
     )
     .unwrap();
 
-    let output = Command::cargo_bin("skim")
-        .unwrap()
+    let output = skim_cmd()
         .args(["pytest", test_file.to_str().unwrap()])
         .output()
         .unwrap();

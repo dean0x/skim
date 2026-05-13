@@ -612,6 +612,7 @@ fn test_hook_cargo_test_match() {
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--hook"])
+        .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(hook_payload("cargo test"))
         .assert()
         .success();
@@ -726,6 +727,7 @@ fn test_hook_compound_command_rewrite() {
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--hook"])
+        .env_remove("SKIM_PASSTHROUGH")
         .write_stdin(hook_payload("cargo test && cargo clippy"))
         .assert()
         .success();
@@ -778,6 +780,7 @@ fn test_hook_version_mismatch_warning() {
     let output = Command::cargo_bin("skim")
         .unwrap()
         .args(["rewrite", "--hook"])
+        .env_remove("SKIM_PASSTHROUGH")
         .env("SKIM_HOOK_VERSION", "0.0.1")
         .env("SKIM_CACHE_DIR", cache_dir.path().as_os_str())
         .write_stdin(hook_payload("cargo test"))

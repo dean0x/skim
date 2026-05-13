@@ -7,27 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-05-13
+
+Container, cloud, database compression; search crate foundation; heatmap insights. 3,558 tests passing (up from 3,310 in v2.9.0).
+
 ### Added
+- **`rskim-search` crate (Wave 0)** — New workspace crate providing the search foundation: `SearchLayer`, `LayerBuilder`, and `FieldClassifier` traits, `SearchQuery`/`SearchResult`/`IndexStats` types, AST-aware `SearchField` classification (8 field variants), and typed `SearchError` hierarchy. Pure library with no I/O — CLI integration in future waves (#213)
+- **`skim heatmap --insights` flag** — threshold-filtered one-liner findings for focused risk analysis. Reports only CRITICAL/WARNING severity metrics (fix-risk, bus-factor, churn, coupling) in text and JSON formats, skipping healthy files (#215)
 - **`skim psql` subcommand** — PostgreSQL query output compression via three-tier degradation: Tier 1 (tabular `----+----` format), Tier 2 (regex row-count extraction), Tier 3 (passthrough). Supports `--json` for structured `DbResult` output (#117)
 - **`skim mysql` subcommand** — MySQL query output compression: Tier 1 (TSV batch output), Tier 2 (bordered `+---+` table format), Tier 3 (passthrough). Handles empty-set detection and multi-result sets. Supports `--json` (#117)
 - **`skim sqlite3` subcommand** — SQLite query output compression: Tier 1 (pipe-separated with `-header -separator |` injection), Tier 3 (passthrough for schema dumps and meta-commands). Supports `--json` (#117)
 - **`DbResult` canonical type** — Structured database query result with column/row data, row count, truncation flag, and pre-rendered aligned table output. Part of the canonical output type system (#117)
-- **`skim docker` subcommand** — Docker output compression for `ps`, `images`, `inspect`, `build`, `logs`, `compose` via three-tier degradation. Previously added in Part 1 (#117)
-- **`skim kubectl` subcommand** — Kubernetes output compression for `get`, `describe`, `logs`. Injects `-o json` for `get` (skipped for watch/existing format flags). Previously added in Part 1 (#117)
-- **`skim terraform` subcommand** — Terraform output compression for `plan` and `apply`: Tier 1 (NDJSON from `-json`), Tier 2 (regex on human-readable text). Safety invariant: never injects `-json` for plan/apply to preserve interactive approval prompts. Previously added in Part 1 (#117)
+- **`skim docker` subcommand** — Docker output compression for `ps`, `images`, `inspect`, `build`, `logs`, `compose` via three-tier degradation (#117)
+- **`skim kubectl` subcommand** — Kubernetes output compression for `get`, `describe`, `logs`. Injects `-o json` for `get` (skipped for watch/existing format flags) (#117)
+- **`skim terraform` subcommand** — Terraform output compression for `plan` and `apply`: Tier 1 (NDJSON from `-json`), Tier 2 (regex on human-readable text). Safety invariant: never injects `-json` for plan/apply to preserve interactive approval prompts (#117)
 - **15 new rewrite rules** — Docker (ps, images, build, inspect, logs, compose ps, compose logs), kubectl (get, describe, logs), terraform (plan, apply), psql (-c), mysql (-e), sqlite3. Total: 122 rules across 8 categories (#117)
-
-### Changed
 
 ### Fixed
 - **DB family ANSI strip bypass** — `strip_ansi_escapes` was stripping ASCII tab characters (0x09) from stdin content, causing MySQL TSV parsers to receive tab-free data and fall through to passthrough. DB family commands now bypass ANSI stripping to preserve tab separators (#117)
-
-### Removed
+- **Heatmap `set_var`/`remove_var` unsafe blocks** — Rust 2024 edition requires explicit `unsafe {}` blocks for `std::env::set_var` and `std::env::remove_var` in test code
+- **Test isolation for `SKIM_PASSTHROUGH`** — Hook and parser E2E tests now clear `SKIM_PASSTHROUGH` from inherited environment, preventing false failures when tests run inside a skim hook session
 
 ### Testing
-- 3,442 tests passing (up from 3,310 in v2.9.0)
+- 3,558 tests passing (up from 3,310 in v2.9.0)
 - 14 new E2E parser tests: psql (tier 1, empty, tier 2, tier 3, JSON), mysql (tier 1 TSV, tier 2 bordered, tier 3, empty set, JSON), sqlite3 (tier 1, empty, tier 3 schema, JSON)
 - 19 new E2E rewrite tests: docker (5 positive, 1 skip), kubectl (3 positive, 2 skip), terraform (2 positive, 1 skip), DB tools (3 positive, 1 skip)
+- 22 new `rskim-search` unit tests: type roundtrips, trait contracts, field classifier, serde agreement (#213)
 
 ## [2.9.0] - 2026-05-08
 
@@ -927,6 +932,7 @@ npx rskim file.ts  # no install required
 
 ## Version History
 
+- **2.10.0** (2026-05-13): Container/cloud/database compression, search crate foundation, heatmap insights (3,558 tests)
 - **2.9.0** (2026-05-08): Heatmap analysis, system utility parsers, curl hardening (3,310 tests)
 - **2.8.0** (2026-05-07): Flat dispatch, Crush agent, multi-file args (3,103 tests)
 - **2.7.0** (2026-05-01): Line numbers, session tracking, output sanitization (3,002 tests)

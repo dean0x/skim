@@ -1,6 +1,6 @@
 [package]
 name = "rskim"
-version = "2.9.0"
+version = "2.10.0"
 edition = "2024"
 authors = ["Skim Contributors"]
 license = "MIT"
@@ -13,8 +13,8 @@ name = "skim"
 path = "src/main.rs"
 
 [dependencies]
-rskim-core = { version = "2.9.0", path = "../rskim-core" }
-clap = { workspace = true }
+rskim-core = { version = "2.10.0", path = "../rskim-core" }
+clap = { version = "4.5", features = ["derive"] }
 anyhow = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
@@ -47,7 +47,7 @@ libc = { workspace = true }
 # Compile-time canary: ensures rskim-search's public API surface remains valid
 # as a downstream consumer. API breakage surfaces here before re-adding as a
 # runtime dependency.
-rskim-search = { version = "0.1.0", path = "../rskim-search" }
+rskim-search = { path = "../rskim-search" }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
