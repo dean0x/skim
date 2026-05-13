@@ -717,7 +717,8 @@ mod tests {
 
         let _ = crate::analytics::AnalyticsDb::open(tmp.path()).unwrap();
 
-        std::env::set_var("SKIM_ANALYTICS_DB", &db_path);
+        // SAFETY: test is single-threaded; no concurrent env reads.
+        unsafe { std::env::set_var("SKIM_ANALYTICS_DB", &db_path) };
 
         let analytics = crate::analytics::AnalyticsConfig {
             enabled: true,
@@ -741,6 +742,7 @@ mod tests {
             cmds.iter().map(|c| &c.original_cmd).collect::<Vec<_>>()
         );
 
-        std::env::remove_var("SKIM_ANALYTICS_DB");
+        // SAFETY: test is single-threaded; no concurrent env reads.
+        unsafe { std::env::remove_var("SKIM_ANALYTICS_DB") };
     }
 }

@@ -19,6 +19,7 @@ fn test_skim_test_cargo_in_this_repo() {
     let assert = Command::cargo_bin("skim")
         .unwrap()
         .args(["cargo", "test", "-p", "rskim-core"])
+        .env_remove("SKIM_PASSTHROUGH")
         .timeout(std::time::Duration::from_secs(120))
         .assert();
 
