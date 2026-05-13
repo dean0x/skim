@@ -185,7 +185,8 @@ pub fn extract_ngrams_with_weights(text: &str, weights: &[(u16, f32)]) -> Vec<(N
     );
 
     let bytes = text.as_bytes();
-    let mut map: HashMap<u16, f32> = HashMap::new();
+    let capacity = bytes.len().min(256);
+    let mut map: HashMap<u16, f32> = HashMap::with_capacity(capacity);
 
     for window in bytes.windows(2) {
         let key = Ngram::from_bytes(window[0], window[1]).key();
