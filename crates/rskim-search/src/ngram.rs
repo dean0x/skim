@@ -43,7 +43,7 @@ pub const BORDER_MULTIPLIER: f32 = 3.5;
 /// binary search.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct Ngram(pub u16);
+pub struct Ngram(pub(crate) u16);
 
 impl Ngram {
     /// Encode two bytes into an [`Ngram`].
@@ -53,6 +53,18 @@ impl Ngram {
     #[inline]
     pub fn from_bytes(b1: u8, b2: u8) -> Self {
         Self((u16::from(b1) << 8) | u16::from(b2))
+    }
+
+    /// Construct an [`Ngram`] directly from a raw `u16` key.
+    ///
+    /// Intended for internal crate use where the key is already in the encoded
+    /// `(high_byte << 8) | low_byte` form (e.g. when iterating over a HashMap
+    /// of `u16` keys built from [`from_bytes`]).  External callers should use
+    /// [`from_bytes`] to guarantee the correct encoding.
+    #[must_use]
+    #[inline]
+    pub(crate) fn from_raw(key: u16) -> Self {
+        Self(key)
     }
 
     /// Decode an [`Ngram`] back into its two component bytes `(b1, b2)`.
@@ -195,7 +207,7 @@ pub fn extract_ngrams_with_weights(text: &str, weights: &[(u16, f32)]) -> Vec<(N
         *entry = entry.max(w);
     }
 
-    map.into_iter().map(|(key, w)| (Ngram(key), w)).collect()
+    map.into_iter().map(|(key, w)| (Ngram::from_raw(key), w)).collect()
 }
 
 /// Extract weighted bigrams from `text` using the production [`BIGRAM_WEIGHTS`] table.
