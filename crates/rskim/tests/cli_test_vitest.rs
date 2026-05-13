@@ -20,6 +20,12 @@ fn read_fixture(name: &str) -> String {
         .unwrap_or_else(|e| panic!("Failed to read fixture {name}: {e}"))
 }
 
+fn skim_cmd() -> Command {
+    let mut cmd = Command::cargo_bin("skim").unwrap();
+    cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd
+}
+
 // ============================================================================
 // Help output
 // ============================================================================
@@ -44,8 +50,7 @@ fn test_skim_vitest_help() {
 fn test_skim_test_vitest_stdin_pass() {
     let fixture = read_fixture("vitest_pass.json");
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .arg("vitest")
         .write_stdin(fixture)
         .assert()
@@ -58,8 +63,7 @@ fn test_skim_test_vitest_stdin_pass() {
 fn test_skim_test_vitest_stdin_fail() {
     let fixture = read_fixture("vitest_fail.json");
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .arg("vitest")
         .write_stdin(fixture)
         .assert()
@@ -74,8 +78,7 @@ fn test_skim_test_vitest_stdin_fail() {
 fn test_skim_test_vitest_stdin_pnpm_prefix() {
     let fixture = read_fixture("vitest_pnpm_prefix.json");
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .arg("vitest")
         .write_stdin(fixture)
         .assert()
@@ -92,8 +95,7 @@ fn test_skim_test_vitest_stdin_pnpm_prefix() {
 fn test_skim_test_vitest_stdin_regex_fallback() {
     let input = "Tests  5 passed | 1 failed | 6 total";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .arg("--debug")
         .arg("vitest")
         .write_stdin(input)
@@ -112,8 +114,7 @@ fn test_skim_test_vitest_stdin_regex_fallback() {
 fn test_skim_test_vitest_stdin_passthrough() {
     let input = "completely unparseable output";
 
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .arg("--debug")
         .arg("vitest")
         .write_stdin(input)
@@ -140,8 +141,7 @@ fn test_skim_test_jest_alias_works() {
     let fixture = read_fixture("vitest_pass.json");
 
     // `skim jest` should route to the vitest parser (compatible format)
-    Command::cargo_bin("skim")
-        .unwrap()
+    skim_cmd()
         .arg("jest")
         .write_stdin(fixture)
         .assert()
