@@ -95,25 +95,10 @@ fn cmd_run(
     corpus_config: &std::path::Path,
     output: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    use rayon::prelude::*;
-
     let config = config::load_corpus_config(corpus_config)
         .with_context(|| format!("loading corpus config from {}", corpus_config.display()))?;
 
-    // Use a provided directory or create a temporary one.
-    let _temp_dir_guard;
-    let corpus_dir = match corpus_dir {
-        Some(p) => p,
-        None => {
-            let td = tempfile::tempdir().context("creating temporary corpus directory")?;
-            let path = td.path().to_path_buf();
-            _temp_dir_guard = td;
-            path
-        }
-    };
-
-    std::fs::create_dir_all(&corpus_dir)
-        .with_context(|| format!("creating corpus dir {}", corpus_dir.display()))?;
+    let (corpus_dir, _temp_dir_guard) = resolve_corpus_dir(corpus_dir)?;
 
     eprintln!(
         "Cloning {} repos into {} ...",
@@ -121,36 +106,7 @@ fn cmd_run(
         corpus_dir.display()
     );
 
-    let source = clone::GitCloneSource {
-        corpus_dir: corpus_dir.clone(),
-    };
-
-    let progress = ProgressBar::new(config.repos.len() as u64);
-    if let Ok(style) =
-        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} {msg}")
-    {
-        progress.set_style(style);
-    }
-
-    // Collect all source files from each repo in parallel.
-    let all_files: Vec<types::SourceFile> = config
-        .repos
-        .par_iter()
-        .flat_map(|repo| {
-            progress.set_message(repo.url.clone());
-            let result = source.fetch_files(repo);
-            progress.inc(1);
-            match result {
-                Ok(files) => files,
-                Err(e) => {
-                    eprintln!("Warning: failed to fetch {}: {e:#}", repo.url);
-                    vec![]
-                }
-            }
-        })
-        .collect();
-
-    progress.finish_with_message("done");
+    let all_files = fetch_all_files(&config, &corpus_dir)?;
 
     eprintln!(
         "Loaded {} source files. Extracting bigrams...",
@@ -173,18 +129,93 @@ fn cmd_run(
         weights.len()
     );
 
-    let weight_pairs: Vec<(u16, f32)> = weights.iter().map(|w| (w.bigram, w.idf)).collect();
-    let test_queries = validate::TEST_QUERIES;
-    let validation = validate::run_validation(&weight_pairs, test_queries);
+    log_validation_summary(&weights);
 
+    let table = types::WeightTable {
+        version: 1,
+        generated_at: chrono_now(),
+        corpus_stats,
+        weights,
+    };
+
+    write_weight_table(&table, output)?;
+
+    Ok(())
+}
+
+/// Resolve the corpus directory, creating a temporary one if none was provided.
+///
+/// Returns `(path, guard)` — the guard keeps the `TempDir` alive for the caller's
+/// scope; it is `None` when the caller supplied an explicit path.
+fn resolve_corpus_dir(
+    corpus_dir: Option<PathBuf>,
+) -> anyhow::Result<(PathBuf, Option<tempfile::TempDir>)> {
+    let (path, guard) = match corpus_dir {
+        Some(p) => (p, None),
+        None => {
+            let td = tempfile::tempdir().context("creating temporary corpus directory")?;
+            let path = td.path().to_path_buf();
+            (path, Some(td))
+        }
+    };
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("creating corpus dir {}", path.display()))?;
+    Ok((path, guard))
+}
+
+/// Clone/fetch all source files from each configured repo in parallel.
+fn fetch_all_files(
+    config: &config::CorpusConfig,
+    corpus_dir: &std::path::Path,
+) -> anyhow::Result<Vec<types::SourceFile>> {
+    use rayon::prelude::*;
+
+    let source = clone::GitCloneSource {
+        corpus_dir: corpus_dir.to_path_buf(),
+    };
+
+    let progress = ProgressBar::new(config.repos.len() as u64);
+    if let Ok(style) =
+        ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} {msg}")
+    {
+        progress.set_style(style);
+    }
+
+    let all_files: Vec<types::SourceFile> = config
+        .repos
+        .par_iter()
+        .flat_map(|repo| {
+            progress.set_message(repo.url.clone());
+            let result = source.fetch_files(repo);
+            progress.inc(1);
+            match result {
+                Ok(files) => files,
+                Err(e) => {
+                    eprintln!("Warning: failed to fetch {}: {e:#}", repo.url);
+                    vec![]
+                }
+            }
+        })
+        .collect();
+
+    progress.finish_with_message("done");
+    Ok(all_files)
+}
+
+/// Print validation summary to stderr.
+fn log_validation_summary(weights: &[types::BigramWeight]) {
+    let weight_pairs: Vec<(u16, f32)> = weights.iter().map(|w| (w.bigram, w.idf)).collect();
+    let validation = validate::run_validation(&weight_pairs, validate::TEST_QUERIES);
     eprintln!(
         "Validation — uniform: {:.4}, border-weighted: {:.4}, improvement: {:.1}%",
         validation.uniform_selectivity,
         validation.border_weighted_selectivity,
         validation.improvement_pct
     );
+}
 
-    // Determine output path.
+/// Serialize the weight table to JSON and write it to the output path.
+fn write_weight_table(table: &types::WeightTable, output: Option<PathBuf>) -> anyhow::Result<()> {
     let output_path = output.unwrap_or_else(|| {
         // Default: crates/rskim-search/data/bigram_weights.json relative to workspace root.
         codegen::find_workspace_root()
@@ -197,14 +228,7 @@ fn cmd_run(
             .with_context(|| format!("creating output directory {}", parent.display()))?;
     }
 
-    let table = types::WeightTable {
-        version: 1,
-        generated_at: chrono_now(),
-        corpus_stats,
-        weights,
-    };
-
-    let json = serde_json::to_string_pretty(&table).context("serializing weight table")?;
+    let json = serde_json::to_string_pretty(table).context("serializing weight table")?;
     std::fs::write(&output_path, json)
         .with_context(|| format!("writing {}", output_path.display()))?;
 

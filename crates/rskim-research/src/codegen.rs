@@ -81,7 +81,14 @@ pub fn generate_weights_rs(json_path: &Path, output_path: &Path) -> anyhow::Resu
 
 fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
     let mut buf = Vec::with_capacity(64 * 1024);
+    write_file_header(&mut buf, table)?;
+    write_entries(&mut buf, &table.weights)?;
+    write_lookup_fn(&mut buf)?;
+    write_generated_tests(&mut buf)?;
+    String::from_utf8(buf).context("building weights.rs source (non-UTF8 output)")
+}
 
+fn write_file_header(buf: &mut Vec<u8>, table: &WeightTable) -> anyhow::Result<()> {
     writeln!(
         buf,
         "//! Empirical character bigram IDF weight table for rskim-search sparse index."
@@ -111,6 +118,10 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
     // in machine-generated const data.
     writeln!(buf, "#![allow(clippy::excessive_precision)]")?;
     writeln!(buf)?;
+    Ok(())
+}
+
+fn write_entries(buf: &mut Vec<u8>, weights: &[crate::types::BigramWeight]) -> anyhow::Result<()> {
     writeln!(buf, "/// Sorted (bigram_key, idf_weight) pairs.")?;
     writeln!(buf, "///")?;
     writeln!(
@@ -122,8 +133,7 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
         "/// Each bigram key encodes two bytes: `key = (byte1 << 8) | byte2`."
     )?;
     writeln!(buf, "pub const BIGRAM_WEIGHTS: &[(u16, f32)] = &[")?;
-
-    for w in &table.weights {
+    for w in weights {
         let display = bigram_to_display(w.bigram);
         writeln!(
             buf,
@@ -131,12 +141,15 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
             w.bigram, w.idf, display
         )?;
     }
-
     writeln!(buf, "];")?;
     writeln!(buf)?;
     writeln!(buf, "/// Default weight for bigrams not in the table.")?;
     writeln!(buf, "pub const DEFAULT_WEIGHT: f32 = 1.0;")?;
     writeln!(buf)?;
+    Ok(())
+}
+
+fn write_lookup_fn(buf: &mut Vec<u8>) -> anyhow::Result<()> {
     writeln!(
         buf,
         "/// Look up the IDF weight of a bigram by binary search."
@@ -154,6 +167,10 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
     writeln!(buf, "        .map(|idx| BIGRAM_WEIGHTS[idx].1)")?;
     writeln!(buf, "}}")?;
     writeln!(buf)?;
+    Ok(())
+}
+
+fn write_generated_tests(buf: &mut Vec<u8>) -> anyhow::Result<()> {
     writeln!(buf, "#[cfg(test)]")?;
     writeln!(buf, "mod tests {{")?;
     writeln!(buf, "    use super::*;")?;
@@ -213,8 +230,7 @@ fn build_weights_rs(table: &WeightTable) -> anyhow::Result<String> {
     )?;
     writeln!(buf, "    }}")?;
     writeln!(buf, "}}")?;
-
-    String::from_utf8(buf).context("building weights.rs source (non-UTF8 output)")
+    Ok(())
 }
 
 #[cfg(test)]
