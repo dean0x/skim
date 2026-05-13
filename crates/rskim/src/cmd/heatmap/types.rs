@@ -2,7 +2,7 @@
 //!
 //! No logic, no I/O. Pure data model.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 // ============================================================================
 // CLI configuration
@@ -253,8 +253,9 @@ pub(crate) enum Severity {
 ///
 /// Using an enum (instead of `String`) gives compile-time exhaustiveness in
 /// `sort_key` and eliminates `.to_string()` allocations at each insight push.
-/// Serialised as kebab-case so JSON output is unchanged (`"fix-risk"`, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Serialized as kebab-case so JSON output matches the documented schema
+/// (`"fix-risk"`, `"bus-factor"`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum InsightCategory {
     Stability,
