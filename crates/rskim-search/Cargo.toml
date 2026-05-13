@@ -26,6 +26,8 @@ expect_used = "deny"
 panic = "deny"
 todo = "warn"
 
+exclude = ["data/"]
+
 [lib]
 name = "rskim_search"
 path = "src/lib.rs"

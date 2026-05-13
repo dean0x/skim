@@ -48,3 +48,6 @@ criterion/
 .memory/
 
 .codenames
+
+# Generated research artifacts (reproducible via rskim-research run)
+crates/rskim-search/data/
