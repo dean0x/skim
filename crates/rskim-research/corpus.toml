@@ -6,133 +6,133 @@
 
 [[repos]]
 url = "https://github.com/BurntSushi/ripgrep"
-commit = "4649aa9700619f94cf9c66876e9549d83420e16c"
+commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"
 language = "Rust"
 
 [[repos]]
 url = "https://github.com/sharkdp/fd"
-commit = "e29bb670e0a8b2c9e0a56e9cd74b30bdb3d5be47"
+commit = "7f1b1471d5e3f88087eaad77885dc70968750bb3"
 language = "Rust"
 
 [[repos]]
 url = "https://github.com/tokio-rs/tokio"
-commit = "6f0e29a1820e50f0cd42f5c75a54d0b1f22ce876"
+commit = "7d3b0ad192fa6da7f0301fb0db7472031a3d253a"
 language = "Rust"
 
 [[repos]]
 url = "https://github.com/serde-rs/serde"
-commit = "4abed062f98e3d795de42e5fbddcba32b1c5a9b8"
+commit = "fa7da4a93567ed347ad0735c28e439fca688ef26"
 language = "Rust"
 
 [[repos]]
 url = "https://github.com/rust-lang/cargo"
-commit = "2ad93b2e3a85f7cdf18b2f15671f5c7efb8a4e7d"
+commit = "11c687e0a9ccd7214c9419eaad05dc2c4c5c9255"
 language = "Rust"
 
 # ---- TypeScript ----
 
 [[repos]]
 url = "https://github.com/microsoft/TypeScript"
-commit = "aed3c07fa9edcc2e38a741a6d1c9e3c2a8d9f4c3"
+commit = "f350b52331494b68c90ab02e2b6d0828d2a22a74"
 language = "TypeScript"
 
 [[repos]]
 url = "https://github.com/microsoft/vscode"
-commit = "b3d3a5c8b2a3d5c8a3d5c8b2a3d5c8a3d5c8b2a3"
+commit = "ed6d7dd68669cbcb1aaf84b9367df538635adb3e"
 language = "TypeScript"
 
 [[repos]]
 url = "https://github.com/nestjs/nest"
-commit = "c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0"
+commit = "8ee0aa52a04410a34b49fe9a80b3857ba738468b"
 language = "TypeScript"
 
 [[repos]]
 url = "https://github.com/trpc/trpc"
-commit = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+commit = "23c723cfeaf07da28a52a5c35c3dcccf96a47578"
 language = "TypeScript"
 
 [[repos]]
 url = "https://github.com/prisma/prisma"
-commit = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
+commit = "d6d9fc9ed341946d45c7d0aba35081a7bd741aa1"
 language = "TypeScript"
 
 # ---- Python ----
 
 [[repos]]
 url = "https://github.com/pallets/flask"
-commit = "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4"
+commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"
 language = "Python"
 
 [[repos]]
 url = "https://github.com/django/django"
-commit = "f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5"
+commit = "335c6d0129400eda792f3bec5c71bb28af5e5d37"
 language = "Python"
 
 [[repos]]
 url = "https://github.com/psf/requests"
-commit = "a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6"
+commit = "6404f345e562d962abe6700a1c357ec1e7e18232"
 language = "Python"
 
 [[repos]]
 url = "https://github.com/pydantic/pydantic"
-commit = "b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7"
+commit = "8a1a222b60131e517ed8f6c0387d296d181490c3"
 language = "Python"
 
 [[repos]]
 url = "https://github.com/tiangolo/fastapi"
-commit = "c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8"
+commit = "e89a37e50d27f124b77e947b7965b6df75052a35"
 language = "Python"
 
 # ---- Go ----
 
 [[repos]]
 url = "https://github.com/kubernetes/kubernetes"
-commit = "d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9"
+commit = "eaa04458b241800ae37e07ad051415a2f2309a17"
 language = "Go"
 
 [[repos]]
 url = "https://github.com/gofiber/fiber"
-commit = "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0"
+commit = "33b7fd4718f7d94e05214f424ed8d44bdd601836"
 language = "Go"
 
 [[repos]]
 url = "https://github.com/gin-gonic/gin"
-commit = "f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"
+commit = "5f4f9643258dc2a65e684b63f12c8d543c936c67"
 language = "Go"
 
 [[repos]]
 url = "https://github.com/cli/cli"
-commit = "a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+commit = "1e6bb88c6d8503189bca408f7be162018b1acf84"
 language = "Go"
 
 [[repos]]
 url = "https://github.com/grafana/grafana"
-commit = "b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3"
+commit = "3219aed082f7eda99f369641423159fd07401c57"
 language = "Go"
 
 # ---- Java ----
 
 [[repos]]
 url = "https://github.com/spring-projects/spring-boot"
-commit = "c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4"
+commit = "458b8baccf1b3999752a6ad4fa7e350f0f347926"
 language = "Java"
 
 [[repos]]
 url = "https://github.com/elastic/elasticsearch"
-commit = "d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5"
+commit = "c22398ffceb92b6eed87dc251b350e6ecc7775d3"
 language = "Java"
 
 [[repos]]
 url = "https://github.com/google/guava"
-commit = "e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6"
+commit = "6f3f85dfe1676e8fe7595e463da6bc7db9a31fb2"
 language = "Java"
 
 [[repos]]
 url = "https://github.com/square/retrofit"
-commit = "f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7"
+commit = "8e83a242eac1afc22a13c52098eddb27421353ff"
 language = "Java"
 
 [[repos]]
 url = "https://github.com/apache/kafka"
-commit = "a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8"
+commit = "7a64fe88476143bd5375a61419579e2f065c0d6c"
 language = "Java"
