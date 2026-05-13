@@ -242,7 +242,17 @@ pub fn extract_query_ngrams_with_weights(query: &str, weights: &[(u16, f32)]) ->
         return vec![];
     }
 
+    // Build O(n) border bitmap: border_bitmap[p] == true when byte p is in any border range.
+    // A bigram at position `p` covers bytes [p, p+1]; it is a border bigram when either
+    // border_bitmap[p] or border_bitmap[p+1] is true — equivalent to the previous
+    // `is_border_bigram` linear scan but O(1) per lookup after O(n+r) preprocessing.
     let border_ranges = token_border_ranges(query);
+    let mut border_bitmap = vec![false; bytes.len()];
+    for (lo, hi) in &border_ranges {
+        for b in border_bitmap[*lo..*hi].iter_mut() {
+            *b = true;
+        }
+    }
 
     // Build candidates: (Ngram, border_weighted_idf, position)
     let mut candidates: Vec<(Ngram, f32, usize)> = bytes
@@ -251,7 +261,7 @@ pub fn extract_query_ngrams_with_weights(query: &str, weights: &[(u16, f32)]) ->
         .map(|(pos, window)| {
             let ngram = Ngram::from_bytes(window[0], window[1]);
             let base_w = lookup_weight(ngram.key(), weights);
-            let multiplier = if is_border_bigram(pos, &border_ranges) {
+            let multiplier = if border_bitmap[pos] || border_bitmap[pos + 1] {
                 BORDER_MULTIPLIER
             } else {
                 1.0_f32
