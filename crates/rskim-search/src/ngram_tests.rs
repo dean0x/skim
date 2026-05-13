@@ -272,12 +272,14 @@ fn query_extract_border_bigrams_have_higher_weight() {
         .find(|(n, _)| *n == Ngram::from_bytes(b'a', b'i'));
 
     assert!(fn_entry.is_some(), "'fn' must appear in query result");
-    if let Some(ai) = ai_entry {
-        assert!(
-            fn_entry.unwrap().1 > ai.1,
-            "'fn' border weight must exceed 'ai' interior weight"
-        );
-    }
+    assert!(
+        ai_entry.is_some(),
+        "'ai' must appear in query result — covering-set must select it to cover byte positions 4-5"
+    );
+    assert!(
+        fn_entry.unwrap().1 > ai_entry.unwrap().1,
+        "'fn' border weight must exceed 'ai' interior weight"
+    );
 }
 
 #[test]
@@ -299,6 +301,7 @@ fn query_extract_covering_set_covers_positions() {
     let result = extract_query_ngrams_with_weights(query, &w);
     let bytes = query.as_bytes();
 
+    // Build coverage from the returned ngrams by scanning every bigram window.
     let mut covered = vec![false; bytes.len()];
     for (ngram, _) in &result {
         for (pos, window) in bytes.windows(2).enumerate() {
@@ -309,12 +312,20 @@ fn query_extract_covering_set_covers_positions() {
         }
     }
 
+    // The covering-set contract guarantees every byte position is covered,
+    // regardless of whether its bigrams appear in the weight table.
     for (pos, window) in bytes.windows(2).enumerate() {
-        let key = Ngram::from_bytes(window[0], window[1]).key();
-        if w.binary_search_by_key(&key, |&(k, _)| k).is_ok() {
-            assert!(covered[pos], "position {pos} must be covered");
-            assert!(covered[pos + 1], "position {} must be covered", pos + 1);
-        }
+        assert!(
+            covered[pos],
+            "byte position {pos} ('{:?}') must be covered by the selected ngrams",
+            window[0] as char
+        );
+        assert!(
+            covered[pos + 1],
+            "byte position {} ('{:?}') must be covered by the selected ngrams",
+            pos + 1,
+            window[1] as char
+        );
     }
 }
 
