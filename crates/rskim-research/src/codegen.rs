@@ -224,10 +224,7 @@ fn write_generated_tests(buf: &mut Vec<u8>) -> anyhow::Result<()> {
     writeln!(buf)?;
     writeln!(buf, "    #[test]")?;
     writeln!(buf, "    fn default_weight_is_positive() {{")?;
-    writeln!(
-        buf,
-        "        const {{ assert!(DEFAULT_WEIGHT > 0.0) }};"
-    )?;
+    writeln!(buf, "        const {{ assert!(DEFAULT_WEIGHT > 0.0) }};")?;
     writeln!(buf, "    }}")?;
     writeln!(buf, "}}")?;
     Ok(())
@@ -332,7 +329,10 @@ mod tests {
                 deduplicated_files: 0,
                 language_breakdown: vec![],
             },
-            weights: vec![BigramWeight { bigram: 0x666E, idf: 8.5 }],
+            weights: vec![BigramWeight {
+                bigram: 0x666E,
+                idf: 8.5,
+            }],
         };
 
         let json = serde_json::to_string(&table).unwrap();
@@ -362,7 +362,10 @@ mod tests {
                 deduplicated_files: 0,
                 language_breakdown: vec![],
             },
-            weights: vec![BigramWeight { bigram: 0x666E, idf: -1.5 }],
+            weights: vec![BigramWeight {
+                bigram: 0x666E,
+                idf: -1.5,
+            }],
         };
 
         let json = serde_json::to_string(&table).unwrap();

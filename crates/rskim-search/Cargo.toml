@@ -7,6 +7,7 @@ license = "MIT"
 description = "Code search foundation library for skim"
 repository = "https://github.com/dean0x/skim"
 publish = false
+exclude = ["data/"]
 
 [dependencies]
 # rskim-core provides Language (for type-safe lang filtering in SearchQuery) and
@@ -25,8 +26,6 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 todo = "warn"
-
-exclude = ["data/"]
 
 [lib]
 name = "rskim_search"

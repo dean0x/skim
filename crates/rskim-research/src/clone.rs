@@ -80,12 +80,8 @@ fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::
     // Move blocking `wait()` onto a background thread so the main thread can
     // enforce the deadline without using any unstable API.
     let (tx, rx) = mpsc::channel();
-    // We need to pass ownership of the child into the thread but also retain a
-    // handle to kill it on timeout.  `Child::try_wait` / `kill` require `&mut
-    // Child` so we use a raw id + a flag instead: after the timeout we kill via
-    // the retained handle and the thread will see the child exit.
-    //
-    // Strategy: pass child to thread, keep pid for kill via a second channel.
+    // Move the child into the background thread for blocking wait.  Capture the
+    // pid first so we can send SIGKILL on timeout without needing the Child handle.
     let child_id = child.id();
     std::thread::spawn(move || {
         let result = child.wait();
@@ -168,10 +164,7 @@ fn clone_repo(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
 
     // Full clone to access the pinned commit.
     let mut full_cmd = std::process::Command::new("git");
-    full_cmd
-        .args(security_args)
-        .args(["clone", url])
-        .arg(dest);
+    full_cmd.args(security_args).args(["clone", url]).arg(dest);
     let ok =
         git_run_with_timeout(full_cmd, "git clone (full)").context("running full git clone")?;
 
@@ -414,7 +407,7 @@ mod tests {
         // Constructed URL where last segment itself contains a slash-like char
         // after URL decoding — reject any embedded slash or backslash.
         assert!(
-            extract_repo_name("https://github.com/owner/a/b").is_err() == false,
+            extract_repo_name("https://github.com/owner/a/b").is_ok(),
             "'b' is the last segment and is safe"
         );
         // Backslash in the extracted name is the real concern.

@@ -15,7 +15,10 @@ use crate::types::BigramWeight;
 /// Callers must ensure the corpus is non-empty before invoking this function.
 #[must_use]
 pub fn compute_idf(df: u32, total_docs: u32) -> f32 {
-    debug_assert!(total_docs > 0, "total_docs must be > 0; got 0 — caller must guard against empty corpus");
+    debug_assert!(
+        total_docs > 0,
+        "total_docs must be > 0; got 0 — caller must guard against empty corpus"
+    );
     ((total_docs as f64) / ((df + 1) as f64)).ln() as f32 + 1.0
 }
 

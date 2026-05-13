@@ -214,14 +214,17 @@ fn log_validation_summary(weights: &[types::BigramWeight]) {
     );
 }
 
+/// Default path for `bigram_weights.json`: `<workspace>/crates/rskim-search/data/bigram_weights.json`,
+/// falling back to `bigram_weights.json` in the current directory if the workspace root cannot be found.
+fn default_json_path() -> PathBuf {
+    codegen::find_workspace_root()
+        .map(|root| root.join("crates/rskim-search/data/bigram_weights.json"))
+        .unwrap_or_else(|_| PathBuf::from("bigram_weights.json"))
+}
+
 /// Serialize the weight table to JSON and write it to the output path.
 fn write_weight_table(table: &types::WeightTable, output: Option<PathBuf>) -> anyhow::Result<()> {
-    let output_path = output.unwrap_or_else(|| {
-        // Default: crates/rskim-search/data/bigram_weights.json relative to workspace root.
-        codegen::find_workspace_root()
-            .map(|root| root.join("crates/rskim-search/data/bigram_weights.json"))
-            .unwrap_or_else(|_| PathBuf::from("bigram_weights.json"))
-    });
+    let output_path = output.unwrap_or_else(default_json_path);
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)
@@ -260,11 +263,7 @@ fn cmd_codegen(json_path: Option<PathBuf>, workspace_root: Option<PathBuf>) -> a
 }
 
 fn cmd_validate(json_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let json_path = json_path.unwrap_or_else(|| {
-        codegen::find_workspace_root()
-            .map(|root| root.join("crates/rskim-search/data/bigram_weights.json"))
-            .unwrap_or_else(|_| PathBuf::from("bigram_weights.json"))
-    });
+    let json_path = json_path.unwrap_or_else(default_json_path);
 
     let raw = std::fs::read_to_string(&json_path)
         .with_context(|| format!("reading {}", json_path.display()))?;
