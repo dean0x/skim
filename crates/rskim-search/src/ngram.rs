@@ -46,7 +46,7 @@ pub const BORDER_MULTIPLIER: f32 = 3.5;
 /// [`crate::weights::BIGRAM_WEIGHTS`], enabling O(log *n*) weight lookup via
 /// binary search.
 #[repr(transparent)]
-#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ngram(pub(crate) u16);
 
 impl Ngram {
