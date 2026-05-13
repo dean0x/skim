@@ -8,43 +8,32 @@
 //! 5. Fix-after-touch: proximity-based bug-introduction risk
 //! 6. Module encapsulation: cross-boundary coupling health
 
+mod args;
 mod excludes;
 mod git_source;
+mod insights;
 mod metrics;
 mod output;
 mod types;
+mod window;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::analytics::{CommandType, RecordingContext};
 
+use args::{parse_args, print_help};
 use excludes::{build_exclude_set, should_exclude};
 use git_source::{CliGitSource, GitDataSource};
+use insights::{build_insights_result, compute_insights};
 use metrics::{
     build_fix_regex, compute_authors, compute_churn, compute_coupling, compute_encapsulation,
     compute_fix_after_touch, compute_stability,
 };
-use output::{render_json, render_text};
-use types::{CommitRecord, FileMetrics, HeatmapConfig, HeatmapResult, ResolvedWindow, WindowInfo};
-
-// ============================================================================
-// Window presets
-// ============================================================================
-
-/// Map a named preset to `--since` epoch seconds offset.
-fn preset_to_since_secs(preset: &str, now_epoch: u64) -> Option<u64> {
-    match preset {
-        "sprint" => Some(now_epoch.saturating_sub(14 * 86400)),
-        "month" => Some(now_epoch.saturating_sub(30 * 86400)),
-        "quarter" => Some(now_epoch.saturating_sub(90 * 86400)),
-        "half" => Some(now_epoch.saturating_sub(180 * 86400)),
-        "year" => Some(now_epoch.saturating_sub(365 * 86400)),
-        "all" => Some(0),
-        _ => None,
-    }
-}
+use output::{render_insights_json, render_insights_text, render_json, render_text};
+use types::{CommitRecord, FileMetrics, HeatmapConfig, HeatmapResult, ResolvedWindow};
+use window::{build_window_info, format_epoch, resolve_effective_config};
 
 // ============================================================================
 // Entry point
@@ -295,12 +284,27 @@ fn run_with_source(
         config.top_n
     };
 
-    // Apply --top N limit to files
-    result.files.truncate(display_top_n);
-
     // Step 10: Render
     let elapsed = start_time.elapsed();
     let mut stdout = io::stdout().lock();
+
+    // Insights early-return (before truncation — insights use full dataset)
+    if config.insights {
+        let insights = compute_insights(&result);
+        if config.format_json {
+            let insights_result = build_insights_result(&result, insights);
+            let json = render_insights_json(&insights_result)?;
+            writeln!(stdout, "{json}")?;
+        } else {
+            let text = render_insights_text(&insights);
+            write!(stdout, "{text}")?;
+        }
+        record_heatmap_analytics(analytics, "skim heatmap --insights", elapsed);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Apply --top N limit to files (not needed for insights)
+    result.files.truncate(display_top_n);
 
     if config.format_json {
         let json = render_json(&result)?;
@@ -311,6 +315,17 @@ fn run_with_source(
     }
 
     // Step 11: Fire-and-forget analytics
+    record_heatmap_analytics(analytics, "skim heatmap", elapsed);
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Fire-and-forget analytics recording for heatmap commands.
+fn record_heatmap_analytics(
+    analytics: &crate::analytics::AnalyticsConfig,
+    command: &str,
+    elapsed: std::time::Duration,
+) {
     let rec = RecordingContext {
         enabled: analytics.enabled,
         command_type: CommandType::Heatmap,
@@ -319,13 +334,11 @@ fn run_with_source(
     };
     crate::analytics::try_record_command(
         rec,
-        String::new(), // no raw text for heatmap
-        String::new(), // no compressed text
-        "skim heatmap".to_string(),
+        String::new(),
+        String::new(),
+        command.to_string(),
         elapsed,
     );
-
-    Ok(ExitCode::SUCCESS)
 }
 
 // ============================================================================
@@ -400,8 +413,6 @@ fn compute_heatmap(
     repository: String,
     warnings: Vec<String>,
 ) -> HeatmapResult {
-    use std::time::Instant;
-
     let t0 = Instant::now();
     let fix_regex = build_fix_regex();
 
@@ -502,463 +513,6 @@ fn compute_heatmap(
 }
 
 // ============================================================================
-// Config resolution
-// ============================================================================
-
-/// Resolve the effective `HeatmapConfig` by applying presets and `--last`.
-///
-/// Precedence: `--since` > `--last` > `--window` preset > dual default.
-///
-/// Returns a tuple of:
-/// - `HeatmapConfig` with `since` set to the resolved epoch (used by `fetch_commits`)
-/// - `ResolvedWindow` carrying window metadata (mode, dual fields) for `build_window_info`
-fn resolve_effective_config(
-    config: &HeatmapConfig,
-    source: &dyn GitDataSource,
-    warnings: &mut Vec<String>,
-    now_epoch: u64,
-) -> anyhow::Result<(HeatmapConfig, ResolvedWindow)> {
-    let mut effective = config.clone();
-    let mut window = ResolvedWindow {
-        since: None,
-        dual_mode: false,
-        dual_time_since: None,
-        dual_count_since: None,
-        window_preset: config.window_preset.clone(),
-        last_n: config.last_n,
-    };
-
-    // Count explicit time-selection flags
-    let explicit_count = [
-        config.since.is_some(),
-        config.last_n.is_some(),
-        config.window_preset.is_some(),
-    ]
-    .into_iter()
-    .filter(|b| *b)
-    .count();
-
-    if explicit_count > 1 {
-        warnings.push(
-            "Multiple window flags specified — using first (--since > --last > --window)."
-                .to_string(),
-        );
-    }
-
-    if let Some(since) = config.since {
-        // Already set — highest precedence
-        effective.since = Some(since);
-        window.since = Some(since);
-    } else if let Some(n) = config.last_n {
-        // --last N: find the timestamp of the Nth commit
-        match source.fetch_commit_count_since(n) {
-            Ok(Some(ts)) => {
-                effective.since = Some(ts);
-                window.since = Some(ts);
-            }
-            Ok(None) => {
-                warnings.push(format!(
-                    "Repository has fewer than {n} commits — analyzing all history."
-                ));
-            }
-            Err(e) => {
-                warnings.push(format!("Could not resolve --last {n}: {e}"));
-            }
-        }
-    } else if let Some(ref preset) = config.window_preset {
-        if let Some(since) = preset_to_since_secs(preset, now_epoch) {
-            effective.since = Some(since);
-            window.since = Some(since);
-        } else {
-            warnings.push(format!(
-                "Unknown window preset '{preset}' — valid: sprint, month, quarter, half, year, all. Analyzing all history."
-            ));
-        }
-    } else {
-        // Dual default: max(last 90 days, last 200 commits)
-        let time_since = now_epoch.saturating_sub(90 * 86400);
-
-        let count_since = match source.fetch_commit_count_since(200) {
-            Ok(Some(ts)) => ts,
-            _ => time_since, // fallback to time-based if lookup fails
-        };
-
-        // Use whichever captures more history (lower epoch = more history)
-        let resolved_since = time_since.min(count_since);
-        effective.since = Some(resolved_since);
-        window.since = Some(resolved_since);
-        window.dual_mode = true;
-        window.dual_time_since = Some(time_since);
-        window.dual_count_since = Some(count_since);
-    }
-
-    Ok((effective, window))
-}
-
-// ============================================================================
-// Window info construction
-// ============================================================================
-
-fn build_window_info(
-    window: &ResolvedWindow,
-    commits_analyzed: usize,
-    now_epoch: u64,
-) -> WindowInfo {
-    let mode = if window.dual_mode {
-        "dual".to_string()
-    } else if let Some(ref preset) = window.window_preset {
-        preset.clone()
-    } else if window.last_n.is_some() {
-        "count".to_string()
-    } else if window.since.is_some() {
-        "time".to_string()
-    } else {
-        "dual".to_string()
-    };
-
-    let since_str = window
-        .since
-        .map(format_epoch)
-        .unwrap_or_else(|| "all".to_string());
-
-    let effective_strategy = if window.dual_mode {
-        let time_since = window.dual_time_since.unwrap_or(0);
-        let count_since = window.dual_count_since.unwrap_or(0);
-        let strategy = if time_since <= count_since {
-            "time"
-        } else {
-            "count"
-        };
-        Some(strategy.to_string())
-    } else {
-        None
-    };
-
-    WindowInfo {
-        mode,
-        since: since_str,
-        until: format_epoch(now_epoch),
-        commits_analyzed,
-        effective_strategy,
-    }
-}
-
-// ============================================================================
-// Formatting helpers
-// ============================================================================
-
-/// Format a Unix epoch as a simple date string (YYYY-MM-DD).
-fn format_epoch(epoch: u64) -> String {
-    // Manual calculation — no chrono dependency
-    // Days since 1970-01-01
-    let days = epoch / 86400;
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}")
-}
-
-/// Convert days since 1970-01-01 to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month prime
-    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
-    let y_adj = if m <= 2 { y + 1 } else { y };
-    (y_adj, m, d)
-}
-
-// ============================================================================
-// Argument parsing
-// ============================================================================
-
-/// Parse CLI args into `HeatmapConfig`.
-///
-/// Follows the manual flag-parsing pattern used by `stats.rs` and `discover.rs`.
-/// Initialises `config.debug` from the process-wide debug flag so that
-/// `SKIM_DEBUG=1` (initialised by `main()` before dispatch) is honoured automatically.
-fn parse_args(args: &[String]) -> anyhow::Result<HeatmapConfig> {
-    let mut config = HeatmapConfig {
-        // Inherit SKIM_DEBUG / --debug flag set by main() before subcommand dispatch.
-        debug: crate::debug::is_debug_enabled(),
-        ..HeatmapConfig::default()
-    };
-    let mut i = 0;
-
-    // Value-taking flags — used to detect when a flag is passed without a value
-    // (e.g. `skim heatmap --since`) before extract_value calls so the error is
-    // actionable rather than falling through to "unknown flag: --since".
-    const VALUE_FLAGS: &[&str] = &[
-        "--since",
-        "--path",
-        "--top",
-        "--window",
-        "--last",
-        "--exclude",
-        "--coupling-threshold",
-        "--fix-window",
-        "--format",
-        "--diff",
-    ];
-
-    while i < args.len() {
-        let arg = args[i].as_str();
-
-        if VALUE_FLAGS.contains(&arg) && i + 1 >= args.len() {
-            anyhow::bail!("{arg} requires a value");
-        }
-
-        // --since=VALUE or --since VALUE
-        if let Some(val) = extract_value(args, &mut i, "--since") {
-            let ts = parse_since_value(&val)?;
-            config.since = Some(ts);
-            continue;
-        }
-
-        // --path
-        if let Some(val) = extract_value(args, &mut i, "--path") {
-            config.path = Some(val);
-            continue;
-        }
-
-        // --top
-        if let Some(val) = extract_value(args, &mut i, "--top") {
-            let n: usize = val
-                .parse()
-                .map_err(|_| anyhow::anyhow!("--top requires a positive integer"))?;
-            if n == 0 {
-                anyhow::bail!("--top must be at least 1");
-            }
-            config.top_n = n;
-            config.top_explicit = true;
-            continue;
-        }
-
-        // --window
-        if let Some(val) = extract_value(args, &mut i, "--window") {
-            config.window_preset = Some(val);
-            continue;
-        }
-
-        // --last
-        if let Some(val) = extract_value(args, &mut i, "--last") {
-            let n: usize = val
-                .parse()
-                .map_err(|_| anyhow::anyhow!("--last requires a positive integer"))?;
-            if n == 0 {
-                anyhow::bail!("--last must be at least 1");
-            }
-            config.last_n = Some(n);
-            continue;
-        }
-
-        // --exclude
-        if let Some(val) = extract_value(args, &mut i, "--exclude") {
-            config.extra_excludes.push(val);
-            continue;
-        }
-
-        // --coupling-threshold
-        if let Some(val) = extract_value(args, &mut i, "--coupling-threshold") {
-            config.coupling_threshold = val
-                .parse::<f64>()
-                .map_err(|_| {
-                    anyhow::anyhow!("--coupling-threshold requires a float between 0 and 1")
-                })?
-                .clamp(0.0, 1.0);
-            continue;
-        }
-
-        // --fix-window
-        if let Some(val) = extract_value(args, &mut i, "--fix-window") {
-            let n: usize = val
-                .parse()
-                .map_err(|_| anyhow::anyhow!("--fix-window requires a positive integer"))?;
-            if n == 0 {
-                anyhow::bail!("--fix-window must be at least 1");
-            }
-            config.fix_window = n;
-            continue;
-        }
-
-        // --format VALUE
-        if let Some(val) = extract_value(args, &mut i, "--format") {
-            if val == "json" {
-                config.format_json = true;
-            } else {
-                anyhow::bail!("--format only supports 'json', got: {val}");
-            }
-            continue;
-        }
-
-        // --diff VALUE
-        if let Some(val) = extract_value(args, &mut i, "--diff") {
-            config.diff_base = Some(val);
-            continue;
-        }
-
-        // Boolean flags
-        if apply_boolean_flag(&mut config, arg)? {
-            i += 1;
-            continue;
-        }
-
-        if arg.starts_with('-') {
-            anyhow::bail!("unknown flag: {arg}");
-        }
-        // Positional (non-flag) argument — file target.
-        config.files.push(arg.to_string());
-        i += 1;
-        continue;
-    }
-
-    // Post-parse validation
-    if config.diff_base.is_some() && !config.files.is_empty() {
-        anyhow::bail!("cannot combine --diff with explicit file arguments");
-    }
-
-    // Normalize file paths: strip leading ./
-    for f in &mut config.files {
-        if let Some(stripped) = f.strip_prefix("./") {
-            *f = stripped.to_string();
-        }
-    }
-
-    Ok(config)
-}
-
-/// Apply a recognised boolean flag to `config`.
-///
-/// Returns `Ok(true)` if the flag was recognised and applied, `Ok(false)` if
-/// the flag is unknown (caller falls through to the unknown-flag error).
-fn apply_boolean_flag(config: &mut HeatmapConfig, flag: &str) -> anyhow::Result<bool> {
-    match flag {
-        "--json" => config.format_json = true,
-        "--no-exclude" => config.no_exclude = true,
-        "--debug" => {
-            config.debug = true;
-            crate::debug::force_enable_debug();
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
-}
-
-/// Extract a `--flag VALUE` or `--flag=VALUE` pair, advancing `i`.
-///
-/// Returns `Some(value_string)` on match, `None` otherwise. Advances `i`
-/// past the consumed argument(s).
-fn extract_value(args: &[String], i: &mut usize, flag: &str) -> Option<String> {
-    let arg = args[*i].as_str();
-    let equals_prefix = format!("{flag}=");
-
-    if arg == flag {
-        // --flag VALUE form
-        if *i + 1 < args.len() {
-            *i += 2;
-            Some(args[*i - 1].clone())
-        } else {
-            None
-        }
-    } else if let Some(val) = arg.strip_prefix(&equals_prefix) {
-        // --flag=VALUE form
-        *i += 1;
-        Some(val.to_string())
-    } else {
-        None
-    }
-}
-
-/// Parse a `--since` value: accepts epoch seconds (integer) or duration strings
-/// like "30d", "2w", "24h".
-fn parse_since_value(val: &str) -> anyhow::Result<u64> {
-    // Try plain integer (epoch seconds)
-    if let Ok(epoch) = val.parse::<u64>() {
-        return Ok(epoch);
-    }
-    // Try duration string
-    let sys_time = crate::cmd::session::types::parse_duration_ago(val)?;
-    let epoch = sys_time
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| anyhow::anyhow!("--since: time before Unix epoch"))?
-        .as_secs();
-    Ok(epoch)
-}
-
-// ============================================================================
-// Help
-// ============================================================================
-
-fn print_help() {
-    print!(
-        "\
-skim heatmap — git history risk and coupling analysis
-
-USAGE:
-    skim heatmap [OPTIONS] [FILE...]
-
-OPTIONS:
-    --since <VALUE>               Analyze commits since epoch (seconds) or duration (30d, 2w, 24h)
-    --last <N>                    Analyze last N commits
-    --window <PRESET>             Named window: sprint|month|quarter|half|year|all
-    --path <DIR>                  Scope analysis to files under this path
-    --diff <BASE>                 Show only files changed vs BASE (three-dot diff)
-    --json, --format json         Output JSON instead of human-readable text
-    --top <N>                     Maximum files to display (default: 20)
-    --no-exclude                  Disable default exclusion patterns (lock files, build dirs, etc.)
-    --exclude <PATTERN>           Add extra glob pattern to exclude (repeatable)
-    --coupling-threshold <FLOAT>  Coupling confidence threshold (default: 0.5)
-    --fix-window <N>              Proximity window for fix-after-touch detection (default: 5)
-    --debug                       Enable debug output
-    -h, --help                    Show this help message
-
-WINDOW PRESETS:
-    sprint     14 days
-    month      30 days
-    quarter    90 days
-    half       180 days
-    year       365 days
-    all        No time limit (analyze entire history)
-
-FILE TARGETING:
-    Positional file arguments and --diff scope the OUTPUT, not the git history.
-    Metrics are computed on full commit history for accuracy — coupling and
-    fix-risk scores reflect the complete picture, then display is narrowed.
-
-    --path scopes the git log itself (commit-level filter). File targeting and
-    --path compose: --path limits which commits are analyzed, file arguments
-    limit which results are shown.
-
-    --diff and explicit file arguments are mutually exclusive.
-
-EXAMPLES:
-    skim heatmap                           # Analyze last 90 days
-    skim heatmap --last 200                # Analyze last 200 commits
-    skim heatmap --window sprint           # Analyze last sprint
-    skim heatmap --since 30d               # Analyze last 30 days
-    skim heatmap --json                    # JSON output
-    skim heatmap --path src/               # Scope to src/ directory
-    skim heatmap --no-exclude              # Include lock files and build artifacts
-    skim heatmap --coupling-threshold 0.3  # Lower coupling threshold
-    skim heatmap src/main.rs               # Scope output to one file
-    skim heatmap --diff main               # Show files changed vs main
-    skim heatmap --path src/ src/main.rs   # Combine path + file scoping
-
-METRICS:
-    Top Churn          Files changed most frequently
-    Blast Radius       Files that tend to change together (coupling)
-    Fix Risk           Files with high fix-commit density or fix-after-touch
-    Module Health      Directory encapsulation (cross-boundary coupling)
-    Bus Factor Risk    Files with a single dominant author (>80%% of commits)
-"
-    );
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -966,369 +520,6 @@ METRICS:
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_args_defaults() {
-        let config = parse_args(&[]).unwrap();
-        assert_eq!(config.top_n, 20);
-        assert!((config.coupling_threshold - 0.5).abs() < 1e-9);
-        assert_eq!(config.fix_window, 5);
-        assert!(!config.format_json);
-        assert!(!config.no_exclude);
-    }
-
-    #[test]
-    fn test_parse_args_json_flag() {
-        let config = parse_args(&["--json".to_string()]).unwrap();
-        assert!(config.format_json);
-    }
-
-    #[test]
-    fn test_parse_args_top_n() {
-        let config = parse_args(&["--top".to_string(), "5".to_string()]).unwrap();
-        assert_eq!(config.top_n, 5);
-    }
-
-    #[test]
-    fn test_parse_args_top_n_equals() {
-        let config = parse_args(&["--top=10".to_string()]).unwrap();
-        assert_eq!(config.top_n, 10);
-    }
-
-    #[test]
-    fn test_parse_args_window_preset() {
-        let config = parse_args(&["--window=sprint".to_string()]).unwrap();
-        assert_eq!(config.window_preset.as_deref(), Some("sprint"));
-    }
-
-    #[test]
-    fn test_parse_args_last_n() {
-        let config = parse_args(&["--last=100".to_string()]).unwrap();
-        assert_eq!(config.last_n, Some(100));
-    }
-
-    #[test]
-    fn test_parse_args_no_exclude() {
-        let config = parse_args(&["--no-exclude".to_string()]).unwrap();
-        assert!(config.no_exclude);
-    }
-
-    #[test]
-    fn test_parse_args_coupling_threshold() {
-        let config = parse_args(&["--coupling-threshold=0.3".to_string()]).unwrap();
-        assert!((config.coupling_threshold - 0.3).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_parse_args_since_epoch() {
-        let config = parse_args(&["--since=1700000000".to_string()]).unwrap();
-        assert_eq!(config.since, Some(1_700_000_000));
-    }
-
-    #[test]
-    fn test_parse_args_since_duration() {
-        let config = parse_args(&["--since=30d".to_string()]).unwrap();
-        // Should be set to some epoch in the past
-        assert!(config.since.is_some());
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let since = config.since.unwrap();
-        let diff = now - since;
-        assert!(diff >= 29 * 86400 && diff <= 31 * 86400);
-    }
-
-    #[test]
-    fn test_parse_args_path() {
-        let config = parse_args(&["--path=src/".to_string()]).unwrap();
-        assert_eq!(config.path.as_deref(), Some("src/"));
-    }
-
-    #[test]
-    fn test_parse_args_unknown_flag_errors() {
-        let result = parse_args(&["--unknown-flag".to_string()]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_format_epoch_known_date() {
-        // 2024-01-01 = 1704067200
-        assert_eq!(format_epoch(1_704_067_200), "2024-01-01");
-    }
-
-    #[test]
-    fn test_format_epoch_unix_epoch() {
-        assert_eq!(format_epoch(0), "1970-01-01");
-    }
-
-    #[test]
-    fn test_preset_to_since_secs_sprint() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let since = preset_to_since_secs("sprint", now).unwrap();
-        let diff = now - since;
-        assert!(diff >= 13 * 86400 && diff <= 15 * 86400);
-    }
-
-    #[test]
-    fn test_preset_to_since_secs_unknown() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        assert!(preset_to_since_secs("unknown-preset", now).is_none());
-    }
-
-    #[test]
-    fn test_parse_args_top_zero_errors() {
-        let result = parse_args(&["--top=0".to_string()]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("--top must be at least 1"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_parse_args_fix_window_zero_errors() {
-        let result = parse_args(&["--fix-window=0".to_string()]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("--fix-window must be at least 1"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_parse_args_last_zero_errors() {
-        let result = parse_args(&["--last=0".to_string()]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("--last must be at least 1"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_parse_args_since_missing_value_errors() {
-        let result = parse_args(&["--since".to_string()]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("--since requires a value"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_parse_args_positional_files() {
-        let config = parse_args(&["src/main.rs".to_string(), "src/lib.rs".to_string()]).unwrap();
-        assert_eq!(config.files, vec!["src/main.rs", "src/lib.rs"]);
-    }
-
-    #[test]
-    fn test_parse_args_diff_flag() {
-        let config = parse_args(&["--diff".to_string(), "main".to_string()]).unwrap();
-        assert_eq!(config.diff_base, Some("main".to_string()));
-    }
-
-    #[test]
-    fn test_parse_args_diff_equals() {
-        let config = parse_args(&["--diff=develop".to_string()]).unwrap();
-        assert_eq!(config.diff_base, Some("develop".to_string()));
-    }
-
-    #[test]
-    fn test_parse_args_diff_and_files_mutual_exclusion() {
-        let result = parse_args(&[
-            "--diff".to_string(),
-            "main".to_string(),
-            "file.rs".to_string(),
-        ]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("cannot combine --diff"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_parse_args_file_path_normalization() {
-        let config = parse_args(&["./src/main.rs".to_string()]).unwrap();
-        assert_eq!(config.files, vec!["src/main.rs"]);
-    }
-
-    #[test]
-    fn test_parse_args_top_explicit_flag() {
-        let config = parse_args(&["--top".to_string(), "5".to_string()]).unwrap();
-        assert!(config.top_explicit);
-    }
-
-    #[test]
-    fn test_parse_args_top_implicit_by_default() {
-        let config = parse_args(&[]).unwrap();
-        assert!(!config.top_explicit);
-    }
-
-    #[test]
-    fn test_parse_args_diff_without_value() {
-        let result = parse_args(&["--diff".to_string()]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("requires a value"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_parse_args_files_with_other_flags() {
-        let config = parse_args(&[
-            "--since".to_string(),
-            "30d".to_string(),
-            "src/main.rs".to_string(),
-            "--json".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(config.files, vec!["src/main.rs"]);
-        assert!(config.format_json);
-        assert!(config.since.is_some());
-    }
-
-    #[test]
-    fn test_days_to_ymd_epoch() {
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn test_days_to_ymd_known_date() {
-        // 2024-01-01 = 19723 days since epoch
-        assert_eq!(days_to_ymd(19723), (2024, 1, 1));
-    }
-
-    #[test]
-    fn test_parse_args_extra_exclude() {
-        let config = parse_args(&["--exclude=*.generated.ts".to_string()]).unwrap();
-        assert_eq!(config.extra_excludes, vec!["*.generated.ts"]);
-    }
-
-    #[test]
-    fn test_parse_args_fix_window() {
-        let config = parse_args(&["--fix-window=10".to_string()]).unwrap();
-        assert_eq!(config.fix_window, 10);
-    }
-
-    // -----------------------------------------------------------------------
-    // build_window_info
-    // -----------------------------------------------------------------------
-
-    fn base_window() -> ResolvedWindow {
-        ResolvedWindow {
-            since: None,
-            dual_mode: false,
-            dual_time_since: None,
-            dual_count_since: None,
-            window_preset: None,
-            last_n: None,
-        }
-    }
-
-    const NOW: u64 = 1_704_067_200; // 2024-01-01
-
-    #[test]
-    fn test_build_window_info_dual_mode() {
-        let window = ResolvedWindow {
-            dual_mode: true,
-            // time_since <= count_since → effective_strategy = "time"
-            dual_time_since: Some(1_000_000),
-            dual_count_since: Some(2_000_000),
-            ..base_window()
-        };
-
-        let info = build_window_info(&window, 42, NOW);
-
-        assert_eq!(info.mode, "dual");
-        assert_eq!(info.commits_analyzed, 42);
-        assert_eq!(info.effective_strategy.as_deref(), Some("time"));
-    }
-
-    #[test]
-    fn test_build_window_info_dual_mode_count_wins() {
-        let window = ResolvedWindow {
-            dual_mode: true,
-            // time_since > count_since → effective_strategy = "count"
-            dual_time_since: Some(2_000_000),
-            dual_count_since: Some(1_000_000),
-            ..base_window()
-        };
-
-        let info = build_window_info(&window, 10, NOW);
-
-        assert_eq!(info.mode, "dual");
-        assert_eq!(info.effective_strategy.as_deref(), Some("count"));
-    }
-
-    #[test]
-    fn test_build_window_info_preset_mode() {
-        let window = ResolvedWindow {
-            window_preset: Some("quarter".to_string()),
-            ..base_window()
-        };
-
-        let info = build_window_info(&window, 50, NOW);
-
-        assert_eq!(info.mode, "quarter");
-        assert!(info.effective_strategy.is_none());
-    }
-
-    #[test]
-    fn test_build_window_info_count_mode() {
-        let window = ResolvedWindow {
-            last_n: Some(200),
-            ..base_window()
-        };
-
-        let info = build_window_info(&window, 200, NOW);
-
-        assert_eq!(info.mode, "count");
-        assert!(info.effective_strategy.is_none());
-    }
-
-    #[test]
-    fn test_build_window_info_time_mode() {
-        let window = ResolvedWindow {
-            since: Some(1_700_000_000),
-            ..base_window()
-        };
-
-        let info = build_window_info(&window, 77, NOW);
-
-        assert_eq!(info.mode, "time");
-        assert_eq!(info.since, "2023-11-14"); // epoch 1_700_000_000
-        assert!(info.effective_strategy.is_none());
-    }
-
-    #[test]
-    fn test_build_window_info_default_falls_back_to_dual() {
-        // No flags set → falls through to the "dual" fallback mode string.
-        // dual_mode=false, so effective_strategy is None (only set in the dual_mode branch).
-        let window = base_window();
-
-        let info = build_window_info(&window, 0, NOW);
-
-        assert_eq!(info.mode, "dual");
-        assert!(info.effective_strategy.is_none());
-    }
-
-    #[test]
-    fn test_build_window_info_no_since_shows_all() {
-        let window = base_window();
-
-        let info = build_window_info(&window, 0, NOW);
-
-        assert_eq!(info.since, "all");
-    }
-
-    #[test]
-    fn test_build_window_info_commits_analyzed_passthrough() {
-        let window = base_window();
-
-        let info = build_window_info(&window, 999, NOW);
-
-        assert_eq!(info.commits_analyzed, 999);
-    }
 
     // -----------------------------------------------------------------------
     // apply_file_scope
@@ -1509,5 +700,47 @@ mod tests {
             !module_paths.contains(&"tests"),
             "expected 'tests' module to be dropped, got: {module_paths:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Analytics recording
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn test_record_heatmap_analytics_insights_label() {
+        use std::time::Duration;
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        let _ = crate::analytics::AnalyticsDb::open(tmp.path()).unwrap();
+
+        std::env::set_var("SKIM_ANALYTICS_DB", &db_path);
+
+        let analytics = crate::analytics::AnalyticsConfig {
+            enabled: true,
+            input_cost_per_mtok: None,
+            session_id: None,
+        };
+
+        record_heatmap_analytics(
+            &analytics,
+            "skim heatmap --insights",
+            Duration::from_millis(42),
+        );
+        crate::analytics::flush_pending();
+
+        let db = crate::analytics::AnalyticsDb::open(tmp.path()).unwrap();
+        let cmds = db.query_by_original_cmd(None).unwrap();
+        assert!(
+            cmds.iter()
+                .any(|c| c.original_cmd == "skim heatmap --insights"),
+            "expected 'skim heatmap --insights' in recorded commands, got: {:?}",
+            cmds.iter().map(|c| &c.original_cmd).collect::<Vec<_>>()
+        );
+
+        std::env::remove_var("SKIM_ANALYTICS_DB");
     }
 }

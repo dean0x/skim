@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`skim heatmap --insights` flag** — threshold-filtered one-liner findings for focused risk analysis. Reports only CRITICAL/WARNING severity metrics (fix-risk, bus-factor, churn, coupling) in text and JSON formats, skipping healthy files
 - **`skim psql` subcommand** — PostgreSQL query output compression via three-tier degradation: Tier 1 (tabular `----+----` format), Tier 2 (regex row-count extraction), Tier 3 (passthrough). Supports `--json` for structured `DbResult` output (#117)
 - **`skim mysql` subcommand** — MySQL query output compression: Tier 1 (TSV batch output), Tier 2 (bordered `+---+` table format), Tier 3 (passthrough). Handles empty-set detection and multi-result sets. Supports `--json` (#117)
 - **`skim sqlite3` subcommand** — SQLite query output compression: Tier 1 (pipe-separated with `-header -separator |` injection), Tier 3 (passthrough for schema dumps and meta-commands). Supports `--json` (#117)

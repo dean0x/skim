@@ -661,7 +661,7 @@ fn test_heatmap_registered_in_help() {
 
 #[test]
 fn test_heatmap_explicit_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -693,7 +693,7 @@ fn test_heatmap_explicit_files() {
 
 #[test]
 fn test_heatmap_explicit_files_text_header() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -714,7 +714,7 @@ fn test_heatmap_explicit_files_text_header() {
 
 #[test]
 fn test_heatmap_diff_and_files_mutual_exclusion() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     Command::cargo_bin("skim")
@@ -731,7 +731,7 @@ fn test_heatmap_diff_and_files_mutual_exclusion() {
 
 #[test]
 fn test_heatmap_diff_bad_ref() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     Command::cargo_bin("skim")
@@ -749,7 +749,7 @@ fn test_heatmap_diff_bad_ref() {
 
 #[test]
 fn test_heatmap_file_not_in_history() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -775,7 +775,7 @@ fn test_heatmap_file_not_in_history() {
 
 #[test]
 fn test_heatmap_files_no_top_truncation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -797,7 +797,7 @@ fn test_heatmap_files_no_top_truncation() {
 
 #[test]
 fn test_heatmap_no_targets_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     let output = Command::cargo_bin("skim")
@@ -818,7 +818,7 @@ fn test_heatmap_no_targets_unchanged() {
 
 #[test]
 fn test_heatmap_diff_flag() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     // Create a branch from the current state
@@ -861,7 +861,7 @@ fn test_heatmap_diff_flag() {
 
 #[test]
 fn test_heatmap_diff_no_changes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     create_test_repo(dir.path());
 
     Command::cargo_bin("skim")
@@ -877,7 +877,7 @@ fn test_heatmap_diff_no_changes() {
 
 #[test]
 fn test_heatmap_coupling_preserved_with_targets() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("tempdir");
     let ts = recent_ts();
 
     git_init(dir.path());
@@ -925,4 +925,190 @@ fn test_heatmap_coupling_preserved_with_targets() {
         has_config_edge,
         "coupling graph should include config.rs edge: {coupling:?}"
     );
+}
+
+// ============================================================================
+// --insights flag
+// ============================================================================
+
+#[test]
+fn test_insights_text_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--insights"])
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Insights"));
+}
+
+#[test]
+fn test_insights_text_no_metric_sections() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+
+    // --insights should produce only the Insights section, not the full heatmap sections
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--insights"])
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Top Churn").not())
+        .stdout(predicate::str::contains("Blast Radius").not())
+        .stdout(predicate::str::contains("Module Health").not())
+        .stdout(predicate::str::contains("Bus Factor").not());
+}
+
+#[test]
+fn test_insights_json_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--insights", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn skim heatmap --insights --json");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("expected valid JSON from --insights --json");
+
+    assert!(parsed["insights"].is_array(), "insights must be array");
+    assert_eq!(parsed["version"], 1, "version must be 1");
+}
+
+#[test]
+fn test_insights_json_has_top_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--insights", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn skim heatmap --insights --json");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert!(
+        parsed["top_files"].is_array(),
+        "top_files must be array in insights JSON"
+    );
+    assert!(
+        parsed["flagged_modules"].is_array(),
+        "flagged_modules must be array in insights JSON"
+    );
+}
+
+#[test]
+fn test_json_without_insights_unchanged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn skim heatmap --json");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    // Regular --json output should NOT have insights-specific top-level keys
+    assert!(
+        parsed.get("insights").is_none(),
+        "regular --json should not have 'insights' key"
+    );
+    assert!(
+        parsed.get("top_files").is_none(),
+        "regular --json should not have 'top_files' key"
+    );
+    // But it should have the standard heatmap keys
+    assert!(parsed["files"].is_array(), "files must be present");
+    assert!(parsed["modules"].is_array(), "modules must be present");
+}
+
+#[test]
+fn test_insights_empty_repo() {
+    // A repo with a single commit yields very few metrics — insights should gracefully handle it
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let base_ts = recent_ts();
+    git_commit(
+        dir.path(),
+        "src/main.rs",
+        "fn main() {}",
+        "feat: initial",
+        base_ts,
+    );
+
+    // With only 1 commit, the tool might succeed or fail depending on min threshold.
+    // Both outcomes are valid; assert specific behavior on each path so a panic or
+    // unexpected output is caught rather than silently passing.
+    let output = Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--insights"])
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn skim heatmap --insights");
+
+    if output.status.success() {
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        // Either findings or empty-state message — any other output is a regression.
+        assert!(
+            stdout.contains("Insights") || stdout.contains("no notable findings"),
+            "expected Insights header or empty-state message on success, got: {stdout}"
+        );
+    } else {
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        // On failure the tool must emit a known diagnostic — not a panic or silent crash.
+        assert!(
+            stderr.contains("No commits") || stderr.contains("No analyzable"),
+            "expected known diagnostic on non-zero exit, got stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_insights_with_file_targeting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    create_test_repo(dir.path());
+
+    // --insights with a positional file arg should succeed and show insights output
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--insights", "src/main.rs"])
+        .env("NO_COLOR", "1")
+        .current_dir(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Insights"));
+}
+
+#[test]
+fn test_insights_help_text() {
+    Command::cargo_bin("skim")
+        .unwrap()
+        .args(["heatmap", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--insights"));
 }
