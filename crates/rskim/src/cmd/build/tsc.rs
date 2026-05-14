@@ -61,9 +61,11 @@ fn parse_tsc(output: &CommandOutput) -> ParseResult<BuildResult> {
         return result;
     }
 
-    // If both stdout and stderr are empty/whitespace, it's a successful build
+    // If both stdout and stderr are empty/whitespace, reflect the exit code.
+    // exit_code == Some(0) → success; None (signal-killed) → failure.
     if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() {
-        let result = BuildResult::new(true, 0, 0, None, vec![]);
+        let success = output.exit_code == Some(0);
+        let result = BuildResult::new(success, 0, 0, None, vec![]);
         return ParseResult::Full(result);
     }
 
@@ -218,6 +220,26 @@ mod tests {
         if let ParseResult::Full(build_result) = &result {
             assert!(build_result.success, "expected success");
             assert_eq!(build_result.errors, 0, "expected 0 errors");
+        }
+    }
+
+    #[test]
+    fn test_signal_killed_tsc_is_failure() {
+        // exit_code: None means the process was killed by a signal (e.g. SIGKILL).
+        // Empty output + None exit code must be treated as failure, not success.
+        let output = make_output("", "", None);
+        let result = parse_tsc(&output);
+
+        assert!(
+            result.is_full(),
+            "expected Full, got {:?}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(build_result) = &result {
+            assert!(
+                !build_result.success,
+                "signal-killed process must not be success"
+            );
         }
     }
 

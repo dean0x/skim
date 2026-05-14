@@ -67,7 +67,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Three-tier degradation from structured parse to regex fallback to passthrough
 
 ### Build Output Compression
-- `skim cargo build`, `skim cargo clippy`, `skim tsc`
+- `skim cargo build`, `skim cargo clippy`, `skim make`, `skim tsc`
 - Extracts errors, warnings, and summaries
 
 ### Lint Output Compression
@@ -578,7 +578,7 @@ cargo bench
 
 ✅ **Command Output Compression:**
 - Test runners: cargo test, pytest, vitest/jest, go test
-- Build tools: cargo build, cargo clippy, tsc
+- Build tools: cargo build, cargo clippy, make, tsc
 - Git: status, diff, log
 - File tools: find, ls, tree, grep, rg
 - Log: JSON structured + plaintext dedup, debug filtering, stack trace collapsing

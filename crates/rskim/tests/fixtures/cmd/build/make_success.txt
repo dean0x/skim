@@ -1,0 +1,5 @@
+gcc -c -o main.o main.c -Wall -Wextra -I/usr/include -std=c11 -O2
+gcc -c -o utils.o utils.c -Wall -Wextra -I/usr/include -std=c11 -O2
+gcc -c -o parser.o parser.c -Wall -Wextra -I/usr/include -std=c11 -O2
+ar rcs libutil.a utils.o parser.o
+gcc -o myapp main.o -L. -lutil -lm

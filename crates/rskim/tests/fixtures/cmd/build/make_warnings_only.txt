@@ -1,0 +1,5 @@
+gcc -c -o main.o main.c -Wall -Wextra
+main.c:12:5: warning: unused variable 'temp' [-Wunused-variable]
+main.c:30:10: warning: implicit declaration of function 'helper' [-Wimplicit-function-declaration]
+gcc -c -o utils.o utils.c -Wall -Wextra
+gcc -o myapp main.o utils.o -lm

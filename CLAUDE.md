@@ -171,6 +171,7 @@ cargo fmt -- --check           # Format check
 
 **Direct tool subcommands (v2.8.0 flat dispatch):**
 - `jest`, `pytest`, `vitest` — Test runner output compression
+- `make` — GNU Make build output compression
 - `tsc` — TypeScript build output compression
 - `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`, `oxlint`, `prettier`, `ruff`, `rustfmt` — Lint/formatter output compression
 - `npm`, `pnpm`, `pip` — Package manager output compression
