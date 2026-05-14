@@ -5,14 +5,184 @@
 //! [`try_read_stdin`] which combines the stdin guard (via
 //! [`crate::cmd::should_read_stdin`]), chunked read, and whitespace-only check
 //! into a single call.
+//!
+//! Also provides [`run_test_runner`] which encapsulates the complete
+//! passthrough-check / stdin-or-spawn / parse / emit / stats / analytics
+//! pipeline shared by vitest, playwright, cypress, swift, and dotnet.
 
+use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use regex::Regex;
 
-use crate::output::canonical::{TestEntry, TestOutcome};
-use crate::runner::CommandOutput;
+use crate::output::ParseResult;
+use crate::output::canonical::{TestEntry, TestOutcome, TestResult};
+use crate::runner::{CommandOutput, CommandRunner};
+
+// ============================================================================
+// Shared run_test_runner pipeline
+// ============================================================================
+
+/// Configuration for a test runner command.
+///
+/// Used by [`run_test_runner`] to spawn the test process. Each field controls
+/// a specific aspect of how the command is launched.
+pub(super) struct TestRunnerConfig<'a> {
+    /// The binary name to invoke (e.g. `"vitest"`, `"swift"`, `"dotnet"`).
+    pub program: &'a str,
+    /// Human-readable install hint emitted in the error when the binary is not
+    /// found (e.g. `"Install vitest locally (npm install -D vitest)"`).
+    pub install_hint: &'a str,
+    /// When `true`, fall back to `npx <program>` if the binary is not in PATH
+    /// (appropriate for Node.js tools: vitest, jest, playwright, cypress).
+    pub node_fallback: bool,
+    /// Extra environment variables to set when spawning the process. Pass `&[]`
+    /// if none are needed.
+    pub env_overrides: &'a [(&'a str, &'a str)],
+}
+
+/// Orchestrate the full test-runner pipeline.
+///
+/// Handles in order:
+/// 1. Passthrough mode — if `SKIM_PASSTHROUGH=1`, forwards raw output and
+///    returns immediately.
+/// 2. Stdin — if the caller has piped stdin (`try_read_stdin`), use that as
+///    the raw output.
+/// 3. Spawn — otherwise, spawn the process via `spawn_runner`.
+/// 4. Parse — call `parse_fn` on the raw output string.
+/// 5. Emit — print parsed result to stdout, emit tier markers to stderr, and
+///    call [`emit_failure_context`] when failures are present.
+/// 6. Stats — emit token-reduction stats when `show_stats` is `true`.
+/// 7. Analytics — record usage via [`crate::analytics::try_record_command`].
+///
+/// `prepare_args` transforms the user-supplied args into the final argument
+/// list (e.g. injecting `--reporter=json`). It is `Fn` rather than `FnOnce`
+/// because it is referenced by both the passthrough path (inside
+/// `run_passthrough`) and the spawn path (`spawn_runner`) — both are
+/// mutually exclusive at runtime but the borrow checker requires a shared
+/// reference.
+///
+/// `parse_fn` is `FnOnce` because it is called exactly once and may capture
+/// owned state (e.g. closures that embed TRX detection for dotnet).
+pub(super) fn run_test_runner(
+    config: &TestRunnerConfig<'_>,
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+    prepare_args: impl Fn(&[String]) -> Vec<String>,
+    parse_fn: impl FnOnce(&str) -> ParseResult<TestResult>,
+) -> anyhow::Result<ExitCode> {
+    // Passthrough mode: bypass compression, run the raw command and forward output.
+    if crate::cmd::is_passthrough_mode() {
+        return run_passthrough(
+            args,
+            |a| prepare_args(a),
+            |arg_refs| spawn_runner_raw(config, arg_refs),
+        );
+    }
+
+    let start = Instant::now();
+
+    // Prefer stdin if piped; otherwise spawn the process.
+    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
+        stdin_content
+    } else {
+        let prepared = prepare_args(args);
+        spawn_runner(config, &prepared)?
+    };
+
+    let result = parse_fn(&raw_output);
+
+    let exit_code = match &result {
+        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
+            println!("{test_result}");
+            let stderr = io::stderr();
+            let mut handle = stderr.lock();
+            let _ = result.emit_markers(&mut handle);
+
+            if test_result.summary.fail > 0 {
+                emit_failure_context(&raw_output, 1);
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        ParseResult::Passthrough(raw) => {
+            println!("{raw}");
+            let _ = result.emit_markers(&mut io::stderr().lock());
+            ExitCode::FAILURE
+        }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    crate::analytics::try_record_command(
+        rec.with_tier(result.tier_name()),
+        raw_output,
+        result.content().to_string(),
+        crate::cmd::format_analytics_label("test", config.program, &args.join(" ")),
+        start.elapsed(),
+    );
+
+    Ok(exit_code)
+}
+
+/// Spawn the test runner, combine stdout+stderr, and strip ANSI escape codes.
+///
+/// Used by the normal (non-passthrough) path of [`run_test_runner`]. Returns
+/// the clean combined output as an owned `String`.
+fn spawn_runner(config: &TestRunnerConfig<'_>, args: &[String]) -> anyhow::Result<String> {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let output = if config.node_fallback {
+        runner.run_with_node_fallback(config.program, &arg_refs)
+    } else if config.env_overrides.is_empty() {
+        runner.run(config.program, &arg_refs)
+    } else {
+        runner.run_with_env(config.program, &arg_refs, config.env_overrides)
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to run {}: {e}\nHint: {}",
+            config.program,
+            config.install_hint
+        )
+    })?;
+
+    let combined = crate::cmd::combine_output(&output);
+    Ok(crate::output::strip_ansi(&combined))
+}
+
+/// Spawn the test runner for the passthrough path, returning a [`CommandOutput`].
+///
+/// Does NOT combine or strip — passthrough forwards the raw process output.
+fn spawn_runner_raw(
+    config: &TestRunnerConfig<'_>,
+    arg_refs: &[&str],
+) -> anyhow::Result<CommandOutput> {
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    if config.node_fallback {
+        runner.run_with_node_fallback(config.program, arg_refs)
+    } else if config.env_overrides.is_empty() {
+        runner.run(config.program, arg_refs)
+    } else {
+        runner.run_with_env(config.program, arg_refs, config.env_overrides)
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to run {}: {e}\nHint: {}",
+            config.program,
+            config.install_hint
+        )
+    })
+}
+
+// ============================================================================
 
 /// Identifies which test runner produced the text being scraped.
 ///
@@ -20,9 +190,10 @@ use crate::runner::CommandOutput;
 /// regex patterns are required to avoid false positives across runners.
 ///
 /// Variants `Pytest` and `Go` are provided for completeness and future use.
-/// Currently only `Cargo` and `Vitest` are consumed by Tier-2 regex paths;
-/// `Go`'s Tier-2 already extracts test names directly and `Pytest` uses
-/// passthrough for its Tier-2.
+/// Currently only `Cargo`, `Vitest`, and `Cypress` are consumed by Tier-2 regex
+/// paths; `Go`'s Tier-2 already extracts test names directly and `Pytest` uses
+/// passthrough for its Tier-2. `Swift` and `Dotnet` use their own local regexes
+/// instead of scrape_failures.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum TestKind {
     /// `cargo test` plain-text format: `test <path> ... FAILED`
@@ -36,14 +207,7 @@ pub(super) enum TestKind {
     /// `vitest` / `jest` plain-text format: `✕ <describe> > <name>` or `✗ <name>`
     Vitest,
     /// `cypress run` text format: failure names scraped from indented lines
-    #[allow(dead_code)]
     Cypress,
-    /// `swift test` / XCTest format: `Test Case '...' failed`
-    #[allow(dead_code)]
-    Swift,
-    /// `dotnet test` console format: `  Failed ClassName.MethodName [Nms]`
-    #[allow(dead_code)]
-    Dotnet,
 }
 
 /// ANSI color-code strip pattern (ESC [ ... m sequences).
@@ -69,16 +233,6 @@ static RE_GO_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 static RE_CYPRESS_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     // Cypress mocha text: `    N) test name` (numbered failure list)
     Regex::new(r"^\s+\d+\)\s+(.+)$").expect("valid cypress fail regex")
-});
-
-static RE_SWIFT_FAIL: LazyLock<Regex> = LazyLock::new(|| {
-    // XCTest: `Test Case '-[Class method]' failed` or SPM: `Test Case 'Class.method' failed`
-    Regex::new(r"^Test Case '(.+)' failed").expect("valid swift fail regex")
-});
-
-static RE_DOTNET_FAIL: LazyLock<Regex> = LazyLock::new(|| {
-    // dotnet test: `  Failed ClassName.MethodName [Nms]`
-    Regex::new(r"^\s+Failed\s+(\S+)\s*\[").expect("valid dotnet fail regex")
 });
 
 static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
@@ -176,8 +330,6 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
         TestKind::Go => &*RE_GO_FAIL,
         TestKind::Vitest => &*RE_VITEST_FAIL,
         TestKind::Cypress => &*RE_CYPRESS_FAIL,
-        TestKind::Swift => &*RE_SWIFT_FAIL,
-        TestKind::Dotnet => &*RE_DOTNET_FAIL,
     };
 
     let mut entries: Vec<TestEntry> = Vec::new();
@@ -265,6 +417,48 @@ pub(super) fn last_n_lines(text: &str, n: usize) -> &str {
     }
     // Fewer than `n` newlines → return the whole input
     text
+}
+
+/// Extract the first balanced JSON object from `text`.
+///
+/// Used by Cypress and Playwright parsers to isolate the JSON report object
+/// from output that may contain preamble or trailing log lines. Handles
+/// nested objects and string literals with escaped characters.
+pub(super) fn extract_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        let idx = start + i;
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]

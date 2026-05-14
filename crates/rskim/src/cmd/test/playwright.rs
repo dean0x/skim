@@ -7,7 +7,6 @@
 //! - **Tier 2 (regex)**: Falls back to regex on summary lines
 //! - **Tier 3 (passthrough)**: Returns raw output unchanged
 
-use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -16,9 +15,8 @@ use regex::Regex;
 use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
-use crate::runner::CommandRunner;
 
-use super::shared::{self, try_read_stdin};
+use super::shared::{TestRunnerConfig, extract_json_object, run_test_runner};
 
 // ============================================================================
 // Tier-2 regex patterns
@@ -51,89 +49,27 @@ pub(crate) fn run(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    // Passthrough mode
-    if crate::cmd::is_passthrough_mode() {
-        return shared::run_passthrough(
-            args,
-            |a| a.to_vec(),
-            |arg_refs| {
-                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
-                    .run_with_node_fallback("playwright", arg_refs)
-            },
-        );
-    }
-
-    let start = std::time::Instant::now();
-    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
-        stdin_content
-    } else {
-        run_playwright(args)?
+    let config = TestRunnerConfig {
+        program: "playwright",
+        install_hint: "Install Playwright (npm install -D @playwright/test)",
+        node_fallback: true,
+        env_overrides: &[],
     };
 
-    let result = parse(&raw_output);
-
-    let exit_code = match &result {
-        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
-            println!("{test_result}");
-            let stderr = io::stderr();
-            let mut handle = stderr.lock();
-            let _ = result.emit_markers(&mut handle);
-
-            if test_result.summary.fail > 0 {
-                shared::emit_failure_context(&raw_output, 1);
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+    run_test_runner(
+        &config,
+        args,
+        show_stats,
+        rec,
+        |a| {
+            let mut final_args = a.to_vec();
+            if !user_has_flag(a, &["--reporter"]) {
+                final_args.push("--reporter=json".to_string());
             }
-        }
-        ParseResult::Passthrough(raw) => {
-            println!("{raw}");
-            let _ = result.emit_markers(&mut io::stderr().lock());
-            ExitCode::FAILURE
-        }
-    };
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
-        raw_output,
-        result.content().to_string(),
-        crate::cmd::format_analytics_label("test", "playwright", &args.join(" ")),
-        start.elapsed(),
-    );
-
-    Ok(exit_code)
-}
-
-fn run_playwright(args: &[String]) -> anyhow::Result<String> {
-    let mut final_args: Vec<String> = args.to_vec();
-
-    if !user_has_flag(args, &["--reporter"]) {
-        final_args.push("--reporter=json".to_string());
-    }
-
-    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
-    let output = runner.run_with_node_fallback("playwright", &arg_refs).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to run playwright: {e}\n\
-             Hint: Install Playwright (npm install -D @playwright/test)"
-        )
-    })?;
-
-    let mut combined = output.stdout;
-    if !output.stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&output.stderr);
-    }
-
-    Ok(combined)
+            final_args
+        },
+        parse,
+    )
 }
 
 // ============================================================================
@@ -232,9 +168,18 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
         )
     } else {
         // Compute from entries
-        let pass = entries.iter().filter(|e| e.outcome == TestOutcome::Pass).count();
-        let fail = entries.iter().filter(|e| e.outcome == TestOutcome::Fail).count();
-        let skip = entries.iter().filter(|e| e.outcome == TestOutcome::Skip).count();
+        let pass = entries
+            .iter()
+            .filter(|e| e.outcome == TestOutcome::Pass)
+            .count();
+        let fail = entries
+            .iter()
+            .filter(|e| e.outcome == TestOutcome::Fail)
+            .count();
+        let skip = entries
+            .iter()
+            .filter(|e| e.outcome == TestOutcome::Skip)
+            .count();
         (pass, fail, skip)
     };
 
@@ -284,44 +229,6 @@ fn collect_entries_from_suites(suites: &[PlaywrightSuite], entries: &mut Vec<Tes
             }
         }
     }
-}
-
-/// Extract first balanced JSON object from text.
-fn extract_json_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-
-    let mut depth: usize = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for (i, &b) in bytes[start..].iter().enumerate() {
-        let idx = start + i;
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        if in_string {
-            match b {
-                b'\\' => escape_next = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=idx]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 // ============================================================================
@@ -417,8 +324,12 @@ mod tests {
         assert!(failed.is_some(), "Should have a failed entry");
         let f = failed.unwrap();
         assert!(
-            f.detail.as_ref().map(|d| d.contains("Expected")).unwrap_or(false),
-            "Detail should contain error message, got: {:?}", f.detail
+            f.detail
+                .as_ref()
+                .map(|d| d.contains("Expected"))
+                .unwrap_or(false),
+            "Detail should contain error message, got: {:?}",
+            f.detail
         );
     }
 
@@ -434,18 +345,30 @@ mod tests {
     #[test]
     fn test_playwright_tier3_passthrough() {
         let result = parse("completely unparseable output with no test info");
-        assert!(result.is_passthrough(), "Expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_playwright_parse_produces_full_on_json() {
         let result = parse(PW_FAIL_JSON);
-        assert!(result.is_full(), "Expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "Expected Full, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_playwright_parse_produces_degraded_on_text() {
         let result = parse(PW_REGEX_TEXT);
-        assert!(result.is_degraded(), "Expected Degraded, got {}", result.tier_name());
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded, got {}",
+            result.tier_name()
+        );
     }
 }

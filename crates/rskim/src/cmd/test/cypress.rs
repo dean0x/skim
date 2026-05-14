@@ -7,7 +7,6 @@
 //! - **Tier 2 (regex)**: Falls back to regex on summary lines
 //! - **Tier 3 (passthrough)**: Returns raw output unchanged
 
-use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -16,9 +15,10 @@ use regex::Regex;
 use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
-use crate::runner::CommandRunner;
 
-use super::shared::{self, TestKind, scrape_failures, try_read_stdin};
+use super::shared::{
+    TestKind, TestRunnerConfig, extract_json_object, run_test_runner, scrape_failures,
+};
 
 // ============================================================================
 // Tier-2 regex patterns
@@ -41,91 +41,28 @@ pub(crate) fn run(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    // Passthrough mode
-    if crate::cmd::is_passthrough_mode() {
-        return shared::run_passthrough(
-            args,
-            |a| a.to_vec(),
-            |arg_refs| {
-                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
-                    .run_with_node_fallback("cypress", arg_refs)
-            },
-        );
-    }
-
-    let start = std::time::Instant::now();
-    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
-        stdin_content
-    } else {
-        run_cypress(args)?
+    let config = TestRunnerConfig {
+        program: "cypress",
+        install_hint: "Install Cypress (npm install -D cypress)",
+        node_fallback: true,
+        env_overrides: &[],
     };
 
-    let result = parse(&raw_output);
-
-    let exit_code = match &result {
-        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
-            println!("{test_result}");
-            let stderr = io::stderr();
-            let mut handle = stderr.lock();
-            let _ = result.emit_markers(&mut handle);
-
-            if test_result.summary.fail > 0 {
-                shared::emit_failure_context(&raw_output, 1);
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+    run_test_runner(
+        &config,
+        args,
+        show_stats,
+        rec,
+        |a| {
+            let mut final_args = a.to_vec();
+            if !user_has_flag(a, &["--reporter"]) {
+                final_args.push("--reporter".to_string());
+                final_args.push("json".to_string());
             }
-        }
-        ParseResult::Passthrough(raw) => {
-            println!("{raw}");
-            let _ = result.emit_markers(&mut io::stderr().lock());
-            ExitCode::FAILURE
-        }
-    };
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
-        raw_output,
-        result.content().to_string(),
-        crate::cmd::format_analytics_label("test", "cypress", &args.join(" ")),
-        start.elapsed(),
-    );
-
-    Ok(exit_code)
-}
-
-fn run_cypress(args: &[String]) -> anyhow::Result<String> {
-    let mut final_args: Vec<String> = args.to_vec();
-
-    // Inject --reporter json unless already specified
-    if !user_has_flag(args, &["--reporter"]) {
-        final_args.push("--reporter".to_string());
-        final_args.push("json".to_string());
-    }
-
-    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
-    let output = runner.run_with_node_fallback("cypress", &arg_refs).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to run cypress: {e}\n\
-             Hint: Install Cypress (npm install -D cypress)"
-        )
-    })?;
-
-    let mut combined = output.stdout;
-    if !output.stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&output.stderr);
-    }
-
-    Ok(combined)
+            final_args
+        },
+        parse,
+    )
 }
 
 // ============================================================================
@@ -194,8 +131,16 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
 
     let mut entries: Vec<TestEntry> = Vec::new();
     for test in &report.tests {
-        let has_err = test.err.as_ref().map(|e| e.message.is_some()).unwrap_or(false);
-        let outcome = if has_err { TestOutcome::Fail } else { TestOutcome::Pass };
+        let has_err = test
+            .err
+            .as_ref()
+            .map(|e| e.message.is_some())
+            .unwrap_or(false);
+        let outcome = if has_err {
+            TestOutcome::Fail
+        } else {
+            TestOutcome::Pass
+        };
 
         let detail = test.err.as_ref().and_then(|e| {
             let mut parts = Vec::new();
@@ -205,7 +150,11 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
             if let Some(stack) = &e.stack {
                 parts.push(stack.clone());
             }
-            if parts.is_empty() { None } else { Some(parts.join("\n")) }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
         });
 
         entries.push(TestEntry {
@@ -223,44 +172,6 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
     };
 
     Some(TestResult::new(summary, entries))
-}
-
-/// Extract first balanced JSON object from text.
-fn extract_json_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{')?;
-
-    let mut depth: usize = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for (i, &b) in bytes[start..].iter().enumerate() {
-        let idx = start + i;
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        if in_string {
-            match b {
-                b'\\' => escape_next = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=idx]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 // ============================================================================
@@ -336,20 +247,33 @@ mod tests {
         let failed = r.entries.iter().find(|e| e.outcome == TestOutcome::Fail);
         assert!(failed.is_some());
         assert!(
-            failed.unwrap().detail.as_ref().map(|d| d.contains("AssertionError")).unwrap_or(false)
+            failed
+                .unwrap()
+                .detail
+                .as_ref()
+                .map(|d| d.contains("AssertionError"))
+                .unwrap_or(false)
         );
     }
 
     #[test]
     fn test_cypress_tier3_passthrough() {
         let result = parse("completely unparseable output");
-        assert!(result.is_passthrough(), "Expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_cypress_parse_full_on_json() {
         let result = parse(CY_FAIL_JSON);
-        assert!(result.is_full(), "Expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "Expected Full, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
@@ -358,7 +282,10 @@ mod tests {
         // Let's use a proper cypress text output
         let text = "Passing:  3\nFailing:  0\nPending:  1\n";
         let result = try_parse_regex(text);
-        assert!(result.is_some(), "Expected regex parse to succeed on clean summary");
+        assert!(
+            result.is_some(),
+            "Expected regex parse to succeed on clean summary"
+        );
         let r = result.unwrap();
         assert_eq!(r.summary.pass, 3);
     }

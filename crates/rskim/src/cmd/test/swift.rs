@@ -7,7 +7,6 @@
 //! - **Tier 2 (Degraded)**: `scrape_failures` for failing test names
 //! - **Tier 3 (Passthrough)**: Returns raw output unchanged
 
-use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -15,9 +14,8 @@ use regex::Regex;
 
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
-use crate::runner::CommandRunner;
 
-use super::shared::{self, try_read_stdin};
+use super::shared::{TestRunnerConfig, run_test_runner};
 
 // ============================================================================
 // Regex patterns
@@ -34,14 +32,12 @@ static RE_XCTEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// SPM test format: `Test Case 'ClassName.methodName' passed.`
-static RE_SPM_PASS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^Test Case '(\S+\.\S+)' passed").expect("valid regex")
-});
+static RE_SPM_PASS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Test Case '(\S+\.\S+)' passed").expect("valid regex"));
 
 /// SPM test format: `Test Case 'ClassName.methodName' failed`
-static RE_SPM_FAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^Test Case '(\S+\.\S+)' failed").expect("valid regex")
-});
+static RE_SPM_FAIL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Test Case '(\S+\.\S+)' failed").expect("valid regex"));
 
 /// Summary: `Executed N tests, with N failures (N unexpected) in N.NNN (N.NNN) seconds`
 static RE_XCTEST_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
@@ -58,88 +54,26 @@ pub(crate) fn run(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    // Passthrough mode
-    if crate::cmd::is_passthrough_mode() {
-        return shared::run_passthrough(
-            args,
-            |a| a.to_vec(),
-            |arg_refs| {
-                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
-                    .run("swift", arg_refs)
-            },
-        );
-    }
-
-    let start = std::time::Instant::now();
-
-    // Prepend "test" since we're always called with the test subcommand
-    let mut full_args = vec!["test".to_string()];
-    full_args.extend_from_slice(args);
-
-    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
-        stdin_content
-    } else {
-        run_swift_test(&full_args)?
+    let config = TestRunnerConfig {
+        program: "swift",
+        install_hint: "Install Swift from https://swift.org/download/",
+        node_fallback: false,
+        env_overrides: &[],
     };
 
-    let result = parse(&raw_output);
-
-    let exit_code = match &result {
-        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
-            println!("{test_result}");
-            let stderr = io::stderr();
-            let mut handle = stderr.lock();
-            let _ = result.emit_markers(&mut handle);
-
-            if test_result.summary.fail > 0 {
-                shared::emit_failure_context(&raw_output, 1);
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
-        ParseResult::Passthrough(raw) => {
-            println!("{raw}");
-            let _ = result.emit_markers(&mut io::stderr().lock());
-            ExitCode::FAILURE
-        }
-    };
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
-        raw_output,
-        result.content().to_string(),
-        crate::cmd::format_analytics_label("test", "swift", &args.join(" ")),
-        start.elapsed(),
-    );
-
-    Ok(exit_code)
-}
-
-fn run_swift_test(args: &[String]) -> anyhow::Result<String> {
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
-    let output = runner.run("swift", &arg_refs).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to run swift: {e}\n\
-             Hint: Install Swift from https://swift.org/download/"
-        )
-    })?;
-
-    let mut combined = output.stdout;
-    if !output.stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&output.stderr);
-    }
-
-    Ok(combined)
+    run_test_runner(
+        &config,
+        args,
+        show_stats,
+        rec,
+        |a| {
+            // Prepend "test" since swift is always called with the test subcommand.
+            let mut full_args = vec!["test".to_string()];
+            full_args.extend_from_slice(a);
+            full_args
+        },
+        parse,
+    )
 }
 
 // ============================================================================
@@ -170,13 +104,19 @@ fn try_parse_xctest(raw: &str) -> Option<TestResult> {
 
     // Collect all pass/fail from per-test lines
     for line in cleaned.lines() {
-        if let Some(caps) = RE_XCTEST_PASS.captures(line).or_else(|| RE_SPM_PASS.captures(line)) {
+        if let Some(caps) = RE_XCTEST_PASS
+            .captures(line)
+            .or_else(|| RE_SPM_PASS.captures(line))
+        {
             entries.push(TestEntry {
                 name: caps[1].to_string(),
                 outcome: TestOutcome::Pass,
                 detail: None,
             });
-        } else if let Some(caps) = RE_XCTEST_FAIL.captures(line).or_else(|| RE_SPM_FAIL.captures(line)) {
+        } else if let Some(caps) = RE_XCTEST_FAIL
+            .captures(line)
+            .or_else(|| RE_SPM_FAIL.captures(line))
+        {
             entries.push(TestEntry {
                 name: caps[1].to_string(),
                 outcome: TestOutcome::Fail,
@@ -206,7 +146,10 @@ fn try_parse_failures_only(raw: &str) -> Option<TestResult> {
     let mut entries: Vec<TestEntry> = Vec::new();
 
     for line in cleaned.lines() {
-        if let Some(caps) = RE_XCTEST_FAIL.captures(line).or_else(|| RE_SPM_FAIL.captures(line)) {
+        if let Some(caps) = RE_XCTEST_FAIL
+            .captures(line)
+            .or_else(|| RE_SPM_FAIL.captures(line))
+        {
             entries.push(TestEntry {
                 name: caps[1].to_string(),
                 outcome: TestOutcome::Fail,
@@ -276,12 +219,20 @@ mod tests {
     #[test]
     fn test_swift_tier3_passthrough() {
         let result = parse("completely unparseable output");
-        assert!(result.is_passthrough(), "Expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_swift_parse_full_on_xctest() {
         let result = parse(SWIFT_PASS);
-        assert!(result.is_full(), "Expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "Expected Full, got {}",
+            result.tier_name()
+        );
     }
 }

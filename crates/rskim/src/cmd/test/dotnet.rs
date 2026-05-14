@@ -8,7 +8,6 @@
 //! - **Tier 2 (Degraded)**: Regex on console summary lines.
 //! - **Tier 3 (Passthrough)**: Returns raw output unchanged.
 
-use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -17,9 +16,8 @@ use regex::Regex;
 use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
-use crate::runner::CommandRunner;
 
-use super::shared::{self, try_read_stdin};
+use super::shared::{TestRunnerConfig, run_test_runner};
 
 // ============================================================================
 // Regex patterns
@@ -37,9 +35,8 @@ static RE_DOTNET_SUMMARY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Failed test: `  Failed ClassName.MethodName [Nms]`
-static RE_DOTNET_FAILED_TEST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s+Failed\s+(\S+)\s*\[").expect("valid regex")
-});
+static RE_DOTNET_FAILED_TEST: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s+Failed\s+(\S+)\s*\[").expect("valid regex"));
 
 // ============================================================================
 // Public entry point
@@ -51,109 +48,46 @@ pub(crate) fn run(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    // Passthrough mode
-    if crate::cmd::is_passthrough_mode() {
-        return shared::run_passthrough(
-            args,
-            |a| a.to_vec(),
-            |arg_refs| {
-                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
-                    .run_with_env("dotnet", arg_refs, &[("DOTNET_CLI_UI_LANGUAGE", "en-US")])
-            },
-        );
-    }
-
-    let start = std::time::Instant::now();
-    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
-        stdin_content
-    } else {
-        run_dotnet_test(args)?
+    let config = TestRunnerConfig {
+        program: "dotnet",
+        install_hint: "Install .NET SDK from https://dotnet.microsoft.com/download",
+        node_fallback: false,
+        env_overrides: &[("DOTNET_CLI_UI_LANGUAGE", "en-US")],
     };
 
-    let result = parse(&raw_output);
-
-    let exit_code = match &result {
-        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
-            println!("{test_result}");
-            let stderr = io::stderr();
-            let mut handle = stderr.lock();
-            let _ = result.emit_markers(&mut handle);
-
-            if test_result.summary.fail > 0 {
-                shared::emit_failure_context(&raw_output, 1);
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+    run_test_runner(
+        &config,
+        args,
+        show_stats,
+        rec,
+        |a| {
+            // Prepend "test" and inject --logger trx for TRX XML output.
+            let mut final_args = vec!["test".to_string()];
+            final_args.extend_from_slice(a);
+            if !user_has_flag(a, &["--logger"]) {
+                final_args.push("--logger".to_string());
+                final_args.push("trx".to_string());
             }
-        }
-        ParseResult::Passthrough(raw) => {
-            println!("{raw}");
-            let _ = result.emit_markers(&mut io::stderr().lock());
-            ExitCode::FAILURE
-        }
-    };
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
-        raw_output,
-        result.content().to_string(),
-        crate::cmd::format_analytics_label("test", "dotnet", &args.join(" ")),
-        start.elapsed(),
-    );
-
-    Ok(exit_code)
-}
-
-fn run_dotnet_test(args: &[String]) -> anyhow::Result<String> {
-    let mut final_args: Vec<String> = vec!["test".to_string()];
-    final_args.extend_from_slice(args);
-
-    // Inject --logger trx unless user already specified --logger
-    if !user_has_flag(args, &["--logger"]) {
-        final_args.push("--logger".to_string());
-        final_args.push("trx".to_string());
-    }
-
-    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
-    let output = runner
-        .run_with_env("dotnet", &arg_refs, &[("DOTNET_CLI_UI_LANGUAGE", "en-US")])
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to run dotnet: {e}\n\
-                 Hint: Install .NET SDK from https://dotnet.microsoft.com/download"
-            )
-        })?;
-
-    // Combine stdout and stderr
-    let mut combined = output.stdout.clone();
-    if !output.stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&output.stderr);
-    }
-
-    // Try to parse TRX file if one was written
-    if let Some(trx_path) = extract_trx_path(&combined)
-        && let Ok(trx_content) = std::fs::read_to_string(&trx_path)
-    {
-        // Prepend TRX content as a parseable marker for the parse function
-        return Ok(format!("__TRX_CONTENT__\n{trx_content}\n__END_TRX__\n{combined}"));
-    }
-
-    Ok(combined)
+            final_args
+        },
+        |raw| {
+            // TRX detection: if the spawn produced a Results File path, read it
+            // and embed the TRX XML so the parser can use Tier-1 (XML) rather
+            // than Tier-2 (regex).
+            if let Some(trx_path) = extract_trx_path(raw)
+                && let Ok(trx_content) = std::fs::read_to_string(&trx_path)
+            {
+                let with_trx = format!("__TRX_CONTENT__\n{trx_content}\n__END_TRX__\n{raw}");
+                parse(&with_trx)
+            } else {
+                parse(raw)
+            }
+        },
+    )
 }
 
 fn extract_trx_path(text: &str) -> Option<String> {
-    RE_TRX_PATH
-        .captures(text)
-        .map(|c| c[1].trim().to_string())
+    RE_TRX_PATH.captures(text).map(|c| c[1].trim().to_string())
 }
 
 // ============================================================================
@@ -299,25 +233,23 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                     current_error = e.unescape().ok().map(|s| s.into_owned());
                 }
             }
-            Ok(Event::End(e)) => {
-                match e.name().as_ref() {
-                    b"UnitTestResult" => {
-                        if let (Some(name), Some(outcome)) =
-                            (current_test_name.take(), current_outcome.take())
-                        {
-                            entries.push(TestEntry {
-                                name,
-                                outcome,
-                                detail: current_error.take(),
-                            });
-                        }
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"UnitTestResult" => {
+                    if let (Some(name), Some(outcome)) =
+                        (current_test_name.take(), current_outcome.take())
+                    {
+                        entries.push(TestEntry {
+                            name,
+                            outcome,
+                            detail: current_error.take(),
+                        });
                     }
-                    b"Message" => {
-                        in_error_message = false;
-                    }
-                    _ => {}
                 }
-            }
+                b"Message" => {
+                    in_error_message = false;
+                }
+                _ => {}
+            },
             Ok(Event::Eof) => break,
             Err(_) => return None,
             _ => {}
@@ -330,8 +262,14 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
 
     // If counters were not found, derive from entries
     if !found_counters {
-        passed = entries.iter().filter(|e| e.outcome == TestOutcome::Pass).count();
-        failed = entries.iter().filter(|e| e.outcome == TestOutcome::Fail).count();
+        passed = entries
+            .iter()
+            .filter(|e| e.outcome == TestOutcome::Pass)
+            .count();
+        failed = entries
+            .iter()
+            .filter(|e| e.outcome == TestOutcome::Fail)
+            .count();
         // total is used for skipped above; here it stays 0 since we can't derive it
     }
 
@@ -441,7 +379,12 @@ mod tests {
         let failed = r.entries.iter().find(|e| e.outcome == TestOutcome::Fail);
         assert!(failed.is_some());
         assert!(
-            failed.unwrap().detail.as_ref().map(|d| d.contains("Expected 2")).unwrap_or(false),
+            failed
+                .unwrap()
+                .detail
+                .as_ref()
+                .map(|d| d.contains("Expected 2"))
+                .unwrap_or(false),
             "Detail should contain error message"
         );
     }
@@ -458,19 +401,31 @@ mod tests {
     #[test]
     fn test_dotnet_tier3_passthrough() {
         let result = parse("completely unparseable output");
-        assert!(result.is_passthrough(), "Expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_dotnet_parse_full_on_trx_stdin() {
         // When TRX XML is piped as stdin
         let result = parse(TRX_PASS);
-        assert!(result.is_full(), "Expected Full on direct TRX XML, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "Expected Full on direct TRX XML, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_dotnet_parse_degraded_on_console() {
         let result = parse(DOTNET_CONSOLE_SUMMARY);
-        assert!(result.is_degraded(), "Expected Degraded on console output, got {}", result.tier_name());
+        assert!(
+            result.is_degraded(),
+            "Expected Degraded on console output, got {}",
+            result.tier_name()
+        );
     }
 }

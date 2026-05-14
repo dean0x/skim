@@ -9,7 +9,6 @@
 //!   parsing fails.
 //! - **Tier 3 (passthrough)**: Returns raw output unchanged when nothing parses.
 
-use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
@@ -18,9 +17,8 @@ use regex::Regex;
 use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
-use crate::runner::CommandRunner;
 
-use super::shared::{self, TestKind, scrape_failures, try_read_stdin};
+use super::shared::{TestKind, TestRunnerConfig, run_test_runner, scrape_failures};
 
 // ============================================================================
 // Public entry point
@@ -36,114 +34,31 @@ pub(crate) fn run(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    // Passthrough mode: bypass compression, run the raw command and forward output.
-    if crate::cmd::is_passthrough_mode() {
-        return shared::run_passthrough(
-            args,
-            |a| a.to_vec(),
-            |arg_refs| {
-                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
-                    .run_with_node_fallback(program, arg_refs)
-            },
-        );
-    }
-
-    let start = std::time::Instant::now();
-    // try_read_stdin returns Some(content) when stdin is piped and non-empty,
-    // None when stdin is empty/whitespace-only or when args are present — in
-    // either case fall through to running vitest directly.
-    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
-        stdin_content
-    } else {
-        run_vitest(program, args)?
+    let config = TestRunnerConfig {
+        program,
+        install_hint: &format!("Install {program} locally (npm install -D {program}) or globally"),
+        node_fallback: true,
+        env_overrides: &[],
     };
 
-    let result = parse(&raw_output);
-
-    // Emit the result to stdout
-    let exit_code = match &result {
-        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
-            println!("{test_result}");
-            // Emit degradation markers to stderr
-            let stderr = io::stderr();
-            let mut handle = stderr.lock();
-            let _ = result.emit_markers(&mut handle);
-
-            if test_result.summary.fail > 0 {
-                // Append raw failure context so the agent can see actual error
-                // messages without needing to re-run with SKIM_PASSTHROUGH=1.
-                shared::emit_failure_context(&raw_output, 1);
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+    run_test_runner(
+        &config,
+        args,
+        show_stats,
+        rec,
+        |a| {
+            let mut final_args = a.to_vec();
+            if program == "jest" {
+                if !user_has_flag(a, &["--json"]) {
+                    final_args.push("--json".to_string());
+                }
+            } else if !user_has_flag(a, &["--reporter"]) {
+                final_args.push("--reporter=json".to_string());
             }
-        }
-        ParseResult::Passthrough(raw) => {
-            println!("{raw}");
-            let _ = result.emit_markers(&mut io::stderr().lock());
-            ExitCode::FAILURE
-        }
-    };
-
-    if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
-        crate::process::report_token_stats(orig, comp, "");
-    }
-
-    // Record analytics (fire-and-forget, non-blocking).
-    crate::analytics::try_record_command(
-        rec.with_tier(result.tier_name()),
-        raw_output,
-        result.content().to_string(),
-        crate::cmd::format_analytics_label("test", program, &args.join(" ")),
-        start.elapsed(),
-    );
-
-    Ok(exit_code)
-}
-
-// ============================================================================
-// Command execution
-// ============================================================================
-
-/// Execute the test runner with the user's args, injecting `--reporter=json` if
-/// not already set.
-///
-/// `program` is the binary to invoke (e.g. `"vitest"` or `"jest"`).
-fn run_vitest(program: &str, args: &[String]) -> anyhow::Result<String> {
-    let mut final_args: Vec<String> = args.to_vec();
-
-    if program == "jest" {
-        if !user_has_flag(args, &["--json"]) {
-            final_args.push("--json".to_string());
-        }
-    } else if !user_has_flag(args, &["--reporter"]) {
-        final_args.push("--reporter=json".to_string());
-    }
-
-    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
-
-    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
-    let output = runner
-        .run_with_node_fallback(program, &arg_refs)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to run {program}: {e}\n\
-             Hint: Install {program} locally (npm install -D {program}) or globally"
-            )
-        })?;
-
-    // Combine stdout and stderr — vitest may emit JSON to either depending on
-    // version and configuration.
-    let mut combined = output.stdout;
-    if !output.stderr.is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(&output.stderr);
-    }
-
-    Ok(combined)
+            final_args
+        },
+        parse,
+    )
 }
 
 // ============================================================================
