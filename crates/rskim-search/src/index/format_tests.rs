@@ -167,6 +167,32 @@ fn test_file_meta_truncated() {
 }
 
 // -----------------------------------------------------------------------
+// read_array — defensive bounds checking
+// -----------------------------------------------------------------------
+
+/// Verify read_array returns Err (not panic) when start + N exceeds data.len().
+#[test]
+fn test_read_array_out_of_bounds_returns_err() {
+    // 3 bytes of data; asking for 4 bytes at offset 0 must fail gracefully.
+    let data = [0u8; 3];
+    let result: crate::Result<[u8; 4]> = read_array(&data, 0, "test");
+    assert!(result.is_err(), "expected Err on out-of-bounds read_array");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("need 4 bytes at offset 0"),
+        "unexpected error message: {msg}"
+    );
+}
+
+/// Verify read_array returns Err (not panic) when start itself is beyond data.
+#[test]
+fn test_read_array_start_beyond_data_returns_err() {
+    let data = [0u8; 2];
+    let result: crate::Result<[u8; 4]> = read_array(&data, 10, "test");
+    assert!(result.is_err(), "expected Err on start-beyond-data read_array");
+}
+
+// -----------------------------------------------------------------------
 // Binary search
 // -----------------------------------------------------------------------
 

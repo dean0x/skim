@@ -131,16 +131,26 @@ pub(crate) struct FileMetaEntry {
     pub doc_length: u32,
 }
 
-/// Extract a fixed-size byte array from `data[start..start+N]`.  Callers must
-/// check the minimum data length before calling this.
+/// Extract a fixed-size byte array from `data[start..start+N]`.
+///
+/// Returns [`SearchError::IndexCorrupted`] if the range would overflow `usize`
+/// or exceeds `data.len()`, rather than panicking.
 fn read_array<const N: usize>(
     data: &[u8],
     start: usize,
     context: &'static str,
 ) -> crate::Result<[u8; N]> {
-    data[start..start + N]
-        .try_into()
-        .map_err(|_| SearchError::IndexCorrupted(format!("{context}: slice conversion failed")))
+    let end = start.checked_add(N).ok_or_else(|| {
+        SearchError::IndexCorrupted(format!("{context}: offset overflow"))
+    })?;
+    data.get(start..end)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| {
+            SearchError::IndexCorrupted(format!(
+                "{context}: need {N} bytes at offset {start}, got {}",
+                data.len()
+            ))
+        })
 }
 
 /// Encode a [`SkidxHeader`] into its 30-byte on-disk representation.
