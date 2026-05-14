@@ -14,12 +14,13 @@ use super::combine_output;
 // ============================================================================
 
 static RE_YARN_SAVED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"success Saved lockfile").unwrap());
+    LazyLock::new(|| Regex::new(r"success Saved lockfile").expect("valid regex"));
 static RE_YARN_WARNING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^warning\s+(.+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^warning\s+(.+)").expect("valid regex"));
 static RE_YARN_INFO_RESOLVED: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^info\s+Resolved\s+(\d+)\s+packages?").unwrap());
-static RE_YARN_DONE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Done in \d+").unwrap());
+    LazyLock::new(|| Regex::new(r"^info\s+Resolved\s+(\d+)\s+packages?").expect("valid regex"));
+static RE_YARN_DONE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Done in \d+").expect("valid regex"));
 
 pub(super) fn run_install(
     args: &[String],

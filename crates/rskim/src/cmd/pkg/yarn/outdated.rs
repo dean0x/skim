@@ -11,7 +11,7 @@ use super::combine_output;
 
 static RE_YARN_OUTDATED_PKG: LazyLock<Regex> = LazyLock::new(|| {
     // yarn outdated text: package name followed by current, wanted, latest
-    Regex::new(r"^(\S+)\s+\S+\s+\S+\s+\S+").unwrap()
+    Regex::new(r"^(\S+)\s+\S+\s+\S+\s+\S+").expect("valid regex")
 });
 
 pub(super) fn run_outdated(
@@ -50,7 +50,7 @@ fn parse_outdated(output: &CommandOutput) -> ParseResult<PkgResult> {
         );
     }
 
-    ParseResult::Passthrough(combine_output(output).into_owned())
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_ndjson(stdout: &str) -> Option<PkgResult> {
@@ -96,7 +96,9 @@ fn try_parse_ndjson(stdout: &str) -> Option<PkgResult> {
 
     Some(PkgResult::new(
         "yarn".to_string(),
-        PkgOperation::Outdated { count: outdated_count },
+        PkgOperation::Outdated {
+            count: outdated_count,
+        },
         true,
         messages,
     ))
@@ -141,7 +143,10 @@ mod tests {
         assert!(result.is_some(), "Expected NDJSON parse to succeed");
         let r = result.unwrap();
         let s = format!("{r}");
-        assert!(s.contains("yarn outdated") || s.contains("2"), "Display: {s}");
+        assert!(
+            s.contains("yarn outdated") || s.contains("2"),
+            "Display: {s}"
+        );
     }
 
     #[test]
@@ -153,6 +158,10 @@ mod tests {
             duration: std::time::Duration::ZERO,
         };
         let result = parse_outdated(&output);
-        assert!(result.is_passthrough(), "Expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 }

@@ -53,9 +53,7 @@ pub(crate) fn run(
     match sub {
         Some("cargo") => cargo::run(remaining, show_stats, rec),
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
-        Some(program @ ("gradle" | "gradlew")) => {
-            gradle::run(program, remaining, show_stats, rec)
-        }
+        Some(program @ ("gradle" | "gradlew")) => gradle::run(program, remaining, show_stats, rec),
         Some("make") => make::run(remaining, show_stats, rec),
         Some(program @ ("mvn" | "mvnw" | "maven")) => {
             maven::run(program, remaining, show_stats, rec)

@@ -50,7 +50,8 @@ pub(crate) fn run(
 
 /// Gradle task: `> Task :name OUTCOME`
 static GRADLE_TASK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^> Task :(\S+)(?:\s+(UP-TO-DATE|FROM-CACHE|SKIPPED|FAILED))?$").expect("valid regex")
+    Regex::new(r"^> Task :(\S+)(?:\s+(UP-TO-DATE|FROM-CACHE|SKIPPED|FAILED))?$")
+        .expect("valid regex")
 });
 
 /// Java diagnostic: `file.java:line: error: message`
@@ -59,9 +60,8 @@ static JAVA_DIAG_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Kotlin diagnostic: `e: file.kt: (line, col): message` or `w:`
-static KOTLIN_DIAG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^([ew]): (.+\.kt): \((\d+), \d+\): (.+)$").expect("valid regex")
-});
+static KOTLIN_DIAG_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([ew]): (.+\.kt): \((\d+), \d+\): (.+)$").expect("valid regex"));
 
 /// BUILD SUCCESSFUL: `BUILD SUCCESSFUL in Xs`
 static BUILD_SUCCESS_RE: LazyLock<Regex> =
@@ -158,7 +158,10 @@ fn try_tier1_diagnostics(
             } else {
                 warnings += 1;
             }
-            error_messages.push(format!("{}: {message} ({file}:{lineno})", if kind == "e" { "error" } else { "warning" }));
+            error_messages.push(format!(
+                "{}: {message} ({file}:{lineno})",
+                if kind == "e" { "error" } else { "warning" }
+            ));
         } else if let Some(caps) = BUILD_SUCCESS_RE.captures(line) {
             any_match = true;
             build_time = caps.get(1).map(|m| m.as_str().to_string());
@@ -245,7 +248,11 @@ mod tests {
         let input = "> Task :compileJava\n> Task :processResources UP-TO-DATE\n> Task :classes\nBUILD SUCCESSFUL in 2.345 secs\n2 actionable tasks: 1 executed, 1 up-to-date\n";
         let output = make_output(input, "", Some(0));
         let result = parse_gradle(&output);
-        assert!(result.is_full(), "expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {}",
+            result.tier_name()
+        );
         if let ParseResult::Full(br) = &result {
             assert!(br.success, "expected success");
             assert_eq!(br.errors, 0);
@@ -257,7 +264,11 @@ mod tests {
         let input = "> Task :compileJava FAILED\n\nFAILURE: Build failed with an exception.\n\nBUILD FAILED\n";
         let output = make_output(input, "", Some(1));
         let result = parse_gradle(&output);
-        assert!(result.is_full(), "expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {}",
+            result.tier_name()
+        );
         if let ParseResult::Full(br) = &result {
             assert!(!br.success, "expected failure");
             assert!(br.errors >= 1);
@@ -269,7 +280,11 @@ mod tests {
         let input = "src/main/java/com/example/App.java:10: error: cannot find symbol\nsymbol: variable foo\nBUILD FAILED\n";
         let output = make_output(input, "", Some(1));
         let result = parse_gradle(&output);
-        assert!(result.is_full(), "expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {}",
+            result.tier_name()
+        );
         if let ParseResult::Full(br) = &result {
             assert!(br.errors >= 1);
         }
@@ -280,21 +295,33 @@ mod tests {
         let input = "Starting a Gradle Daemon (subsequent builds will be faster)\n> Configure project :app\nTask :build UP-TO-DATE\nDownload https://example.com/artifact.jar\n";
         let output = make_output(input, "", Some(0));
         let result = parse_gradle(&output);
-        assert!(result.is_degraded(), "expected Degraded, got {}", result.tier_name());
+        assert!(
+            result.is_degraded(),
+            "expected Degraded, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_gradle_tier3_passthrough() {
         let output = make_output("some random unrecognized output\n", "", Some(1));
         let result = parse_gradle(&output);
-        assert!(result.is_passthrough(), "expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_empty_output_is_success() {
         let output = make_output("", "", Some(0));
         let result = parse_gradle(&output);
-        assert!(result.is_full(), "expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {}",
+            result.tier_name()
+        );
         if let ParseResult::Full(br) = &result {
             assert!(br.success);
         }

@@ -729,12 +729,7 @@ fn dispatch_swift(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let Some((subcmd, idx)) = extract_subcmd(
-        "swift",
-        args,
-        "skim swift <test> [args...]",
-        "test",
-    )?
+    let Some((subcmd, idx)) = extract_subcmd("swift", args, "skim swift <test> [args...]", "test")?
     else {
         return Ok(ExitCode::FAILURE);
     };
@@ -786,12 +781,8 @@ fn dispatch_dotnet(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let Some((subcmd, idx)) = extract_subcmd(
-        "dotnet",
-        args,
-        "skim dotnet <test> [args...]",
-        "test",
-    )?
+    let Some((subcmd, idx)) =
+        extract_subcmd("dotnet", args, "skim dotnet <test> [args...]", "test")?
     else {
         return Ok(ExitCode::FAILURE);
     };

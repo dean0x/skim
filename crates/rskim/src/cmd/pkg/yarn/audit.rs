@@ -9,9 +9,8 @@ use crate::runner::CommandOutput;
 
 use super::combine_output;
 
-static RE_YARN_AUDIT_VULN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\d+)\s+vulnerabilit").unwrap()
-});
+static RE_YARN_AUDIT_VULN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+)\s+vulnerabilit").expect("valid regex"));
 
 pub(super) fn run_audit(
     args: &[String],
@@ -49,7 +48,7 @@ fn parse_audit(output: &CommandOutput) -> ParseResult<PkgResult> {
         );
     }
 
-    ParseResult::Passthrough(combine_output(output).into_owned())
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_parse_ndjson(stdout: &str) -> Option<PkgResult> {
@@ -82,8 +81,7 @@ fn try_parse_ndjson(stdout: &str) -> Option<PkgResult> {
                     total = vuln_count;
                     critical = data.get("critical").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     high = data.get("high").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    moderate =
-                        data.get("moderate").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    moderate = data.get("moderate").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     low = data.get("low").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 }
             }
@@ -186,6 +184,10 @@ mod tests {
             duration: std::time::Duration::ZERO,
         };
         let result = parse_audit(&output);
-        assert!(result.is_passthrough(), "Expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "Expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 }

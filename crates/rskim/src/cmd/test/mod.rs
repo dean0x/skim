@@ -18,7 +18,15 @@ use std::process::ExitCode;
 
 /// Known test runners that the test handler can dispatch to.
 const KNOWN_RUNNERS: &[&str] = &[
-    "cargo", "cypress", "dotnet", "go", "jest", "playwright", "pytest", "swift", "vitest",
+    "cargo",
+    "cypress",
+    "dotnet",
+    "go",
+    "jest",
+    "playwright",
+    "pytest",
+    "swift",
+    "vitest",
 ];
 
 /// Entry point for `skim <runner> [args...]` (test runners).

@@ -44,9 +44,7 @@ pub(crate) fn run(
             // Unknown subcommand → raw passthrough. Don't compress things we
             // don't understand (e.g., `yarn build`, `yarn run dev`).
             let safe = crate::cmd::sanitize_for_display(other);
-            eprintln!(
-                "skim yarn: unknown subcommand '{safe}' — passing through to yarn"
-            );
+            eprintln!("skim yarn: unknown subcommand '{safe}' — passing through to yarn");
             // Run the raw command without compression
             use crate::runner::CommandRunner;
             let mut all_args: Vec<String> = vec![other.to_string()];

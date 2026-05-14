@@ -268,10 +268,11 @@ const BUILD_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // gradle (longest prefix first: ./gradlew, gradlew, gradle)
+    // Verbose flags bypass compression — user wants full debug output
     RewriteRule {
         prefix: &["./gradlew"],
         rewrite_to: &["skim", "gradlew"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--stacktrace", "--info", "--debug", "--full-stacktrace"],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -281,7 +282,7 @@ const BUILD_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gradlew"],
         rewrite_to: &["skim", "gradlew"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--stacktrace", "--info", "--debug", "--full-stacktrace"],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -291,7 +292,7 @@ const BUILD_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["gradle"],
         rewrite_to: &["skim", "gradle"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--stacktrace", "--info", "--debug", "--full-stacktrace"],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -299,10 +300,11 @@ const BUILD_RULES: &[RewriteRule] = &[
         require_flag: &[],
     },
     // maven (longest prefix first: ./mvnw, mvnw, mvn)
+    // -X (debug) and -e (errors+stacktraces) bypass compression
     RewriteRule {
         prefix: &["./mvnw"],
         rewrite_to: &["skim", "mvnw"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["-X", "-e"],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -312,7 +314,7 @@ const BUILD_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["mvnw"],
         rewrite_to: &["skim", "mvnw"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["-X", "-e"],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -322,7 +324,7 @@ const BUILD_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["mvn"],
         rewrite_to: &["skim", "mvn"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["-X", "-e"],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,

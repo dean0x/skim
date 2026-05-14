@@ -79,10 +79,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
 
     for entry in &arr {
         let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        let line = entry
-            .get("line")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let line = entry.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
         let rule_id = entry
             .get("rule_id")
             .and_then(|v| v.as_str())
@@ -91,10 +88,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("warning");
-        let reason = entry
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let reason = entry.get("reason").and_then(|v| v.as_str()).unwrap_or("");
 
         let severity = match type_str {
             "error" => LintSeverity::Error,
@@ -181,7 +175,10 @@ mod tests {
     #[test]
     fn test_swiftlint_tier1_pass() {
         let result = try_parse_json(SWIFTLINT_PASS_JSON);
-        assert!(result.is_some(), "Expected JSON parse to succeed on empty array");
+        assert!(
+            result.is_some(),
+            "Expected JSON parse to succeed on empty array"
+        );
         let r = result.unwrap();
         assert_eq!(r.errors, 0);
         assert_eq!(r.warnings, 0);
@@ -243,6 +240,9 @@ mod tests {
     #[test]
     fn test_flag_injection_skipped_when_reporter_present() {
         let args = vec!["--reporter".to_string(), "emoji".to_string()];
-        assert!(user_has_flag(&args, &["--reporter", "--fix", "--autocorrect"]));
+        assert!(user_has_flag(
+            &args,
+            &["--reporter", "--fix", "--autocorrect"]
+        ));
     }
 }

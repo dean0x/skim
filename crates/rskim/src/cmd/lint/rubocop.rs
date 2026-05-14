@@ -26,9 +26,8 @@ const CONFIG: LinterConfig<'static> = LinterConfig {
 
 /// `file:line:col: S: CopName: message`
 /// Letter codes: C=convention, W=warning, E=error, F=fatal
-static RE_RUBOCOP_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(.+):(\d+):\d+: ([CWEF]): (.+?): (.+)$").expect("valid regex")
-});
+static RE_RUBOCOP_LINE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.+):(\d+):\d+: ([CWEF]): (.+?): (.+)$").expect("valid regex"));
 
 /// Run `skim rubocop [args...]`.
 pub(crate) fn run(
@@ -43,7 +42,14 @@ pub(crate) fn run(
 fn prepare_args(cmd_args: &mut Vec<String>) {
     if !user_has_flag(
         cmd_args,
-        &["--format", "-f", "-a", "-A", "--autocorrect", "--autocorrect-all"],
+        &[
+            "--format",
+            "-f",
+            "-a",
+            "-A",
+            "--autocorrect",
+            "--autocorrect-all",
+        ],
     ) {
         cmd_args.insert(0, "json".to_string());
         cmd_args.insert(0, "--format".to_string());
@@ -229,7 +235,11 @@ mod tests {
 
     #[test]
     fn test_rubocop_tier3_passthrough() {
-        let output = make_output("completely unparseable output\nno json no regex", "", Some(1));
+        let output = make_output(
+            "completely unparseable output\nno json no regex",
+            "",
+            Some(1),
+        );
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
@@ -263,12 +273,32 @@ mod tests {
     #[test]
     fn test_flag_injection_skipped_when_format_present() {
         let args = vec!["--format".to_string(), "progress".to_string()];
-        assert!(user_has_flag(&args, &["--format", "-f", "-a", "-A", "--autocorrect", "--autocorrect-all"]));
+        assert!(user_has_flag(
+            &args,
+            &[
+                "--format",
+                "-f",
+                "-a",
+                "-A",
+                "--autocorrect",
+                "--autocorrect-all"
+            ]
+        ));
     }
 
     #[test]
     fn test_flag_injection_skipped_when_autocorrect_present() {
         let args = vec!["-a".to_string()];
-        assert!(user_has_flag(&args, &["--format", "-f", "-a", "-A", "--autocorrect", "--autocorrect-all"]));
+        assert!(user_has_flag(
+            &args,
+            &[
+                "--format",
+                "-f",
+                "-a",
+                "-A",
+                "--autocorrect",
+                "--autocorrect-all"
+            ]
+        ));
     }
 }
