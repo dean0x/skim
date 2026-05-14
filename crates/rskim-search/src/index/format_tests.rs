@@ -263,4 +263,3 @@ fn test_bm25_zero_avg_doc_len_no_panic() {
     let score = bm25_score(1.0, 2.0, 100, 0.0);
     assert!(score.is_finite(), "BM25 should return finite value");
 }
-
