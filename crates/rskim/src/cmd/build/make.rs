@@ -139,7 +139,7 @@ fn try_tier1_diagnostics(
 ) -> Option<ParseResult<BuildResult>> {
     let mut errors: usize = 0;
     let mut warnings: usize = 0;
-    let mut error_messages = Vec::new();
+    let mut error_messages = Vec::with_capacity(16);
     let mut any_match = false;
 
     for line in combined.lines() {
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn test_noop_after_errors_preserves_diagnostics() {
         // A trailing noop line must not discard previously-accumulated diagnostics.
-        // Regression test for the noop-early-return bug (make.rs:175).
+        // Regression test for the noop-early-return bug (make.rs:176).
         let input = "main.c:1:1: error: use of undeclared identifier 'x'\nmake: Nothing to be done for 'all'\n";
         let output = make_output("", input, Some(1));
         let result = parse_make(&output);
