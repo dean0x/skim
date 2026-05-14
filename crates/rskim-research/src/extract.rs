@@ -97,7 +97,7 @@ pub fn extract_bigrams_from_corpus(files: &[SourceFile]) -> (HashMap<u16, u32>, 
                 file_count,
             })
             .collect();
-        breakdown.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+        breakdown.sort_by_key(|b| std::cmp::Reverse(b.file_count));
         breakdown
     };
 
