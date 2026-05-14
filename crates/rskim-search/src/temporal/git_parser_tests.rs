@@ -23,26 +23,25 @@ use crate::types::{SearchError, TemporalSource};
 /// Tests that require git skip themselves gracefully.
 fn init_git_repo() -> Option<TempDir> {
     let dir = tempfile::tempdir().ok()?;
-    let ok = Command::new("git")
+
+    // Try `git init -b main` first (git ≥2.28); fall back to plain `git init`.
+    let init_ok = Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(dir.path())
         .output()
-        .ok()?
-        .status
-        .success();
-    if !ok {
-        // Try without -b flag (older git)
-        let ok2 = Command::new("git")
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        || Command::new("git")
             .args(["init"])
             .current_dir(dir.path())
             .output()
-            .ok()?
-            .status
-            .success();
-        if !ok2 {
-            return None;
-        }
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+    if !init_ok {
+        return None;
     }
+
     // Configure identity so commits work
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
@@ -108,10 +107,7 @@ fn test_empty_repo_returns_ok_empty() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     let src = GixSource;
     let result = src.parse_history(dir.path(), 90);
     let history = result.expect("empty repo should succeed");
@@ -153,10 +149,7 @@ fn test_single_commit_fields() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "hello.txt", "world", "feat: first commit"));
 
     let src = GixSource;
@@ -181,10 +174,7 @@ fn test_multiple_commits_ordering() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "a.txt", "a", "commit one"));
     assert!(git_commit_file(dir.path(), "b.txt", "b", "commit two"));
     assert!(git_commit_file(dir.path(), "c.txt", "c", "commit three"));
@@ -211,10 +201,7 @@ fn test_root_commit_includes_changed_files() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "main.rs", "fn main(){}", "add main"));
 
     let src = GixSource;
@@ -237,10 +224,7 @@ fn test_commit_with_multiple_files() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     // Create 3 files and commit them together
     std::fs::write(dir.path().join("a.rs"), "a").unwrap();
     std::fs::write(dir.path().join("b.rs"), "b").unwrap();
@@ -282,10 +266,7 @@ fn test_lookback_zero_returns_all_history() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "a.txt", "a", "old commit"));
     assert!(git_commit_file(dir.path(), "b.txt", "b", "new commit"));
 
@@ -299,10 +280,7 @@ fn test_lookback_large_value_returns_recent() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "a.txt", "a", "commit A"));
     assert!(git_commit_file(dir.path(), "b.txt", "b", "commit B"));
 
@@ -321,10 +299,7 @@ fn test_file_addition_appears_in_changed_files() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "new_feature.rs", "pub fn feature(){}", "add feature"));
 
     let src = GixSource;
@@ -341,10 +316,7 @@ fn test_file_deletion_appears_in_changed_files() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "old.rs", "content", "add old.rs"));
     assert!(git_delete_file(dir.path(), "old.rs", "delete old.rs"));
 
@@ -365,10 +337,7 @@ fn test_file_modification_appears_in_changed_files() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "lib.rs", "v1", "initial"));
     assert!(git_commit_file(dir.path(), "lib.rs", "v2 with more content", "update lib.rs"));
 
@@ -392,10 +361,7 @@ fn test_commit_count_matches_vec_len() {
     if !git_available() {
         return;
     }
-    let dir = match init_git_repo() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "a.txt", "a", "one"));
     assert!(git_commit_file(dir.path(), "b.txt", "b", "two"));
     assert!(git_commit_file(dir.path(), "c.txt", "c", "three"));

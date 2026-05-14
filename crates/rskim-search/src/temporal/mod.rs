@@ -17,7 +17,6 @@ use regex::Regex;
 
 /// Regex that identifies "fix" commits by subject keywords.
 ///
-/// Same pattern as `crates/rskim/src/cmd/heatmap/metrics.rs::build_fix_regex()`.
 /// Compiled once and reused via `once_cell::sync::Lazy`.
 #[allow(clippy::expect_used)] // hardcoded pattern is always valid
 static FIX_REGEX: Lazy<Regex> =

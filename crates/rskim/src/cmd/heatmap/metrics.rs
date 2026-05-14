@@ -12,9 +12,6 @@ use super::types::{
     ModuleHealth,
 };
 
-// CommitRecord is an alias for rskim_search::CommitInfo; its fields are:
-//   .message (was .subject), .changed_files (was .files), .timestamp: i64 (was u64)
-
 // ============================================================================
 // Fix keyword regex
 // ============================================================================
@@ -89,8 +86,8 @@ pub(crate) fn compute_coupling(
     min_support: usize,
 ) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
     // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b).
-    // &str keys borrow from CommitRecord.files[].path — valid for entire function
-    // because `commits` (and therefore all CommitRecords) outlive these maps.
+    // &str keys borrow from CommitRecord.changed_files[].path — valid for entire
+    // function because `commits` (and therefore all CommitRecords) outlive these maps.
     let mut co_occur: HashMap<(&str, &str), (f64, usize)> = HashMap::new();
     // weighted_total[a] = weighted sum of commits touching a
     let mut weighted_total: HashMap<&str, f64> = HashMap::new();

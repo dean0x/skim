@@ -208,36 +208,18 @@ fn changed_files_for_commit(
         .map_err(gix_err)?
         .for_each_to_obtain_tree(&new_tree, |change| -> std::result::Result<_, std::convert::Infallible> {
             use gix::object::tree::diff::Change;
-            let path_opt = match &change {
-                Change::Addition { location, entry_mode, .. } => {
-                    if entry_mode.is_no_tree() && !location.is_empty() {
-                        Some(location.to_str_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                }
-                Change::Deletion { location, entry_mode, .. } => {
-                    if entry_mode.is_no_tree() && !location.is_empty() {
-                        Some(location.to_str_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                }
-                Change::Modification { location, entry_mode, .. } => {
-                    if entry_mode.is_no_tree() && !location.is_empty() {
-                        Some(location.to_str_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                }
-                Change::Rewrite { location, entry_mode, .. } => {
-                    // Renames: use destination path
-                    if entry_mode.is_no_tree() && !location.is_empty() {
-                        Some(location.to_str_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                }
+            // All change kinds use the destination location.
+            // Renames (Rewrite) also provide the new path via `location`.
+            let (location, entry_mode) = match &change {
+                Change::Addition { location, entry_mode, .. }
+                | Change::Deletion { location, entry_mode, .. }
+                | Change::Modification { location, entry_mode, .. }
+                | Change::Rewrite { location, entry_mode, .. } => (location, entry_mode),
+            };
+            let path_opt = if entry_mode.is_no_tree() && !location.is_empty() {
+                Some(location.to_str_lossy().into_owned())
+            } else {
+                None
             };
             if let Some(path) = path_opt {
                 changed_files.push(FileChangeInfo {
