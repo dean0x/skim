@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::weights::{lookup_weight, BIGRAM_WEIGHTS};
+use crate::weights::{BIGRAM_WEIGHTS, lookup_weight};
 
 // Re-export DEFAULT_WEIGHT so tests can reach it via `use super::*`.
 #[cfg(test)]
@@ -202,7 +202,9 @@ pub fn extract_ngrams_with_weights(text: &str, weights: &[(u16, f32)]) -> Vec<(N
         *entry = entry.max(w);
     }
 
-    map.into_iter().map(|(key, w)| (Ngram::from_raw(key), w)).collect()
+    map.into_iter()
+        .map(|(key, w)| (Ngram::from_raw(key), w))
+        .collect()
 }
 
 /// Extract weighted bigrams from `text` using the production [`BIGRAM_WEIGHTS`] table.
@@ -303,9 +305,8 @@ pub fn extract_query_ngrams_with_weights(query: &str, weights: &[(u16, f32)]) ->
         }
     }
 
-    // Output sorted by weight descending (already in insertion order from greedy,
-    // but re-sort to guarantee the contract even for ties).
-    selected.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // `candidates` is sorted descending and `selected` is built in that order,
+    // so the output is already sorted by weight descending.
     selected
 }
 

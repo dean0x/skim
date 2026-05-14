@@ -16174,11 +16174,9 @@ mod tests {
 
     #[test]
     fn no_duplicate_keys() {
-        let keys: Vec<u16> = BIGRAM_WEIGHTS.iter().map(|&(k, _)| k).collect();
-        let unique: std::collections::HashSet<u16> = keys.iter().copied().collect();
-        assert_eq!(
-            keys.len(),
-            unique.len(),
+        // Table is sorted, so duplicates would be adjacent.
+        assert!(
+            BIGRAM_WEIGHTS.windows(2).all(|w| w[0].0 != w[1].0),
             "BIGRAM_WEIGHTS must not have duplicate keys"
         );
     }
