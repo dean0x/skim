@@ -86,9 +86,7 @@ impl NgramIndexReader {
         let entries_bytes = (header.ngram_count as usize)
             .checked_mul(SKIDX_ENTRY_SIZE)
             .ok_or_else(|| {
-                SearchError::IndexCorrupted(
-                    "ngram_count * SKIDX_ENTRY_SIZE overflow".into(),
-                )
+                SearchError::IndexCorrupted("ngram_count * SKIDX_ENTRY_SIZE overflow".into())
             })?;
         let meta_bytes = (header.file_count as usize)
             .checked_mul(FILE_META_SIZE)
@@ -98,9 +96,7 @@ impl NgramIndexReader {
         let expected_idx_size = SKIDX_HEADER_SIZE
             .checked_add(entries_bytes)
             .and_then(|s| s.checked_add(meta_bytes))
-            .ok_or_else(|| {
-                SearchError::IndexCorrupted("expected_idx_size overflow".into())
-            })?;
+            .ok_or_else(|| SearchError::IndexCorrupted("expected_idx_size overflow".into()))?;
         if idx_mmap.len() != expected_idx_size {
             return Err(SearchError::IndexCorrupted(format!(
                 "skidx size mismatch: expected {expected_idx_size}, got {}",
@@ -160,11 +156,14 @@ impl NgramIndexReader {
     fn file_meta_at(&self, file_index: u32) -> Result<FileMetaEntry> {
         let entries_end = SKIDX_HEADER_SIZE + (self.header.ngram_count as usize) * SKIDX_ENTRY_SIZE;
         let offset = entries_end + (file_index as usize) * FILE_META_SIZE;
-        let end = offset.checked_add(FILE_META_SIZE).filter(|&e| e <= self.idx_mmap.len()).ok_or_else(|| {
-            SearchError::IndexCorrupted(format!(
-                "file_meta_at({file_index}): offset {offset} out of bounds"
-            ))
-        })?;
+        let end = offset
+            .checked_add(FILE_META_SIZE)
+            .filter(|&e| e <= self.idx_mmap.len())
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted(format!(
+                    "file_meta_at({file_index}): offset {offset} out of bounds"
+                ))
+            })?;
         decode_file_meta(&self.idx_mmap[offset..end])
     }
 
@@ -187,9 +186,7 @@ impl NgramIndexReader {
         })?;
         let length = entry.posting_length as usize;
         let end = start.checked_add(length).ok_or_else(|| {
-            SearchError::IndexCorrupted(format!(
-                "posting slice overflow: {start} + {length}"
-            ))
+            SearchError::IndexCorrupted(format!("posting slice overflow: {start} + {length}"))
         })?;
         if end > self.post_mmap.len() {
             return Err(SearchError::IndexCorrupted(format!(
@@ -198,7 +195,7 @@ impl NgramIndexReader {
             )));
         }
 
-        if length % POSTING_ENTRY_SIZE != 0 {
+        if !length.is_multiple_of(POSTING_ENTRY_SIZE) {
             return Err(SearchError::IndexCorrupted(format!(
                 "posting_length {length} not aligned to POSTING_ENTRY_SIZE {POSTING_ENTRY_SIZE}"
             )));
@@ -271,14 +268,13 @@ impl SearchLayer for NgramIndexReader {
             for (doc_id, tf) in tf_per_doc {
                 // Apply language filter before scoring to avoid decoding metadata
                 // for documents that won't appear in results.
-                if let Some(required_lang) = lang_filter {
-                    if doc_id < self.header.file_count {
-                        let meta = self.file_meta_at(doc_id)?;
-                        // Cache doc_length at the same time we read meta.
-                        doc_len_cache.entry(doc_id).or_insert(meta.doc_length);
-                        if meta.lang_id != required_lang {
-                            continue;
-                        }
+                if let Some(required_lang) = lang_filter
+                    && doc_id < self.header.file_count
+                {
+                    let meta = self.file_meta_at(doc_id)?;
+                    doc_len_cache.entry(doc_id).or_insert(meta.doc_length);
+                    if meta.lang_id != required_lang {
+                        continue;
                     }
                 }
 

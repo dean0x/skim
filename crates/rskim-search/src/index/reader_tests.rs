@@ -288,8 +288,7 @@ fn test_offset_skips_top_results() {
         "offset=2 should still return results"
     );
     assert_eq!(
-        offset_results[0].file_id,
-        all_results[2].file_id,
+        offset_results[0].file_id, all_results[2].file_id,
         "first result with offset=2 should match 3rd result of no-offset search"
     );
 }

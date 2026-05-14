@@ -140,9 +140,9 @@ fn read_array<const N: usize>(
     start: usize,
     context: &'static str,
 ) -> crate::Result<[u8; N]> {
-    let end = start.checked_add(N).ok_or_else(|| {
-        SearchError::IndexCorrupted(format!("{context}: offset overflow"))
-    })?;
+    let end = start
+        .checked_add(N)
+        .ok_or_else(|| SearchError::IndexCorrupted(format!("{context}: offset overflow")))?;
     data.get(start..end)
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| {

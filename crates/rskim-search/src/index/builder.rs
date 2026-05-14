@@ -235,10 +235,7 @@ impl LayerBuilder for NgramIndexBuilder {
 
         // Build header.
         let ngram_count = u32::try_from(entries.len()).map_err(|_| {
-            SearchError::IndexCorrupted(format!(
-                "ngram_count {} exceeds u32::MAX",
-                entries.len()
-            ))
+            SearchError::IndexCorrupted(format!("ngram_count {} exceeds u32::MAX", entries.len()))
         })?;
         let header = SkidxHeader {
             magic: *SKIDX_MAGIC,

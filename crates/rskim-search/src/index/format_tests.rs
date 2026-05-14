@@ -189,7 +189,10 @@ fn test_read_array_out_of_bounds_returns_err() {
 fn test_read_array_start_beyond_data_returns_err() {
     let data = [0u8; 2];
     let result: crate::Result<[u8; 4]> = read_array(&data, 10, "test");
-    assert!(result.is_err(), "expected Err on start-beyond-data read_array");
+    assert!(
+        result.is_err(),
+        "expected Err on start-beyond-data read_array"
+    );
 }
 
 // -----------------------------------------------------------------------
