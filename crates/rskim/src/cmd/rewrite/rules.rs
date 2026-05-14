@@ -1,6 +1,6 @@
 //! Declarative rewrite rule table.
 //!
-//! 122 rules grouped into 8 category arrays: TEST (10), BUILD (4), GIT (7),
+//! 124 rules grouped into 8 category arrays: TEST (10), BUILD (6), GIT (7),
 //! LINT (38), PKG (18), INFRA (26), FILE_OPS (16), DB (3).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
@@ -135,7 +135,7 @@ const TEST_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// BUILD rules (4)
+// BUILD rules (6)
 // ============================================================================
 
 const BUILD_RULES: &[RewriteRule] = &[
@@ -174,6 +174,28 @@ const BUILD_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["tsc"],
         rewrite_to: &["skim", "tsc"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // gmake (GNU make alias, common on BSD systems)
+    RewriteRule {
+        prefix: &["gmake"],
+        rewrite_to: &["skim", "make"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // make bare
+    RewriteRule {
+        prefix: &["make"],
+        rewrite_to: &["skim", "make"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
@@ -1572,8 +1594,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(10) + BUILD(4) + GIT(7) + LINT(38) + PKG(18) + INFRA(26) + FILE_OPS(16) + DB(3)
-    const EXPECTED_RULE_COUNT: usize = 10 + 4 + 7 + 38 + 18 + 26 + 16 + 3;
+    /// TEST(10) + BUILD(6) + GIT(7) + LINT(38) + PKG(18) + INFRA(26) + FILE_OPS(16) + DB(3)
+    const EXPECTED_RULE_COUNT: usize = 10 + 6 + 7 + 38 + 18 + 26 + 16 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {

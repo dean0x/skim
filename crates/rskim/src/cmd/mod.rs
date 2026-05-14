@@ -172,6 +172,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "pytest",
     "vitest",
     // Build tools
+    "make",
     "tsc",
     // Linters (11)
     "biome",
@@ -751,7 +752,7 @@ pub(crate) fn dispatch(
 
         // Direct-to-category routing (prepend tool name for category dispatcher)
         "jest" | "pytest" | "vitest" => test::run(&prepend(subcommand, args), analytics),
-        "tsc" => build::run(&prepend(subcommand, args), analytics),
+        "make" | "tsc" => build::run(&prepend(subcommand, args), analytics),
         "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "mypy" | "oxlint"
         | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
         "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),

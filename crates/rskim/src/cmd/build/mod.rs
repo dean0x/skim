@@ -6,6 +6,7 @@
 //! invocation and piped stdin.
 
 pub(crate) mod cargo;
+pub(crate) mod make;
 pub(crate) mod tsc;
 
 use std::process::ExitCode;
@@ -50,6 +51,7 @@ pub(crate) fn run(
     match sub {
         Some("cargo") => cargo::run(remaining, show_stats, rec),
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
+        Some("make") => make::run(remaining, show_stats, rec),
         Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
             // Defensive branch: flat dispatch always prepends a known tool name
@@ -59,7 +61,7 @@ pub(crate) fn run(
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             eprintln!(
                 "skim: unknown subcommand '{safe_unknown}'\n\
-                 Supported tools: cargo, clippy, tsc"
+                 Supported tools: cargo, clippy, make, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -67,8 +69,9 @@ pub(crate) fn run(
             eprintln!(
                 "skim: missing build tool\n\n\
                  Usage: skim cargo build [args...]\n\
+                 Usage: skim make [args...]\n\
                  Usage: skim tsc [args...]\n\n\
-                 Supported tools: cargo, clippy, tsc"
+                 Supported tools: cargo, clippy, make, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -76,13 +79,14 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim {{cargo build|cargo clippy|tsc}} [args...]");
+    println!("skim {{cargo build|cargo clippy|make|tsc}} [args...]");
     println!();
     println!("  Run build tools and compress output for AI context windows.");
     println!();
     println!("Available tools:");
     println!("  cargo      Run cargo build with output compression");
     println!("  clippy     Run cargo clippy with output compression");
+    println!("  make       Run GNU make with output compression");
     println!("  tsc        Run TypeScript compiler with output compression");
     println!();
     println!("Flags:");
@@ -92,6 +96,8 @@ fn print_help() {
     println!("  skim cargo build");
     println!("  skim cargo build --release");
     println!("  skim cargo clippy -- -W clippy::pedantic");
+    println!("  skim make");
+    println!("  skim make -j4 all");
     println!("  skim tsc --noEmit");
 }
 

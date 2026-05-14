@@ -1,0 +1,7 @@
+gcc -c -o main.o main.c -Wall -Wextra
+main.c:42:10: error: 'foo' undeclared (first use in this function)
+main.c:42:10: note: each undeclared identifier is reported only once for each function it appears in
+main.c:55:5: warning: unused variable 'x' [-Wunused-variable]
+main.c:3:10: fatal error: missing_header.h: No such file or directory
+compilation terminated.
+make: *** [Makefile:15: main.o] Error 1

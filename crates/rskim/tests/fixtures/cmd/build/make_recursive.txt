@@ -1,0 +1,14 @@
+make[1]: Entering directory '/home/user/project/lib'
+[ 25%] Building C object CMakeFiles/foo.dir/foo.c.o
+gcc -c -o libfoo.o libfoo.c -Wall -fPIC
+[ 50%] Linking C shared library libfoo.so
+gcc -shared -o libfoo.so libfoo.o
+make[1]: Leaving directory '/home/user/project/lib'
+--- src ---
+make[1]: Entering directory '/home/user/project/src'
+[ 75%] Building C object CMakeFiles/app.dir/main.c.o
+gcc -c -o main.o main.c -Wall -I../lib
+[100%] Linking C executable app
+gcc -o app main.o -L../lib -lfoo
+make[1]: Leaving directory '/home/user/project/src'
+--- src ---

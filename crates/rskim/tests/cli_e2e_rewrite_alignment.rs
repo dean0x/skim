@@ -541,3 +541,25 @@ fn test_alignment_python3_m_pytest_same_handler_as_bare_pytest() {
         "python3 -m pytest must rewrite to skim pytest: {python3_stdout}"
     );
 }
+
+// ============================================================================
+// Make: rewrite alignment
+// ============================================================================
+
+#[test]
+fn test_alignment_make_rewrite() {
+    skim_cmd()
+        .args(["rewrite", "make", "-j4", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim make"));
+}
+
+#[test]
+fn test_alignment_gmake_rewrite() {
+    skim_cmd()
+        .args(["rewrite", "gmake", "clean"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim make"));
+}

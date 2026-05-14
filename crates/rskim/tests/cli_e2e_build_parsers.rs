@@ -71,3 +71,12 @@ fn test_cargo_no_subcmd_shows_help() {
         .success()
         .stdout(predicate::str::contains("skim cargo"));
 }
+
+// ============================================================================
+// Make: dispatch + help
+// ============================================================================
+
+#[test]
+fn test_build_make_dispatches_through_build_module() {
+    skim_cmd().args(["make", "--help"]).assert().success();
+}
