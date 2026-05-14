@@ -9,9 +9,14 @@
 //!
 //! CLI/binary code in `crates/rskim/src/cmd/search.rs` handles all I/O.
 
+pub mod ngram;
 mod types;
 pub mod weights;
 
+pub use ngram::{
+    BORDER_MULTIPLIER, Ngram, extract_ngrams, extract_ngrams_with_weights, extract_query_ngrams,
+    extract_query_ngrams_with_weights,
+};
 pub use types::{
     FieldClassifier, FileId, IndexStats, LayerBuilder, NodeInfo, Result, SearchError, SearchField,
     SearchLayer, SearchQuery, SearchResult, TemporalFlags,
