@@ -1,6 +1,6 @@
 //! Build output compression (#51)
 //!
-//! Handles build tool output for cargo, clippy, and tsc using three-tier
+//! Handles build tool output for cargo, clippy, make, and tsc using three-tier
 //! parse degradation. Called via flat dispatch (`skim tsc`) or multi-category
 //! dispatch (`skim cargo build`, `skim cargo clippy`). Supports both direct
 //! invocation and piped stdin.
@@ -55,7 +55,7 @@ pub(crate) fn run(
         Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
             // Defensive branch: flat dispatch always prepends a known tool name
-            // (cargo/clippy/tsc) before calling this function, so this arm is
+            // (cargo/clippy/make/tsc) before calling this function, so this arm is
             // only reachable via internal routing bugs. Use eprintln! + FAILURE
             // (not bail!) consistent with sibling handlers (pkg, lint, test).
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
