@@ -10,6 +10,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 // Search types derive Serialize/Deserialize because search results are serialized
 // to JSON for `--json` CLI output. rskim-core types do not need serde — they are
@@ -148,6 +149,82 @@ impl SearchField {
 pub struct TemporalFlags {
     /// Restrict results to files modified within the given number of days.
     pub modified_within_days: Option<u32>,
+}
+
+// ============================================================================
+// Git history types (Wave 2a)
+// ============================================================================
+
+/// A single file touched in a commit, with line-change counts.
+///
+/// Shared between the `temporal` module (git history parsing) and any consumer
+/// that needs file-level change metadata. Both `additions` and `deletions` use
+/// `u64` to accommodate large generated files without overflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeInfo {
+    /// Repo-root-relative path of the file.
+    pub path: PathBuf,
+    /// Number of lines added.
+    pub additions: u64,
+    /// Number of lines deleted.
+    pub deletions: u64,
+}
+
+/// Metadata extracted from a single git commit.
+///
+/// Intentionally free of gix types — all gix values are converted at the
+/// parser boundary so no gix dependency leaks into the public API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitInfo {
+    /// Full 40-character hex SHA of the commit.
+    pub hash: String,
+    /// Unix timestamp (seconds since epoch, UTC).
+    pub timestamp: i64,
+    /// Author name (from git `author.name`).
+    pub author: String,
+    /// First line of the commit message.
+    pub message: String,
+    /// Files touched by this commit.
+    pub changed_files: Vec<FileChangeInfo>,
+}
+
+/// Summary metadata about a parsed history result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalMetadata {
+    /// True when the repository is a shallow clone (history may be incomplete).
+    pub is_shallow: bool,
+    /// Number of commits included in this result (equals `commits.len()`).
+    pub commit_count: usize,
+}
+
+/// Output of [`TemporalSource::parse_history`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryResult {
+    /// Commits ordered from newest to oldest.
+    pub commits: Vec<CommitInfo>,
+    /// Summary metadata about the history traversal.
+    pub metadata: TemporalMetadata,
+}
+
+/// Trait for git history parsers.
+///
+/// Implementations must be `Send + Sync` so they can be used from worker
+/// threads. Object safety is preserved — no associated types or generics.
+pub trait TemporalSource: Send + Sync {
+    /// Parse git history for the repository at `repo_path`.
+    ///
+    /// Returns commits ordered from newest to oldest, filtered to those whose
+    /// author timestamp falls within the last `lookback_days` days.
+    /// When `lookback_days` is `0`, all history is returned (no time filter).
+    ///
+    /// # Errors
+    /// Returns [`SearchError::Git`] on any git-level failure (not a repo,
+    /// unreadable objects, etc.).
+    fn parse_history(
+        &self,
+        repo_path: &Path,
+        lookback_days: u32,
+    ) -> Result<HistoryResult>;
 }
 
 // ============================================================================
@@ -346,6 +423,11 @@ pub enum SearchError {
     /// I/O error (primarily for future persistence layers)
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Git operation error — all gix/libgit2 errors are converted to strings
+    /// at the parser boundary so no git library types leak into this enum.
+    #[error("Git error: {0}")]
+    Git(String),
 }
 
 /// Result type alias for all rskim-search operations.

@@ -4,6 +4,10 @@
 
 use serde::Serialize;
 
+// Re-export shared commit/file types from rskim-search so heatmap modules
+// use a single canonical definition (eliminates the local duplicate).
+pub(crate) use rskim_search::{CommitInfo as CommitRecord, FileChangeInfo as FileChange};
+
 // ============================================================================
 // CLI configuration
 // ============================================================================
@@ -89,29 +93,6 @@ pub(crate) struct ResolvedWindow {
     pub(crate) window_preset: Option<String>,
     /// Last-N commit count, if `--last` was used.
     pub(crate) last_n: Option<usize>,
-}
-
-// ============================================================================
-// Git log data
-// ============================================================================
-
-/// A single commit extracted from git log.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct CommitRecord {
-    pub(crate) hash: String,
-    pub(crate) author: String,
-    /// Unix timestamp.
-    pub(crate) timestamp: u64,
-    pub(crate) subject: String,
-    pub(crate) files: Vec<FileChange>,
-}
-
-/// A file touched in a commit, with line change counts.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct FileChange {
-    pub(crate) path: String,
-    pub(crate) additions: u64,
-    pub(crate) deletions: u64,
 }
 
 // ============================================================================

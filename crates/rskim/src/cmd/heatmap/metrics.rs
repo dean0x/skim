@@ -12,6 +12,9 @@ use super::types::{
     ModuleHealth,
 };
 
+// CommitRecord is an alias for rskim_search::CommitInfo; its fields are:
+//   .message (was .subject), .changed_files (was .files), .timestamp: i64 (was u64)
+
 // ============================================================================
 // Fix keyword regex
 // ============================================================================
@@ -31,8 +34,10 @@ pub(crate) fn compute_churn(commits: &[CommitRecord]) -> HashMap<String, ChurnMe
     let mut counts: HashMap<String, usize> = HashMap::new();
 
     for commit in commits {
-        for file in &commit.files {
-            *counts.entry(file.path.clone()).or_insert(0) += 1;
+        for file in &commit.changed_files {
+            *counts
+                .entry(file.path.to_string_lossy().into_owned())
+                .or_insert(0) += 1;
         }
     }
 
@@ -91,7 +96,11 @@ pub(crate) fn compute_coupling(
     let mut weighted_total: HashMap<&str, f64> = HashMap::new();
 
     for commit in commits {
-        let files: Vec<&str> = commit.files.iter().map(|f| f.path.as_str()).collect();
+        let files: Vec<&str> = commit
+            .changed_files
+            .iter()
+            .map(|f| f.path.to_str().unwrap_or(""))
+            .collect();
         let n = files.len();
         let weight = 1.0 / (n as f64).sqrt();
 
@@ -200,14 +209,15 @@ pub(crate) fn compute_stability(
     let mut file_fix_count: HashMap<String, usize> = HashMap::new();
 
     for commit in commits {
-        let is_fix = fix_regex.is_match(&commit.subject);
-        for file in &commit.files {
+        let is_fix = fix_regex.is_match(&commit.message);
+        for file in &commit.changed_files {
+            let path_str = file.path.to_string_lossy().into_owned();
             file_commits
-                .entry(file.path.clone())
+                .entry(path_str.clone())
                 .or_default()
-                .push(commit.timestamp);
+                .push(commit.timestamp as u64);
             if is_fix {
-                *file_fix_count.entry(file.path.clone()).or_insert(0) += 1;
+                *file_fix_count.entry(path_str).or_insert(0) += 1;
             }
         }
     }
@@ -256,9 +266,9 @@ pub(crate) fn compute_authors(commits: &[CommitRecord]) -> HashMap<String, Autho
     let mut file_author_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
     for commit in commits {
-        for file in &commit.files {
+        for file in &commit.changed_files {
             *file_author_counts
-                .entry(file.path.clone())
+                .entry(file.path.to_string_lossy().into_owned())
                 .or_default()
                 .entry(commit.author.clone())
                 .or_insert(0) += 1;
@@ -319,14 +329,17 @@ pub(crate) fn compute_fix_after_touch(
     // Classify every commit
     let is_fix: Vec<bool> = commits
         .iter()
-        .map(|c| fix_regex.is_match(&c.subject))
+        .map(|c| fix_regex.is_match(&c.message))
         .collect();
 
     // Per-file: which commit indices touch it?
     let mut file_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, commit) in commits.iter().enumerate() {
-        for file in &commit.files {
-            file_indices.entry(file.path.clone()).or_default().push(i);
+        for file in &commit.changed_files {
+            file_indices
+                .entry(file.path.to_string_lossy().into_owned())
+                .or_default()
+                .push(i);
         }
     }
 
@@ -435,21 +448,21 @@ pub(crate) fn compute_encapsulation(
         // Precompute top-level directory for each file once to avoid calling
         // extract_top_dir twice per file (once for dirs, once for module_files).
         let file_dirs: Vec<Option<String>> = commit
-            .files
+            .changed_files
             .iter()
-            .map(|f| extract_top_dir(&f.path))
+            .map(|f| extract_top_dir(&f.path.to_string_lossy()))
             .collect();
 
         // Collect unique top-level directories for this commit
         let dirs: HashSet<&str> = file_dirs.iter().filter_map(|d| d.as_deref()).collect();
 
         // Track files per module
-        for (file, dir) in commit.files.iter().zip(file_dirs.iter()) {
+        for (file, dir) in commit.changed_files.iter().zip(file_dirs.iter()) {
             if let Some(d) = dir {
                 module_files
                     .entry(d.clone())
                     .or_default()
-                    .insert(file.path.clone());
+                    .insert(file.path.to_string_lossy().into_owned());
             }
         }
 
@@ -513,12 +526,12 @@ mod tests {
         CommitRecord {
             hash: hash.to_string(),
             author: author.to_string(),
-            timestamp: ts,
-            subject: subject.to_string(),
-            files: files
+            timestamp: ts as i64,
+            message: subject.to_string(),
+            changed_files: files
                 .iter()
                 .map(|p| FileChange {
-                    path: p.to_string(),
+                    path: std::path::PathBuf::from(p),
                     additions: 1,
                     deletions: 0,
                 })

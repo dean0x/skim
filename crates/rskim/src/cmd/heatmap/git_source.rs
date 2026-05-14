@@ -213,9 +213,9 @@ pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord
             current = Some(CommitRecord {
                 hash,
                 author,
-                timestamp,
-                subject,
-                files: Vec::new(),
+                timestamp: timestamp as i64,
+                message: subject,
+                changed_files: Vec::new(),
             });
         } else if line.trim().is_empty() {
             // Blank lines separate commits — skip
@@ -226,7 +226,7 @@ pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord
             if let Some(record) = current.as_mut()
                 && let Some(file_change) = parse_numstat_line(line)
             {
-                record.files.push(file_change);
+                record.changed_files.push(file_change);
             }
         }
     }
@@ -265,7 +265,7 @@ fn parse_numstat_line(line: &str) -> Option<FileChange> {
     let path = resolve_rename(raw_path);
 
     Some(FileChange {
-        path,
+        path: std::path::PathBuf::from(path),
         additions,
         deletions,
     })
@@ -323,9 +323,9 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, "abc123");
         assert_eq!(result[0].author, "Alice");
-        assert_eq!(result[0].timestamp, 1_700_000_000);
-        assert_eq!(result[0].subject, "fix: something");
-        assert!(result[0].files.is_empty());
+        assert_eq!(result[0].timestamp, 1_700_000_000i64);
+        assert_eq!(result[0].message, "fix: something");
+        assert!(result[0].changed_files.is_empty());
     }
 
     #[test]
@@ -333,10 +333,10 @@ mod tests {
         let input = "COMMIT:abc123|Alice|1700000000|chore: update\n5\t2\tsrc/main.rs\n3\t1\tlib/utils.rs\n\n";
         let result = parse_git_log_output(input).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].files.len(), 2);
-        assert_eq!(result[0].files[0].path, "src/main.rs");
-        assert_eq!(result[0].files[0].additions, 5);
-        assert_eq!(result[0].files[0].deletions, 2);
+        assert_eq!(result[0].changed_files.len(), 2);
+        assert_eq!(result[0].changed_files[0].path, std::path::Path::new("src/main.rs"));
+        assert_eq!(result[0].changed_files[0].additions, 5);
+        assert_eq!(result[0].changed_files[0].deletions, 2);
     }
 
     #[test]
@@ -367,8 +367,8 @@ mod tests {
     fn test_binary_files_skipped() {
         let input = "COMMIT:abc|Alice|1000|msg\n-\t-\tbinary.bin\n5\t2\treal.rs\n\n";
         let result = parse_git_log_output(input).unwrap();
-        assert_eq!(result[0].files.len(), 1);
-        assert_eq!(result[0].files[0].path, "real.rs");
+        assert_eq!(result[0].changed_files.len(), 1);
+        assert_eq!(result[0].changed_files[0].path, std::path::Path::new("real.rs"));
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
         // Subject may contain the separator — splitn(4) protects us
         let input = "COMMIT:abc|Alice|1000|feat: add foo|bar\n\n";
         let result = parse_git_log_output(input).unwrap();
-        assert_eq!(result[0].subject, "feat: add foo|bar");
+        assert_eq!(result[0].message, "feat: add foo|bar");
     }
 
     #[test]
@@ -407,6 +407,6 @@ mod tests {
         let input = "COMMIT:abc|Alice|1000|msg\nnot-a-numstat-line\n\n";
         let result = parse_git_log_output(input).unwrap();
         // The malformed line should be silently ignored
-        assert_eq!(result[0].files.len(), 0);
+        assert_eq!(result[0].changed_files.len(), 0);
     }
 }

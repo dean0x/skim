@@ -219,11 +219,11 @@ fn prepare_commits(
     let mut commits = raw_commits;
     for commit in &mut commits {
         commit
-            .files
-            .retain(|f| !should_exclude(&f.path, &exclude_set));
+            .changed_files
+            .retain(|f| !should_exclude(f.path.to_str().unwrap_or(""), &exclude_set));
     }
     // Remove commits that are now file-less after exclusion
-    commits.retain(|c| !c.files.is_empty());
+    commits.retain(|c| !c.changed_files.is_empty());
 
     if config.debug {
         eprintln!(
