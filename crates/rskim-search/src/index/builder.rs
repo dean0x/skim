@@ -153,7 +153,9 @@ impl LayerBuilder for NgramIndexBuilder {
             });
         }
 
-        self.file_count += 1;
+        self.file_count = self.file_count.checked_add(1).ok_or_else(|| {
+            SearchError::IndexCorrupted("file_count overflow: too many files".into())
+        })?;
         self.total_doc_length += u64::from(doc_length);
         Ok(())
     }
@@ -174,7 +176,7 @@ impl LayerBuilder for NgramIndexBuilder {
         let avg_doc_length = if self.file_count == 0 {
             0.0f32
         } else {
-            self.total_doc_length as f32 / self.file_count as f32
+            (self.total_doc_length as f64 / f64::from(self.file_count)) as f32
         };
 
         // Sort each posting list by (doc_id, field_id, position).
@@ -232,10 +234,16 @@ impl LayerBuilder for NgramIndexBuilder {
         let checksum = hasher.finalize();
 
         // Build header.
+        let ngram_count = u32::try_from(entries.len()).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "ngram_count {} exceeds u32::MAX",
+                entries.len()
+            ))
+        })?;
         let header = SkidxHeader {
             magic: *SKIDX_MAGIC,
             version: FORMAT_VERSION,
-            ngram_count: entries.len() as u32,
+            ngram_count,
             file_count: self.file_count,
             postings_file_size: postings_buf.len() as u64,
             avg_doc_length,
