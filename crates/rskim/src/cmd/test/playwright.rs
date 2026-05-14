@@ -44,6 +44,10 @@ static RE_PW_FAIL_LINE: LazyLock<Regex> = LazyLock::new(|| {
 // ============================================================================
 
 /// Run `playwright test [args...]`.
+///
+/// Strips the `test` subcommand token (already verified by the dispatcher)
+/// so that `should_read_stdin` sees the real user args. The subcommand is
+/// re-prepended in `prepare_args` for the spawn path.
 pub(crate) fn run(
     args: &[String],
     show_stats: bool,
@@ -56,13 +60,20 @@ pub(crate) fn run(
         env_overrides: &[],
     };
 
+    let user_args = if args.first().map(String::as_str) == Some("test") {
+        &args[1..]
+    } else {
+        args
+    };
+
     run_test_runner(
         &config,
-        args,
+        user_args,
         show_stats,
         rec,
         |a| {
-            let mut final_args = a.to_vec();
+            let mut final_args = vec!["test".to_string()];
+            final_args.extend_from_slice(a);
             if !user_has_flag(a, &["--reporter"]) {
                 final_args.push("--reporter=json".to_string());
             }
