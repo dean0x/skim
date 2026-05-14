@@ -68,9 +68,8 @@ static MAVEN_TIME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[INFO\] Total time:\s+(.+)").expect("valid regex"));
 
 /// Download noise: `Downloading from central:` or `Downloaded from central:`
-static MAVEN_DOWNLOAD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\[INFO\] Downloa(?:ding|ded) from ").expect("valid regex")
-});
+static MAVEN_DOWNLOAD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[INFO\] Downloa(?:ding|ded) from ").expect("valid regex"));
 
 /// Maven INFO separator lines and scanning/building markers
 static MAVEN_INFO_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -106,7 +105,7 @@ fn parse_maven(output: &CommandOutput) -> ParseResult<BuildResult> {
 
 fn try_tier1_diagnostics(
     combined: &str,
-    _exit_code: Option<i32>,
+    exit_code: Option<i32>,
 ) -> Option<ParseResult<BuildResult>> {
     let mut errors: usize = 0;
     let mut warnings: usize = 0;
@@ -135,7 +134,7 @@ fn try_tier1_diagnostics(
         return None;
     }
 
-    let success = MAVEN_SUCCESS_RE.is_match(combined) && errors == 0;
+    let success = exit_code == Some(0) && MAVEN_SUCCESS_RE.is_match(combined) && errors == 0;
 
     Some(ParseResult::Full(BuildResult::new(
         success,
@@ -149,7 +148,11 @@ fn try_tier1_diagnostics(
 /// Parse Maven duration string: "2.345 s" → 2345ms, "1:23 min" → 83000ms
 fn parse_maven_duration(s: &str) -> Option<u64> {
     if let Some(secs_str) = s.strip_suffix(" s") {
-        return secs_str.trim().parse::<f64>().ok().map(|f| (f * 1000.0) as u64);
+        return secs_str
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|f| (f * 1000.0) as u64);
     }
     if let Some(min_str) = s.strip_suffix(" min") {
         let parts: Vec<&str> = min_str.trim().split(':').collect();
@@ -217,7 +220,11 @@ mod tests {
     fn test_maven_tier1_success() {
         let output = make_output(MAVEN_SUCCESS, "", Some(0));
         let result = parse_maven(&output);
-        assert!(result.is_full(), "expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {}",
+            result.tier_name()
+        );
         if let ParseResult::Full(br) = &result {
             assert!(br.success);
             assert_eq!(br.errors, 0);
@@ -228,7 +235,11 @@ mod tests {
     fn test_maven_tier1_failure() {
         let output = make_output(MAVEN_FAILURE, "", Some(1));
         let result = parse_maven(&output);
-        assert!(result.is_full(), "expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {}",
+            result.tier_name()
+        );
         if let ParseResult::Full(br) = &result {
             assert!(!br.success);
             assert!(br.errors >= 1);
@@ -239,21 +250,33 @@ mod tests {
     fn test_maven_tier2_noise_strip() {
         let output = make_output(MAVEN_NOISY, "", Some(0));
         let result = parse_maven(&output);
-        assert!(result.is_degraded(), "expected Degraded, got {}", result.tier_name());
+        assert!(
+            result.is_degraded(),
+            "expected Degraded, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_maven_tier3_passthrough() {
         let output = make_output("random unrecognized output\n", "", Some(1));
         let result = parse_maven(&output);
-        assert!(result.is_passthrough(), "expected Passthrough, got {}", result.tier_name());
+        assert!(
+            result.is_passthrough(),
+            "expected Passthrough, got {}",
+            result.tier_name()
+        );
     }
 
     #[test]
     fn test_maven_empty_success() {
         let output = make_output("", "", Some(0));
         let result = parse_maven(&output);
-        assert!(result.is_full(), "expected Full, got {}", result.tier_name());
+        assert!(
+            result.is_full(),
+            "expected Full, got {}",
+            result.tier_name()
+        );
         if let ParseResult::Full(br) = &result {
             assert!(br.success);
         }

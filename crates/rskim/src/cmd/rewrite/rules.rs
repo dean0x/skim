@@ -1,7 +1,7 @@
 //! Declarative rewrite rule table.
 //!
-//! 124 rules grouped into 8 category arrays: TEST (10), BUILD (6), GIT (7),
-//! LINT (38), PKG (18), INFRA (26), FILE_OPS (16), DB (3).
+//! 146 rules grouped into 8 category arrays: TEST (16), BUILD (12), GIT (7),
+//! LINT (42), PKG (24), INFRA (26), FILE_OPS (16), DB (3).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
@@ -864,7 +864,14 @@ const LINT_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["bundle", "exec", "rubocop"],
         rewrite_to: &["skim", "rubocop"],
-        skip_if_flag_prefix: &["--format", "-f", "-a", "-A", "--autocorrect", "--autocorrect-all"],
+        skip_if_flag_prefix: &[
+            "--format",
+            "-f",
+            "-a",
+            "-A",
+            "--autocorrect",
+            "--autocorrect-all",
+        ],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -874,7 +881,14 @@ const LINT_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["rubocop"],
         rewrite_to: &["skim", "rubocop"],
-        skip_if_flag_prefix: &["--format", "-f", "-a", "-A", "--autocorrect", "--autocorrect-all"],
+        skip_if_flag_prefix: &[
+            "--format",
+            "-f",
+            "-a",
+            "-A",
+            "--autocorrect",
+            "--autocorrect-all",
+        ],
         category: RewriteCategory::Lint,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,

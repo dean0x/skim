@@ -1,8 +1,8 @@
-//! Lint handler — dispatches to linter parsers (#104, #116, #133)
+//! Lint handler — dispatches to linter parsers (#104, #116, #118, #133)
 //!
 //! Called via flat dispatch: `skim <linter> [args...]`. Supported linters:
 //! `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`,
-//! `oxlint`, `prettier`, `ruff`, `rustfmt`.
+//! `oxlint`, `prettier`, `rubocop`, `ruff`, `rustfmt`, `swiftlint`.
 
 pub(crate) mod biome;
 pub(crate) mod black;
@@ -28,8 +28,19 @@ use crate::runner::CommandOutput;
 
 /// Known linters that the lint handler can dispatch to.
 const KNOWN_LINTERS: &[&str] = &[
-    "biome", "black", "dprint", "eslint", "gofmt", "golangci", "mypy", "oxlint", "prettier",
-    "rubocop", "ruff", "rustfmt", "swiftlint",
+    "biome",
+    "black",
+    "dprint",
+    "eslint",
+    "gofmt",
+    "golangci",
+    "mypy",
+    "oxlint",
+    "prettier",
+    "rubocop",
+    "ruff",
+    "rustfmt",
+    "swiftlint",
 ];
 
 /// Entry point for `skim <linter> [args...]` (lint handler).

@@ -53,13 +53,11 @@ pub(crate) fn run(
     match sub {
         Some("cargo") => cargo::run(remaining, show_stats, rec),
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
-        Some("gradle") | Some("gradlew") => {
-            let program = sub.unwrap();
+        Some(program @ ("gradle" | "gradlew")) => {
             gradle::run(program, remaining, show_stats, rec)
         }
         Some("make") => make::run(remaining, show_stats, rec),
-        Some("mvn") | Some("mvnw") | Some("maven") => {
-            let program = sub.unwrap();
+        Some(program @ ("mvn" | "mvnw" | "maven")) => {
             maven::run(program, remaining, show_stats, rec)
         }
         Some("tsc") => tsc::run(remaining, show_stats, rec),
@@ -90,14 +88,16 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim {{cargo build|cargo clippy|make|tsc}} [args...]");
+    println!("skim {{cargo build|cargo clippy|gradle|make|mvn|tsc}} [args...]");
     println!();
     println!("  Run build tools and compress output for AI context windows.");
     println!();
     println!("Available tools:");
     println!("  cargo      Run cargo build with output compression");
     println!("  clippy     Run cargo clippy with output compression");
+    println!("  gradle     Run Gradle with output compression (also: gradlew)");
     println!("  make       Run GNU make with output compression");
+    println!("  mvn        Run Maven with output compression (also: mvnw)");
     println!("  tsc        Run TypeScript compiler with output compression");
     println!();
     println!("Flags:");
@@ -107,8 +107,10 @@ fn print_help() {
     println!("  skim cargo build");
     println!("  skim cargo build --release");
     println!("  skim cargo clippy -- -W clippy::pedantic");
+    println!("  skim gradle build");
     println!("  skim make");
     println!("  skim make -j4 all");
+    println!("  skim mvn compile");
     println!("  skim tsc --noEmit");
 }
 
