@@ -53,6 +53,20 @@ fn test_add_file_duplicate_id_returns_error() {
 }
 
 #[test]
+fn test_add_file_non_sequential_id_returns_error() {
+    let dir = tmp_dir();
+    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    // First file must be FileId(0), not FileId(5).
+    let result = builder.add_file(crate::FileId(5), "content", rskim_core::Language::Rust);
+    assert!(result.is_err(), "non-sequential FileId should be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("sequential"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn test_add_file_empty_content_succeeds() {
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();

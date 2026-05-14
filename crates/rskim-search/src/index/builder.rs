@@ -14,8 +14,8 @@ use tempfile::NamedTempFile;
 
 use super::format::{
     FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, POSTING_ENTRY_SIZE, PostingEntry,
-    SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, compute_checksum,
-    encode_entry, encode_file_meta, encode_header, encode_posting, lang_to_id,
+    SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry,
+    encode_file_meta, encode_header, encode_posting, lang_to_id,
 };
 use super::reader::NgramIndexReader;
 use crate::{FileId, LayerBuilder, Result, SearchError, SearchLayer};
@@ -110,35 +110,51 @@ impl LayerBuilder for NgramIndexBuilder {
                 id.0
             )));
         }
+
+        // The on-disk format uses doc_id as a direct index into the file_meta
+        // array.  FileIds must therefore be assigned sequentially starting at 0.
+        // A future format version may store an explicit FileId→index mapping to
+        // lift this constraint.
+        if id.0 != self.file_count {
+            return Err(SearchError::InvalidQuery(format!(
+                "FileId must equal sequential insertion index: expected {}, got {}",
+                self.file_count, id.0
+            )));
+        }
+
+        // Validate content length fits u32 before any state mutation so a
+        // failure leaves the builder in a consistent state.
+        let doc_length: u32 = u32::try_from(content.len()).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "file {} too large: {} bytes exceeds u32::MAX",
+                id.0,
+                content.len()
+            ))
+        })?;
+
         self.seen_file_ids.insert(id.0);
 
         // Record file metadata.
         self.file_meta.push(FileMetaEntry {
             lang_id: lang_to_id(lang),
-            doc_length: content.len() as u32,
+            doc_length,
         });
 
         // Scan every 2-byte window.
         let bytes = content.as_bytes();
         let field_id = crate::SearchField::Other.discriminant();
         for (pos, window) in bytes.windows(2).enumerate() {
-            let position = pos as u64;
-            if position > u64::from(u32::MAX) {
-                return Err(SearchError::IndexCorrupted(format!(
-                    "file {} too large: position {} exceeds u32::MAX",
-                    id.0, position
-                )));
-            }
+            // Safe: doc_length fits u32, so pos (which is at most doc_length - 2) also fits.
             let key = (u16::from(window[0]) << 8) | u16::from(window[1]);
             self.postings.entry(key).or_default().push(PostingEntry {
                 doc_id: id.0,
                 field_id,
-                position: position as u32,
+                position: pos as u32,
             });
         }
 
         self.file_count += 1;
-        self.total_doc_length += content.len() as u64;
+        self.total_doc_length += u64::from(doc_length);
         Ok(())
     }
 
@@ -177,7 +193,16 @@ impl LayerBuilder for NgramIndexBuilder {
         for key in &sorted_keys {
             let list = &self.postings[key];
             let offset = postings_buf.len() as u64;
-            let length = (list.len() * POSTING_ENTRY_SIZE) as u32;
+            let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
+                SearchError::IndexCorrupted(format!(
+                    "posting list for key {key:#06x} overflows usize"
+                ))
+            })?;
+            let length = u32::try_from(byte_len).map_err(|_| {
+                SearchError::IndexCorrupted(format!(
+                    "posting list for key {key:#06x} exceeds u32::MAX bytes ({byte_len})"
+                ))
+            })?;
             for p in list {
                 postings_buf.extend_from_slice(&encode_posting(p));
             }
@@ -200,10 +225,11 @@ impl LayerBuilder for NgramIndexBuilder {
             entries_buf.extend_from_slice(&encode_entry(e));
         }
 
-        // CRC32 over entry array + file metadata.
-        let mut checksum_data = entries_buf.clone();
-        checksum_data.extend_from_slice(&meta_buf);
-        let checksum = compute_checksum(&checksum_data);
+        // CRC32 over entry array + file metadata (contiguous).
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&entries_buf);
+        hasher.update(&meta_buf);
+        let checksum = hasher.finalize();
 
         // Build header.
         let header = SkidxHeader {

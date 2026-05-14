@@ -53,10 +53,8 @@ pub struct NgramIndexReader {
     post_mmap: Mmap,
 }
 
-// SAFETY: Both Mmap fields are read-only after construction and `Mmap` itself
-// is Send + Sync on all supported platforms (see memmap2 docs).
-unsafe impl Send for NgramIndexReader {}
-unsafe impl Sync for NgramIndexReader {}
+// NgramIndexReader is automatically Send + Sync because all fields
+// (SkidxHeader: Copy, Mmap: Send+Sync) satisfy the auto-trait bounds.
 
 impl NgramIndexReader {
     /// Open an existing index from `dir`.
@@ -101,14 +99,10 @@ impl NgramIndexReader {
             )));
         }
 
-        // Verify CRC32 checksum over entries + file metadata.
-        let entries_start = SKIDX_HEADER_SIZE;
-        let entries_end = entries_start + (header.ngram_count as usize) * SKIDX_ENTRY_SIZE;
-        let meta_end = entries_end + (header.file_count as usize) * FILE_META_SIZE;
-
-        let mut checksum_data = Vec::with_capacity(meta_end - entries_start);
-        checksum_data.extend_from_slice(&idx_mmap[entries_start..meta_end]);
-        let actual_checksum = compute_checksum(&checksum_data);
+        // Verify CRC32 checksum over entries + file metadata.  The slice is
+        // contiguous in the mmap so no copy is needed.
+        let payload = &idx_mmap[SKIDX_HEADER_SIZE..expected_idx_size];
+        let actual_checksum = compute_checksum(payload);
         if actual_checksum != header.checksum {
             return Err(SearchError::IndexCorrupted(format!(
                 "checksum mismatch: expected {:#010x}, got {:#010x}",
