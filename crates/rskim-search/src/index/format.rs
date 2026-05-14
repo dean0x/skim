@@ -27,42 +27,32 @@
 //!   or returns owned byte arrays.  All I/O happens in `builder.rs`/`reader.rs`.
 //! - **No `unwrap()` / `expect()` / `panic!()`** outside `#[cfg(test)]`.
 
+pub(crate) use super::lang_map::lang_to_id;
 use crate::{
     SearchError, SearchField,
     weights::{BIGRAM_WEIGHTS, lookup_weight},
 };
 
 // ============================================================================
-// Format constants
+// Constants
 // ============================================================================
 
 /// Magic bytes at the start of every `.skidx` file.
 pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
-
 /// Current on-disk format version.  Increment on any breaking change.
 pub(crate) const FORMAT_VERSION: u16 = 1;
-
 /// Size in bytes of [`SkidxHeader`] on disk.
 pub(crate) const SKIDX_HEADER_SIZE: usize = 30;
-
 /// Size in bytes of a single [`SkidxEntry`] on disk.
 pub(crate) const SKIDX_ENTRY_SIZE: usize = 14;
-
 /// Size in bytes of a single [`PostingEntry`] on disk.
 pub(crate) const POSTING_ENTRY_SIZE: usize = 9;
-
 /// Size in bytes of a single [`FileMetaEntry`] on disk.
 pub(crate) const FILE_META_SIZE: usize = 5;
-
-// ============================================================================
-// BM25 parameters
-// ============================================================================
-
 /// BM25 term-frequency saturation parameter.
-pub(crate) const BM25_K1: f32 = 1.2;
-
+const BM25_K1: f32 = 1.2;
 /// BM25 document-length normalisation parameter.
-pub(crate) const BM25_B: f32 = 0.75;
+const BM25_B: f32 = 0.75;
 
 // ============================================================================
 // On-disk structs
@@ -150,6 +140,18 @@ pub(crate) struct FileMetaEntry {
 }
 
 // ============================================================================
+// Internal helpers
+// ============================================================================
+
+/// Extract a fixed-size byte array from `data[start..start+N]`.  Callers must
+/// check the minimum data length before calling this.
+fn read_array<const N: usize>(data: &[u8], start: usize, context: &'static str) -> crate::Result<[u8; N]> {
+    data[start..start + N].try_into().map_err(|_| {
+        SearchError::IndexCorrupted(format!("{context}: slice conversion failed"))
+    })
+}
+
+// ============================================================================
 // Header encode / decode
 // ============================================================================
 
@@ -179,48 +181,27 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
             data.len()
         )));
     }
-    let magic: [u8; 4] = data[0..4].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("header: magic slice conversion failed".to_string())
-    })?;
+    let magic: [u8; 4] = read_array(data, 0, "header: magic")?;
     if &magic != SKIDX_MAGIC {
         return Err(SearchError::IndexCorrupted(format!(
             "bad magic: expected {:?}, got {:?}",
             SKIDX_MAGIC, magic
         )));
     }
-    let version = u16::from_le_bytes(data[4..6].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("header: version slice conversion failed".to_string())
-    })?);
+    let version = u16::from_le_bytes(read_array(data, 4, "header: version")?);
     if version != FORMAT_VERSION {
         return Err(SearchError::IndexCorrupted(format!(
             "unsupported format version: {version} (expected {FORMAT_VERSION})"
         )));
     }
-    let ngram_count = u32::from_le_bytes(data[6..10].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("header: ngram_count slice conversion failed".to_string())
-    })?);
-    let file_count = u32::from_le_bytes(data[10..14].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("header: file_count slice conversion failed".to_string())
-    })?);
-    let postings_file_size = u64::from_le_bytes(data[14..22].try_into().map_err(|_| {
-        SearchError::IndexCorrupted(
-            "header: postings_file_size slice conversion failed".to_string(),
-        )
-    })?);
-    let avg_doc_length = f32::from_le_bytes(data[22..26].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("header: avg_doc_length slice conversion failed".to_string())
-    })?);
-    let checksum = u32::from_le_bytes(data[26..30].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("header: checksum slice conversion failed".to_string())
-    })?);
     Ok(SkidxHeader {
         magic,
         version,
-        ngram_count,
-        file_count,
-        postings_file_size,
-        avg_doc_length,
-        checksum,
+        ngram_count: u32::from_le_bytes(read_array(data, 6, "header: ngram_count")?),
+        file_count: u32::from_le_bytes(read_array(data, 10, "header: file_count")?),
+        postings_file_size: u64::from_le_bytes(read_array(data, 14, "header: postings_file_size")?),
+        avg_doc_length: f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?),
+        checksum: u32::from_le_bytes(read_array(data, 26, "header: checksum")?),
     })
 }
 
@@ -249,19 +230,10 @@ pub(crate) fn decode_entry(data: &[u8]) -> crate::Result<SkidxEntry> {
             data.len()
         )));
     }
-    let ngram_key = u16::from_le_bytes(data[0..2].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("entry: ngram_key slice conversion failed".to_string())
-    })?);
-    let posting_offset = u64::from_le_bytes(data[2..10].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("entry: posting_offset slice conversion failed".to_string())
-    })?);
-    let posting_length = u32::from_le_bytes(data[10..14].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("entry: posting_length slice conversion failed".to_string())
-    })?);
     Ok(SkidxEntry {
-        ngram_key,
-        posting_offset,
-        posting_length,
+        ngram_key: u16::from_le_bytes(read_array(data, 0, "entry: ngram_key")?),
+        posting_offset: u64::from_le_bytes(read_array(data, 2, "entry: posting_offset")?),
+        posting_length: u32::from_le_bytes(read_array(data, 10, "entry: posting_length")?),
     })
 }
 
@@ -291,9 +263,7 @@ pub(crate) fn decode_posting(data: &[u8]) -> crate::Result<PostingEntry> {
             data.len()
         )));
     }
-    let doc_id = u32::from_le_bytes(data[0..4].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("posting: doc_id slice conversion failed".to_string())
-    })?);
+    let doc_id = u32::from_le_bytes(read_array(data, 0, "posting: doc_id")?);
     let field_id = data[4];
     // Validate the field_id byte — bad data produces a recoverable error.
     if SearchField::from_discriminant(field_id).is_none() {
@@ -301,13 +271,10 @@ pub(crate) fn decode_posting(data: &[u8]) -> crate::Result<PostingEntry> {
             "posting: invalid field_id {field_id}"
         )));
     }
-    let position = u32::from_le_bytes(data[5..9].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("posting: position slice conversion failed".to_string())
-    })?);
     Ok(PostingEntry {
         doc_id,
         field_id,
-        position,
+        position: u32::from_le_bytes(read_array(data, 5, "posting: position")?),
     })
 }
 
@@ -335,13 +302,9 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> crate::Result<FileMetaEntry> {
             data.len()
         )));
     }
-    let lang_id = data[0];
-    let doc_length = u32::from_le_bytes(data[1..5].try_into().map_err(|_| {
-        SearchError::IndexCorrupted("file_meta: doc_length slice conversion failed".to_string())
-    })?);
     Ok(FileMetaEntry {
-        lang_id,
-        doc_length,
+        lang_id: data[0],
+        doc_length: u32::from_le_bytes(read_array(data, 1, "file_meta: doc_length")?),
     })
 }
 
@@ -373,10 +336,7 @@ pub(crate) fn lookup_ngram(
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let offset = mid * SKIDX_ENTRY_SIZE;
-        let key =
-            u16::from_le_bytes(entries_data[offset..offset + 2].try_into().map_err(|_| {
-                SearchError::IndexCorrupted("entries: key read failed".to_string())
-            })?);
+        let key = u16::from_le_bytes(read_array(entries_data, offset, "entries: key read")?);
         match key.cmp(&ngram_key) {
             std::cmp::Ordering::Equal => {
                 return decode_entry(&entries_data[offset..offset + SKIDX_ENTRY_SIZE]).map(Some);
@@ -389,20 +349,16 @@ pub(crate) fn lookup_ngram(
 }
 
 // ============================================================================
-// Checksum
+// BM25 scoring and checksum
 // ============================================================================
 
 /// Compute the CRC32 checksum of `data`.
 ///
-/// Used to verify index integrity on load.  The checksum in the header
-/// covers the entry array and file-metadata bytes appended together.
+/// The checksum in the header covers the entry array and file-metadata bytes
+/// appended together.
 pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
-
-// ============================================================================
-// BM25 scoring
-// ============================================================================
 
 /// Compute the BM25 contribution for a single term occurrence.
 ///
@@ -420,80 +376,10 @@ pub(crate) fn bm25_score(tf: f32, idf: f32, doc_len: u32, avg_doc_len: f32) -> f
     let tf = f64::from(tf);
     let idf = f64::from(idf);
     let dl = f64::from(doc_len);
-    let adl = if avg_doc_len > 0.0 {
-        f64::from(avg_doc_len)
-    } else {
-        1.0
-    };
+    let adl = if avg_doc_len > 0.0 { f64::from(avg_doc_len) } else { 1.0 };
     let norm = 1.0 - b + b * (dl / adl);
     let tf_norm = tf * (k1 + 1.0) / (tf + k1 * norm);
     idf * tf_norm
-}
-
-// ============================================================================
-// Language mapping
-// ============================================================================
-
-/// Map a [`rskim_core::Language`] variant to a stable 1-byte ID.
-///
-/// IDs are assigned in alphabetical order of the enum variant names and are
-/// part of the stable on-disk format.  Adding a new language variant without
-/// a format version bump is acceptable because [`lang_from_id`] returns
-/// `None` for unknown IDs (graceful degradation).
-#[must_use]
-pub(crate) fn lang_to_id(lang: rskim_core::Language) -> u8 {
-    match lang {
-        rskim_core::Language::C => 0,
-        rskim_core::Language::Cpp => 1,
-        rskim_core::Language::CSharp => 2,
-        rskim_core::Language::Go => 3,
-        rskim_core::Language::Java => 4,
-        rskim_core::Language::JavaScript => 5,
-        rskim_core::Language::Json => 6,
-        rskim_core::Language::Kotlin => 7,
-        rskim_core::Language::Markdown => 8,
-        rskim_core::Language::Python => 9,
-        rskim_core::Language::Ruby => 10,
-        rskim_core::Language::Rust => 11,
-        rskim_core::Language::Sql => 12,
-        rskim_core::Language::Swift => 13,
-        rskim_core::Language::Toml => 14,
-        rskim_core::Language::TypeScript => 15,
-        rskim_core::Language::Yaml => 16,
-    }
-}
-
-/// Recover a [`rskim_core::Language`] from its 1-byte index ID.
-///
-/// Returns `None` for IDs that don't correspond to any known language,
-/// allowing the reader to degrade gracefully when opening indices written
-/// by a newer version that supports additional languages.
-///
-/// Currently used only in tests and reserved for future reader use
-/// (e.g. language-aware snippet extraction).
-#[must_use]
-#[allow(dead_code)]
-pub(crate) fn lang_from_id(id: u8) -> Option<rskim_core::Language> {
-    match id {
-        0 => Some(rskim_core::Language::C),
-        1 => Some(rskim_core::Language::Cpp),
-        2 => Some(rskim_core::Language::CSharp),
-        3 => Some(rskim_core::Language::Go),
-        4 => Some(rskim_core::Language::Java),
-        5 => Some(rskim_core::Language::JavaScript),
-        6 => Some(rskim_core::Language::Json),
-        7 => Some(rskim_core::Language::Kotlin),
-        8 => Some(rskim_core::Language::Markdown),
-        9 => Some(rskim_core::Language::Python),
-        10 => Some(rskim_core::Language::Ruby),
-        11 => Some(rskim_core::Language::Rust),
-        12 => Some(rskim_core::Language::Sql),
-        13 => Some(rskim_core::Language::Swift),
-        14 => Some(rskim_core::Language::Toml),
-        15 => Some(rskim_core::Language::TypeScript),
-        16 => Some(rskim_core::Language::Yaml),
-        _ => None,
-    }
 }
 
 /// Compute IDF weight for a bigram key using the empirical weight table.
