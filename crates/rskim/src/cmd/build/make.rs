@@ -138,12 +138,12 @@ fn try_tier1_diagnostics(
 ) -> Option<ParseResult<BuildResult>> {
     let mut errors: usize = 0;
     let mut warnings: usize = 0;
-    let mut error_messages: Vec<String> = Vec::new();
+    let mut error_messages = Vec::new();
     let mut any_match = false;
 
     for line in combined.lines() {
-        // GCC/Clang diagnostics: file:line:col: (fatal )?error|warning|note: message
         if let Some(caps) = GCC_DIAGNOSTIC_RE.captures(line) {
+            // GCC/Clang diagnostic: file:line:col: (fatal )?error|warning|note: message
             any_match = true;
             let severity = caps.get(4).map_or("", |m| m.as_str());
             let file = caps.get(1).map_or("", |m| m.as_str());
@@ -153,40 +153,27 @@ fn try_tier1_diagnostics(
             if severity == "warning" {
                 warnings += 1;
             } else if severity != "note" {
-                // "error" or "fatal error" — both count as errors; note does not
+                // "error" and "fatal error" count as errors; "note" does not
                 errors += 1;
             }
-            // note lines are added to messages but NOT counted in errors or warnings
             error_messages.push(format!("{severity}: {message} ({file}:{line_num})"));
-            continue;
-        }
-
-        // Make failure: make: *** [target] Error N
-        if MAKE_FAILURE_RE.is_match(line) {
+        } else if MAKE_FAILURE_RE.is_match(line) {
+            // Make failure: make: *** [target] Error N
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
-            continue;
-        }
-
-        // Makefile syntax error: Makefile:5: *** missing separator.  Stop.
-        if MAKEFILE_ERROR_RE.is_match(line) {
+        } else if MAKEFILE_ERROR_RE.is_match(line) {
+            // Makefile syntax error: Makefile:5: *** missing separator.  Stop.
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
-            continue;
-        }
-
-        // Linker errors
-        if LINKER_ERROR_RE.is_match(line) {
+        } else if LINKER_ERROR_RE.is_match(line) {
+            // Linker error (GNU ld or macOS ld)
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
-            continue;
-        }
-
-        // Nothing-to-do / up-to-date → immediate success (no errors)
-        if MAKE_NOOP_RE.is_match(line) {
+        } else if MAKE_NOOP_RE.is_match(line) {
+            // Nothing-to-do / up-to-date → immediate success
             return Some(ParseResult::Full(BuildResult::new(
                 true,
                 0,
@@ -240,7 +227,7 @@ fn try_tier2_noise_strip(
     }
 
     let success = exit_code == Some(0);
-    let error_messages: Vec<String> = remaining_lines.iter().map(|l| (*l).to_string()).collect();
+    let error_messages: Vec<String> = remaining_lines.iter().map(|l| l.to_string()).collect();
     Some(ParseResult::Degraded(
         BuildResult::new(success, 0, 0, None, error_messages),
         vec!["make: no diagnostics found, noise-stripped".to_string()],
@@ -275,11 +262,14 @@ mod tests {
         }
     }
 
-    // Test 1: Tier 1 — errors fixture
+    // ========================================================================
+    // Tier 1: GCC/Clang diagnostics, make failures, linker errors, noops
+    // ========================================================================
+
     #[test]
     fn test_tier1_errors() {
+        // Compiler errors come through combined stderr (compiler + make)
         let fixture = load_fixture("make_errors.txt");
-        // make errors come from combined (compiler output to stderr, make to stderr)
         let output = make_output("", &fixture, Some(1));
         let result = parse_make(&output);
         assert!(
@@ -294,7 +284,6 @@ mod tests {
         }
     }
 
-    // Test 2: Tier 1 — warnings only
     #[test]
     fn test_tier1_warnings_only() {
         let fixture = load_fixture("make_warnings_only.txt");
@@ -312,7 +301,6 @@ mod tests {
         }
     }
 
-    // Test 3: Tier 1 — nothing to do
     #[test]
     fn test_tier1_nothing_to_do() {
         let fixture = load_fixture("make_nothing.txt");
@@ -330,7 +318,6 @@ mod tests {
         }
     }
 
-    // Test 4: Tier 1 — up to date
     #[test]
     fn test_tier1_up_to_date() {
         let output = make_output("", "make: 'app' is up to date.", Some(0));
@@ -345,7 +332,6 @@ mod tests {
         }
     }
 
-    // Test 5: Tier 1 — make failure line
     #[test]
     fn test_tier1_make_failure_line() {
         let output = make_output("", "make: *** [Makefile:10: all] Error 1", Some(2));
@@ -361,7 +347,6 @@ mod tests {
         }
     }
 
-    // Test 6: Tier 1 — Makefile syntax error
     #[test]
     fn test_tier1_makefile_syntax_error() {
         let output = make_output("", "Makefile:5: *** missing separator.  Stop.", Some(2));
@@ -377,7 +362,6 @@ mod tests {
         }
     }
 
-    // Test 7: Tier 1 — fatal error
     #[test]
     fn test_tier1_fatal_error() {
         let output = make_output(
@@ -397,7 +381,6 @@ mod tests {
         }
     }
 
-    // Test 8: Tier 1 — GNU linker error
     #[test]
     fn test_tier1_linker_error_gnu() {
         let output = make_output("", "main.o: undefined reference to 'foo'", Some(1));
@@ -412,7 +395,6 @@ mod tests {
         }
     }
 
-    // Test 9: Tier 1 — macOS linker error
     #[test]
     fn test_tier1_linker_error_macos() {
         let output = make_output(
@@ -431,7 +413,6 @@ mod tests {
         }
     }
 
-    // Test 10: Tier 1 — note not counted as error
     #[test]
     fn test_tier1_note_not_counted() {
         let input =
@@ -445,14 +426,18 @@ mod tests {
         );
         if let ParseResult::Full(br) = &result {
             assert_eq!(br.errors, 1, "note should not be counted as error");
-            assert!(
-                br.error_messages.len() == 2,
+            assert_eq!(
+                br.error_messages.len(),
+                2,
                 "both error and note in messages"
             );
         }
     }
 
-    // Test 11: Tier 2 — recursive make noise stripped
+    // ========================================================================
+    // Tier 2: Noise stripping
+    // ========================================================================
+
     #[test]
     fn test_tier2_noise_strip_recursive() {
         let fixture = load_fixture("make_recursive.txt");
@@ -468,7 +453,6 @@ mod tests {
         }
     }
 
-    // Test 12: Tier 2 — clean build all noise
     #[test]
     fn test_tier2_noise_strip_success() {
         let fixture = load_fixture("make_success.txt");
@@ -481,7 +465,10 @@ mod tests {
         );
     }
 
-    // Test 13: Tier 3 — passthrough
+    // ========================================================================
+    // Tier 3: Passthrough
+    // ========================================================================
+
     #[test]
     fn test_tier3_passthrough() {
         let output = make_output("some random unrecognized output\n", "", Some(1));
@@ -493,7 +480,10 @@ mod tests {
         );
     }
 
-    // Test 14: Empty output is success
+    // ========================================================================
+    // Edge cases
+    // ========================================================================
+
     #[test]
     fn test_empty_output_is_success() {
         let output = make_output("", "", Some(0));
