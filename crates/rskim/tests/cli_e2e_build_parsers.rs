@@ -108,11 +108,7 @@ fn test_build_make_real_execution_success() {
     }
 
     let dir = TempDir::new().expect("failed to create temp dir");
-    std::fs::write(
-        dir.path().join("Makefile"),
-        "all:\n\t@:\n",
-    )
-    .expect("failed to write Makefile");
+    std::fs::write(dir.path().join("Makefile"), "all:\n\t@:\n").expect("failed to write Makefile");
 
     skim_cmd()
         .args(["make", "all"])

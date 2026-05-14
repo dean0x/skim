@@ -157,15 +157,10 @@ fn try_tier1_diagnostics(
                 errors += 1;
             }
             error_messages.push(format!("{severity}: {message} ({file}:{line_num})"));
-        } else if MAKE_FAILURE_RE.is_match(line) {
-            any_match = true;
-            errors += 1;
-            error_messages.push(line.to_string());
-        } else if MAKEFILE_ERROR_RE.is_match(line) {
-            any_match = true;
-            errors += 1;
-            error_messages.push(line.to_string());
-        } else if LINKER_ERROR_RE.is_match(line) {
+        } else if MAKE_FAILURE_RE.is_match(line)
+            || MAKEFILE_ERROR_RE.is_match(line)
+            || LINKER_ERROR_RE.is_match(line)
+        {
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
@@ -536,11 +531,7 @@ mod tests {
     #[test]
     fn test_tier1_recursive_noop() {
         // MAKE_NOOP_RE handles make[N]: prefix; verify it fires on recursive make.
-        let output = make_output(
-            "",
-            "make[1]: Nothing to be done for 'target'\n",
-            Some(0),
-        );
+        let output = make_output("", "make[1]: Nothing to be done for 'target'\n", Some(0));
         let result = parse_make(&output);
         assert!(
             result.is_full(),

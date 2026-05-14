@@ -236,7 +236,10 @@ mod tests {
             result.tier_name()
         );
         if let ParseResult::Full(build_result) = &result {
-            assert!(!build_result.success, "signal-killed process must not be success");
+            assert!(
+                !build_result.success,
+                "signal-killed process must not be success"
+            );
         }
     }
 
