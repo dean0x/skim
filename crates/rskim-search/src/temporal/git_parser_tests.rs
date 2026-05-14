@@ -167,6 +167,40 @@ fn test_single_commit_fields() {
     assert!(commit.timestamp > 0, "timestamp should be positive");
     assert!(!commit.author.is_empty(), "author should be non-empty");
     assert_eq!(commit.message, "feat: first commit");
+    assert!(!history.metadata.is_shallow, "normal repo should not be shallow");
+}
+
+#[test]
+fn test_shallow_clone_detected() {
+    if !git_available() {
+        return;
+    }
+    let Some(origin) = init_git_repo() else { return };
+    assert!(git_commit_file(origin.path(), "a.txt", "a", "first"));
+    assert!(git_commit_file(origin.path(), "b.txt", "b", "second"));
+    assert!(git_commit_file(origin.path(), "c.txt", "c", "third"));
+
+    let shallow_dir = tempfile::tempdir().expect("tempdir");
+    let origin_url = format!("file://{}", origin.path().display());
+    let ok = Command::new("git")
+        .args(["clone", "--depth", "1"])
+        .arg(&origin_url)
+        .arg(shallow_dir.path().join("repo"))
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        return;
+    }
+
+    let src = GixSource;
+    let history = src
+        .parse_history(&shallow_dir.path().join("repo"), 0)
+        .expect("shallow parse");
+    assert!(history.metadata.is_shallow, "shallow clone should be detected");
+    assert!(
+        !history.commits.is_empty(),
+        "shallow clone should still return available commits"
+    );
 }
 
 #[test]

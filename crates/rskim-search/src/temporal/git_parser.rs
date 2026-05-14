@@ -123,7 +123,11 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
     let mut commits: Vec<CommitInfo> = Vec::new();
 
     for info_result in walk {
-        let info = info_result.map_err(gix_err)?;
+        let info = match info_result {
+            Ok(info) => info,
+            Err(_) if is_shallow => break,
+            Err(e) => return Err(gix_err(e)),
+        };
 
         // Decode the full commit object for author/message fields
         let commit_obj = info.object().map_err(gix_err)?;
@@ -149,8 +153,13 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         let msg_bytes = commit_ref.message;
         let message = first_line_of(msg_bytes.to_str_lossy().as_ref()).to_owned();
 
-        // Compute changed files (tree diff vs. first parent or empty tree)
-        let changed_files = changed_files_for_commit(&repo, &info)?;
+        // Compute changed files (tree diff vs. first parent or empty tree).
+        // In shallow clones, the parent object may be missing — treat as empty.
+        let changed_files = match changed_files_for_commit(&repo, &info) {
+            Ok(files) => files,
+            Err(_) if is_shallow => Vec::new(),
+            Err(e) => return Err(e),
+        };
 
         commits.push(CommitInfo {
             hash,
@@ -270,5 +279,6 @@ fn first_line_of(s: &str) -> &str {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "git_parser_tests.rs"]
 mod tests;

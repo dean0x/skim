@@ -471,7 +471,7 @@ mod tests {
             file_id: FileId(1),
             score: 0.95,
             line_range: 10..20,
-            match_positions: vec![5..10],
+            match_positions: vec![5..8, 12..15],
             field: SearchField::FunctionSignature,
             snippet: Some("fn foo()".to_string()),
         };
@@ -484,7 +484,9 @@ mod tests {
         assert_eq!(v["line_range"]["start"], serde_json::json!(10));
         assert_eq!(v["line_range"]["end"], serde_json::json!(20));
         assert_eq!(v["match_positions"][0]["start"], serde_json::json!(5));
-        assert_eq!(v["match_positions"][0]["end"], serde_json::json!(10));
+        assert_eq!(v["match_positions"][0]["end"], serde_json::json!(8));
+        assert_eq!(v["match_positions"][1]["start"], serde_json::json!(12));
+        assert_eq!(v["match_positions"][1]["end"], serde_json::json!(15));
         assert_eq!(v["field"], serde_json::json!("function_signature"));
         assert_eq!(v["snippet"], serde_json::json!("fn foo()"));
     }
