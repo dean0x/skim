@@ -27,8 +27,9 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use super::format::{
-    FILE_META_SIZE, FileMetaEntry, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SkidxHeader, bm25_score,
-    compute_checksum, decode_file_meta, decode_header, decode_posting, idf_for_key, lookup_ngram,
+    FILE_META_SIZE, FileMetaEntry, POSTING_ENTRY_SIZE, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE,
+    SkidxHeader, bm25_score, compute_checksum, decode_file_meta, decode_header, decode_posting,
+    idf_for_key, lookup_ngram,
 };
 use crate::{
     FileId, IndexStats, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
@@ -159,12 +160,12 @@ impl NgramIndexReader {
     fn file_meta_at(&self, file_index: u32) -> Result<FileMetaEntry> {
         let entries_end = SKIDX_HEADER_SIZE + (self.header.ngram_count as usize) * SKIDX_ENTRY_SIZE;
         let offset = entries_end + (file_index as usize) * FILE_META_SIZE;
-        if offset + FILE_META_SIZE > self.idx_mmap.len() {
-            return Err(SearchError::IndexCorrupted(format!(
+        let end = offset.checked_add(FILE_META_SIZE).filter(|&e| e <= self.idx_mmap.len()).ok_or_else(|| {
+            SearchError::IndexCorrupted(format!(
                 "file_meta_at({file_index}): offset {offset} out of bounds"
-            )));
-        }
-        decode_file_meta(&self.idx_mmap[offset..offset + FILE_META_SIZE])
+            ))
+        })?;
+        decode_file_meta(&self.idx_mmap[offset..end])
     }
 
     /// Retrieve all posting entries for `ngram_key` from the mmap'd posting file.
@@ -197,23 +198,19 @@ impl NgramIndexReader {
             )));
         }
 
-        let posting_len = length;
-        if posting_len % super::format::POSTING_ENTRY_SIZE != 0 {
+        if length % POSTING_ENTRY_SIZE != 0 {
             return Err(SearchError::IndexCorrupted(format!(
-                "posting_length {posting_len} not aligned to POSTING_ENTRY_SIZE {}",
-                super::format::POSTING_ENTRY_SIZE
+                "posting_length {length} not aligned to POSTING_ENTRY_SIZE {POSTING_ENTRY_SIZE}"
             )));
         }
         let data = &self.post_mmap[start..end];
-        let n = posting_len / super::format::POSTING_ENTRY_SIZE;
-        let mut result = Vec::with_capacity(n);
+        let n = length / POSTING_ENTRY_SIZE;
+        let mut postings = Vec::with_capacity(n);
         for i in 0..n {
-            let off = i * super::format::POSTING_ENTRY_SIZE;
-            result.push(decode_posting(
-                &data[off..off + super::format::POSTING_ENTRY_SIZE],
-            )?);
+            let off = i * POSTING_ENTRY_SIZE;
+            postings.push(decode_posting(&data[off..off + POSTING_ENTRY_SIZE])?);
         }
-        Ok(result)
+        Ok(postings)
     }
 }
 
@@ -310,28 +307,22 @@ impl SearchLayer for NgramIndexReader {
         let offset = query.offset.unwrap_or(0);
         let limit = query.limit.unwrap_or(20);
 
-        let mut results: Vec<SearchResult> = Vec::new();
-        let mut count = 0usize;
-        for (doc_id, score) in scored {
-            if count < offset {
-                count += 1;
-                continue;
-            }
-            if results.len() >= limit {
-                break;
-            }
-
-            let positions = doc_positions.remove(&doc_id).unwrap_or_default();
-            results.push(SearchResult {
-                file_id: FileId(doc_id),
-                score,
-                line_range: 0..0,
-                match_positions: positions,
-                field: SearchField::Other,
-                snippet: None,
-            });
-            count += 1;
-        }
+        let results = scored
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(doc_id, score)| {
+                let positions = doc_positions.remove(&doc_id).unwrap_or_default();
+                SearchResult {
+                    file_id: FileId(doc_id),
+                    score,
+                    line_range: 0..0,
+                    match_positions: positions,
+                    field: SearchField::Other,
+                    snippet: None,
+                }
+            })
+            .collect();
 
         Ok(results)
     }
