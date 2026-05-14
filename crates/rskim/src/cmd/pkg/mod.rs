@@ -7,6 +7,7 @@ mod cargo;
 mod npm;
 mod pip;
 mod pnpm;
+mod yarn;
 
 use std::process::ExitCode;
 
@@ -14,7 +15,7 @@ use crate::output::ParseResult;
 use crate::runner::CommandOutput;
 
 /// Known package manager tools that the pkg handler can dispatch to.
-const KNOWN_TOOLS: &[&str] = &["npm", "pnpm", "pip", "cargo"];
+const KNOWN_TOOLS: &[&str] = &["cargo", "npm", "pip", "pnpm", "yarn"];
 
 /// Entry point for `skim <tool> [subcmd] [args...]` (pkg handler).
 ///
@@ -49,6 +50,7 @@ pub(crate) fn run(
         "pnpm" => pnpm::run(tool_args, show_stats, json_output, rec),
         "pip" => pip::run(tool_args, show_stats, json_output, rec),
         "cargo" => cargo::run(tool_args, show_stats, json_output, rec),
+        "yarn" => yarn::run(tool_args, show_stats, json_output, rec),
         tool => {
             let safe_tool = crate::cmd::sanitize_for_display(tool);
             eprintln!(

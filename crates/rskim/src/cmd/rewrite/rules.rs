@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 use super::types::{RewriteCategory, RewriteRule};
 
 // ============================================================================
-// TEST rules (10)
+// TEST rules (16)
 // ============================================================================
 
 const TEST_RULES: &[RewriteRule] = &[
@@ -132,10 +132,74 @@ const TEST_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
+    // playwright (longest prefix first: npx playwright test, playwright test)
+    RewriteRule {
+        prefix: &["npx", "playwright", "test"],
+        rewrite_to: &["skim", "playwright"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["playwright", "test"],
+        rewrite_to: &["skim", "playwright"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // cypress (longest prefix first: npx cypress run, cypress run)
+    RewriteRule {
+        prefix: &["npx", "cypress", "run"],
+        rewrite_to: &["skim", "cypress"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["cypress", "run"],
+        rewrite_to: &["skim", "cypress"],
+        skip_if_flag_prefix: &["--reporter"],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // swift test
+    RewriteRule {
+        prefix: &["swift", "test"],
+        rewrite_to: &["skim", "swift", "test"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // dotnet test
+    RewriteRule {
+        prefix: &["dotnet", "test"],
+        rewrite_to: &["skim", "dotnet", "test"],
+        skip_if_flag_prefix: &["--logger"],
+        category: RewriteCategory::Test,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
 ];
 
 // ============================================================================
-// BUILD rules (6)
+// BUILD rules (12)
 // ============================================================================
 
 const BUILD_RULES: &[RewriteRule] = &[
@@ -196,6 +260,68 @@ const BUILD_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["make"],
         rewrite_to: &["skim", "make"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // gradle (longest prefix first: ./gradlew, gradlew, gradle)
+    RewriteRule {
+        prefix: &["./gradlew"],
+        rewrite_to: &["skim", "gradlew"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["gradlew"],
+        rewrite_to: &["skim", "gradlew"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["gradle"],
+        rewrite_to: &["skim", "gradle"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // maven (longest prefix first: ./mvnw, mvnw, mvn)
+    RewriteRule {
+        prefix: &["./mvnw"],
+        rewrite_to: &["skim", "mvnw"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["mvnw"],
+        rewrite_to: &["skim", "mvnw"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Build,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["mvn"],
+        rewrite_to: &["skim", "mvn"],
         skip_if_flag_prefix: &[],
         category: RewriteCategory::Build,
         exclude_pipe_source: false,
@@ -328,7 +454,7 @@ const GIT_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// LINT rules (38)
+// LINT rules (42)
 // ============================================================================
 
 const LINT_RULES: &[RewriteRule] = &[
@@ -731,10 +857,58 @@ const LINT_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
+    // rubocop (bundle exec rubocop, rubocop)
+    //
+    // Skip if user passes --format/-f (explicit format) or -a/-A/--autocorrect
+    // (write mode — skim only wraps check/read operations, not auto-fix).
+    RewriteRule {
+        prefix: &["bundle", "exec", "rubocop"],
+        rewrite_to: &["skim", "rubocop"],
+        skip_if_flag_prefix: &["--format", "-f", "-a", "-A", "--autocorrect", "--autocorrect-all"],
+        category: RewriteCategory::Lint,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["rubocop"],
+        rewrite_to: &["skim", "rubocop"],
+        skip_if_flag_prefix: &["--format", "-f", "-a", "-A", "--autocorrect", "--autocorrect-all"],
+        category: RewriteCategory::Lint,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // swiftlint (longest prefix first: bundle exec swiftlint, swiftlint)
+    //
+    // Skip if user passes --reporter (explicit reporter) or --fix/--autocorrect
+    // (write mode — skim only wraps read operations, not auto-fix).
+    RewriteRule {
+        prefix: &["bundle", "exec", "swiftlint"],
+        rewrite_to: &["skim", "swiftlint"],
+        skip_if_flag_prefix: &["--reporter", "--fix", "--autocorrect"],
+        category: RewriteCategory::Lint,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["swiftlint"],
+        rewrite_to: &["skim", "swiftlint"],
+        skip_if_flag_prefix: &["--reporter", "--fix", "--autocorrect"],
+        category: RewriteCategory::Lint,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
 ];
 
 // ============================================================================
-// PKG rules (18)
+// PKG rules (24)
 // ============================================================================
 
 const PKG_RULES: &[RewriteRule] = &[
@@ -916,6 +1090,68 @@ const PKG_RULES: &[RewriteRule] = &[
         prefix: &["pip3", "list"],
         rewrite_to: &["skim", "pip", "list"],
         skip_if_flag_prefix: &["--format"],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // yarn (longest prefix first: install aliases, audit, outdated, catch-all)
+    RewriteRule {
+        prefix: &["yarn", "install"],
+        rewrite_to: &["skim", "yarn", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["yarn", "add"],
+        rewrite_to: &["skim", "yarn", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["yarn", "remove"],
+        rewrite_to: &["skim", "yarn", "install"],
+        skip_if_flag_prefix: &[],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["yarn", "audit"],
+        rewrite_to: &["skim", "yarn", "audit"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    RewriteRule {
+        prefix: &["yarn", "outdated"],
+        rewrite_to: &["skim", "yarn", "outdated"],
+        skip_if_flag_prefix: &["--json"],
+        category: RewriteCategory::Pkg,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // yarn bare — catch-all (dispatches to install handler for bare `yarn` or `yarn i`)
+    RewriteRule {
+        prefix: &["yarn", "i"],
+        rewrite_to: &["skim", "yarn", "install"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Pkg,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1557,7 +1793,7 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
 // ============================================================================
 
 /// All rules concatenated once at startup, in priority order:
-/// TEST → BUILD → GIT → LINT → PKG → INFRA → FILE_OPS.
+/// TEST → BUILD → GIT → LINT → PKG → INFRA → FILE_OPS → DB.
 ///
 /// Using a `LazyLock`-backed `Vec` avoids re-chaining the seven category
 /// slices on every call to `all_rules()`, which is invoked on every rewrite
@@ -1594,8 +1830,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(10) + BUILD(6) + GIT(7) + LINT(38) + PKG(18) + INFRA(26) + FILE_OPS(16) + DB(3)
-    const EXPECTED_RULE_COUNT: usize = 10 + 6 + 7 + 38 + 18 + 26 + 16 + 3;
+    /// TEST(16) + BUILD(12) + GIT(7) + LINT(42) + PKG(24) + INFRA(26) + FILE_OPS(16) + DB(3)
+    const EXPECTED_RULE_COUNT: usize = 16 + 12 + 7 + 42 + 24 + 26 + 16 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {

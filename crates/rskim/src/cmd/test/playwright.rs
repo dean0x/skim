@@ -1,0 +1,451 @@
+//! Playwright test parser with three-tier degradation (#118).
+//!
+//! Parses `playwright test` output into structured `TestResult`.
+//!
+//! Three tiers:
+//! - **Tier 1 (JSON)**: `--reporter json` produces a JSON report
+//! - **Tier 2 (regex)**: Falls back to regex on summary lines
+//! - **Tier 3 (passthrough)**: Returns raw output unchanged
+
+use std::io;
+use std::process::ExitCode;
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use crate::cmd::user_has_flag;
+use crate::output::ParseResult;
+use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
+use crate::runner::CommandRunner;
+
+use super::shared::{self, try_read_stdin};
+
+// ============================================================================
+// Tier-2 regex patterns
+// ============================================================================
+
+/// Playwright summary: `3 passed (5s)` or `2 failed`
+static RE_PW_PASSED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+)\s+passed").expect("valid regex"));
+static RE_PW_FAILED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+)\s+failed").expect("valid regex"));
+static RE_PW_SKIPPED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d+)\s+skipped").expect("valid regex"));
+
+// ============================================================================
+// Failure regex for scrape (Tier 2)
+// ============================================================================
+
+static RE_PW_FAIL_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    // Playwright marks failures with `✘` or `×` prefixed lines
+    Regex::new(r"^\s*[✘×]\s+(.+?)(?:\s+\(\d+ms\))?$").expect("valid regex")
+});
+
+// ============================================================================
+// Public entry point
+// ============================================================================
+
+/// Run `playwright test [args...]`.
+pub(crate) fn run(
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+) -> anyhow::Result<ExitCode> {
+    // Passthrough mode
+    if crate::cmd::is_passthrough_mode() {
+        return shared::run_passthrough(
+            args,
+            |a| a.to_vec(),
+            |arg_refs| {
+                CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT))
+                    .run_with_node_fallback("playwright", arg_refs)
+            },
+        );
+    }
+
+    let start = std::time::Instant::now();
+    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
+        stdin_content
+    } else {
+        run_playwright(args)?
+    };
+
+    let result = parse(&raw_output);
+
+    let exit_code = match &result {
+        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
+            println!("{test_result}");
+            let stderr = io::stderr();
+            let mut handle = stderr.lock();
+            let _ = result.emit_markers(&mut handle);
+
+            if test_result.summary.fail > 0 {
+                shared::emit_failure_context(&raw_output, 1);
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        ParseResult::Passthrough(raw) => {
+            println!("{raw}");
+            let _ = result.emit_markers(&mut io::stderr().lock());
+            ExitCode::FAILURE
+        }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    crate::analytics::try_record_command(
+        rec.with_tier(result.tier_name()),
+        raw_output,
+        result.content().to_string(),
+        crate::cmd::format_analytics_label("test", "playwright", &args.join(" ")),
+        start.elapsed(),
+    );
+
+    Ok(exit_code)
+}
+
+fn run_playwright(args: &[String]) -> anyhow::Result<String> {
+    let mut final_args: Vec<String> = args.to_vec();
+
+    if !user_has_flag(args, &["--reporter"]) {
+        final_args.push("--reporter=json".to_string());
+    }
+
+    let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let output = runner.run_with_node_fallback("playwright", &arg_refs).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to run playwright: {e}\n\
+             Hint: Install Playwright (npm install -D @playwright/test)"
+        )
+    })?;
+
+    let mut combined = output.stdout;
+    if !output.stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&output.stderr);
+    }
+
+    Ok(combined)
+}
+
+// ============================================================================
+// Three-tier parser
+// ============================================================================
+
+fn parse(raw: &str) -> ParseResult<TestResult> {
+    if let Some(result) = try_parse_json(raw) {
+        return ParseResult::Full(result);
+    }
+
+    if let Some(result) = try_parse_regex(raw) {
+        return ParseResult::Degraded(
+            result,
+            vec!["playwright: JSON parse failed, using regex".to_string()],
+        );
+    }
+
+    ParseResult::Passthrough(raw.to_string())
+}
+
+// ============================================================================
+// Tier 1: JSON parsing
+// ============================================================================
+
+/// Playwright JSON report structure (subset).
+#[derive(serde::Deserialize)]
+struct PlaywrightReport {
+    #[serde(default)]
+    suites: Vec<PlaywrightSuite>,
+    stats: Option<PlaywrightStats>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PlaywrightStats {
+    #[serde(default)]
+    expected: usize,
+    #[serde(default)]
+    unexpected: usize,
+    #[serde(default)]
+    flaky: usize,
+    #[serde(default)]
+    skipped: usize,
+    #[serde(default)]
+    duration: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct PlaywrightSuite {
+    #[serde(default)]
+    suites: Vec<PlaywrightSuite>,
+    #[serde(default)]
+    specs: Vec<PlaywrightSpec>,
+}
+
+#[derive(serde::Deserialize)]
+struct PlaywrightSpec {
+    title: Option<String>,
+    #[serde(default)]
+    tests: Vec<PlaywrightTest>,
+}
+
+#[derive(serde::Deserialize)]
+struct PlaywrightTest {
+    #[serde(default)]
+    results: Vec<PlaywrightResult>,
+}
+
+#[derive(serde::Deserialize)]
+struct PlaywrightResult {
+    status: Option<String>,
+    error: Option<PlaywrightError>,
+}
+
+#[derive(serde::Deserialize)]
+struct PlaywrightError {
+    message: Option<String>,
+    snippet: Option<String>,
+}
+
+fn try_parse_json(raw: &str) -> Option<TestResult> {
+    let cleaned = crate::output::strip_ansi(raw);
+
+    // Find the JSON object via brace balance
+    let json_str = extract_json_object(&cleaned)?;
+    let report: PlaywrightReport = serde_json::from_str(json_str).ok()?;
+
+    let mut entries: Vec<TestEntry> = Vec::new();
+    collect_entries_from_suites(&report.suites, &mut entries);
+
+    let (pass, fail, skip) = if let Some(stats) = &report.stats {
+        (
+            stats.expected + stats.flaky,
+            stats.unexpected,
+            stats.skipped,
+        )
+    } else {
+        // Compute from entries
+        let pass = entries.iter().filter(|e| e.outcome == TestOutcome::Pass).count();
+        let fail = entries.iter().filter(|e| e.outcome == TestOutcome::Fail).count();
+        let skip = entries.iter().filter(|e| e.outcome == TestOutcome::Skip).count();
+        (pass, fail, skip)
+    };
+
+    let duration_ms = report.stats.as_ref().map(|s| s.duration as u64);
+
+    let summary = TestSummary {
+        pass,
+        fail,
+        skip,
+        duration_ms,
+    };
+
+    Some(TestResult::new(summary, entries))
+}
+
+fn collect_entries_from_suites(suites: &[PlaywrightSuite], entries: &mut Vec<TestEntry>) {
+    for suite in suites {
+        collect_entries_from_suites(&suite.suites, entries);
+        for spec in &suite.specs {
+            for test in &spec.tests {
+                // Only use the first result per test
+                if let Some(result) = test.results.first() {
+                    let status = result.status.as_deref().unwrap_or("unknown");
+                    let outcome = match status {
+                        "expected" | "flaky" => TestOutcome::Pass,
+                        "unexpected" | "timedOut" => TestOutcome::Fail,
+                        _ => TestOutcome::Skip,
+                    };
+
+                    let detail = result.error.as_ref().map(|e| {
+                        let mut parts = Vec::new();
+                        if let Some(msg) = &e.message {
+                            parts.push(msg.clone());
+                        }
+                        if let Some(snippet) = &e.snippet {
+                            parts.push(snippet.clone());
+                        }
+                        parts.join("\n")
+                    });
+
+                    entries.push(TestEntry {
+                        name: spec.title.clone().unwrap_or_default(),
+                        outcome,
+                        detail,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Extract first balanced JSON object from text.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        let idx = start + i;
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// ============================================================================
+// Tier 2: Regex fallback
+// ============================================================================
+
+fn try_parse_regex(raw: &str) -> Option<TestResult> {
+    let cleaned = crate::output::strip_ansi(raw);
+
+    let pass = RE_PW_PASSED
+        .captures(&cleaned)
+        .and_then(|c| c[1].parse::<usize>().ok())
+        .unwrap_or(0);
+    let fail = RE_PW_FAILED
+        .captures(&cleaned)
+        .and_then(|c| c[1].parse::<usize>().ok())
+        .unwrap_or(0);
+    let skip = RE_PW_SKIPPED
+        .captures(&cleaned)
+        .and_then(|c| c[1].parse::<usize>().ok())
+        .unwrap_or(0);
+
+    // Only proceed if we found at least one count
+    if pass == 0 && fail == 0 && skip == 0 {
+        return None;
+    }
+
+    let entries = if fail > 0 {
+        // Scrape failure names from playwright output
+        let mut entries = Vec::new();
+        for line in cleaned.lines() {
+            if let Some(caps) = RE_PW_FAIL_LINE.captures(line) {
+                let name = caps[1].trim().to_string();
+                if !name.is_empty() {
+                    entries.push(TestEntry {
+                        name,
+                        outcome: TestOutcome::Fail,
+                        detail: None,
+                    });
+                }
+            }
+            if entries.len() >= 100 {
+                break;
+            }
+        }
+        entries
+    } else {
+        vec![]
+    };
+
+    let summary = TestSummary {
+        pass,
+        fail,
+        skip,
+        duration_ms: None,
+    };
+
+    Some(TestResult::new(summary, entries))
+}
+
+// ============================================================================
+// Unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PW_PASS_JSON: &str = r#"{"version":"1.40.0","stats":{"startTime":"2026-01-01T00:00:00.000Z","duration":1234,"expected":3,"unexpected":0,"flaky":0,"skipped":0},"suites":[{"title":"home","file":"tests/home.spec.ts","suites":[],"specs":[{"title":"has title","ok":true,"tests":[{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"chromium","results":[{"status":"expected","duration":500,"error":null}]}]}]},{"title":"login","file":"tests/login.spec.ts","suites":[],"specs":[{"title":"can login","ok":true,"tests":[{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"chromium","results":[{"status":"expected","duration":600,"error":null}]},{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"firefox","results":[{"status":"expected","duration":700,"error":null}]}]}]}]}"#;
+
+    const PW_FAIL_JSON: &str = r#"{"version":"1.40.0","stats":{"startTime":"2026-01-01T00:00:00.000Z","duration":2345,"expected":1,"unexpected":1,"flaky":0,"skipped":0},"suites":[{"title":"home","file":"tests/home.spec.ts","suites":[],"specs":[{"title":"has title","ok":true,"tests":[{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"chromium","results":[{"status":"expected","duration":500,"error":null}]}]},{"title":"should work","ok":false,"tests":[{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"chromium","results":[{"status":"unexpected","duration":800,"error":{"message":"Expected 'Hello' to equal 'World'","snippet":"  123 |   await expect(page).toHaveTitle('World');\n  > 124 |   expect(title).toBe('World');\n        |                 ^\n  125 | }"}}]}]}]}]}"#;
+
+    const PW_REGEX_TEXT: &str = "Running 5 tests using 2 workers\n  ✘ tests/login.spec.ts:10:5 › login › should login\n  ✓ tests/home.spec.ts:5:5 › home › has title\n\n  3 passed (2.3s)\n  1 failed\n";
+
+    #[test]
+    fn test_playwright_tier1_pass() {
+        let result = try_parse_json(PW_PASS_JSON);
+        assert!(result.is_some(), "Expected JSON parse to succeed");
+        let r = result.unwrap();
+        assert_eq!(r.summary.fail, 0);
+        assert_eq!(r.summary.pass, 3);
+    }
+
+    #[test]
+    fn test_playwright_tier1_fail() {
+        let result = try_parse_json(PW_FAIL_JSON);
+        assert!(result.is_some(), "Expected JSON parse to succeed");
+        let r = result.unwrap();
+        assert_eq!(r.summary.fail, 1);
+        assert_eq!(r.summary.pass, 1);
+        // Verify error detail is preserved
+        let failed = r.entries.iter().find(|e| e.outcome == TestOutcome::Fail);
+        assert!(failed.is_some(), "Should have a failed entry");
+        let f = failed.unwrap();
+        assert!(
+            f.detail.as_ref().map(|d| d.contains("Expected")).unwrap_or(false),
+            "Detail should contain error message, got: {:?}", f.detail
+        );
+    }
+
+    #[test]
+    fn test_playwright_tier2_regex() {
+        let result = try_parse_regex(PW_REGEX_TEXT);
+        assert!(result.is_some(), "Expected regex parse to succeed");
+        let r = result.unwrap();
+        assert_eq!(r.summary.pass, 3);
+        assert_eq!(r.summary.fail, 1);
+    }
+
+    #[test]
+    fn test_playwright_tier3_passthrough() {
+        let result = parse("completely unparseable output with no test info");
+        assert!(result.is_passthrough(), "Expected Passthrough, got {}", result.tier_name());
+    }
+
+    #[test]
+    fn test_playwright_parse_produces_full_on_json() {
+        let result = parse(PW_FAIL_JSON);
+        assert!(result.is_full(), "Expected Full, got {}", result.tier_name());
+    }
+
+    #[test]
+    fn test_playwright_parse_produces_degraded_on_text() {
+        let result = parse(PW_REGEX_TEXT);
+        assert!(result.is_degraded(), "Expected Degraded, got {}", result.tier_name());
+    }
+}

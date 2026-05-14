@@ -13,8 +13,10 @@ pub(crate) mod golangci;
 pub(crate) mod mypy;
 pub(crate) mod oxlint;
 pub(crate) mod prettier;
+pub(crate) mod rubocop;
 pub(crate) mod ruff;
 pub(crate) mod rustfmt;
+pub(crate) mod swiftlint;
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -27,7 +29,7 @@ use crate::runner::CommandOutput;
 /// Known linters that the lint handler can dispatch to.
 const KNOWN_LINTERS: &[&str] = &[
     "biome", "black", "dprint", "eslint", "gofmt", "golangci", "mypy", "oxlint", "prettier",
-    "ruff", "rustfmt",
+    "rubocop", "ruff", "rustfmt", "swiftlint",
 ];
 
 /// Entry point for `skim <linter> [args...]` (lint handler).
@@ -69,8 +71,10 @@ pub(crate) fn run(
         "mypy" => mypy::run(linter_args, &ctx),
         "oxlint" => oxlint::run(linter_args, &ctx),
         "prettier" => prettier::run(linter_args, &ctx),
+        "rubocop" => rubocop::run(linter_args, &ctx),
         "ruff" => ruff::run(linter_args, &ctx),
         "rustfmt" => rustfmt::run(linter_args, &ctx),
+        "swiftlint" => swiftlint::run(linter_args, &ctx),
         linter => {
             let safe_linter = crate::cmd::sanitize_for_display(linter);
             eprintln!(

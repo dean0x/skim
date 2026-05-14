@@ -168,13 +168,21 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "cargo",
     "go",
     // Test runners
+    "cypress",
+    "dotnet",
     "jest",
+    "playwright",
     "pytest",
+    "swift",
     "vitest",
     // Build tools
+    "gradle",
+    "gradlew",
     "make",
+    "mvn",
+    "mvnw",
     "tsc",
-    // Linters (11)
+    // Linters (13)
     "biome",
     "black",
     "dprint",
@@ -184,12 +192,15 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "mypy",
     "oxlint",
     "prettier",
+    "rubocop",
     "ruff",
     "rustfmt",
+    "swiftlint",
     // Package managers
     "npm",
-    "pnpm",
     "pip",
+    "pnpm",
+    "yarn",
     // Infrastructure
     "aws",
     "curl",
@@ -705,6 +716,119 @@ fn print_cargo_help() {
     );
 }
 
+/// Route `skim swift <subcmd> [args...]` to the correct category handler.
+///
+/// Only `swift test` is compressed. Other `swift` subcommands (build, run, etc.)
+/// pass through as raw to avoid interrupting normal swift workflows.
+fn dispatch_swift(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        eprintln!("skim swift: supported subcommands: test");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some((subcmd, idx)) = extract_subcmd(
+        "swift",
+        args,
+        "skim swift <test> [args...]",
+        "test",
+    )?
+    else {
+        return Ok(ExitCode::FAILURE);
+    };
+
+    match subcmd {
+        "test" => test::run(&prepend_without("swift", args, idx), analytics),
+        unknown => {
+            // Unknown swift subcommand → raw passthrough
+            let safe = sanitize_for_display(unknown);
+            eprintln!(
+                "skim swift: unknown subcommand '{safe}' — passing through\n\
+                 Supported subcommands: test"
+            );
+            // Run the raw command
+            let mut all_args: Vec<String> = vec![unknown.to_string()];
+            all_args.extend(
+                args.iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, s)| s.clone()),
+            );
+            let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+            let arg_refs: Vec<&str> = all_args.iter().map(String::as_str).collect();
+            match runner.run("swift", &arg_refs) {
+                Ok(output) => {
+                    print!("{}", output.stdout);
+                    if !output.stderr.is_empty() {
+                        eprint!("{}", output.stderr);
+                    }
+                    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+                    Ok(ExitCode::from(code))
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// Route `skim dotnet <subcmd> [args...]` to the correct category handler.
+///
+/// Only `dotnet test` is compressed. Other `dotnet` subcommands (build, run, publish, etc.)
+/// pass through as raw to avoid interrupting normal dotnet workflows.
+fn dispatch_dotnet(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        eprintln!("skim dotnet: supported subcommands: test");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some((subcmd, idx)) = extract_subcmd(
+        "dotnet",
+        args,
+        "skim dotnet <test> [args...]",
+        "test",
+    )?
+    else {
+        return Ok(ExitCode::FAILURE);
+    };
+
+    match subcmd {
+        "test" => test::run(&prepend_without("dotnet", args, idx), analytics),
+        unknown => {
+            // Unknown dotnet subcommand → raw passthrough
+            let safe = sanitize_for_display(unknown);
+            eprintln!(
+                "skim dotnet: unknown subcommand '{safe}' — passing through\n\
+                 Supported subcommands: test"
+            );
+            let mut all_args: Vec<String> = vec![unknown.to_string()];
+            all_args.extend(
+                args.iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, s)| s.clone()),
+            );
+            let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+            let arg_refs: Vec<&str> = all_args.iter().map(String::as_str).collect();
+            match runner.run_with_env("dotnet", &arg_refs, &[("DOTNET_CLI_UI_LANGUAGE", "en-US")]) {
+                Ok(output) => {
+                    print!("{}", output.stdout);
+                    if !output.stderr.is_empty() {
+                        eprint!("{}", output.stderr);
+                    }
+                    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+                    Ok(ExitCode::from(code))
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
 fn print_go_help() {
     print!(
         "skim go\n\
@@ -750,12 +874,22 @@ pub(crate) fn dispatch(
         "cargo" => dispatch_cargo(args, analytics),
         "go" => dispatch_go(args, analytics),
 
+        // Multi-category dispatchers for tools with subcommands
+        "swift" => dispatch_swift(args, analytics),
+        "dotnet" => dispatch_dotnet(args, analytics),
+
         // Direct-to-category routing (prepend tool name for category dispatcher)
-        "jest" | "pytest" | "vitest" => test::run(&prepend(subcommand, args), analytics),
-        "make" | "tsc" => build::run(&prepend(subcommand, args), analytics),
+        "cypress" | "jest" | "playwright" | "pytest" | "vitest" => {
+            test::run(&prepend(subcommand, args), analytics)
+        }
+        "gradle" | "gradlew" | "make" | "mvn" | "mvnw" | "tsc" => {
+            build::run(&prepend(subcommand, args), analytics)
+        }
         "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "mypy" | "oxlint"
-        | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
-        "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
+        | "prettier" | "rubocop" | "ruff" | "rustfmt" | "swiftlint" => {
+            lint::run(&prepend(subcommand, args), analytics)
+        }
+        "npm" | "pip" | "pnpm" | "yarn" => pkg::run(&prepend(subcommand, args), analytics),
         "aws" | "curl" | "docker" | "gh" | "kubectl" | "terraform" | "wget" => {
             infra::run(&prepend(subcommand, args), analytics)
         }

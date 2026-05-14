@@ -35,6 +35,15 @@ pub(super) enum TestKind {
     Go,
     /// `vitest` / `jest` plain-text format: `✕ <describe> > <name>` or `✗ <name>`
     Vitest,
+    /// `cypress run` text format: failure names scraped from indented lines
+    #[allow(dead_code)]
+    Cypress,
+    /// `swift test` / XCTest format: `Test Case '...' failed`
+    #[allow(dead_code)]
+    Swift,
+    /// `dotnet test` console format: `  Failed ClassName.MethodName [Nms]`
+    #[allow(dead_code)]
+    Dotnet,
 }
 
 /// ANSI color-code strip pattern (ESC [ ... m sequences).
@@ -55,6 +64,21 @@ static RE_PYTEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 static RE_GO_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     // `--- FAIL: TestFoo (0.01s)`
     Regex::new(r"^--- FAIL:\s+(\S+)\s+\(").expect("valid go fail regex")
+});
+
+static RE_CYPRESS_FAIL: LazyLock<Regex> = LazyLock::new(|| {
+    // Cypress mocha text: `    N) test name` (numbered failure list)
+    Regex::new(r"^\s+\d+\)\s+(.+)$").expect("valid cypress fail regex")
+});
+
+static RE_SWIFT_FAIL: LazyLock<Regex> = LazyLock::new(|| {
+    // XCTest: `Test Case '-[Class method]' failed` or SPM: `Test Case 'Class.method' failed`
+    Regex::new(r"^Test Case '(.+)' failed").expect("valid swift fail regex")
+});
+
+static RE_DOTNET_FAIL: LazyLock<Regex> = LazyLock::new(|| {
+    // dotnet test: `  Failed ClassName.MethodName [Nms]`
+    Regex::new(r"^\s+Failed\s+(\S+)\s*\[").expect("valid dotnet fail regex")
 });
 
 static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
@@ -151,6 +175,9 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
         TestKind::Pytest => &*RE_PYTEST_FAIL,
         TestKind::Go => &*RE_GO_FAIL,
         TestKind::Vitest => &*RE_VITEST_FAIL,
+        TestKind::Cypress => &*RE_CYPRESS_FAIL,
+        TestKind::Swift => &*RE_SWIFT_FAIL,
+        TestKind::Dotnet => &*RE_DOTNET_FAIL,
     };
 
     let mut entries: Vec<TestEntry> = Vec::new();
