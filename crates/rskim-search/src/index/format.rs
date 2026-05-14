@@ -33,10 +33,6 @@ use crate::{
     weights::{BIGRAM_WEIGHTS, lookup_weight},
 };
 
-// ============================================================================
-// Constants
-// ============================================================================
-
 /// Magic bytes at the start of every `.skidx` file.
 pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// Current on-disk format version.  Increment on any breaking change.
@@ -53,10 +49,6 @@ pub(crate) const FILE_META_SIZE: usize = 5;
 const BM25_K1: f32 = 1.2;
 /// BM25 document-length normalisation parameter.
 const BM25_B: f32 = 0.75;
-
-// ============================================================================
-// On-disk structs
-// ============================================================================
 
 /// Fixed-size header at the start of every `.skidx` file.
 ///
@@ -139,21 +131,17 @@ pub(crate) struct FileMetaEntry {
     pub doc_length: u32,
 }
 
-// ============================================================================
-// Internal helpers
-// ============================================================================
-
 /// Extract a fixed-size byte array from `data[start..start+N]`.  Callers must
 /// check the minimum data length before calling this.
-fn read_array<const N: usize>(data: &[u8], start: usize, context: &'static str) -> crate::Result<[u8; N]> {
-    data[start..start + N].try_into().map_err(|_| {
-        SearchError::IndexCorrupted(format!("{context}: slice conversion failed"))
-    })
+fn read_array<const N: usize>(
+    data: &[u8],
+    start: usize,
+    context: &'static str,
+) -> crate::Result<[u8; N]> {
+    data[start..start + N]
+        .try_into()
+        .map_err(|_| SearchError::IndexCorrupted(format!("{context}: slice conversion failed")))
 }
-
-// ============================================================================
-// Header encode / decode
-// ============================================================================
 
 /// Encode a [`SkidxHeader`] into its 30-byte on-disk representation.
 pub(crate) fn encode_header(h: &SkidxHeader) -> [u8; SKIDX_HEADER_SIZE] {
@@ -205,10 +193,6 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
     })
 }
 
-// ============================================================================
-// Entry encode / decode
-// ============================================================================
-
 /// Encode a [`SkidxEntry`] into its 14-byte on-disk representation.
 pub(crate) fn encode_entry(e: &SkidxEntry) -> [u8; SKIDX_ENTRY_SIZE] {
     let mut buf = [0u8; SKIDX_ENTRY_SIZE];
@@ -236,10 +220,6 @@ pub(crate) fn decode_entry(data: &[u8]) -> crate::Result<SkidxEntry> {
         posting_length: u32::from_le_bytes(read_array(data, 10, "entry: posting_length")?),
     })
 }
-
-// ============================================================================
-// Posting encode / decode
-// ============================================================================
 
 /// Encode a [`PostingEntry`] into its 9-byte on-disk representation.
 pub(crate) fn encode_posting(p: &PostingEntry) -> [u8; POSTING_ENTRY_SIZE] {
@@ -278,10 +258,6 @@ pub(crate) fn decode_posting(data: &[u8]) -> crate::Result<PostingEntry> {
     })
 }
 
-// ============================================================================
-// File metadata encode / decode
-// ============================================================================
-
 /// Encode a [`FileMetaEntry`] into its 5-byte on-disk representation.
 pub(crate) fn encode_file_meta(m: &FileMetaEntry) -> [u8; FILE_META_SIZE] {
     let mut buf = [0u8; FILE_META_SIZE];
@@ -307,10 +283,6 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> crate::Result<FileMetaEntry> {
         doc_length: u32::from_le_bytes(read_array(data, 1, "file_meta: doc_length")?),
     })
 }
-
-// ============================================================================
-// Binary search
-// ============================================================================
 
 /// Binary-search `entries_data` for the entry with `ngram_key`.
 ///
@@ -348,10 +320,6 @@ pub(crate) fn lookup_ngram(
     Ok(None)
 }
 
-// ============================================================================
-// BM25 scoring and checksum
-// ============================================================================
-
 /// Compute the CRC32 checksum of `data`.
 ///
 /// The checksum in the header covers the entry array and file-metadata bytes
@@ -376,7 +344,11 @@ pub(crate) fn bm25_score(tf: f32, idf: f32, doc_len: u32, avg_doc_len: f32) -> f
     let tf = f64::from(tf);
     let idf = f64::from(idf);
     let dl = f64::from(doc_len);
-    let adl = if avg_doc_len > 0.0 { f64::from(avg_doc_len) } else { 1.0 };
+    let adl = if avg_doc_len > 0.0 {
+        f64::from(avg_doc_len)
+    } else {
+        1.0
+    };
     let norm = 1.0 - b + b * (dl / adl);
     let tf_norm = tf * (k1 + 1.0) / (tf + k1 * norm);
     idf * tf_norm
@@ -390,10 +362,6 @@ pub(crate) fn bm25_score(tf: f32, idf: f32, doc_len: u32, avg_doc_len: f32) -> f
 pub(crate) fn idf_for_key(key: u16) -> f32 {
     lookup_weight(key, BIGRAM_WEIGHTS)
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 #[path = "format_tests.rs"]
