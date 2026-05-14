@@ -106,12 +106,13 @@ static CMAKE_PROGRESS_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Parse make output through three degradation tiers.
 fn parse_make(output: &CommandOutput) -> ParseResult<BuildResult> {
-    let combined = format!("{}\n{}", output.stdout, output.stderr);
-
-    // Empty output → success (covers `make -s` silent mode)
+    // Empty output → reflect exit code (`make -s` silent mode, signal-killed process)
     if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() {
-        return ParseResult::Full(BuildResult::new(true, 0, 0, None, vec![]));
+        let success = output.exit_code == Some(0);
+        return ParseResult::Full(BuildResult::new(success, 0, 0, None, vec![]));
     }
+
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
 
     // Tier 1: Diagnostics
     if let Some(result) = try_tier1_diagnostics(&combined, output.exit_code) {
@@ -172,8 +173,10 @@ fn try_tier1_diagnostics(
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
-        } else if MAKE_NOOP_RE.is_match(line) {
-            // Nothing-to-do / up-to-date → immediate success
+        } else if !any_match && MAKE_NOOP_RE.is_match(line) {
+            // Nothing-to-do / up-to-date → immediate success (only when no
+            // diagnostics have been collected; a trailing noop after real errors
+            // must not discard those accumulated diagnostics)
             return Some(ParseResult::Full(BuildResult::new(
                 true,
                 0,
@@ -495,6 +498,61 @@ mod tests {
         );
         if let ParseResult::Full(br) = &result {
             assert!(br.success);
+            assert_eq!(br.errors, 0);
+            assert_eq!(br.warnings, 0);
+        }
+    }
+
+    #[test]
+    fn test_signal_killed_make_is_failure() {
+        // exit_code: None means the process was killed by a signal (e.g. SIGKILL).
+        // Empty output + None exit code must be treated as failure, not success.
+        let output = make_output("", "", None);
+        let result = parse_make(&output);
+        assert!(
+            result.is_full(),
+            "expected Full, got {:?}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(br) = &result {
+            assert!(!br.success, "signal-killed process must not be success");
+        }
+    }
+
+    #[test]
+    fn test_noop_after_errors_preserves_diagnostics() {
+        // A trailing noop line must not discard previously-accumulated diagnostics.
+        // Regression test for the noop-early-return bug (make.rs:175).
+        let input = "main.c:1:1: error: use of undeclared identifier 'x'\nmake: Nothing to be done for 'all'\n";
+        let output = make_output("", input, Some(1));
+        let result = parse_make(&output);
+        assert!(
+            result.is_full(),
+            "expected Full, got {:?}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(br) = &result {
+            assert!(!br.success, "errors must not be discarded by trailing noop");
+            assert_eq!(br.errors, 1, "error line must be counted");
+        }
+    }
+
+    #[test]
+    fn test_tier1_recursive_noop() {
+        // MAKE_NOOP_RE handles make[N]: prefix; verify it fires on recursive make.
+        let output = make_output(
+            "",
+            "make[1]: Nothing to be done for 'target'\n",
+            Some(0),
+        );
+        let result = parse_make(&output);
+        assert!(
+            result.is_full(),
+            "expected Full, got {:?}",
+            result.tier_name()
+        );
+        if let ParseResult::Full(br) = &result {
+            assert!(br.success, "recursive noop must be success");
             assert_eq!(br.errors, 0);
             assert_eq!(br.warnings, 0);
         }
