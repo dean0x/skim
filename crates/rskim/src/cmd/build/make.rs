@@ -144,7 +144,6 @@ fn try_tier1_diagnostics(
 
     for line in combined.lines() {
         if let Some(caps) = GCC_DIAGNOSTIC_RE.captures(line) {
-            // GCC/Clang diagnostic: file:line:col: (fatal )?error|warning|note: message
             any_match = true;
             let severity = caps.get(4).map_or("", |m| m.as_str());
             let file = caps.get(1).map_or("", |m| m.as_str());
@@ -159,17 +158,14 @@ fn try_tier1_diagnostics(
             }
             error_messages.push(format!("{severity}: {message} ({file}:{line_num})"));
         } else if MAKE_FAILURE_RE.is_match(line) {
-            // Make failure: make: *** [target] Error N
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
         } else if MAKEFILE_ERROR_RE.is_match(line) {
-            // Makefile syntax error: Makefile:5: *** missing separator.  Stop.
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
         } else if LINKER_ERROR_RE.is_match(line) {
-            // Linker error (GNU ld or macOS ld)
             any_match = true;
             errors += 1;
             error_messages.push(line.to_string());
