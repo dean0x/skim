@@ -82,16 +82,37 @@ impl NgramIndexReader {
         let header = decode_header(&idx_mmap)?;
 
         // Validate sizes are internally consistent.
+        let entries_bytes = (header.ngram_count as usize)
+            .checked_mul(SKIDX_ENTRY_SIZE)
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted(
+                    "ngram_count * SKIDX_ENTRY_SIZE overflow".into(),
+                )
+            })?;
+        let meta_bytes = (header.file_count as usize)
+            .checked_mul(FILE_META_SIZE)
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted("file_count * FILE_META_SIZE overflow".into())
+            })?;
         let expected_idx_size = SKIDX_HEADER_SIZE
-            + (header.ngram_count as usize) * SKIDX_ENTRY_SIZE
-            + (header.file_count as usize) * FILE_META_SIZE;
+            .checked_add(entries_bytes)
+            .and_then(|s| s.checked_add(meta_bytes))
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted("expected_idx_size overflow".into())
+            })?;
         if idx_mmap.len() != expected_idx_size {
             return Err(SearchError::IndexCorrupted(format!(
                 "skidx size mismatch: expected {expected_idx_size}, got {}",
                 idx_mmap.len()
             )));
         }
-        if post_mmap.len() != header.postings_file_size as usize {
+        let expected_post_size = usize::try_from(header.postings_file_size).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "postings_file_size {} exceeds platform usize",
+                header.postings_file_size
+            ))
+        })?;
+        if post_mmap.len() != expected_post_size {
             return Err(SearchError::IndexCorrupted(format!(
                 "skpost size mismatch: expected {}, got {}",
                 header.postings_file_size,
@@ -157,8 +178,18 @@ impl NgramIndexReader {
             None => return Ok(Vec::new()),
         };
 
-        let start = entry.posting_offset as usize;
-        let end = start + entry.posting_length as usize;
+        let start = usize::try_from(entry.posting_offset).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "posting_offset {} exceeds usize",
+                entry.posting_offset
+            ))
+        })?;
+        let length = entry.posting_length as usize;
+        let end = start.checked_add(length).ok_or_else(|| {
+            SearchError::IndexCorrupted(format!(
+                "posting slice overflow: {start} + {length}"
+            ))
+        })?;
         if end > self.post_mmap.len() {
             return Err(SearchError::IndexCorrupted(format!(
                 "posting slice [{start}..{end}] out of bounds (skpost len={})",
@@ -166,8 +197,15 @@ impl NgramIndexReader {
             )));
         }
 
+        let posting_len = length;
+        if posting_len % super::format::POSTING_ENTRY_SIZE != 0 {
+            return Err(SearchError::IndexCorrupted(format!(
+                "posting_length {posting_len} not aligned to POSTING_ENTRY_SIZE {}",
+                super::format::POSTING_ENTRY_SIZE
+            )));
+        }
         let data = &self.post_mmap[start..end];
-        let n = entry.posting_length as usize / super::format::POSTING_ENTRY_SIZE;
+        let n = posting_len / super::format::POSTING_ENTRY_SIZE;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             let off = i * super::format::POSTING_ENTRY_SIZE;
@@ -206,42 +244,67 @@ impl SearchLayer for NgramIndexReader {
             return Ok(Vec::new());
         }
 
-        // doc_id → (accumulated BM25 score, positions)
-        let mut doc_tf: HashMap<u32, f64> = HashMap::new();
+        // Language filter resolved up-front so we can skip scoring documents that
+        // won't pass the filter.
+        let lang_filter: Option<u8> = query.lang.map(super::format::lang_to_id);
+
+        // doc_id → accumulated BM25 score.
+        let mut doc_scores: HashMap<u32, f64> = HashMap::new();
+        // doc_id → match positions (collected during the single posting pass).
         let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
+        // Cache of doc_length per doc_id to avoid re-decoding file metadata for
+        // the same document across multiple bigram iterations.
+        let mut doc_len_cache: HashMap<u32, u32> = HashMap::new();
 
         for (ngram, _weight) in &ngrams {
             let postings = self.lookup_postings(ngram.key())?;
             let idf = idf_for_key(ngram.key());
-            let tf_per_doc = {
-                let mut counts: HashMap<u32, u32> = HashMap::new();
-                for p in &postings {
-                    *counts.entry(p.doc_id).or_default() += 1;
-                }
-                counts
-            };
-            for (doc_id, tf) in tf_per_doc {
-                let doc_len = if doc_id < self.header.file_count {
-                    self.file_meta_at(doc_id)?.doc_length
-                } else {
-                    0
-                };
-                let contribution = bm25_score(tf as f32, idf, doc_len, self.header.avg_doc_length);
-                *doc_tf.entry(doc_id).or_default() += contribution;
-            }
+
+            // Single pass: accumulate tf counts and positions simultaneously.
+            let mut tf_per_doc: HashMap<u32, u32> = HashMap::new();
             for p in &postings {
+                *tf_per_doc.entry(p.doc_id).or_default() += 1;
                 let pos = p.position as usize;
                 doc_positions
                     .entry(p.doc_id)
                     .or_default()
                     .push(pos..pos + 2);
             }
+
+            for (doc_id, tf) in tf_per_doc {
+                // Apply language filter before scoring to avoid decoding metadata
+                // for documents that won't appear in results.
+                if let Some(required_lang) = lang_filter {
+                    if doc_id < self.header.file_count {
+                        let meta = self.file_meta_at(doc_id)?;
+                        // Cache doc_length at the same time we read meta.
+                        doc_len_cache.entry(doc_id).or_insert(meta.doc_length);
+                        if meta.lang_id != required_lang {
+                            continue;
+                        }
+                    }
+                }
+
+                // Resolve doc_length from cache (populated above when lang filter
+                // reads the meta, or populated here on first encounter without filter).
+                let doc_len = if doc_id < self.header.file_count {
+                    if let Some(&cached) = doc_len_cache.get(&doc_id) {
+                        cached
+                    } else {
+                        let len = self.file_meta_at(doc_id)?.doc_length;
+                        doc_len_cache.insert(doc_id, len);
+                        len
+                    }
+                } else {
+                    0
+                };
+
+                let contribution = bm25_score(tf as f32, idf, doc_len, self.header.avg_doc_length);
+                *doc_scores.entry(doc_id).or_default() += contribution;
+            }
         }
 
-        // Language filter.
-        let lang_filter: Option<u8> = query.lang.map(super::format::lang_to_id);
-
-        let mut scored: Vec<(u32, f64)> = doc_tf.into_iter().collect();
+        let mut scored: Vec<(u32, f64)> = doc_scores.into_iter().collect();
         scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let offset = query.offset.unwrap_or(0);
@@ -250,16 +313,6 @@ impl SearchLayer for NgramIndexReader {
         let mut results: Vec<SearchResult> = Vec::new();
         let mut count = 0usize;
         for (doc_id, score) in scored {
-            // Apply language filter.
-            if let Some(required_lang) = lang_filter
-                && doc_id < self.header.file_count
-            {
-                let meta = self.file_meta_at(doc_id)?;
-                if meta.lang_id != required_lang {
-                    continue;
-                }
-            }
-
             if count < offset {
                 count += 1;
                 continue;

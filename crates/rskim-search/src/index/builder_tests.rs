@@ -1,6 +1,6 @@
 //! Tests for NgramIndexBuilder (builder.rs).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(clippy::unwrap_used)]
 
 use super::*;
 use crate::SearchQuery;

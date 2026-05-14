@@ -1,6 +1,6 @@
 //! Tests for NgramIndexReader (reader.rs).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(clippy::unwrap_used)]
 
 use std::path::Path;
 
@@ -248,6 +248,50 @@ fn test_limit_restricts_result_count() {
     query.limit = Some(3);
     let results = reader.search(&query).unwrap();
     assert!(results.len() <= 3, "limit should cap results");
+}
+
+// -----------------------------------------------------------------------
+// search — offset pagination
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_offset_skips_top_results() {
+    // Build an index with 10 files that all contain the query term.  Use
+    // distinct per-file content to produce varied BM25 scores.
+    let dir = tmp_dir();
+    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    for i in 0..10u32 {
+        // Vary document length/frequency so scores differ.
+        let content = format!("main {}", "padding ".repeat(i as usize));
+        builder
+            .add_file(FileId(i), &content, rskim_core::Language::Rust)
+            .unwrap();
+    }
+    builder.build().unwrap();
+    let reader = NgramIndexReader::open(dir.path()).unwrap();
+
+    // Fetch all results (no offset).
+    let all_results = reader.search(&SearchQuery::new("main")).unwrap();
+    assert!(
+        all_results.len() >= 3,
+        "need at least 3 results; got {}",
+        all_results.len()
+    );
+
+    // Fetch with offset=2: the first result must equal the 3rd result from the
+    // no-offset search.
+    let mut query = SearchQuery::new("main");
+    query.offset = Some(2);
+    let offset_results = reader.search(&query).unwrap();
+    assert!(
+        !offset_results.is_empty(),
+        "offset=2 should still return results"
+    );
+    assert_eq!(
+        offset_results[0].file_id,
+        all_results[2].file_id,
+        "first result with offset=2 should match 3rd result of no-offset search"
+    );
 }
 
 // -----------------------------------------------------------------------

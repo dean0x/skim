@@ -2,12 +2,12 @@
 //!
 //! # Architecture
 //!
-//! **IMPORTANT: This is a LIBRARY with NO I/O.**
-//! - Accepts pre-parsed data, not file paths
-//! - Returns Result types, not stdout writes
-//! - Pure types and traits, no side effects
+//! - Core types (`types` module) are **pure**: no I/O, no side effects.
+//! - The `index` module provides on-disk persistence via memory-mapped files.
+//! - The `ngram` module handles bigram extraction (pure, no I/O).
+//! - Returns Result types throughout — no panics in non-test code.
 //!
-//! CLI/binary code in `crates/rskim/src/cmd/search.rs` handles all I/O.
+//! CLI/binary code in `crates/rskim/src/cmd/search.rs` handles user-facing I/O.
 
 pub mod index;
 pub mod ngram;
