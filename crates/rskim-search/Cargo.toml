@@ -18,6 +18,10 @@ rskim-core = { version = "2.9.0", path = "../rskim-core" }
 thiserror = { workspace = true }
 serde = { workspace = true }
 
+memmap2 = { workspace = true }
+crc32fast = { workspace = true }
+tempfile = { workspace = true }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 

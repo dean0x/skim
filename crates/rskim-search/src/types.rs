@@ -44,25 +44,66 @@ impl fmt::Display for FileId {
 ///
 /// Determines which structural region of a source file a match appears in.
 /// Used to weight search results and filter queries to specific code regions.
+///
+/// # Binary format
+///
+/// The `#[repr(u8)]` attribute with explicit discriminants 0–7 allows the index
+/// format to store field IDs as a single byte and recover the variant via
+/// [`SearchField::from_discriminant`]. The mapping is part of the stable on-disk
+/// format — **do not change discriminant values without a format migration**.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchField {
     /// Type definitions: structs, enums, interfaces, type aliases
-    TypeDefinition,
+    TypeDefinition = 0,
     /// Function and method signatures (declaration lines only, not body)
-    FunctionSignature,
+    FunctionSignature = 1,
     /// Symbol names: variable names, identifiers, labels
-    SymbolName,
+    SymbolName = 2,
     /// Import and export declarations
-    ImportExport,
+    ImportExport = 3,
     /// Function and method bodies (implementation, excluding signature)
-    FunctionBody,
+    FunctionBody = 4,
     /// Comments (line and block)
-    Comment,
+    Comment = 5,
     /// String literals
-    StringLiteral,
+    StringLiteral = 6,
     /// Unclassified content not matching any of the above
-    Other,
+    Other = 7,
+}
+
+impl SearchField {
+    /// Returns the numeric discriminant of this variant (0–7).
+    ///
+    /// The discriminant is stable across compilations and forms part of the
+    /// on-disk index format. Changing a variant's discriminant is a **breaking
+    /// format change** requiring a version bump in `FORMAT_VERSION`.
+    #[must_use]
+    #[inline]
+    pub fn discriminant(self) -> u8 {
+        self as u8
+    }
+
+    /// Recover a [`SearchField`] from its numeric discriminant.
+    ///
+    /// Returns `None` for any byte that does not correspond to a known variant,
+    /// so corrupt index bytes produce a recoverable error rather than undefined
+    /// behaviour.
+    #[must_use]
+    pub fn from_discriminant(d: u8) -> Option<Self> {
+        match d {
+            0 => Some(Self::TypeDefinition),
+            1 => Some(Self::FunctionSignature),
+            2 => Some(Self::SymbolName),
+            3 => Some(Self::ImportExport),
+            4 => Some(Self::FunctionBody),
+            5 => Some(Self::Comment),
+            6 => Some(Self::StringLiteral),
+            7 => Some(Self::Other),
+            _ => None,
+        }
+    }
 }
 
 impl SearchField {
@@ -457,6 +498,47 @@ mod tests {
         for (json, expected) in cases {
             let got: SearchField = serde_json::from_str(json).unwrap();
             assert_eq!(got, *expected, "failed for input {json}");
+        }
+    }
+
+    /// Verifies that discriminant() returns values 0-7 matching the #[repr(u8)]
+    /// discriminants, and that from_discriminant() is the exact inverse.
+    #[test]
+    fn test_search_field_discriminant_roundtrip() {
+        let variants = [
+            (SearchField::TypeDefinition, 0u8),
+            (SearchField::FunctionSignature, 1u8),
+            (SearchField::SymbolName, 2u8),
+            (SearchField::ImportExport, 3u8),
+            (SearchField::FunctionBody, 4u8),
+            (SearchField::Comment, 5u8),
+            (SearchField::StringLiteral, 6u8),
+            (SearchField::Other, 7u8),
+        ];
+        for (variant, expected_disc) in variants {
+            assert_eq!(
+                variant.discriminant(),
+                expected_disc,
+                "discriminant mismatch for {variant:?}"
+            );
+            let recovered = SearchField::from_discriminant(expected_disc);
+            assert_eq!(
+                recovered,
+                Some(variant),
+                "from_discriminant({expected_disc}) did not recover {variant:?}"
+            );
+        }
+    }
+
+    /// Verifies that from_discriminant returns None for unknown byte values.
+    #[test]
+    fn test_search_field_unknown_discriminant_returns_none() {
+        for bad in [8u8, 9, 100, 200, 255] {
+            assert_eq!(
+                SearchField::from_discriminant(bad),
+                None,
+                "from_discriminant({bad}) should be None"
+            );
         }
     }
 
