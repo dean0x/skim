@@ -213,7 +213,7 @@ pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord
             current = Some(CommitRecord {
                 hash,
                 author,
-                timestamp: timestamp as i64,
+                timestamp: i64::try_from(timestamp).unwrap_or(i64::MAX),
                 message: subject,
                 changed_files: Vec::new(),
             });

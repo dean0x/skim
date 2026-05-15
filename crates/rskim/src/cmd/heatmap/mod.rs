@@ -220,7 +220,7 @@ fn prepare_commits(
     for commit in &mut commits {
         commit
             .changed_files
-            .retain(|f| !should_exclude(f.path.to_str().unwrap_or(""), &exclude_set));
+            .retain(|f| !should_exclude(&f.path.to_string_lossy(), &exclude_set));
     }
     // Remove commits that are now file-less after exclusion
     commits.retain(|c| !c.changed_files.is_empty());
