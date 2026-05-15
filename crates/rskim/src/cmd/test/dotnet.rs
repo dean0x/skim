@@ -17,7 +17,7 @@ use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{TestRunnerConfig, run_test_runner};
+use super::shared::{ArgPreparation, TestRunnerConfig, run_test_runner};
 
 // ============================================================================
 // Regex patterns
@@ -69,21 +69,23 @@ pub(crate) fn run(
         args,
         show_stats,
         rec,
-        // passthrough_prepare_args: prepend "test" subcommand only — no --logger flag.
-        |a| {
-            let mut final_args = vec!["test".to_string()];
-            final_args.extend_from_slice(a);
-            final_args
-        },
-        // prepare_args: prepend "test" and inject --logger trx for TRX XML output.
-        |a| {
-            let mut final_args = vec!["test".to_string()];
-            final_args.extend_from_slice(a);
-            if !user_has_flag(a, &["--logger"]) {
-                final_args.push("--logger".to_string());
-                final_args.push("trx".to_string());
-            }
-            final_args
+        ArgPreparation {
+            // Passthrough: prepend "test" subcommand only — no --logger flag.
+            passthrough: |a: &[String]| {
+                let mut final_args = vec!["test".to_string()];
+                final_args.extend_from_slice(a);
+                final_args
+            },
+            // Normal: prepend "test" and inject --logger trx for TRX XML output.
+            normal: |a: &[String]| {
+                let mut final_args = vec!["test".to_string()];
+                final_args.extend_from_slice(a);
+                if !user_has_flag(a, &["--logger"]) {
+                    final_args.push("--logger".to_string());
+                    final_args.push("trx".to_string());
+                }
+                final_args
+            },
         },
         |raw| {
             // TRX detection: if the spawn produced a Results File path, read it
@@ -422,7 +424,7 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
 // ============================================================================
 
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
-    let cleaned = crate::output::strip_ansi(raw);
+    let cleaned = crate::output::strip_ansi_cow(raw);
 
     let caps = RE_DOTNET_SUMMARY.captures(&cleaned)?;
     let fail: usize = caps[1].parse().ok()?;

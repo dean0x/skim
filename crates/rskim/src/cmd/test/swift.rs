@@ -15,7 +15,7 @@ use regex::Regex;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{TestRunnerConfig, run_test_runner};
+use super::shared::{ArgPreparation, TestRunnerConfig, run_test_runner};
 
 // ============================================================================
 // Regex patterns
@@ -66,19 +66,21 @@ pub(crate) fn run(
         args,
         show_stats,
         rec,
-        // passthrough_prepare_args: prepend "test" subcommand only — no flags.
-        |a| {
-            let mut final_args = vec!["test".to_string()];
-            final_args.extend_from_slice(a);
-            final_args
-        },
-        // prepare_args: intentionally identical to passthrough_prepare_args because
-        // Swift Package Manager has no JSON reporter flag to inject. Both closures
-        // produce the same args on purpose — this is not an oversight.
-        |a| {
-            let mut final_args = vec!["test".to_string()];
-            final_args.extend_from_slice(a);
-            final_args
+        ArgPreparation {
+            // Passthrough: prepend "test" subcommand only — no flags.
+            passthrough: |a: &[String]| {
+                let mut final_args = vec!["test".to_string()];
+                final_args.extend_from_slice(a);
+                final_args
+            },
+            // Normal: intentionally identical to passthrough because Swift Package
+            // Manager has no JSON reporter flag to inject. Both produce the same
+            // args on purpose — this is not an oversight.
+            normal: |a: &[String]| {
+                let mut final_args = vec!["test".to_string()];
+                final_args.extend_from_slice(a);
+                final_args
+            },
         },
         parse,
     )
@@ -106,13 +108,7 @@ fn parse(raw: &str) -> ParseResult<TestResult> {
 }
 
 fn try_parse_xctest(raw: &str) -> Option<TestResult> {
-    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
-    // already strips); only allocate when ESC bytes are detected.
-    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    let cleaned = crate::output::strip_ansi_cow(raw);
 
     let mut entries: Vec<TestEntry> = Vec::new();
 
@@ -156,13 +152,7 @@ fn try_parse_xctest(raw: &str) -> Option<TestResult> {
 }
 
 fn try_parse_failures_only(raw: &str) -> Option<TestResult> {
-    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
-    // already strips); only allocate when ESC bytes are detected.
-    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    let cleaned = crate::output::strip_ansi_cow(raw);
     let mut entries: Vec<TestEntry> = Vec::new();
 
     for line in cleaned.lines() {

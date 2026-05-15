@@ -17,7 +17,8 @@ use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
 use super::shared::{
-    TestKind, TestRunnerConfig, extract_json_object, run_test_runner, scrape_failures,
+    ArgPreparation, TestKind, TestRunnerConfig, extract_json_object, run_test_runner,
+    scrape_failures,
 };
 
 // ============================================================================
@@ -63,21 +64,23 @@ pub(crate) fn run(
         user_args,
         show_stats,
         rec,
-        // passthrough_prepare_args: prepend "run" subcommand only — no reporter flag.
-        |a| {
-            let mut final_args = vec!["run".to_string()];
-            final_args.extend_from_slice(a);
-            final_args
-        },
-        // prepare_args: prepend "run" and inject the JSON reporter flag.
-        |a| {
-            let mut final_args = vec!["run".to_string()];
-            final_args.extend_from_slice(a);
-            if !user_has_flag(a, &["--reporter"]) {
-                final_args.push("--reporter".to_string());
-                final_args.push("json".to_string());
-            }
-            final_args
+        ArgPreparation {
+            // Passthrough: prepend "run" subcommand only — no reporter flag.
+            passthrough: |a: &[String]| {
+                let mut final_args = vec!["run".to_string()];
+                final_args.extend_from_slice(a);
+                final_args
+            },
+            // Normal: prepend "run" and inject the JSON reporter flag.
+            normal: |a: &[String]| {
+                let mut final_args = vec!["run".to_string()];
+                final_args.extend_from_slice(a);
+                if !user_has_flag(a, &["--reporter"]) {
+                    final_args.push("--reporter".to_string());
+                    final_args.push("json".to_string());
+                }
+                final_args
+            },
         },
         parse,
     )
@@ -139,13 +142,7 @@ struct MochaError {
 }
 
 fn try_parse_json(raw: &str) -> Option<TestResult> {
-    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
-    // already strips); only allocate when ESC bytes are detected.
-    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    let cleaned = crate::output::strip_ansi_cow(raw);
 
     // Find balanced JSON object
     let json_str = extract_json_object(&cleaned)?;
@@ -203,13 +200,7 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
 // ============================================================================
 
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
-    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
-    // already strips); only allocate when ESC bytes are detected.
-    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    let cleaned = crate::output::strip_ansi_cow(raw);
 
     let pass = RE_CY_PASSING
         .captures(&cleaned)

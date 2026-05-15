@@ -25,6 +25,43 @@ use crate::runner::{CommandOutput, CommandRunner};
 // Shared run_test_runner pipeline
 // ============================================================================
 
+/// Source of the exit code for a test-runner invocation.
+///
+/// Replaces `Option<Option<i32>>` to make each case unambiguous in debug output
+/// and match arms:
+/// - [`ExitSource::Stdin`] — output came from piped stdin; no process exit code.
+/// - [`ExitSource::Process`]`(Some(n))` — process exited normally with code `n`.
+/// - [`ExitSource::Process`]`(None)` — process was killed by a signal (no numeric
+///   code).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ExitSource {
+    /// No process was spawned — output arrived from stdin.
+    Stdin,
+    /// A process was spawned. `Some(n)` = exited with code `n`; `None` = signal-killed.
+    Process(Option<i32>),
+}
+
+/// Argument-preparation strategy for a test runner command.
+///
+/// Groups the two argument-transformation closures passed to [`run_test_runner`]
+/// so that call sites name each closure explicitly rather than relying on
+/// positional order (which is easy to confuse when both have identical types).
+///
+/// - `passthrough` — called on the `SKIM_PASSTHROUGH` path. MUST NOT inject
+///   reporter/logger flags; it may only prepend the required subcommand token.
+/// - `normal` — called on the normal spawn path to inject reporter flags (e.g.
+///   `--reporter=json`, `--logger trx`).
+pub(super) struct ArgPreparation<F, G>
+where
+    F: Fn(&[String]) -> Vec<String>,
+    G: Fn(&[String]) -> Vec<String>,
+{
+    /// Args transformation for `SKIM_PASSTHROUGH` mode — subcommand only, no flags.
+    pub passthrough: F,
+    /// Args transformation for the normal spawn path — subcommand + reporter flags.
+    pub normal: G,
+}
+
 /// Configuration for a test runner command.
 ///
 /// Used by [`run_test_runner`] to spawn the test process. Each field controls
@@ -57,17 +94,14 @@ pub(super) struct TestRunnerConfig<'a> {
 /// 6. Stats — emit token-reduction stats when `show_stats` is `true`.
 /// 7. Analytics — record usage via [`crate::analytics::try_record_command`].
 ///
-/// `passthrough_prepare_args` transforms user-supplied args for the
-/// `SKIM_PASSTHROUGH` path. It MUST NOT inject reporter/logger flags — those
-/// change the tool's output format and defeat the purpose of running the tool
-/// unmodified. For runners that require a subcommand token (e.g. playwright
-/// "test", cypress "run", swift "test", dotnet "test"), this closure should
+/// `arg_prep` groups the two argument-transformation closures (see [`ArgPreparation`]).
+/// The `passthrough` closure MUST NOT inject reporter/logger flags. For runners that
+/// require a subcommand token (e.g. playwright "test", cypress "run"), it should
 /// prepend that token and nothing else. For runners with no required subcommand
-/// (e.g. vitest, jest), pass `|a| a.to_vec()`.
-///
-/// `prepare_args` transforms the user-supplied args for the normal spawn
-/// path (e.g. injecting `--reporter=json`). It is `Fn` rather than `FnOnce`
-/// because the borrow checker requires a shared reference.
+/// (e.g. vitest, jest), use `|a| a.to_vec()`.
+/// The `normal` closure injects reporter flags for the normal spawn path
+/// (e.g. `--reporter=json`). It is `Fn` rather than `FnOnce` because the borrow
+/// checker requires a shared reference.
 ///
 /// `parse_fn` is `FnOnce` because it is called exactly once and may capture
 /// owned state (e.g. closures that embed TRX detection for dotnet).
@@ -80,35 +114,34 @@ pub(super) struct TestRunnerConfig<'a> {
 /// abnormally (e.g. OOM kill, timeout, compilation error before any test runs).
 /// The stdin path has no process exit code and therefore does not apply this
 /// override.
-pub(super) fn run_test_runner(
+pub(super) fn run_test_runner<F, G>(
     config: &TestRunnerConfig<'_>,
     args: &[String],
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
-    passthrough_prepare_args: impl Fn(&[String]) -> Vec<String>,
-    prepare_args: impl Fn(&[String]) -> Vec<String>,
+    arg_prep: ArgPreparation<F, G>,
     parse_fn: impl FnOnce(&str) -> ParseResult<TestResult>,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<ExitCode>
+where
+    F: Fn(&[String]) -> Vec<String>,
+    G: Fn(&[String]) -> Vec<String>,
+{
     // Passthrough mode: bypass compression, run the raw command and forward output.
     if crate::cmd::is_passthrough_mode() {
-        return run_passthrough(
-            args,
-            passthrough_prepare_args,
-            |arg_refs| spawn_runner_raw(config, arg_refs),
-        );
+        return run_passthrough(args, arg_prep.passthrough, |arg_refs| {
+            spawn_runner_raw(config, arg_refs)
+        });
     }
 
     let start = Instant::now();
 
     // Prefer stdin if piped; otherwise spawn the process.
-    // `spawn_exit_code` is Some(code) when a process was spawned, None when the
-    // output came from stdin (no process exit code is available in that case).
-    let (raw_output, spawn_exit_code) = if let Some(stdin_content) = try_read_stdin(args)? {
-        (stdin_content, None::<Option<i32>>)
+    let (raw_output, exit_source) = if let Some(stdin_content) = try_read_stdin(args)? {
+        (stdin_content, ExitSource::Stdin)
     } else {
-        let prepared = prepare_args(args);
+        let prepared = (arg_prep.normal)(args);
         let (text, code) = spawn_runner(config, &prepared)?;
-        (text, Some(code))
+        (text, ExitSource::Process(code))
     };
 
     let result = parse_fn(&raw_output);
@@ -120,23 +153,11 @@ pub(super) fn run_test_runner(
             let mut handle = stderr.lock();
             let _ = result.emit_markers(&mut handle);
 
-            // Treat as failure when: the parser found failures, OR the spawned
-            // process exited non-zero / was signal-killed (exit_code != Some(0)).
-            // A missing exit code (None inner) means signal-killed — always failure.
-            let process_failed = spawn_exit_code
-                .map(|inner| inner != Some(0))
-                .unwrap_or(false);
-
-            if test_result.summary.fail > 0 || process_failed {
-                let ec = spawn_exit_code
-                    .and_then(|inner| inner)
-                    .unwrap_or(1)
-                    .clamp(1, 255) as u8;
-                emit_failure_context(&raw_output, ec as i32);
-                ExitCode::from(ec)
-            } else {
-                ExitCode::SUCCESS
+            let ec = resolve_exit_code(test_result.summary.fail, exit_source);
+            if ec != ExitCode::SUCCESS {
+                emit_failure_context(&raw_output, exit_code_byte(exit_source) as i32);
             }
+            ec
         }
         ParseResult::Passthrough(raw) => {
             println!("{raw}");
@@ -159,6 +180,48 @@ pub(super) fn run_test_runner(
     );
 
     Ok(exit_code)
+}
+
+// ============================================================================
+// Exit-code resolution helpers
+// ============================================================================
+
+/// Determine the final [`ExitCode`] for a parsed test result.
+///
+/// Returns `FAILURE` (or a specific non-zero code) when either:
+/// - `fail_count > 0` — the parser found at least one failing test, OR
+/// - `exit_source` is [`ExitSource::Process`] with a non-zero or missing code.
+///
+/// This prevents skim from returning `SUCCESS` when the runner exits non-zero
+/// even though the parser reports zero failures (e.g. OOM kill before tests run,
+/// compilation error, or framework-level panic).
+///
+/// When `exit_source` is [`ExitSource::Stdin`] and `fail_count` is zero, the
+/// result is `SUCCESS` — no process was spawned so no non-zero exit can be observed.
+pub(super) fn resolve_exit_code(fail_count: usize, exit_source: ExitSource) -> ExitCode {
+    let process_failed = match exit_source {
+        ExitSource::Stdin => false,
+        ExitSource::Process(Some(0)) => false,
+        ExitSource::Process(_) => true, // non-zero or signal-killed
+    };
+
+    if fail_count > 0 || process_failed {
+        ExitCode::from(exit_code_byte(exit_source))
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Extract a clamped 1–255 exit code byte from an [`ExitSource`].
+///
+/// - `Process(Some(n))` → `n.clamp(1, 255) as u8`
+/// - `Process(None)` (signal kill) → `1`
+/// - `Stdin` (no process spawned) → `1`
+fn exit_code_byte(exit_source: ExitSource) -> u8 {
+    match exit_source {
+        ExitSource::Process(Some(n)) => n.clamp(1, 255) as u8,
+        _ => 1,
+    }
 }
 
 /// Spawn the test runner, combine stdout+stderr, and strip ANSI escape codes.
@@ -314,6 +377,14 @@ pub(super) fn try_read_stdin(args: &[String]) -> anyhow::Result<Option<String>> 
 /// Handles the two sub-cases of SKIM_PASSTHROUGH mode for test runners:
 /// 1. Piped stdin — print the raw content and return FAILURE (no exit code available).
 /// 2. Spawn mode — run the command via `run_cmd` and forward the combined output.
+///
+/// # Stdin path always returns FAILURE
+///
+/// When input arrives from stdin, no process exit code is available — skim does not
+/// know whether the upstream command succeeded or failed. `FAILURE` is returned as a
+/// conservative default so that callers in a pipeline treat ambiguous output as an
+/// error rather than silently swallowing it. Full exit-code semantics are only
+/// available on the spawn path (sub-case 2).
 ///
 /// `prepare_args` transforms the user args into the final argument list that
 /// `run_cmd` receives (e.g., adding `--reporter=json` or `--tb=short`).
@@ -504,6 +575,71 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    // ========================================================================
+    // resolve_exit_code tests
+    //
+    // Tests for the extracted exit-code decision logic, covering the
+    // "zero failures + non-zero exit" path that was previously only
+    // indirectly exercised through run_passthrough.
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_exit_zero_is_success() {
+        // Parser reports 0 failures, process exited 0 → SUCCESS.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(0)));
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_nonzero_exit_is_failure() {
+        // Parser reports 0 failures but process exited 1 (e.g. compilation error
+        // before any tests ran). Must return FAILURE rather than SUCCESS.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(1)));
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_exit_two_preserves_code() {
+        // Process exited 2 (common for "compilation failed") with 0 parser failures.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(2)));
+        assert_eq!(code, ExitCode::from(2u8));
+    }
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_signal_kill_is_failure() {
+        // Signal-killed process (Process(None)) with 0 parser failures → FAILURE.
+        let code = resolve_exit_code(0, ExitSource::Process(None));
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_nonzero_fail_exit_zero_is_failure() {
+        // Parser found failures; process exited 0 → still FAILURE.
+        let code = resolve_exit_code(3, ExitSource::Process(Some(0)));
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_stdin_path_zero_fail_is_success() {
+        // Stdin path (no process spawned), parser found 0 failures → SUCCESS.
+        let code = resolve_exit_code(0, ExitSource::Stdin);
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_stdin_path_nonzero_fail_is_failure() {
+        // Stdin path, parser found failures → FAILURE.
+        let code = resolve_exit_code(2, ExitSource::Stdin);
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_clamps_exit_255() {
+        // Exit code 255 is the max allowed; should be preserved.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(255)));
+        assert_eq!(code, ExitCode::from(255u8));
+    }
 
     // ========================================================================
     // run_passthrough tests (spawn branch)

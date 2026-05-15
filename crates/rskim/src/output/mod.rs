@@ -181,6 +181,22 @@ pub(crate) fn strip_ansi(input: &str) -> String {
     strip_ansi_escapes::strip_str(input)
 }
 
+/// Strip ANSI escape sequences with a fast-path borrow.
+///
+/// When no ESC byte (`0x1b`) is present in `input`, returns `Cow::Borrowed(input)`
+/// without any allocation. Only allocates when ANSI escapes are actually present.
+///
+/// Use this in hot paths where the input may already be clean (e.g. when the
+/// spawn path has already stripped ANSI before passing the string to a parser).
+#[inline]
+pub(crate) fn strip_ansi_cow(input: &str) -> std::borrow::Cow<'_, str> {
+    if input.as_bytes().contains(&0x1b) {
+        std::borrow::Cow::Owned(strip_ansi_escapes::strip_str(input))
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    }
+}
+
 /// Collapse progress lines that use carriage return (`\r`) overwriting.
 ///
 /// Terminal progress bars use `\r` (without `\n`) to overwrite the current line.
@@ -563,6 +579,39 @@ mod tests {
     // ========================================================================
     // PassthroughCleaner tests
     // ========================================================================
+
+    #[test]
+    fn test_strip_ansi_cow_borrows_when_clean() {
+        let input = "no ansi codes here";
+        let result = strip_ansi_cow(input);
+        assert!(
+            matches!(result, std::borrow::Cow::Borrowed(_)),
+            "expected Borrowed for input without ESC bytes"
+        );
+        assert_eq!(result, "no ansi codes here");
+    }
+
+    #[test]
+    fn test_strip_ansi_cow_allocates_when_ansi_present() {
+        let input = "\x1b[31mred\x1b[0m";
+        let result = strip_ansi_cow(input);
+        assert!(
+            matches!(result, std::borrow::Cow::Owned(_)),
+            "expected Owned for input with ESC bytes"
+        );
+        assert_eq!(result, "red");
+    }
+
+    #[test]
+    fn test_strip_ansi_cow_empty_input() {
+        let input = "";
+        let result = strip_ansi_cow(input);
+        assert!(
+            matches!(result, std::borrow::Cow::Borrowed(_)),
+            "expected Borrowed for empty input"
+        );
+        assert_eq!(result, "");
+    }
 
     #[test]
     fn test_strip_ansi_removes_color_codes() {

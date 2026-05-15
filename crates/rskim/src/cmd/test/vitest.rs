@@ -18,7 +18,7 @@ use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{TestKind, TestRunnerConfig, run_test_runner, scrape_failures};
+use super::shared::{ArgPreparation, TestKind, TestRunnerConfig, run_test_runner, scrape_failures};
 
 // ============================================================================
 // Public entry point
@@ -46,19 +46,21 @@ pub(crate) fn run(
         args,
         show_stats,
         rec,
-        // passthrough_prepare_args: no subcommand to prepend, no flags to inject.
-        |a| a.to_vec(),
-        // prepare_args: inject the JSON reporter flag for the normal spawn path.
-        |a| {
-            let mut final_args = a.to_vec();
-            if program == "jest" {
-                if !user_has_flag(a, &["--json"]) {
-                    final_args.push("--json".to_string());
+        ArgPreparation {
+            // Passthrough: no subcommand to prepend, no flags to inject.
+            passthrough: |a: &[String]| a.to_vec(),
+            // Normal: inject the JSON reporter flag for the normal spawn path.
+            normal: |a: &[String]| {
+                let mut final_args = a.to_vec();
+                if program == "jest" {
+                    if !user_has_flag(a, &["--json"]) {
+                        final_args.push("--json".to_string());
+                    }
+                } else if !user_has_flag(a, &["--reporter"]) {
+                    final_args.push("--reporter=json".to_string());
                 }
-            } else if !user_has_flag(a, &["--reporter"]) {
-                final_args.push("--reporter=json".to_string());
-            }
-            final_args
+                final_args
+            },
         },
         parse,
     )
@@ -129,7 +131,7 @@ struct VitestAssertion {
 /// If the first balanced `{...}` candidate is not valid Vitest JSON (e.g., a
 /// `{project}` tag in a pnpm log), subsequent candidates are tried.
 fn try_parse_json(raw: &str) -> Option<TestResult> {
-    let cleaned = crate::output::strip_ansi(raw);
+    let cleaned = crate::output::strip_ansi_cow(raw);
 
     // Iterate over brace-balanced candidates until one parses as Vitest JSON.
     let mut search_from = 0;

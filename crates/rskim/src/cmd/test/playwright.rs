@@ -16,7 +16,7 @@ use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{TestRunnerConfig, extract_json_object, run_test_runner};
+use super::shared::{ArgPreparation, TestRunnerConfig, extract_json_object, run_test_runner};
 
 // ============================================================================
 // Tier-2 regex patterns
@@ -71,20 +71,22 @@ pub(crate) fn run(
         user_args,
         show_stats,
         rec,
-        // passthrough_prepare_args: prepend "test" subcommand only — no reporter flag.
-        |a| {
-            let mut final_args = vec!["test".to_string()];
-            final_args.extend_from_slice(a);
-            final_args
-        },
-        // prepare_args: prepend "test" and inject the JSON reporter flag.
-        |a| {
-            let mut final_args = vec!["test".to_string()];
-            final_args.extend_from_slice(a);
-            if !user_has_flag(a, &["--reporter"]) {
-                final_args.push("--reporter=json".to_string());
-            }
-            final_args
+        ArgPreparation {
+            // Passthrough: prepend "test" subcommand only — no reporter flag.
+            passthrough: |a: &[String]| {
+                let mut final_args = vec!["test".to_string()];
+                final_args.extend_from_slice(a);
+                final_args
+            },
+            // Normal: prepend "test" and inject the JSON reporter flag.
+            normal: |a: &[String]| {
+                let mut final_args = vec!["test".to_string()];
+                final_args.extend_from_slice(a);
+                if !user_has_flag(a, &["--reporter"]) {
+                    final_args.push("--reporter=json".to_string());
+                }
+                final_args
+            },
         },
         parse,
     )
@@ -169,13 +171,7 @@ struct PlaywrightError {
 }
 
 fn try_parse_json(raw: &str) -> Option<TestResult> {
-    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
-    // already strips); only allocate when ESC bytes are detected.
-    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    let cleaned = crate::output::strip_ansi_cow(raw);
 
     // Find the JSON object via brace balance
     let json_str = extract_json_object(&cleaned)?;
@@ -277,13 +273,7 @@ fn collect_entries_from_suites_inner(
 // ============================================================================
 
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
-    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
-    // already strips); only allocate when ESC bytes are detected.
-    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
-    } else {
-        std::borrow::Cow::Borrowed(raw)
-    };
+    let cleaned = crate::output::strip_ansi_cow(raw);
 
     let pass = RE_PW_PASSED
         .captures(&cleaned)
