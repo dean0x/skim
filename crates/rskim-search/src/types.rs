@@ -233,11 +233,7 @@ pub trait TemporalSource: Send + Sync {
     /// # Errors
     /// Returns [`SearchError::Git`] on any git-level failure (not a repo,
     /// unreadable objects, etc.).
-    fn parse_history(
-        &self,
-        repo_path: &Path,
-        lookback_days: u32,
-    ) -> Result<HistoryResult>;
+    fn parse_history(&self, repo_path: &Path, lookback_days: u32) -> Result<HistoryResult>;
 }
 
 // ============================================================================

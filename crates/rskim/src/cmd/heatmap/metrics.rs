@@ -21,9 +21,7 @@ pub(crate) fn compute_churn(commits: &[CommitInfo]) -> HashMap<String, ChurnMetr
 
     for commit in commits {
         for file in &commit.changed_files {
-            *counts
-                .entry(file.path_str().into_owned())
-                .or_insert(0) += 1;
+            *counts.entry(file.path_str().into_owned()).or_insert(0) += 1;
         }
     }
 
@@ -499,13 +497,7 @@ mod tests {
     use super::*;
     use crate::cmd::heatmap::types::FileChangeInfo;
 
-    fn make_commit(
-        hash: &str,
-        author: &str,
-        ts: u64,
-        subject: &str,
-        files: &[&str],
-    ) -> CommitInfo {
+    fn make_commit(hash: &str, author: &str, ts: u64, subject: &str, files: &[&str]) -> CommitInfo {
         CommitInfo {
             hash: hash.to_string(),
             author: author.to_string(),

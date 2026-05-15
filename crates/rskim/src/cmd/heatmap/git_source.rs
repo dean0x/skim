@@ -339,7 +339,10 @@ mod tests {
         let result = parse_git_log_output(input).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].changed_files.len(), 2);
-        assert_eq!(result[0].changed_files[0].path, std::path::Path::new("src/main.rs"));
+        assert_eq!(
+            result[0].changed_files[0].path,
+            std::path::Path::new("src/main.rs")
+        );
         assert_eq!(result[0].changed_files[0].additions, 5);
         assert_eq!(result[0].changed_files[0].deletions, 2);
     }
@@ -373,7 +376,10 @@ mod tests {
         let input = "COMMIT:abc|Alice|1000|msg\n-\t-\tbinary.bin\n5\t2\treal.rs\n\n";
         let result = parse_git_log_output(input).unwrap();
         assert_eq!(result[0].changed_files.len(), 1);
-        assert_eq!(result[0].changed_files[0].path, std::path::Path::new("real.rs"));
+        assert_eq!(
+            result[0].changed_files[0].path,
+            std::path::Path::new("real.rs")
+        );
     }
 
     #[test]

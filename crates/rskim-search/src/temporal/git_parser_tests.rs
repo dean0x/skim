@@ -152,7 +152,12 @@ fn test_single_commit_fields() {
         return;
     }
     let Some(dir) = init_git_repo() else { return };
-    assert!(git_commit_file(dir.path(), "hello.txt", "world", "feat: first commit"));
+    assert!(git_commit_file(
+        dir.path(),
+        "hello.txt",
+        "world",
+        "feat: first commit"
+    ));
 
     let src = GixSource;
     let history = src.parse_history(dir.path(), 0).expect("parse_history");
@@ -160,7 +165,12 @@ fn test_single_commit_fields() {
 
     let commit = &history.commits[0];
     // Hash should be 40 hex chars
-    assert_eq!(commit.hash.len(), 40, "hash should be 40 chars: {}", commit.hash);
+    assert_eq!(
+        commit.hash.len(),
+        40,
+        "hash should be 40 chars: {}",
+        commit.hash
+    );
     assert!(
         commit.hash.chars().all(|c| c.is_ascii_hexdigit()),
         "hash should be hex: {}",
@@ -169,7 +179,10 @@ fn test_single_commit_fields() {
     assert!(commit.timestamp > 0, "timestamp should be positive");
     assert!(!commit.author.is_empty(), "author should be non-empty");
     assert_eq!(commit.message, "feat: first commit");
-    assert!(!history.metadata.is_shallow, "normal repo should not be shallow");
+    assert!(
+        !history.metadata.is_shallow,
+        "normal repo should not be shallow"
+    );
 }
 
 #[test]
@@ -178,7 +191,9 @@ fn test_shallow_clone_detected() {
         eprintln!("SKIPPED: git not available on PATH");
         return;
     }
-    let Some(origin) = init_git_repo() else { return };
+    let Some(origin) = init_git_repo() else {
+        return;
+    };
     assert!(git_commit_file(origin.path(), "a.txt", "a", "first"));
     assert!(git_commit_file(origin.path(), "b.txt", "b", "second"));
     assert!(git_commit_file(origin.path(), "c.txt", "c", "third"));
@@ -199,7 +214,10 @@ fn test_shallow_clone_detected() {
     let history = src
         .parse_history(&shallow_dir.path().join("repo"), 0)
         .expect("shallow parse");
-    assert!(history.metadata.is_shallow, "shallow clone should be detected");
+    assert!(
+        history.metadata.is_shallow,
+        "shallow clone should be detected"
+    );
     assert!(
         !history.commits.is_empty(),
         "shallow clone should still return available commits"
@@ -241,7 +259,12 @@ fn test_root_commit_includes_changed_files() {
         return;
     }
     let Some(dir) = init_git_repo() else { return };
-    assert!(git_commit_file(dir.path(), "main.rs", "fn main(){}", "add main"));
+    assert!(git_commit_file(
+        dir.path(),
+        "main.rs",
+        "fn main(){}",
+        "add main"
+    ));
 
     let src = GixSource;
     let history = src.parse_history(dir.path(), 0).expect("parse_history");
@@ -313,7 +336,11 @@ fn test_lookback_zero_returns_all_history() {
 
     let src = GixSource;
     let history = src.parse_history(dir.path(), 0).expect("parse_history");
-    assert_eq!(history.commits.len(), 2, "lookback_days=0 should return all commits");
+    assert_eq!(
+        history.commits.len(),
+        2,
+        "lookback_days=0 should return all commits"
+    );
 }
 
 #[test]
@@ -329,7 +356,11 @@ fn test_lookback_large_value_returns_recent() {
     let src = GixSource;
     // lookback_days=365 should include commits from the last year (both are very recent)
     let history = src.parse_history(dir.path(), 365).expect("parse_history");
-    assert_eq!(history.commits.len(), 2, "both recent commits should be within 365 days");
+    assert_eq!(
+        history.commits.len(),
+        2,
+        "both recent commits should be within 365 days"
+    );
 }
 
 #[test]
@@ -361,7 +392,12 @@ fn test_lookback_excludes_old_commits() {
     assert!(committed, "git commit with old date failed");
 
     // Also create a recent commit so the repo isn't empty after filtering.
-    assert!(git_commit_file(dir.path(), "recent.txt", "new", "recent commit"));
+    assert!(git_commit_file(
+        dir.path(),
+        "recent.txt",
+        "new",
+        "recent commit"
+    ));
 
     let src = GixSource;
     // lookback_days=30 should include only the recent commit; the 2000-dated
@@ -371,7 +407,11 @@ fn test_lookback_excludes_old_commits() {
         history.commits.len(),
         1,
         "expected only 1 recent commit within 30-day window, got: {:?}",
-        history.commits.iter().map(|c| &c.message).collect::<Vec<_>>()
+        history
+            .commits
+            .iter()
+            .map(|c| &c.message)
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         history.commits[0].message, "recent commit",
@@ -390,11 +430,20 @@ fn test_file_addition_appears_in_changed_files() {
         return;
     }
     let Some(dir) = init_git_repo() else { return };
-    assert!(git_commit_file(dir.path(), "new_feature.rs", "pub fn feature(){}", "add feature"));
+    assert!(git_commit_file(
+        dir.path(),
+        "new_feature.rs",
+        "pub fn feature(){}",
+        "add feature"
+    ));
 
     let src = GixSource;
     let history = src.parse_history(dir.path(), 0).expect("parse_history");
-    let files: Vec<&PathBuf> = history.commits[0].changed_files.iter().map(|f| &f.path).collect();
+    let files: Vec<&PathBuf> = history.commits[0]
+        .changed_files
+        .iter()
+        .map(|f| &f.path)
+        .collect();
     assert!(
         files.iter().any(|p| p.as_os_str() == "new_feature.rs"),
         "expected new_feature.rs in changed_files, got: {files:?}"
@@ -408,7 +457,12 @@ fn test_file_deletion_appears_in_changed_files() {
         return;
     }
     let Some(dir) = init_git_repo() else { return };
-    assert!(git_commit_file(dir.path(), "old.rs", "content", "add old.rs"));
+    assert!(git_commit_file(
+        dir.path(),
+        "old.rs",
+        "content",
+        "add old.rs"
+    ));
     assert!(git_delete_file(dir.path(), "old.rs", "delete old.rs"));
 
     let src = GixSource;
@@ -416,7 +470,11 @@ fn test_file_deletion_appears_in_changed_files() {
     assert_eq!(history.commits.len(), 2);
     // The deletion commit (newest, commits[0]) should mention old.rs
     let delete_commit = &history.commits[0];
-    let files: Vec<&PathBuf> = delete_commit.changed_files.iter().map(|f| &f.path).collect();
+    let files: Vec<&PathBuf> = delete_commit
+        .changed_files
+        .iter()
+        .map(|f| &f.path)
+        .collect();
     assert!(
         files.iter().any(|p| p.as_os_str() == "old.rs"),
         "expected old.rs in deletion commit, got: {files:?}"
@@ -431,7 +489,12 @@ fn test_file_modification_appears_in_changed_files() {
     }
     let Some(dir) = init_git_repo() else { return };
     assert!(git_commit_file(dir.path(), "lib.rs", "v1", "initial"));
-    assert!(git_commit_file(dir.path(), "lib.rs", "v2 with more content", "update lib.rs"));
+    assert!(git_commit_file(
+        dir.path(),
+        "lib.rs",
+        "v2 with more content",
+        "update lib.rs"
+    ));
 
     let src = GixSource;
     let history = src.parse_history(dir.path(), 0).expect("parse_history");
@@ -453,7 +516,12 @@ fn test_file_rename_appears_in_changed_files() {
     let Some(dir) = init_git_repo() else { return };
 
     // Create original file and commit it.
-    assert!(git_commit_file(dir.path(), "original.rs", "pub fn hello(){}", "add original.rs"));
+    assert!(git_commit_file(
+        dir.path(),
+        "original.rs",
+        "pub fn hello(){}",
+        "add original.rs"
+    ));
 
     // Rename via `git mv` and commit.
     let moved = Command::new("git")
@@ -477,7 +545,11 @@ fn test_file_rename_appears_in_changed_files() {
 
     // The rename commit is newest (commits[0]).
     let rename_commit = &history.commits[0];
-    let files: Vec<&PathBuf> = rename_commit.changed_files.iter().map(|f| &f.path).collect();
+    let files: Vec<&PathBuf> = rename_commit
+        .changed_files
+        .iter()
+        .map(|f| &f.path)
+        .collect();
     assert!(
         files.iter().any(|p| p.as_os_str() == "renamed.rs"),
         "expected renamed.rs (new path) in rename commit changed_files, got: {files:?}"
@@ -611,7 +683,10 @@ fn test_commit_info_serialization_roundtrip() {
     assert_eq!(restored.author, original.author);
     assert_eq!(restored.message, original.message);
     assert_eq!(restored.changed_files.len(), 1);
-    assert_eq!(restored.changed_files[0].path, original.changed_files[0].path);
+    assert_eq!(
+        restored.changed_files[0].path,
+        original.changed_files[0].path
+    );
     assert_eq!(restored.changed_files[0].additions, 10);
     assert_eq!(restored.changed_files[0].deletions, 3);
 }

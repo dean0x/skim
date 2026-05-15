@@ -242,28 +242,47 @@ fn changed_files_for_commit(
 
     lhs.changes()
         .map_err(gix_err)?
-        .for_each_to_obtain_tree(&new_tree, |change| -> std::result::Result<_, std::convert::Infallible> {
-            use gix::object::tree::diff::Change;
-            // All change kinds use the destination location.
-            // Renames (Rewrite) also provide the new path via `location`.
-            let (location, entry_mode) = match &change {
-                Change::Addition { location, entry_mode, .. }
-                | Change::Deletion { location, entry_mode, .. }
-                | Change::Modification { location, entry_mode, .. }
-                | Change::Rewrite { location, entry_mode, .. } => (location, entry_mode),
-            };
-            // Build PathBuf from the location bytes. `to_str_lossy()` returns a
-            // `Cow<str>`; using `.as_ref()` avoids the intermediate owned String
-            // allocation when the path is already valid UTF-8 (Cow::Borrowed).
-            if entry_mode.is_no_tree() && !location.is_empty() {
-                changed_files.push(FileChangeInfo {
-                    path: PathBuf::from(location.to_str_lossy().as_ref()),
-                    additions: 0,
-                    deletions: 0,
-                });
-            }
-            Ok(gix::object::tree::diff::Action::Continue)
-        })
+        .for_each_to_obtain_tree(
+            &new_tree,
+            |change| -> std::result::Result<_, std::convert::Infallible> {
+                use gix::object::tree::diff::Change;
+                // All change kinds use the destination location.
+                // Renames (Rewrite) also provide the new path via `location`.
+                let (location, entry_mode) = match &change {
+                    Change::Addition {
+                        location,
+                        entry_mode,
+                        ..
+                    }
+                    | Change::Deletion {
+                        location,
+                        entry_mode,
+                        ..
+                    }
+                    | Change::Modification {
+                        location,
+                        entry_mode,
+                        ..
+                    }
+                    | Change::Rewrite {
+                        location,
+                        entry_mode,
+                        ..
+                    } => (location, entry_mode),
+                };
+                // Build PathBuf from the location bytes. `to_str_lossy()` returns a
+                // `Cow<str>`; using `.as_ref()` avoids the intermediate owned String
+                // allocation when the path is already valid UTF-8 (Cow::Borrowed).
+                if entry_mode.is_no_tree() && !location.is_empty() {
+                    changed_files.push(FileChangeInfo {
+                        path: PathBuf::from(location.to_str_lossy().as_ref()),
+                        additions: 0,
+                        deletions: 0,
+                    });
+                }
+                Ok(gix::object::tree::diff::Action::Continue)
+            },
+        )
         .map_err(gix_err)?;
 
     Ok(changed_files)
