@@ -71,6 +71,13 @@ pub(crate) fn run(
         user_args,
         show_stats,
         rec,
+        // passthrough_prepare_args: prepend "test" subcommand only — no reporter flag.
+        |a| {
+            let mut final_args = vec!["test".to_string()];
+            final_args.extend_from_slice(a);
+            final_args
+        },
+        // prepare_args: prepend "test" and inject the JSON reporter flag.
         |a| {
             let mut final_args = vec!["test".to_string()];
             final_args.extend_from_slice(a);
@@ -162,7 +169,13 @@ struct PlaywrightError {
 }
 
 fn try_parse_json(raw: &str) -> Option<TestResult> {
-    let cleaned = crate::output::strip_ansi(raw);
+    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
+    // already strips); only allocate when ESC bytes are detected.
+    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
+        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
 
     // Find the JSON object via brace balance
     let json_str = extract_json_object(&cleaned)?;
@@ -206,9 +219,26 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
     Some(TestResult::new(summary, entries))
 }
 
+/// Recursively collect test entries from nested suites.
+///
+/// `depth` tracks call depth; recursion stops at `MAX_SUITE_DEPTH` to prevent
+/// stack overflows from pathologically-deep or adversarial JSON payloads.
+const MAX_SUITE_DEPTH: usize = 64;
+
 fn collect_entries_from_suites(suites: &[PlaywrightSuite], entries: &mut Vec<TestEntry>) {
+    collect_entries_from_suites_inner(suites, entries, 0);
+}
+
+fn collect_entries_from_suites_inner(
+    suites: &[PlaywrightSuite],
+    entries: &mut Vec<TestEntry>,
+    depth: usize,
+) {
+    if depth >= MAX_SUITE_DEPTH {
+        return;
+    }
     for suite in suites {
-        collect_entries_from_suites(&suite.suites, entries);
+        collect_entries_from_suites_inner(&suite.suites, entries, depth + 1);
         for spec in &suite.specs {
             for test in &spec.tests {
                 // Only use the first result per test
@@ -247,7 +277,13 @@ fn collect_entries_from_suites(suites: &[PlaywrightSuite], entries: &mut Vec<Tes
 // ============================================================================
 
 fn try_parse_regex(raw: &str) -> Option<TestResult> {
-    let cleaned = crate::output::strip_ansi(raw);
+    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
+    // already strips); only allocate when ESC bytes are detected.
+    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
+        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
 
     let pass = RE_PW_PASSED
         .captures(&cleaned)

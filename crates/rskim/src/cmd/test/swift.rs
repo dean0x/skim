@@ -66,8 +66,14 @@ pub(crate) fn run(
         args,
         show_stats,
         rec,
+        // passthrough_prepare_args: prepend "test" subcommand only — no flags.
         |a| {
-            // Prepend "test" since swift is always called with the test subcommand.
+            let mut full_args = vec!["test".to_string()];
+            full_args.extend_from_slice(a);
+            full_args
+        },
+        // prepare_args: prepend "test" (swift has no JSON reporter to inject).
+        |a| {
             let mut full_args = vec!["test".to_string()];
             full_args.extend_from_slice(a);
             full_args
@@ -98,7 +104,13 @@ fn parse(raw: &str) -> ParseResult<TestResult> {
 }
 
 fn try_parse_xctest(raw: &str) -> Option<TestResult> {
-    let cleaned = crate::output::strip_ansi(raw);
+    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
+    // already strips); only allocate when ESC bytes are detected.
+    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
+        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
 
     let mut entries: Vec<TestEntry> = Vec::new();
 
