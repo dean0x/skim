@@ -197,14 +197,14 @@ pub(crate) fn compute_stability(
     for commit in commits {
         let is_fix = rskim_search::is_fix_commit(&commit.message);
         for file in &commit.changed_files {
-            let path_str = file.path_str().into_owned();
+            let path = file.path_str().into_owned();
+            if is_fix {
+                *file_fix_count.entry(path.clone()).or_insert(0) += 1;
+            }
             file_commits
-                .entry(path_str.clone())
+                .entry(path)
                 .or_default()
                 .push(commit.timestamp.max(0) as u64);
-            if is_fix {
-                *file_fix_count.entry(path_str).or_insert(0) += 1;
-            }
         }
     }
 
@@ -399,16 +399,14 @@ pub(crate) fn compute_fix_after_touch(
 ///
 /// Returns `None` for root-level files (no directory component), e.g. `Makefile`.
 /// Returns `Some("src")` for `src/lib.rs`, `Some("tests")` for `tests/foo.rs`.
-fn extract_top_dir(path: &str) -> Option<String> {
-    let p = std::path::Path::new(path);
+fn extract_top_dir(path: &std::path::Path) -> Option<String> {
     // Require at least one parent directory (not root-level files)
-    let parent = p.parent()?;
-    let s = parent.to_string_lossy();
-    if s.is_empty() || s == "." {
+    let parent = path.parent()?;
+    if parent == std::path::Path::new("") || parent == std::path::Path::new(".") {
         return None;
     }
     // Return the first path component as the module name
-    p.components()
+    path.components()
         .next()
         .and_then(|c| c.as_os_str().to_str().map(String::from))
 }
@@ -435,7 +433,7 @@ pub(crate) fn compute_encapsulation(
         let file_dirs: Vec<Option<String>> = commit
             .changed_files
             .iter()
-            .map(|f| extract_top_dir(&f.path_str()))
+            .map(|f| extract_top_dir(&f.path))
             .collect();
 
         // Collect unique top-level directories for this commit
@@ -881,17 +879,23 @@ mod tests {
 
     #[test]
     fn test_extract_top_dir_root_level_file() {
-        assert_eq!(extract_top_dir("Makefile"), None);
-        assert_eq!(extract_top_dir("README.md"), None);
+        assert_eq!(extract_top_dir(std::path::Path::new("Makefile")), None);
+        assert_eq!(extract_top_dir(std::path::Path::new("README.md")), None);
     }
 
     #[test]
     fn test_extract_top_dir_nested_file() {
-        assert_eq!(extract_top_dir("src/lib.rs"), Some("src".to_string()));
         assert_eq!(
-            extract_top_dir("src/cmd/heatmap/mod.rs"),
+            extract_top_dir(std::path::Path::new("src/lib.rs")),
             Some("src".to_string())
         );
-        assert_eq!(extract_top_dir("tests/foo.rs"), Some("tests".to_string()));
+        assert_eq!(
+            extract_top_dir(std::path::Path::new("src/cmd/heatmap/mod.rs")),
+            Some("src".to_string())
+        );
+        assert_eq!(
+            extract_top_dir(std::path::Path::new("tests/foo.rs")),
+            Some("tests".to_string())
+        );
     }
 }
