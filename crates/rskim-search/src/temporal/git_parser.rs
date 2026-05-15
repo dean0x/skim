@@ -70,6 +70,10 @@ impl TemporalSource for GixSource {
 // Implementation
 // ============================================================================
 
+/// Safety cap on commit traversal to prevent OOM on very large repositories
+/// (e.g. linux kernel: 1M+ commits) when `lookback_days = 0`.
+const MAX_COMMITS: usize = 100_000;
+
 fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryResult> {
     // Open repository, discovering .git in parent directories
     let mut repo = gix::discover(repo_path).map_err(gix_err)?;
@@ -93,11 +97,14 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         }
     };
 
-    // Compute lookback cutoff (seconds since unix epoch)
+    // Compute lookback cutoff (seconds since unix epoch).
+    // Fail explicitly if the system clock predates the Unix epoch — silently
+    // returning 0 would make cutoff_secs negative, causing all commits to pass
+    // the filter and effectively ignoring the lookback window.
     let cutoff_secs: Option<i64> = if lookback_days > 0 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|_| SearchError::Git("system clock is before Unix epoch".into()))?
             .as_secs() as i64;
         Some(now - i64::from(lookback_days) * 86_400)
     } else {
@@ -123,13 +130,24 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
     let mut commits: Vec<CommitInfo> = Vec::new();
 
     for info_result in walk {
+        // Guard against OOM on very large repositories (e.g. linux kernel).
+        if commits.len() >= MAX_COMMITS {
+            eprintln!(
+                "skim: parse_history reached the {MAX_COMMITS}-commit safety cap; \
+                 truncating history. Pass lookback_days > 0 to scope the traversal."
+            );
+            break;
+        }
+
         let info = match info_result {
             Ok(info) => info,
             Err(_) if is_shallow => break,
             Err(e) => return Err(gix_err(e)),
         };
 
-        // Decode the full commit object for author/message fields
+        // Decode the full commit object for author/message fields.
+        // The same object is reused in changed_files_for_commit below to avoid
+        // a second object-store lookup per commit.
         let commit_obj = info.object().map_err(gix_err)?;
         let commit_ref = commit_obj.decode().map_err(gix_err)?;
 
@@ -154,8 +172,9 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         let message = first_line_of(msg_bytes.to_str_lossy().as_ref()).to_owned();
 
         // Compute changed files (tree diff vs. first parent or empty tree).
+        // Pass the already-decoded commit object to avoid a second object lookup.
         // In shallow clones, the parent object may be missing — treat as empty.
-        let changed_files = match changed_files_for_commit(&repo, &info) {
+        let changed_files = match changed_files_for_commit(&repo, &commit_obj, &info.parent_ids) {
             Ok(files) => files,
             Err(_) if is_shallow => Vec::new(),
             Err(e) => return Err(e),
@@ -171,26 +190,34 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
     }
 
     let commit_count = commits.len();
-    Ok(HistoryResult {
+    let result = HistoryResult {
         commits,
         metadata: TemporalMetadata {
             is_shallow,
             commit_count,
         },
-    })
+    };
+    debug_assert_eq!(
+        result.metadata.commit_count,
+        result.commits.len(),
+        "commit_count must equal commits.len()"
+    );
+    Ok(result)
 }
 
 /// Return the changed files in a commit by diffing its tree against its first
 /// parent (or the empty tree for root commits).
 ///
+/// Accepts the already-decoded `commit` object from the caller to avoid a
+/// second object-store lookup per commit.
+///
 /// Uses `Tree::changes().for_each_to_obtain_tree()` which is the high-level
 /// gix API. Requires the `blob-diff` feature.
 fn changed_files_for_commit(
     repo: &gix::Repository,
-    info: &gix::revision::walk::Info<'_>,
+    commit: &gix::Commit<'_>,
+    parent_ids: &gix::traverse::commit::ParentIds,
 ) -> Result<Vec<FileChangeInfo>> {
-    let commit = info.object().map_err(gix_err)?;
-
     // Get the new (this commit's) tree
     let new_tree = commit.tree().map_err(gix_err)?;
 
@@ -198,7 +225,7 @@ fn changed_files_for_commit(
     let old_tree: gix::Tree<'_>;
     let empty_tree: gix::Tree<'_>;
 
-    let lhs: &gix::Tree<'_> = if let Some(&parent_id) = info.parent_ids.first() {
+    let lhs: &gix::Tree<'_> = if let Some(&parent_id) = parent_ids.first() {
         let parent_obj = repo.find_object(parent_id).map_err(gix_err)?;
         let parent_commit = parent_obj
             .try_into_commit()
@@ -225,14 +252,12 @@ fn changed_files_for_commit(
                 | Change::Modification { location, entry_mode, .. }
                 | Change::Rewrite { location, entry_mode, .. } => (location, entry_mode),
             };
-            let path_opt = if entry_mode.is_no_tree() && !location.is_empty() {
-                Some(location.to_str_lossy().into_owned())
-            } else {
-                None
-            };
-            if let Some(path) = path_opt {
+            // Build PathBuf from the location bytes. `to_str_lossy()` returns a
+            // `Cow<str>`; using `.as_ref()` avoids the intermediate owned String
+            // allocation when the path is already valid UTF-8 (Cow::Borrowed).
+            if entry_mode.is_no_tree() && !location.is_empty() {
                 changed_files.push(FileChangeInfo {
-                    path: PathBuf::from(path),
+                    path: PathBuf::from(location.to_str_lossy().as_ref()),
                     additions: 0,
                     deletions: 0,
                 });
