@@ -347,11 +347,8 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                 b"Counters" => {
                     counters = parse_counters_element(e.attributes().flatten());
                 }
-                b"UnitTestResult"
-                    if entries.len() < MAX_ENTRIES =>
-                {
-                    let (name, outcome) =
-                        parse_unit_test_result_attrs(e.attributes().flatten());
+                b"UnitTestResult" if entries.len() < MAX_ENTRIES => {
+                    let (name, outcome) = parse_unit_test_result_attrs(e.attributes().flatten());
                     if let (Some(name), Some(outcome)) = (name, outcome) {
                         entries.push(TestEntry {
                             name,
