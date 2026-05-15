@@ -5,12 +5,14 @@
 //! - Core types (`types` module) are **pure**: no I/O, no side effects.
 //! - The `index` module provides on-disk persistence via memory-mapped files.
 //! - The `ngram` module handles bigram extraction (pure, no I/O).
+//! - The `temporal` module parses git history via gix for temporal scoring.
 //! - Returns Result types throughout — no panics in non-test code.
 //!
 //! CLI/binary code in `crates/rskim/src/cmd/search.rs` handles user-facing I/O.
 
 pub mod index;
 pub mod ngram;
+pub mod temporal;
 mod types;
 pub mod weights;
 
@@ -19,8 +21,10 @@ pub use ngram::{
     BORDER_MULTIPLIER, Ngram, extract_ngrams, extract_ngrams_with_weights, extract_query_ngrams,
     extract_query_ngrams_with_weights,
 };
+pub use temporal::{GixSource, is_fix_commit};
 pub use types::{
-    FieldClassifier, FileId, IndexStats, LayerBuilder, NodeInfo, Result, SearchError, SearchField,
-    SearchLayer, SearchQuery, SearchResult, TemporalFlags,
+    CommitInfo, FieldClassifier, FileChangeInfo, FileId, HistoryResult, IndexStats, LayerBuilder,
+    NodeInfo, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
+    TemporalFlags, TemporalMetadata, TemporalSource,
 };
 pub use weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT, bigram_weight};

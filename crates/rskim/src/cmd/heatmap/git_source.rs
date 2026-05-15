@@ -1,13 +1,13 @@
 //! Git data source for `skim heatmap` — the ONLY I/O file in this module.
 //!
 //! Uses `CommandRunner` to execute git commands and parses their output into
-//! `CommitRecord` values via a simple state machine.
+//! `CommitInfo` values via a simple state machine.
 
 use std::time::Duration;
 
 use crate::runner::{CommandRunner, is_spawn_error};
 
-use super::types::{CommitRecord, FileChange, HeatmapConfig};
+use super::types::{CommitInfo, FileChangeInfo, HeatmapConfig};
 
 /// Map a `CommandRunner` error to a friendly "git not installed" message when appropriate.
 fn git_not_found(e: anyhow::Error) -> anyhow::Error {
@@ -27,10 +27,15 @@ fn git_not_found(e: anyhow::Error) -> anyhow::Error {
 /// The only implementation is [`CliGitSource`]; the trait enables unit-testing
 /// the orchestration logic in `mod.rs` without spawning a real git process.
 ///
+/// Heatmap-specific git data source — wraps CLI `git` binary via `CommandRunner`.
+///
 /// Infra methods (`is_git_repo`, `get_repo_root`, `detect_shallow_clone`,
 /// `fetch_commit_count_since`) are included so `run_with_source` can accept a
 /// single `&dyn GitDataSource` instead of splitting into a concrete `&CliGitSource`
 /// for infrastructure and a trait object for data fetch.
+///
+/// Long-term, this trait will be replaced by `rskim_search::TemporalSource` +
+/// `GixSource` once the heatmap pipeline migrates from CLI git to the gix library.
 pub(crate) trait GitDataSource {
     /// Return `true` when the cwd is inside a git repository.
     fn is_git_repo(&self) -> bool;
@@ -46,8 +51,8 @@ pub(crate) trait GitDataSource {
     /// Returns `None` when the repo has fewer than `n` commits.
     fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>>;
 
-    /// Fetch commit records according to `config`.
-    fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitRecord>>;
+    /// Fetch commits according to `config`.
+    fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>>;
 }
 
 // ============================================================================
@@ -174,7 +179,7 @@ impl GitDataSource for CliGitSource {
         Ok((ts > 0).then_some(ts))
     }
 
-    fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitRecord>> {
+    fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>> {
         let owned_args = self.build_git_log_args(config);
         let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let output = self.runner.run("git", &args).map_err(git_not_found)?;
@@ -190,9 +195,9 @@ impl GitDataSource for CliGitSource {
 ///
 /// Exposed as `pub(crate)` so unit tests can exercise the parser on hardcoded
 /// strings without spawning a real git process.
-pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord>> {
-    let mut commits: Vec<CommitRecord> = Vec::new();
-    let mut current: Option<CommitRecord> = None;
+pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitInfo>> {
+    let mut commits: Vec<CommitInfo> = Vec::new();
+    let mut current: Option<CommitInfo> = None;
 
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("COMMIT:") {
@@ -210,12 +215,12 @@ pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord
             let timestamp: u64 = parts[2].trim().parse().unwrap_or(0);
             let subject = parts[3].trim().to_string();
 
-            current = Some(CommitRecord {
+            current = Some(CommitInfo {
                 hash,
                 author,
-                timestamp,
-                subject,
-                files: Vec::new(),
+                timestamp: i64::try_from(timestamp).unwrap_or(i64::MAX),
+                message: subject,
+                changed_files: Vec::new(),
             });
         } else if line.trim().is_empty() {
             // Blank lines separate commits — skip
@@ -226,7 +231,7 @@ pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord
             if let Some(record) = current.as_mut()
                 && let Some(file_change) = parse_numstat_line(line)
             {
-                record.files.push(file_change);
+                record.changed_files.push(file_change);
             }
         }
     }
@@ -239,11 +244,11 @@ pub(crate) fn parse_git_log_output(raw: &str) -> anyhow::Result<Vec<CommitRecord
     Ok(commits)
 }
 
-/// Parse a single git numstat line into a `FileChange`.
+/// Parse a single git numstat line into a `FileChangeInfo`.
 ///
 /// Returns `None` for binary files (marked with `-` in both columns) or
 /// malformed lines.
-fn parse_numstat_line(line: &str) -> Option<FileChange> {
+fn parse_numstat_line(line: &str) -> Option<FileChangeInfo> {
     let parts: Vec<&str> = line.splitn(3, '\t').collect();
     if parts.len() < 3 {
         return None;
@@ -264,8 +269,8 @@ fn parse_numstat_line(line: &str) -> Option<FileChange> {
     // Resolve renames: `{old => new}` or `dir/{old => new}/rest`
     let path = resolve_rename(raw_path);
 
-    Some(FileChange {
-        path,
+    Some(FileChangeInfo {
+        path: std::path::PathBuf::from(path),
         additions,
         deletions,
     })
@@ -323,9 +328,9 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash, "abc123");
         assert_eq!(result[0].author, "Alice");
-        assert_eq!(result[0].timestamp, 1_700_000_000);
-        assert_eq!(result[0].subject, "fix: something");
-        assert!(result[0].files.is_empty());
+        assert_eq!(result[0].timestamp, 1_700_000_000i64);
+        assert_eq!(result[0].message, "fix: something");
+        assert!(result[0].changed_files.is_empty());
     }
 
     #[test]
@@ -333,10 +338,13 @@ mod tests {
         let input = "COMMIT:abc123|Alice|1700000000|chore: update\n5\t2\tsrc/main.rs\n3\t1\tlib/utils.rs\n\n";
         let result = parse_git_log_output(input).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].files.len(), 2);
-        assert_eq!(result[0].files[0].path, "src/main.rs");
-        assert_eq!(result[0].files[0].additions, 5);
-        assert_eq!(result[0].files[0].deletions, 2);
+        assert_eq!(result[0].changed_files.len(), 2);
+        assert_eq!(
+            result[0].changed_files[0].path,
+            std::path::Path::new("src/main.rs")
+        );
+        assert_eq!(result[0].changed_files[0].additions, 5);
+        assert_eq!(result[0].changed_files[0].deletions, 2);
     }
 
     #[test]
@@ -367,8 +375,11 @@ mod tests {
     fn test_binary_files_skipped() {
         let input = "COMMIT:abc|Alice|1000|msg\n-\t-\tbinary.bin\n5\t2\treal.rs\n\n";
         let result = parse_git_log_output(input).unwrap();
-        assert_eq!(result[0].files.len(), 1);
-        assert_eq!(result[0].files[0].path, "real.rs");
+        assert_eq!(result[0].changed_files.len(), 1);
+        assert_eq!(
+            result[0].changed_files[0].path,
+            std::path::Path::new("real.rs")
+        );
     }
 
     #[test]
@@ -399,7 +410,7 @@ mod tests {
         // Subject may contain the separator — splitn(4) protects us
         let input = "COMMIT:abc|Alice|1000|feat: add foo|bar\n\n";
         let result = parse_git_log_output(input).unwrap();
-        assert_eq!(result[0].subject, "feat: add foo|bar");
+        assert_eq!(result[0].message, "feat: add foo|bar");
     }
 
     #[test]
@@ -407,6 +418,6 @@ mod tests {
         let input = "COMMIT:abc|Alice|1000|msg\nnot-a-numstat-line\n\n";
         let result = parse_git_log_output(input).unwrap();
         // The malformed line should be silently ignored
-        assert_eq!(result[0].files.len(), 0);
+        assert_eq!(result[0].changed_files.len(), 0);
     }
 }

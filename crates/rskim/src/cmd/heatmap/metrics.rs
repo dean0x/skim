@@ -1,38 +1,27 @@
 //! Pure computation functions for `skim heatmap` — 6 risk metrics.
 //!
-//! Zero I/O. All functions accept `&[CommitRecord]` and return computed values.
+//! Zero I/O. All functions accept `&[CommitInfo]` and return computed values.
 //! `now_epoch` is a parameter (not `SystemTime::now()`) for deterministic tests.
 
 use std::collections::{HashMap, HashSet};
 
-use regex::Regex;
-
 use super::types::{
-    AuthorMetrics, ChurnMetrics, CommitRecord, CouplingEdge, CouplingEntry, FixRiskMetrics,
+    AuthorMetrics, ChurnMetrics, CommitInfo, CouplingEdge, CouplingEntry, FixRiskMetrics,
     ModuleHealth,
 };
-
-// ============================================================================
-// Fix keyword regex
-// ============================================================================
-
-/// Build the regex that identifies "fix" commits by subject keywords.
-pub(crate) fn build_fix_regex() -> Regex {
-    Regex::new(r"(?i)\b(fix|bug|hotfix|patch|revert)\b").expect("valid regex")
-}
 
 // ============================================================================
 // Metric 1: Churn
 // ============================================================================
 
 /// Count commits per file and compute rate = file_commits / total_commits.
-pub(crate) fn compute_churn(commits: &[CommitRecord]) -> HashMap<String, ChurnMetrics> {
+pub(crate) fn compute_churn(commits: &[CommitInfo]) -> HashMap<String, ChurnMetrics> {
     let total = commits.len();
     let mut counts: HashMap<String, usize> = HashMap::new();
 
     for commit in commits {
-        for file in &commit.files {
-            *counts.entry(file.path.clone()).or_insert(0) += 1;
+        for file in &commit.changed_files {
+            *counts.entry(file.path_str().into_owned()).or_insert(0) += 1;
         }
     }
 
@@ -79,19 +68,24 @@ const COUPLING_MAX_FILES: usize = 50;
 /// - per-file blast radius map: `HashMap<String, Vec<CouplingEntry>>`
 /// - global coupling graph: `Vec<CouplingEdge>`
 pub(crate) fn compute_coupling(
-    commits: &[CommitRecord],
+    commits: &[CommitInfo],
     threshold: f64,
     min_support: usize,
 ) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
     // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b).
-    // &str keys borrow from CommitRecord.files[].path — valid for entire function
-    // because `commits` (and therefore all CommitRecords) outlive these maps.
+    // &str keys borrow from PathBuf::to_str() on each FileChangeInfo.path — valid
+    // for the entire function because `commits` (and all CommitInfos) outlive
+    // these maps. Non-UTF-8 paths fall back to "" via unwrap_or_default().
     let mut co_occur: HashMap<(&str, &str), (f64, usize)> = HashMap::new();
     // weighted_total[a] = weighted sum of commits touching a
     let mut weighted_total: HashMap<&str, f64> = HashMap::new();
 
     for commit in commits {
-        let files: Vec<&str> = commit.files.iter().map(|f| f.path.as_str()).collect();
+        let files: Vec<&str> = commit
+            .changed_files
+            .iter()
+            .map(|f| f.path.to_str().unwrap_or_default())
+            .collect();
         let n = files.len();
         let weight = 1.0 / (n as f64).sqrt();
 
@@ -190,8 +184,7 @@ pub(crate) fn compute_coupling(
 ///
 /// `now_epoch` is a parameter so tests are deterministic.
 pub(crate) fn compute_stability(
-    commits: &[CommitRecord],
-    fix_regex: &Regex,
+    commits: &[CommitInfo],
     max_churn: usize,
     now_epoch: u64,
 ) -> HashMap<String, u8> {
@@ -200,15 +193,16 @@ pub(crate) fn compute_stability(
     let mut file_fix_count: HashMap<String, usize> = HashMap::new();
 
     for commit in commits {
-        let is_fix = fix_regex.is_match(&commit.subject);
-        for file in &commit.files {
-            file_commits
-                .entry(file.path.clone())
-                .or_default()
-                .push(commit.timestamp);
+        let is_fix = rskim_search::is_fix_commit(&commit.message);
+        for file in &commit.changed_files {
+            let path = file.path_str().into_owned();
             if is_fix {
-                *file_fix_count.entry(file.path.clone()).or_insert(0) += 1;
+                *file_fix_count.entry(path.clone()).or_insert(0) += 1;
             }
+            file_commits
+                .entry(path)
+                .or_default()
+                .push(commit.timestamp.max(0) as u64);
         }
     }
 
@@ -251,14 +245,14 @@ pub(crate) fn compute_stability(
 // ============================================================================
 
 /// Compute author diversity metrics per file.
-pub(crate) fn compute_authors(commits: &[CommitRecord]) -> HashMap<String, AuthorMetrics> {
+pub(crate) fn compute_authors(commits: &[CommitInfo]) -> HashMap<String, AuthorMetrics> {
     // file -> author -> commit_count
     let mut file_author_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
     for commit in commits {
-        for file in &commit.files {
+        for file in &commit.changed_files {
             *file_author_counts
-                .entry(file.path.clone())
+                .entry(file.path_str().into_owned())
                 .or_default()
                 .entry(commit.author.clone())
                 .or_insert(0) += 1;
@@ -312,21 +306,23 @@ pub(crate) fn compute_authors(commits: &[CommitRecord]) -> HashMap<String, Autho
 /// - `combined_pct`: union (not sum) of the two signals.
 /// - `insufficient_data`: true when the file has <2 commits.
 pub(crate) fn compute_fix_after_touch(
-    commits: &[CommitRecord],
-    fix_regex: &Regex,
+    commits: &[CommitInfo],
     window: usize,
 ) -> HashMap<String, FixRiskMetrics> {
     // Classify every commit
     let is_fix: Vec<bool> = commits
         .iter()
-        .map(|c| fix_regex.is_match(&c.subject))
+        .map(|c| rskim_search::is_fix_commit(&c.message))
         .collect();
 
     // Per-file: which commit indices touch it?
     let mut file_indices: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, commit) in commits.iter().enumerate() {
-        for file in &commit.files {
-            file_indices.entry(file.path.clone()).or_default().push(i);
+        for file in &commit.changed_files {
+            file_indices
+                .entry(file.path_str().into_owned())
+                .or_default()
+                .push(i);
         }
     }
 
@@ -401,16 +397,14 @@ pub(crate) fn compute_fix_after_touch(
 ///
 /// Returns `None` for root-level files (no directory component), e.g. `Makefile`.
 /// Returns `Some("src")` for `src/lib.rs`, `Some("tests")` for `tests/foo.rs`.
-fn extract_top_dir(path: &str) -> Option<String> {
-    let p = std::path::Path::new(path);
+fn extract_top_dir(path: &std::path::Path) -> Option<String> {
     // Require at least one parent directory (not root-level files)
-    let parent = p.parent()?;
-    let s = parent.to_string_lossy();
-    if s.is_empty() || s == "." {
+    let parent = path.parent()?;
+    if parent == std::path::Path::new("") || parent == std::path::Path::new(".") {
         return None;
     }
     // Return the first path component as the module name
-    p.components()
+    path.components()
         .next()
         .and_then(|c| c.as_os_str().to_str().map(String::from))
 }
@@ -423,7 +417,7 @@ fn extract_top_dir(path: &str) -> Option<String> {
 /// Filters modules with fewer than `min_commits` total commits.
 /// Returns results sorted by encapsulation_pct ascending (worst first).
 pub(crate) fn compute_encapsulation(
-    commits: &[CommitRecord],
+    commits: &[CommitInfo],
     min_commits: usize,
 ) -> Vec<ModuleHealth> {
     // module -> files seen
@@ -435,7 +429,7 @@ pub(crate) fn compute_encapsulation(
         // Precompute top-level directory for each file once to avoid calling
         // extract_top_dir twice per file (once for dirs, once for module_files).
         let file_dirs: Vec<Option<String>> = commit
-            .files
+            .changed_files
             .iter()
             .map(|f| extract_top_dir(&f.path))
             .collect();
@@ -444,12 +438,12 @@ pub(crate) fn compute_encapsulation(
         let dirs: HashSet<&str> = file_dirs.iter().filter_map(|d| d.as_deref()).collect();
 
         // Track files per module
-        for (file, dir) in commit.files.iter().zip(file_dirs.iter()) {
+        for (file, dir) in commit.changed_files.iter().zip(file_dirs.iter()) {
             if let Some(d) = dir {
                 module_files
                     .entry(d.clone())
                     .or_default()
-                    .insert(file.path.clone());
+                    .insert(file.path_str().into_owned());
             }
         }
 
@@ -501,24 +495,18 @@ pub(crate) fn compute_encapsulation(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::cmd::heatmap::types::FileChange;
+    use crate::cmd::heatmap::types::FileChangeInfo;
 
-    fn make_commit(
-        hash: &str,
-        author: &str,
-        ts: u64,
-        subject: &str,
-        files: &[&str],
-    ) -> CommitRecord {
-        CommitRecord {
+    fn make_commit(hash: &str, author: &str, ts: u64, subject: &str, files: &[&str]) -> CommitInfo {
+        CommitInfo {
             hash: hash.to_string(),
             author: author.to_string(),
-            timestamp: ts,
-            subject: subject.to_string(),
-            files: files
+            timestamp: ts as i64,
+            message: subject.to_string(),
+            changed_files: files
                 .iter()
-                .map(|p| FileChange {
-                    path: p.to_string(),
+                .map(|p| FileChangeInfo {
+                    path: std::path::PathBuf::from(p),
                     additions: 1,
                     deletions: 0,
                 })
@@ -639,14 +627,12 @@ mod tests {
 
     #[test]
     fn test_stability_empty() {
-        let fix_re = build_fix_regex();
-        let result = compute_stability(&[], &fix_re, 0, 0);
+        let result = compute_stability(&[], 0, 0);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_stability_moderate_for_max_churn_old_file() {
-        let fix_re = build_fix_regex();
         // One commit, old (365 days ago), no fix keywords, but max churn (1/1)
         let old_ts = 0u64;
         let now = 365 * 86400u64;
@@ -657,7 +643,7 @@ mod tests {
             "feat: initial",
             &["stable.rs"],
         )];
-        let result = compute_stability(&commits, &fix_re, 1, now);
+        let result = compute_stability(&commits, 1, now);
         let score = result["stable.rs"];
         // Churn = 1/1 = 1.0 → penalty 40, recency ≈ 0 (old), volatility = 0
         // penalty ≈ 40, score ≈ 60
@@ -669,7 +655,6 @@ mod tests {
 
     #[test]
     fn test_stability_recent_fix_lowers_score() {
-        let fix_re = build_fix_regex();
         let now = 1_000_000u64;
         let commits = vec![make_commit(
             "h1",
@@ -678,7 +663,7 @@ mod tests {
             "fix: critical bug",
             &["risky.rs"],
         )];
-        let result = compute_stability(&commits, &fix_re, 1, now);
+        let result = compute_stability(&commits, 1, now);
         let score = result["risky.rs"];
         // Recent fix commit → low stability
         assert!(score < 50, "expected low score for recent fix, got {score}");
@@ -740,16 +725,14 @@ mod tests {
 
     #[test]
     fn test_fix_risk_empty() {
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&[], &fix_re, 5);
+        let result = compute_fix_after_touch(&[], 5);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_fix_risk_single_commit_insufficient_data() {
         let commits = vec![make_commit("h1", "Alice", 1, "feat: add", &["a.rs"])];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         assert!(result["a.rs"].insufficient_data);
     }
 
@@ -759,8 +742,7 @@ mod tests {
             make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
             make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
         ];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
         assert!(!m.insufficient_data);
         // 1 fix commit out of 2 = 50%
@@ -775,8 +757,7 @@ mod tests {
             make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
             make_commit("h2", "Alice", 2, "fix: quick patch", &["a.rs"]),
         ];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
         assert!(!m.insufficient_data);
         // total=2, proximity_set={0}, proximity_pct = 1/2*100 = 50%
@@ -801,8 +782,7 @@ mod tests {
             make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
             make_commit("h3", "Alice", 3, "feat: more work", &["a.rs"]),
         ];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
 
         assert!(!m.insufficient_data);
@@ -891,17 +871,23 @@ mod tests {
 
     #[test]
     fn test_extract_top_dir_root_level_file() {
-        assert_eq!(extract_top_dir("Makefile"), None);
-        assert_eq!(extract_top_dir("README.md"), None);
+        assert_eq!(extract_top_dir(std::path::Path::new("Makefile")), None);
+        assert_eq!(extract_top_dir(std::path::Path::new("README.md")), None);
     }
 
     #[test]
     fn test_extract_top_dir_nested_file() {
-        assert_eq!(extract_top_dir("src/lib.rs"), Some("src".to_string()));
         assert_eq!(
-            extract_top_dir("src/cmd/heatmap/mod.rs"),
+            extract_top_dir(std::path::Path::new("src/lib.rs")),
             Some("src".to_string())
         );
-        assert_eq!(extract_top_dir("tests/foo.rs"), Some("tests".to_string()));
+        assert_eq!(
+            extract_top_dir(std::path::Path::new("src/cmd/heatmap/mod.rs")),
+            Some("src".to_string())
+        );
+        assert_eq!(
+            extract_top_dir(std::path::Path::new("tests/foo.rs")),
+            Some("tests".to_string())
+        );
     }
 }
