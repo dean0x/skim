@@ -93,7 +93,8 @@ fn parse_gradle(output: &CommandOutput) -> ParseResult<BuildResult> {
         return ParseResult::Full(BuildResult::new(success, 0, 0, None, vec![]));
     }
 
-    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    // Zero-copy when stderr is empty (Cow::Borrowed fast path), owned otherwise.
+    let combined = crate::cmd::combine_output(output);
 
     // Verbose bypass: if verbose flags appear in the output metadata, pass through
     // (The flags are already checked in the rewrite rule; this is a safety net
@@ -112,7 +113,7 @@ fn parse_gradle(output: &CommandOutput) -> ParseResult<BuildResult> {
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 /// Tier 1: Extract Gradle task outcomes, Java/Kotlin diagnostics, and build summary.
@@ -125,6 +126,7 @@ fn try_tier1_diagnostics(
     let mut error_messages: Vec<String> = Vec::new();
     let mut any_match = false;
     let mut build_time: Option<String> = None;
+    let mut saw_build_failed = false;
 
     for line in combined.lines() {
         if let Some(caps) = GRADLE_TASK_RE.captures(line) {
@@ -167,6 +169,7 @@ fn try_tier1_diagnostics(
             build_time = caps.get(1).map(|m| m.as_str().to_string());
         } else if BUILD_FAILED_RE.is_match(line) {
             any_match = true;
+            saw_build_failed = true;
         }
     }
 
@@ -174,7 +177,7 @@ fn try_tier1_diagnostics(
         return None;
     }
 
-    let success = exit_code == Some(0) && errors == 0 && !BUILD_FAILED_RE.is_match(combined);
+    let success = exit_code == Some(0) && errors == 0 && !saw_build_failed;
     let duration_ms = build_time.as_deref().and_then(parse_gradle_duration);
 
     Some(ParseResult::Full(BuildResult::new(
@@ -188,13 +191,21 @@ fn try_tier1_diagnostics(
 
 /// Parse Gradle duration string like "3.456 secs" or "1 min 2 secs" to milliseconds.
 fn parse_gradle_duration(s: &str) -> Option<u64> {
-    // "3.456 secs" → 3456ms
-    if let Some(secs) = s.split_whitespace().next()
-        && let Ok(f) = secs.parse::<f64>()
-    {
-        return Some((f * 1000.0) as u64);
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    match parts.as_slice() {
+        // "3.456 secs" → 3456ms
+        [secs_str, _unit] => {
+            let f = secs_str.parse::<f64>().ok()?;
+            Some((f * 1000.0) as u64)
+        }
+        // "1 min 2 secs" → 62000ms
+        [mins_str, "min", secs_str, _unit] => {
+            let mins: u64 = mins_str.parse().ok()?;
+            let secs: f64 = secs_str.parse().ok()?;
+            Some(mins * 60_000 + (secs * 1000.0) as u64)
+        }
+        _ => None,
     }
-    None
 }
 
 /// Tier 2: Strip daemon startup, download progress, configure project lines.
@@ -324,6 +335,37 @@ mod tests {
         );
         if let ParseResult::Full(br) = &result {
             assert!(br.success);
+        }
+    }
+
+    #[test]
+    fn test_gradle_duration_simple() {
+        // "3.456 secs" → 3456ms
+        assert_eq!(parse_gradle_duration("3.456 secs"), Some(3456));
+    }
+
+    #[test]
+    fn test_gradle_duration_multi_part() {
+        // "1 min 2 secs" → 62000ms (was returning 1000ms before fix)
+        assert_eq!(parse_gradle_duration("1 min 2 secs"), Some(62_000));
+        // "2 min 30 secs" → 150000ms
+        assert_eq!(parse_gradle_duration("2 min 30 secs"), Some(150_000));
+    }
+
+    #[test]
+    fn test_gradle_duration_invalid() {
+        assert_eq!(parse_gradle_duration("invalid"), None);
+        assert_eq!(parse_gradle_duration(""), None);
+    }
+
+    #[test]
+    fn test_gradle_tier1_success_with_duration() {
+        // Verify that a 1-minute build is parsed as 62000ms, not 1000ms
+        let input = "> Task :compileJava\nBUILD SUCCESSFUL in 1 min 2 secs\n";
+        let output = make_output(input, "", Some(0));
+        let result = parse_gradle(&output);
+        if let ParseResult::Full(br) = &result {
+            assert_eq!(br.duration_ms, Some(62_000), "multi-part duration must be 62s");
         }
     }
 }

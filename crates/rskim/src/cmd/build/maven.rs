@@ -87,7 +87,8 @@ fn parse_maven(output: &CommandOutput) -> ParseResult<BuildResult> {
         return ParseResult::Full(BuildResult::new(success, 0, 0, None, vec![]));
     }
 
-    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    // Zero-copy when stderr is empty (Cow::Borrowed fast path), owned otherwise.
+    let combined = crate::cmd::combine_output(output);
 
     // Tier 1: Diagnostics
     if let Some(result) = try_tier1_diagnostics(&combined, output.exit_code) {
@@ -100,7 +101,7 @@ fn parse_maven(output: &CommandOutput) -> ParseResult<BuildResult> {
     }
 
     // Tier 3: Passthrough
-    ParseResult::Passthrough(combined)
+    ParseResult::Passthrough(combined.into_owned())
 }
 
 fn try_tier1_diagnostics(
@@ -112,6 +113,7 @@ fn try_tier1_diagnostics(
     let mut error_messages: Vec<String> = Vec::new();
     let mut any_match = false;
     let mut duration_ms: Option<u64> = None;
+    let mut saw_build_success = false;
 
     for line in combined.lines() {
         if let Some(caps) = MAVEN_ERROR_RE.captures(line) {
@@ -122,7 +124,10 @@ fn try_tier1_diagnostics(
             any_match = true;
             warnings += 1;
             error_messages.push(format!("warning: {}", &caps[1]));
-        } else if MAVEN_SUCCESS_RE.is_match(line) || MAVEN_FAILURE_RE.is_match(line) {
+        } else if MAVEN_SUCCESS_RE.is_match(line) {
+            any_match = true;
+            saw_build_success = true;
+        } else if MAVEN_FAILURE_RE.is_match(line) {
             any_match = true;
         } else if let Some(caps) = MAVEN_TIME_RE.captures(line) {
             any_match = true;
@@ -134,7 +139,7 @@ fn try_tier1_diagnostics(
         return None;
     }
 
-    let success = exit_code == Some(0) && MAVEN_SUCCESS_RE.is_match(combined) && errors == 0;
+    let success = exit_code == Some(0) && saw_build_success && errors == 0;
 
     Some(ParseResult::Full(BuildResult::new(
         success,
