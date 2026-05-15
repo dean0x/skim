@@ -934,4 +934,53 @@ mod tests {
             "compilation error exit code 2 must be forwarded"
         );
     }
+
+    // ========================================================================
+    // extract_json_object tests
+    //
+    // `extract_json_object` is used by the Cypress and Playwright parsers to
+    // isolate the JSON report from output that may include preamble log lines.
+    // Vitest's equivalent `extract_json_by_brace_balance` has 8 edge-case tests;
+    // these four tests establish the same coverage baseline for this function.
+    // ========================================================================
+
+    #[test]
+    fn test_extract_json_object_simple() {
+        let input = r#"{"key":"value"}"#;
+        let result = extract_json_object(input);
+        assert_eq!(result, Some(r#"{"key":"value"}"#));
+    }
+
+    #[test]
+    fn test_extract_json_object_nested() {
+        let input = r#"{"outer":{"inner":"data"},"count":42}"#;
+        let result = extract_json_object(input);
+        assert_eq!(result, Some(r#"{"outer":{"inner":"data"},"count":42}"#));
+    }
+
+    #[test]
+    fn test_extract_json_object_garbage_prefix() {
+        // Preamble log lines precede the JSON object — common in cypress/playwright output.
+        let input = "Starting Cypress run...\nConnecting to Cypress Cloud\n{\"stats\":{\"passes\":3}}\n";
+        let result = extract_json_object(input);
+        assert!(result.is_some(), "should find JSON despite garbage prefix");
+        assert!(
+            result.unwrap().starts_with('{'),
+            "extracted slice must start at opening brace"
+        );
+        // Verify the extracted object parses correctly
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(result.unwrap());
+        assert!(parsed.is_ok(), "extracted JSON must parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_extract_json_object_unclosed_brace_returns_none() {
+        // An unclosed brace means depth never returns to 0 — None is returned.
+        let input = r#"{"key":"value", "nested": {"missing_close": true}"#;
+        let result = extract_json_object(input);
+        assert!(
+            result.is_none(),
+            "unclosed brace must return None, got: {result:?}"
+        );
+    }
 }

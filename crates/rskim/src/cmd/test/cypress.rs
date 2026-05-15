@@ -319,4 +319,19 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.summary.pass, 3);
     }
+
+    /// Verify that `CY_TEXT` — the realistic cypress text-mode fixture — is
+    /// recognized by the regex tier: "Passing: 1\nFailing: 1\n" must parse to
+    /// pass=1, fail=1 via `try_parse_regex`.
+    #[test]
+    fn test_cypress_cy_text_fixture_parsed_by_regex() {
+        let result = try_parse_regex(CY_TEXT);
+        assert!(
+            result.is_some(),
+            "CY_TEXT must be recognized by the regex tier, got None"
+        );
+        let r = result.unwrap();
+        assert_eq!(r.summary.pass, 1, "CY_TEXT: expected pass=1, got {}", r.summary.pass);
+        assert_eq!(r.summary.fail, 1, "CY_TEXT: expected fail=1, got {}", r.summary.fail);
+    }
 }

@@ -1,0 +1,1 @@
+{"metadata":{"rubocop_version":"1.60.2","ruby_engine":"ruby","ruby_version":"3.2.0","ruby_patchlevel":"0","ruby_platform":"x86_64-linux"},"files":[{"path":"app/models/user.rb","offenses":[]},{"path":"app/controllers/sessions_controller.rb","offenses":[]}],"summary":{"offense_count":0,"target_file_count":2,"inspected_file_count":10}}

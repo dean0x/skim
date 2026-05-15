@@ -1,0 +1,1 @@
+{"type":"table","data":{"head":["Package","Current","Wanted","Latest","Package Type","URL"],"body":[["lodash","4.17.15","4.17.21","4.17.21","dependencies","https://lodash.com"],["react","17.0.2","17.0.2","18.2.0","dependencies","https://reactjs.org"],["typescript","4.9.5","4.9.5","5.3.3","devDependencies","https://www.typescriptlang.org/"]]}}
