@@ -4,6 +4,24 @@
 //! backward compatibility with file-first invocations. Also provides shared
 //! helper functions used by subcommand parsers (arg inspection, flag injection,
 //! command execution with three-tier parse degradation).
+//!
+//! # Dispatcher behavioral models
+//!
+//! There are two distinct behaviors for multi-category dispatchers, chosen
+//! intentionally based on how each tool is typically used in practice:
+//!
+//! **Strict dispatchers** (`cargo`, `go`): Unknown subcommands print an error
+//! and return `ExitCode::FAILURE`. These tools have well-defined, finite
+//! subcommand sets that skim supports comprehensively. An unrecognized subcommand
+//! almost certainly means a typo or a command that belongs in a different context.
+//!
+//! **Passthrough dispatchers** (`swift`, `dotnet`): Unknown subcommands are
+//! forwarded verbatim to the underlying tool and return its exit code. These
+//! tools expose a wide surface area of lifecycle subcommands (`build`, `run`,
+//! `publish`, `package`, `restore`, …) that agents invoke routinely. Blocking
+//! unknown subcommands would make skim unusable in normal project workflows;
+//! passthrough lets skim compress only what it understands while staying
+//! transparent for everything else.
 
 mod agents;
 mod build;
@@ -716,6 +734,63 @@ fn print_cargo_help() {
     );
 }
 
+fn print_swift_help() {
+    print!(
+        "skim swift\n\
+         \n\
+           Swift subcommand compression\n\
+         \n\
+         Usage: skim swift <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test       Run and compress swift test output\n\
+         \n\
+         Other subcommands (build, run, etc.) are passed through unmodified.\n\
+         \n\
+         Examples:\n\
+           skim swift test\n\
+           skim swift test --filter MyTests\n"
+    );
+}
+
+fn print_dotnet_help() {
+    print!(
+        "skim dotnet\n\
+         \n\
+           .NET subcommand compression\n\
+         \n\
+         Usage: skim dotnet <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test       Run and compress dotnet test output\n\
+         \n\
+         Other subcommands (build, run, publish, restore, etc.) are passed through unmodified.\n\
+         \n\
+         Examples:\n\
+           skim dotnet test\n\
+           skim dotnet test --filter Category=Unit\n"
+    );
+}
+
+/// Run a program with the given args and env vars, printing stdout/stderr and
+/// returning the process exit code. Used by passthrough dispatchers for unknown
+/// subcommands that skim does not compress.
+fn run_raw_passthrough(
+    program: &str,
+    args: &[String],
+    env: &[(&str, &str)],
+) -> anyhow::Result<ExitCode> {
+    let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = runner.run_with_env(program, &arg_refs, env)?;
+    print!("{}", output.stdout);
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+    }
+    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+    Ok(ExitCode::from(code))
+}
+
 /// Route `skim swift <subcmd> [args...]` to the correct category handler.
 ///
 /// Only `swift test` is compressed. Other `swift` subcommands (build, run, etc.)
@@ -725,7 +800,7 @@ fn dispatch_swift(
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        eprintln!("skim swift: supported subcommands: test");
+        print_swift_help();
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -737,13 +812,12 @@ fn dispatch_swift(
     match subcmd {
         "test" => test::run(&prepend_without("swift", args, idx), analytics),
         unknown => {
-            // Unknown swift subcommand → raw passthrough
+            // Unknown swift subcommand → raw passthrough (passthrough dispatcher model)
             let safe = sanitize_for_display(unknown);
             eprintln!(
                 "skim swift: unknown subcommand '{safe}' — passing through\n\
                  Supported subcommands: test"
             );
-            // Run the raw command
             let mut all_args: Vec<String> = vec![unknown.to_string()];
             all_args.extend(
                 args.iter()
@@ -751,19 +825,7 @@ fn dispatch_swift(
                     .filter(|(i, _)| *i != idx)
                     .map(|(_, s)| s.clone()),
             );
-            let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
-            let arg_refs: Vec<&str> = all_args.iter().map(String::as_str).collect();
-            match runner.run("swift", &arg_refs) {
-                Ok(output) => {
-                    print!("{}", output.stdout);
-                    if !output.stderr.is_empty() {
-                        eprint!("{}", output.stderr);
-                    }
-                    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-                    Ok(ExitCode::from(code))
-                }
-                Err(e) => Err(e),
-            }
+            run_raw_passthrough("swift", &all_args, &[])
         }
     }
 }
@@ -777,7 +839,7 @@ fn dispatch_dotnet(
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        eprintln!("skim dotnet: supported subcommands: test");
+        print_dotnet_help();
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -790,7 +852,7 @@ fn dispatch_dotnet(
     match subcmd {
         "test" => test::run(&prepend_without("dotnet", args, idx), analytics),
         unknown => {
-            // Unknown dotnet subcommand → raw passthrough
+            // Unknown dotnet subcommand → raw passthrough (passthrough dispatcher model)
             let safe = sanitize_for_display(unknown);
             eprintln!(
                 "skim dotnet: unknown subcommand '{safe}' — passing through\n\
@@ -803,19 +865,9 @@ fn dispatch_dotnet(
                     .filter(|(i, _)| *i != idx)
                     .map(|(_, s)| s.clone()),
             );
-            let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
-            let arg_refs: Vec<&str> = all_args.iter().map(String::as_str).collect();
-            match runner.run_with_env("dotnet", &arg_refs, &[("DOTNET_CLI_UI_LANGUAGE", "en-US")]) {
-                Ok(output) => {
-                    print!("{}", output.stdout);
-                    if !output.stderr.is_empty() {
-                        eprint!("{}", output.stderr);
-                    }
-                    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-                    Ok(ExitCode::from(code))
-                }
-                Err(e) => Err(e),
-            }
+            // DOTNET_CLI_UI_LANGUAGE forces English output for reliable parsing
+            // even in passthrough mode, matching the compressed-path behavior.
+            run_raw_passthrough("dotnet", &all_args, &[("DOTNET_CLI_UI_LANGUAGE", "en-US")])
         }
     }
 }
