@@ -331,7 +331,15 @@ mod tests {
             "CY_TEXT must be recognized by the regex tier, got None"
         );
         let r = result.unwrap();
-        assert_eq!(r.summary.pass, 1, "CY_TEXT: expected pass=1, got {}", r.summary.pass);
-        assert_eq!(r.summary.fail, 1, "CY_TEXT: expected fail=1, got {}", r.summary.fail);
+        assert_eq!(
+            r.summary.pass, 1,
+            "CY_TEXT: expected pass=1, got {}",
+            r.summary.pass
+        );
+        assert_eq!(
+            r.summary.fail, 1,
+            "CY_TEXT: expected fail=1, got {}",
+            r.summary.fail
+        );
     }
 }

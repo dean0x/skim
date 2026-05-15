@@ -775,7 +775,7 @@ fn print_dotnet_help() {
 /// Run a program with the given args and env vars, printing stdout/stderr and
 /// returning the process exit code. Used by passthrough dispatchers for unknown
 /// subcommands that skim does not compress.
-fn run_raw_passthrough(
+pub(crate) fn run_raw_passthrough(
     program: &str,
     args: &[String],
     env: &[(&str, &str)],

@@ -154,7 +154,13 @@ fn try_parse_xctest(raw: &str) -> Option<TestResult> {
 }
 
 fn try_parse_failures_only(raw: &str) -> Option<TestResult> {
-    let cleaned = crate::output::strip_ansi(raw);
+    // Fast-path: borrow directly when no ANSI escapes are present (spawn path
+    // already strips); only allocate when ESC bytes are detected.
+    let cleaned: std::borrow::Cow<str> = if raw.as_bytes().contains(&0x1b) {
+        std::borrow::Cow::Owned(crate::output::strip_ansi(raw))
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
     let mut entries: Vec<TestEntry> = Vec::new();
 
     for line in cleaned.lines() {

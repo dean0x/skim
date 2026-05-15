@@ -389,10 +389,7 @@ fn test_gradle_not_installed_surfaces_hint() {
     }
     // When gradle is absent, skim must fail with a non-zero exit and mention
     // an install hint in stderr.
-    let output = skim_cmd()
-        .args(["gradle", "build"])
-        .output()
-        .unwrap();
+    let output = skim_cmd().args(["gradle", "build"]).output().unwrap();
     assert_ne!(
         output.status.code(),
         Some(0),
@@ -428,10 +425,7 @@ fn test_maven_not_installed_surfaces_hint() {
         eprintln!("skipping: mvn is installed");
         return;
     }
-    let output = skim_cmd()
-        .args(["mvn", "compile"])
-        .output()
-        .unwrap();
+    let output = skim_cmd().args(["mvn", "compile"]).output().unwrap();
     assert_ne!(
         output.status.code(),
         Some(0),

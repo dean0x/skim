@@ -39,6 +39,15 @@ static RE_DOTNET_FAILED_TEST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s+Failed\s+(\S+)\s*\[").expect("valid regex"));
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum TRX file size accepted before reading. Files larger than this are
+/// rejected to bound peak memory usage (the read + format! produces ~2× the
+/// file size in heap).
+const TRX_MAX_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+
+// ============================================================================
 // Public entry point
 // ============================================================================
 
@@ -79,12 +88,8 @@ pub(crate) fn run(
         |raw| {
             // TRX detection: if the spawn produced a Results File path, read it
             // and embed the TRX XML so the parser can use Tier-1 (XML) rather
-            // than Tier-2 (regex).
-            //
-            // The path is validated (extension, regular-file, directory bounds)
-            // before reading. Files over 50 MB are rejected to bound peak memory
-            // usage: format! below produces ~2x the file size in heap.
-            const TRX_MAX_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+            // than Tier-2 (regex). The path is validated (extension,
+            // regular-file, directory bounds) before reading.
             if let Some(trx_path) = extract_trx_path(raw)
                 && std::fs::metadata(&trx_path)
                     .map(|m| m.len() <= TRX_MAX_BYTES)

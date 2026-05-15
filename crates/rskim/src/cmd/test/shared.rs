@@ -93,7 +93,7 @@ pub(super) fn run_test_runner(
     if crate::cmd::is_passthrough_mode() {
         return run_passthrough(
             args,
-            |a| passthrough_prepare_args(a),
+            passthrough_prepare_args,
             |arg_refs| spawn_runner_raw(config, arg_refs),
         );
     }
@@ -961,7 +961,8 @@ mod tests {
     #[test]
     fn test_extract_json_object_garbage_prefix() {
         // Preamble log lines precede the JSON object — common in cypress/playwright output.
-        let input = "Starting Cypress run...\nConnecting to Cypress Cloud\n{\"stats\":{\"passes\":3}}\n";
+        let input =
+            "Starting Cypress run...\nConnecting to Cypress Cloud\n{\"stats\":{\"passes\":3}}\n";
         let result = extract_json_object(input);
         assert!(result.is_some(), "should find JSON despite garbage prefix");
         assert!(

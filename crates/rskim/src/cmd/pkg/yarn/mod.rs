@@ -45,23 +45,9 @@ pub(crate) fn run(
             // don't understand (e.g., `yarn build`, `yarn run dev`).
             let safe = crate::cmd::sanitize_for_display(other);
             eprintln!("skim yarn: unknown subcommand '{safe}' — passing through to yarn");
-            // Run the raw command without compression
-            use crate::runner::CommandRunner;
             let mut all_args: Vec<String> = vec![other.to_string()];
             all_args.extend_from_slice(subcmd_args);
-            let arg_refs: Vec<&str> = all_args.iter().map(String::as_str).collect();
-            let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
-            match runner.run_with_env("yarn", &arg_refs, &[]) {
-                Ok(output) => {
-                    print!("{}", output.stdout);
-                    if !output.stderr.is_empty() {
-                        eprint!("{}", output.stderr);
-                    }
-                    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
-                    Ok(ExitCode::from(code))
-                }
-                Err(e) => Err(e),
-            }
+            crate::cmd::run_raw_passthrough("yarn", &all_args, &[])
         }
     }
 }
