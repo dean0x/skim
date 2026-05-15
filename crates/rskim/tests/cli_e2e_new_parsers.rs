@@ -545,3 +545,126 @@ fn test_yarn_outdated_tier3_passthrough() {
         .stdout(predicate::str::contains("completely unparseable"))
         .stderr(predicate::str::contains("[skim:notice]"));
 }
+
+// ============================================================================
+// SKIM_PASSTHROUGH=1 stdin path — cypress, playwright, swift, dotnet
+//
+// These tests verify the core behavioral fix introduced in #118:
+// `passthrough_prepare_args` must NOT inject reporter/logger flags when
+// `SKIM_PASSTHROUGH=1` is set. The stdin branch of `run_passthrough` prints
+// piped content as-is and exits FAILURE (no process exit code is available).
+//
+// The assertions confirm:
+// 1. Piped content is forwarded unchanged to stdout.
+// 2. The exit code is non-zero (stdin passthrough always returns FAILURE).
+// 3. No reporter/logger flags are injected — if they were, the binary would
+//    be spawned rather than reading stdin, and the content would be missing.
+// ============================================================================
+
+/// Cypress SKIM_PASSTHROUGH=1 stdin path: raw content forwarded, exits non-zero.
+///
+/// `passthrough_prepare_args` for cypress prepends "run" only — no `--reporter json`.
+/// With stdin piped, run_passthrough prints the raw content and returns FAILURE
+/// without spawning the cypress binary.
+#[test]
+fn test_cypress_passthrough_stdin_forwarded_no_reporter_injected() {
+    let raw_output = "cypress raw output line 1\ncypress raw output line 2\n";
+    skim_cmd()
+        .args(["cypress", "run"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(raw_output)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("cypress raw output line 1"))
+        .stdout(predicate::str::contains("cypress raw output line 2"));
+}
+
+/// Playwright SKIM_PASSTHROUGH=1 stdin path: raw content forwarded, exits non-zero.
+///
+/// `passthrough_prepare_args` for playwright prepends "test" only — no `--reporter=json`.
+/// With stdin piped, run_passthrough prints the raw content and returns FAILURE.
+#[test]
+fn test_playwright_passthrough_stdin_forwarded_no_reporter_injected() {
+    let raw_output = "playwright raw output line 1\nplaywright raw output line 2\n";
+    skim_cmd()
+        .args(["playwright", "test"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(raw_output)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("playwright raw output line 1"))
+        .stdout(predicate::str::contains("playwright raw output line 2"));
+}
+
+/// Swift SKIM_PASSTHROUGH=1 stdin path: raw content forwarded, exits non-zero.
+///
+/// `passthrough_prepare_args` for swift prepends "test" only — no additional flags.
+/// With stdin piped, run_passthrough prints the raw content and returns FAILURE.
+#[test]
+fn test_swift_passthrough_stdin_forwarded_no_flags_injected() {
+    let raw_output = "swift raw output line 1\nswift raw output line 2\n";
+    skim_cmd()
+        .args(["swift", "test"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(raw_output)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("swift raw output line 1"))
+        .stdout(predicate::str::contains("swift raw output line 2"));
+}
+
+/// Dotnet SKIM_PASSTHROUGH=1 stdin path: raw content forwarded, exits non-zero.
+///
+/// `passthrough_prepare_args` for dotnet prepends "test" only — no `--logger trx`.
+/// With stdin piped, run_passthrough prints the raw content and returns FAILURE.
+#[test]
+fn test_dotnet_passthrough_stdin_forwarded_no_logger_injected() {
+    let raw_output = "dotnet raw output line 1\ndotnet raw output line 2\n";
+    skim_cmd()
+        .args(["dotnet", "test"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(raw_output)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("dotnet raw output line 1"))
+        .stdout(predicate::str::contains("dotnet raw output line 2"));
+}
+
+/// Cypress SKIM_PASSTHROUGH=1 with a realistic passing JSON fixture.
+///
+/// Even valid JSON fixtures are forwarded unchanged in passthrough mode —
+/// skim must not parse or compress the output.
+#[test]
+fn test_cypress_passthrough_json_fixture_forwarded_unchanged() {
+    let fixture = include_str!("fixtures/cmd/test/cypress_pass.json");
+    skim_cmd()
+        .args(["cypress", "run"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(fixture)
+        .assert()
+        .failure()
+        // passthrough: no structured output headers
+        .stdout(predicate::str::contains("pass:").not())
+        .stdout(predicate::str::contains("fail:").not())
+        // raw JSON content forwarded (cypress fixture has "suites" key)
+        .stdout(predicate::str::contains("suites"));
+}
+
+/// Playwright SKIM_PASSTHROUGH=1 with a realistic passing JSON fixture.
+///
+/// Valid JSON fixtures must be forwarded unchanged — no parsing, no compression.
+#[test]
+fn test_playwright_passthrough_json_fixture_forwarded_unchanged() {
+    let fixture = include_str!("fixtures/cmd/test/playwright_pass.json");
+    skim_cmd()
+        .args(["playwright", "test"])
+        .env("SKIM_PASSTHROUGH", "1")
+        .write_stdin(fixture)
+        .assert()
+        .failure()
+        // passthrough: no structured output headers
+        .stdout(predicate::str::contains("pass:").not())
+        .stdout(predicate::str::contains("fail:").not())
+        // raw JSON content forwarded (playwright fixture has "stats" key)
+        .stdout(predicate::str::contains("stats"));
+}
