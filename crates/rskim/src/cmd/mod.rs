@@ -772,6 +772,37 @@ fn print_dotnet_help() {
     );
 }
 
+/// Pass through an unknown subcommand to the underlying tool unchanged.
+///
+/// Logs a warning to stderr naming the unknown subcommand, then reconstructs
+/// the full argument list (`unknown` + remaining `args` with the subcmd at
+/// `subcmd_idx` stripped) and delegates to [`run_raw_passthrough`].
+///
+/// Used by multi-category dispatchers (`swift`, `dotnet`) where unknown
+/// subcommands are forwarded rather than rejected.
+fn passthrough_subcmd(
+    tool: &str,
+    unknown: &str,
+    args: &[String],
+    subcmd_idx: usize,
+    env: &[(&str, &str)],
+) -> anyhow::Result<ExitCode> {
+    let safe = sanitize_for_display(unknown);
+    eprintln!(
+        "skim {tool}: unknown subcommand '{safe}' — passing through\n\
+         Supported subcommands: test"
+    );
+    let mut all_args: Vec<String> = Vec::with_capacity(args.len());
+    all_args.push(unknown.to_string());
+    all_args.extend(
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != subcmd_idx)
+            .map(|(_, s)| s.clone()),
+    );
+    run_raw_passthrough(tool, &all_args, env)
+}
+
 /// Run a program with the given args and env vars, printing stdout/stderr and
 /// returning the process exit code. Used by passthrough dispatchers for unknown
 /// subcommands that skim does not compress.
@@ -811,22 +842,7 @@ fn dispatch_swift(
 
     match subcmd {
         "test" => test::run(&prepend_without("swift", args, idx), analytics),
-        unknown => {
-            // Unknown swift subcommand → raw passthrough (passthrough dispatcher model)
-            let safe = sanitize_for_display(unknown);
-            eprintln!(
-                "skim swift: unknown subcommand '{safe}' — passing through\n\
-                 Supported subcommands: test"
-            );
-            let mut all_args: Vec<String> = vec![unknown.to_string()];
-            all_args.extend(
-                args.iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != idx)
-                    .map(|(_, s)| s.clone()),
-            );
-            run_raw_passthrough("swift", &all_args, &[])
-        }
+        unknown => passthrough_subcmd("swift", unknown, args, idx, &[]),
     }
 }
 
@@ -851,24 +867,15 @@ fn dispatch_dotnet(
 
     match subcmd {
         "test" => test::run(&prepend_without("dotnet", args, idx), analytics),
-        unknown => {
-            // Unknown dotnet subcommand → raw passthrough (passthrough dispatcher model)
-            let safe = sanitize_for_display(unknown);
-            eprintln!(
-                "skim dotnet: unknown subcommand '{safe}' — passing through\n\
-                 Supported subcommands: test"
-            );
-            let mut all_args: Vec<String> = vec![unknown.to_string()];
-            all_args.extend(
-                args.iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != idx)
-                    .map(|(_, s)| s.clone()),
-            );
-            // DOTNET_CLI_UI_LANGUAGE forces English output for reliable parsing
-            // even in passthrough mode, matching the compressed-path behavior.
-            run_raw_passthrough("dotnet", &all_args, &[("DOTNET_CLI_UI_LANGUAGE", "en-US")])
-        }
+        // DOTNET_CLI_UI_LANGUAGE forces English output for reliable parsing
+        // even in passthrough mode, matching the compressed-path behavior.
+        unknown => passthrough_subcmd(
+            "dotnet",
+            unknown,
+            args,
+            idx,
+            &[("DOTNET_CLI_UI_LANGUAGE", "en-US")],
+        ),
     }
 }
 
