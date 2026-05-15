@@ -42,10 +42,15 @@ static RE_DOTNET_FAILED_TEST: LazyLock<Regex> =
 // Constants
 // ============================================================================
 
-/// Maximum TRX file size accepted before reading. Files larger than this are
-/// rejected to bound peak memory usage (the read + format! produces ~2× the
-/// file size in heap).
-const TRX_MAX_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+/// Maximum TRX file size in bytes. The read + format! produces ~2× the file
+/// size in heap, so keep this modest. Reduced from 50 MB to 10 MB to cap
+/// peak heap at ~20 MB for TRX content.
+const TRX_MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+
+/// Maximum number of `<UnitTestResult>` entries collected during TRX XML
+/// parsing. A crafted 50 MB (or 10 MB) TRX could contain millions of
+/// elements; this bound matches the cap used by other parsers (regex tier).
+const MAX_ENTRIES: usize = 100;
 
 // ============================================================================
 // Public entry point
@@ -88,21 +93,12 @@ pub(crate) fn run(
             },
         },
         |raw| {
-            // TRX detection: if the spawn produced a Results File path, read it
-            // and embed the TRX XML so the parser can use Tier-1 (XML) rather
-            // than Tier-2 (regex). The path is validated (extension,
-            // regular-file, directory bounds) before reading.
-            if let Some(trx_path) = extract_trx_path(raw)
-                && std::fs::metadata(&trx_path)
-                    .map(|m| m.len() <= TRX_MAX_BYTES)
-                    .unwrap_or(false)
-                && let Ok(trx_content) = std::fs::read_to_string(&trx_path)
-            {
-                let with_trx = format!("__TRX_CONTENT__\n{trx_content}\n__END_TRX__\n{raw}");
-                parse(&with_trx)
-            } else {
-                parse(raw)
-            }
+            // TRX detection: if the spawn produced a Results File path, open
+            // it once (collapses TOCTOU), check size on the open handle, then
+            // read. Pass content directly to the parser — no sentinel markers
+            // and no format! doubling of peak memory.
+            let trx = extract_trx_path(raw).and_then(|p| read_trx_file(&p));
+            parse(raw, trx.as_deref())
         },
     )
 }
@@ -173,9 +169,39 @@ fn validate_trx_path(path: &str) -> bool {
 // Three-tier parser
 // ============================================================================
 
-fn parse(raw: &str) -> ParseResult<TestResult> {
-    // Tier 1: TRX XML (if available in raw output)
-    if let Some(result) = try_parse_trx(raw) {
+/// Read and validate a TRX file from the given path.
+///
+/// Opens the file once and checks its size via the open file handle — no
+/// TOCTOU window between a path-level size check and the actual read.
+/// Returns `None` if the path fails validation, the file is too large, or the
+/// content is not valid UTF-8.
+fn read_trx_file(path: &str) -> Option<String> {
+    use std::fs::File;
+    use std::io::Read;
+
+    if !validate_trx_path(path) {
+        return None;
+    }
+
+    let mut file = File::open(path).ok()?;
+    // Check size on the open handle — no TOCTOU between stat and read.
+    let len = file.metadata().ok()?.len();
+    if len > TRX_MAX_BYTES {
+        return None;
+    }
+
+    let mut buf = String::with_capacity(len as usize);
+    file.read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Three-tier parser.
+///
+/// `trx` carries pre-read TRX XML when the caller already opened the file
+/// (the normal CLI path). Pass `None` for stdin / direct-XML input.
+fn parse(raw: &str, trx: Option<&str>) -> ParseResult<TestResult> {
+    // Tier 1: TRX XML — prefer explicitly-passed content, then detect inline.
+    if let Some(result) = try_parse_trx(raw, trx) {
         return ParseResult::Full(result);
     }
 
@@ -190,23 +216,21 @@ fn parse(raw: &str) -> ParseResult<TestResult> {
     ParseResult::Passthrough(raw.to_string())
 }
 
-/// Parse TRX XML content embedded in the raw output.
-fn try_parse_trx(raw: &str) -> Option<TestResult> {
-    // Extract TRX content from the embedded marker
-    let trx_content = if raw.contains("__TRX_CONTENT__") {
-        let start = raw.find("__TRX_CONTENT__\n")? + "__TRX_CONTENT__\n".len();
-        let end = raw.find("\n__END_TRX__")?;
-        &raw[start..end]
-    } else {
-        // Also handle direct TRX XML (for stdin piping)
-        if raw.trim_start().starts_with("<?xml") || raw.contains("<TestRun") {
-            raw
-        } else {
-            return None;
-        }
-    };
+/// Attempt TRX XML parse.
+///
+/// Uses `trx` when provided (caller already read the file). Falls back to
+/// detecting inline XML in `raw` for stdin / direct-XML use cases.
+fn try_parse_trx(raw: &str, trx: Option<&str>) -> Option<TestResult> {
+    if let Some(xml) = trx {
+        return parse_trx_xml(xml);
+    }
 
-    parse_trx_xml(trx_content)
+    // Inline XML detection for stdin piping (e.g. `cat results.trx | skim dotnet`)
+    if raw.trim_start().starts_with("<?xml") || raw.contains("<TestRun") {
+        return parse_trx_xml(raw);
+    }
+
+    None
 }
 
 /// Counters parsed from a TRX `<Counters>` element.
@@ -330,13 +354,16 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                 }
                 b"UnitTestResult" => {
                     // Self-closing: push the entry now (no End event will follow).
-                    let (name, outcome) = parse_unit_test_result_attrs(e.attributes().flatten());
-                    if let (Some(name), Some(outcome)) = (name, outcome) {
-                        entries.push(TestEntry {
-                            name,
-                            outcome,
-                            detail: None,
-                        });
+                    if entries.len() < MAX_ENTRIES {
+                        let (name, outcome) =
+                            parse_unit_test_result_attrs(e.attributes().flatten());
+                        if let (Some(name), Some(outcome)) = (name, outcome) {
+                            entries.push(TestEntry {
+                                name,
+                                outcome,
+                                detail: None,
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -364,14 +391,21 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
             }
             Ok(Event::End(e)) => match e.name().as_ref() {
                 b"UnitTestResult" => {
-                    if let (Some(name), Some(outcome)) =
-                        (current_test_name.take(), current_outcome.take())
-                    {
-                        entries.push(TestEntry {
-                            name,
-                            outcome,
-                            detail: current_error.take(),
-                        });
+                    if entries.len() < MAX_ENTRIES {
+                        if let (Some(name), Some(outcome)) =
+                            (current_test_name.take(), current_outcome.take())
+                        {
+                            entries.push(TestEntry {
+                                name,
+                                outcome,
+                                detail: current_error.take(),
+                            });
+                        }
+                    } else {
+                        // Discard accumulated state for this entry.
+                        current_test_name.take();
+                        current_outcome.take();
+                        current_error.take();
                     }
                 }
                 b"Message" => {
@@ -536,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_dotnet_tier3_passthrough() {
-        let result = parse("completely unparseable output");
+        let result = parse("completely unparseable output", None);
         assert!(
             result.is_passthrough(),
             "Expected Passthrough, got {}",
@@ -546,8 +580,8 @@ mod tests {
 
     #[test]
     fn test_dotnet_parse_full_on_trx_stdin() {
-        // When TRX XML is piped as stdin
-        let result = parse(TRX_PASS);
+        // When TRX XML is piped as stdin (no separate file — trx=None)
+        let result = parse(TRX_PASS, None);
         assert!(
             result.is_full(),
             "Expected Full on direct TRX XML, got {}",
@@ -557,10 +591,21 @@ mod tests {
 
     #[test]
     fn test_dotnet_parse_degraded_on_console() {
-        let result = parse(DOTNET_CONSOLE_SUMMARY);
+        let result = parse(DOTNET_CONSOLE_SUMMARY, None);
         assert!(
             result.is_degraded(),
             "Expected Degraded on console output, got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_dotnet_parse_full_on_explicit_trx() {
+        // When TRX content is passed explicitly (the normal CLI path)
+        let result = parse("Results File: /some/TestResults/run.trx", Some(TRX_PASS));
+        assert!(
+            result.is_full(),
+            "Expected Full when trx content provided explicitly, got {}",
             result.tier_name()
         );
     }
@@ -627,6 +672,17 @@ mod tests {
             assert!(
                 !validate_trx_path(&path_str),
                 "path outside cwd and TestResults must be rejected"
+            );
+        } else {
+            // Guard skipped: temp_dir() is inside cwd or contains a
+            // TestResults component on this system. The rejection path is
+            // not exercisable without a path outside both roots. CI log
+            // surfaces this so the skip is not silent.
+            eprintln!(
+                "[SKIP] test_validate_trx_path_rejects_path_outside_cwd_and_test_results: \
+                 tmp_path={:?} is within cwd={:?} or contains TestResults; \
+                 rejection assertion skipped on this system",
+                tmp_path, cwd
             );
         }
         let _ = std::fs::remove_file(&tmp_path);
