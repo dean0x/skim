@@ -6,7 +6,7 @@ use serde::Serialize;
 
 // Re-export shared commit/file types from rskim-search so heatmap modules
 // use a single canonical definition (eliminates the local duplicate).
-pub(crate) use rskim_search::{CommitInfo as CommitRecord, FileChangeInfo as FileChange};
+pub(crate) use rskim_search::{CommitInfo, FileChangeInfo};
 
 // ============================================================================
 // CLI configuration

@@ -1,12 +1,12 @@
 //! Pure computation functions for `skim heatmap` — 6 risk metrics.
 //!
-//! Zero I/O. All functions accept `&[CommitRecord]` and return computed values.
+//! Zero I/O. All functions accept `&[CommitInfo]` and return computed values.
 //! `now_epoch` is a parameter (not `SystemTime::now()`) for deterministic tests.
 
 use std::collections::{HashMap, HashSet};
 
 use super::types::{
-    AuthorMetrics, ChurnMetrics, CommitRecord, CouplingEdge, CouplingEntry, FixRiskMetrics,
+    AuthorMetrics, ChurnMetrics, CommitInfo, CouplingEdge, CouplingEntry, FixRiskMetrics,
     ModuleHealth,
 };
 
@@ -15,7 +15,7 @@ use super::types::{
 // ============================================================================
 
 /// Count commits per file and compute rate = file_commits / total_commits.
-pub(crate) fn compute_churn(commits: &[CommitRecord]) -> HashMap<String, ChurnMetrics> {
+pub(crate) fn compute_churn(commits: &[CommitInfo]) -> HashMap<String, ChurnMetrics> {
     let total = commits.len();
     let mut counts: HashMap<String, usize> = HashMap::new();
 
@@ -70,13 +70,13 @@ const COUPLING_MAX_FILES: usize = 50;
 /// - per-file blast radius map: `HashMap<String, Vec<CouplingEntry>>`
 /// - global coupling graph: `Vec<CouplingEdge>`
 pub(crate) fn compute_coupling(
-    commits: &[CommitRecord],
+    commits: &[CommitInfo],
     threshold: f64,
     min_support: usize,
 ) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
     // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b).
-    // &str keys borrow from PathBuf::to_str() on each FileChangeInfo.path — valid
-    // for the entire function because `commits` (and all CommitRecords) outlive
+    // &str keys borrow from PathBuf::to_str() on each FileChangeInfoInfo.path — valid
+    // for the entire function because `commits` (and all CommitInfos) outlive
     // these maps. Non-UTF-8 paths fall back to "" via unwrap_or_default().
     let mut co_occur: HashMap<(&str, &str), (f64, usize)> = HashMap::new();
     // weighted_total[a] = weighted sum of commits touching a
@@ -186,7 +186,7 @@ pub(crate) fn compute_coupling(
 ///
 /// `now_epoch` is a parameter so tests are deterministic.
 pub(crate) fn compute_stability(
-    commits: &[CommitRecord],
+    commits: &[CommitInfo],
     max_churn: usize,
     now_epoch: u64,
 ) -> HashMap<String, u8> {
@@ -247,7 +247,7 @@ pub(crate) fn compute_stability(
 // ============================================================================
 
 /// Compute author diversity metrics per file.
-pub(crate) fn compute_authors(commits: &[CommitRecord]) -> HashMap<String, AuthorMetrics> {
+pub(crate) fn compute_authors(commits: &[CommitInfo]) -> HashMap<String, AuthorMetrics> {
     // file -> author -> commit_count
     let mut file_author_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
@@ -308,7 +308,7 @@ pub(crate) fn compute_authors(commits: &[CommitRecord]) -> HashMap<String, Autho
 /// - `combined_pct`: union (not sum) of the two signals.
 /// - `insufficient_data`: true when the file has <2 commits.
 pub(crate) fn compute_fix_after_touch(
-    commits: &[CommitRecord],
+    commits: &[CommitInfo],
     window: usize,
 ) -> HashMap<String, FixRiskMetrics> {
     // Classify every commit
@@ -419,7 +419,7 @@ fn extract_top_dir(path: &std::path::Path) -> Option<String> {
 /// Filters modules with fewer than `min_commits` total commits.
 /// Returns results sorted by encapsulation_pct ascending (worst first).
 pub(crate) fn compute_encapsulation(
-    commits: &[CommitRecord],
+    commits: &[CommitInfo],
     min_commits: usize,
 ) -> Vec<ModuleHealth> {
     // module -> files seen
@@ -497,7 +497,7 @@ pub(crate) fn compute_encapsulation(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::cmd::heatmap::types::FileChange;
+    use crate::cmd::heatmap::types::FileChangeInfo;
 
     fn make_commit(
         hash: &str,
@@ -505,15 +505,15 @@ mod tests {
         ts: u64,
         subject: &str,
         files: &[&str],
-    ) -> CommitRecord {
-        CommitRecord {
+    ) -> CommitInfo {
+        CommitInfo {
             hash: hash.to_string(),
             author: author.to_string(),
             timestamp: ts as i64,
             message: subject.to_string(),
             changed_files: files
                 .iter()
-                .map(|p| FileChange {
+                .map(|p| FileChangeInfo {
                     path: std::path::PathBuf::from(p),
                     additions: 1,
                     deletions: 0,

@@ -32,7 +32,7 @@ use metrics::{
     compute_fix_after_touch, compute_stability,
 };
 use output::{render_insights_json, render_insights_text, render_json, render_text};
-use types::{CommitRecord, FileMetrics, HeatmapConfig, HeatmapResult, ResolvedWindow};
+use types::{CommitInfo, FileMetrics, HeatmapConfig, HeatmapResult, ResolvedWindow};
 use window::{build_window_info, format_epoch, resolve_effective_config};
 
 // ============================================================================
@@ -117,7 +117,7 @@ fn resolve_diff_files(
 
 /// Bundled output of [`prepare_commits`] — everything needed to call [`compute_heatmap`].
 struct PreparedCommits {
-    commits: Vec<CommitRecord>,
+    commits: Vec<CommitInfo>,
     window: ResolvedWindow,
     now_epoch: u64,
     repo_root: String,
@@ -406,7 +406,7 @@ const MIN_SUPPORT_THRESHOLD: usize = 3;
 ///
 /// Debug timing is emitted to stderr when `config.debug` is enabled.
 fn compute_heatmap(
-    commits: Vec<CommitRecord>,
+    commits: Vec<CommitInfo>,
     config: &HeatmapConfig,
     window: &ResolvedWindow,
     now_epoch: u64,
