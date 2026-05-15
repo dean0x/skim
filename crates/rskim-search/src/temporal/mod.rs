@@ -12,15 +12,15 @@ mod git_parser;
 
 pub use git_parser::GixSource;
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 
 /// Regex that identifies "fix" commits by subject keywords.
 ///
-/// Compiled once and reused via `once_cell::sync::Lazy`.
+/// Compiled once and reused via `std::sync::LazyLock`.
 #[allow(clippy::expect_used)] // hardcoded pattern is always valid
-static FIX_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\b(fix|bug|hotfix|patch|revert)\b").expect("valid regex"));
+static FIX_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"(?i)\b(fix|bug|hotfix|patch|revert)\b").expect("valid regex")
+});
 
 /// Returns `true` when the commit message matches a fix-related keyword.
 ///
