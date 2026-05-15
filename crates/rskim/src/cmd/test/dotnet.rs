@@ -347,18 +347,17 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                 b"Counters" => {
                     counters = parse_counters_element(e.attributes().flatten());
                 }
-                b"UnitTestResult" => {
-                    // Self-closing: push the entry now (no End event will follow).
-                    if entries.len() < MAX_ENTRIES {
-                        let (name, outcome) =
-                            parse_unit_test_result_attrs(e.attributes().flatten());
-                        if let (Some(name), Some(outcome)) = (name, outcome) {
-                            entries.push(TestEntry {
-                                name,
-                                outcome,
-                                detail: None,
-                            });
-                        }
+                b"UnitTestResult"
+                    if entries.len() < MAX_ENTRIES =>
+                {
+                    let (name, outcome) =
+                        parse_unit_test_result_attrs(e.attributes().flatten());
+                    if let (Some(name), Some(outcome)) = (name, outcome) {
+                        entries.push(TestEntry {
+                            name,
+                            outcome,
+                            detail: None,
+                        });
                     }
                 }
                 _ => {}
@@ -379,10 +378,8 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                 }
                 _ => {}
             },
-            Ok(Event::Text(e)) => {
-                if in_error_message {
-                    current_error = e.unescape().ok().map(|s| s.into_owned());
-                }
+            Ok(Event::Text(e)) if in_error_message => {
+                current_error = e.unescape().ok().map(|s| s.into_owned());
             }
             Ok(Event::End(e)) => match e.name().as_ref() {
                 b"UnitTestResult" => {
