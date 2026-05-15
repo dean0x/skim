@@ -365,7 +365,11 @@ mod tests {
         let output = make_output(input, "", Some(0));
         let result = parse_gradle(&output);
         if let ParseResult::Full(br) = &result {
-            assert_eq!(br.duration_ms, Some(62_000), "multi-part duration must be 62s");
+            assert_eq!(
+                br.duration_ms,
+                Some(62_000),
+                "multi-part duration must be 62s"
+            );
         }
     }
 }

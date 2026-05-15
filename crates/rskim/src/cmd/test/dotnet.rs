@@ -155,10 +155,8 @@ fn validate_trx_path(path: &str) -> bool {
     }
 
     // Allow if the path is within the current working directory tree
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(cwd_canonical) = cwd.canonicalize() {
-            return canonical.starts_with(&cwd_canonical);
-        }
+    if let Ok(cwd) = std::env::current_dir().and_then(|c| c.canonicalize()) {
+        return canonical.starts_with(&cwd);
     }
 
     false
@@ -246,7 +244,11 @@ fn parse_counters_element<'a>(
         }
     }
 
-    found.then_some(TrxCounters { total, passed, failed })
+    found.then_some(TrxCounters {
+        total,
+        passed,
+        failed,
+    })
 }
 
 /// Parse `testName` and `outcome` attributes from a `<UnitTestResult>` element.
@@ -262,9 +264,7 @@ fn parse_unit_test_result_attrs<'a>(
     for attr in attrs {
         match attr.key.as_ref() {
             b"testName" => {
-                name = std::str::from_utf8(&attr.value)
-                    .ok()
-                    .map(|s| s.to_string());
+                name = std::str::from_utf8(&attr.value).ok().map(|s| s.to_string());
             }
             b"outcome" => {
                 outcome = std::str::from_utf8(&attr.value).ok().map(|s| match s {
@@ -323,8 +323,7 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                 }
                 b"UnitTestResult" => {
                     // Self-closing: push the entry now (no End event will follow).
-                    let (name, outcome) =
-                        parse_unit_test_result_attrs(e.attributes().flatten());
+                    let (name, outcome) = parse_unit_test_result_attrs(e.attributes().flatten());
                     if let (Some(name), Some(outcome)) = (name, outcome) {
                         entries.push(TestEntry {
                             name,
@@ -341,8 +340,7 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
                 }
                 b"UnitTestResult" => {
                     // Non-self-closing: accumulate pending state; entry pushed in End.
-                    let (name, outcome) =
-                        parse_unit_test_result_attrs(e.attributes().flatten());
+                    let (name, outcome) = parse_unit_test_result_attrs(e.attributes().flatten());
                     current_test_name = name;
                     current_outcome = outcome;
                     current_error = None;
@@ -385,11 +383,21 @@ fn parse_trx_xml(xml: &str) -> Option<TestResult> {
     }
 
     let (passed, failed, skipped) = match &counters {
-        Some(c) => (c.passed, c.failed, c.total.saturating_sub(c.passed + c.failed)),
+        Some(c) => (
+            c.passed,
+            c.failed,
+            c.total.saturating_sub(c.passed + c.failed),
+        ),
         None => {
             // Derive from entries when no <Counters> element was found
-            let p = entries.iter().filter(|e| e.outcome == TestOutcome::Pass).count();
-            let f = entries.iter().filter(|e| e.outcome == TestOutcome::Fail).count();
+            let p = entries
+                .iter()
+                .filter(|e| e.outcome == TestOutcome::Pass)
+                .count();
+            let f = entries
+                .iter()
+                .filter(|e| e.outcome == TestOutcome::Fail)
+                .count();
             (p, f, 0)
         }
     };
@@ -590,7 +598,10 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let result = validate_trx_path(&path_str);
         let _ = std::fs::remove_file(&path);
-        assert!(result, "real .trx in TestResults directory must be accepted");
+        assert!(
+            result,
+            "real .trx in TestResults directory must be accepted"
+        );
     }
 
     #[test]
