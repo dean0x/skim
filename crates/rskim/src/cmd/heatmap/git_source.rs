@@ -51,7 +51,7 @@ pub(crate) trait GitDataSource {
     /// Returns `None` when the repo has fewer than `n` commits.
     fn fetch_commit_count_since(&self, n: usize) -> anyhow::Result<Option<u64>>;
 
-    /// Fetch commit records according to `config`.
+    /// Fetch commits according to `config`.
     fn fetch_commits(&self, config: &HeatmapConfig) -> anyhow::Result<Vec<CommitInfo>>;
 }
 

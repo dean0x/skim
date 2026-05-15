@@ -75,7 +75,7 @@ pub(crate) fn compute_coupling(
     min_support: usize,
 ) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
     // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b).
-    // &str keys borrow from PathBuf::to_str() on each FileChangeInfoInfo.path — valid
+    // &str keys borrow from PathBuf::to_str() on each FileChangeInfo.path — valid
     // for the entire function because `commits` (and all CommitInfos) outlive
     // these maps. Non-UTF-8 paths fall back to "" via unwrap_or_default().
     let mut co_occur: HashMap<(&str, &str), (f64, usize)> = HashMap::new();
