@@ -59,6 +59,7 @@ serial_test = "3.0"
 libc = "0.2"
 filetime = "0.2"
 gix = { version = "0.72", default-features = false, features = ["max-performance-safe", "blob-diff"] }
+quick-xml = "0.37"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.14.0"

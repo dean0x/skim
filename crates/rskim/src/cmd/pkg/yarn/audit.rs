@@ -58,6 +58,9 @@ fn try_parse_ndjson(stdout: &str) -> Option<PkgResult> {
     let mut high = 0usize;
     let mut moderate = 0usize;
     let mut low = 0usize;
+    // When auditSummary is found, its counts are authoritative. Advisory
+    // increments after that point would double-count, so we suppress them.
+    let mut found_summary = false;
 
     for line in stdout.lines() {
         let trimmed = line.trim();
@@ -78,6 +81,7 @@ fn try_parse_ndjson(stdout: &str) -> Option<PkgResult> {
                     .unwrap_or(0) as usize;
                 // Use summary counts if available, else fall back to advisory counts
                 if vuln_count > 0 {
+                    found_summary = true;
                     total = vuln_count;
                     critical = data.get("critical").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     high = data.get("high").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -85,7 +89,7 @@ fn try_parse_ndjson(stdout: &str) -> Option<PkgResult> {
                     low = data.get("low").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 }
             }
-        } else if type_str == "auditAdvisory" {
+        } else if type_str == "auditAdvisory" && !found_summary {
             total += 1;
             match v
                 .get("data")

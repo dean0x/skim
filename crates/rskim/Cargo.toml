@@ -40,7 +40,7 @@ crossterm = { workspace = true }
 # CLI needs this dep to work with Tree/Node types in the diff rendering pipeline
 # (git.rs: is_container_node, find_changed_node_ranges, render_with_unchanged_context).
 tree-sitter = { workspace = true }
-quick-xml = "0.37"
+quick-xml = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
