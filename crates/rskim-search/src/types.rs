@@ -170,6 +170,19 @@ pub struct FileChangeInfo {
     pub deletions: u64,
 }
 
+impl FileChangeInfo {
+    /// Returns the path as a string slice, using lossy UTF-8 conversion.
+    ///
+    /// Git paths are always valid UTF-8 in practice, so lossy conversion is
+    /// safe and consistent with the rest of the codebase. Returns a `Cow<str>`
+    /// to avoid an unnecessary allocation when the path is already valid UTF-8.
+    #[must_use]
+    #[inline]
+    pub fn path_str(&self) -> std::borrow::Cow<'_, str> {
+        self.path.to_string_lossy()
+    }
+}
+
 /// Metadata extracted from a single git commit.
 ///
 /// Intentionally free of gix types — all gix values are converted at the

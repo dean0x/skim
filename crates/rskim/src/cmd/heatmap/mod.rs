@@ -28,7 +28,7 @@ use excludes::{build_exclude_set, should_exclude};
 use git_source::{CliGitSource, GitDataSource};
 use insights::{build_insights_result, compute_insights};
 use metrics::{
-    build_fix_regex, compute_authors, compute_churn, compute_coupling, compute_encapsulation,
+    compute_authors, compute_churn, compute_coupling, compute_encapsulation,
     compute_fix_after_touch, compute_stability,
 };
 use output::{render_insights_json, render_insights_text, render_json, render_text};
@@ -414,7 +414,6 @@ fn compute_heatmap(
     warnings: Vec<String>,
 ) -> HeatmapResult {
     let t0 = Instant::now();
-    let fix_regex = build_fix_regex();
 
     // Step 5: Compute metrics
     // Phase 1: churn must run first — max_churn feeds into stability.
@@ -430,7 +429,7 @@ fn compute_heatmap(
     ) = rayon::join(
         || {
             rayon::join(
-                || compute_stability(&commits, &fix_regex, max_churn, now_epoch),
+                || compute_stability(&commits, max_churn, now_epoch),
                 || compute_authors(&commits),
             )
         },
@@ -438,7 +437,7 @@ fn compute_heatmap(
             rayon::join(
                 || {
                     rayon::join(
-                        || compute_fix_after_touch(&commits, &fix_regex, fix_window),
+                        || compute_fix_after_touch(&commits, fix_window),
                         || compute_coupling(&commits, coupling_threshold, MIN_SUPPORT_THRESHOLD),
                     )
                 },

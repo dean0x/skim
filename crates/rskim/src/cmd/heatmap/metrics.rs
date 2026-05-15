@@ -5,21 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use regex::Regex;
-
 use super::types::{
     AuthorMetrics, ChurnMetrics, CommitRecord, CouplingEdge, CouplingEntry, FixRiskMetrics,
     ModuleHealth,
 };
-
-// ============================================================================
-// Fix keyword regex
-// ============================================================================
-
-/// Build the regex that identifies "fix" commits by subject keywords.
-pub(crate) fn build_fix_regex() -> Regex {
-    Regex::new(r"(?i)\b(fix|bug|hotfix|patch|revert)\b").expect("valid regex")
-}
 
 // ============================================================================
 // Metric 1: Churn
@@ -33,7 +22,7 @@ pub(crate) fn compute_churn(commits: &[CommitRecord]) -> HashMap<String, ChurnMe
     for commit in commits {
         for file in &commit.changed_files {
             *counts
-                .entry(file.path.to_string_lossy().into_owned())
+                .entry(file.path_str().into_owned())
                 .or_insert(0) += 1;
         }
     }
@@ -86,8 +75,9 @@ pub(crate) fn compute_coupling(
     min_support: usize,
 ) -> (HashMap<String, Vec<CouplingEntry>>, Vec<CouplingEdge>) {
     // co_occur[(a, b)] = (weighted_sum, raw_count) for ordered pair (a, b).
-    // &str keys borrow from CommitRecord.changed_files[].path — valid for entire
-    // function because `commits` (and therefore all CommitRecords) outlive these maps.
+    // &str keys borrow from PathBuf::to_str() on each FileChangeInfo.path — valid
+    // for the entire function because `commits` (and all CommitRecords) outlive
+    // these maps. Non-UTF-8 paths fall back to "" via unwrap_or_default().
     let mut co_occur: HashMap<(&str, &str), (f64, usize)> = HashMap::new();
     // weighted_total[a] = weighted sum of commits touching a
     let mut weighted_total: HashMap<&str, f64> = HashMap::new();
@@ -96,7 +86,7 @@ pub(crate) fn compute_coupling(
         let files: Vec<&str> = commit
             .changed_files
             .iter()
-            .map(|f| f.path.to_str().unwrap_or(""))
+            .map(|f| f.path.to_str().unwrap_or_default())
             .collect();
         let n = files.len();
         let weight = 1.0 / (n as f64).sqrt();
@@ -197,7 +187,6 @@ pub(crate) fn compute_coupling(
 /// `now_epoch` is a parameter so tests are deterministic.
 pub(crate) fn compute_stability(
     commits: &[CommitRecord],
-    fix_regex: &Regex,
     max_churn: usize,
     now_epoch: u64,
 ) -> HashMap<String, u8> {
@@ -206,13 +195,13 @@ pub(crate) fn compute_stability(
     let mut file_fix_count: HashMap<String, usize> = HashMap::new();
 
     for commit in commits {
-        let is_fix = fix_regex.is_match(&commit.message);
+        let is_fix = rskim_search::is_fix_commit(&commit.message);
         for file in &commit.changed_files {
-            let path_str = file.path.to_string_lossy().into_owned();
+            let path_str = file.path_str().into_owned();
             file_commits
                 .entry(path_str.clone())
                 .or_default()
-                .push(commit.timestamp as u64);
+                .push(commit.timestamp.max(0) as u64);
             if is_fix {
                 *file_fix_count.entry(path_str).or_insert(0) += 1;
             }
@@ -265,7 +254,7 @@ pub(crate) fn compute_authors(commits: &[CommitRecord]) -> HashMap<String, Autho
     for commit in commits {
         for file in &commit.changed_files {
             *file_author_counts
-                .entry(file.path.to_string_lossy().into_owned())
+                .entry(file.path_str().into_owned())
                 .or_default()
                 .entry(commit.author.clone())
                 .or_insert(0) += 1;
@@ -320,13 +309,12 @@ pub(crate) fn compute_authors(commits: &[CommitRecord]) -> HashMap<String, Autho
 /// - `insufficient_data`: true when the file has <2 commits.
 pub(crate) fn compute_fix_after_touch(
     commits: &[CommitRecord],
-    fix_regex: &Regex,
     window: usize,
 ) -> HashMap<String, FixRiskMetrics> {
     // Classify every commit
     let is_fix: Vec<bool> = commits
         .iter()
-        .map(|c| fix_regex.is_match(&c.message))
+        .map(|c| rskim_search::is_fix_commit(&c.message))
         .collect();
 
     // Per-file: which commit indices touch it?
@@ -334,7 +322,7 @@ pub(crate) fn compute_fix_after_touch(
     for (i, commit) in commits.iter().enumerate() {
         for file in &commit.changed_files {
             file_indices
-                .entry(file.path.to_string_lossy().into_owned())
+                .entry(file.path_str().into_owned())
                 .or_default()
                 .push(i);
         }
@@ -447,7 +435,7 @@ pub(crate) fn compute_encapsulation(
         let file_dirs: Vec<Option<String>> = commit
             .changed_files
             .iter()
-            .map(|f| extract_top_dir(&f.path.to_string_lossy()))
+            .map(|f| extract_top_dir(&f.path_str()))
             .collect();
 
         // Collect unique top-level directories for this commit
@@ -459,7 +447,7 @@ pub(crate) fn compute_encapsulation(
                 module_files
                     .entry(d.clone())
                     .or_default()
-                    .insert(file.path.to_string_lossy().into_owned());
+                    .insert(file.path_str().into_owned());
             }
         }
 
@@ -649,14 +637,12 @@ mod tests {
 
     #[test]
     fn test_stability_empty() {
-        let fix_re = build_fix_regex();
-        let result = compute_stability(&[], &fix_re, 0, 0);
+        let result = compute_stability(&[], 0, 0);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_stability_moderate_for_max_churn_old_file() {
-        let fix_re = build_fix_regex();
         // One commit, old (365 days ago), no fix keywords, but max churn (1/1)
         let old_ts = 0u64;
         let now = 365 * 86400u64;
@@ -667,7 +653,7 @@ mod tests {
             "feat: initial",
             &["stable.rs"],
         )];
-        let result = compute_stability(&commits, &fix_re, 1, now);
+        let result = compute_stability(&commits, 1, now);
         let score = result["stable.rs"];
         // Churn = 1/1 = 1.0 → penalty 40, recency ≈ 0 (old), volatility = 0
         // penalty ≈ 40, score ≈ 60
@@ -679,7 +665,6 @@ mod tests {
 
     #[test]
     fn test_stability_recent_fix_lowers_score() {
-        let fix_re = build_fix_regex();
         let now = 1_000_000u64;
         let commits = vec![make_commit(
             "h1",
@@ -688,7 +673,7 @@ mod tests {
             "fix: critical bug",
             &["risky.rs"],
         )];
-        let result = compute_stability(&commits, &fix_re, 1, now);
+        let result = compute_stability(&commits, 1, now);
         let score = result["risky.rs"];
         // Recent fix commit → low stability
         assert!(score < 50, "expected low score for recent fix, got {score}");
@@ -750,16 +735,14 @@ mod tests {
 
     #[test]
     fn test_fix_risk_empty() {
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&[], &fix_re, 5);
+        let result = compute_fix_after_touch(&[], 5);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_fix_risk_single_commit_insufficient_data() {
         let commits = vec![make_commit("h1", "Alice", 1, "feat: add", &["a.rs"])];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         assert!(result["a.rs"].insufficient_data);
     }
 
@@ -769,8 +752,7 @@ mod tests {
             make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
             make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
         ];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
         assert!(!m.insufficient_data);
         // 1 fix commit out of 2 = 50%
@@ -785,8 +767,7 @@ mod tests {
             make_commit("h1", "Alice", 1, "feat: add", &["a.rs"]),
             make_commit("h2", "Alice", 2, "fix: quick patch", &["a.rs"]),
         ];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
         assert!(!m.insufficient_data);
         // total=2, proximity_set={0}, proximity_pct = 1/2*100 = 50%
@@ -811,8 +792,7 @@ mod tests {
             make_commit("h2", "Alice", 2, "fix: bug in a", &["a.rs"]),
             make_commit("h3", "Alice", 3, "feat: more work", &["a.rs"]),
         ];
-        let fix_re = build_fix_regex();
-        let result = compute_fix_after_touch(&commits, &fix_re, 5);
+        let result = compute_fix_after_touch(&commits, 5);
         let m = &result["a.rs"];
 
         assert!(!m.insufficient_data);
