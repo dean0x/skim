@@ -68,15 +68,17 @@ pub(crate) fn run(
         rec,
         // passthrough_prepare_args: prepend "test" subcommand only — no flags.
         |a| {
-            let mut full_args = vec!["test".to_string()];
-            full_args.extend_from_slice(a);
-            full_args
+            let mut final_args = vec!["test".to_string()];
+            final_args.extend_from_slice(a);
+            final_args
         },
-        // prepare_args: prepend "test" (swift has no JSON reporter to inject).
+        // prepare_args: intentionally identical to passthrough_prepare_args because
+        // Swift Package Manager has no JSON reporter flag to inject. Both closures
+        // produce the same args on purpose — this is not an oversight.
         |a| {
-            let mut full_args = vec!["test".to_string()];
-            full_args.extend_from_slice(a);
-            full_args
+            let mut final_args = vec!["test".to_string()];
+            final_args.extend_from_slice(a);
+            final_args
         },
         parse,
     )
