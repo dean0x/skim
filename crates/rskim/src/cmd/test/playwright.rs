@@ -238,8 +238,14 @@ fn collect_entries_from_suites_inner(
         return;
     }
     for suite in suites {
+        if entries.len() >= MAX_ENTRIES {
+            return;
+        }
         collect_entries_from_suites_inner(&suite.suites, entries, depth + 1);
         for spec in &suite.specs {
+            if entries.len() >= MAX_ENTRIES {
+                return;
+            }
             for test in &spec.tests {
                 // Only use the first result per test
                 if let Some(result) = test.results.first() {
