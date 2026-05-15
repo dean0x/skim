@@ -16,7 +16,9 @@ use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{ArgPreparation, TestRunnerConfig, extract_json_object, run_test_runner};
+use super::shared::{
+    ArgPreparation, MAX_ENTRIES, TestRunnerConfig, extract_json_object, run_test_runner,
+};
 
 // ============================================================================
 // Tier-2 regex patterns
@@ -219,11 +221,9 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
 ///
 /// `depth` tracks call depth; recursion stops at `MAX_SUITE_DEPTH` to prevent
 /// stack overflows from pathologically-deep or adversarial JSON payloads.
-/// `MAX_ENTRIES` caps total entries collected to match the Tier-2 regex path
-/// and prevent unbounded accumulation from wide (many suites, shallow depth)
-/// JSON payloads.
+/// `MAX_ENTRIES` (from `shared`) caps total entries collected to match the
+/// Tier-2 regex path and prevent unbounded accumulation from wide payloads.
 const MAX_SUITE_DEPTH: usize = 64;
-const MAX_ENTRIES: usize = 100;
 
 fn collect_entries_from_suites(suites: &[PlaywrightSuite], entries: &mut Vec<TestEntry>) {
     collect_entries_from_suites_inner(suites, entries, 0);

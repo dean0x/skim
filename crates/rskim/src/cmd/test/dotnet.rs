@@ -17,7 +17,7 @@ use crate::cmd::user_has_flag;
 use crate::output::ParseResult;
 use crate::output::canonical::{TestEntry, TestOutcome, TestResult, TestSummary};
 
-use super::shared::{ArgPreparation, TestRunnerConfig, run_test_runner};
+use super::shared::{ArgPreparation, MAX_ENTRIES, TestRunnerConfig, run_test_runner};
 
 // ============================================================================
 // Regex patterns
@@ -46,11 +46,6 @@ static RE_DOTNET_FAILED_TEST: LazyLock<Regex> =
 /// size in heap, so keep this modest. Reduced from 50 MB to 10 MB to cap
 /// peak heap at ~20 MB for TRX content.
 const TRX_MAX_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
-
-/// Maximum number of `<UnitTestResult>` entries collected during TRX XML
-/// parsing. A crafted 50 MB (or 10 MB) TRX could contain millions of
-/// elements; this bound matches the cap used by other parsers (regex tier).
-const MAX_ENTRIES: usize = 100;
 
 // ============================================================================
 // Public entry point

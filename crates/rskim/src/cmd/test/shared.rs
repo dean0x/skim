@@ -311,10 +311,6 @@ pub(super) enum TestKind {
     Cypress,
 }
 
-/// ANSI color-code strip pattern (ESC [ ... m sequences).
-static RE_ANSI: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("valid ANSI regex"));
-
 /// Per-kind failure patterns — compiled once.
 static RE_CARGO_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     // `test my_module::test_foo ... FAILED`
@@ -417,21 +413,22 @@ pub(super) fn run_passthrough(
 /// the runner's full output format, which is precisely what Tier-1 JSON exists
 /// to avoid.
 ///
-/// Cap matches Tier-1's entry cap (100) to keep output size predictable
-/// regardless of tier.
+/// Maximum number of test entries collected during parsing (Tier-1 and Tier-2).
+///
+/// Caps both the regex-scrape path in [`scrape_failures`] and Tier-1 JSON
+/// collection in parsers that have wide (many suites, shallow depth) payloads.
+/// All parsers import this constant rather than defining their own.
+pub(super) const MAX_ENTRIES: usize = 100;
+
+/// Cap matches [`MAX_ENTRIES`] to keep output size predictable regardless of tier.
 pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
     // Strip ANSI escape codes so color-enabled output (e.g. pytest --color=yes,
     // vitest with TTY detected) does not break pattern matching.
     //
     // Fast-path: when the caller has already stripped ANSI (no ESC bytes remain),
-    // borrow the slice directly rather than running the regex over it a second time.
-    // This eliminates the double-strip in `vitest::try_parse_regex`, which calls
-    // `output::strip_ansi(raw)` → `cleaned` and then passes `cleaned` here.
-    let cleaned: std::borrow::Cow<str> = if text.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(RE_ANSI.replace_all(text, "").into_owned())
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    };
+    // borrows the slice directly — no allocation. This eliminates the double-strip
+    // in `vitest::try_parse_regex`, which strips ANSI before calling here.
+    let cleaned = crate::output::strip_ansi_cow(text);
 
     let re = match kind {
         TestKind::Cargo => &*RE_CARGO_FAIL,
@@ -443,7 +440,7 @@ pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
 
     let mut entries: Vec<TestEntry> = Vec::new();
     for line in cleaned.lines() {
-        if entries.len() >= 100 {
+        if entries.len() >= MAX_ENTRIES {
             break;
         }
         if let Some(caps) = re.captures(line) {
