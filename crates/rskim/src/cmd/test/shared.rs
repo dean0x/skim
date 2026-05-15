@@ -57,20 +57,35 @@ pub(super) struct TestRunnerConfig<'a> {
 /// 6. Stats — emit token-reduction stats when `show_stats` is `true`.
 /// 7. Analytics — record usage via [`crate::analytics::try_record_command`].
 ///
-/// `prepare_args` transforms the user-supplied args into the final argument
-/// list (e.g. injecting `--reporter=json`). It is `Fn` rather than `FnOnce`
-/// because it is referenced by both the passthrough path (inside
-/// `run_passthrough`) and the spawn path (`spawn_runner`) — both are
-/// mutually exclusive at runtime but the borrow checker requires a shared
-/// reference.
+/// `passthrough_prepare_args` transforms user-supplied args for the
+/// `SKIM_PASSTHROUGH` path. It MUST NOT inject reporter/logger flags — those
+/// change the tool's output format and defeat the purpose of running the tool
+/// unmodified. For runners that require a subcommand token (e.g. playwright
+/// "test", cypress "run", swift "test", dotnet "test"), this closure should
+/// prepend that token and nothing else. For runners with no required subcommand
+/// (e.g. vitest, jest), pass `|a| a.to_vec()`.
+///
+/// `prepare_args` transforms the user-supplied args for the normal spawn
+/// path (e.g. injecting `--reporter=json`). It is `Fn` rather than `FnOnce`
+/// because the borrow checker requires a shared reference.
 ///
 /// `parse_fn` is `FnOnce` because it is called exactly once and may capture
 /// owned state (e.g. closures that embed TRX detection for dotnet).
+///
+/// # Exit-code semantics
+///
+/// A non-zero or missing (signal-killed) exit code from the spawned process is
+/// treated as a failure even when the parser reports zero failed tests. This
+/// prevents skim from returning `SUCCESS` when the runner is terminated
+/// abnormally (e.g. OOM kill, timeout, compilation error before any test runs).
+/// The stdin path has no process exit code and therefore does not apply this
+/// override.
 pub(super) fn run_test_runner(
     config: &TestRunnerConfig<'_>,
     args: &[String],
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
+    passthrough_prepare_args: impl Fn(&[String]) -> Vec<String>,
     prepare_args: impl Fn(&[String]) -> Vec<String>,
     parse_fn: impl FnOnce(&str) -> ParseResult<TestResult>,
 ) -> anyhow::Result<ExitCode> {
@@ -78,7 +93,7 @@ pub(super) fn run_test_runner(
     if crate::cmd::is_passthrough_mode() {
         return run_passthrough(
             args,
-            |a| prepare_args(a),
+            |a| passthrough_prepare_args(a),
             |arg_refs| spawn_runner_raw(config, arg_refs),
         );
     }
@@ -86,11 +101,14 @@ pub(super) fn run_test_runner(
     let start = Instant::now();
 
     // Prefer stdin if piped; otherwise spawn the process.
-    let raw_output = if let Some(stdin_content) = try_read_stdin(args)? {
-        stdin_content
+    // `spawn_exit_code` is Some(code) when a process was spawned, None when the
+    // output came from stdin (no process exit code is available in that case).
+    let (raw_output, spawn_exit_code) = if let Some(stdin_content) = try_read_stdin(args)? {
+        (stdin_content, None::<Option<i32>>)
     } else {
         let prepared = prepare_args(args);
-        spawn_runner(config, &prepared)?
+        let (text, code) = spawn_runner(config, &prepared)?;
+        (text, Some(code))
     };
 
     let result = parse_fn(&raw_output);
@@ -102,9 +120,20 @@ pub(super) fn run_test_runner(
             let mut handle = stderr.lock();
             let _ = result.emit_markers(&mut handle);
 
-            if test_result.summary.fail > 0 {
-                emit_failure_context(&raw_output, 1);
-                ExitCode::FAILURE
+            // Treat as failure when: the parser found failures, OR the spawned
+            // process exited non-zero / was signal-killed (exit_code != Some(0)).
+            // A missing exit code (None inner) means signal-killed — always failure.
+            let process_failed = spawn_exit_code
+                .map(|inner| inner != Some(0))
+                .unwrap_or(false);
+
+            if test_result.summary.fail > 0 || process_failed {
+                let ec = spawn_exit_code
+                    .and_then(|inner| inner)
+                    .unwrap_or(1)
+                    .clamp(1, 255) as u8;
+                emit_failure_context(&raw_output, ec as i32);
+                ExitCode::from(ec)
             } else {
                 ExitCode::SUCCESS
             }
@@ -135,8 +164,16 @@ pub(super) fn run_test_runner(
 /// Spawn the test runner, combine stdout+stderr, and strip ANSI escape codes.
 ///
 /// Used by the normal (non-passthrough) path of [`run_test_runner`]. Returns
-/// the clean combined output as an owned `String`.
-fn spawn_runner(config: &TestRunnerConfig<'_>, args: &[String]) -> anyhow::Result<String> {
+/// the clean combined output paired with the process exit code. The exit code
+/// is `None` when the process was killed by a signal before exiting normally.
+///
+/// Returning the exit code lets [`run_test_runner`] treat a non-zero or missing
+/// exit as a failure even when the parser reports zero failed tests (e.g. the
+/// runner was OOM-killed before executing any test cases).
+fn spawn_runner(
+    config: &TestRunnerConfig<'_>,
+    args: &[String],
+) -> anyhow::Result<(String, Option<i32>)> {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
     let output = if config.node_fallback {
@@ -154,8 +191,9 @@ fn spawn_runner(config: &TestRunnerConfig<'_>, args: &[String]) -> anyhow::Resul
         )
     })?;
 
+    let exit_code = output.exit_code;
     let combined = crate::cmd::combine_output(&output);
-    Ok(crate::output::strip_ansi(&combined))
+    Ok((crate::output::strip_ansi(&combined), exit_code))
 }
 
 /// Spawn the test runner for the passthrough path, returning a [`CommandOutput`].
@@ -753,5 +791,147 @@ mod tests {
         // n=2 → find 2nd \n from end, which is after "line1\r", return "line2\r\nline3"
         let result = last_n_lines(text, 2);
         assert_eq!(result, "line2\r\nline3");
+    }
+
+    // ========================================================================
+    // Issue regression: passthrough must NOT inject reporter flags
+    //
+    // Before the fix, run_test_runner passed `prepare_args` (which injects
+    // --reporter=json) to run_passthrough. The passthrough path must call
+    // `passthrough_prepare_args` instead, which is flag-free.
+    // ========================================================================
+
+    /// Regression: vitest passthrough must NOT inject `--reporter=json`.
+    ///
+    /// The passthrough closure for vitest is `|a| a.to_vec()` (identity).
+    /// run_passthrough must receive exactly the user-supplied args, with no
+    /// reporter flag appended.
+    #[test]
+    fn test_passthrough_prepare_args_does_not_inject_reporter_vitest() {
+        let user_args = vec!["--run".to_string(), "math".to_string()];
+        let mut received_args: Vec<String> = Vec::new();
+
+        run_passthrough(
+            &user_args,
+            // identity — mimics vitest's passthrough_prepare_args
+            |a| a.to_vec(),
+            |arg_refs| {
+                received_args = arg_refs.iter().map(|s| s.to_string()).collect();
+                Ok(make_output("", "", Some(0)))
+            },
+        )
+        .expect("run_passthrough should not error");
+
+        assert!(
+            !received_args.iter().any(|a| a.contains("--reporter")),
+            "passthrough must not inject --reporter flag: {received_args:?}"
+        );
+        assert!(
+            !received_args.iter().any(|a| a.contains("--json")),
+            "passthrough must not inject --json flag: {received_args:?}"
+        );
+        assert_eq!(
+            received_args,
+            vec!["--run", "math"],
+            "passthrough must forward user args unchanged: {received_args:?}"
+        );
+    }
+
+    /// Regression: playwright/cypress passthrough must prepend the subcommand
+    /// token ("test" or "run") but must NOT inject `--reporter=json`.
+    ///
+    /// The passthrough closure for playwright is:
+    ///   `|a| { let mut v = vec!["test".to_string()]; v.extend_from_slice(a); v }`
+    /// run_passthrough must receive ["test", ...user_args] with no reporter flag.
+    #[test]
+    fn test_passthrough_prepare_args_prepends_subcommand_without_reporter() {
+        let user_args = vec!["--project=chromium".to_string()];
+        let mut received_args: Vec<String> = Vec::new();
+
+        run_passthrough(
+            &user_args,
+            // subcommand-only — mimics playwright's passthrough_prepare_args
+            |a| {
+                let mut v = vec!["test".to_string()];
+                v.extend_from_slice(a);
+                v
+            },
+            |arg_refs| {
+                received_args = arg_refs.iter().map(|s| s.to_string()).collect();
+                Ok(make_output("", "", Some(0)))
+            },
+        )
+        .expect("run_passthrough should not error");
+
+        assert_eq!(
+            received_args.first().map(String::as_str),
+            Some("test"),
+            "first arg must be the subcommand token: {received_args:?}"
+        );
+        assert!(
+            !received_args.iter().any(|a| a.contains("--reporter")),
+            "passthrough must not inject --reporter flag: {received_args:?}"
+        );
+        assert_eq!(
+            received_args,
+            vec!["test", "--project=chromium"],
+            "passthrough must be [subcommand, ...user_args]: {received_args:?}"
+        );
+    }
+
+    // ========================================================================
+    // Issue regression: spawn_runner exit code surfacing
+    //
+    // Before the fix, spawn_runner returned only String and the exit code was
+    // discarded. The run_test_runner function now receives (String, Option<i32>)
+    // and treats non-zero / missing exit codes as failures even when the parser
+    // reports zero failing tests.
+    //
+    // We test the run_passthrough exit-code forwarding as a proxy for the
+    // spawn_exit_code semantics (the passthrough path already surfaces the exit
+    // code correctly and those tests cover exit code 0, non-zero, and None).
+    //
+    // The spawn_runner itself cannot be called from unit tests (it requires a
+    // live binary), so we instead test the outcome logic via make_output helpers
+    // that exercise the same Option<Option<i32>> handling indirectly through the
+    // run_passthrough path (which already has full exit-code tests above).
+    // ========================================================================
+
+    /// Regression: signal-killed process (exit_code=None) must return FAILURE.
+    ///
+    /// Previously run_passthrough (and by extension run_test_runner) would use
+    /// .unwrap_or(1) — this test verifies that path is still correct.
+    #[test]
+    fn test_passthrough_signal_kill_returns_failure() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("partial output\n", "", None)),
+        )
+        .expect("run_passthrough should not error");
+        assert_eq!(
+            code,
+            ExitCode::FAILURE,
+            "signal-killed process must map to FAILURE"
+        );
+    }
+
+    /// Regression: non-zero exit code must be preserved even when stdout is empty.
+    ///
+    /// Exercises the path where the process exited with code 2 (e.g. compilation
+    /// error) and produced no parseable test output.
+    #[test]
+    fn test_passthrough_compilation_error_exit_code_preserved() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("error: could not compile\n", "", Some(2))),
+        )
+        .expect("run_passthrough should not error");
+        assert_eq!(
+            code,
+            ExitCode::from(2u8),
+            "compilation error exit code 2 must be forwarded"
+        );
     }
 }

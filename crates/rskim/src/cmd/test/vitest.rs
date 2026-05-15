@@ -46,6 +46,9 @@ pub(crate) fn run(
         args,
         show_stats,
         rec,
+        // passthrough_prepare_args: no subcommand to prepend, no flags to inject.
+        |a| a.to_vec(),
+        // prepare_args: inject the JSON reporter flag for the normal spawn path.
         |a| {
             let mut final_args = a.to_vec();
             if program == "jest" {
