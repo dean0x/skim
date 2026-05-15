@@ -105,6 +105,7 @@ fn git_delete_file(dir: &Path, filename: &str, message: &str) -> bool {
 #[test]
 fn test_empty_repo_returns_ok_empty() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -147,6 +148,7 @@ fn test_not_a_git_repo_returns_git_error() {
 #[test]
 fn test_single_commit_fields() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -173,6 +175,7 @@ fn test_single_commit_fields() {
 #[test]
 fn test_shallow_clone_detected() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(origin) = init_git_repo() else { return };
@@ -206,6 +209,7 @@ fn test_shallow_clone_detected() {
 #[test]
 fn test_multiple_commits_ordering() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -233,6 +237,7 @@ fn test_multiple_commits_ordering() {
 #[test]
 fn test_root_commit_includes_changed_files() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -256,6 +261,7 @@ fn test_root_commit_includes_changed_files() {
 #[test]
 fn test_commit_with_multiple_files() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -298,6 +304,7 @@ fn test_commit_with_multiple_files() {
 #[test]
 fn test_lookback_zero_returns_all_history() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -312,6 +319,7 @@ fn test_lookback_zero_returns_all_history() {
 #[test]
 fn test_lookback_large_value_returns_recent() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -324,6 +332,53 @@ fn test_lookback_large_value_returns_recent() {
     assert_eq!(history.commits.len(), 2, "both recent commits should be within 365 days");
 }
 
+#[test]
+fn test_lookback_excludes_old_commits() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
+        return;
+    }
+    let Some(dir) = init_git_repo() else { return };
+
+    // Create a commit dated 180 days ago via GIT_AUTHOR_DATE / GIT_COMMITTER_DATE.
+    let old_date = "2000-01-01T00:00:00+0000";
+    std::fs::write(dir.path().join("old.txt"), "old content").unwrap();
+    let staged = Command::new("git")
+        .args(["add", "old.txt"])
+        .current_dir(dir.path())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(staged, "git add failed");
+    let committed = Command::new("git")
+        .args(["commit", "-m", "old commit"])
+        .env("GIT_AUTHOR_DATE", old_date)
+        .env("GIT_COMMITTER_DATE", old_date)
+        .current_dir(dir.path())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(committed, "git commit with old date failed");
+
+    // Also create a recent commit so the repo isn't empty after filtering.
+    assert!(git_commit_file(dir.path(), "recent.txt", "new", "recent commit"));
+
+    let src = GixSource;
+    // lookback_days=30 should include only the recent commit; the 2000-dated
+    // commit is ~9000 days in the past and must be excluded.
+    let history = src.parse_history(dir.path(), 30).expect("parse_history");
+    assert_eq!(
+        history.commits.len(),
+        1,
+        "expected only 1 recent commit within 30-day window, got: {:?}",
+        history.commits.iter().map(|c| &c.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        history.commits[0].message, "recent commit",
+        "the surviving commit should be the recent one"
+    );
+}
+
 // ============================================================================
 // File tracking
 // ============================================================================
@@ -331,6 +386,7 @@ fn test_lookback_large_value_returns_recent() {
 #[test]
 fn test_file_addition_appears_in_changed_files() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -348,6 +404,7 @@ fn test_file_addition_appears_in_changed_files() {
 #[test]
 fn test_file_deletion_appears_in_changed_files() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -369,6 +426,7 @@ fn test_file_deletion_appears_in_changed_files() {
 #[test]
 fn test_file_modification_appears_in_changed_files() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
@@ -386,6 +444,46 @@ fn test_file_modification_appears_in_changed_files() {
     );
 }
 
+#[test]
+fn test_file_rename_appears_in_changed_files() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
+        return;
+    }
+    let Some(dir) = init_git_repo() else { return };
+
+    // Create original file and commit it.
+    assert!(git_commit_file(dir.path(), "original.rs", "pub fn hello(){}", "add original.rs"));
+
+    // Rename via `git mv` and commit.
+    let moved = Command::new("git")
+        .args(["mv", "original.rs", "renamed.rs"])
+        .current_dir(dir.path())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(moved, "git mv failed");
+    let committed = Command::new("git")
+        .args(["commit", "-m", "rename original.rs to renamed.rs"])
+        .current_dir(dir.path())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(committed, "git commit after rename failed");
+
+    let src = GixSource;
+    let history = src.parse_history(dir.path(), 0).expect("parse_history");
+    assert_eq!(history.commits.len(), 2);
+
+    // The rename commit is newest (commits[0]).
+    let rename_commit = &history.commits[0];
+    let files: Vec<&PathBuf> = rename_commit.changed_files.iter().map(|f| &f.path).collect();
+    assert!(
+        files.iter().any(|p| p.as_os_str() == "renamed.rs"),
+        "expected renamed.rs (new path) in rename commit changed_files, got: {files:?}"
+    );
+}
+
 // ============================================================================
 // Metadata
 // ============================================================================
@@ -393,6 +491,7 @@ fn test_file_modification_appears_in_changed_files() {
 #[test]
 fn test_commit_count_matches_vec_len() {
     if !git_available() {
+        eprintln!("SKIPPED: git not available on PATH");
         return;
     }
     let Some(dir) = init_git_repo() else { return };
