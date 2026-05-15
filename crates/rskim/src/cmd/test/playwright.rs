@@ -219,7 +219,11 @@ fn try_parse_json(raw: &str) -> Option<TestResult> {
 ///
 /// `depth` tracks call depth; recursion stops at `MAX_SUITE_DEPTH` to prevent
 /// stack overflows from pathologically-deep or adversarial JSON payloads.
+/// `MAX_ENTRIES` caps total entries collected to match the Tier-2 regex path
+/// and prevent unbounded accumulation from wide (many suites, shallow depth)
+/// JSON payloads.
 const MAX_SUITE_DEPTH: usize = 64;
+const MAX_ENTRIES: usize = 100;
 
 fn collect_entries_from_suites(suites: &[PlaywrightSuite], entries: &mut Vec<TestEntry>) {
     collect_entries_from_suites_inner(suites, entries, 0);
@@ -230,7 +234,7 @@ fn collect_entries_from_suites_inner(
     entries: &mut Vec<TestEntry>,
     depth: usize,
 ) {
-    if depth >= MAX_SUITE_DEPTH {
+    if depth >= MAX_SUITE_DEPTH || entries.len() >= MAX_ENTRIES {
         return;
     }
     for suite in suites {
@@ -406,6 +410,31 @@ mod tests {
             result.is_degraded(),
             "Expected Degraded, got {}",
             result.tier_name()
+        );
+    }
+
+    /// Regression: a wide JSON payload with more than MAX_ENTRIES suites at depth 1
+    /// must not accumulate more than MAX_ENTRIES entries (unbounded accumulation guard).
+    #[test]
+    fn test_collect_entries_capped_at_max_entries() {
+        // Build 200 suites each with one passing spec — well above MAX_ENTRIES.
+        let spec = r#"{"title":"t","ok":true,"tests":[{"timeout":30000,"annotations":[],"expectedStatus":"passed","projectId":"chromium","results":[{"status":"expected","duration":10,"error":null}]}]}"#;
+        let suite_body = format!(r#"{{"title":"s","file":"f.ts","suites":[],"specs":[{spec}]}}"#);
+        let suites_array = std::iter::repeat(suite_body.as_str())
+            .take(200)
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"version":"1.40.0","stats":{{"startTime":"2026-01-01T00:00:00.000Z","duration":1000,"expected":200,"unexpected":0,"flaky":0,"skipped":0}},"suites":[{suites_array}]}}"#
+        );
+
+        let result = try_parse_json(&json);
+        assert!(result.is_some(), "JSON parse should succeed");
+        let r = result.unwrap();
+        assert!(
+            r.entries.len() <= MAX_ENTRIES,
+            "entries must not exceed MAX_ENTRIES={MAX_ENTRIES}, got {}",
+            r.entries.len()
         );
     }
 }
