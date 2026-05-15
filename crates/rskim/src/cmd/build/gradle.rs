@@ -196,13 +196,13 @@ fn parse_gradle_duration(s: &str) -> Option<u64> {
         // "3.456 secs" → 3456ms
         [secs_str, _unit] => {
             let f = secs_str.parse::<f64>().ok()?;
-            Some((f * 1000.0) as u64)
+            Some((f * 1000.0).max(0.0).round() as u64)
         }
         // "1 min 2 secs" → 62000ms
         [mins_str, "min", secs_str, _unit] => {
             let mins: u64 = mins_str.parse().ok()?;
             let secs: f64 = secs_str.parse().ok()?;
-            Some(mins * 60_000 + (secs * 1000.0) as u64)
+            Some(mins * 60_000 + (secs * 1000.0).max(0.0).round() as u64)
         }
         _ => None,
     }
