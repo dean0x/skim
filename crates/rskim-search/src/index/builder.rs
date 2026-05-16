@@ -184,21 +184,18 @@ impl NgramIndexBuilder {
 /// Returns an array of 8 `u32` values — one per [`SearchField`] discriminant.
 /// The sum of the returned values equals `source_len` (enforced by the
 /// contiguous invariant of `field_map`).
-fn compute_field_lengths(
-    source_len: usize,
-    field_map: &[(Range<usize>, SearchField)],
-) -> [u32; 8] {
+fn compute_field_lengths(source_len: usize, field_map: &[(Range<usize>, SearchField)]) -> [u32; 8] {
     let mut lengths = [0u32; 8];
     if field_map.is_empty() {
         // All bytes are Other (discriminant 7).
         lengths[SearchField::Other.discriminant() as usize] =
-            source_len.min(u32::MAX as usize) as u32;
+            u32::try_from(source_len).unwrap_or(u32::MAX);
         return lengths;
     }
     for (range, field) in field_map {
-        let range_len = range.end.saturating_sub(range.start);
+        let range_len = u32::try_from(range.end.saturating_sub(range.start)).unwrap_or(u32::MAX);
         let idx = field.discriminant() as usize;
-        lengths[idx] = lengths[idx].saturating_add(range_len as u32);
+        lengths[idx] = lengths[idx].saturating_add(range_len);
     }
     lengths
 }
@@ -256,21 +253,18 @@ impl LayerBuilder for NgramIndexBuilder {
     where
         Self: Sized,
     {
-        let avg_doc_length = if self.file_count == 0 {
-            0.0f32
+        // Compute corpus averages. Both avg_doc_length and avg_field_lengths share
+        // the same divisor, so evaluate it once and default to 0.0 for empty indexes.
+        let (avg_doc_length, avg_field_lengths) = if self.file_count == 0 {
+            (0.0f32, [0.0f32; 8])
         } else {
-            (self.total_doc_length as f64 / f64::from(self.file_count)) as f32
-        };
-
-        // Compute per-field averages for BM25F normalisation.
-        let avg_field_lengths: [f32; 8] = if self.file_count == 0 {
-            [0.0f32; 8]
-        } else {
+            let n = f64::from(self.file_count);
+            let avg_doc = (self.total_doc_length as f64 / n) as f32;
             let mut avgs = [0.0f32; 8];
-            for (i, &total) in self.total_field_lengths.iter().enumerate() {
-                avgs[i] = (total as f64 / f64::from(self.file_count)) as f32;
+            for (avg, &total) in avgs.iter_mut().zip(self.total_field_lengths.iter()) {
+                *avg = (total as f64 / n) as f32;
             }
-            avgs
+            (avg_doc, avgs)
         };
 
         // Sort each posting list by (doc_id, field_id, position).

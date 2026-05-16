@@ -153,16 +153,10 @@ pub fn classify_source(
             // No sibling — go up.
             if !cursor.goto_parent() {
                 // Reached root — traversal complete.
-                goto_done(&mut cursor);
                 return Ok(run_length_encode(field_at, len));
             }
         }
     }
-}
-
-/// Marker to exit the traversal loop.
-fn goto_done(_cursor: &mut tree_sitter::TreeCursor<'_>) {
-    // No-op — exists so the loop can break to a named point.
 }
 
 /// Run-length encode a per-byte field array into a sorted range list.
@@ -189,13 +183,6 @@ fn run_length_encode(field_at: Vec<SearchField>, len: usize) -> Vec<(Range<usize
     result.push((start..len, current));
     result
 }
-
-/// A stateless classifier that uses [`classify_source`] to produce field ranges.
-///
-/// Implements [`crate::FieldClassifier`] for callers that need the trait interface.
-/// Exposed primarily for documentation; the free function [`classify_source`] is
-/// sufficient for builder integration.
-pub struct TreeSitterClassifier;
 
 // ============================================================================
 // Tests

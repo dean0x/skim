@@ -12,7 +12,10 @@ use crate::SearchField;
 /// Assert that ranges cover the full source length without gaps or overlaps.
 fn assert_contiguous(ranges: &[(std::ops::Range<usize>, SearchField)], source_len: usize) {
     if source_len == 0 {
-        assert!(ranges.is_empty(), "empty source should produce empty ranges");
+        assert!(
+            ranges.is_empty(),
+            "empty source should produce empty ranges"
+        );
         return;
     }
     let mut expected = 0usize;
@@ -59,7 +62,11 @@ fn test_json_classified_as_single_other() {
     let source = r#"{"key": "value"}"#;
     let ranges = classify_source(source, rskim_core::Language::Json).unwrap();
     assert_eq!(ranges.len(), 1, "JSON should return single range");
-    assert_eq!(ranges[0].1, SearchField::Other, "JSON range should be Other");
+    assert_eq!(
+        ranges[0].1,
+        SearchField::Other,
+        "JSON range should be Other"
+    );
     assert_eq!(ranges[0].0.start, 0);
     assert_eq!(ranges[0].0.end, source.len());
 }
@@ -122,7 +129,8 @@ fn test_non_overlapping_invariant() {
     // Verify no two ranges overlap.
     for i in 0..ranges.len().saturating_sub(1) {
         assert_eq!(
-            ranges[i].0.end, ranges[i + 1].0.start,
+            ranges[i].0.end,
+            ranges[i + 1].0.start,
             "ranges overlap or gap between index {i} and {}: {:?} vs {:?}",
             i + 1,
             ranges[i],
@@ -141,7 +149,9 @@ fn test_innermost_wins() {
     assert_contiguous(&ranges, source.len());
     // At least TypeDefinition should appear somewhere.
     assert!(
-        ranges.iter().any(|(_, f)| *f == SearchField::TypeDefinition),
+        ranges
+            .iter()
+            .any(|(_, f)| *f == SearchField::TypeDefinition),
         "struct should have TypeDefinition range; got: {ranges:?}"
     );
 }
@@ -176,9 +186,7 @@ fn test_typescript_import_contains_import_export() {
     let source = "import { Component } from '@angular/core';\n";
     let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
     assert_contiguous(&ranges, source.len());
-    let has_import = ranges
-        .iter()
-        .any(|(_, f)| *f == SearchField::ImportExport);
+    let has_import = ranges.iter().any(|(_, f)| *f == SearchField::ImportExport);
     assert!(
         has_import,
         "TypeScript import should produce ImportExport range; got: {ranges:?}"
@@ -190,7 +198,10 @@ fn test_field_lengths_sum_multi_language() {
     let cases: &[(&str, rskim_core::Language)] = &[
         ("def f(x): return x", rskim_core::Language::Python),
         ("fn x() {}", rskim_core::Language::Rust),
-        ("function y() { return 1; }", rskim_core::Language::JavaScript),
+        (
+            "function y() { return 1; }",
+            rskim_core::Language::JavaScript,
+        ),
     ];
     for (source, lang) in cases {
         let ranges = classify_source(source, *lang).unwrap();

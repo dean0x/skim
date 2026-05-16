@@ -45,7 +45,10 @@ fn test_single_field_positive_score() {
     lengths[0] = 200;
 
     let score = bm25f_score(5.0, &tfs, &lengths, &avg_lengths(200.0), &cfg);
-    assert!(score > 0.0, "positive TF and IDF should give positive score");
+    assert!(
+        score > 0.0,
+        "positive TF and IDF should give positive score"
+    );
     assert!(score.is_finite(), "score must be finite");
 }
 
@@ -60,10 +63,22 @@ fn test_higher_boost_increases_score() {
 
     let mut tfs_high = zero_field_tfs();
     tfs_high[0] = 2.0;
-    let high = bm25f_score(2.0, &tfs_high, &[100; FIELD_COUNT], &avg_lengths(100.0), &cfg);
+    let high = bm25f_score(
+        2.0,
+        &tfs_high,
+        &[100; FIELD_COUNT],
+        &avg_lengths(100.0),
+        &cfg,
+    );
 
     cfg.field_boosts[0] = 1.0;
-    let low = bm25f_score(2.0, &tfs_high, &[100; FIELD_COUNT], &avg_lengths(100.0), &cfg);
+    let low = bm25f_score(
+        2.0,
+        &tfs_high,
+        &[100; FIELD_COUNT],
+        &avg_lengths(100.0),
+        &cfg,
+    );
 
     assert!(
         high > low,
@@ -90,7 +105,10 @@ fn test_zero_avg_field_length_no_panic() {
     let mut tfs = zero_field_tfs();
     tfs[1] = 2.0;
     let score = bm25f_score(3.0, &tfs, &[50; FIELD_COUNT], &[0.0; FIELD_COUNT], &cfg);
-    assert!(score.is_finite(), "score must be finite even with avg_len=0");
+    assert!(
+        score.is_finite(),
+        "score must be finite even with avg_len=0"
+    );
 }
 
 #[test]
@@ -149,7 +167,32 @@ fn test_extreme_length_ratio_finite() {
     let mut lengths = zero_field_lengths();
     lengths[0] = u32::MAX;
     let score = bm25f_score(2.0, &tfs, &lengths, &avg_lengths(1.0), &cfg);
-    assert!(score.is_finite(), "extreme length ratio must not produce NaN/inf");
+    assert!(
+        score.is_finite(),
+        "extreme length ratio must not produce NaN/inf"
+    );
+}
+
+#[test]
+fn test_zero_field_length_with_b_one_no_nan() {
+    // b=1.0 and dl=0 produces norm=0.0 in the formula.
+    // The guard should prevent NaN/Inf.
+    let mut cfg = BM25FConfig::default();
+    cfg.field_b = [1.0; FIELD_COUNT]; // full normalisation
+    cfg.field_boosts = [0.0; FIELD_COUNT];
+    cfg.field_boosts[0] = 1.0;
+
+    let mut tfs = zero_field_tfs();
+    tfs[0] = 2.0; // term appears in field with zero length (edge case)
+    let lengths = zero_field_lengths(); // dl=0 for all fields
+    let avgs = avg_lengths(100.0);
+
+    let score = bm25f_score(3.0, &tfs, &lengths, &avgs, &cfg);
+    assert!(
+        score.is_finite(),
+        "b=1.0 with dl=0 must not produce NaN/Inf, got {score}"
+    );
+    assert!(score > 0.0, "score should still be positive: {score}");
 }
 
 #[test]
@@ -216,6 +259,10 @@ fn test_dominant_field_deterministic() {
     tfs[3] = 4.0;
     let first = dominant_field(&tfs);
     for _ in 0..50 {
-        assert_eq!(dominant_field(&tfs), first, "dominant_field must be deterministic");
+        assert_eq!(
+            dominant_field(&tfs),
+            first,
+            "dominant_field must be deterministic"
+        );
     }
 }

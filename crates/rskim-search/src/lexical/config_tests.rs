@@ -7,20 +7,47 @@ use super::*;
 #[test]
 fn test_default_k1() {
     let cfg = BM25FConfig::default();
-    assert!((cfg.k1 - 1.2).abs() < f32::EPSILON, "default k1 should be 1.2");
+    assert!(
+        (cfg.k1 - 1.2).abs() < f32::EPSILON,
+        "default k1 should be 1.2"
+    );
 }
 
 #[test]
 fn test_default_boosts() {
     let cfg = BM25FConfig::default();
-    assert!((cfg.field_boosts[0] - 5.0).abs() < f32::EPSILON, "TypeDefinition boost");
-    assert!((cfg.field_boosts[1] - 4.0).abs() < f32::EPSILON, "FunctionSignature boost");
-    assert!((cfg.field_boosts[2] - 3.5).abs() < f32::EPSILON, "SymbolName boost");
-    assert!((cfg.field_boosts[3] - 3.0).abs() < f32::EPSILON, "ImportExport boost");
-    assert!((cfg.field_boosts[4] - 1.0).abs() < f32::EPSILON, "FunctionBody boost");
-    assert!((cfg.field_boosts[5] - 0.8).abs() < f32::EPSILON, "Comment boost");
-    assert!((cfg.field_boosts[6] - 0.5).abs() < f32::EPSILON, "StringLiteral boost");
-    assert!((cfg.field_boosts[7] - 1.0).abs() < f32::EPSILON, "Other boost");
+    assert!(
+        (cfg.field_boosts[0] - 5.0).abs() < f32::EPSILON,
+        "TypeDefinition boost"
+    );
+    assert!(
+        (cfg.field_boosts[1] - 4.0).abs() < f32::EPSILON,
+        "FunctionSignature boost"
+    );
+    assert!(
+        (cfg.field_boosts[2] - 3.5).abs() < f32::EPSILON,
+        "SymbolName boost"
+    );
+    assert!(
+        (cfg.field_boosts[3] - 3.0).abs() < f32::EPSILON,
+        "ImportExport boost"
+    );
+    assert!(
+        (cfg.field_boosts[4] - 1.0).abs() < f32::EPSILON,
+        "FunctionBody boost"
+    );
+    assert!(
+        (cfg.field_boosts[5] - 0.8).abs() < f32::EPSILON,
+        "Comment boost"
+    );
+    assert!(
+        (cfg.field_boosts[6] - 0.5).abs() < f32::EPSILON,
+        "StringLiteral boost"
+    );
+    assert!(
+        (cfg.field_boosts[7] - 1.0).abs() < f32::EPSILON,
+        "Other boost"
+    );
 }
 
 #[test]
@@ -83,7 +110,10 @@ fn test_validate_rejects_b_below_zero() {
     let result = cfg.validate();
     assert!(result.is_err());
     let msg = format!("{}", result.unwrap_err());
-    assert!(msg.contains("field_b[3]"), "error should mention field index: {msg}");
+    assert!(
+        msg.contains("field_b[3]"),
+        "error should mention field index: {msg}"
+    );
 }
 
 #[test]
@@ -127,8 +157,7 @@ fn test_partial_eq() {
 fn test_field_count_matches_search_field_variants() {
     // SearchField has 8 variants (0..=7). FIELD_COUNT must match.
     assert_eq!(
-        FIELD_COUNT,
-        8,
+        FIELD_COUNT, 8,
         "FIELD_COUNT must equal the number of SearchField variants"
     );
 }

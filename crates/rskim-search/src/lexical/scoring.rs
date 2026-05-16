@@ -69,6 +69,10 @@ pub fn bm25f_score(
         // Okapi BM25 length normalisation factor for this field.
         let norm = 1.0 - b + b * (dl / adl);
 
+        // Guard: norm can be zero when b=1.0 and dl=0 (all field bytes absent).
+        // Treat as 1.0 to avoid division by zero producing NaN/Inf.
+        let norm = if norm <= 0.0 { 1.0 } else { norm };
+
         // Normalised TF for this field, boosted by the field weight.
         let tf_norm = tf / norm;
         tf_weighted += boost * tf_norm;

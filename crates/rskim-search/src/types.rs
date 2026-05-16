@@ -942,11 +942,7 @@ mod tests {
     /// SearchField::ALL must contain all 8 variants in discriminant order.
     #[test]
     fn test_search_field_all_contains_all_variants() {
-        assert_eq!(
-            SearchField::ALL.len(),
-            8,
-            "ALL must have 8 elements"
-        );
+        assert_eq!(SearchField::ALL.len(), 8, "ALL must have 8 elements");
         for (i, &field) in SearchField::ALL.iter().enumerate() {
             assert_eq!(
                 field.discriminant(),

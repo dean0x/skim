@@ -5,9 +5,9 @@
 //! The `.skidx` file is memory-mapped in its entirety.  The layout is:
 //!
 //! ```text
-//! [SkidxHeader: 30 bytes]
+//! [SkidxHeader: 62 bytes]
 //! [SkidxEntry × ngram_count: 14 bytes each]
-//! [FileMetaEntry × file_count: 5 bytes each]
+//! [FileMetaEntry × file_count: 37 bytes each]
 //! ```
 //!
 //! The `.skpost` file is also memory-mapped.  Entry offsets/lengths in the

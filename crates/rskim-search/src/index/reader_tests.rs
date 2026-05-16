@@ -370,9 +370,9 @@ fn test_duplicate_file_id_rejected() {
 /// bytes appropriately for each file.
 #[test]
 fn test_ac1_type_definition_ranks_above_string_literal() {
-    use std::ops::Range;
     use crate::SearchField;
     use crate::index::NgramIndexBuilder;
+    use std::ops::Range;
 
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
@@ -419,7 +419,6 @@ fn test_ac1_type_definition_ranks_above_string_literal() {
 /// AC2: Field boosts are configurable — a query with reversed boosts reverses ranking.
 #[test]
 fn test_ac2_configurable_boosts_reverse_ranking() {
-    use std::ops::Range;
     use crate::SearchField;
     use crate::index::NgramIndexBuilder;
     use crate::lexical::BM25FConfig;
@@ -484,10 +483,7 @@ fn test_ac3_bm25f_validation_rejects_invalid() {
 
     let mut bad_k1 = BM25FConfig::default();
     bad_k1.k1 = -0.1;
-    assert!(
-        bad_k1.validate().is_err(),
-        "negative k1 must be rejected"
-    );
+    assert!(bad_k1.validate().is_err(), "negative k1 must be rejected");
 
     let mut bad_boost = BM25FConfig::default();
     bad_boost.field_boosts[0] = -1.0;
@@ -498,10 +494,7 @@ fn test_ac3_bm25f_validation_rejects_invalid() {
 
     let mut bad_b = BM25FConfig::default();
     bad_b.field_b[2] = 1.5;
-    assert!(
-        bad_b.validate().is_err(),
-        "b > 1.0 must be rejected"
-    );
+    assert!(bad_b.validate().is_err(), "b > 1.0 must be rejected");
 
     // Valid config must pass.
     assert!(
@@ -527,11 +520,7 @@ fn test_ac4_scoring_deterministic() {
     let first = reader.search(&SearchQuery::new("function")).unwrap();
     for _ in 0..100 {
         let run = reader.search(&SearchQuery::new("function")).unwrap();
-        assert_eq!(
-            run.len(),
-            first.len(),
-            "result count must be deterministic"
-        );
+        assert_eq!(run.len(), first.len(), "result count must be deterministic");
         for (a, b) in run.iter().zip(first.iter()) {
             assert_eq!(
                 a.file_id, b.file_id,
@@ -564,15 +553,18 @@ fn test_open_with_config_stores_config() {
     let reader = NgramIndexReader::open_with_config(dir.path(), custom_config).unwrap();
     // Smoke test: search returns results without panicking.
     let results = reader.search(&SearchQuery::new("main")).unwrap();
-    assert!(!results.is_empty(), "custom config reader should still find results");
+    assert!(
+        !results.is_empty(),
+        "custom config reader should still find results"
+    );
 }
 
 /// Verify SearchResult.field is populated from dominant_field, not hardcoded Other.
 #[test]
 fn test_search_result_field_populated_from_dominant_field() {
-    use std::ops::Range;
     use crate::SearchField;
     use crate::index::NgramIndexBuilder;
+    use std::ops::Range;
 
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
@@ -580,15 +572,9 @@ fn test_search_result_field_populated_from_dominant_field() {
     let content = "struct MyStruct { x: u32 }";
     let len = content.len();
     // Classify all bytes as TypeDefinition.
-    let field_map: Vec<(Range<usize>, SearchField)> =
-        vec![(0..len, SearchField::TypeDefinition)];
+    let field_map: Vec<(Range<usize>, SearchField)> = vec![(0..len, SearchField::TypeDefinition)];
     builder
-        .add_file_classified(
-            FileId(0),
-            content,
-            rskim_core::Language::Rust,
-            &field_map,
-        )
+        .add_file_classified(FileId(0), content, rskim_core::Language::Rust, &field_map)
         .unwrap();
     builder.build().unwrap();
     let reader = NgramIndexReader::open(dir.path()).unwrap();
