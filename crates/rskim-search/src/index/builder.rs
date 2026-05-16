@@ -20,7 +20,7 @@ use super::format::{
     encode_file_meta, encode_header, encode_posting, lang_to_id,
 };
 use super::reader::NgramIndexReader;
-use crate::{FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer};
+use crate::{FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer};
 
 // ============================================================================
 // Public builder struct
@@ -48,7 +48,7 @@ pub struct NgramIndexBuilder {
     /// Sum of all document byte lengths (for avg_doc_length computation).
     total_doc_length: u64,
     /// Sum of per-field byte lengths across all documents (for avg_field_lengths).
-    total_field_lengths: [u64; 8],
+    total_field_lengths: [u64; FIELD_COUNT],
 }
 
 impl NgramIndexBuilder {
@@ -71,7 +71,7 @@ impl NgramIndexBuilder {
             seen_file_ids: HashSet::new(),
             file_count: 0,
             total_doc_length: 0,
-            total_field_lengths: [0u64; 8],
+            total_field_lengths: [0u64; FIELD_COUNT],
         })
     }
 
@@ -155,10 +155,23 @@ impl NgramIndexBuilder {
             field_lengths,
         });
 
-        // Scan every 2-byte window, resolving the field via field_map.
+        // Scan every 2-byte window, resolving the field via a linearly advancing
+        // pointer through field_map.  Because positions increase monotonically and
+        // field_map is sorted ascending, a single forward scan is O(n + m) instead
+        // of the O(n log m) cost of calling binary search once per window.
         let bytes = content.as_bytes();
+        let mut range_idx = 0usize;
         for (pos, window) in bytes.windows(2).enumerate() {
-            let field_id = resolve_field(pos, field_map);
+            // Advance past any ranges that have ended before `pos`.
+            while range_idx < field_map.len() && field_map[range_idx].0.end <= pos {
+                range_idx += 1;
+            }
+            let field_id = if range_idx < field_map.len() && field_map[range_idx].0.contains(&pos)
+            {
+                field_map[range_idx].1.discriminant()
+            } else {
+                SearchField::Other.discriminant()
+            };
             let key = (u16::from(window[0]) << 8) | u16::from(window[1]);
             self.postings.entry(key).or_default().push(PostingEntry {
                 doc_id: id.0,
@@ -181,11 +194,14 @@ impl NgramIndexBuilder {
 
 /// Compute per-field byte lengths from a field_map covering `source_len` bytes.
 ///
-/// Returns an array of 8 `u32` values — one per [`SearchField`] discriminant.
+/// Returns an array of `FIELD_COUNT` `u32` values — one per [`SearchField`] discriminant.
 /// The sum of the returned values equals `source_len` (enforced by the
 /// contiguous invariant of `field_map`).
-fn compute_field_lengths(source_len: usize, field_map: &[(Range<usize>, SearchField)]) -> [u32; 8] {
-    let mut lengths = [0u32; 8];
+fn compute_field_lengths(
+    source_len: usize,
+    field_map: &[(Range<usize>, SearchField)],
+) -> [u32; FIELD_COUNT] {
+    let mut lengths = [0u32; FIELD_COUNT];
     if field_map.is_empty() {
         // All bytes are Other (discriminant 7).
         lengths[SearchField::Other.discriminant() as usize] =
@@ -200,26 +216,6 @@ fn compute_field_lengths(source_len: usize, field_map: &[(Range<usize>, SearchFi
     lengths
 }
 
-/// Binary-search `field_map` to find the field for byte position `pos`.
-///
-/// Returns the [`SearchField::Other`] discriminant when `field_map` is empty
-/// or `pos` falls outside all ranges (should not happen for well-formed maps).
-fn resolve_field(pos: usize, field_map: &[(Range<usize>, SearchField)]) -> u8 {
-    if field_map.is_empty() {
-        return SearchField::Other.discriminant();
-    }
-    // Binary search by range start — the map is sorted ascending.
-    let idx = field_map.partition_point(|(r, _)| r.start <= pos);
-    if idx == 0 {
-        return SearchField::Other.discriminant();
-    }
-    let (range, field) = &field_map[idx - 1];
-    if range.contains(&pos) {
-        field.discriminant()
-    } else {
-        SearchField::Other.discriminant()
-    }
-}
 
 // ============================================================================
 // LayerBuilder implementation
@@ -256,11 +252,11 @@ impl LayerBuilder for NgramIndexBuilder {
         // Compute corpus averages. Both avg_doc_length and avg_field_lengths share
         // the same divisor, so evaluate it once and default to 0.0 for empty indexes.
         let (avg_doc_length, avg_field_lengths) = if self.file_count == 0 {
-            (0.0f32, [0.0f32; 8])
+            (0.0f32, [0.0f32; FIELD_COUNT])
         } else {
             let n = f64::from(self.file_count);
             let avg_doc = (self.total_doc_length as f64 / n) as f32;
-            let mut avgs = [0.0f32; 8];
+            let mut avgs = [0.0f32; FIELD_COUNT];
             for (avg, &total) in avgs.iter_mut().zip(self.total_field_lengths.iter()) {
                 *avg = (total as f64 / n) as f32;
             }

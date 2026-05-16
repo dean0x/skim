@@ -22,8 +22,18 @@ use crate::{Result, SearchError};
 
 /// Number of searchable fields in the BM25F scoring model.
 ///
-/// Must equal the number of [`crate::SearchField`] variants.
-pub const FIELD_COUNT: usize = 8;
+/// Derived from [`crate::SearchField::count()`] so it stays in sync
+/// automatically when variants are added or removed.
+pub const FIELD_COUNT: usize = crate::SearchField::count();
+
+/// Compile-time assertion: `FIELD_COUNT` must equal `SearchField::ALL.len()`.
+///
+/// This fires if `count()` and `ALL` diverge (e.g. a variant is added to one
+/// but not the other), catching the inconsistency at build time.
+const _: () = assert!(
+    FIELD_COUNT == crate::SearchField::ALL.len(),
+    "FIELD_COUNT must equal SearchField::ALL.len()"
+);
 
 /// BM25F scoring parameters controlling relevance ranking.
 ///

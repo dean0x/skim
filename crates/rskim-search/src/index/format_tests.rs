@@ -247,6 +247,25 @@ fn test_file_meta_truncated() {
     assert!(err.contains("truncated"), "unexpected error: {err}");
 }
 
+/// decode_file_meta must reject entries where field_lengths sum != doc_length.
+#[test]
+fn test_file_meta_field_lengths_sum_mismatch_rejected() {
+    let m = FileMetaEntry {
+        lang_id: 0,
+        doc_length: 1000,
+        // Sum is 100+200 = 300, not 1000 — deliberate mismatch.
+        field_lengths: [100, 200, 0, 0, 0, 0, 0, 0],
+    };
+    let encoded = encode_file_meta(&m);
+    let result = decode_file_meta(&encoded);
+    assert!(result.is_err(), "expected Err for field_lengths sum mismatch");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("field_lengths sum"),
+        "unexpected error message: {err}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // read_array — defensive bounds checking
 // -----------------------------------------------------------------------

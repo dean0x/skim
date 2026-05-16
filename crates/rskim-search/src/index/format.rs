@@ -29,7 +29,7 @@
 
 pub(crate) use super::lang_map::lang_to_id;
 use crate::{
-    SearchError, SearchField,
+    FIELD_COUNT, SearchError, SearchField,
     weights::{BIGRAM_WEIGHTS, lookup_weight},
 };
 
@@ -90,7 +90,7 @@ pub(crate) struct SkidxHeader {
     /// Average per-field byte length across all documents (BM25F normalisation).
     ///
     /// Indexed by [`crate::SearchField`] discriminant.
-    pub avg_field_lengths: [f32; 8],
+    pub avg_field_lengths: [f32; FIELD_COUNT],
     /// CRC32 of the entry array + file-metadata array bytes.
     pub checksum: u32,
 }
@@ -153,7 +153,7 @@ pub(crate) struct FileMetaEntry {
     /// Per-field byte lengths for BM25F normalisation.
     ///
     /// Indexed by [`crate::SearchField`] discriminant (0 = TypeDefinition … 7 = Other).
-    pub field_lengths: [u32; 8],
+    pub field_lengths: [u32; FIELD_COUNT],
 }
 
 /// Extract a fixed-size byte array from `data[start..start+N]`.
@@ -225,8 +225,8 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
         )));
     }
 
-    // Decode avg_field_lengths: 8 × f32 LE at bytes [26..58]
-    let mut avg_field_lengths = [0.0f32; 8];
+    // Decode avg_field_lengths: FIELD_COUNT × f32 LE at bytes [26..58]
+    let mut avg_field_lengths = [0.0f32; FIELD_COUNT];
     for (i, v) in avg_field_lengths.iter_mut().enumerate() {
         let start = 26 + i * 4;
         *v = f32::from_le_bytes(read_array(data, start, "header: avg_field_lengths")?);
@@ -334,14 +334,22 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> crate::Result<FileMetaEntry> {
             data.len()
         )));
     }
-    let mut field_lengths = [0u32; 8];
+    let mut field_lengths = [0u32; FIELD_COUNT];
     for (i, v) in field_lengths.iter_mut().enumerate() {
         let start = 5 + i * 4;
         *v = u32::from_le_bytes(read_array(data, start, "file_meta: field_lengths")?);
     }
+    let doc_length = u32::from_le_bytes(read_array(data, 1, "file_meta: doc_length")?);
+    // Validate the documented invariant: field_lengths must sum to doc_length.
+    let field_sum: u32 = field_lengths.iter().sum();
+    if field_sum != doc_length {
+        return Err(SearchError::IndexCorrupted(format!(
+            "file_meta: field_lengths sum ({field_sum}) != doc_length ({doc_length})"
+        )));
+    }
     Ok(FileMetaEntry {
         lang_id: data[0],
-        doc_length: u32::from_le_bytes(read_array(data, 1, "file_meta: doc_length")?),
+        doc_length,
         field_lengths,
     })
 }
