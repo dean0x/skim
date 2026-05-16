@@ -230,7 +230,7 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
         f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?);
     if !avg_doc_length.is_finite() || avg_doc_length < 0.0 {
         return Err(SearchError::IndexCorrupted(format!(
-            "header: avg_doc_length is not a valid non-negative finite float: {avg_doc_length}"
+            "header: avg_doc_length must be a finite number >= 0.0, got {avg_doc_length}"
         )));
     }
 
@@ -241,7 +241,7 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
         let raw = f32::from_le_bytes(read_array(data, start, "header: avg_field_lengths")?);
         if !raw.is_finite() || raw < 0.0 {
             return Err(SearchError::IndexCorrupted(format!(
-                "header: avg_field_lengths[{i}] is not a valid non-negative finite float: {raw}"
+                "header: avg_field_lengths[{i}] must be a finite number >= 0.0, got {raw}"
             )));
         }
         *v = raw;

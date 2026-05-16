@@ -47,7 +47,6 @@ use crate::SearchField;
 /// blocks) are kept in sync with `rskim_core::transform::utils::node_kind_info`
 /// and `rskim_core::transform::utils::find_body_child`. Any new node kind
 /// categories added to those functions may need a corresponding case here.
-// COUPLING: synced with rskim_core::transform::utils::node_kind_info and find_body_child
 fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
     // First check for specific comment/string kinds regardless of priority.
     match kind {
@@ -106,6 +105,14 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
     }
 }
 
+/// Maximum source size (in bytes) accepted by [`classify_source`].
+///
+/// The classifier allocates a per-byte `Vec<SearchField>`, so accepting
+/// unbounded input would allow a caller to trigger proportional memory
+/// allocation. 100 MiB is generous for any real source file while keeping
+/// peak RSS bounded.
+pub const MAX_SOURCE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
+
 /// Classify all bytes in `source` according to their AST-derived field.
 ///
 /// Returns a sorted, non-overlapping, contiguous list of `(Range<usize>, SearchField)`
@@ -119,15 +126,6 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
 /// Returns [`crate::SearchError`] if the tree-sitter parser fails to initialise
 /// (grammar loading failure, which should not happen in practice for supported
 /// languages).
-
-/// Maximum source size (in bytes) accepted by [`classify_source`].
-///
-/// The classifier allocates a per-byte `Vec<SearchField>`, so accepting
-/// unbounded input would allow a caller to trigger proportional memory
-/// allocation. 100 MiB is generous for any real source file while keeping
-/// peak RSS bounded.
-pub const MAX_SOURCE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
-
 pub fn classify_source(
     source: &str,
     lang: Language,

@@ -2365,7 +2365,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
- "tree-sitter",
 ]
 
 [[package]]
