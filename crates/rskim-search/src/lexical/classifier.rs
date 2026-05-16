@@ -208,8 +208,8 @@ fn build_field_ranges(
 
     // Track which byte intervals are still unclaimed. Starts as the full source.
     // Double-buffer to reuse allocations across iterations.
-    let initial_range = 0..source_len;
-    let mut uncovered: Vec<Range<usize>> = vec![initial_range];
+    let mut uncovered: Vec<Range<usize>> = vec![];
+    uncovered.push(0..source_len);
     let mut next_uncovered: Vec<Range<usize>> = Vec::new();
     let mut result: Vec<(Range<usize>, SearchField)> = Vec::with_capacity(node_ranges.len() * 2);
 
