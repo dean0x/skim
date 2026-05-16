@@ -75,7 +75,12 @@ fn test_source_exceeding_limit_returns_error() {
     );
 }
 
+/// Verifies that a source of exactly MAX_SOURCE_BYTES is accepted, not rejected.
+///
+/// This test allocates ~100 MiB, which is excessive for a normal CI run.
+/// Run it explicitly with `cargo test -- --ignored` when changing the size guard.
 #[test]
+#[ignore = "allocates 100 MiB — run explicitly with --ignored"]
 fn test_source_at_limit_boundary_does_not_error() {
     // A source of exactly MAX_SOURCE_BYTES bytes must NOT be rejected.
     // We use JSON (non-tree-sitter) so this stays fast even at 100 MiB;
@@ -201,6 +206,60 @@ fn test_field_lengths_sum_equals_source_len_rust() {
     let source = "fn main() { let x: u32 = 42; }";
     let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
     assert_field_lengths_sum(&ranges, source.len());
+}
+
+// -----------------------------------------------------------------------
+// Body block classification
+// -----------------------------------------------------------------------
+
+/// Body blocks (`{ ... }`) must be classified as FunctionBody, not
+/// FunctionSignature. Before this fix, block/statement_block nodes returned
+/// Other from map_priority_to_field and were overwritten by the parent
+/// function node's FunctionSignature stamp, inflating FunctionSignature lengths.
+#[test]
+fn test_rust_function_body_classified_as_function_body() {
+    // The block `{ x * 2 }` is the function body.
+    let source = "fn compute(x: u32) -> u32 { x * 2 }";
+    let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
+    assert_contiguous(&ranges, source.len());
+
+    let has_body = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::FunctionBody);
+    assert!(
+        has_body,
+        "Rust function body should produce FunctionBody range; got: {ranges:?}"
+    );
+}
+
+#[test]
+fn test_typescript_function_body_classified_as_function_body() {
+    let source = "function greet(name: string): string { return name; }\n";
+    let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
+    assert_contiguous(&ranges, source.len());
+
+    let has_body = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::FunctionBody);
+    assert!(
+        has_body,
+        "TypeScript function body should produce FunctionBody range; got: {ranges:?}"
+    );
+}
+
+#[test]
+fn test_c_compound_statement_classified_as_function_body() {
+    let source = "int add(int a, int b) { return a + b; }\n";
+    let ranges = classify_source(source, rskim_core::Language::C).unwrap();
+    assert_contiguous(&ranges, source.len());
+
+    let has_body = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::FunctionBody);
+    assert!(
+        has_body,
+        "C compound_statement should produce FunctionBody range; got: {ranges:?}"
+    );
 }
 
 // -----------------------------------------------------------------------

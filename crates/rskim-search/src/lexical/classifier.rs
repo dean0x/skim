@@ -40,6 +40,14 @@ use crate::SearchField;
 ///
 /// Comments and string literals get their own fields via dedicated node kinds
 /// handled in [`classify_node_kind`].
+///
+/// # Coupling
+///
+/// The specific node kinds matched here (comments, strings, identifiers, body
+/// blocks) are kept in sync with `rskim_core::transform::utils::node_kind_info`
+/// and `rskim_core::transform::utils::find_body_child`. Any new node kind
+/// categories added to those functions may need a corresponding case here.
+// COUPLING: synced with rskim_core::transform::utils::node_kind_info and find_body_child
 fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
     // First check for specific comment/string kinds regardless of priority.
     match kind {
@@ -66,6 +74,27 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
         | "attribute_name" => {
             return SearchField::SymbolName;
         }
+        // Body/block nodes → FunctionBody.
+        //
+        // Without this arm, block nodes return Other from the priority match
+        // below (priority 1) and are skipped by the innermost-wins rule
+        // (Other is the default fill — we only overwrite non-Other). The parent
+        // function node has already stamped those bytes as FunctionSignature,
+        // so they remain FunctionSignature even though they are body bytes.
+        // This inflates FunctionSignature field lengths by the full body size,
+        // which artificially raises BM25F scores for body-content queries.
+        //
+        // Kinds here mirror rskim_core::transform::utils::find_body_child (the
+        // union of all body kinds across supported languages).
+        "block"              // Rust, Python, Go, Java, C#, Kotlin
+        | "statement_block" // TypeScript, JavaScript
+        | "compound_statement" // C, C++
+        | "constructor_body"   // Java
+        | "body_statement"     // Ruby
+        | "function_body" => {
+            // Kotlin, Swift
+            return SearchField::FunctionBody;
+        }
         _ => {}
     }
 
@@ -90,6 +119,7 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
 /// Returns [`crate::SearchError`] if the tree-sitter parser fails to initialise
 /// (grammar loading failure, which should not happen in practice for supported
 /// languages).
+
 /// Maximum source size (in bytes) accepted by [`classify_source`].
 ///
 /// The classifier allocates a per-byte `Vec<SearchField>`, so accepting
