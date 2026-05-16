@@ -190,6 +190,59 @@ impl NgramIndexReader {
         decode_file_meta(&self.idx_mmap[offset..end])
     }
 
+    /// Score the candidates accumulated in `tf_per_doc` for a single ngram iteration.
+    ///
+    /// For each candidate document this method:
+    /// 1. Resolves (and caches) the file metadata via `doc_meta_cache`.
+    /// 2. Applies the language filter — skips documents whose `lang_id` doesn't match.
+    /// 3. Accumulates per-field TF counts into `doc_field_tfs` for [`dominant_field`].
+    /// 4. Computes the BM25F contribution and adds it to `doc_scores`.
+    /// 5. Transfers any buffered positions from `pos_per_doc` into `doc_positions`.
+    #[allow(clippy::too_many_arguments)]
+    fn score_ngram_postings(
+        &self,
+        idf: f64,
+        tf_per_doc: &HashMap<u32, [f32; FIELD_COUNT]>,
+        pos_per_doc: &mut HashMap<u32, Vec<std::ops::Range<usize>>>,
+        lang_filter: Option<u8>,
+        scoring_config: &BM25FConfig,
+        doc_scores: &mut HashMap<u32, f64>,
+        doc_field_tfs: &mut HashMap<u32, [f32; FIELD_COUNT]>,
+        doc_positions: &mut HashMap<u32, Vec<std::ops::Range<usize>>>,
+        doc_meta_cache: &mut HashMap<u32, FileMetaEntry>,
+    ) -> Result<()> {
+        for (&doc_id, field_tfs) in tf_per_doc {
+            if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(doc_id) {
+                let meta = self.file_meta_at(doc_id)?;
+                e.insert(meta);
+            }
+            let meta = &doc_meta_cache[&doc_id];
+
+            if lang_filter.is_some_and(|required_lang| meta.lang_id != required_lang) {
+                continue;
+            }
+
+            let doc_tfs = doc_field_tfs.entry(doc_id).or_insert([0.0; FIELD_COUNT]);
+            for i in 0..FIELD_COUNT {
+                doc_tfs[i] += field_tfs[i];
+            }
+
+            let contribution = bm25f_score(
+                idf,
+                field_tfs,
+                &meta.field_lengths,
+                &self.header.avg_field_lengths,
+                scoring_config,
+            );
+            *doc_scores.entry(doc_id).or_default() += contribution;
+
+            if let Some(positions) = pos_per_doc.remove(&doc_id) {
+                doc_positions.entry(doc_id).or_default().extend(positions);
+            }
+        }
+        Ok(())
+    }
+
     /// Retrieve all posting entries for `ngram_key` from the mmap'd posting file.
     fn lookup_postings(&self, ngram_key: u16) -> Result<Vec<super::format::PostingEntry>> {
         let entries_start = SKIDX_HEADER_SIZE;
@@ -312,38 +365,17 @@ impl SearchLayer for NgramIndexReader {
 
             // Second sub-pass: apply language filter, score, and transfer positions
             // only for documents that survive all filters.
-            for (&doc_id, field_tfs) in &tf_per_doc {
-                // Resolve or cache file metadata.
-                if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(doc_id) {
-                    let meta = self.file_meta_at(doc_id)?;
-                    e.insert(meta);
-                }
-                let meta = &doc_meta_cache[&doc_id];
-
-                if lang_filter.is_some_and(|required_lang| meta.lang_id != required_lang) {
-                    continue;
-                }
-
-                // Accumulate per-field TFs across ngrams for dominant_field().
-                let doc_tfs = doc_field_tfs.entry(doc_id).or_insert([0.0; FIELD_COUNT]);
-                for i in 0..FIELD_COUNT {
-                    doc_tfs[i] += field_tfs[i];
-                }
-
-                let contribution = bm25f_score(
-                    idf,
-                    field_tfs,
-                    &meta.field_lengths,
-                    &self.header.avg_field_lengths,
-                    scoring_config,
-                );
-                *doc_scores.entry(doc_id).or_default() += contribution;
-
-                // Transfer positions now that we know this doc passes all filters.
-                if let Some(positions) = pos_per_doc.remove(&doc_id) {
-                    doc_positions.entry(doc_id).or_default().extend(positions);
-                }
-            }
+            self.score_ngram_postings(
+                idf,
+                &tf_per_doc,
+                &mut pos_per_doc,
+                lang_filter,
+                scoring_config,
+                &mut doc_scores,
+                &mut doc_field_tfs,
+                &mut doc_positions,
+                &mut doc_meta_cache,
+            )?;
         }
 
         let mut scored: Vec<(u32, f64)> = doc_scores.into_iter().collect();
