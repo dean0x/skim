@@ -2021,3 +2021,43 @@ fn test_rewrite_docker_host_before_ps() {
         .success()
         .stdout(predicate::str::contains("\"match\":true"));
 }
+
+// ============================================================================
+// DNS rewrite rules: dig and nslookup (#168)
+// ============================================================================
+
+#[test]
+fn test_rewrite_dig_fires() {
+    skim_cmd()
+        .args(["rewrite", "dig", "example.com", "A"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim dig"));
+}
+
+#[test]
+fn test_rewrite_dig_short_skipped() {
+    // `dig +short` produces already-compact output — rewrite should not fire.
+    skim_cmd()
+        .args(["rewrite", "dig", "+short", "example.com"])
+        .assert()
+        .failure(); // No match = exit 1
+}
+
+#[test]
+fn test_rewrite_dig_trace_skipped() {
+    // `dig +trace` produces streaming diagnostic output — rewrite should not fire.
+    skim_cmd()
+        .args(["rewrite", "dig", "+trace", "example.com"])
+        .assert()
+        .failure(); // No match = exit 1
+}
+
+#[test]
+fn test_rewrite_nslookup_fires() {
+    skim_cmd()
+        .args(["rewrite", "nslookup", "example.com"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim nslookup"));
+}
