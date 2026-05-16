@@ -536,26 +536,50 @@ fn test_ac4_scoring_deterministic() {
     }
 }
 
-/// Verify that open_with_config() applies the provided BM25FConfig correctly.
+/// Verify that open_with_config() applies the provided BM25FConfig correctly,
+/// producing different scores than the default config.
 #[test]
 fn test_open_with_config_stores_config() {
     use crate::lexical::BM25FConfig;
 
     let dir = tmp_dir();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    // Repeat "main" several times so tf_weighted is large enough that changing
+    // k1 from 1.2 (default) to 2.0 produces a measurable score difference.
+    // BM25F saturation formula: IDF * tf_weighted / (tf_weighted + k1)
     builder
-        .add_file(FileId(0), "fn main() {}", rskim_core::Language::Rust)
+        .add_file(
+            FileId(0),
+            "fn main() { let main_count = 1; main_count + main_count; }",
+            rskim_core::Language::Rust,
+        )
         .unwrap();
     builder.build().unwrap();
 
+    // Open twice: once with the default config, once with k1 = 2.0.
+    let default_reader = NgramIndexReader::open(dir.path()).unwrap();
     let mut custom_config = BM25FConfig::default();
-    custom_config.k1 = 2.0; // non-default value
-    let reader = NgramIndexReader::open_with_config(dir.path(), custom_config).unwrap();
-    // Smoke test: search returns results without panicking.
-    let results = reader.search(&SearchQuery::new("main")).unwrap();
+    custom_config.k1 = 2.0; // higher k1 → lower saturation → lower score
+    let custom_reader = NgramIndexReader::open_with_config(dir.path(), custom_config).unwrap();
+
+    let default_results = default_reader.search(&SearchQuery::new("main")).unwrap();
+    let custom_results = custom_reader.search(&SearchQuery::new("main")).unwrap();
+
+    // Both configs must find the document.
+    assert!(!default_results.is_empty(), "default config should find results");
+    assert!(!custom_results.is_empty(), "custom config should find results");
+
+    // A higher k1 value reduces score saturation, so scores must differ.
+    let default_score = default_results[0].score;
+    let custom_score = custom_results[0].score;
     assert!(
-        !results.is_empty(),
-        "custom config reader should still find results"
+        (default_score - custom_score).abs() > 1e-6,
+        "k1=1.2 score ({default_score}) and k1=2.0 score ({custom_score}) should differ"
+    );
+    // k1=1.2 saturates faster than k1=2.0, so the default score should be higher.
+    assert!(
+        default_score > custom_score,
+        "default k1=1.2 should score higher than k1=2.0 (less saturation dampening)"
     );
 }
 
