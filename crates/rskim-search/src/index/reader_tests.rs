@@ -613,6 +613,60 @@ fn test_search_result_field_populated_from_dominant_field() {
 }
 
 // -----------------------------------------------------------------------
+// BM25FConfig validation at trust boundaries
+// -----------------------------------------------------------------------
+
+/// open_with_config() must reject an invalid BM25FConfig before opening the index.
+#[test]
+fn test_open_with_config_rejects_invalid_config() {
+    use crate::lexical::BM25FConfig;
+
+    let dir = tmp_dir();
+    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+    builder
+        .add_file(FileId(0), "fn main() {}", rskim_core::Language::Rust)
+        .unwrap();
+    builder.build().unwrap();
+
+    let mut bad_config = BM25FConfig::default();
+    bad_config.k1 = -1.0; // invalid: must be >= 0.0
+
+    let result = NgramIndexReader::open_with_config(dir.path(), bad_config);
+    assert!(
+        result.is_err(),
+        "open_with_config should reject an invalid BM25FConfig"
+    );
+    if let Err(e) = result {
+        let err = format!("{e}");
+        assert!(
+            err.contains("k1"),
+            "error should mention k1, got: {err}"
+        );
+    }
+}
+
+/// search() must reject a per-query BM25FConfig with invalid parameters.
+#[test]
+fn test_search_rejects_invalid_per_query_config() {
+    use crate::lexical::BM25FConfig;
+
+    let (_dir, layer) =
+        build_index_with(&[(FileId(0), "fn main() {}", rskim_core::Language::Rust)]);
+
+    let mut bad_config = BM25FConfig::default();
+    bad_config.field_b[0] = 1.5; // invalid: must be in [0.0, 1.0]
+
+    let mut query = SearchQuery::new("main");
+    query.bm25f_config = Some(bad_config);
+
+    let result = layer.search(&query);
+    assert!(
+        result.is_err(),
+        "search() should reject an invalid per-query BM25FConfig"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Large-index benchmark (release mode only)
 // -----------------------------------------------------------------------
 

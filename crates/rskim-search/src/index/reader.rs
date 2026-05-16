@@ -149,8 +149,10 @@ impl NgramIndexReader {
     ///
     /// # Errors
     ///
-    /// Same conditions as [`NgramIndexReader::open`].
+    /// - Same conditions as [`NgramIndexReader::open`].
+    /// - [`SearchError::InvalidQuery`] if `config` fails validation.
     pub fn open_with_config(dir: &std::path::Path, config: BM25FConfig) -> Result<Self> {
+        config.validate()?;
         let mut reader = Self::open(dir)?;
         reader.bm25f_config = config;
         Ok(reader)
@@ -262,8 +264,14 @@ impl SearchLayer for NgramIndexReader {
         }
 
         // Resolve scoring config: per-query override takes priority.
-        let scoring_config: &BM25FConfig =
-            query.bm25f_config.as_ref().unwrap_or(&self.bm25f_config);
+        // Validate at the trust boundary so invalid params are rejected early.
+        let scoring_config: &BM25FConfig = match &query.bm25f_config {
+            Some(cfg) => {
+                cfg.validate()?;
+                cfg
+            }
+            None => &self.bm25f_config,
+        };
 
         // Language filter resolved up-front so we can skip scoring documents that
         // won't pass the filter.
@@ -282,27 +290,25 @@ impl SearchLayer for NgramIndexReader {
             let postings = self.lookup_postings(ngram.key())?;
             let idf = f64::from(idf_for_key(ngram.key()));
 
-            // Single pass: accumulate per-field TF counts and positions.
+            // First sub-pass: accumulate per-field TF counts and candidate positions,
+            // skipping doc_ids that are out of range (never valid).
             let mut tf_per_doc: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
+            let mut pos_per_doc: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
             for p in &postings {
+                if p.doc_id >= self.header.file_count {
+                    continue; // out-of-range doc_ids are never valid
+                }
                 let field_idx = p.field_id as usize;
                 if field_idx < FIELD_COUNT {
                     tf_per_doc.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
                 }
                 let pos = p.position as usize;
-                doc_positions
-                    .entry(p.doc_id)
-                    .or_default()
-                    .push(pos..pos + 2);
+                pos_per_doc.entry(p.doc_id).or_default().push(pos..pos + 2);
             }
 
+            // Second sub-pass: apply language filter, score, and transfer positions
+            // only for documents that survive all filters.
             for (doc_id, field_tfs) in tf_per_doc {
-                // Apply language filter before scoring to avoid decoding metadata
-                // for documents that won't appear in results.
-                if doc_id >= self.header.file_count {
-                    continue;
-                }
-
                 // Resolve or cache file metadata.
                 if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(doc_id) {
                     let meta = self.file_meta_at(doc_id)?;
@@ -328,12 +334,18 @@ impl SearchLayer for NgramIndexReader {
                     scoring_config,
                 );
                 *doc_scores.entry(doc_id).or_default() += contribution;
+
+                // Transfer positions now that we know this doc passes all filters.
+                if let Some(positions) = pos_per_doc.remove(&doc_id) {
+                    doc_positions.entry(doc_id).or_default().extend(positions);
+                }
             }
         }
 
         let mut scored: Vec<(u32, f64)> = doc_scores.into_iter().collect();
         // Sort descending by score; tie-break ascending by FileId for determinism.
-        scored.sort_by(|a, b| {
+        // FileId tie-breaking already guarantees a total order so stable sort is not needed.
+        scored.sort_unstable_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
