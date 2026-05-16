@@ -256,8 +256,7 @@ impl LayerBuilder for NgramIndexBuilder {
     where
         Self: Sized,
     {
-        // Compute corpus averages. Both avg_doc_length and avg_field_lengths share
-        // the same divisor, so evaluate it once and default to 0.0 for empty indexes.
+        // Compute corpus averages.
         let (avg_doc_length, avg_field_lengths) = if self.file_count == 0 {
             (0.0f32, [0.0f32; FIELD_COUNT])
         } else {
@@ -270,18 +269,42 @@ impl LayerBuilder for NgramIndexBuilder {
             (avg_doc, avgs)
         };
 
-        // Sort each posting list by (doc_id, field_id, position).
+        // Sort posting lists and ngram keys.
         for list in self.postings.values_mut() {
             list.sort_unstable();
         }
-
-        // Sort ngram keys for the lookup table.
         let mut sorted_keys: Vec<u16> = self.postings.keys().copied().collect();
         sorted_keys.sort_unstable();
 
+        // Serialise everything into the two on-disk buffers.
+        let (postings_buf, skidx_buf) = self.serialize_index(
+            &sorted_keys,
+            avg_doc_length,
+            avg_field_lengths,
+        )?;
+
+        let post_path = self.output_dir.join("index.skpost");
+        let idx_path = self.output_dir.join("index.skidx");
+
+        // Atomic writes: .skpost first, .skidx second (commit point).
+        Self::atomic_write(&self.output_dir, &post_path, &postings_buf)?;
+        Self::atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
+
+        let reader = NgramIndexReader::open(&self.output_dir)?;
+        Ok(Box::new(reader))
+    }
+}
+
+impl NgramIndexBuilder {
+    /// Serialise postings, entries, file metadata, and header into the two
+    /// on-disk byte buffers: `(postings_buf, skidx_buf)`.
+    fn serialize_index(
+        &self,
+        sorted_keys: &[u16],
+        avg_doc_length: f32,
+        avg_field_lengths: [f32; FIELD_COUNT],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         // Serialise posting lists and build the entry table.
-        // Pre-size the buffer to avoid O(log n) reallocations: each posting
-        // entry is exactly POSTING_ENTRY_SIZE bytes.
         let total_posting_bytes: usize = self
             .postings
             .values()
@@ -290,7 +313,7 @@ impl LayerBuilder for NgramIndexBuilder {
         let mut postings_buf: Vec<u8> = Vec::with_capacity(total_posting_bytes);
         let mut entries: Vec<SkidxEntry> = Vec::with_capacity(sorted_keys.len());
 
-        for key in &sorted_keys {
+        for key in sorted_keys {
             let list = &self.postings[key];
             let offset = postings_buf.len() as u64;
             let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
@@ -325,7 +348,7 @@ impl LayerBuilder for NgramIndexBuilder {
             entries_buf.extend_from_slice(&encode_entry(e));
         }
 
-        // CRC32 over entry array + file metadata (contiguous).
+        // CRC32 over entries + file metadata.
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&entries_buf);
         hasher.update(&meta_buf);
@@ -346,22 +369,14 @@ impl LayerBuilder for NgramIndexBuilder {
             checksum,
         };
 
-        // Assemble .skidx bytes: header + entries + file_meta.
+        // Assemble .skidx: header + entries + file_meta.
         let mut skidx_buf =
             Vec::with_capacity(SKIDX_HEADER_SIZE + entries_buf.len() + meta_buf.len());
         skidx_buf.extend_from_slice(&encode_header(&header));
         skidx_buf.extend_from_slice(&entries_buf);
         skidx_buf.extend_from_slice(&meta_buf);
 
-        let post_path = self.output_dir.join("index.skpost");
-        let idx_path = self.output_dir.join("index.skidx");
-
-        // Atomic writes: .skpost first, .skidx second (commit point).
-        Self::atomic_write(&self.output_dir, &post_path, &postings_buf)?;
-        Self::atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
-
-        let reader = NgramIndexReader::open(&self.output_dir)?;
-        Ok(Box::new(reader))
+        Ok((postings_buf, skidx_buf))
     }
 }
 

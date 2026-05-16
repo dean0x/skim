@@ -3,11 +3,12 @@
 //! # Algorithm
 //!
 //! 1. Parse `source` via [`rskim_core::Parser`] for the given language.
-//! 2. Walk the tree in pre-order, mapping each node kind to a [`SearchField`] via
-//!    [`rskim_core::node_kind_priority`] and [`map_priority_to_field`].
-//! 3. Fill a per-byte `field_at` array: children overwrite parents (innermost wins).
-//! 4. Run-length encode the result into a sorted, non-overlapping, contiguous range
-//!    list.
+//! 2. Walk the tree in pre-order, collecting non-`Other` `(Range, SearchField)` tuples.
+//!    Memory: O(AST nodes), not O(source bytes).
+//! 3. Process ranges in reverse (innermost/children first) using interval subtraction
+//!    against an "uncovered" set so that the deepest node wins each byte.
+//! 4. Fill uncovered gaps with `SearchField::Other`, then merge adjacent same-field
+//!    ranges.
 //!
 //! # Non-tree-sitter languages
 //!
@@ -107,10 +108,9 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
 
 /// Maximum source size (in bytes) accepted by [`classify_source`].
 ///
-/// The classifier allocates a per-byte `Vec<SearchField>`, so accepting
-/// unbounded input would allow a caller to trigger proportional memory
-/// allocation. 100 MiB is generous for any real source file while keeping
-/// peak RSS bounded.
+/// Although the classifier allocates O(AST nodes) rather than O(source bytes),
+/// an unbounded source could still trigger proportional tree-sitter parsing
+/// time. 100 MiB is generous for any real source file.
 pub const MAX_SOURCE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
 /// Classify all bytes in `source` according to their AST-derived field.
@@ -155,11 +155,10 @@ pub fn classify_source(
     let tree = parser.parse(source)?;
     let root = tree.root_node();
 
-    // Allocate per-byte field array, initialised to Other.
-    let mut field_at: Vec<SearchField> = vec![SearchField::Other; len];
+    // Collect non-Other AST node ranges in pre-order (parents before children).
+    // Memory: O(AST_nodes) instead of the previous O(source_bytes) per-byte array.
+    let mut node_ranges: Vec<(Range<usize>, SearchField)> = Vec::new();
 
-    // Pre-order walk: children are processed after parents, so they overwrite
-    // (innermost wins).
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
@@ -174,13 +173,8 @@ pub fn classify_source(
             let priority = rskim_core::node_kind_priority(kind);
             let field = map_priority_to_field(kind, priority);
 
-            // Only overwrite if this field is more specific than Other.
-            // Other is the default; we only stamp non-Other fields so that
-            // an unrecognised parent doesn't clobber a specific child.
             if field != SearchField::Other {
-                for byte in &mut field_at[start..end] {
-                    *byte = field;
-                }
+                node_ranges.push((start..end, field));
             }
         }
 
@@ -188,43 +182,85 @@ pub fn classify_source(
         if cursor.goto_first_child() {
             continue;
         }
-        // No children — try next sibling.
         loop {
             if cursor.goto_next_sibling() {
                 break;
             }
-            // No sibling — go up.
             if !cursor.goto_parent() {
-                // Reached root — traversal complete.
-                return Ok(run_length_encode(field_at, len));
+                return Ok(build_field_ranges(node_ranges, len));
             }
         }
     }
 }
 
-/// Run-length encode a per-byte field array into a sorted range list.
+/// Build the final contiguous range list from pre-order node ranges.
 ///
-/// Adjacent bytes with the same field are merged into one `Range<usize>`.
-/// The output is sorted, non-overlapping, and covers `[0..len)`.
-fn run_length_encode(field_at: Vec<SearchField>, len: usize) -> Vec<(Range<usize>, SearchField)> {
-    if len == 0 {
-        return Vec::new();
+/// Implements "innermost wins": processes ranges in reverse (children first)
+/// so deeper nodes claim bytes before their parents. Uncovered bytes become
+/// [`SearchField::Other`]. Adjacent same-field ranges are merged.
+fn build_field_ranges(
+    node_ranges: Vec<(Range<usize>, SearchField)>,
+    source_len: usize,
+) -> Vec<(Range<usize>, SearchField)> {
+    if node_ranges.is_empty() {
+        return vec![(0..source_len, SearchField::Other)];
     }
 
-    let mut result = Vec::new();
-    let mut start = 0usize;
-    let mut current = field_at[0];
+    // Track which byte intervals are still unclaimed. Starts as the full source.
+    // Double-buffer to reuse allocations across iterations.
+    let initial_range = 0..source_len;
+    let mut uncovered: Vec<Range<usize>> = vec![initial_range];
+    let mut next_uncovered: Vec<Range<usize>> = Vec::new();
+    let mut result: Vec<(Range<usize>, SearchField)> = Vec::with_capacity(node_ranges.len() * 2);
 
-    for (i, &f) in field_at.iter().enumerate().skip(1) {
-        if f != current {
-            result.push((start..i, current));
-            start = i;
-            current = f;
+    // Reverse: children (later in pre-order) claim bytes before parents.
+    for (range, field) in node_ranges.into_iter().rev() {
+        next_uncovered.clear();
+
+        for unc in &uncovered {
+            if unc.end <= range.start || unc.start >= range.end {
+                // No overlap — interval stays uncovered.
+                next_uncovered.push(unc.clone());
+            } else {
+                // Overlap — split around the claimed region.
+                if unc.start < range.start {
+                    next_uncovered.push(unc.start..range.start);
+                }
+                result.push((unc.start.max(range.start)..unc.end.min(range.end), field));
+                if unc.end > range.end {
+                    next_uncovered.push(range.end..unc.end);
+                }
+            }
+        }
+
+        std::mem::swap(&mut uncovered, &mut next_uncovered);
+    }
+
+    // Remaining uncovered bytes → Other.
+    for gap in uncovered {
+        result.push((gap, SearchField::Other));
+    }
+
+    result.sort_unstable_by_key(|(r, _)| r.start);
+    merge_adjacent(&mut result);
+    result
+}
+
+/// Merge adjacent ranges that share the same field into a single range.
+fn merge_adjacent(ranges: &mut Vec<(Range<usize>, SearchField)>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        if ranges[read].1 == ranges[write].1 && ranges[read].0.start == ranges[write].0.end {
+            ranges[write].0.end = ranges[read].0.end;
+        } else {
+            write += 1;
+            ranges[write] = ranges[read].clone();
         }
     }
-    // Push the final segment.
-    result.push((start..len, current));
-    result
+    ranges.truncate(write + 1);
 }
 
 // ============================================================================
