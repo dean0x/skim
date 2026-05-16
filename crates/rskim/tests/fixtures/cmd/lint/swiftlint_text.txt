@@ -1,0 +1,3 @@
+/path/to/Sources/MyApp/ContentView.swift:15:1: warning: Line Length Violation: Line should be 120 characters or less; currently it is 135 characters (line_length)
+/path/to/Sources/MyApp/ContentView.swift:42:5: error: Force Cast Violation: Force casts should be avoided (force_cast)
+Done linting! Found 2 violations, 1 serious in 5 files.

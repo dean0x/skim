@@ -1,18 +1,33 @@
-//! Test handler — dispatches to test runner parsers (#46, #47, #48, #49)
+//! Test handler — dispatches to test runner parsers (#46, #47, #48, #49, #118)
 //!
 //! Routes `skim <runner> [args...]` to the appropriate test parser.
-//! Currently supported runners: `cargo`, `go`, `vitest`, `jest`, `pytest`.
+//! Supported runners: `cargo`, `go`, `vitest`, `jest`, `pytest`, `playwright`,
+//! `cypress`, `swift`, `dotnet`.
 
 pub(crate) mod cargo;
+pub(crate) mod cypress;
+pub(crate) mod dotnet;
 pub(crate) mod go;
+pub(crate) mod playwright;
 mod pytest;
 mod shared;
+pub(crate) mod swift;
 pub(crate) mod vitest;
 
 use std::process::ExitCode;
 
 /// Known test runners that the test handler can dispatch to.
-const KNOWN_RUNNERS: &[&str] = &["cargo", "go", "vitest", "jest", "pytest"];
+const KNOWN_RUNNERS: &[&str] = &[
+    "cargo",
+    "cypress",
+    "dotnet",
+    "go",
+    "jest",
+    "playwright",
+    "pytest",
+    "swift",
+    "vitest",
+];
 
 /// Entry point for `skim <runner> [args...]` (test runners).
 ///
@@ -44,9 +59,13 @@ pub(crate) fn run(
 
     match runner {
         "cargo" => cargo::run(runner_args, show_stats, rec),
+        "cypress" => cypress::run(runner_args, show_stats, rec),
+        "dotnet" => dotnet::run(runner_args, show_stats, rec),
         "go" => go::run(runner_args, show_stats, rec),
+        "playwright" => playwright::run(runner_args, show_stats, rec),
         "vitest" | "jest" => vitest::run(runner, runner_args, show_stats, rec),
         "pytest" => pytest::run(runner_args, show_stats, rec),
+        "swift" => swift::run(runner_args, show_stats, rec),
         _ => {
             let safe_runner = crate::cmd::sanitize_for_display(runner);
             eprintln!(

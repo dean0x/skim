@@ -563,3 +563,192 @@ fn test_alignment_gmake_rewrite() {
         .success()
         .stdout(predicate::str::contains("skim make"));
 }
+
+// ============================================================================
+// New parsers (#118): rewrite-to-handler alignment
+// ============================================================================
+
+/// Verify `playwright test` rewrites to `skim playwright` AND the handler
+/// processes playwright JSON output correctly.
+#[test]
+fn test_alignment_playwright_test_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "playwright", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim playwright"));
+
+    let fixture = include_str!("fixtures/cmd/test/playwright_pass.json");
+    skim_cmd()
+        .args(["playwright", "test"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pass:"));
+}
+
+/// Verify `cypress run` rewrites to `skim cypress` AND the handler processes
+/// cypress JSON output correctly.
+#[test]
+fn test_alignment_cypress_run_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "cypress", "run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim cypress"));
+
+    let fixture = include_str!("fixtures/cmd/test/cypress_pass.json");
+    skim_cmd()
+        .args(["cypress", "run"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pass:"));
+}
+
+/// Verify `swift test` rewrites to `skim swift test` AND the handler processes
+/// XCTest text output correctly.
+#[test]
+fn test_alignment_swift_test_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "swift", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim swift test"));
+
+    let fixture = include_str!("fixtures/cmd/test/swift_pass.txt");
+    skim_cmd()
+        .args(["swift", "test"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pass:"));
+}
+
+/// Verify `dotnet test` rewrites to `skim dotnet test` AND the handler
+/// processes dotnet console summary output correctly.
+#[test]
+fn test_alignment_dotnet_test_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "dotnet", "test"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim dotnet test"));
+
+    let fixture = include_str!("fixtures/cmd/test/dotnet_pass.txt");
+    skim_cmd()
+        .args(["dotnet", "test"])
+        .write_stdin(fixture)
+        .assert()
+        .stdout(predicate::str::contains("pass:"));
+}
+
+/// Verify `gradle build` rewrites to `skim gradle` (build dispatcher).
+#[test]
+fn test_alignment_gradle_build_rewrite() {
+    skim_cmd()
+        .args(["rewrite", "gradle", "build"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim gradle"));
+}
+
+/// Verify `mvn compile` rewrites to `skim mvn` (build dispatcher).
+#[test]
+fn test_alignment_mvn_compile_rewrite() {
+    skim_cmd()
+        .args(["rewrite", "mvn", "compile"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim mvn"));
+}
+
+/// Verify `rubocop` rewrites to `skim rubocop` AND the handler processes
+/// rubocop JSON output correctly.
+#[test]
+fn test_alignment_rubocop_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "rubocop"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim rubocop"));
+
+    let fixture = include_str!("fixtures/cmd/lint/rubocop_fail.json");
+    skim_cmd()
+        .args(["rubocop"])
+        .write_stdin(fixture)
+        .assert()
+        .stdout(predicate::str::contains("rubocop"));
+}
+
+/// Verify `swiftlint` rewrites to `skim swiftlint` AND the handler processes
+/// swiftlint JSON output correctly.
+#[test]
+fn test_alignment_swiftlint_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "swiftlint"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim swiftlint"));
+
+    let fixture = include_str!("fixtures/cmd/lint/swiftlint_fail.json");
+    skim_cmd()
+        .args(["swiftlint"])
+        .write_stdin(fixture)
+        .assert()
+        .stdout(predicate::str::contains("swiftlint"));
+}
+
+/// Verify `yarn install` rewrites to `skim yarn install` AND the handler
+/// processes yarn NDJSON install output correctly.
+#[test]
+fn test_alignment_yarn_install_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "yarn", "install"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim yarn install"));
+
+    let fixture = include_str!("fixtures/cmd/pkg/yarn_install.ndjson");
+    skim_cmd()
+        .args(["yarn", "install"])
+        .write_stdin(fixture)
+        .assert()
+        .stdout(predicate::str::contains("yarn install"));
+}
+
+/// Verify `yarn audit` rewrites to `skim yarn audit` AND the handler processes
+/// yarn audit NDJSON output correctly.
+#[test]
+fn test_alignment_yarn_audit_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "yarn", "audit"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim yarn audit"));
+
+    let fixture = include_str!("fixtures/cmd/pkg/yarn_audit.ndjson");
+    skim_cmd()
+        .args(["yarn", "audit"])
+        .write_stdin(fixture)
+        .assert()
+        .stdout(predicate::str::contains("yarn audit"));
+}
+
+/// Verify `yarn outdated` rewrites to `skim yarn outdated` AND the handler
+/// processes yarn outdated NDJSON output correctly.
+#[test]
+fn test_alignment_yarn_outdated_rewrite_and_handler() {
+    skim_cmd()
+        .args(["rewrite", "yarn", "outdated"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skim yarn outdated"));
+
+    let fixture = include_str!("fixtures/cmd/pkg/yarn_outdated.ndjson");
+    skim_cmd()
+        .args(["yarn", "outdated"])
+        .write_stdin(fixture)
+        .assert()
+        .stdout(predicate::str::contains("yarn outdated"));
+}

@@ -1,1 +1,24 @@
-{"version":1,"features":{}}
+{
+  "version": 1,
+  "features": {
+    "build-parsers": {
+      "name": "Build Tool Output Parsers",
+      "description": "Use when adding a new build tool parser, modifying cargo/tsc/make compression, or debugging three-tier parse degradation for build commands. Keywords: build, cargo, tsc, make, clippy, ParseResult, BuildResult, three-tier, NDJSON, flag injection.",
+      "directories": [
+        "crates/rskim/src/cmd/build/"
+      ],
+      "referencedFiles": [
+        "crates/rskim/src/cmd/build/mod.rs",
+        "crates/rskim/src/cmd/build/cargo.rs",
+        "crates/rskim/src/cmd/build/tsc.rs",
+        "crates/rskim/src/cmd/build/make.rs",
+        "crates/rskim/src/output/mod.rs",
+        "crates/rskim/src/output/canonical.rs",
+        "crates/rskim/src/cmd/mod.rs",
+        "crates/rskim/src/runner.rs"
+      ],
+      "lastUpdated": "2026-05-14T14:43:19.739Z",
+      "createdBy": "devflow-knowledge"
+    }
+  }
+}

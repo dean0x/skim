@@ -5,14 +5,285 @@
 //! [`try_read_stdin`] which combines the stdin guard (via
 //! [`crate::cmd::should_read_stdin`]), chunked read, and whitespace-only check
 //! into a single call.
+//!
+//! Also provides [`run_test_runner`] which encapsulates the complete
+//! passthrough-check / stdin-or-spawn / parse / emit / stats / analytics
+//! pipeline shared by vitest, playwright, cypress, swift, and dotnet.
 
+use std::io;
 use std::process::ExitCode;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use regex::Regex;
 
-use crate::output::canonical::{TestEntry, TestOutcome};
-use crate::runner::CommandOutput;
+use crate::output::ParseResult;
+use crate::output::canonical::{TestEntry, TestOutcome, TestResult};
+use crate::runner::{CommandOutput, CommandRunner};
+
+// ============================================================================
+// Shared run_test_runner pipeline
+// ============================================================================
+
+/// Source of the exit code for a test-runner invocation.
+///
+/// Replaces `Option<Option<i32>>` to make each case unambiguous in debug output
+/// and match arms:
+/// - [`ExitSource::Stdin`] — output came from piped stdin; no process exit code.
+/// - [`ExitSource::Process`]`(Some(n))` — process exited normally with code `n`.
+/// - [`ExitSource::Process`]`(None)` — process was killed by a signal (no numeric
+///   code).
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ExitSource {
+    /// No process was spawned — output arrived from stdin.
+    Stdin,
+    /// A process was spawned. `Some(n)` = exited with code `n`; `None` = signal-killed.
+    Process(Option<i32>),
+}
+
+/// Argument-preparation strategy for a test runner command.
+///
+/// Groups the two argument-transformation closures passed to [`run_test_runner`]
+/// so that call sites name each closure explicitly rather than relying on
+/// positional order (which is easy to confuse when both have identical types).
+///
+/// - `passthrough` — called on the `SKIM_PASSTHROUGH` path. MUST NOT inject
+///   reporter/logger flags; it may only prepend the required subcommand token.
+/// - `normal` — called on the normal spawn path to inject reporter flags (e.g.
+///   `--reporter=json`, `--logger trx`).
+pub(super) struct ArgPreparation<F, G>
+where
+    F: Fn(&[String]) -> Vec<String>,
+    G: Fn(&[String]) -> Vec<String>,
+{
+    /// Args transformation for `SKIM_PASSTHROUGH` mode — subcommand only, no flags.
+    pub passthrough: F,
+    /// Args transformation for the normal spawn path — subcommand + reporter flags.
+    pub normal: G,
+}
+
+/// Configuration for a test runner command.
+///
+/// Used by [`run_test_runner`] to spawn the test process. Each field controls
+/// a specific aspect of how the command is launched.
+pub(super) struct TestRunnerConfig<'a> {
+    /// The binary name to invoke (e.g. `"vitest"`, `"swift"`, `"dotnet"`).
+    pub program: &'a str,
+    /// Human-readable install hint emitted in the error when the binary is not
+    /// found (e.g. `"Install vitest locally (npm install -D vitest)"`).
+    pub install_hint: &'a str,
+    /// When `true`, fall back to `npx <program>` if the binary is not in PATH
+    /// (appropriate for Node.js tools: vitest, jest, playwright, cypress).
+    pub node_fallback: bool,
+    /// Extra environment variables to set when spawning the process. Pass `&[]`
+    /// if none are needed.
+    pub env_overrides: &'a [(&'a str, &'a str)],
+}
+
+/// Orchestrate the full test-runner pipeline.
+///
+/// Handles in order:
+/// 1. Passthrough mode — if `SKIM_PASSTHROUGH=1`, forwards raw output and
+///    returns immediately.
+/// 2. Stdin — if the caller has piped stdin (`try_read_stdin`), use that as
+///    the raw output.
+/// 3. Spawn — otherwise, spawn the process via `spawn_runner`.
+/// 4. Parse — call `parse_fn` on the raw output string.
+/// 5. Emit — print parsed result to stdout, emit tier markers to stderr, and
+///    call [`emit_failure_context`] when failures are present.
+/// 6. Stats — emit token-reduction stats when `show_stats` is `true`.
+/// 7. Analytics — record usage via [`crate::analytics::try_record_command`].
+///
+/// `arg_prep` groups the two argument-transformation closures (see [`ArgPreparation`]).
+/// The `passthrough` closure MUST NOT inject reporter/logger flags. For runners that
+/// require a subcommand token (e.g. playwright "test", cypress "run"), it should
+/// prepend that token and nothing else. For runners with no required subcommand
+/// (e.g. vitest, jest), use `|a| a.to_vec()`.
+/// The `normal` closure injects reporter flags for the normal spawn path
+/// (e.g. `--reporter=json`). It is `Fn` rather than `FnOnce` because the borrow
+/// checker requires a shared reference.
+///
+/// `parse_fn` is `FnOnce` because it is called exactly once and may capture
+/// owned state (e.g. closures that embed TRX detection for dotnet).
+///
+/// # Exit-code semantics
+///
+/// A non-zero or missing (signal-killed) exit code from the spawned process is
+/// treated as a failure even when the parser reports zero failed tests. This
+/// prevents skim from returning `SUCCESS` when the runner is terminated
+/// abnormally (e.g. OOM kill, timeout, compilation error before any test runs).
+/// The stdin path has no process exit code and therefore does not apply this
+/// override.
+pub(super) fn run_test_runner<F, G>(
+    config: &TestRunnerConfig<'_>,
+    args: &[String],
+    show_stats: bool,
+    rec: crate::analytics::RecordingContext<'_>,
+    arg_prep: ArgPreparation<F, G>,
+    parse_fn: impl FnOnce(&str) -> ParseResult<TestResult>,
+) -> anyhow::Result<ExitCode>
+where
+    F: Fn(&[String]) -> Vec<String>,
+    G: Fn(&[String]) -> Vec<String>,
+{
+    // Passthrough mode: bypass compression, run the raw command and forward output.
+    if crate::cmd::is_passthrough_mode() {
+        return run_passthrough(args, arg_prep.passthrough, |arg_refs| {
+            spawn_runner_raw(config, arg_refs)
+        });
+    }
+
+    let start = Instant::now();
+
+    // Prefer stdin if piped; otherwise spawn the process.
+    let (raw_output, exit_source) = if let Some(stdin_content) = try_read_stdin(args)? {
+        (stdin_content, ExitSource::Stdin)
+    } else {
+        let prepared = (arg_prep.normal)(args);
+        let (text, code) = spawn_runner(config, &prepared)?;
+        (text, ExitSource::Process(code))
+    };
+
+    let result = parse_fn(&raw_output);
+
+    let exit_code = match &result {
+        ParseResult::Full(test_result) | ParseResult::Degraded(test_result, _) => {
+            println!("{test_result}");
+            let stderr = io::stderr();
+            let mut handle = stderr.lock();
+            let _ = result.emit_markers(&mut handle);
+
+            let ec = resolve_exit_code(test_result.summary.fail, exit_source);
+            if ec != ExitCode::SUCCESS {
+                emit_failure_context(&raw_output, exit_code_byte(exit_source) as i32);
+            }
+            ec
+        }
+        ParseResult::Passthrough(raw) => {
+            println!("{raw}");
+            let _ = result.emit_markers(&mut io::stderr().lock());
+            ExitCode::FAILURE
+        }
+    };
+
+    if show_stats {
+        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
+        crate::process::report_token_stats(orig, comp, "");
+    }
+
+    crate::analytics::try_record_command(
+        rec.with_tier(result.tier_name()),
+        raw_output,
+        result.content().to_string(),
+        crate::cmd::format_analytics_label("test", config.program, &args.join(" ")),
+        start.elapsed(),
+    );
+
+    Ok(exit_code)
+}
+
+// ============================================================================
+// Exit-code resolution helpers
+// ============================================================================
+
+/// Determine the final [`ExitCode`] for a parsed test result.
+///
+/// Returns `FAILURE` (or a specific non-zero code) when either:
+/// - `fail_count > 0` — the parser found at least one failing test, OR
+/// - `exit_source` is [`ExitSource::Process`] with a non-zero or missing code.
+///
+/// This prevents skim from returning `SUCCESS` when the runner exits non-zero
+/// even though the parser reports zero failures (e.g. OOM kill before tests run,
+/// compilation error, or framework-level panic).
+///
+/// When `exit_source` is [`ExitSource::Stdin`] and `fail_count` is zero, the
+/// result is `SUCCESS` — no process was spawned so no non-zero exit can be observed.
+pub(super) fn resolve_exit_code(fail_count: usize, exit_source: ExitSource) -> ExitCode {
+    let process_failed = match exit_source {
+        ExitSource::Stdin => false,
+        ExitSource::Process(Some(0)) => false,
+        ExitSource::Process(_) => true, // non-zero or signal-killed
+    };
+
+    if fail_count > 0 || process_failed {
+        ExitCode::from(exit_code_byte(exit_source))
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Extract a clamped 1–255 exit code byte from an [`ExitSource`].
+///
+/// - `Process(Some(n))` → `n.clamp(1, 255) as u8`
+/// - `Process(None)` (signal kill) → `1`
+/// - `Stdin` (no process spawned) → `1`
+fn exit_code_byte(exit_source: ExitSource) -> u8 {
+    match exit_source {
+        ExitSource::Process(Some(n)) => n.clamp(1, 255) as u8,
+        _ => 1,
+    }
+}
+
+/// Spawn the test runner, combine stdout+stderr, and strip ANSI escape codes.
+///
+/// Used by the normal (non-passthrough) path of [`run_test_runner`]. Returns
+/// the clean combined output paired with the process exit code. The exit code
+/// is `None` when the process was killed by a signal before exiting normally.
+///
+/// Returning the exit code lets [`run_test_runner`] treat a non-zero or missing
+/// exit as a failure even when the parser reports zero failed tests (e.g. the
+/// runner was OOM-killed before executing any test cases).
+fn spawn_runner(
+    config: &TestRunnerConfig<'_>,
+    args: &[String],
+) -> anyhow::Result<(String, Option<i32>)> {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    let output = if config.node_fallback {
+        runner.run_with_node_fallback(config.program, &arg_refs)
+    } else if config.env_overrides.is_empty() {
+        runner.run(config.program, &arg_refs)
+    } else {
+        runner.run_with_env(config.program, &arg_refs, config.env_overrides)
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to run {}: {e}\nHint: {}",
+            config.program,
+            config.install_hint
+        )
+    })?;
+
+    let exit_code = output.exit_code;
+    let combined = crate::cmd::combine_output(&output);
+    Ok((crate::output::strip_ansi(&combined), exit_code))
+}
+
+/// Spawn the test runner for the passthrough path, returning a [`CommandOutput`].
+///
+/// Does NOT combine or strip — passthrough forwards the raw process output.
+fn spawn_runner_raw(
+    config: &TestRunnerConfig<'_>,
+    arg_refs: &[&str],
+) -> anyhow::Result<CommandOutput> {
+    let runner = CommandRunner::new(Some(crate::cmd::DEFAULT_CMD_TIMEOUT));
+    if config.node_fallback {
+        runner.run_with_node_fallback(config.program, arg_refs)
+    } else if config.env_overrides.is_empty() {
+        runner.run(config.program, arg_refs)
+    } else {
+        runner.run_with_env(config.program, arg_refs, config.env_overrides)
+    }
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "failed to run {}: {e}\nHint: {}",
+            config.program,
+            config.install_hint
+        )
+    })
+}
+
+// ============================================================================
 
 /// Identifies which test runner produced the text being scraped.
 ///
@@ -20,9 +291,10 @@ use crate::runner::CommandOutput;
 /// regex patterns are required to avoid false positives across runners.
 ///
 /// Variants `Pytest` and `Go` are provided for completeness and future use.
-/// Currently only `Cargo` and `Vitest` are consumed by Tier-2 regex paths;
-/// `Go`'s Tier-2 already extracts test names directly and `Pytest` uses
-/// passthrough for its Tier-2.
+/// Currently only `Cargo`, `Vitest`, and `Cypress` are consumed by Tier-2 regex
+/// paths; `Go`'s Tier-2 already extracts test names directly and `Pytest` uses
+/// passthrough for its Tier-2. `Swift` and `Dotnet` use their own local regexes
+/// instead of scrape_failures.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum TestKind {
     /// `cargo test` plain-text format: `test <path> ... FAILED`
@@ -35,11 +307,9 @@ pub(super) enum TestKind {
     Go,
     /// `vitest` / `jest` plain-text format: `✕ <describe> > <name>` or `✗ <name>`
     Vitest,
+    /// `cypress run` text format: failure names scraped from indented lines
+    Cypress,
 }
-
-/// ANSI color-code strip pattern (ESC [ ... m sequences).
-static RE_ANSI: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("valid ANSI regex"));
 
 /// Per-kind failure patterns — compiled once.
 static RE_CARGO_FAIL: LazyLock<Regex> = LazyLock::new(|| {
@@ -55,6 +325,11 @@ static RE_PYTEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
 static RE_GO_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     // `--- FAIL: TestFoo (0.01s)`
     Regex::new(r"^--- FAIL:\s+(\S+)\s+\(").expect("valid go fail regex")
+});
+
+static RE_CYPRESS_FAIL: LazyLock<Regex> = LazyLock::new(|| {
+    // Cypress mocha text: `    N) test name` (numbered failure list)
+    Regex::new(r"^\s+\d+\)\s+(.+)$").expect("valid cypress fail regex")
 });
 
 static RE_VITEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
@@ -99,6 +374,14 @@ pub(super) fn try_read_stdin(args: &[String]) -> anyhow::Result<Option<String>> 
 /// 1. Piped stdin — print the raw content and return FAILURE (no exit code available).
 /// 2. Spawn mode — run the command via `run_cmd` and forward the combined output.
 ///
+/// # Stdin path always returns FAILURE
+///
+/// When input arrives from stdin, no process exit code is available — skim does not
+/// know whether the upstream command succeeded or failed. `FAILURE` is returned as a
+/// conservative default so that callers in a pipeline treat ambiguous output as an
+/// error rather than silently swallowing it. Full exit-code semantics are only
+/// available on the spawn path (sub-case 2).
+///
 /// `prepare_args` transforms the user args into the final argument list that
 /// `run_cmd` receives (e.g., adding `--reporter=json` or `--tb=short`).
 /// `run_cmd` receives the prepared args as `&[&str]` and returns a `CommandOutput`.
@@ -130,32 +413,34 @@ pub(super) fn run_passthrough(
 /// the runner's full output format, which is precisely what Tier-1 JSON exists
 /// to avoid.
 ///
-/// Cap matches Tier-1's entry cap (100) to keep output size predictable
-/// regardless of tier.
+/// Maximum number of test entries collected during parsing (Tier-1 and Tier-2).
+///
+/// Caps both the regex-scrape path in [`scrape_failures`] and Tier-1 JSON
+/// collection in parsers that have wide (many suites, shallow depth) payloads.
+/// All parsers import this constant rather than defining their own.
+pub(super) const MAX_ENTRIES: usize = 100;
+
+/// Cap matches [`MAX_ENTRIES`] to keep output size predictable regardless of tier.
 pub(super) fn scrape_failures(text: &str, kind: TestKind) -> Vec<TestEntry> {
     // Strip ANSI escape codes so color-enabled output (e.g. pytest --color=yes,
     // vitest with TTY detected) does not break pattern matching.
     //
     // Fast-path: when the caller has already stripped ANSI (no ESC bytes remain),
-    // borrow the slice directly rather than running the regex over it a second time.
-    // This eliminates the double-strip in `vitest::try_parse_regex`, which calls
-    // `output::strip_ansi(raw)` → `cleaned` and then passes `cleaned` here.
-    let cleaned: std::borrow::Cow<str> = if text.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(RE_ANSI.replace_all(text, "").into_owned())
-    } else {
-        std::borrow::Cow::Borrowed(text)
-    };
+    // borrows the slice directly — no allocation. This eliminates the double-strip
+    // in `vitest::try_parse_regex`, which strips ANSI before calling here.
+    let cleaned = crate::output::strip_ansi_cow(text);
 
     let re = match kind {
         TestKind::Cargo => &*RE_CARGO_FAIL,
         TestKind::Pytest => &*RE_PYTEST_FAIL,
         TestKind::Go => &*RE_GO_FAIL,
         TestKind::Vitest => &*RE_VITEST_FAIL,
+        TestKind::Cypress => &*RE_CYPRESS_FAIL,
     };
 
     let mut entries: Vec<TestEntry> = Vec::new();
     for line in cleaned.lines() {
-        if entries.len() >= 100 {
+        if entries.len() >= MAX_ENTRIES {
             break;
         }
         if let Some(caps) = re.captures(line) {
@@ -240,11 +525,118 @@ pub(super) fn last_n_lines(text: &str, n: usize) -> &str {
     text
 }
 
+/// Extract the first balanced JSON object from `text`.
+///
+/// Used by Cypress and Playwright parsers to isolate the JSON report object
+/// from output that may contain preamble or trailing log lines. Handles
+/// nested objects and string literals with escaped characters.
+pub(super) fn extract_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        let idx = start + i;
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if in_string {
+            match b {
+                b'\\' => escape_next = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=idx]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    // ========================================================================
+    // resolve_exit_code tests
+    //
+    // Tests for the extracted exit-code decision logic, covering the
+    // "zero failures + non-zero exit" path that was previously only
+    // indirectly exercised through run_passthrough.
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_exit_zero_is_success() {
+        // Parser reports 0 failures, process exited 0 → SUCCESS.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(0)));
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_nonzero_exit_is_failure() {
+        // Parser reports 0 failures but process exited 1 (e.g. compilation error
+        // before any tests ran). Must return FAILURE rather than SUCCESS.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(1)));
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_exit_two_preserves_code() {
+        // Process exited 2 (common for "compilation failed") with 0 parser failures.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(2)));
+        assert_eq!(code, ExitCode::from(2u8));
+    }
+
+    #[test]
+    fn test_resolve_exit_code_zero_fail_signal_kill_is_failure() {
+        // Signal-killed process (Process(None)) with 0 parser failures → FAILURE.
+        let code = resolve_exit_code(0, ExitSource::Process(None));
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_nonzero_fail_exit_zero_is_failure() {
+        // Parser found failures; process exited 0 → still FAILURE.
+        let code = resolve_exit_code(3, ExitSource::Process(Some(0)));
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_stdin_path_zero_fail_is_success() {
+        // Stdin path (no process spawned), parser found 0 failures → SUCCESS.
+        let code = resolve_exit_code(0, ExitSource::Stdin);
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_stdin_path_nonzero_fail_is_failure() {
+        // Stdin path, parser found failures → FAILURE.
+        let code = resolve_exit_code(2, ExitSource::Stdin);
+        assert_eq!(code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn test_resolve_exit_code_clamps_exit_255() {
+        // Exit code 255 is the max allowed; should be preserved.
+        let code = resolve_exit_code(0, ExitSource::Process(Some(255)));
+        assert_eq!(code, ExitCode::from(255u8));
+    }
 
     // ========================================================================
     // run_passthrough tests (spawn branch)
@@ -532,5 +924,197 @@ mod tests {
         // n=2 → find 2nd \n from end, which is after "line1\r", return "line2\r\nline3"
         let result = last_n_lines(text, 2);
         assert_eq!(result, "line2\r\nline3");
+    }
+
+    // ========================================================================
+    // Issue regression: passthrough must NOT inject reporter flags
+    //
+    // Before the fix, run_test_runner passed `prepare_args` (which injects
+    // --reporter=json) to run_passthrough. The passthrough path must call
+    // `passthrough_prepare_args` instead, which is flag-free.
+    // ========================================================================
+
+    /// Regression: vitest passthrough must NOT inject `--reporter=json`.
+    ///
+    /// The passthrough closure for vitest is `|a| a.to_vec()` (identity).
+    /// run_passthrough must receive exactly the user-supplied args, with no
+    /// reporter flag appended.
+    #[test]
+    fn test_passthrough_prepare_args_does_not_inject_reporter_vitest() {
+        let user_args = vec!["--run".to_string(), "math".to_string()];
+        let mut received_args: Vec<String> = Vec::new();
+
+        run_passthrough(
+            &user_args,
+            // identity — mimics vitest's passthrough_prepare_args
+            |a| a.to_vec(),
+            |arg_refs| {
+                received_args = arg_refs.iter().map(|s| s.to_string()).collect();
+                Ok(make_output("", "", Some(0)))
+            },
+        )
+        .expect("run_passthrough should not error");
+
+        assert!(
+            !received_args.iter().any(|a| a.contains("--reporter")),
+            "passthrough must not inject --reporter flag: {received_args:?}"
+        );
+        assert!(
+            !received_args.iter().any(|a| a.contains("--json")),
+            "passthrough must not inject --json flag: {received_args:?}"
+        );
+        assert_eq!(
+            received_args,
+            vec!["--run", "math"],
+            "passthrough must forward user args unchanged: {received_args:?}"
+        );
+    }
+
+    /// Regression: playwright/cypress passthrough must prepend the subcommand
+    /// token ("test" or "run") but must NOT inject `--reporter=json`.
+    ///
+    /// The passthrough closure for playwright is:
+    ///   `|a| { let mut v = vec!["test".to_string()]; v.extend_from_slice(a); v }`
+    /// run_passthrough must receive ["test", ...user_args] with no reporter flag.
+    #[test]
+    fn test_passthrough_prepare_args_prepends_subcommand_without_reporter() {
+        let user_args = vec!["--project=chromium".to_string()];
+        let mut received_args: Vec<String> = Vec::new();
+
+        run_passthrough(
+            &user_args,
+            // subcommand-only — mimics playwright's passthrough_prepare_args
+            |a| {
+                let mut v = vec!["test".to_string()];
+                v.extend_from_slice(a);
+                v
+            },
+            |arg_refs| {
+                received_args = arg_refs.iter().map(|s| s.to_string()).collect();
+                Ok(make_output("", "", Some(0)))
+            },
+        )
+        .expect("run_passthrough should not error");
+
+        assert_eq!(
+            received_args.first().map(String::as_str),
+            Some("test"),
+            "first arg must be the subcommand token: {received_args:?}"
+        );
+        assert!(
+            !received_args.iter().any(|a| a.contains("--reporter")),
+            "passthrough must not inject --reporter flag: {received_args:?}"
+        );
+        assert_eq!(
+            received_args,
+            vec!["test", "--project=chromium"],
+            "passthrough must be [subcommand, ...user_args]: {received_args:?}"
+        );
+    }
+
+    // ========================================================================
+    // Issue regression: spawn_runner exit code surfacing
+    //
+    // Before the fix, spawn_runner returned only String and the exit code was
+    // discarded. The run_test_runner function now receives (String, Option<i32>)
+    // and treats non-zero / missing exit codes as failures even when the parser
+    // reports zero failing tests.
+    //
+    // We test the run_passthrough exit-code forwarding as a proxy for the
+    // spawn_exit_code semantics (the passthrough path already surfaces the exit
+    // code correctly and those tests cover exit code 0, non-zero, and None).
+    //
+    // The spawn_runner itself cannot be called from unit tests (it requires a
+    // live binary), so we instead test the outcome logic via make_output helpers
+    // that exercise the same Option<Option<i32>> handling indirectly through the
+    // run_passthrough path (which already has full exit-code tests above).
+    // ========================================================================
+
+    /// Regression: signal-killed process (exit_code=None) must return FAILURE.
+    ///
+    /// Previously run_passthrough (and by extension run_test_runner) would use
+    /// .unwrap_or(1) — this test verifies that path is still correct.
+    #[test]
+    fn test_passthrough_signal_kill_returns_failure() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("partial output\n", "", None)),
+        )
+        .expect("run_passthrough should not error");
+        assert_eq!(
+            code,
+            ExitCode::FAILURE,
+            "signal-killed process must map to FAILURE"
+        );
+    }
+
+    /// Regression: non-zero exit code must be preserved even when stdout is empty.
+    ///
+    /// Exercises the path where the process exited with code 2 (e.g. compilation
+    /// error) and produced no parseable test output.
+    #[test]
+    fn test_passthrough_compilation_error_exit_code_preserved() {
+        let code = run_passthrough(
+            &[],
+            |a| a.to_vec(),
+            |_| Ok(make_output("error: could not compile\n", "", Some(2))),
+        )
+        .expect("run_passthrough should not error");
+        assert_eq!(
+            code,
+            ExitCode::from(2u8),
+            "compilation error exit code 2 must be forwarded"
+        );
+    }
+
+    // ========================================================================
+    // extract_json_object tests
+    //
+    // `extract_json_object` is used by the Cypress and Playwright parsers to
+    // isolate the JSON report from output that may include preamble log lines.
+    // Vitest's equivalent `extract_json_by_brace_balance` has 8 edge-case tests;
+    // these four tests establish the same coverage baseline for this function.
+    // ========================================================================
+
+    #[test]
+    fn test_extract_json_object_simple() {
+        let input = r#"{"key":"value"}"#;
+        let result = extract_json_object(input);
+        assert_eq!(result, Some(r#"{"key":"value"}"#));
+    }
+
+    #[test]
+    fn test_extract_json_object_nested() {
+        let input = r#"{"outer":{"inner":"data"},"count":42}"#;
+        let result = extract_json_object(input);
+        assert_eq!(result, Some(r#"{"outer":{"inner":"data"},"count":42}"#));
+    }
+
+    #[test]
+    fn test_extract_json_object_garbage_prefix() {
+        // Preamble log lines precede the JSON object — common in cypress/playwright output.
+        let input =
+            "Starting Cypress run...\nConnecting to Cypress Cloud\n{\"stats\":{\"passes\":3}}\n";
+        let result = extract_json_object(input);
+        assert!(result.is_some(), "should find JSON despite garbage prefix");
+        assert!(
+            result.unwrap().starts_with('{'),
+            "extracted slice must start at opening brace"
+        );
+        // Verify the extracted object parses correctly
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(result.unwrap());
+        assert!(parsed.is_ok(), "extracted JSON must parse: {:?}", result);
+    }
+
+    #[test]
+    fn test_extract_json_object_unclosed_brace_returns_none() {
+        // An unclosed brace means depth never returns to 0 — None is returned.
+        let input = r#"{"key":"value", "nested": {"missing_close": true}"#;
+        let result = extract_json_object(input);
+        assert!(
+            result.is_none(),
+            "unclosed brace must return None, got: {result:?}"
+        );
     }
 }

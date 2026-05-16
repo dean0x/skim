@@ -1,0 +1,16 @@
+Inspecting 10 files
+.........W
+
+Offenses:
+
+app/models/user.rb:5:15: C: Style/StringLiterals: Prefer single-quoted strings when you don't need string interpolation or special symbols.
+  name = "John"
+              ^^^^^^
+app/models/user.rb:10:3: W: Metrics/MethodLength: Method has too many lines. [12/10]
+  def process_user
+  ^^^^^^^^^^^^^^^^
+app/controllers/sessions_controller.rb:8:19: E: Lint/UnusedMethodArgument: Unused method argument - session_id.
+  def create(session_id)
+                  ^^^^^^^^^^
+
+10 files inspected, 3 offenses detected

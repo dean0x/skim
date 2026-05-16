@@ -1,0 +1,16 @@
+Build succeeded.
+
+Test run for /path/to/MyProject.Tests/bin/Debug/net8.0/MyProject.Tests.dll (.NETCoreApp,Version=v8.0)
+Microsoft (R) Test Execution Command Line Tool Version 17.8.0
+Copyright (c) Microsoft Corporation.  All rights reserved.
+
+Starting test execution, please wait...
+A total of 1 test files matched the specified pattern.
+
+  Failed MyProject.Tests.CalculatorTests.Add_TwoPositiveNumbers_ReturnsSum [45ms]
+  Error Message:
+   Assert.AreEqual failed. Expected:<5>. Actual:<4>.
+  Stack Trace:
+     at MyProject.Tests.CalculatorTests.Add_TwoPositiveNumbers_ReturnsSum() in /path/to/CalculatorTests.cs:line 15
+
+Failed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5, Duration: 456 ms - MyProject.Tests.dll (net8.0)

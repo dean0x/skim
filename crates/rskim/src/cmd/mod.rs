@@ -4,6 +4,24 @@
 //! backward compatibility with file-first invocations. Also provides shared
 //! helper functions used by subcommand parsers (arg inspection, flag injection,
 //! command execution with three-tier parse degradation).
+//!
+//! # Dispatcher behavioral models
+//!
+//! There are two distinct behaviors for multi-category dispatchers, chosen
+//! intentionally based on how each tool is typically used in practice:
+//!
+//! **Strict dispatchers** (`cargo`, `go`): Unknown subcommands print an error
+//! and return `ExitCode::FAILURE`. These tools have well-defined, finite
+//! subcommand sets that skim supports comprehensively. An unrecognized subcommand
+//! almost certainly means a typo or a command that belongs in a different context.
+//!
+//! **Passthrough dispatchers** (`swift`, `dotnet`): Unknown subcommands are
+//! forwarded verbatim to the underlying tool and return its exit code. These
+//! tools expose a wide surface area of lifecycle subcommands (`build`, `run`,
+//! `publish`, `package`, `restore`, …) that agents invoke routinely. Blocking
+//! unknown subcommands would make skim unusable in normal project workflows;
+//! passthrough lets skim compress only what it understands while staying
+//! transparent for everything else.
 
 mod agents;
 mod build;
@@ -168,13 +186,21 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "cargo",
     "go",
     // Test runners
+    "cypress",
+    "dotnet",
     "jest",
+    "playwright",
     "pytest",
+    "swift",
     "vitest",
     // Build tools
+    "gradle",
+    "gradlew",
     "make",
+    "mvn",
+    "mvnw",
     "tsc",
-    // Linters (11)
+    // Linters (13)
     "biome",
     "black",
     "dprint",
@@ -184,12 +210,15 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "mypy",
     "oxlint",
     "prettier",
+    "rubocop",
     "ruff",
     "rustfmt",
+    "swiftlint",
     // Package managers
     "npm",
-    "pnpm",
     "pip",
+    "pnpm",
+    "yarn",
     // Infrastructure
     "aws",
     "curl",
@@ -705,6 +734,151 @@ fn print_cargo_help() {
     );
 }
 
+fn print_swift_help() {
+    print!(
+        "skim swift\n\
+         \n\
+           Swift subcommand compression\n\
+         \n\
+         Usage: skim swift <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test       Run and compress swift test output\n\
+         \n\
+         Other subcommands (build, run, etc.) are passed through unmodified.\n\
+         \n\
+         Examples:\n\
+           skim swift test\n\
+           skim swift test --filter MyTests\n"
+    );
+}
+
+fn print_dotnet_help() {
+    print!(
+        "skim dotnet\n\
+         \n\
+           .NET subcommand compression\n\
+         \n\
+         Usage: skim dotnet <SUBCOMMAND> [args...]\n\
+         \n\
+         Subcommands:\n\
+           test       Run and compress dotnet test output\n\
+         \n\
+         Other subcommands (build, run, publish, restore, etc.) are passed through unmodified.\n\
+         \n\
+         Examples:\n\
+           skim dotnet test\n\
+           skim dotnet test --filter Category=Unit\n"
+    );
+}
+
+/// Pass through an unknown subcommand to the underlying tool unchanged.
+///
+/// Logs a warning to stderr naming the unknown subcommand, then reconstructs
+/// the full argument list (`unknown` + remaining `args` with the subcmd at
+/// `subcmd_idx` stripped) and delegates to [`run_raw_passthrough`].
+///
+/// Used by multi-category dispatchers (`swift`, `dotnet`) where unknown
+/// subcommands are forwarded rather than rejected.
+fn passthrough_subcmd(
+    tool: &str,
+    unknown: &str,
+    args: &[String],
+    subcmd_idx: usize,
+    env: &[(&str, &str)],
+) -> anyhow::Result<ExitCode> {
+    let safe = sanitize_for_display(unknown);
+    eprintln!(
+        "skim {tool}: unknown subcommand '{safe}' — passing through\n\
+         Supported subcommands: test"
+    );
+    let mut all_args: Vec<String> = Vec::with_capacity(args.len());
+    all_args.push(unknown.to_string());
+    all_args.extend(
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != subcmd_idx)
+            .map(|(_, s)| s.clone()),
+    );
+    run_raw_passthrough(tool, &all_args, env)
+}
+
+/// Run a program with the given args and env vars, printing stdout/stderr and
+/// returning the process exit code. Used by passthrough dispatchers for unknown
+/// subcommands that skim does not compress.
+pub(crate) fn run_raw_passthrough(
+    program: &str,
+    args: &[String],
+    env: &[(&str, &str)],
+) -> anyhow::Result<ExitCode> {
+    let runner = crate::runner::CommandRunner::new(Some(DEFAULT_CMD_TIMEOUT));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = runner.run_with_env(program, &arg_refs, env)?;
+    print!("{}", output.stdout);
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+    }
+    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+    Ok(ExitCode::from(code))
+}
+
+/// Route `skim swift <subcmd> [args...]` to the correct category handler.
+///
+/// Only `swift test` is compressed. Other `swift` subcommands (build, run, etc.)
+/// pass through as raw to avoid interrupting normal swift workflows.
+fn dispatch_swift(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_swift_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some((subcmd, idx)) = extract_subcmd("swift", args, "skim swift <test> [args...]", "test")?
+    else {
+        return Ok(ExitCode::FAILURE);
+    };
+
+    match subcmd {
+        "test" => test::run(&prepend_without("swift", args, idx), analytics),
+        unknown => passthrough_subcmd("swift", unknown, args, idx, &[]),
+    }
+}
+
+/// Route `skim dotnet <subcmd> [args...]` to the correct category handler.
+///
+/// Only `dotnet test` is compressed. Other `dotnet` subcommands (build, run, publish, etc.)
+/// pass through as raw to avoid interrupting normal dotnet workflows.
+fn dispatch_dotnet(
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        print_dotnet_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some((subcmd, idx)) =
+        extract_subcmd("dotnet", args, "skim dotnet <test> [args...]", "test")?
+    else {
+        return Ok(ExitCode::FAILURE);
+    };
+
+    match subcmd {
+        "test" => test::run(&prepend_without("dotnet", args, idx), analytics),
+        // DOTNET_CLI_UI_LANGUAGE forces English output for reliable parsing
+        // even in passthrough mode, matching the compressed-path behavior.
+        unknown => passthrough_subcmd(
+            "dotnet",
+            unknown,
+            args,
+            idx,
+            &[("DOTNET_CLI_UI_LANGUAGE", "en-US")],
+        ),
+    }
+}
+
 fn print_go_help() {
     print!(
         "skim go\n\
@@ -750,12 +924,22 @@ pub(crate) fn dispatch(
         "cargo" => dispatch_cargo(args, analytics),
         "go" => dispatch_go(args, analytics),
 
+        // Multi-category dispatchers for tools with subcommands
+        "swift" => dispatch_swift(args, analytics),
+        "dotnet" => dispatch_dotnet(args, analytics),
+
         // Direct-to-category routing (prepend tool name for category dispatcher)
-        "jest" | "pytest" | "vitest" => test::run(&prepend(subcommand, args), analytics),
-        "make" | "tsc" => build::run(&prepend(subcommand, args), analytics),
+        "cypress" | "jest" | "playwright" | "pytest" | "vitest" => {
+            test::run(&prepend(subcommand, args), analytics)
+        }
+        "gradle" | "gradlew" | "make" | "mvn" | "mvnw" | "tsc" => {
+            build::run(&prepend(subcommand, args), analytics)
+        }
         "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "mypy" | "oxlint"
-        | "prettier" | "ruff" | "rustfmt" => lint::run(&prepend(subcommand, args), analytics),
-        "npm" | "pnpm" | "pip" => pkg::run(&prepend(subcommand, args), analytics),
+        | "prettier" | "rubocop" | "ruff" | "rustfmt" | "swiftlint" => {
+            lint::run(&prepend(subcommand, args), analytics)
+        }
+        "npm" | "pip" | "pnpm" | "yarn" => pkg::run(&prepend(subcommand, args), analytics),
         "aws" | "curl" | "docker" | "gh" | "kubectl" | "terraform" | "wget" => {
             infra::run(&prepend(subcommand, args), analytics)
         }

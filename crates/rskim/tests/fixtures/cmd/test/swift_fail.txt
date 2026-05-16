@@ -1,0 +1,14 @@
+Test Suite 'All tests' started at 2026-01-01 00:00:00.000
+Test Suite 'MyPackageTests.xctest' started at 2026-01-01 00:00:00.001
+Test Suite 'MyTests' started at 2026-01-01 00:00:00.002
+Test Case '-[MyTests.MyTests testExample]' started.
+Test Case '-[MyTests.MyTests testExample]' passed (0.001 seconds).
+Test Case '-[MyTests.MyTests testFailingExample]' started.
+/path/to/MyTests.swift:15: error: -[MyTests.MyTests testFailingExample] : XCTAssertEqual failed: ("1") is not equal to ("2")
+Test Case '-[MyTests.MyTests testFailingExample]' failed (0.003 seconds).
+Test Suite 'MyTests' failed at 2026-01-01 00:00:00.006.
+	 Executed 2 tests, with 1 failure (1 unexpected) in 0.004 (0.006) seconds
+Test Suite 'MyPackageTests.xctest' failed at 2026-01-01 00:00:00.007.
+	 Executed 2 tests, with 1 failure (1 unexpected) in 0.004 (0.007) seconds
+Test Suite 'All tests' failed at 2026-01-01 00:00:00.008.
+	 Executed 2 tests, with 1 failure (1 unexpected) in 0.004 (0.008) seconds

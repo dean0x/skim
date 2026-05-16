@@ -6,7 +6,9 @@
 //! invocation and piped stdin.
 
 pub(crate) mod cargo;
+pub(crate) mod gradle;
 pub(crate) mod make;
+pub(crate) mod maven;
 pub(crate) mod tsc;
 
 use std::process::ExitCode;
@@ -51,17 +53,20 @@ pub(crate) fn run(
     match sub {
         Some("cargo") => cargo::run(remaining, show_stats, rec),
         Some("clippy") => cargo::run_clippy(remaining, show_stats, rec),
+        Some(program @ ("gradle" | "gradlew")) => gradle::run(program, remaining, show_stats, rec),
         Some("make") => make::run(remaining, show_stats, rec),
+        Some(program @ ("mvn" | "mvnw" | "maven")) => {
+            maven::run(program, remaining, show_stats, rec)
+        }
         Some("tsc") => tsc::run(remaining, show_stats, rec),
         Some(unknown) => {
             // Defensive branch: flat dispatch always prepends a known tool name
-            // (cargo/clippy/make/tsc) before calling this function, so this arm is
-            // only reachable via internal routing bugs. Use eprintln! + FAILURE
-            // (not bail!) consistent with sibling handlers (pkg, lint, test).
+            // before calling this function, so this arm is only reachable via
+            // internal routing bugs.
             let safe_unknown = crate::cmd::sanitize_for_display(unknown);
             eprintln!(
                 "skim: unknown subcommand '{safe_unknown}'\n\
-                 Supported tools: cargo, clippy, make, tsc"
+                 Supported tools: cargo, clippy, gradle, gradlew, make, mvn, mvnw, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -69,9 +74,11 @@ pub(crate) fn run(
             eprintln!(
                 "skim: missing build tool\n\n\
                  Usage: skim cargo build [args...]\n\
+                 Usage: skim gradle [args...]\n\
                  Usage: skim make [args...]\n\
+                 Usage: skim mvn [args...]\n\
                  Usage: skim tsc [args...]\n\n\
-                 Supported tools: cargo, clippy, make, tsc"
+                 Supported tools: cargo, clippy, gradle, gradlew, make, mvn, mvnw, tsc"
             );
             Ok(ExitCode::FAILURE)
         }
@@ -79,14 +86,16 @@ pub(crate) fn run(
 }
 
 fn print_help() {
-    println!("skim {{cargo build|cargo clippy|make|tsc}} [args...]");
+    println!("skim {{cargo build|cargo clippy|gradle|make|mvn|tsc}} [args...]");
     println!();
     println!("  Run build tools and compress output for AI context windows.");
     println!();
     println!("Available tools:");
     println!("  cargo      Run cargo build with output compression");
     println!("  clippy     Run cargo clippy with output compression");
+    println!("  gradle     Run Gradle with output compression (also: gradlew)");
     println!("  make       Run GNU make with output compression");
+    println!("  mvn        Run Maven with output compression (also: mvnw)");
     println!("  tsc        Run TypeScript compiler with output compression");
     println!();
     println!("Flags:");
@@ -96,8 +105,10 @@ fn print_help() {
     println!("  skim cargo build");
     println!("  skim cargo build --release");
     println!("  skim cargo clippy -- -W clippy::pedantic");
+    println!("  skim gradle build");
     println!("  skim make");
     println!("  skim make -j4 all");
+    println!("  skim mvn compile");
     println!("  skim tsc --noEmit");
 }
 
