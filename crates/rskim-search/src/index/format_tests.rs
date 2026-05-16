@@ -17,6 +17,7 @@ fn test_header_roundtrip() {
         file_count: 42,
         postings_file_size: 65536,
         avg_doc_length: 512.5,
+        avg_field_lengths: [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
         checksum: 0xDEAD_BEEF,
     };
     let encoded = encode_header(&h);
@@ -28,6 +29,17 @@ fn test_header_roundtrip() {
     assert_eq!(decoded.file_count, h.file_count);
     assert_eq!(decoded.postings_file_size, h.postings_file_size);
     assert!((decoded.avg_doc_length - h.avg_doc_length).abs() < f32::EPSILON);
+    for (i, (&a, &b)) in decoded
+        .avg_field_lengths
+        .iter()
+        .zip(h.avg_field_lengths.iter())
+        .enumerate()
+    {
+        assert!(
+            (a - b).abs() < f32::EPSILON,
+            "avg_field_lengths[{i}] mismatch: {a} vs {b}"
+        );
+    }
     assert_eq!(decoded.checksum, h.checksum);
 }
 
@@ -40,6 +52,7 @@ fn test_header_bad_magic() {
         file_count: 0,
         postings_file_size: 0,
         avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
         checksum: 0,
     };
     let encoded = encode_header(&h);
@@ -58,6 +71,7 @@ fn test_header_bad_version() {
         file_count: 0,
         postings_file_size: 0,
         avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
         checksum: 0,
     };
     let encoded = encode_header(&h);
@@ -67,6 +81,25 @@ fn test_header_bad_version() {
     assert!(
         err.contains("unsupported format version"),
         "unexpected error: {err}"
+    );
+}
+
+/// Format v1 indexes (old header size 30 bytes) must be rejected with a clear error.
+#[test]
+fn test_v1_header_rejected_with_format_version_message() {
+    // Simulate a v1-style header (30 bytes) — will fail both size check and version check.
+    // We write the magic correctly to get past magic check and hit the version rejection.
+    let mut buf = vec![0u8; 30]; // v1 header size
+    buf[0..4].copy_from_slice(b"SKIX"); // correct magic
+    buf[4..6].copy_from_slice(&1u16.to_le_bytes()); // version = 1
+    // Truncated header — size check fires first.
+    let result = decode_header(&buf);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    // Either truncated or version error — both are acceptable rejections.
+    assert!(
+        err.contains("truncated") || err.contains("format version"),
+        "v1 index should be rejected with truncated or format version error: {err}"
     );
 }
 
@@ -151,11 +184,59 @@ fn test_file_meta_roundtrip() {
     let m = FileMetaEntry {
         lang_id: lang_to_id(rskim_core::Language::Rust),
         doc_length: 8192,
+        field_lengths: [100, 200, 300, 400, 500, 600, 700, 5392],
     };
     let encoded = encode_file_meta(&m);
     assert_eq!(encoded.len(), FILE_META_SIZE);
     let decoded = decode_file_meta(&encoded).unwrap();
     assert_eq!(decoded, m);
+}
+
+/// Verify that the field_lengths invariant is encoded correctly.
+#[test]
+fn test_file_meta_field_lengths_encode_decode() {
+    let field_lengths = [10u32, 20, 30, 40, 50, 60, 70, 80];
+    let total: u32 = field_lengths.iter().sum();
+    let m = FileMetaEntry {
+        lang_id: lang_to_id(rskim_core::Language::TypeScript),
+        doc_length: total,
+        field_lengths,
+    };
+    let encoded = encode_file_meta(&m);
+    let decoded = decode_file_meta(&encoded).unwrap();
+    assert_eq!(decoded.field_lengths, field_lengths);
+    assert_eq!(decoded.doc_length, total);
+}
+
+/// Verify the v2 header size constant matches actual encoded size.
+#[test]
+fn test_header_size_is_62_bytes() {
+    assert_eq!(SKIDX_HEADER_SIZE, 62, "v2 header must be 62 bytes");
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: FORMAT_VERSION,
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    assert_eq!(encoded.len(), 62);
+}
+
+/// Verify the v2 FileMetaEntry size constant matches actual encoded size.
+#[test]
+fn test_file_meta_size_is_37_bytes() {
+    assert_eq!(FILE_META_SIZE, 37, "v2 FileMetaEntry must be 37 bytes");
+    let m = FileMetaEntry {
+        lang_id: 0,
+        doc_length: 0,
+        field_lengths: [0; 8],
+    };
+    let encoded = encode_file_meta(&m);
+    assert_eq!(encoded.len(), 37);
 }
 
 #[test]

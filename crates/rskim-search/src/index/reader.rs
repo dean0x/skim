@@ -28,11 +28,12 @@ use memmap2::Mmap;
 
 use super::format::{
     FILE_META_SIZE, FileMetaEntry, POSTING_ENTRY_SIZE, SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE,
-    SkidxHeader, bm25_score, compute_checksum, decode_file_meta, decode_header, decode_posting,
-    idf_for_key, lookup_ngram,
+    SkidxHeader, compute_checksum, decode_file_meta, decode_header, decode_posting, idf_for_key,
+    lookup_ngram,
 };
 use crate::{
     FileId, IndexStats, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
+    lexical::{BM25FConfig, FIELD_COUNT, bm25f_score, dominant_field},
     ngram::extract_query_ngrams,
 };
 
@@ -52,6 +53,10 @@ pub struct NgramIndexReader {
     idx_mmap: Mmap,
     /// Memory-mapped `.skpost` file (concatenated posting lists).
     post_mmap: Mmap,
+    /// Default BM25F scoring configuration for this reader.
+    ///
+    /// Can be overridden per-query via [`SearchQuery::bm25f_config`].
+    bm25f_config: BM25FConfig,
 }
 
 // NgramIndexReader is automatically Send + Sync because all fields
@@ -132,7 +137,23 @@ impl NgramIndexReader {
             header,
             idx_mmap,
             post_mmap,
+            bm25f_config: BM25FConfig::default(),
         })
+    }
+
+    /// Open an existing index from `dir` with a custom BM25F configuration.
+    ///
+    /// Identical to [`NgramIndexReader::open`] except the provided `config`
+    /// is used as the reader-level default (still overridable per-query via
+    /// [`SearchQuery::bm25f_config`]).
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`NgramIndexReader::open`].
+    pub fn open_with_config(dir: &std::path::Path, config: BM25FConfig) -> Result<Self> {
+        let mut reader = Self::open(dir)?;
+        reader.bm25f_config = config;
+        Ok(reader)
     }
 
     /// Return summary statistics for this index.
@@ -216,18 +237,20 @@ impl NgramIndexReader {
 // ============================================================================
 
 impl SearchLayer for NgramIndexReader {
-    /// Execute a BM25-scored n-gram search.
+    /// Execute a BM25F-scored n-gram search.
     ///
     /// # Algorithm
     ///
     /// 1. Extract query bigrams via [`extract_query_ngrams`] (sorted by weight desc).
     /// 2. For each bigram, retrieve its posting list.
-    /// 3. Accumulate per-document: term frequency and all match positions.
+    /// 3. Accumulate per-document, per-field term frequencies and match positions.
     /// 4. Apply language filter if `query.lang` is set.
-    /// 5. Score each document with BM25, using per-bigram IDF from the weight table.
-    /// 6. Sort descending by score, apply offset/limit (default: 0/20).
-    /// 7. Return [`SearchResult`] values with `line_range: 0..0` and `snippet: None`
-    ///    (v1 — full line/snippet extraction is deferred to a later wave).
+    /// 5. Score each document with BM25F using per-field TF, field lengths, and
+    ///    average field lengths from the header.
+    /// 6. Sort descending by score with [`FileId`] tie-breaking for determinism.
+    /// 7. Apply offset/limit (default: 0/20).
+    /// 8. Return [`SearchResult`] values with `field` from [`dominant_field`],
+    ///    `line_range: 0..0`, and `snippet: None` (deferred to a later wave).
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         if query.text.is_empty() {
             return Ok(Vec::new());
@@ -238,26 +261,36 @@ impl SearchLayer for NgramIndexReader {
             return Ok(Vec::new());
         }
 
+        // Resolve scoring config: per-query override takes priority.
+        let scoring_config: &BM25FConfig = query
+            .bm25f_config
+            .as_ref()
+            .unwrap_or(&self.bm25f_config);
+
         // Language filter resolved up-front so we can skip scoring documents that
         // won't pass the filter.
         let lang_filter: Option<u8> = query.lang.map(super::format::lang_to_id);
 
-        // doc_id → accumulated BM25 score.
+        // doc_id → accumulated BM25F score.
         let mut doc_scores: HashMap<u32, f64> = HashMap::new();
+        // doc_id → per-field TF accumulators for dominant_field().
+        let mut doc_field_tfs: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
         // doc_id → match positions (collected during the single posting pass).
         let mut doc_positions: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
-        // Cache of doc_length per doc_id to avoid re-decoding file metadata for
-        // the same document across multiple bigram iterations.
-        let mut doc_len_cache: HashMap<u32, u32> = HashMap::new();
+        // Cache decoded FileMetaEntry per doc_id to avoid repeated mmap decoding.
+        let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
 
         for (ngram, _weight) in &ngrams {
             let postings = self.lookup_postings(ngram.key())?;
-            let idf = idf_for_key(ngram.key());
+            let idf = f64::from(idf_for_key(ngram.key()));
 
-            // Single pass: accumulate tf counts and positions simultaneously.
-            let mut tf_per_doc: HashMap<u32, u32> = HashMap::new();
+            // Single pass: accumulate per-field TF counts and positions.
+            let mut tf_per_doc: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
             for p in &postings {
-                *tf_per_doc.entry(p.doc_id).or_default() += 1;
+                let field_idx = p.field_id as usize;
+                if field_idx < FIELD_COUNT {
+                    tf_per_doc.entry(p.doc_id).or_insert([0.0; FIELD_COUNT])[field_idx] += 1.0;
+                }
                 let pos = p.position as usize;
                 doc_positions
                     .entry(p.doc_id)
@@ -265,40 +298,50 @@ impl SearchLayer for NgramIndexReader {
                     .push(pos..pos + 2);
             }
 
-            for (doc_id, tf) in tf_per_doc {
+            for (doc_id, field_tfs) in tf_per_doc {
                 // Apply language filter before scoring to avoid decoding metadata
                 // for documents that won't appear in results.
-                if let Some(required_lang) = lang_filter
-                    && doc_id < self.header.file_count
-                {
+                if doc_id >= self.header.file_count {
+                    continue;
+                }
+
+                // Resolve or cache file metadata.
+                if !doc_meta_cache.contains_key(&doc_id) {
                     let meta = self.file_meta_at(doc_id)?;
-                    doc_len_cache.entry(doc_id).or_insert(meta.doc_length);
+                    doc_meta_cache.insert(doc_id, meta);
+                }
+                let meta = &doc_meta_cache[&doc_id];
+
+                if let Some(required_lang) = lang_filter {
                     if meta.lang_id != required_lang {
                         continue;
                     }
                 }
 
-                // Resolve doc_length from cache (populated above when lang filter
-                // reads the meta, or populated here on first encounter without filter).
-                let doc_len = if doc_id < self.header.file_count {
-                    if let Some(&cached) = doc_len_cache.get(&doc_id) {
-                        cached
-                    } else {
-                        let len = self.file_meta_at(doc_id)?.doc_length;
-                        doc_len_cache.insert(doc_id, len);
-                        len
-                    }
-                } else {
-                    0
-                };
+                // Accumulate per-field TFs across ngrams for dominant_field().
+                let doc_tfs = doc_field_tfs.entry(doc_id).or_insert([0.0; FIELD_COUNT]);
+                for i in 0..FIELD_COUNT {
+                    doc_tfs[i] += field_tfs[i];
+                }
 
-                let contribution = bm25_score(tf as f32, idf, doc_len, self.header.avg_doc_length);
+                let contribution = bm25f_score(
+                    idf,
+                    &field_tfs,
+                    &meta.field_lengths,
+                    &self.header.avg_field_lengths,
+                    scoring_config,
+                );
                 *doc_scores.entry(doc_id).or_default() += contribution;
             }
         }
 
         let mut scored: Vec<(u32, f64)> = doc_scores.into_iter().collect();
-        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort descending by score; tie-break ascending by FileId for determinism.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         let offset = query.offset.unwrap_or(0);
         let limit = query.limit.unwrap_or(20);
@@ -309,12 +352,16 @@ impl SearchLayer for NgramIndexReader {
             .take(limit)
             .map(|(doc_id, score)| {
                 let positions = doc_positions.remove(&doc_id).unwrap_or_default();
+                let field = doc_field_tfs
+                    .get(&doc_id)
+                    .map(dominant_field)
+                    .unwrap_or(SearchField::Other);
                 SearchResult {
                     file_id: FileId(doc_id),
                     score,
                     line_range: 0..0,
                     match_positions: positions,
-                    field: SearchField::Other,
+                    field,
                     snippet: None,
                 }
             })

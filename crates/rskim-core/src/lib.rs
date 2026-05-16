@@ -42,6 +42,25 @@
 // Public API — stable as of v1.0.0
 pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, TransformResult};
 
+/// Return the structural priority of a tree-sitter node kind (1–5).
+///
+/// Used by the BM25F classifier to map node kinds to [`SearchField`] variants.
+/// Priority 5 = type definitions, 4 = function signatures, 3 = import/export,
+/// 2 = class/module containers, 1 = everything else (including unknown kinds).
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(rskim_core::node_kind_priority("struct_item"), 5);
+/// assert_eq!(rskim_core::node_kind_priority("function_item"), 4);
+/// assert_eq!(rskim_core::node_kind_priority("import_statement"), 3);
+/// assert_eq!(rskim_core::node_kind_priority("unknown_xyz"), 1);
+/// ```
+#[must_use]
+pub fn node_kind_priority(kind: &str) -> u8 {
+    transform::utils::node_kind_info(kind).1
+}
+
 mod parser;
 mod transform;
 mod types;
