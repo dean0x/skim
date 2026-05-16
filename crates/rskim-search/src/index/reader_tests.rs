@@ -450,7 +450,7 @@ fn test_ac2_configurable_boosts_reverse_ranking() {
         )
         .unwrap();
 
-    let layer = builder.build().unwrap();
+    builder.build().unwrap();
     let reader = NgramIndexReader::open(dir.path()).unwrap();
 
     // Default boosts: TypeDefinition=5.0 > StringLiteral=0.5 → file 0 ranks first.
@@ -473,7 +473,6 @@ fn test_ac2_configurable_boosts_reverse_ranking() {
         reversed_results[0].file_id.0, 1,
         "reversed boosts: StringLiteral should rank first"
     );
-    drop(layer);
 }
 
 /// AC3: BM25F params are tunable — validation rejects invalid values.

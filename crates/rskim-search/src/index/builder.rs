@@ -94,7 +94,7 @@ impl NgramIndexBuilder {
 }
 
 // ============================================================================
-// LayerBuilder implementation
+// Classified indexing
 // ============================================================================
 
 impl NgramIndexBuilder {
@@ -215,7 +215,6 @@ fn compute_field_lengths(
     }
     lengths
 }
-
 
 // ============================================================================
 // LayerBuilder implementation
