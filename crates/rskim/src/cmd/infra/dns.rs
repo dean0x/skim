@@ -436,7 +436,7 @@ fn extract_nslookup_server(text: &str) -> Option<String> {
 /// whitespace-delimited token on a line that contains "mail exchanger":
 ///
 /// ```text
-/// example.com	mail exchanger = 0 .
+/// example.com    mail exchanger = 0 .
 /// ```
 fn extract_nslookup_mx_domain(text: &str) -> Option<String> {
     for line in text.lines() {
