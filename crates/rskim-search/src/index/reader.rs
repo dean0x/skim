@@ -262,10 +262,8 @@ impl SearchLayer for NgramIndexReader {
         }
 
         // Resolve scoring config: per-query override takes priority.
-        let scoring_config: &BM25FConfig = query
-            .bm25f_config
-            .as_ref()
-            .unwrap_or(&self.bm25f_config);
+        let scoring_config: &BM25FConfig =
+            query.bm25f_config.as_ref().unwrap_or(&self.bm25f_config);
 
         // Language filter resolved up-front so we can skip scoring documents that
         // won't pass the filter.
@@ -306,16 +304,14 @@ impl SearchLayer for NgramIndexReader {
                 }
 
                 // Resolve or cache file metadata.
-                if !doc_meta_cache.contains_key(&doc_id) {
+                if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(doc_id) {
                     let meta = self.file_meta_at(doc_id)?;
-                    doc_meta_cache.insert(doc_id, meta);
+                    e.insert(meta);
                 }
                 let meta = &doc_meta_cache[&doc_id];
 
-                if let Some(required_lang) = lang_filter {
-                    if meta.lang_id != required_lang {
-                        continue;
-                    }
+                if lang_filter.is_some_and(|required_lang| meta.lang_id != required_lang) {
+                    continue;
                 }
 
                 // Accumulate per-field TFs across ngrams for dominant_field().

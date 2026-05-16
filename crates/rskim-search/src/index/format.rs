@@ -54,8 +54,10 @@ pub(crate) const POSTING_ENTRY_SIZE: usize = 9;
 /// v1 was 5 bytes; v2 adds 32 bytes for `field_lengths: [u32; 8]`.
 pub(crate) const FILE_META_SIZE: usize = 37;
 /// BM25 term-frequency saturation parameter.
+#[cfg(test)]
 const BM25_K1: f32 = 1.2;
 /// BM25 document-length normalisation parameter.
+#[cfg(test)]
 const BM25_B: f32 = 0.75;
 
 /// Fixed-size header at the start of every `.skidx` file.
@@ -397,6 +399,7 @@ pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
 ///
 /// Returns the BM25 score contribution as `f64` (accumulated across terms
 /// to avoid precision loss).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn bm25_score(tf: f32, idf: f32, doc_len: u32, avg_doc_len: f32) -> f64 {
     let k1 = f64::from(BM25_K1);

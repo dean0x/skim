@@ -95,12 +95,11 @@ pub fn dominant_field(field_tfs: &[f32; FIELD_COUNT]) -> SearchField {
 
     // Walk in discriminant order (0..FIELD_COUNT) so the lowest discriminant
     // wins on ties — deterministic without sorting.
-    for i in 0..FIELD_COUNT {
-        if field_tfs[i] > best_tf {
-            best_tf = field_tfs[i];
+    for (i, &tf) in field_tfs.iter().enumerate() {
+        if tf > best_tf {
+            best_tf = tf;
             // SAFETY: discriminants 0..7 are always valid SearchField variants.
-            best_field = SearchField::from_discriminant(i as u8)
-                .unwrap_or(SearchField::Other);
+            best_field = SearchField::from_discriminant(i as u8).unwrap_or(SearchField::Other);
         }
     }
 

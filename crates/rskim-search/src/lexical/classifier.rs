@@ -46,14 +46,24 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
         "comment" | "line_comment" | "block_comment" | "doc_comment" => {
             return SearchField::Comment;
         }
-        "string_literal" | "string" | "interpreted_string_literal"
-        | "raw_string_literal" | "string_content" | "raw_str_literal"
-        | "template_string" | "template_literal" | "quoted_string" => {
+        "string_literal"
+        | "string"
+        | "interpreted_string_literal"
+        | "raw_string_literal"
+        | "string_content"
+        | "raw_str_literal"
+        | "template_string"
+        | "template_literal"
+        | "quoted_string" => {
             return SearchField::StringLiteral;
         }
         // Identifier / name nodes → SymbolName
-        "identifier" | "type_identifier" | "field_identifier" | "property_identifier"
-        | "variable_name" | "attribute_name" => {
+        "identifier"
+        | "type_identifier"
+        | "field_identifier"
+        | "property_identifier"
+        | "variable_name"
+        | "attribute_name" => {
             return SearchField::SymbolName;
         }
         _ => {}
@@ -63,7 +73,7 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
         5 => SearchField::TypeDefinition,
         4 => SearchField::FunctionSignature,
         3 => SearchField::ImportExport,
-        2 | 1 | _ => SearchField::Other,
+        _ => SearchField::Other,
     }
 }
 
@@ -168,11 +178,11 @@ fn run_length_encode(field_at: Vec<SearchField>, len: usize) -> Vec<(Range<usize
     let mut start = 0usize;
     let mut current = field_at[0];
 
-    for i in 1..len {
-        if field_at[i] != current {
+    for (i, &f) in field_at.iter().enumerate().skip(1) {
+        if f != current {
             result.push((start..i, current));
             start = i;
-            current = field_at[i];
+            current = f;
         }
     }
     // Push the final segment.
