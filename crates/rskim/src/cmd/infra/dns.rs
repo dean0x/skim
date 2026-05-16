@@ -375,11 +375,9 @@ fn try_parse_nslookup_structured(text: &str) -> Option<InfraResult> {
         let domain = caps[1].trim_end_matches(':').to_string();
         let server = extract_nslookup_server(text).unwrap_or_else(|| "unknown".to_string());
 
-        items.push(InfraItem {
-            label: "error".to_string(),
-            value: format!("NXDOMAIN: {domain}"),
-        });
-
+        // No separate error item: the summary line already carries the full
+        // NXDOMAIN signal. Adding an item repeats the domain a third time and
+        // makes the compressed output larger than the raw input (AC-NSL-10).
         let summary = format!("{domain} → NXDOMAIN (via {server})");
         return Some(InfraResult::new(
             "nslookup".to_string(),
@@ -401,10 +399,13 @@ fn try_parse_nslookup_structured(text: &str) -> Option<InfraResult> {
         return None;
     }
 
-    // Try to find the queried domain from Name: lines or server header
+    // Try to find the queried domain from Name: lines (A/AAAA queries),
+    // or from MX record lines (MX queries, which have no Name: line).
+    // MX format: `example.com\tmail exchanger = 0 .` — domain is first field.
     let domain = RE_NSL_NAME
         .captures(text)
         .map(|c| c[1].trim().to_string())
+        .or_else(|| extract_nslookup_mx_domain(text))
         .unwrap_or_else(|| "unknown".to_string());
 
     let summary = format!("{domain} → {record_count} records (via {server})");
@@ -427,6 +428,26 @@ fn extract_nslookup_server(text: &str) -> Option<String> {
     RE_NSL_SERVER
         .captures(text)
         .map(|c| c[1].trim().to_string())
+}
+
+/// Extract the queried domain from an MX record line.
+///
+/// nslookup MX output has no `Name:` line. The domain appears as the first
+/// whitespace-delimited token on a line that contains "mail exchanger":
+///
+/// ```text
+/// example.com	mail exchanger = 0 .
+/// ```
+fn extract_nslookup_mx_domain(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if line.contains("mail exchanger") {
+            let domain = line.split_whitespace().next()?;
+            if !domain.is_empty() {
+                return Some(domain.trim_end_matches('.').to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Extract answer records from nslookup output.
@@ -769,9 +790,62 @@ mod tests {
             "Summary should contain NXDOMAIN: {}",
             result.as_ref()
         );
+        // No separate error item — the summary line carries the full NXDOMAIN
+        // signal. A separate item would repeat the domain and bloat the output
+        // past the raw input size (AC-NSL-10).
         assert!(
-            result.items.iter().any(|i| i.label == "error"),
-            "Expected error item"
+            result.items.is_empty(),
+            "NXDOMAIN result must have no items (summary line is sufficient): {:?}",
+            result.items
+        );
+    }
+
+    #[test]
+    fn test_nslookup_tier1_nxdomain_compression() {
+        // AC-NSL-10: NXDOMAIN compressed output must be strictly smaller than raw input.
+        let input = load_fixture("nslookup_nxdomain.txt");
+        let output = make_output(&input);
+        let result = parse_nslookup_impl(&output);
+        assert!(
+            result.is_full(),
+            "Expected Full parse for NXDOMAIN, got {}",
+            result.tier_name()
+        );
+        // The rendered output (as_ref() + newline) must be smaller than the raw fixture.
+        // parse_nslookup_impl returns a ParseResult<InfraResult>; the InfraResult is
+        // accessible via the Full variant. We compare the rendered string length plus 1
+        // (for the trailing newline that the CLI emits) against the raw input length.
+        if let ParseResult::Full(ref r) = result {
+            let rendered_len = r.as_ref().len() + 1; // +1 for trailing newline
+            assert!(
+                rendered_len < input.len(),
+                "NXDOMAIN compressed output ({} bytes) must be smaller than raw input ({} bytes):\n{}",
+                rendered_len,
+                input.len(),
+                r.as_ref()
+            );
+        } else {
+            panic!("Expected Full parse result");
+        }
+    }
+
+    #[test]
+    fn test_nslookup_tier1_mx_domain_extracted() {
+        // AC-NSL-MX: MX queries must show the queried domain, not "unknown".
+        let input = load_fixture("nslookup_mx_record.txt");
+        let result = try_parse_nslookup_structured(&input);
+        assert!(result.is_some(), "Expected Tier 1 parse for MX");
+        let result = result.unwrap();
+        let summary = result.as_ref();
+        assert!(
+            !summary.contains("unknown"),
+            "MX summary must not contain 'unknown' domain: {}",
+            summary
+        );
+        assert!(
+            summary.contains("example.com"),
+            "MX summary must contain queried domain 'example.com': {}",
+            summary
         );
     }
 
