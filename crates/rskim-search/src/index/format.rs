@@ -226,8 +226,7 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
     }
 
     // Decode avg_doc_length: f32 LE at bytes [22..26]
-    let avg_doc_length =
-        f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?);
+    let avg_doc_length = f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?);
     if !avg_doc_length.is_finite() || avg_doc_length < 0.0 {
         return Err(SearchError::IndexCorrupted(format!(
             "header: avg_doc_length must be a finite number >= 0.0, got {avg_doc_length}"

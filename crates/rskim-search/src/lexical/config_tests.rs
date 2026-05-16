@@ -178,7 +178,6 @@ fn test_validate_rejects_nan_k1() {
     assert!(msg.contains("k1"), "error should mention k1: {msg}");
 }
 
-
 #[test]
 fn test_validate_rejects_infinity_k1() {
     let cfg = BM25FConfig {

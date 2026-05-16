@@ -258,7 +258,10 @@ fn test_file_meta_field_lengths_sum_mismatch_rejected() {
     };
     let encoded = encode_file_meta(&m);
     let result = decode_file_meta(&encoded);
-    assert!(result.is_err(), "expected Err for field_lengths sum mismatch");
+    assert!(
+        result.is_err(),
+        "expected Err for field_lengths sum mismatch"
+    );
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("field_lengths sum"),
@@ -305,7 +308,10 @@ fn test_decode_header_rejects_nan_avg_doc_length() {
 fn test_decode_header_rejects_infinity_avg_doc_length() {
     let buf = make_header_with_float_at(22, f32::INFINITY);
     let result = decode_header(&buf);
-    assert!(result.is_err(), "infinity avg_doc_length should be rejected");
+    assert!(
+        result.is_err(),
+        "infinity avg_doc_length should be rejected"
+    );
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("avg_doc_length"),

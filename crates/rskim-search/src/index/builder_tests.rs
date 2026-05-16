@@ -328,7 +328,10 @@ fn test_add_file_classified_partial_field_map_succeeds() {
          ranges present in field_map — gap bytes don't appear here"
     );
     // doc_length still reflects the full source size.
-    assert_eq!(meta.doc_length, 20, "doc_length must equal full source length");
+    assert_eq!(
+        meta.doc_length, 20,
+        "doc_length must equal full source length"
+    );
 }
 
 /// Non-contiguous field_map with a gap in the middle.  The metadata field
@@ -367,6 +370,8 @@ fn test_add_file_classified_non_contiguous_map_builds_successfully() {
     );
 
     // Build must succeed and the layer must be searchable.
-    let layer = builder.build().expect("build with non-contiguous map must succeed");
+    let layer = builder
+        .build()
+        .expect("build with non-contiguous map must succeed");
     assert_eq!(layer.name(), "ngram-index");
 }

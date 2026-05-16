@@ -565,8 +565,14 @@ fn test_open_with_config_stores_config() {
     let custom_results = custom_reader.search(&SearchQuery::new("main")).unwrap();
 
     // Both configs must find the document.
-    assert!(!default_results.is_empty(), "default config should find results");
-    assert!(!custom_results.is_empty(), "custom config should find results");
+    assert!(
+        !default_results.is_empty(),
+        "default config should find results"
+    );
+    assert!(
+        !custom_results.is_empty(),
+        "custom config should find results"
+    );
 
     // A higher k1 value reduces score saturation, so scores must differ.
     let default_score = default_results[0].score;
@@ -637,10 +643,7 @@ fn test_open_with_config_rejects_invalid_config() {
     );
     if let Err(e) = result {
         let err = format!("{e}");
-        assert!(
-            err.contains("k1"),
-            "error should mention k1, got: {err}"
-        );
+        assert!(err.contains("k1"), "error should mention k1, got: {err}");
     }
 }
 

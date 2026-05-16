@@ -223,9 +223,7 @@ fn test_rust_function_body_classified_as_function_body() {
     let ranges = classify_source(source, rskim_core::Language::Rust).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    let has_body = ranges
-        .iter()
-        .any(|(_, f)| *f == SearchField::FunctionBody);
+    let has_body = ranges.iter().any(|(_, f)| *f == SearchField::FunctionBody);
     assert!(
         has_body,
         "Rust function body should produce FunctionBody range; got: {ranges:?}"
@@ -238,9 +236,7 @@ fn test_typescript_function_body_classified_as_function_body() {
     let ranges = classify_source(source, rskim_core::Language::TypeScript).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    let has_body = ranges
-        .iter()
-        .any(|(_, f)| *f == SearchField::FunctionBody);
+    let has_body = ranges.iter().any(|(_, f)| *f == SearchField::FunctionBody);
     assert!(
         has_body,
         "TypeScript function body should produce FunctionBody range; got: {ranges:?}"
@@ -253,9 +249,7 @@ fn test_c_compound_statement_classified_as_function_body() {
     let ranges = classify_source(source, rskim_core::Language::C).unwrap();
     assert_contiguous(&ranges, source.len());
 
-    let has_body = ranges
-        .iter()
-        .any(|(_, f)| *f == SearchField::FunctionBody);
+    let has_body = ranges.iter().any(|(_, f)| *f == SearchField::FunctionBody);
     assert!(
         has_body,
         "C compound_statement should produce FunctionBody range; got: {ranges:?}"

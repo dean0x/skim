@@ -166,8 +166,7 @@ impl NgramIndexBuilder {
             while range_idx < field_map.len() && field_map[range_idx].0.end <= pos {
                 range_idx += 1;
             }
-            let field_id = if range_idx < field_map.len() && field_map[range_idx].0.contains(&pos)
-            {
+            let field_id = if range_idx < field_map.len() && field_map[range_idx].0.contains(&pos) {
                 field_map[range_idx].1.discriminant()
             } else {
                 SearchField::Other.discriminant()
@@ -277,11 +276,8 @@ impl LayerBuilder for NgramIndexBuilder {
         sorted_keys.sort_unstable();
 
         // Serialise everything into the two on-disk buffers.
-        let (postings_buf, skidx_buf) = self.serialize_index(
-            &sorted_keys,
-            avg_doc_length,
-            avg_field_lengths,
-        )?;
+        let (postings_buf, skidx_buf) =
+            self.serialize_index(&sorted_keys, avg_doc_length, avg_field_lengths)?;
 
         let post_path = self.output_dir.join("index.skpost");
         let idx_path = self.output_dir.join("index.skidx");
