@@ -85,8 +85,7 @@ static RE_NSL_SERVER_ADDR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^Address:\s+(\S+)#(\d+)$").unwrap());
 
 /// Captures a result Name line
-static RE_NSL_NAME: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^Name:\s+(.+)$").unwrap());
+static RE_NSL_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^Name:\s+(.+)$").unwrap());
 
 /// Captures a result Address line (no #port = answer, not server)
 static RE_NSL_ADDRESS: LazyLock<Regex> =
@@ -105,8 +104,7 @@ static RE_NSL_CNAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"canonical name\s*=\s*(\S+)").unwrap());
 
 /// Captures TXT records: `text = "<content>"`
-static RE_NSL_TXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"text\s*=\s*"(.+)""#).unwrap());
+static RE_NSL_TXT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"text\s*=\s*"(.+)""#).unwrap());
 
 /// macOS format: `address = <ip>` (without #port)
 static RE_NSL_ADDRESS_MAC: LazyLock<Regex> =
@@ -412,7 +410,9 @@ fn extract_nslookup_server(text: &str) -> Option<String> {
         return Some(caps[1].to_string());
     }
     // Fallback: Server: name line
-    RE_NSL_SERVER.captures(text).map(|c| c[1].trim().to_string())
+    RE_NSL_SERVER
+        .captures(text)
+        .map(|c| c[1].trim().to_string())
 }
 
 /// Extract answer records from nslookup output.
@@ -579,7 +579,10 @@ mod tests {
             result.as_ref()
         );
         assert!(
-            result.items.iter().any(|i| i.label == "status" && i.value == "NXDOMAIN"),
+            result
+                .items
+                .iter()
+                .any(|i| i.label == "status" && i.value == "NXDOMAIN"),
             "Expected status=NXDOMAIN item"
         );
     }
