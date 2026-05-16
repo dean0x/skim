@@ -39,12 +39,19 @@ const CONFIG_DIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "dig",
     env_overrides: &[],
     install_hint: "Install via: apt install dnsutils / brew install bind",
+    // dig uses TABs as field separators in ANSWER records (e.g. `name\tTTL\tIN\tA\tip`).
+    // strip_ansi_escapes treats \t as a control code and removes it, collapsing fields
+    // so RE_DIG_RECORD can no longer match. Skip stripping for dig and nslookup.
+    skip_ansi_strip: true,
 };
 
 const CONFIG_NSLOOKUP: InfraToolConfig<'static> = InfraToolConfig {
     program: "nslookup",
     env_overrides: &[],
     install_hint: "Install via: apt install dnsutils / brew install bind",
+    // nslookup also uses TABs as field separators (Server:\t<ip>, Address:\t<ip>#port).
+    // See CONFIG_DIG comment for the full rationale.
+    skip_ansi_strip: true,
 };
 
 // ============================================================================
@@ -55,10 +62,6 @@ const CONFIG_NSLOOKUP: InfraToolConfig<'static> = InfraToolConfig {
 static RE_DIG_HEADER_STATUS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"status:\s*(\w+)").unwrap());
 
-/// Detects the ANSWER SECTION marker
-static RE_DIG_ANSWER_SECTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^;; ANSWER SECTION:").unwrap());
-
 /// Captures an answer record: name TTL class type rdata
 /// Groups: (name, ttl, class, type, rdata)
 static RE_DIG_RECORD: LazyLock<Regex> =
@@ -67,10 +70,6 @@ static RE_DIG_RECORD: LazyLock<Regex> =
 /// Captures the query time in msec
 static RE_DIG_QUERY_TIME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r";; Query time:\s*(\d+)\s*msec").unwrap());
-
-/// Tier 2: look for any status code anywhere in output
-static RE_DIG_ANY_STATUS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"status:\s*(\w+)").unwrap());
 
 // ============================================================================
 // nslookup regex patterns (compiled once)
@@ -210,15 +209,7 @@ fn try_parse_dig_structured(text: &str) -> Option<InfraResult> {
     // Extract ANSWER records
     let records = extract_dig_answer_records(text);
     let record_count = records.len();
-
-    for record in records {
-        items.push(record);
-    }
-
-    if items.len() <= 1 && !text.contains(";; ANSWER SECTION:") {
-        // Header present but no answers and no answer section — still valid (empty response)
-        // Return with what we have
-    }
+    items.extend(records);
 
     let domain = extract_dig_question_domain(text).unwrap_or_else(|| "unknown".to_string());
     let query_time = extract_dig_query_time(text);
@@ -238,15 +229,41 @@ fn try_parse_dig_structured(text: &str) -> Option<InfraResult> {
 }
 
 /// Extract the queried domain from the QUESTION SECTION.
+///
+/// dig output has two kinds of single-semicolon lines:
+/// - The version header: `; <<>> DiG 9.10.6 <<>> example.com A` — appears before any section.
+/// - The question entry: `;example.com.    IN    A` — appears after `;; QUESTION SECTION:`.
+///
+/// We must only match the latter. We track whether we have seen the QUESTION SECTION
+/// marker and then parse the first single-semicolon line inside that section.
 fn extract_dig_question_domain(text: &str) -> Option<String> {
+    let mut in_question = false;
+
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with(';') && !trimmed.starts_with(";;") {
-            // Question line: `;example.com. IN A`
-            let domain = trimmed.trim_start_matches(';').split_whitespace().next()?;
-            // Strip trailing dot
-            let domain = domain.trim_end_matches('.');
-            return Some(domain.to_string());
+
+        // Detect QUESTION SECTION header
+        if trimmed.starts_with(";; QUESTION SECTION:") {
+            in_question = true;
+            continue;
+        }
+
+        if in_question {
+            // Any `;;` line ends the section
+            if trimmed.starts_with(";;") {
+                break;
+            }
+            // Empty line ends the section
+            if trimmed.is_empty() {
+                break;
+            }
+            // Single-semicolon line inside QUESTION SECTION: `;example.com.    IN    A`
+            if trimmed.starts_with(';') {
+                let domain = trimmed.trim_start_matches(';').split_whitespace().next()?;
+                // Strip trailing dot (dig always appends a dot to FQDNs)
+                let domain = domain.trim_end_matches('.');
+                return Some(domain.to_string());
+            }
         }
     }
     None
@@ -271,7 +288,7 @@ fn extract_dig_answer_records(text: &str) -> Vec<InfraItem> {
         let trimmed = line.trim();
 
         // Detect ANSWER SECTION start
-        if RE_DIG_ANSWER_SECTION.is_match(trimmed) {
+        if trimmed.starts_with(";; ANSWER SECTION:") {
             in_answer = true;
             continue;
         }
@@ -306,7 +323,7 @@ fn extract_dig_answer_records(text: &str) -> Vec<InfraItem> {
 
 /// Tier 2: Look for a status keyword anywhere in the output.
 fn try_parse_dig_regex(text: &str) -> Option<InfraResult> {
-    if let Some(caps) = RE_DIG_ANY_STATUS.captures(text) {
+    if let Some(caps) = RE_DIG_HEADER_STATUS.captures(text) {
         let status = caps[1].to_string();
         let items = vec![InfraItem {
             label: "status".to_string(),
@@ -378,10 +395,7 @@ fn try_parse_nslookup_structured(text: &str) -> Option<InfraResult> {
     // Extract records
     let records = extract_nslookup_records(text);
     let record_count = records.len();
-
-    for record in records {
-        items.push(record);
-    }
+    items.extend(records);
 
     if items.is_empty() && server == "unknown" {
         return None;
@@ -468,14 +482,12 @@ fn extract_nslookup_records(text: &str) -> Vec<InfraItem> {
             continue;
         }
 
-        // A/AAAA answer Address line (no #port)
+        // A/AAAA answer Address line (no #port — server Address lines already skipped above)
         if let Some(caps) = RE_NSL_ADDRESS.captures(trimmed) {
-            if !trimmed.contains('#') {
-                items.push(InfraItem {
-                    label: "A".to_string(),
-                    value: caps[1].to_string(),
-                });
-            }
+            items.push(InfraItem {
+                label: "A".to_string(),
+                value: caps[1].to_string(),
+            });
             continue;
         }
 
@@ -598,6 +610,14 @@ mod tests {
             "Summary should contain NOERROR: {}",
             result.as_ref()
         );
+        // AC-DIG-5: multi-record fixture must yield at least 2 A record items
+        let a_records: Vec<_> = result.items.iter().filter(|i| i.label == "A").collect();
+        assert!(
+            a_records.len() >= 2,
+            "Expected at least 2 A records, got {}: {:?}",
+            a_records.len(),
+            a_records
+        );
     }
 
     #[test]
@@ -609,6 +629,31 @@ mod tests {
             result.as_ref().contains("ms"),
             "Summary should contain timing: {}",
             result.as_ref()
+        );
+    }
+
+    #[test]
+    fn test_dig_tier1_aaaa_record() {
+        // AC-DIG-10: AAAA/IPv6 records must be extracted as Tier 1 Full
+        let input = load_fixture("dig_aaaa_record.txt");
+        let result = try_parse_dig_structured(&input);
+        assert!(result.is_some(), "Expected Tier 1 parse for AAAA record");
+        let result = result.unwrap();
+        assert!(
+            result.as_ref().contains("NOERROR"),
+            "Summary should contain NOERROR: {}",
+            result.as_ref()
+        );
+        // Must have at least one AAAA item containing an IPv6 address
+        let aaaa_items: Vec<_> = result.items.iter().filter(|i| i.label == "AAAA").collect();
+        assert!(
+            !aaaa_items.is_empty(),
+            "Expected at least one AAAA record item"
+        );
+        assert!(
+            aaaa_items.iter().any(|i| i.value.contains("2606:2800")),
+            "Expected IPv6 address 2606:2800:... in AAAA items, got: {:?}",
+            aaaa_items
         );
     }
 
@@ -738,6 +783,30 @@ mod tests {
             result.as_ref().contains("via"),
             "Summary should contain 'via <server>': {}",
             result.as_ref()
+        );
+    }
+
+    #[test]
+    fn test_nslookup_tier1_macos_address_format() {
+        // AC-NSL-8: macOS nslookup uses `address = x.x.x.x` (lowercase, equals sign).
+        // This must be extracted as Tier 1 Full with the address in items.
+        let input = "Server:\t8.8.8.8\nAddress:\t8.8.8.8#53\n\nNon-authoritative answer:\nName:\texample.com\naddress = 93.184.216.34\n";
+        let result = try_parse_nslookup_structured(input);
+        assert!(
+            result.is_some(),
+            "Expected Tier 1 parse for macOS nslookup format"
+        );
+        let result = result.unwrap();
+        let a_items: Vec<_> = result.items.iter().filter(|i| i.label == "A").collect();
+        assert!(
+            !a_items.is_empty(),
+            "Expected at least one A item from macOS address = format, got items: {:?}",
+            result.items
+        );
+        assert!(
+            a_items.iter().any(|i| i.value.contains("93.184.216.34")),
+            "Expected 93.184.216.34 in A items, got: {:?}",
+            a_items
         );
     }
 

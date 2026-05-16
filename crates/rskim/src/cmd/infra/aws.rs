@@ -22,6 +22,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "aws",
     env_overrides: &[],
     install_hint: "Install AWS CLI: https://aws.amazon.com/cli/",
+    skip_ansi_strip: false,
 };
 
 /// Keys stripped from AWS JSON responses (metadata, not useful data).

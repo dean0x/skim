@@ -29,6 +29,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "curl",
     env_overrides: &[],
     install_hint: "Install curl: https://curl.se/",
+    skip_ansi_strip: false,
 };
 
 /// Maximum number of source fields in a JSON response before a truncation notice is added.

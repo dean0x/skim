@@ -31,12 +31,27 @@ fn skim_cmd() -> Command {
 #[test]
 fn test_dig_tier1_a_record_compressed() {
     let fixture = include_str!("fixtures/cmd/infra/dig_a_record.txt");
-    skim_cmd()
+    let out = skim_cmd()
         .args(["dig"])
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("dig query"));
+        .stdout(predicate::str::contains("dig query"))
+        // Must contain an IP address from the fixture (either of the two A records)
+        .stdout(
+            predicate::str::contains("104.20.23.154")
+                .or(predicate::str::contains("172.66.147.243")),
+        )
+        .get_output()
+        .stdout
+        .clone();
+    // AC-DIG-14: compressed output must be strictly smaller than raw input
+    assert!(
+        out.len() < fixture.len(),
+        "Compressed output ({} bytes) must be smaller than raw fixture ({} bytes)",
+        out.len(),
+        fixture.len()
+    );
 }
 
 #[test]
@@ -101,12 +116,27 @@ fn test_dig_json_output_valid() {
 #[test]
 fn test_nslookup_tier1_a_record_compressed() {
     let fixture = include_str!("fixtures/cmd/infra/nslookup_a_record.txt");
-    skim_cmd()
+    let out = skim_cmd()
         .args(["nslookup"])
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("nslookup query"));
+        .stdout(predicate::str::contains("nslookup query"))
+        // Must contain one of the resolved addresses from the fixture
+        .stdout(
+            predicate::str::contains("104.20.23.154")
+                .or(predicate::str::contains("172.66.147.243")),
+        )
+        .get_output()
+        .stdout
+        .clone();
+    // AC-NSL-10: compressed output must be strictly smaller than raw input
+    assert!(
+        out.len() < fixture.len(),
+        "Compressed output ({} bytes) must be smaller than raw fixture ({} bytes)",
+        out.len(),
+        fixture.len()
+    );
 }
 
 #[test]

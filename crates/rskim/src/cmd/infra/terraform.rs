@@ -25,6 +25,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "terraform",
     env_overrides: &[],
     install_hint: "Install Terraform: https://developer.hashicorp.com/terraform/downloads",
+    skip_ansi_strip: false,
 };
 
 /// Matches the plan summary line in text output.
