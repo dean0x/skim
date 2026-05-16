@@ -92,11 +92,13 @@ impl SearchField {
 
     /// The total number of [`SearchField`] variants.
     ///
-    /// Must equal `FIELD_COUNT` in the lexical module and the length of `ALL`.
+    /// Derived from `ALL.len()` so it stays in sync automatically when variants
+    /// are added or removed. `FIELD_COUNT` in the lexical module is defined as
+    /// `SearchField::count()` to create a single authoritative source.
     #[must_use]
     #[inline]
     pub const fn count() -> usize {
-        8
+        Self::ALL.len()
     }
 
     /// Returns the numeric discriminant of this variant (0–7).
@@ -469,6 +471,12 @@ pub enum SearchError {
     /// at the parser boundary so no git library types leak into this enum.
     #[error("Git error: {0}")]
     Git(String),
+
+    /// The source file exceeds the maximum size that can be safely classified.
+    /// The classifier allocates a per-byte array, so unbounded input would
+    /// cause proportional memory growth.
+    #[error("File too large to classify: {size} bytes exceeds the {limit}-byte limit")]
+    FileTooLarge { size: usize, limit: usize },
 }
 
 /// Result type alias for all rskim-search operations.

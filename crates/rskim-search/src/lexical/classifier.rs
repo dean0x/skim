@@ -90,6 +90,14 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
 /// Returns [`crate::SearchError`] if the tree-sitter parser fails to initialise
 /// (grammar loading failure, which should not happen in practice for supported
 /// languages).
+/// Maximum source size (in bytes) accepted by [`classify_source`].
+///
+/// The classifier allocates a per-byte `Vec<SearchField>`, so accepting
+/// unbounded input would allow a caller to trigger proportional memory
+/// allocation. 100 MiB is generous for any real source file while keeping
+/// peak RSS bounded.
+pub const MAX_SOURCE_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
+
 pub fn classify_source(
     source: &str,
     lang: Language,
@@ -99,6 +107,13 @@ pub fn classify_source(
     }
 
     let len = source.len();
+
+    if len > MAX_SOURCE_BYTES {
+        return Err(crate::SearchError::FileTooLarge {
+            size: len,
+            limit: MAX_SOURCE_BYTES,
+        });
+    }
 
     // For non-tree-sitter languages (JSON, YAML, TOML), classify all bytes as Other.
     let mut parser = match rskim_core::Parser::new(lang) {

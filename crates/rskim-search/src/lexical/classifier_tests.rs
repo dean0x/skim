@@ -54,6 +54,46 @@ fn test_empty_source_returns_empty() {
 }
 
 // -----------------------------------------------------------------------
+// Size limit guard
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_source_exceeding_limit_returns_error() {
+    use crate::SearchError;
+
+    // Build a source that is exactly one byte over the limit.
+    // We use a byte string of spaces so allocation stays minimal in tests;
+    // the limit check fires before any tree-sitter work.
+    let oversized = " ".repeat(MAX_SOURCE_BYTES + 1);
+    let err = classify_source(&oversized, rskim_core::Language::Rust)
+        .expect_err("sources over MAX_SOURCE_BYTES must return Err");
+
+    assert!(
+        matches!(err, SearchError::FileTooLarge { size, limit }
+            if size == MAX_SOURCE_BYTES + 1 && limit == MAX_SOURCE_BYTES),
+        "expected FileTooLarge with correct size/limit, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_source_at_limit_boundary_does_not_error() {
+    // A source of exactly MAX_SOURCE_BYTES bytes must NOT be rejected.
+    // We use JSON (non-tree-sitter) so this stays fast even at 100 MiB;
+    // it returns a single Other range without touching the parser.
+    let at_limit = " ".repeat(MAX_SOURCE_BYTES);
+    let result = classify_source(&at_limit, rskim_core::Language::Json);
+    // Json parser returns an error (unsupported for tree-sitter), but the
+    // size guard must not fire — the error, if any, comes from the parser,
+    // not from FileTooLarge.
+    match result {
+        Err(crate::SearchError::FileTooLarge { .. }) => {
+            panic!("MAX_SOURCE_BYTES itself must not trigger FileTooLarge");
+        }
+        _ => {} // Ok or a parser error — both are acceptable here.
+    }
+}
+
+// -----------------------------------------------------------------------
 // Non-tree-sitter languages (JSON, YAML, TOML)
 // -----------------------------------------------------------------------
 
