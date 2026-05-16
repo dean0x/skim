@@ -17,8 +17,6 @@ exclude = ["data/"]
 rskim-core = { version = "2.9.0", path = "../rskim-core" }
 thiserror = { workspace = true }
 serde = { workspace = true }
-# tree-sitter is used by the BM25F classifier to walk AST nodes for field classification.
-tree-sitter = { workspace = true }
 
 memmap2 = { workspace = true }
 crc32fast = { workspace = true }

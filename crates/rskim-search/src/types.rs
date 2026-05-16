@@ -435,6 +435,14 @@ pub struct NodeInfo {
 ///
 /// Implementations should be thread-safe so they can be shared across indexing
 /// workers.
+///
+/// # Relationship to `classify_source`
+///
+/// [`crate::lexical::classify_source`] is the built-in, byte-range implementation
+/// used by the BM25F indexing pipeline. `FieldClassifier` is a **future extension
+/// point**: it allows downstream consumers (custom indexers, non-tree-sitter
+/// language plugins) to plug in alternative classification logic without depending
+/// on tree-sitter internals. The two are parallel, not competing, APIs.
 pub trait FieldClassifier: Send + Sync {
     /// Classify the given `node` within its `source` file.
     fn classify(&self, node: &NodeInfo, source: &str) -> SearchField;

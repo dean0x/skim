@@ -286,14 +286,18 @@ impl SearchLayer for NgramIndexReader {
         // Cache decoded FileMetaEntry per doc_id to avoid repeated mmap decoding.
         let mut doc_meta_cache: HashMap<u32, FileMetaEntry> = HashMap::new();
 
+        // Reused across ngram iterations to avoid per-iteration allocation churn.
+        let mut tf_per_doc: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
+        let mut pos_per_doc: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
+
         for (ngram, _weight) in &ngrams {
             let postings = self.lookup_postings(ngram.key())?;
             let idf = f64::from(idf_for_key(ngram.key()));
 
             // First sub-pass: accumulate per-field TF counts and candidate positions,
             // skipping doc_ids that are out of range (never valid).
-            let mut tf_per_doc: HashMap<u32, [f32; FIELD_COUNT]> = HashMap::new();
-            let mut pos_per_doc: HashMap<u32, Vec<std::ops::Range<usize>>> = HashMap::new();
+            tf_per_doc.clear();
+            pos_per_doc.clear();
             for p in &postings {
                 if p.doc_id >= self.header.file_count {
                     continue; // out-of-range doc_ids are never valid
@@ -308,7 +312,7 @@ impl SearchLayer for NgramIndexReader {
 
             // Second sub-pass: apply language filter, score, and transfer positions
             // only for documents that survive all filters.
-            for (doc_id, field_tfs) in tf_per_doc {
+            for (&doc_id, field_tfs) in &tf_per_doc {
                 // Resolve or cache file metadata.
                 if let std::collections::hash_map::Entry::Vacant(e) = doc_meta_cache.entry(doc_id) {
                     let meta = self.file_meta_at(doc_id)?;
@@ -328,7 +332,7 @@ impl SearchLayer for NgramIndexReader {
 
                 let contribution = bm25f_score(
                     idf,
-                    &field_tfs,
+                    field_tfs,
                     &meta.field_lengths,
                     &self.header.avg_field_lengths,
                     scoring_config,
