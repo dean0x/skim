@@ -44,7 +44,7 @@ pub struct NgramIndexBuilder {
     /// Guard against duplicate FileIds.
     seen_file_ids: HashSet<u32>,
     /// Number of files added.
-    pub(crate) file_count: u32,
+    file_count: u32,
     /// Sum of all document byte lengths (for avg_doc_length computation).
     total_doc_length: u64,
     /// Sum of per-field byte lengths across all documents (for avg_field_lengths).
@@ -201,6 +201,14 @@ fn compute_field_lengths(
     source_len: usize,
     field_map: &[(Range<usize>, SearchField)],
 ) -> [u32; FIELD_COUNT] {
+    // Precondition: source_len fits in u32. This is guaranteed by the caller
+    // (add_file_classified converts content.len() to u32 before reaching here),
+    // and enforced transitively by MAX_SOURCE_BYTES < u32::MAX. The assert
+    // documents the invariant so future callers cannot silently violate it.
+    debug_assert!(
+        source_len <= u32::MAX as usize,
+        "source_len {source_len} exceeds u32::MAX — caller must enforce this"
+    );
     let mut lengths = [0u32; FIELD_COUNT];
     if field_map.is_empty() {
         // All bytes are Other (discriminant 7).
@@ -272,7 +280,14 @@ impl LayerBuilder for NgramIndexBuilder {
         sorted_keys.sort_unstable();
 
         // Serialise posting lists and build the entry table.
-        let mut postings_buf: Vec<u8> = Vec::new();
+        // Pre-size the buffer to avoid O(log n) reallocations: each posting
+        // entry is exactly POSTING_ENTRY_SIZE bytes.
+        let total_posting_bytes: usize = self
+            .postings
+            .values()
+            .map(|v| v.len() * POSTING_ENTRY_SIZE)
+            .fold(0usize, usize::saturating_add);
+        let mut postings_buf: Vec<u8> = Vec::with_capacity(total_posting_bytes);
         let mut entries: Vec<SkidxEntry> = Vec::with_capacity(sorted_keys.len());
 
         for key in &sorted_keys {
