@@ -75,6 +75,32 @@ pub enum SearchField {
 }
 
 impl SearchField {
+    /// All eight field variants in discriminant order (0–7).
+    ///
+    /// Used wherever code needs to iterate over every field (e.g., BM25F scoring
+    /// loops, field-length accumulation in the builder).
+    pub const ALL: [Self; 8] = [
+        Self::TypeDefinition,
+        Self::FunctionSignature,
+        Self::SymbolName,
+        Self::ImportExport,
+        Self::FunctionBody,
+        Self::Comment,
+        Self::StringLiteral,
+        Self::Other,
+    ];
+
+    /// The total number of [`SearchField`] variants.
+    ///
+    /// Derived from `ALL.len()` so it stays in sync automatically when variants
+    /// are added or removed. `FIELD_COUNT` in the lexical module is defined as
+    /// `SearchField::count()` to create a single authoritative source.
+    #[must_use]
+    #[inline]
+    pub const fn count() -> usize {
+        Self::ALL.len()
+    }
+
     /// Returns the numeric discriminant of this variant (0–7).
     ///
     /// The discriminant is stable across compilations and forms part of the
@@ -263,6 +289,13 @@ pub struct SearchQuery {
     pub limit: Option<usize>,
     /// Number of results to skip (for pagination)
     pub offset: Option<usize>,
+    /// Per-query BM25F scoring configuration override.
+    ///
+    /// When `Some`, this configuration replaces the reader's default
+    /// [`crate::lexical::BM25FConfig`] for this query only. When `None`,
+    /// the reader's default is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25f_config: Option<crate::lexical::BM25FConfig>,
 }
 
 impl SearchQuery {
@@ -276,6 +309,7 @@ impl SearchQuery {
             temporal_flags: None,
             limit: None,
             offset: None,
+            bm25f_config: None,
         }
     }
 }
@@ -401,6 +435,14 @@ pub struct NodeInfo {
 ///
 /// Implementations should be thread-safe so they can be shared across indexing
 /// workers.
+///
+/// # Relationship to `classify_source`
+///
+/// [`crate::lexical::classify_source`] is the built-in, byte-range implementation
+/// used by the BM25F indexing pipeline. `FieldClassifier` is a **future extension
+/// point**: it allows downstream consumers (custom indexers, non-tree-sitter
+/// language plugins) to plug in alternative classification logic without depending
+/// on tree-sitter internals. The two are parallel, not competing, APIs.
 pub trait FieldClassifier: Send + Sync {
     /// Classify the given `node` within its `source` file.
     fn classify(&self, node: &NodeInfo, source: &str) -> SearchField;
@@ -437,6 +479,12 @@ pub enum SearchError {
     /// at the parser boundary so no git library types leak into this enum.
     #[error("Git error: {0}")]
     Git(String),
+
+    /// The source file exceeds the maximum size that can be safely classified.
+    /// The classifier allocates a per-byte array, so unbounded input would
+    /// cause proportional memory growth.
+    #[error("File too large to classify: {size} bytes exceeds the {limit}-byte limit")]
+    FileTooLarge { size: usize, limit: usize },
 }
 
 /// Result type alias for all rskim-search operations.
@@ -552,6 +600,7 @@ mod tests {
             }),
             limit: Some(10),
             offset: Some(5),
+            bm25f_config: None,
         };
         assert_eq!(q.text, "find_me");
         assert_eq!(q.lang, Some(rskim_core::Language::Rust));
@@ -904,5 +953,35 @@ mod tests {
         assert_eq!(layer.name(), "noop");
         let results = layer.search(&SearchQuery::new("hello")).unwrap();
         assert!(results.is_empty());
+    }
+
+    /// SearchField::ALL must contain all 8 variants in discriminant order.
+    #[test]
+    fn test_search_field_all_contains_all_variants() {
+        assert_eq!(SearchField::ALL.len(), 8, "ALL must have 8 elements");
+        for (i, &field) in SearchField::ALL.iter().enumerate() {
+            assert_eq!(
+                field.discriminant(),
+                i as u8,
+                "ALL[{i}] should have discriminant {i}, got {}",
+                field.discriminant()
+            );
+        }
+    }
+
+    /// SearchField::count() must equal 8.
+    #[test]
+    fn test_search_field_count() {
+        assert_eq!(SearchField::count(), 8, "count() must return 8");
+    }
+
+    /// SearchQuery::new() should have bm25f_config set to None.
+    #[test]
+    fn test_search_query_new_bm25f_config_none() {
+        let q = SearchQuery::new("hello");
+        assert!(
+            q.bm25f_config.is_none(),
+            "new() should initialise bm25f_config to None"
+        );
     }
 }

@@ -12,13 +12,15 @@ use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
+use std::ops::Range;
+
 use super::format::{
     FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, POSTING_ENTRY_SIZE, PostingEntry,
     SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry,
     encode_file_meta, encode_header, encode_posting, lang_to_id,
 };
 use super::reader::NgramIndexReader;
-use crate::{FileId, LayerBuilder, Result, SearchError, SearchLayer};
+use crate::{FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer};
 
 // ============================================================================
 // Public builder struct
@@ -45,6 +47,8 @@ pub struct NgramIndexBuilder {
     file_count: u32,
     /// Sum of all document byte lengths (for avg_doc_length computation).
     total_doc_length: u64,
+    /// Sum of per-field byte lengths across all documents (for avg_field_lengths).
+    total_field_lengths: [u64; FIELD_COUNT],
 }
 
 impl NgramIndexBuilder {
@@ -67,6 +71,7 @@ impl NgramIndexBuilder {
             seen_file_ids: HashSet::new(),
             file_count: 0,
             total_doc_length: 0,
+            total_field_lengths: [0u64; FIELD_COUNT],
         })
     }
 
@@ -89,32 +94,35 @@ impl NgramIndexBuilder {
 }
 
 // ============================================================================
-// LayerBuilder implementation
+// Classified indexing
 // ============================================================================
 
-impl LayerBuilder for NgramIndexBuilder {
-    /// Index the byte-content of a file.
+impl NgramIndexBuilder {
+    /// Index the byte-content of a file with pre-computed field classification.
     ///
-    /// Scans every overlapping 2-byte window in `content` and records a posting
-    /// entry with [`crate::SearchField::Other`] and the window's byte position.
+    /// `field_map` is a sorted, non-overlapping, contiguous list of byte ranges
+    /// mapping each byte position to a [`SearchField`], as produced by
+    /// [`crate::lexical::classify_source`].
+    ///
+    /// When `field_map` is empty, all bytes default to [`SearchField::Other`].
     ///
     /// # Errors
     ///
-    /// - [`SearchError::InvalidQuery`] if `id` was already added.
-    /// - [`SearchError::IndexCorrupted`] if `content` is so large that a byte
-    ///   position would overflow `u32`.
-    fn add_file(&mut self, id: FileId, content: &str, lang: rskim_core::Language) -> Result<()> {
+    /// - [`SearchError::InvalidQuery`] if `id` was already added or is not sequential.
+    /// - [`SearchError::IndexCorrupted`] if `content` exceeds `u32::MAX` bytes.
+    pub fn add_file_classified(
+        &mut self,
+        id: FileId,
+        content: &str,
+        lang: rskim_core::Language,
+        field_map: &[(Range<usize>, SearchField)],
+    ) -> Result<()> {
         if self.seen_file_ids.contains(&id.0) {
             return Err(SearchError::InvalidQuery(format!(
                 "duplicate FileId: {}",
                 id.0
             )));
         }
-
-        // The on-disk format uses doc_id as a direct index into the file_meta
-        // array.  FileIds must therefore be assigned sequentially starting at 0.
-        // A future format version may store an explicit FileId→index mapping to
-        // lift this constraint.
         if id.0 != self.file_count {
             return Err(SearchError::InvalidQuery(format!(
                 "FileId must equal sequential insertion index: expected {}, got {}",
@@ -122,8 +130,6 @@ impl LayerBuilder for NgramIndexBuilder {
             )));
         }
 
-        // Validate content length fits u32 before any state mutation so a
-        // failure leaves the builder in a consistent state.
         let doc_length: u32 = u32::try_from(content.len()).map_err(|_| {
             SearchError::IndexCorrupted(format!(
                 "file {} too large: {} bytes exceeds u32::MAX",
@@ -134,17 +140,37 @@ impl LayerBuilder for NgramIndexBuilder {
 
         self.seen_file_ids.insert(id.0);
 
+        // Compute per-field byte lengths from the field_map.
+        let field_lengths = compute_field_lengths(content.len(), field_map);
+
+        // Accumulate total field lengths for header avg_field_lengths.
+        for (i, &fl) in field_lengths.iter().enumerate() {
+            self.total_field_lengths[i] += u64::from(fl);
+        }
+
         // Record file metadata.
         self.file_meta.push(FileMetaEntry {
             lang_id: lang_to_id(lang),
             doc_length,
+            field_lengths,
         });
 
-        // Scan every 2-byte window.
+        // Scan every 2-byte window, resolving the field via a linearly advancing
+        // pointer through field_map.  Because positions increase monotonically and
+        // field_map is sorted ascending, a single forward scan is O(n + m) instead
+        // of the O(n log m) cost of calling binary search once per window.
         let bytes = content.as_bytes();
-        let field_id = crate::SearchField::Other.discriminant();
+        let mut range_idx = 0usize;
         for (pos, window) in bytes.windows(2).enumerate() {
-            // Safe: doc_length fits u32, so pos (which is at most doc_length - 2) also fits.
+            // Advance past any ranges that have ended before `pos`.
+            while range_idx < field_map.len() && field_map[range_idx].0.end <= pos {
+                range_idx += 1;
+            }
+            let field_id = if range_idx < field_map.len() && field_map[range_idx].0.contains(&pos) {
+                field_map[range_idx].1.discriminant()
+            } else {
+                SearchField::Other.discriminant()
+            };
             let key = (u16::from(window[0]) << 8) | u16::from(window[1]);
             self.postings.entry(key).or_default().push(PostingEntry {
                 doc_id: id.0,
@@ -158,6 +184,62 @@ impl LayerBuilder for NgramIndexBuilder {
         })?;
         self.total_doc_length += u64::from(doc_length);
         Ok(())
+    }
+}
+
+// ============================================================================
+// Private helpers
+// ============================================================================
+
+/// Compute per-field byte lengths from a field_map covering `source_len` bytes.
+///
+/// Returns an array of `FIELD_COUNT` `u32` values — one per [`SearchField`] discriminant.
+/// The sum of the returned values equals `source_len` (enforced by the
+/// contiguous invariant of `field_map`).
+fn compute_field_lengths(
+    source_len: usize,
+    field_map: &[(Range<usize>, SearchField)],
+) -> [u32; FIELD_COUNT] {
+    // Precondition: source_len fits in u32. This is guaranteed by the caller
+    // (add_file_classified converts content.len() to u32 before reaching here),
+    // and enforced transitively by MAX_SOURCE_BYTES < u32::MAX. The assert
+    // documents the invariant so future callers cannot silently violate it.
+    debug_assert!(
+        source_len <= u32::MAX as usize,
+        "source_len {source_len} exceeds u32::MAX — caller must enforce this"
+    );
+    let mut lengths = [0u32; FIELD_COUNT];
+    if field_map.is_empty() {
+        // All bytes are Other (discriminant 7).
+        lengths[SearchField::Other.discriminant() as usize] =
+            u32::try_from(source_len).unwrap_or(u32::MAX);
+        return lengths;
+    }
+    for (range, field) in field_map {
+        let range_len = u32::try_from(range.end.saturating_sub(range.start)).unwrap_or(u32::MAX);
+        let idx = field.discriminant() as usize;
+        lengths[idx] = lengths[idx].saturating_add(range_len);
+    }
+    lengths
+}
+
+// ============================================================================
+// LayerBuilder implementation
+// ============================================================================
+
+impl LayerBuilder for NgramIndexBuilder {
+    /// Index the byte-content of a file.
+    ///
+    /// Delegates to [`NgramIndexBuilder::add_file_classified`] with an empty
+    /// `field_map` so all bytes are classified as [`SearchField::Other`].
+    ///
+    /// # Errors
+    ///
+    /// - [`SearchError::InvalidQuery`] if `id` was already added.
+    /// - [`SearchError::IndexCorrupted`] if `content` is so large that a byte
+    ///   position would overflow `u32`.
+    fn add_file(&mut self, id: FileId, content: &str, lang: rskim_core::Language) -> Result<()> {
+        self.add_file_classified(id, content, lang, &[])
     }
 
     /// Finalise the builder: serialise the index to disk and return a reader.
@@ -173,26 +255,61 @@ impl LayerBuilder for NgramIndexBuilder {
     where
         Self: Sized,
     {
-        let avg_doc_length = if self.file_count == 0 {
-            0.0f32
+        // Compute corpus averages.
+        let (avg_doc_length, avg_field_lengths) = if self.file_count == 0 {
+            (0.0f32, [0.0f32; FIELD_COUNT])
         } else {
-            (self.total_doc_length as f64 / f64::from(self.file_count)) as f32
+            let n = f64::from(self.file_count);
+            let avg_doc = (self.total_doc_length as f64 / n) as f32;
+            let mut avgs = [0.0f32; FIELD_COUNT];
+            for (avg, &total) in avgs.iter_mut().zip(self.total_field_lengths.iter()) {
+                *avg = (total as f64 / n) as f32;
+            }
+            (avg_doc, avgs)
         };
 
-        // Sort each posting list by (doc_id, field_id, position).
+        // Sort posting lists and ngram keys.
         for list in self.postings.values_mut() {
             list.sort_unstable();
         }
-
-        // Sort ngram keys for the lookup table.
         let mut sorted_keys: Vec<u16> = self.postings.keys().copied().collect();
         sorted_keys.sort_unstable();
 
+        // Serialise everything into the two on-disk buffers.
+        let (postings_buf, skidx_buf) =
+            self.serialize_index(&sorted_keys, avg_doc_length, avg_field_lengths)?;
+
+        let post_path = self.output_dir.join("index.skpost");
+        let idx_path = self.output_dir.join("index.skidx");
+
+        // Atomic writes: .skpost first, .skidx second (commit point).
+        Self::atomic_write(&self.output_dir, &post_path, &postings_buf)?;
+        Self::atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
+
+        let reader = NgramIndexReader::open(&self.output_dir)?;
+        Ok(Box::new(reader))
+    }
+}
+
+impl NgramIndexBuilder {
+    /// Serialise postings, entries, file metadata, and header into the two
+    /// on-disk byte buffers: `(postings_buf, skidx_buf)`.
+    fn serialize_index(
+        &self,
+        sorted_keys: &[u16],
+        avg_doc_length: f32,
+        avg_field_lengths: [f32; FIELD_COUNT],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         // Serialise posting lists and build the entry table.
-        let mut postings_buf: Vec<u8> = Vec::new();
+        let total_posting_bytes: usize = self
+            .postings
+            .values()
+            .map(|v| v.len() * POSTING_ENTRY_SIZE)
+            .fold(0usize, usize::saturating_add);
+        let mut postings_buf: Vec<u8> = Vec::with_capacity(total_posting_bytes);
         let mut entries: Vec<SkidxEntry> = Vec::with_capacity(sorted_keys.len());
 
-        for key in &sorted_keys {
+        for key in sorted_keys {
             let list = &self.postings[key];
             let offset = postings_buf.len() as u64;
             let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
@@ -227,7 +344,7 @@ impl LayerBuilder for NgramIndexBuilder {
             entries_buf.extend_from_slice(&encode_entry(e));
         }
 
-        // CRC32 over entry array + file metadata (contiguous).
+        // CRC32 over entries + file metadata.
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&entries_buf);
         hasher.update(&meta_buf);
@@ -244,25 +361,18 @@ impl LayerBuilder for NgramIndexBuilder {
             file_count: self.file_count,
             postings_file_size: postings_buf.len() as u64,
             avg_doc_length,
+            avg_field_lengths,
             checksum,
         };
 
-        // Assemble .skidx bytes: header + entries + file_meta.
+        // Assemble .skidx: header + entries + file_meta.
         let mut skidx_buf =
             Vec::with_capacity(SKIDX_HEADER_SIZE + entries_buf.len() + meta_buf.len());
         skidx_buf.extend_from_slice(&encode_header(&header));
         skidx_buf.extend_from_slice(&entries_buf);
         skidx_buf.extend_from_slice(&meta_buf);
 
-        let post_path = self.output_dir.join("index.skpost");
-        let idx_path = self.output_dir.join("index.skidx");
-
-        // Atomic writes: .skpost first, .skidx second (commit point).
-        Self::atomic_write(&self.output_dir, &post_path, &postings_buf)?;
-        Self::atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
-
-        let reader = NgramIndexReader::open(&self.output_dir)?;
-        Ok(Box::new(reader))
+        Ok((postings_buf, skidx_buf))
     }
 }
 

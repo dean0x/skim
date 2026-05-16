@@ -5,9 +5,9 @@
 //! ## `index.skidx`
 //!
 //! ```text
-//! [SkidxHeader: 30 bytes]
+//! [SkidxHeader: 62 bytes]
 //! [SkidxEntry × ngram_count: 14 bytes each]
-//! [FileMetaEntry × file_count: 5 bytes each]
+//! [FileMetaEntry × file_count: 37 bytes each]
 //! ```
 //!
 //! ## `index.skpost`
@@ -29,38 +29,49 @@
 
 pub(crate) use super::lang_map::lang_to_id;
 use crate::{
-    SearchError, SearchField,
+    FIELD_COUNT, SearchError, SearchField,
     weights::{BIGRAM_WEIGHTS, lookup_weight},
 };
 
 /// Magic bytes at the start of every `.skidx` file.
 pub(crate) const SKIDX_MAGIC: &[u8; 4] = b"SKIX";
 /// Current on-disk format version.  Increment on any breaking change.
-pub(crate) const FORMAT_VERSION: u16 = 1;
+///
+/// v1 → v2: `SkidxHeader` gained `avg_field_lengths: [f32; 8]` (+32 bytes),
+/// and `FileMetaEntry` gained `field_lengths: [u32; 8]` (+32 bytes).
+/// v1 indexes are rejected with a clear error message containing "format version".
+pub(crate) const FORMAT_VERSION: u16 = 2;
 /// Size in bytes of [`SkidxHeader`] on disk.
-pub(crate) const SKIDX_HEADER_SIZE: usize = 30;
+///
+/// v1 was 30 bytes; v2 adds 32 bytes for `avg_field_lengths: [f32; 8]`.
+pub(crate) const SKIDX_HEADER_SIZE: usize = 62;
 /// Size in bytes of a single [`SkidxEntry`] on disk.
 pub(crate) const SKIDX_ENTRY_SIZE: usize = 14;
 /// Size in bytes of a single [`PostingEntry`] on disk.
 pub(crate) const POSTING_ENTRY_SIZE: usize = 9;
 /// Size in bytes of a single [`FileMetaEntry`] on disk.
-pub(crate) const FILE_META_SIZE: usize = 5;
+///
+/// v1 was 5 bytes; v2 adds 32 bytes for `field_lengths: [u32; 8]`.
+pub(crate) const FILE_META_SIZE: usize = 37;
 /// BM25 term-frequency saturation parameter.
+#[cfg(test)]
 const BM25_K1: f32 = 1.2;
 /// BM25 document-length normalisation parameter.
+#[cfg(test)]
 const BM25_B: f32 = 0.75;
 
 /// Fixed-size header at the start of every `.skidx` file.
 ///
-/// Layout (30 bytes, all integers little-endian):
+/// Layout (62 bytes, all integers little-endian):
 /// ```text
-/// [0..4]   magic         4 bytes
-/// [4..6]   version       2 bytes
-/// [6..10]  ngram_count   4 bytes
-/// [10..14] file_count    4 bytes
-/// [14..22] postings_file_size  8 bytes
-/// [22..26] avg_doc_length  4 bytes (f32 LE)
-/// [26..30] checksum      4 bytes (CRC32)
+/// [0..4]   magic              4 bytes
+/// [4..6]   version            2 bytes
+/// [6..10]  ngram_count        4 bytes
+/// [10..14] file_count         4 bytes
+/// [14..22] postings_file_size 8 bytes
+/// [22..26] avg_doc_length     4 bytes (f32 LE)
+/// [26..58] avg_field_lengths  32 bytes ([f32; 8] LE)
+/// [58..62] checksum           4 bytes (CRC32)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SkidxHeader {
@@ -76,6 +87,10 @@ pub(crate) struct SkidxHeader {
     pub postings_file_size: u64,
     /// Average document byte length, used for BM25 normalisation.
     pub avg_doc_length: f32,
+    /// Average per-field byte length across all documents (BM25F normalisation).
+    ///
+    /// Indexed by [`crate::SearchField`] discriminant.
+    pub avg_field_lengths: [f32; FIELD_COUNT],
     /// CRC32 of the entry array + file-metadata array bytes.
     pub checksum: u32,
 }
@@ -118,17 +133,27 @@ pub(crate) struct PostingEntry {
 
 /// Per-file metadata stored in the tail of `.skidx`.
 ///
-/// Layout (5 bytes, all integers little-endian):
+/// Layout (37 bytes, all integers little-endian):
 /// ```text
-/// [0]    lang_id     1 byte
-/// [1..5] doc_length  4 bytes
+/// [0]      lang_id        1 byte
+/// [1..5]   doc_length     4 bytes
+/// [5..37]  field_lengths  32 bytes ([u32; 8] LE)
 /// ```
+///
+/// # Invariant
+///
+/// `field_lengths[0..8].iter().sum::<u32>() == doc_length`.
+/// Upheld by the builder; validated by the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileMetaEntry {
     /// Language ID from [`lang_to_id`].
     pub lang_id: u8,
     /// Byte length of the original document.
     pub doc_length: u32,
+    /// Per-field byte lengths for BM25F normalisation.
+    ///
+    /// Indexed by [`crate::SearchField`] discriminant (0 = TypeDefinition … 7 = Other).
+    pub field_lengths: [u32; FIELD_COUNT],
 }
 
 /// Extract a fixed-size byte array from `data[start..start+N]`.
@@ -153,7 +178,7 @@ fn read_array<const N: usize>(
         })
 }
 
-/// Encode a [`SkidxHeader`] into its 30-byte on-disk representation.
+/// Encode a [`SkidxHeader`] into its 62-byte on-disk representation.
 pub(crate) fn encode_header(h: &SkidxHeader) -> [u8; SKIDX_HEADER_SIZE] {
     let mut buf = [0u8; SKIDX_HEADER_SIZE];
     buf[0..4].copy_from_slice(&h.magic);
@@ -162,7 +187,12 @@ pub(crate) fn encode_header(h: &SkidxHeader) -> [u8; SKIDX_HEADER_SIZE] {
     buf[10..14].copy_from_slice(&h.file_count.to_le_bytes());
     buf[14..22].copy_from_slice(&h.postings_file_size.to_le_bytes());
     buf[22..26].copy_from_slice(&h.avg_doc_length.to_le_bytes());
-    buf[26..30].copy_from_slice(&h.checksum.to_le_bytes());
+    // avg_field_lengths: 8 × f32 LE at bytes [26..58]
+    for (i, &v) in h.avg_field_lengths.iter().enumerate() {
+        let start = 26 + i * 4;
+        buf[start..start + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    buf[58..62].copy_from_slice(&h.checksum.to_le_bytes());
     buf
 }
 
@@ -171,7 +201,8 @@ pub(crate) fn encode_header(h: &SkidxHeader) -> [u8; SKIDX_HEADER_SIZE] {
 /// # Errors
 ///
 /// Returns [`SearchError::IndexCorrupted`] if the slice is too short,
-/// the magic bytes do not match, or the version is unsupported.
+/// the magic bytes do not match, or the version is not [`FORMAT_VERSION`].
+/// Format v1 indexes are rejected with an error message containing "format version".
 pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
     if data.len() < SKIDX_HEADER_SIZE {
         return Err(SearchError::IndexCorrupted(format!(
@@ -189,17 +220,41 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
     let version = u16::from_le_bytes(read_array(data, 4, "header: version")?);
     if version != FORMAT_VERSION {
         return Err(SearchError::IndexCorrupted(format!(
-            "unsupported format version: {version} (expected {FORMAT_VERSION})"
+            "unsupported format version: {version} (expected {FORMAT_VERSION}); \
+             please rebuild the index"
         )));
     }
+
+    // Decode avg_doc_length: f32 LE at bytes [22..26]
+    let avg_doc_length = f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?);
+    if !avg_doc_length.is_finite() || avg_doc_length < 0.0 {
+        return Err(SearchError::IndexCorrupted(format!(
+            "header: avg_doc_length must be a finite number >= 0.0, got {avg_doc_length}"
+        )));
+    }
+
+    // Decode avg_field_lengths: FIELD_COUNT × f32 LE at bytes [26..58]
+    let mut avg_field_lengths = [0.0f32; FIELD_COUNT];
+    for (i, v) in avg_field_lengths.iter_mut().enumerate() {
+        let start = 26 + i * 4;
+        let raw = f32::from_le_bytes(read_array(data, start, "header: avg_field_lengths")?);
+        if !raw.is_finite() || raw < 0.0 {
+            return Err(SearchError::IndexCorrupted(format!(
+                "header: avg_field_lengths[{i}] must be a finite number >= 0.0, got {raw}"
+            )));
+        }
+        *v = raw;
+    }
+
     Ok(SkidxHeader {
         magic,
         version,
         ngram_count: u32::from_le_bytes(read_array(data, 6, "header: ngram_count")?),
         file_count: u32::from_le_bytes(read_array(data, 10, "header: file_count")?),
         postings_file_size: u64::from_le_bytes(read_array(data, 14, "header: postings_file_size")?),
-        avg_doc_length: f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?),
-        checksum: u32::from_le_bytes(read_array(data, 26, "header: checksum")?),
+        avg_doc_length,
+        avg_field_lengths,
+        checksum: u32::from_le_bytes(read_array(data, 58, "header: checksum")?),
     })
 }
 
@@ -268,15 +323,20 @@ pub(crate) fn decode_posting(data: &[u8]) -> crate::Result<PostingEntry> {
     })
 }
 
-/// Encode a [`FileMetaEntry`] into its 5-byte on-disk representation.
+/// Encode a [`FileMetaEntry`] into its 37-byte on-disk representation.
 pub(crate) fn encode_file_meta(m: &FileMetaEntry) -> [u8; FILE_META_SIZE] {
     let mut buf = [0u8; FILE_META_SIZE];
     buf[0] = m.lang_id;
     buf[1..5].copy_from_slice(&m.doc_length.to_le_bytes());
+    // field_lengths: 8 × u32 LE at bytes [5..37]
+    for (i, &v) in m.field_lengths.iter().enumerate() {
+        let start = 5 + i * 4;
+        buf[start..start + 4].copy_from_slice(&v.to_le_bytes());
+    }
     buf
 }
 
-/// Decode a [`FileMetaEntry`] from a 5-byte slice.
+/// Decode a [`FileMetaEntry`] from a 37-byte slice.
 ///
 /// # Errors
 ///
@@ -288,9 +348,23 @@ pub(crate) fn decode_file_meta(data: &[u8]) -> crate::Result<FileMetaEntry> {
             data.len()
         )));
     }
+    let mut field_lengths = [0u32; FIELD_COUNT];
+    for (i, v) in field_lengths.iter_mut().enumerate() {
+        let start = 5 + i * 4;
+        *v = u32::from_le_bytes(read_array(data, start, "file_meta: field_lengths")?);
+    }
+    let doc_length = u32::from_le_bytes(read_array(data, 1, "file_meta: doc_length")?);
+    // Validate the documented invariant: field_lengths must sum to doc_length.
+    let field_sum: u32 = field_lengths.iter().sum();
+    if field_sum != doc_length {
+        return Err(SearchError::IndexCorrupted(format!(
+            "file_meta: field_lengths sum ({field_sum}) != doc_length ({doc_length})"
+        )));
+    }
     Ok(FileMetaEntry {
         lang_id: data[0],
-        doc_length: u32::from_le_bytes(read_array(data, 1, "file_meta: doc_length")?),
+        doc_length,
+        field_lengths,
     })
 }
 
@@ -347,6 +421,7 @@ pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
 ///
 /// Returns the BM25 score contribution as `f64` (accumulated across terms
 /// to avoid precision loss).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn bm25_score(tf: f32, idf: f32, doc_len: u32, avg_doc_len: f32) -> f64 {
     let k1 = f64::from(BM25_K1);

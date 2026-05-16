@@ -17,6 +17,7 @@ fn test_header_roundtrip() {
         file_count: 42,
         postings_file_size: 65536,
         avg_doc_length: 512.5,
+        avg_field_lengths: [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
         checksum: 0xDEAD_BEEF,
     };
     let encoded = encode_header(&h);
@@ -28,6 +29,17 @@ fn test_header_roundtrip() {
     assert_eq!(decoded.file_count, h.file_count);
     assert_eq!(decoded.postings_file_size, h.postings_file_size);
     assert!((decoded.avg_doc_length - h.avg_doc_length).abs() < f32::EPSILON);
+    for (i, (&a, &b)) in decoded
+        .avg_field_lengths
+        .iter()
+        .zip(h.avg_field_lengths.iter())
+        .enumerate()
+    {
+        assert!(
+            (a - b).abs() < f32::EPSILON,
+            "avg_field_lengths[{i}] mismatch: {a} vs {b}"
+        );
+    }
     assert_eq!(decoded.checksum, h.checksum);
 }
 
@@ -40,6 +52,7 @@ fn test_header_bad_magic() {
         file_count: 0,
         postings_file_size: 0,
         avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
         checksum: 0,
     };
     let encoded = encode_header(&h);
@@ -58,6 +71,7 @@ fn test_header_bad_version() {
         file_count: 0,
         postings_file_size: 0,
         avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
         checksum: 0,
     };
     let encoded = encode_header(&h);
@@ -67,6 +81,25 @@ fn test_header_bad_version() {
     assert!(
         err.contains("unsupported format version"),
         "unexpected error: {err}"
+    );
+}
+
+/// Format v1 indexes (old header size 30 bytes) must be rejected with a clear error.
+#[test]
+fn test_v1_header_rejected_with_format_version_message() {
+    // Simulate a v1-style header (30 bytes) — will fail both size check and version check.
+    // We write the magic correctly to get past magic check and hit the version rejection.
+    let mut buf = vec![0u8; 30]; // v1 header size
+    buf[0..4].copy_from_slice(b"SKIX"); // correct magic
+    buf[4..6].copy_from_slice(&1u16.to_le_bytes()); // version = 1
+    // Truncated header — size check fires first.
+    let result = decode_header(&buf);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    // Either truncated or version error — both are acceptable rejections.
+    assert!(
+        err.contains("truncated") || err.contains("format version"),
+        "v1 index should be rejected with truncated or format version error: {err}"
     );
 }
 
@@ -151,11 +184,59 @@ fn test_file_meta_roundtrip() {
     let m = FileMetaEntry {
         lang_id: lang_to_id(rskim_core::Language::Rust),
         doc_length: 8192,
+        field_lengths: [100, 200, 300, 400, 500, 600, 700, 5392],
     };
     let encoded = encode_file_meta(&m);
     assert_eq!(encoded.len(), FILE_META_SIZE);
     let decoded = decode_file_meta(&encoded).unwrap();
     assert_eq!(decoded, m);
+}
+
+/// Verify that the field_lengths invariant is encoded correctly.
+#[test]
+fn test_file_meta_field_lengths_encode_decode() {
+    let field_lengths = [10u32, 20, 30, 40, 50, 60, 70, 80];
+    let total: u32 = field_lengths.iter().sum();
+    let m = FileMetaEntry {
+        lang_id: lang_to_id(rskim_core::Language::TypeScript),
+        doc_length: total,
+        field_lengths,
+    };
+    let encoded = encode_file_meta(&m);
+    let decoded = decode_file_meta(&encoded).unwrap();
+    assert_eq!(decoded.field_lengths, field_lengths);
+    assert_eq!(decoded.doc_length, total);
+}
+
+/// Verify the v2 header size constant matches actual encoded size.
+#[test]
+fn test_header_size_is_62_bytes() {
+    assert_eq!(SKIDX_HEADER_SIZE, 62, "v2 header must be 62 bytes");
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: FORMAT_VERSION,
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    assert_eq!(encoded.len(), 62);
+}
+
+/// Verify the v2 FileMetaEntry size constant matches actual encoded size.
+#[test]
+fn test_file_meta_size_is_37_bytes() {
+    assert_eq!(FILE_META_SIZE, 37, "v2 FileMetaEntry must be 37 bytes");
+    let m = FileMetaEntry {
+        lang_id: 0,
+        doc_length: 0,
+        field_lengths: [0; 8],
+    };
+    let encoded = encode_file_meta(&m);
+    assert_eq!(encoded.len(), 37);
 }
 
 #[test]
@@ -164,6 +245,141 @@ fn test_file_meta_truncated() {
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
     assert!(err.contains("truncated"), "unexpected error: {err}");
+}
+
+/// decode_file_meta must reject entries where field_lengths sum != doc_length.
+#[test]
+fn test_file_meta_field_lengths_sum_mismatch_rejected() {
+    let m = FileMetaEntry {
+        lang_id: 0,
+        doc_length: 1000,
+        // Sum is 100+200 = 300, not 1000 — deliberate mismatch.
+        field_lengths: [100, 200, 0, 0, 0, 0, 0, 0],
+    };
+    let encoded = encode_file_meta(&m);
+    let result = decode_file_meta(&encoded);
+    assert!(
+        result.is_err(),
+        "expected Err for field_lengths sum mismatch"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("field_lengths sum"),
+        "unexpected error message: {err}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// NaN / Infinity rejection in decode_header
+// -----------------------------------------------------------------------
+
+/// Helper: build a valid 62-byte header buffer then patch 4 bytes at `offset`
+/// with the given f32 bit pattern.
+fn make_header_with_float_at(offset: usize, value: f32) -> Vec<u8> {
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: FORMAT_VERSION,
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let mut buf = encode_header(&h).to_vec();
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    buf
+}
+
+#[test]
+fn test_decode_header_rejects_nan_avg_doc_length() {
+    // avg_doc_length is at bytes [22..26]
+    let buf = make_header_with_float_at(22, f32::NAN);
+    let result = decode_header(&buf);
+    assert!(result.is_err(), "NaN avg_doc_length should be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_doc_length"),
+        "error should mention avg_doc_length: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_infinity_avg_doc_length() {
+    let buf = make_header_with_float_at(22, f32::INFINITY);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "infinity avg_doc_length should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_doc_length"),
+        "error should mention avg_doc_length: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_negative_avg_doc_length() {
+    let buf = make_header_with_float_at(22, -1.0f32);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "negative avg_doc_length should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_doc_length"),
+        "error should mention avg_doc_length: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_nan_avg_field_length() {
+    // avg_field_lengths start at byte 26; field 0 is at bytes [26..30]
+    let buf = make_header_with_float_at(26, f32::NAN);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "NaN avg_field_lengths[0] should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_field_lengths"),
+        "error should mention avg_field_lengths: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_infinity_avg_field_length() {
+    // avg_field_lengths[3] is at bytes [26 + 3*4 .. 26 + 3*4 + 4] = [38..42]
+    let buf = make_header_with_float_at(38, f32::INFINITY);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "infinity avg_field_lengths[3] should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_field_lengths"),
+        "error should mention avg_field_lengths: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_negative_avg_field_length() {
+    // avg_field_lengths[7] is at bytes [26 + 7*4 .. 26 + 7*4 + 4] = [54..58]
+    let buf = make_header_with_float_at(54, -0.5f32);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "negative avg_field_lengths[7] should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_field_lengths"),
+        "error should mention avg_field_lengths: {err}"
+    );
 }
 
 // -----------------------------------------------------------------------
