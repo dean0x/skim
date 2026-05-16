@@ -225,11 +225,26 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
         )));
     }
 
+    // Decode avg_doc_length: f32 LE at bytes [22..26]
+    let avg_doc_length =
+        f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?);
+    if !avg_doc_length.is_finite() || avg_doc_length < 0.0 {
+        return Err(SearchError::IndexCorrupted(format!(
+            "header: avg_doc_length is not a valid non-negative finite float: {avg_doc_length}"
+        )));
+    }
+
     // Decode avg_field_lengths: FIELD_COUNT × f32 LE at bytes [26..58]
     let mut avg_field_lengths = [0.0f32; FIELD_COUNT];
     for (i, v) in avg_field_lengths.iter_mut().enumerate() {
         let start = 26 + i * 4;
-        *v = f32::from_le_bytes(read_array(data, start, "header: avg_field_lengths")?);
+        let raw = f32::from_le_bytes(read_array(data, start, "header: avg_field_lengths")?);
+        if !raw.is_finite() || raw < 0.0 {
+            return Err(SearchError::IndexCorrupted(format!(
+                "header: avg_field_lengths[{i}] is not a valid non-negative finite float: {raw}"
+            )));
+        }
+        *v = raw;
     }
 
     Ok(SkidxHeader {
@@ -238,7 +253,7 @@ pub(crate) fn decode_header(data: &[u8]) -> crate::Result<SkidxHeader> {
         ngram_count: u32::from_le_bytes(read_array(data, 6, "header: ngram_count")?),
         file_count: u32::from_le_bytes(read_array(data, 10, "header: file_count")?),
         postings_file_size: u64::from_le_bytes(read_array(data, 14, "header: postings_file_size")?),
-        avg_doc_length: f32::from_le_bytes(read_array(data, 22, "header: avg_doc_length")?),
+        avg_doc_length,
         avg_field_lengths,
         checksum: u32::from_le_bytes(read_array(data, 58, "header: checksum")?),
     })

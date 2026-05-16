@@ -62,23 +62,23 @@ impl BM25FConfig {
     ///
     /// Returns [`SearchError::InvalidQuery`] if any invariant is violated.
     pub fn validate(&self) -> Result<()> {
-        if self.k1 < 0.0 {
+        if !self.k1.is_finite() || self.k1 < 0.0 {
             return Err(SearchError::InvalidQuery(format!(
-                "BM25FConfig: k1 must be >= 0.0, got {}",
+                "BM25FConfig: k1 must be a finite number >= 0.0, got {}",
                 self.k1
             )));
         }
         for (i, &boost) in self.field_boosts.iter().enumerate() {
-            if boost < 0.0 {
+            if !boost.is_finite() || boost < 0.0 {
                 return Err(SearchError::InvalidQuery(format!(
-                    "BM25FConfig: field_boosts[{i}] must be >= 0.0, got {boost}"
+                    "BM25FConfig: field_boosts[{i}] must be a finite number >= 0.0, got {boost}"
                 )));
             }
         }
         for (i, &b) in self.field_b.iter().enumerate() {
-            if !(0.0..=1.0).contains(&b) {
+            if !b.is_finite() || !(0.0..=1.0).contains(&b) {
                 return Err(SearchError::InvalidQuery(format!(
-                    "BM25FConfig: field_b[{i}] must be in [0.0, 1.0], got {b}"
+                    "BM25FConfig: field_b[{i}] must be a finite number in [0.0, 1.0], got {b}"
                 )));
             }
         }

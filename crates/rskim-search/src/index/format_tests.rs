@@ -267,6 +267,116 @@ fn test_file_meta_field_lengths_sum_mismatch_rejected() {
 }
 
 // -----------------------------------------------------------------------
+// NaN / Infinity rejection in decode_header
+// -----------------------------------------------------------------------
+
+/// Helper: build a valid 62-byte header buffer then patch 4 bytes at `offset`
+/// with the given f32 bit pattern.
+fn make_header_with_float_at(offset: usize, value: f32) -> Vec<u8> {
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: FORMAT_VERSION,
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let mut buf = encode_header(&h).to_vec();
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    buf
+}
+
+#[test]
+fn test_decode_header_rejects_nan_avg_doc_length() {
+    // avg_doc_length is at bytes [22..26]
+    let buf = make_header_with_float_at(22, f32::NAN);
+    let result = decode_header(&buf);
+    assert!(result.is_err(), "NaN avg_doc_length should be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_doc_length"),
+        "error should mention avg_doc_length: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_infinity_avg_doc_length() {
+    let buf = make_header_with_float_at(22, f32::INFINITY);
+    let result = decode_header(&buf);
+    assert!(result.is_err(), "INFINITY avg_doc_length should be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_doc_length"),
+        "error should mention avg_doc_length: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_negative_avg_doc_length() {
+    let buf = make_header_with_float_at(22, -1.0f32);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "negative avg_doc_length should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_doc_length"),
+        "error should mention avg_doc_length: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_nan_avg_field_length() {
+    // avg_field_lengths start at byte 26; field 0 is at bytes [26..30]
+    let buf = make_header_with_float_at(26, f32::NAN);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "NaN avg_field_lengths[0] should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_field_lengths"),
+        "error should mention avg_field_lengths: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_infinity_avg_field_length() {
+    // avg_field_lengths[3] is at bytes [26 + 3*4 .. 26 + 3*4 + 4] = [38..42]
+    let buf = make_header_with_float_at(38, f32::INFINITY);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "INFINITY avg_field_lengths[3] should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_field_lengths"),
+        "error should mention avg_field_lengths: {err}"
+    );
+}
+
+#[test]
+fn test_decode_header_rejects_negative_avg_field_length() {
+    // avg_field_lengths[7] is at bytes [26 + 7*4 .. 26 + 7*4 + 4] = [54..58]
+    let buf = make_header_with_float_at(54, -0.5f32);
+    let result = decode_header(&buf);
+    assert!(
+        result.is_err(),
+        "negative avg_field_lengths[7] should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("avg_field_lengths"),
+        "error should mention avg_field_lengths: {err}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // read_array — defensive bounds checking
 // -----------------------------------------------------------------------
 

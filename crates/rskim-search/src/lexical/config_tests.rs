@@ -161,3 +161,95 @@ fn test_field_count_matches_search_field_variants() {
         "FIELD_COUNT must equal the number of SearchField variants"
     );
 }
+
+// ============================================================================
+// NaN / Infinity rejection tests
+// ============================================================================
+
+#[test]
+fn test_validate_rejects_nan_k1() {
+    let cfg = BM25FConfig {
+        k1: f32::NAN,
+        ..BM25FConfig::default()
+    };
+    let result = cfg.validate();
+    assert!(result.is_err(), "NaN k1 should be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("k1"), "error should mention k1: {msg}");
+}
+
+#[test]
+fn test_validate_rejects_infinity_k1() {
+    let cfg = BM25FConfig {
+        k1: f32::INFINITY,
+        ..BM25FConfig::default()
+    };
+    let result = cfg.validate();
+    assert!(result.is_err(), "INFINITY k1 should be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("k1"), "error should mention k1: {msg}");
+}
+
+#[test]
+fn test_validate_rejects_neg_infinity_k1() {
+    let cfg = BM25FConfig {
+        k1: f32::NEG_INFINITY,
+        ..BM25FConfig::default()
+    };
+    let result = cfg.validate();
+    assert!(result.is_err(), "NEG_INFINITY k1 should be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("k1"), "error should mention k1: {msg}");
+}
+
+#[test]
+fn test_validate_rejects_nan_field_boost() {
+    let mut cfg = BM25FConfig::default();
+    cfg.field_boosts[3] = f32::NAN;
+    let result = cfg.validate();
+    assert!(result.is_err(), "NaN field_boosts should be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("field_boosts[3]"),
+        "error should mention field index: {msg}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_infinity_field_boost() {
+    let mut cfg = BM25FConfig::default();
+    cfg.field_boosts[0] = f32::INFINITY;
+    let result = cfg.validate();
+    assert!(result.is_err(), "INFINITY field_boosts should be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("field_boosts[0]"),
+        "error should mention field index: {msg}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_nan_field_b() {
+    let mut cfg = BM25FConfig::default();
+    cfg.field_b[5] = f32::NAN;
+    let result = cfg.validate();
+    assert!(result.is_err(), "NaN field_b should be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("field_b[5]"),
+        "error should mention field index: {msg}"
+    );
+}
+
+#[test]
+fn test_validate_rejects_infinity_field_b() {
+    let mut cfg = BM25FConfig::default();
+    cfg.field_b[2] = f32::INFINITY;
+    let result = cfg.validate();
+    assert!(result.is_err(), "INFINITY field_b should be rejected");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("field_b[2]"),
+        "error should mention field index: {msg}"
+    );
+}
