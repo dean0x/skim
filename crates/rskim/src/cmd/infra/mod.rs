@@ -1,10 +1,11 @@
-//! Infrastructure tool handler — dispatches to infra parsers (#116, #117, #131)
+//! Infrastructure tool handler — dispatches to infra parsers (#116, #117, #131, #168)
 //!
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
-//! `aws`, `curl`, `docker`, `gh`, `kubectl`, `terraform`, `wget`.
+//! `aws`, `curl`, `dig`, `docker`, `gh`, `kubectl`, `nslookup`, `terraform`, `wget`.
 
 pub(crate) mod aws;
 pub(crate) mod curl;
+pub(crate) mod dns;
 pub(crate) mod docker;
 pub(crate) mod gh;
 pub(crate) mod kubectl;
@@ -22,9 +23,11 @@ use crate::runner::CommandOutput;
 const KNOWN_TOOLS: &[&str] = &[
     "aws",
     "curl",
+    "dig",
     "docker",
     "gh",
     "kubectl",
+    "nslookup",
     "terraform",
     "wget",
 ];
@@ -60,9 +63,11 @@ pub(crate) fn run(
     match tool_name.as_str() {
         "aws" => aws::run(tool_args, &ctx),
         "curl" => curl::run(tool_args, &ctx),
+        "dig" => dns::run_dig(tool_args, &ctx),
         "docker" => docker::run(tool_args, &ctx),
         "gh" => gh::run(tool_args, &ctx),
         "kubectl" => kubectl::run(tool_args, &ctx),
+        "nslookup" => dns::run_nslookup(tool_args, &ctx),
         "terraform" => terraform::run(tool_args, &ctx),
         "wget" => wget::run(tool_args, &ctx),
         _ => {
