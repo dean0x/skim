@@ -50,6 +50,14 @@ const MINIFY_AVG_LINE_BYTES: usize = 500;
 /// 256 ancestors is far beyond any real filesystem depth.
 const MAX_ANCESTORS: usize = 256;
 
+/// Maximum number of skip reasons collected during a walk.
+///
+/// Large monorepos may encounter millions of unsupported files.  Collecting an
+/// unbounded path list wastes memory; callers only need a representative sample
+/// for diagnostics.  Once the cap is hit, [`SkipReason::CapReached`] entries
+/// are still appended so the caller knows truncation occurred.
+const MAX_SKIP_REASONS: usize = 10_000;
+
 // ============================================================================
 // Typed read outcome
 // ============================================================================
@@ -106,6 +114,100 @@ pub(super) fn discover_project_root(start: &Path) -> anyhow::Result<PathBuf> {
 // File walking
 // ============================================================================
 
+/// Outcome of classifying a single [`ignore::DirEntry`].
+///
+/// `Transparent` covers non-file entries (directories, symlinks) that should be
+/// silently skipped without recording a reason.
+enum EntryOutcome {
+    /// Entry is a readable source file ready to be added to the index.
+    Accept(ReadFile),
+    /// Entry should be skipped with a recorded reason.
+    Skip(SkipReason),
+    /// Entry is not a regular file; skip silently.
+    Transparent,
+}
+
+/// Classify a single directory entry into an [`EntryOutcome`].
+///
+/// Handles language detection, size pre-screening (via cached `DirEntry`
+/// metadata), file reading, and minification detection.  The caller is
+/// responsible for the file-count cap and for guarding the `skipped` vector
+/// length against [`MAX_SKIP_REASONS`].
+fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
+    // Only process regular files.
+    let file_type = match entry.file_type() {
+        Some(ft) => ft,
+        None => return EntryOutcome::Transparent,
+    };
+    if !file_type.is_file() {
+        return EntryOutcome::Transparent;
+    }
+
+    let abs_path = entry.path();
+
+    // --- Unsupported language ---
+    let lang = match Language::from_path(abs_path) {
+        Some(l) => l,
+        None => return EntryOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf())),
+    };
+
+    // --- Fast size pre-screen using DirEntry cached metadata ---
+    // entry.metadata() avoids an extra stat(2) syscall on 50 K-file repos.
+    // If it fails we fall through and let the open() path handle the error.
+    if let Ok(meta) = entry.metadata() {
+        let size = meta.len();
+        if size > MAX_FILE_BYTES {
+            return EntryOutcome::Skip(SkipReason::TooLarge {
+                path: abs_path.to_path_buf(),
+                size,
+            });
+        }
+    }
+
+    // --- Open, size-check on handle, read (fixes TOCTOU race) ---
+    // Open the file first so that the metadata check and the read operate
+    // on the same inode.  Pre-allocate the buffer to the known size so
+    // read_to_string does at most one allocation.
+    let content = match open_and_read(abs_path) {
+        ReadOutcome::Content(c) => c,
+        ReadOutcome::NonUtf8 => {
+            return EntryOutcome::Skip(SkipReason::NonUtf8(abs_path.to_path_buf()))
+        }
+        ReadOutcome::TooLarge(size) => {
+            // File grew past the limit between the pre-screen and open.
+            return EntryOutcome::Skip(SkipReason::TooLarge {
+                path: abs_path.to_path_buf(),
+                size,
+            });
+        }
+        ReadOutcome::Io(e) => {
+            return EntryOutcome::Skip(SkipReason::ReadError {
+                path: abs_path.to_path_buf(),
+                error: e.to_string(),
+            })
+        }
+    };
+
+    // --- Minification check (tree-sitter languages only) ---
+    if is_tree_sitter_language(lang) && is_minified(&content) {
+        return EntryOutcome::Skip(SkipReason::Minified(abs_path.to_path_buf()));
+    }
+
+    // --- Compute SHA-256 and build relative path ---
+    let sha256 = sha256_hex(content.as_bytes());
+    let rel_path = abs_path
+        .strip_prefix(root)
+        .unwrap_or(abs_path)
+        .to_path_buf();
+
+    EntryOutcome::Accept(ReadFile {
+        rel_path,
+        lang,
+        content,
+        sha256,
+    })
+}
+
 /// Walk `root` recursively, read each source file, compute its SHA-256, and
 /// return the list of [`ReadFile`]s along with collected [`SkipReason`]s.
 ///
@@ -158,96 +260,25 @@ pub(super) fn walk_and_read(
                     ignore::Error::WithPath { path, .. } => path.clone(),
                     _ => PathBuf::new(),
                 };
-                skipped.push(SkipReason::ReadError {
-                    path,
-                    error: err.to_string(),
-                });
+                if skipped.len() < MAX_SKIP_REASONS {
+                    skipped.push(SkipReason::ReadError {
+                        path,
+                        error: err.to_string(),
+                    });
+                }
                 continue;
             }
         };
 
-        // Only process regular files.
-        let file_type = match entry.file_type() {
-            Some(ft) => ft,
-            None => continue,
-        };
-        if !file_type.is_file() {
-            continue;
+        match classify_entry(&entry, root) {
+            EntryOutcome::Accept(file) => files.push(file),
+            EntryOutcome::Skip(reason) => {
+                if skipped.len() < MAX_SKIP_REASONS {
+                    skipped.push(reason);
+                }
+            }
+            EntryOutcome::Transparent => {}
         }
-
-        let abs_path = entry.path();
-
-        // --- Unsupported language ---
-        let lang = match Language::from_path(abs_path) {
-            Some(l) => l,
-            None => {
-                skipped.push(SkipReason::UnsupportedLanguage(abs_path.to_path_buf()));
-                continue;
-            }
-        };
-
-        // --- Fast size pre-screen using DirEntry cached metadata (issue #2) ---
-        // entry.metadata() avoids an extra stat(2) syscall on 50 K-file repos.
-        // If it fails we fall through and let the open() path handle the error.
-        if let Ok(meta) = entry.metadata() {
-            let size = meta.len();
-            if size > MAX_FILE_BYTES {
-                skipped.push(SkipReason::TooLarge {
-                    path: abs_path.to_path_buf(),
-                    size,
-                });
-                continue;
-            }
-        }
-
-        // --- Open, size-check on handle, read (fixes TOCTOU race, issue #1) ---
-        // Open the file first so that the metadata check and the read operate
-        // on the same inode.  Pre-allocate the buffer to the known size so
-        // read_to_string does at most one allocation.
-        let content = match open_and_read(abs_path) {
-            ReadOutcome::Content(c) => c,
-            ReadOutcome::NonUtf8 => {
-                skipped.push(SkipReason::NonUtf8(abs_path.to_path_buf()));
-                continue;
-            }
-            ReadOutcome::TooLarge(size) => {
-                // File grew past the limit between the pre-screen and open.
-                skipped.push(SkipReason::TooLarge {
-                    path: abs_path.to_path_buf(),
-                    size,
-                });
-                continue;
-            }
-            ReadOutcome::Io(e) => {
-                skipped.push(SkipReason::ReadError {
-                    path: abs_path.to_path_buf(),
-                    error: e.to_string(),
-                });
-                continue;
-            }
-        };
-
-        // --- Minification check (tree-sitter languages only) ---
-        if is_tree_sitter_language(lang) && is_minified(&content) {
-            skipped.push(SkipReason::Minified(abs_path.to_path_buf()));
-            continue;
-        }
-
-        // --- Compute SHA-256 ---
-        let sha256 = sha256_hex(content.as_bytes());
-
-        // --- Build relative path ---
-        let rel_path = abs_path
-            .strip_prefix(root)
-            .unwrap_or(abs_path)
-            .to_path_buf();
-
-        files.push(ReadFile {
-            rel_path,
-            lang,
-            content,
-            sha256,
-        });
     }
 
     Ok((files, skipped))
@@ -297,7 +328,7 @@ fn open_and_read(path: &Path) -> ReadOutcome {
 /// Non-tree-sitter languages (JSON, YAML, TOML) are excluded from the minify
 /// check because their format makes long lines normal (e.g. minified JSON).
 fn is_tree_sitter_language(lang: Language) -> bool {
-    !matches!(lang, Language::Json | Language::Yaml | Language::Toml)
+    !lang.is_serde_based()
 }
 
 /// Returns `true` if the content appears minified.
@@ -328,8 +359,8 @@ pub(super) fn sha256_hex(data: &[u8]) -> String {
         hex[i * 2] = NIBBLES[(byte >> 4) as usize];
         hex[i * 2 + 1] = NIBBLES[(byte & 0x0f) as usize];
     }
-    // SAFETY: NIBBLES contains only ASCII hex characters, so hex is always valid UTF-8.
-    unsafe { String::from_utf8_unchecked(hex) }
+    // NIBBLES contains only ASCII hex characters, so hex is always valid UTF-8.
+    String::from_utf8(hex).expect("hex nibbles are always valid UTF-8")
 }
 
 // ============================================================================
