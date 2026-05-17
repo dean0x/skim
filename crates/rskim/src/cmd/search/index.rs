@@ -2,7 +2,7 @@
 //!
 //! # Data flow
 //!
-//! **Streaming build** (Commit 3):
+//! **Streaming build**:
 //! 1. `discover_project_root(cwd)` → walk up to `.git`, fall back to cwd
 //! 2. Resolve cache dir: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/`
 //! 3. `walk_metadata(root, max_files)` → metadata-only WalkEntry list (sorted)
@@ -19,19 +19,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use clap::Parser;
-use sha2::{Digest, Sha256};
-
 use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, classify_source};
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
 use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
 use super::walk::{
-    discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata, ReadOutcome,
+    ReadOutcome, discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata,
 };
 
 // ============================================================================
@@ -139,18 +137,10 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
-// ============================================================================
-// Core pipeline (thin delegation — delegates to Pipeline)
-// ============================================================================
-
 /// Execute the full build or incremental build pipeline.
 fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     Pipeline::new(config)?.run()
 }
-
-// ============================================================================
-// Pipeline struct — decomposed build stages
-// ============================================================================
 
 /// Orchestrates the index build pipeline as discrete, testable stages.
 ///
@@ -193,7 +183,8 @@ impl<'cfg> Pipeline<'cfg> {
     /// Run the streaming pipeline and return the final [`IndexResult`].
     pub(super) fn run(self) -> anyhow::Result<IndexResult> {
         // Stage 1: Metadata-only walk (no content reading).
-        let (walk_entries, walk_skips) = walk_metadata(&self.config.root, self.config.effective_max_files())?;
+        let (walk_entries, walk_skips) =
+            walk_metadata(&self.config.root, self.config.effective_max_files())?;
         let walk_skip_count = walk_skips.len();
 
         if walk_entries.is_empty() {
@@ -231,13 +222,10 @@ impl<'cfg> Pipeline<'cfg> {
         let debug_enabled = crate::debug::is_debug_enabled();
         let force = self.config.force;
 
-        // Clone data needed by the producer thread.
-        let root_for_producer = self.config.root.clone();
-
         // Spawn producer thread.
         let producer_handle = std::thread::spawn(move || {
             for entry in &walk_entries {
-                match read_and_classify(entry, &root_for_producer, &manifest, force, debug_enabled) {
+                match read_and_classify(entry, &manifest, force, debug_enabled) {
                     Ok(pf) => {
                         // Send blocks when the channel is full — this is the
                         // backpressure mechanism that limits peak memory.
@@ -318,8 +306,8 @@ impl<'cfg> Pipeline<'cfg> {
         // Manifest written last — marks index as coherent.
         new_manifest.save()?;
 
-        let total_skipped = to_u32_capped(walk_skip_count)
-            .saturating_add(producer_skips.load(Ordering::Relaxed));
+        let total_skipped =
+            to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
 
         Ok(IndexResult {
             file_count: next_file_id,
@@ -340,7 +328,6 @@ impl<'cfg> Pipeline<'cfg> {
 /// Called by the producer thread for each [`WalkEntry`].
 fn read_and_classify(
     entry: &WalkEntry,
-    _root: &Path,
     manifest: &FileManifest,
     force: bool,
     debug: bool,
@@ -458,24 +445,12 @@ fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
     Ok(base.join("search").join(hash))
 }
 
-/// Compute a 16-char hex hash of the canonical project root path.
+/// Compute a 16-char hex prefix of the SHA-256 of the canonical project root path.
 ///
 /// Used as a stable directory name in the search cache.
 fn project_root_hash(canonical_root: &Path) -> String {
     let input = canonical_root.to_string_lossy();
-    let digest = Sha256::digest(input.as_bytes());
-    // Take first 8 bytes → 16 hex chars
-    digest
-        .iter()
-        .take(8)
-        .flat_map(|byte| {
-            [
-                b"0123456789abcdef"[(byte >> 4) as usize],
-                b"0123456789abcdef"[(byte & 0x0f) as usize],
-            ]
-        })
-        .map(|b| b as char)
-        .collect()
+    sha256_hex(input.as_bytes())[..16].to_string()
 }
 
 // ============================================================================

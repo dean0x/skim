@@ -313,7 +313,7 @@ fn test_wrong_root_returns_empty_manifest() {
 }
 
 // ============================================================================
-// Mtime — new tests for Commit 1 (mtime pre-screening)
+// Mtime pre-screening
 // ============================================================================
 
 /// Inserting a ManifestEntry with `mtime: Some(...)`, saving, and loading

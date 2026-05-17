@@ -203,20 +203,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
         return EntryOutcome::Skip(SkipReason::Minified(abs_path.to_path_buf()));
     }
 
-    // --- Extract mtime (used as a fast pre-screening hint; SHA remains authoritative) ---
-    // Convert SystemTime → seconds since UNIX_EPOCH.  Returns None on any failure
-    // (e.g. platform does not expose mtime, or the time is before the epoch).
-    let mtime: Option<u64> = entry
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| {
-            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs())
-        });
-
-    // --- Build relative path ---
+    let mtime = mtime_secs(entry);
     let rel_path = abs_path
         .strip_prefix(root)
         .unwrap_or(abs_path)
@@ -257,15 +244,7 @@ pub(super) fn walk_and_read(
     let root_buf = root.to_path_buf();
 
     let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(true) // skip hidden files/dirs
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .ignore(true)
-        .parents(true)
-        .require_git(false)
-        .follow_links(false);
+    configure_builder(&mut builder);
 
     builder.build_parallel().run(|| {
         let files = Arc::clone(&files);
@@ -359,17 +338,7 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
         }
     }
 
-    // Extract mtime.
-    let mtime: Option<u64> = entry
-        .metadata()
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| {
-            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs())
-        });
-
+    let mtime = mtime_secs(entry);
     let rel_path = abs_path
         .strip_prefix(root)
         .unwrap_or(abs_path)
@@ -409,15 +378,7 @@ pub(super) fn walk_metadata(
     let root_buf = root.to_path_buf();
 
     let mut builder = WalkBuilder::new(root);
-    builder
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .ignore(true)
-        .parents(true)
-        .require_git(false)
-        .follow_links(false);
+    configure_builder(&mut builder);
 
     builder.build_parallel().run(|| {
         let entries = Arc::clone(&entries);
@@ -562,6 +523,36 @@ fn handle_entry(
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+/// Extract mtime from a `DirEntry` as seconds since UNIX_EPOCH.
+///
+/// Returns `None` if the platform does not expose mtime or the syscall fails.
+/// Used as a fast pre-screening hint; SHA-256 is always the correctness
+/// guarantee for cache invalidation.
+fn mtime_secs(entry: &ignore::DirEntry) -> Option<u64> {
+    entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| {
+            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        })
+}
+
+/// Configure a [`WalkBuilder`] with the project-standard ignore rules.
+fn configure_builder(builder: &mut WalkBuilder) {
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .require_git(false)
+        .follow_links(false);
+}
 
 /// Open `path`, verify its on-disk size via the file handle (not a separate
 /// `stat(2)` call), then read it into a `String`.

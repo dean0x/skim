@@ -469,7 +469,7 @@ fn test_walk_skips_git_directory() {
 }
 
 // ============================================================================
-// Mtime — new tests for Commit 1 (mtime pre-screening)
+// Mtime pre-screening
 // ============================================================================
 
 /// Walk returns `mtime: Some(...)` for all accepted files on platforms that
@@ -494,7 +494,7 @@ fn test_mtime_populated_in_walk() {
 }
 
 // ============================================================================
-// walk_metadata — Commit 3 tests
+// walk_metadata
 // ============================================================================
 
 /// `walk_metadata` returns entries sorted by `rel_path` (lexicographic).
@@ -527,7 +527,11 @@ fn test_walk_metadata_respects_max_files_cap() {
     let root = dir.path();
     fs::create_dir_all(root.join(".git")).unwrap();
     for i in 0..12 {
-        fs::write(root.join(format!("file_{i:02}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+        fs::write(
+            root.join(format!("file_{i:02}.rs")),
+            format!("fn f{i}() {{}}\n"),
+        )
+        .unwrap();
     }
 
     let root = root.canonicalize().unwrap();

@@ -493,125 +493,6 @@ fn find_file_with_ext(dir: &Path, ext: &str) -> bool {
     find_file_with_ext_depth(dir, ext, 5)
 }
 
-// ============================================================================
-// Mtime pre-screening — Commit 1 tests
-// ============================================================================
-
-/// After two builds on an unchanged project, the second build must produce
-/// `cache_hits == file_count` (all files served from the manifest cache).
-///
-/// This validates the full mtime/SHA-based cache logic end-to-end without
-/// requiring the caller to inspect mtime values directly.
-#[test]
-fn test_incremental_cache_hits_with_mtime() {
-    use super::super::types::IndexConfig;
-    use super::build_index;
-
-    let project = make_project();
-    let cache = tempfile::tempdir().unwrap();
-
-    let config = IndexConfig {
-        root: project.path().to_path_buf(),
-        max_files: None,
-        force: false,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-
-    let result1 = build_index(&config).expect("first build must succeed");
-    assert!(result1.file_count > 0, "first build should index files");
-
-    let result2 = build_index(&config).expect("second build must succeed");
-    assert_eq!(
-        result2.cache_hits, result2.file_count,
-        "second build on unchanged files must produce cache_hits == file_count; \
-         got cache_hits={} file_count={}",
-        result2.cache_hits, result2.file_count
-    );
-}
-
-/// After a first build, modifying a file must cause its SHA to change in the
-/// manifest on the second build (cache miss for that file).
-#[test]
-fn test_modified_file_detected_despite_mtime() {
-    use super::super::manifest::FileManifest;
-    use super::super::types::IndexConfig;
-    use super::build_index;
-
-    let project = make_project();
-    let cache = tempfile::tempdir().unwrap();
-
-    let config = IndexConfig {
-        root: project.path().to_path_buf(),
-        max_files: None,
-        force: false,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-
-    build_index(&config).expect("first build must succeed");
-    let m1 = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-        .unwrap();
-    let sha_before = m1
-        .lookup("src/main.rs")
-        .expect("first manifest must contain src/main.rs")
-        .sha256
-        .clone();
-
-    // Modify the file so its SHA changes.
-    fs::write(
-        project.path().join("src/main.rs"),
-        "fn main() { eprintln!(\"modified\"); }\n",
-    )
-    .unwrap();
-
-    build_index(&config).expect("second build must succeed");
-    let m2 = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
-        .unwrap();
-    let sha_after = m2
-        .lookup("src/main.rs")
-        .expect("second manifest must contain src/main.rs")
-        .sha256
-        .clone();
-
-    assert_ne!(
-        sha_before, sha_after,
-        "SHA for src/main.rs must differ after modification — cache reuse would be wrong"
-    );
-}
-
-/// With `--force`, the cache_hits must be zero even when a manifest exists and
-/// files are unchanged.
-#[test]
-fn test_force_ignores_mtime_cache() {
-    use super::super::types::IndexConfig;
-    use super::build_index;
-
-    let project = make_project();
-    let cache = tempfile::tempdir().unwrap();
-
-    // First build — populate the manifest.
-    let config = IndexConfig {
-        root: project.path().to_path_buf(),
-        max_files: None,
-        force: false,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-    build_index(&config).expect("first build must succeed");
-
-    // Second build with --force.
-    let force_config = IndexConfig {
-        root: project.path().to_path_buf(),
-        max_files: None,
-        force: true,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-    let result = build_index(&force_config).expect("--force build must succeed");
-    assert_eq!(
-        result.cache_hits, 0,
-        "--force must produce zero cache hits; got {}",
-        result.cache_hits
-    );
-}
-
 /// After a full build, the manifest must contain a 64-char lowercase hex SHA-256
 /// for every indexed file (SHA computed in classify phase).
 #[test]
@@ -645,10 +526,11 @@ fn test_sha_computed_in_classify_phase() {
 }
 
 // ============================================================================
-// Streaming pipeline — Commit 3 tests
+// Streaming pipeline — unique pipeline-level tests
 // ============================================================================
 
-/// Streaming build on a normal project produces correct file count and succeeds.
+/// Streaming build on a normal project produces exact file_count and zero
+/// cache_hits on cold start.
 #[test]
 fn test_streaming_produces_same_result() {
     use super::super::types::IndexConfig;
@@ -668,58 +550,6 @@ fn test_streaming_produces_same_result() {
     // make_project() creates 3 source files (main.rs, lib.rs, build.py).
     assert_eq!(result.file_count, 3, "should index all 3 source files");
     assert_eq!(result.cache_hits, 0, "cold start must have zero cache hits");
-}
-
-/// Streaming build on an empty project returns file_count == 0 and succeeds.
-#[test]
-fn test_streaming_empty_project() {
-    use super::super::types::IndexConfig;
-    use super::build_index;
-
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path();
-    fs::create_dir_all(root.join(".git")).unwrap();
-    let cache = tempfile::tempdir().unwrap();
-
-    let config = IndexConfig {
-        root: root.to_path_buf(),
-        max_files: None,
-        force: false,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-
-    let result = build_index(&config).expect("empty project build must succeed");
-    assert_eq!(result.file_count, 0, "empty project must index 0 files");
-    assert_eq!(result.cache_hits, 0, "empty project has no cache hits");
-}
-
-/// Two consecutive streaming builds on unchanged files produce all-cache-hit
-/// result on the second run.
-#[test]
-fn test_streaming_incremental_builds() {
-    use super::super::types::IndexConfig;
-    use super::build_index;
-
-    let project = make_project();
-    let cache = tempfile::tempdir().unwrap();
-
-    let config = IndexConfig {
-        root: project.path().to_path_buf(),
-        max_files: None,
-        force: false,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-
-    let result1 = build_index(&config).expect("first build must succeed");
-    assert!(result1.file_count > 0);
-
-    let result2 = build_index(&config).expect("second build must succeed");
-    assert_eq!(
-        result2.cache_hits, result2.file_count,
-        "streaming incremental: all files should be cache hits; \
-         got cache_hits={} file_count={}",
-        result2.cache_hits, result2.file_count
-    );
 }
 
 /// A minified JS file in the project appears in the skipped count.
@@ -751,39 +581,6 @@ fn test_streaming_skipped_includes_minified() {
         result.skipped
     );
     assert_eq!(result.file_count, 1, "only main.rs should be indexed");
-}
-
-/// `--force` produces zero cache hits even when a manifest exists.
-#[test]
-fn test_streaming_force_flag() {
-    use super::super::types::IndexConfig;
-    use super::build_index;
-
-    let project = make_project();
-    let cache = tempfile::tempdir().unwrap();
-
-    // Populate manifest.
-    let config = IndexConfig {
-        root: project.path().to_path_buf(),
-        max_files: None,
-        force: false,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-    build_index(&config).expect("first build must succeed");
-
-    // Force rebuild.
-    let force_config = IndexConfig {
-        root: project.path().to_path_buf(),
-        max_files: None,
-        force: true,
-        cache_dir_override: Some(cache.path().to_path_buf()),
-    };
-    let result = build_index(&force_config).expect("--force build must succeed");
-    assert_eq!(
-        result.cache_hits, 0,
-        "streaming --force must produce zero cache hits, got {}",
-        result.cache_hits
-    );
 }
 
 /// With `max_files=2`, the streaming pipeline indexes exactly 2 files.
