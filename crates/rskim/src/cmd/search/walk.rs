@@ -218,8 +218,9 @@ fn is_tree_sitter_language(lang: Language) -> bool {
 /// they contain no newlines, or the average bytes-per-line exceeds
 /// [`MINIFY_AVG_LINE_BYTES`], the file is considered minified.
 fn is_minified(content: &str) -> bool {
-    let probe = &content[..content.len().min(MINIFY_PROBE_BYTES)];
-    let newline_count = probe.bytes().filter(|&b| b == b'\n').count();
+    let probe_len = content.len().min(MINIFY_PROBE_BYTES);
+    let probe = content.as_bytes().get(..probe_len).unwrap_or(content.as_bytes());
+    let newline_count = probe.iter().filter(|&&b| b == b'\n').count();
     if newline_count == 0 {
         return probe.len() > MINIFY_AVG_LINE_BYTES;
     }
