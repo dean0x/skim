@@ -254,8 +254,8 @@ fn try_parse_dig_regex(text: &str) -> Option<InfraResult> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::{load_fixture, make_output};
+    use super::*;
 
     // ========================================================================
     // dig: Tier 1

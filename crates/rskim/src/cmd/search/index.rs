@@ -221,15 +221,13 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     // explicitly — no indexing invariant to maintain, no residual entries.
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;
     let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
-    for (idx, ((rf, (field_map, _)), path_key)) in read_files
-        .iter()
-        .zip(classified)
-        .zip(path_keys)
-        .enumerate()
+    for (idx, ((rf, (field_map, _)), path_key)) in
+        read_files.iter().zip(classified).zip(path_keys).enumerate()
     {
         // Guard against usize overflow into FileId(u32) on pathological inputs.
-        let file_id = u32::try_from(idx)
-            .map_err(|_| anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files"))?;
+        let file_id = u32::try_from(idx).map_err(|_| {
+            anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files")
+        })?;
         // Fail-soft: a single file that fails to index should not abort a
         // 50 K-file build. Log the error under debug and continue.
         if let Err(e) =
@@ -328,7 +326,12 @@ fn project_root_hash(canonical_root: &Path) -> String {
     digest
         .iter()
         .take(8)
-        .flat_map(|byte| [b"0123456789abcdef"[(byte >> 4) as usize], b"0123456789abcdef"[(byte & 0x0f) as usize]])
+        .flat_map(|byte| {
+            [
+                b"0123456789abcdef"[(byte >> 4) as usize],
+                b"0123456789abcdef"[(byte & 0x0f) as usize],
+            ]
+        })
         .map(|b| b as char)
         .collect()
 }

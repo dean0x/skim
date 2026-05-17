@@ -174,7 +174,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     let content = match open_and_read(abs_path) {
         ReadOutcome::Content(c) => c,
         ReadOutcome::NonUtf8 => {
-            return EntryOutcome::Skip(SkipReason::NonUtf8(abs_path.to_path_buf()))
+            return EntryOutcome::Skip(SkipReason::NonUtf8(abs_path.to_path_buf()));
         }
         ReadOutcome::TooLarge(size) => {
             // File grew past the limit between the pre-screen and open.
@@ -187,7 +187,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
             return EntryOutcome::Skip(SkipReason::ReadError {
                 path: abs_path.to_path_buf(),
                 error: e.to_string(),
-            })
+            });
         }
     };
 
@@ -269,11 +269,15 @@ pub(super) fn walk_and_read(
     });
 
     let mut files = Arc::try_unwrap(files)
-        .map_err(|_| anyhow::anyhow!("files Arc still has multiple owners after walker completion"))?
+        .map_err(|_| {
+            anyhow::anyhow!("files Arc still has multiple owners after walker completion")
+        })?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
     let skipped = Arc::try_unwrap(skipped)
-        .map_err(|_| anyhow::anyhow!("skipped Arc still has multiple owners after walker completion"))?
+        .map_err(|_| {
+            anyhow::anyhow!("skipped Arc still has multiple owners after walker completion")
+        })?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
 

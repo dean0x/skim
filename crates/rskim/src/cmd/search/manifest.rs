@@ -145,7 +145,10 @@ impl FileManifest {
         // Guard: reject suspiciously large manifest files before allocating
         // line buffers. A single line without a newline would allocate the
         // entire file content into one String — cap to MAX_MANIFEST_FILE_BYTES.
-        if file.metadata().is_ok_and(|m| m.len() > MAX_MANIFEST_FILE_BYTES) {
+        if file
+            .metadata()
+            .is_ok_and(|m| m.len() > MAX_MANIFEST_FILE_BYTES)
+        {
             return Ok(Self::new(project_root, cache_dir));
         }
 
@@ -269,7 +272,9 @@ impl FileManifest {
 
         // Flush the buffer before persisting so all bytes reach the temp file.
         buf.flush()?;
-        let tmp = buf.into_inner().context("failed to flush manifest buffer")?;
+        let tmp = buf
+            .into_inner()
+            .context("failed to flush manifest buffer")?;
 
         let manifest_path = self.cache_dir.join(Self::MANIFEST_FILENAME);
         tmp.persist(&manifest_path)
