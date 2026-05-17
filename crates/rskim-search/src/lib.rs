@@ -8,7 +8,7 @@
 //! - The `temporal` module parses git history via gix for temporal scoring.
 //! - Returns Result types throughout — no panics in non-test code.
 //!
-//! CLI/binary code in `crates/rskim/src/cmd/search.rs` handles user-facing I/O.
+//! CLI/binary code in `crates/rskim/src/cmd/search/mod.rs` handles user-facing I/O.
 
 pub mod index;
 pub mod lexical;

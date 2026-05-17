@@ -30,16 +30,17 @@ pub(crate) fn run(
     args: &[String],
     _analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
+    // `skim search index [OPTIONS]` — build the index (checked before --help so
+    // that `skim search index --help` is handled by index::run, not this parent).
+    if args.first().is_some_and(|a| a == "index") {
+        let rest = &args[1..];
+        return index::run(rest);
+    }
+
     // No args or --help/-h → print help
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
-    }
-
-    // `skim search index [OPTIONS]` — build the index
-    if args.first().is_some_and(|a| a == "index") {
-        let rest = &args[1..];
-        return index::run(rest);
     }
 
     // Has a query arg → not yet implemented
@@ -119,5 +120,18 @@ mod tests {
     fn test_search_unimplemented_returns_failure() {
         let result = run(&["fn parse".to_string()], &TEST_ANALYTICS).unwrap();
         assert_eq!(result, ExitCode::FAILURE);
+    }
+
+    /// Regression: `skim search index --help` must dispatch to index help,
+    /// not the parent search help. The parent help check must not intercept
+    /// flags intended for a known subcommand.
+    #[test]
+    fn test_index_help_dispatches_to_index_not_parent() {
+        let result = run(
+            &["index".to_string(), "--help".to_string()],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(result, ExitCode::SUCCESS);
     }
 }

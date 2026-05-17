@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use clap::Parser;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -48,7 +49,7 @@ type ClassifiedFile = (FieldMap, bool);
 /// Accepted flags:
 /// - `--root=<PATH>` or `--root <PATH>` — explicit project root (default: cwd)
 /// - `--force` — skip manifest cache and re-classify every file
-/// - `--max-files=<N>` — override the 50,000 file cap
+/// - `--max-files=<N>` — override the 50,000 file cap (must be ≥ 1)
 /// - `-h` / `--help` — print help text and exit
 ///
 /// # Errors
@@ -57,12 +58,18 @@ type ClassifiedFile = (FieldMap, bool);
 /// languages, too-large files) are counted and reported to stderr but do not
 /// cause a non-zero exit code.
 pub(super) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
-    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
-        print_help();
-        return Ok(ExitCode::SUCCESS);
-    }
+    let cli = match IndexCli::try_parse_from(
+        std::iter::once(&"skim search index".to_string()).chain(args),
+    ) {
+        Ok(cli) => cli,
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {
+            // `--help` / `-h` — clap already printed the help text to stdout.
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(e) => return Err(anyhow::anyhow!("{e}")),
+    };
 
-    let config = parse_args(args)?;
+    let config = cli.into_config()?;
     let result = build_index(&config)?;
 
     eprintln!(
@@ -77,78 +84,62 @@ pub(super) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
 }
 
 // ============================================================================
-// Argument parsing
+// Argument parsing (clap derive)
 // ============================================================================
 
-fn parse_args(args: &[String]) -> anyhow::Result<IndexConfig> {
-    let mut root: Option<PathBuf> = None;
-    let mut force = false;
-    let mut max_files: Option<usize> = None;
-    let mut cache_dir_override: Option<PathBuf> = None;
+/// CLI arguments for `skim search index`.
+#[derive(Parser, Debug)]
+#[command(
+    name = "skim search index",
+    about = "Build or update the search index for the current project.",
+    long_about = None,
+    disable_version_flag = true,
+)]
+struct IndexCli {
+    /// Project root to index (default: auto-discover via .git)
+    #[arg(long)]
+    root: Option<PathBuf>,
 
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
+    /// Rebuild from scratch, ignoring the manifest cache
+    #[arg(long)]
+    force: bool,
 
-        if arg == "--force" {
-            force = true;
-        } else if let Some(val) = next_value(args, &mut i, "--root")? {
-            root = Some(PathBuf::from(val));
-        } else if let Some(val) = next_value(args, &mut i, "--max-files")? {
-            max_files = Some(
-                val.parse::<usize>()
-                    .map_err(|_| anyhow::anyhow!("--max-files requires a positive integer"))?,
-            );
-        } else if let Some(val) = next_value(args, &mut i, "--index-dir")? {
-            // Internal/test flag: override the cache directory.
-            cache_dir_override = Some(PathBuf::from(val));
-        } else {
-            anyhow::bail!("skim search index: unknown argument: {arg}");
-        }
+    /// Maximum files to index (default: 50000; must be ≥ 1)
+    #[arg(long, value_parser = parse_positive_usize)]
+    max_files: Option<usize>,
 
-        i += 1;
-    }
-
-    // Determine the project root.
-    let effective_root = match root {
-        Some(r) => r.canonicalize().unwrap_or(r),
-        None => {
-            let cwd = std::env::current_dir()?;
-            discover_project_root(&cwd)?
-        }
-    };
-
-    Ok(IndexConfig {
-        root: effective_root,
-        max_files,
-        force,
-        cache_dir_override,
-    })
+    /// Internal/test flag: override the cache directory
+    #[arg(long, hide = true)]
+    index_dir: Option<PathBuf>,
 }
 
-/// Extract the value for a `--flag=val` or `--flag val` argument pair.
-///
-/// Returns `Ok(Some(val))` if the current arg matches `flag`, advancing `i` for
-/// the space-separated form. Returns `Ok(None)` if this arg is not `flag`.
-fn next_value<'a>(
-    args: &'a [String],
-    i: &mut usize,
-    flag: &str,
-) -> anyhow::Result<Option<&'a str>> {
-    let arg = &args[*i];
-    let eq_prefix = format!("{flag}=");
+impl IndexCli {
+    fn into_config(self) -> anyhow::Result<IndexConfig> {
+        let effective_root = match self.root {
+            Some(r) => r.canonicalize().unwrap_or(r),
+            None => {
+                let cwd = std::env::current_dir()?;
+                discover_project_root(&cwd)?
+            }
+        };
+        Ok(IndexConfig {
+            root: effective_root,
+            max_files: self.max_files,
+            force: self.force,
+            cache_dir_override: self.index_dir,
+        })
+    }
+}
 
-    if let Some(val) = arg.strip_prefix(&eq_prefix) {
-        return Ok(Some(val));
+/// Value parser that rejects zero — `--max-files` must be ≥ 1.
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    let n = s
+        .parse::<usize>()
+        .map_err(|_| "--max-files requires a positive integer".to_string())?;
+    if n == 0 {
+        return Err("--max-files must be ≥ 1 (zero produces an empty index)".to_string());
     }
-    if arg == flag {
-        *i += 1;
-        let val = args
-            .get(*i)
-            .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))?;
-        return Ok(Some(val.as_str()));
-    }
-    Ok(None)
+    Ok(n)
 }
 
 // ============================================================================
@@ -190,13 +181,20 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
         FileManifest::load(config.root.clone(), cache_dir.clone())?
     };
 
-    // 4. Classify in parallel: for each file, either use cached field_map or call
-    //    classify_source. Results are in the same order as read_files.
+    // 4a. Pre-compute path keys once (avoids duplicate allocation in classify +
+    //     manifest write phases — each key is a heap allocation).
+    let path_keys: Vec<String> = read_files
+        .iter()
+        .map(|rf| rf.rel_path.to_string_lossy().replace('\\', "/"))
+        .collect();
+
+    // 4b. Classify in parallel: for each file, either use cached field_map or
+    //     call classify_source. Results are in the same order as read_files.
     let classified: Vec<ClassifiedFile> = read_files
         .par_iter()
-        .map(|rf| {
-            let path_key = rf.rel_path.to_string_lossy().replace('\\', "/");
-            if let Some(entry) = manifest.lookup(&path_key)
+        .zip(path_keys.par_iter())
+        .map(|(rf, path_key)| {
+            if let Some(entry) = manifest.lookup(path_key)
                 && entry.sha256 == rf.sha256
             {
                 // Cache hit: reuse field_map
@@ -214,7 +212,10 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;
     for (idx, rf) in read_files.iter().enumerate() {
         let (ref field_map, _) = classified[idx];
-        builder.add_file_classified(FileId(idx as u32), &rf.content, rf.lang, field_map)?;
+        // Guard against usize overflow into FileId(u32) on pathological inputs.
+        let file_id = u32::try_from(idx)
+            .map_err(|_| anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files"))?;
+        builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, field_map)?;
     }
     // build() flushes index.skidx + index.skpost
     let _layer = builder.build()?;
@@ -223,11 +224,10 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
     for (idx, rf) in read_files.iter().enumerate() {
         let (ref field_map, _) = classified[idx];
-        let path_key = rf.rel_path.to_string_lossy().replace('\\', "/");
         new_manifest.insert(ManifestEntry {
-            path: path_key,
+            path: path_keys[idx].clone(),
             sha256: rf.sha256.clone(),
-            lang: format!("{:?}", rf.lang).to_lowercase(),
+            lang: rf.lang.as_str().to_string(),
             field_map: encode_field_map(field_map),
         });
     }
@@ -247,12 +247,27 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
 // Private helpers
 // ============================================================================
 
-/// Call `classify_source` and return the field_map. On error, fall back to empty.
+/// Call `classify_source` and return the field_map.
+///
+/// On error, falls back to an empty field map so indexing continues. The
+/// failure is logged to stderr when `SKIM_DEBUG` is set, which matches the
+/// existing debug gate used throughout the codebase.
 fn run_classify(
     content: &str,
     lang: rskim_core::Language,
 ) -> Vec<(std::ops::Range<usize>, rskim_search::SearchField)> {
-    classify_source(content, lang).unwrap_or_default()
+    match classify_source(content, lang) {
+        Ok(fields) => fields,
+        Err(e) => {
+            if std::env::var_os("SKIM_DEBUG").is_some() {
+                eprintln!(
+                    "skim search index [debug]: classify_source failed for {:?}: {e}",
+                    lang.as_str()
+                );
+            }
+            Vec::new()
+        }
+    }
 }
 
 /// Resolve the per-project search cache directory.
@@ -284,36 +299,6 @@ fn project_root_hash(canonical_root: &Path) -> String {
         write!(hex, "{byte:02x}").unwrap();
     }
     hex
-}
-
-// ============================================================================
-// Help text
-// ============================================================================
-
-fn print_help() {
-    println!(
-        "\
-Usage: skim search index [OPTIONS]
-
-Build or update the search index for the current project.
-
-Options:
-  --root <PATH>       Project root to index (default: auto-discover via .git)
-  --force             Rebuild from scratch, ignoring the manifest cache
-  --max-files <N>     Maximum files to index (default: 50000)
-  -h, --help          Print this help message
-
-Index location:
-  ~/.cache/skim/search/<project-hash>/
-    index.skidx    Vocabulary + file metadata
-    index.skpost   Posting lists
-    index.skfiles  Manifest sidecar (for incremental updates)
-
-Examples:
-  skim search index
-  skim search index --root /path/to/project
-  skim search index --force"
-    );
 }
 
 // ============================================================================

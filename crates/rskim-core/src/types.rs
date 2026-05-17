@@ -121,6 +121,33 @@ impl Language {
         }
     }
 
+    /// Stable lowercase identifier for this language, safe for serialisation.
+    ///
+    /// Unlike `format!("{:?}", lang).to_lowercase()`, this is not tied to the
+    /// variant name and will not change if variants are renamed.  Follow the
+    /// pattern of [`Mode::name`] — one match arm per variant, explicit strings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TypeScript => "typescript",
+            Self::JavaScript => "javascript",
+            Self::Python => "python",
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Java => "java",
+            Self::Markdown => "markdown",
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Toml => "toml",
+            Self::CSharp => "csharp",
+            Self::Ruby => "ruby",
+            Self::Sql => "sql",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
+        }
+    }
+
     /// Convert to tree-sitter Language
     ///
     /// ARCHITECTURE: This is the ONLY place where tree-sitter grammars are loaded.

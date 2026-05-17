@@ -212,6 +212,28 @@ fn test_index_short_help_returns_success() {
 }
 
 // ============================================================================
+// Argument validation
+// ============================================================================
+
+#[test]
+fn test_index_max_files_zero_is_rejected() {
+    // --max-files=0 must produce an error, not a silently empty index.
+    let result = run(&["--max-files=0".to_string()]);
+    assert!(result.is_err(), "--max-files=0 should return an error");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("≥ 1") || msg.contains("positive"),
+        "error message should mention the constraint, got: {msg}"
+    );
+}
+
+#[test]
+fn test_index_unknown_flag_is_rejected() {
+    let result = run(&["--unknown-flag".to_string()]);
+    assert!(result.is_err(), "unknown flags should return an error");
+}
+
+// ============================================================================
 // Private helpers
 // ============================================================================
 
