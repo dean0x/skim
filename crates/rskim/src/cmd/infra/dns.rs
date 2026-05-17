@@ -942,6 +942,10 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // nslookup: try_parse_nslookup_record_line
+    // ========================================================================
+
     #[test]
     fn test_try_parse_nslookup_record_line_mx() {
         let item =

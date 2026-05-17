@@ -110,23 +110,6 @@ fn test_dig_json_output_valid() {
 }
 
 // ============================================================================
-// nslookup: JSON output mode
-// ============================================================================
-
-#[test]
-fn test_nslookup_json_output_valid() {
-    let fixture = include_str!("fixtures/cmd/infra/nslookup_a_record.txt");
-    skim_cmd()
-        .args(["nslookup", "--json"])
-        .write_stdin(fixture)
-        .assert()
-        .success()
-        .stdout(predicate::str::is_match(r#""tool"\s*:\s*"nslookup""#).unwrap())
-        .stdout(predicate::str::is_match(r#""operation"\s*:\s*"query""#).unwrap())
-        .stdout(predicate::str::is_match(r#""items""#).unwrap());
-}
-
-// ============================================================================
 // nslookup: Tier 1 (Full parse)
 // ============================================================================
 
@@ -189,4 +172,21 @@ fn test_nslookup_garbage_passthrough() {
         .assert()
         .stdout(predicate::str::contains("random garbage"))
         .stderr(predicate::str::contains("[skim:notice]"));
+}
+
+// ============================================================================
+// nslookup: JSON output mode
+// ============================================================================
+
+#[test]
+fn test_nslookup_json_output_valid() {
+    let fixture = include_str!("fixtures/cmd/infra/nslookup_a_record.txt");
+    skim_cmd()
+        .args(["nslookup", "--json"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r#""tool"\s*:\s*"nslookup""#).unwrap())
+        .stdout(predicate::str::is_match(r#""operation"\s*:\s*"query""#).unwrap())
+        .stdout(predicate::str::is_match(r#""items""#).unwrap());
 }
