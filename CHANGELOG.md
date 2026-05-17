@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`skim dig` / `skim nslookup` subcommands** — DNS query output compression via two independent parsers: `dig` uses section-based parsing (QUESTION/ANSWER/AUTHORITY/ADDITIONAL), `nslookup` uses key-value line parsing. Both support three-tier degradation, `--json` structured output, error state compression, and macOS + Linux format variants. `nslookup` includes no-args guard. 2 new rewrite rules (total: 148) (#168)
 - **`skim make` / `skim gmake` subcommands** — GNU Make build output compression via three-tier parser: Tier 1 (GCC/Clang diagnostics regex + make failure lines), Tier 2 (noise-stripped invocation/directory-change lines), Tier 3 (passthrough). Includes `gmake` rewrite rule for hook integration. 17 unit tests, 2 E2E tests (#167)
 
 ## [2.10.0] - 2026-05-13
