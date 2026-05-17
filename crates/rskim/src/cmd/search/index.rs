@@ -183,13 +183,17 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
 
     // 4a. Pre-compute path keys once (avoids duplicate allocation in classify +
     //     manifest write phases — each key is a heap allocation).
-    let path_keys: Vec<String> = read_files
+    let mut path_keys: Vec<String> = read_files
         .iter()
         .map(|rf| rf.rel_path.to_string_lossy().replace('\\', "/"))
         .collect();
 
     // 4b. Classify in parallel: for each file, either use cached field_map or
     //     call classify_source. Results are in the same order as read_files.
+    //
+    // Hoist the debug flag once before entering the rayon worker pool to avoid
+    // a syscall (env::var_os) on every classify error across parallel workers.
+    let debug_enabled = std::env::var_os("SKIM_DEBUG").is_some();
     let classified: Vec<ClassifiedFile> = read_files
         .par_iter()
         .zip(path_keys.par_iter())
@@ -201,7 +205,7 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
                 return (decode_field_map(&entry.field_map), true);
             }
             // SHA mismatch or no entry: fresh classify
-            (run_classify(&rf.content, rf.lang), false)
+            (run_classify(&rf.content, rf.lang, debug_enabled), false)
         })
         .collect();
 
@@ -218,7 +222,7 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
             .map_err(|_| anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files"))?;
         builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, field_map)?;
         new_manifest.insert(ManifestEntry {
-            path: path_keys[idx].clone(),
+            path: std::mem::take(&mut path_keys[idx]),
             sha256: rf.sha256.clone(),
             lang: rf.lang.as_str().to_string(),
             field_map: encode_field_map(field_map),
@@ -253,16 +257,19 @@ fn to_u32_capped(n: usize) -> u32 {
 /// Call `classify_source` and return the field_map.
 ///
 /// On error, falls back to an empty field map so indexing continues. The
-/// failure is logged to stderr when `SKIM_DEBUG` is set, which matches the
-/// existing debug gate used throughout the codebase.
+/// failure is logged to stderr when `debug` is true (i.e. `SKIM_DEBUG` was
+/// set), which matches the existing debug gate used throughout the codebase.
+/// The caller hoists the env-var check once before the rayon worker pool so
+/// that this function never performs a syscall on the hot path.
 fn run_classify(
     content: &str,
     lang: rskim_core::Language,
+    debug: bool,
 ) -> Vec<(std::ops::Range<usize>, rskim_search::SearchField)> {
     match classify_source(content, lang) {
         Ok(fields) => fields,
         Err(e) => {
-            if std::env::var_os("SKIM_DEBUG").is_some() {
+            if debug {
                 eprintln!(
                     "skim search index [debug]: classify_source failed for {:?}: {e}",
                     lang.as_str()
