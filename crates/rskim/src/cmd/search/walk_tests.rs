@@ -255,6 +255,42 @@ fn test_walk_skips_files_over_5mb() {
 }
 
 #[test]
+fn test_walk_skips_minified_js_file() {
+    // is_minified() fires when average bytes-per-line in the first 8 KB exceeds
+    // 500.  A single-line .js file with 10 000 bytes has no newlines at all,
+    // so the average is 8192 (the full probe length) — well above the threshold.
+    // The file must NOT appear in the walk results.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // Write a "minified" JS file: one very long line, no newlines.
+    let content = "x".repeat(10_000);
+    fs::write(root.join("bundle.js"), &content).unwrap();
+
+    // Write a normal JS file alongside it to confirm the walker still works.
+    fs::write(
+        root.join("normal.js"),
+        "function greet() {\n  return 'hello';\n}\n",
+    )
+    .unwrap();
+
+    let root_canonical = root.canonicalize().unwrap();
+    let (files, _skipped) = walk_and_read(&root_canonical, 50_000).unwrap();
+    let paths: Vec<PathBuf> = files.iter().map(|f| f.rel_path.clone()).collect();
+
+    assert!(
+        !paths.iter().any(|p| p.ends_with("bundle.js")),
+        "minified bundle.js should be skipped, paths: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("normal.js")),
+        "normal.js should be included, paths: {paths:?}"
+    );
+}
+
+#[test]
 fn test_walk_empty_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();

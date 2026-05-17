@@ -124,6 +124,57 @@ fn test_index_incremental_second_build_faster_or_same() {
 }
 
 #[test]
+fn test_index_incremental_manifest_correctness() {
+    // After two consecutive builds the manifest must:
+    //   (a) contain entries for all source files,
+    //   (b) have stable SHA-256 values across builds,
+    //   (c) have non-empty field_maps for at least the Rust sources.
+    use super::super::manifest::{FileManifest, ManifestEntry};
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+    let args = index_args(project.path(), cache.path());
+
+    // First build
+    run(&args).unwrap();
+    let manifest1 = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .unwrap();
+
+    // Second build — should reuse cached data
+    run(&args).unwrap();
+    let manifest2 = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .unwrap();
+
+    // (a) Entries must exist for the three source files in make_project().
+    // Paths use forward slashes in the manifest.
+    for path in &["src/main.rs", "src/lib.rs", "build.py"] {
+        assert!(
+            manifest2.lookup(path).is_some(),
+            "manifest should contain an entry for {path}"
+        );
+    }
+
+    // (b) SHA-256 values must be identical across both builds (content unchanged).
+    for path in &["src/main.rs", "src/lib.rs", "build.py"] {
+        let e1: &ManifestEntry = manifest1.lookup(path).unwrap();
+        let e2: &ManifestEntry = manifest2.lookup(path).unwrap();
+        assert_eq!(
+            e1.sha256, e2.sha256,
+            "sha256 for {path} should be stable between builds"
+        );
+    }
+
+    // (c) Rust files must have a non-empty field_map (classifier produced output).
+    for path in &["src/main.rs", "src/lib.rs"] {
+        let entry = manifest2.lookup(path).unwrap();
+        assert!(
+            !entry.field_map.is_empty(),
+            "field_map for {path} should be non-empty after classification"
+        );
+    }
+}
+
+#[test]
 fn test_index_incremental_modified_file_reindexed() {
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
@@ -192,6 +243,49 @@ fn test_index_mixed_languages() {
         result,
         ExitCode::SUCCESS,
         "mixed language build should succeed"
+    );
+}
+
+// ============================================================================
+// --max-files integration
+// ============================================================================
+
+#[test]
+fn test_index_max_files_limits_manifest_entries() {
+    // Create 10 source files, index with --max-files=2, and verify that the
+    // manifest contains at most 2 entries.  This exercises the full CLI flag
+    // path end-to-end (clap parse → walk cap → manifest write).
+    use super::super::manifest::FileManifest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    for i in 0..10 {
+        fs::write(
+            root.join(format!("file_{i:02}.rs")),
+            format!("fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let cache = tempfile::tempdir().unwrap();
+    let mut args = index_args(root, cache.path());
+    args.push("--max-files=2".to_string());
+
+    let result = run(&args).unwrap();
+    assert_eq!(result, ExitCode::SUCCESS, "--max-files=2 build should succeed");
+
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Count entries by checking all possible file names.
+    let entry_count = (0..10)
+        .filter(|i| manifest.lookup(&format!("file_{i:02}.rs")).is_some())
+        .count();
+
+    assert_eq!(
+        entry_count, 2,
+        "only 2 files should be indexed when --max-files=2, got {entry_count}"
     );
 }
 

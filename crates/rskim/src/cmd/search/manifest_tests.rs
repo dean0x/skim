@@ -5,7 +5,7 @@
 use std::fs;
 use std::ops::Range;
 
-use super::{FileManifest, ManifestEntry};
+use super::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
 use rskim_search::SearchField;
 
 // ============================================================================
@@ -27,22 +27,6 @@ fn sample_entry(path: &str, sha256: &str) -> ManifestEntry {
         lang: "rust".to_string(),
         field_map: encode_field_map(&sample_field_map()),
     }
-}
-
-fn encode_field_map(field_map: &[(Range<usize>, SearchField)]) -> Vec<(usize, usize, u8)> {
-    field_map
-        .iter()
-        .map(|(r, f)| (r.start, r.end, f.discriminant()))
-        .collect()
-}
-
-fn decode_field_map(encoded: &[(usize, usize, u8)]) -> Vec<(Range<usize>, SearchField)> {
-    encoded
-        .iter()
-        .filter_map(|(start, end, disc)| {
-            SearchField::from_discriminant(*disc).map(|f| (*start..*end, f))
-        })
-        .collect()
 }
 
 // ============================================================================
