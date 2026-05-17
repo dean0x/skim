@@ -267,6 +267,40 @@ fn test_index_force_flag_ignores_manifest() {
 }
 
 // ============================================================================
+// Incremental build — cache hit count (direct build_index)
+// ============================================================================
+
+#[test]
+fn test_index_incremental_cache_hits_count() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    // Cold start — no manifest exists.
+    let result1 = build_index(&config).expect("first build should succeed");
+    assert!(result1.file_count > 0, "first build should index files");
+    assert_eq!(result1.cache_hits, 0, "cold start must have zero cache hits");
+
+    // Incremental — all files unchanged, all should be cache hits.
+    let result2 = build_index(&config).expect("second build should succeed");
+    assert!(result2.cache_hits > 0, "incremental build must have cache hits");
+    assert_eq!(
+        result2.cache_hits, result2.file_count,
+        "all {} files should be cache hits; got {}",
+        result2.file_count, result2.cache_hits
+    );
+}
+
+// ============================================================================
 // Mixed languages
 // ============================================================================
 
