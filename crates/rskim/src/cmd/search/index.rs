@@ -142,7 +142,11 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 }
 
 /// Execute the full build or incremental build pipeline.
-fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
+///
+/// Returns an [`IndexResult`] with counts and duration. Callers that need only
+/// an exit code (e.g. [`run`]) wrap this; tests that need to inspect counts
+/// call it directly.
+pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     Pipeline::new(config)?.run()
 }
 
@@ -223,10 +227,11 @@ impl<'cfg> Pipeline<'cfg> {
 
         // Stage 3: Consume processed files, build the index.
         let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
-        let mut new_manifest =
-            FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
-        let ConsumeResult { file_count, cache_hits } =
-            Self::consume(&mut builder, &mut new_manifest, rx, debug_enabled);
+        let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+        let ConsumeResult {
+            file_count,
+            cache_hits,
+        } = Self::consume(&mut builder, &mut new_manifest, rx, debug_enabled);
 
         // Wait for the producer to finish and propagate any panic.
         producer_handle.join().map_err(|e| {
@@ -242,8 +247,8 @@ impl<'cfg> Pipeline<'cfg> {
         let _layer = builder.build()?;
         new_manifest.save()?;
 
-        let total_skipped = to_u32_capped(walk_skip_count)
-            .saturating_add(producer_skips.load(Ordering::Relaxed));
+        let total_skipped =
+            to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
 
         Ok(IndexResult {
             file_count,
@@ -255,8 +260,7 @@ impl<'cfg> Pipeline<'cfg> {
 
     /// Stage 1: walk the project root and return `(entries, skip_count)`.
     fn walk(&self) -> anyhow::Result<(Vec<WalkEntry>, usize)> {
-        let (entries, skips) =
-            walk_metadata(&self.config.root, self.config.effective_max_files())?;
+        let (entries, skips) = walk_metadata(&self.config.root, self.config.effective_max_files())?;
         Ok((entries, skips.len()))
     }
 
@@ -288,7 +292,7 @@ impl<'cfg> Pipeline<'cfg> {
     ) {
         let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(CHANNEL_CAPACITY);
         let producer_skips = Arc::new(AtomicU32::new(0));
-        let producer_skips_clone = Arc::clone(&producer_skips);
+        let skips = Arc::clone(&producer_skips);
 
         // Both `walk_entries` and `manifest` are moved into the producer thread.
         // `Vec<WalkEntry>` and `FileManifest` must be `Send`; the compiler
@@ -304,7 +308,7 @@ impl<'cfg> Pipeline<'cfg> {
                         }
                     }
                     Err(_reason) => {
-                        producer_skips_clone.fetch_add(1, Ordering::Relaxed);
+                        skips.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -383,7 +387,10 @@ impl<'cfg> Pipeline<'cfg> {
             // `pf.content` dropped here — memory released immediately.
         }
 
-        ConsumeResult { file_count: next_file_id, cache_hits }
+        ConsumeResult {
+            file_count: next_file_id,
+            cache_hits,
+        }
     }
 }
 
@@ -438,14 +445,16 @@ fn read_and_classify(
     // 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
     let path_key = entry.rel_path.to_string_lossy().replace('\\', "/");
 
-    let (field_map, cache_hit) =
-        if !force && let Some(cached) = manifest.lookup(&path_key) && cached.sha256 == sha {
-            // SHA match → reuse field_map (cache hit).
-            (decode_field_map(&cached.field_map), true)
-        } else {
-            // Cache miss or --force → classify.
-            (run_classify(&content, entry.lang, debug), false)
-        };
+    let (field_map, cache_hit) = if !force
+        && let Some(cached) = manifest.lookup(&path_key)
+        && cached.sha256 == sha
+    {
+        // SHA match → reuse field_map (cache hit).
+        (decode_field_map(&cached.field_map), true)
+    } else {
+        // Cache miss or --force → classify.
+        (run_classify(&content, entry.lang, debug), false)
+    };
 
     Ok(ProcessedFile {
         rel_path: entry.rel_path.clone(),
