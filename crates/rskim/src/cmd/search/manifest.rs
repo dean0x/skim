@@ -234,12 +234,6 @@ impl FileManifest {
         Ok(())
     }
 
-    /// Returns the number of entries in this manifest.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(super) fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 // ============================================================================
