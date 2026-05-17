@@ -145,10 +145,8 @@ impl FileManifest {
         // Guard: reject suspiciously large manifest files before allocating
         // line buffers. A single line without a newline would allocate the
         // entire file content into one String — cap to MAX_MANIFEST_FILE_BYTES.
-        if let Ok(meta) = file.metadata() {
-            if meta.len() > MAX_MANIFEST_FILE_BYTES {
-                return Ok(Self::new(project_root, cache_dir));
-            }
+        if file.metadata().is_ok_and(|m| m.len() > MAX_MANIFEST_FILE_BYTES) {
+            return Ok(Self::new(project_root, cache_dir));
         }
 
         let reader = BufReader::new(file);
@@ -216,8 +214,6 @@ impl FileManifest {
 
     /// Insert or replace an entry (keyed by `entry.path`).
     pub(super) fn insert(&mut self, entry: ManifestEntry) {
-        // Clone the key from the entry before the move so the entry itself
-        // is stored once without an extra heap allocation for a separate key.
         let key = entry.path.clone();
         self.entries.insert(key, entry);
     }
@@ -274,11 +270,6 @@ impl FileManifest {
         // Flush the buffer before persisting so all bytes reach the temp file.
         buf.flush()?;
         let tmp = buf.into_inner().context("failed to flush manifest buffer")?;
-
-        // Sync data to storage before renaming so that the manifest is not
-        // left with zeros or partial content after a power loss that occurs
-        // between the OS page-cache flush and the physical write.
-        tmp.as_file().sync_data()?;
 
         let manifest_path = self.cache_dir.join(Self::MANIFEST_FILENAME);
         tmp.persist(&manifest_path)
