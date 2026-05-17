@@ -129,6 +129,10 @@ pub(crate) fn run_dig(
 /// In agent contexts (piped stdin, non-TTY) this hangs or exits immediately
 /// with no useful output. Guard triggers when args are empty AND stdin is a
 /// terminal — matching exactly the interactive-mode case.
+///
+/// The piped-stdin case (`echo '' | skim nslookup`) is safe: `should_read_stdin`
+/// in `run_infra_tool` detects the non-TTY pipe and reads stdin directly,
+/// never spawning the nslookup binary at all.
 pub(crate) fn run_nslookup(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -476,52 +480,60 @@ fn extract_nslookup_records(text: &str) -> Vec<InfraItem> {
             continue;
         }
 
-        // MX records: `example.com  mail exchanger = 0 .`
-        if let Some(caps) = RE_NSL_MX.captures(trimmed) {
-            items.push(InfraItem {
-                label: "MX".to_string(),
-                value: format!("{} (priority {})", &caps[2], &caps[1]),
-            });
-            continue;
-        }
-
-        // CNAME records
-        if let Some(caps) = RE_NSL_CNAME.captures(trimmed) {
-            items.push(InfraItem {
-                label: "CNAME".to_string(),
-                value: caps[1].trim_end_matches('.').to_string(),
-            });
-            continue;
-        }
-
-        // TXT records
-        if let Some(caps) = RE_NSL_TXT.captures(trimmed) {
-            items.push(InfraItem {
-                label: "TXT".to_string(),
-                value: caps[1].to_string(),
-            });
-            continue;
-        }
-
-        // A/AAAA answer Address line (no #port — server Address lines already skipped above)
-        if let Some(caps) = RE_NSL_ADDRESS.captures(trimmed) {
-            items.push(InfraItem {
-                label: "A".to_string(),
-                value: caps[1].to_string(),
-            });
-            continue;
-        }
-
-        // macOS format: `address = <ip>`
-        if let Some(caps) = RE_NSL_ADDRESS_MAC.captures(trimmed) {
-            items.push(InfraItem {
-                label: "A".to_string(),
-                value: caps[1].to_string(),
-            });
+        if let Some(item) = try_parse_nslookup_record_line(trimmed) {
+            items.push(item);
         }
     }
 
     items
+}
+
+/// Try to parse a single trimmed nslookup answer line into an `InfraItem`.
+///
+/// Returns `Some` for MX, CNAME, TXT, A/AAAA (standard Address:), and macOS
+/// `address = <ip>` formats. Returns `None` for lines that carry no answer record.
+fn try_parse_nslookup_record_line(trimmed: &str) -> Option<InfraItem> {
+    // MX records: `example.com  mail exchanger = 0 host.`
+    if let Some(caps) = RE_NSL_MX.captures(trimmed) {
+        return Some(InfraItem {
+            label: "MX".to_string(),
+            value: format!("{} (priority {})", &caps[2], &caps[1]),
+        });
+    }
+
+    // CNAME records: `canonical name = target.`
+    if let Some(caps) = RE_NSL_CNAME.captures(trimmed) {
+        return Some(InfraItem {
+            label: "CNAME".to_string(),
+            value: caps[1].trim_end_matches('.').to_string(),
+        });
+    }
+
+    // TXT records: `text = "content"`
+    if let Some(caps) = RE_NSL_TXT.captures(trimmed) {
+        return Some(InfraItem {
+            label: "TXT".to_string(),
+            value: caps[1].to_string(),
+        });
+    }
+
+    // A/AAAA answer Address line (no #port — server Address lines already skipped above)
+    if let Some(caps) = RE_NSL_ADDRESS.captures(trimmed) {
+        return Some(InfraItem {
+            label: "A".to_string(),
+            value: caps[1].to_string(),
+        });
+    }
+
+    // macOS format: `address = <ip>`
+    if let Some(caps) = RE_NSL_ADDRESS_MAC.captures(trimmed) {
+        return Some(InfraItem {
+            label: "A".to_string(),
+            value: caps[1].to_string(),
+        });
+    }
+
+    None
 }
 
 /// Tier 2: Simple fallback — look for Server: line indicating DNS output.
@@ -882,6 +894,93 @@ mod tests {
             "Expected 93.184.216.34 in A items, got: {:?}",
             a_items
         );
+    }
+
+    #[test]
+    fn test_nslookup_tier1_cname_record() {
+        // Synthetic nslookup CNAME output (Linux format).
+        let input = "Server:\t8.8.8.8\nAddress:\t8.8.8.8#53\n\nNon-authoritative answer:\nwww.example.com\tcanonical name = example.com.\nName:\texample.com\nAddress: 93.184.216.34\n";
+        let result = try_parse_nslookup_structured(input);
+        assert!(
+            result.is_some(),
+            "Expected Tier 1 parse for CNAME record output"
+        );
+        let result = result.unwrap();
+        let cname_items: Vec<_> = result.items.iter().filter(|i| i.label == "CNAME").collect();
+        assert!(
+            !cname_items.is_empty(),
+            "Expected at least one CNAME item, got items: {:?}",
+            result.items
+        );
+        assert!(
+            cname_items.iter().any(|i| i.value.contains("example.com")),
+            "Expected 'example.com' in CNAME value, got: {:?}",
+            cname_items
+        );
+    }
+
+    #[test]
+    fn test_nslookup_tier1_txt_record() {
+        // Synthetic nslookup TXT output (Linux format).
+        let input = "Server:\t8.8.8.8\nAddress:\t8.8.8.8#53\n\nNon-authoritative answer:\nexample.com\ttext = \"v=spf1 include:_spf.example.com ~all\"\n";
+        let result = try_parse_nslookup_structured(input);
+        assert!(
+            result.is_some(),
+            "Expected Tier 1 parse for TXT record output"
+        );
+        let result = result.unwrap();
+        let txt_items: Vec<_> = result.items.iter().filter(|i| i.label == "TXT").collect();
+        assert!(
+            !txt_items.is_empty(),
+            "Expected at least one TXT item, got items: {:?}",
+            result.items
+        );
+        assert!(
+            txt_items.iter().any(|i| i.value.contains("v=spf1")),
+            "Expected SPF content in TXT value, got: {:?}",
+            txt_items
+        );
+    }
+
+    #[test]
+    fn test_try_parse_nslookup_record_line_mx() {
+        let item =
+            try_parse_nslookup_record_line("example.com\tmail exchanger = 10 mail.example.com.");
+        assert!(item.is_some());
+        let item = item.unwrap();
+        assert_eq!(item.label, "MX");
+        assert!(
+            item.value.contains("mail.example.com"),
+            "got: {}",
+            item.value
+        );
+        assert!(item.value.contains("priority 10"), "got: {}", item.value);
+    }
+
+    #[test]
+    fn test_try_parse_nslookup_record_line_cname() {
+        let item = try_parse_nslookup_record_line("www.example.com\tcanonical name = example.com.");
+        assert!(item.is_some());
+        let item = item.unwrap();
+        assert_eq!(item.label, "CNAME");
+        assert_eq!(item.value, "example.com");
+    }
+
+    #[test]
+    fn test_try_parse_nslookup_record_line_txt() {
+        let item = try_parse_nslookup_record_line(r#"example.com	text = "v=spf1 ~all""#);
+        assert!(item.is_some());
+        let item = item.unwrap();
+        assert_eq!(item.label, "TXT");
+        assert_eq!(item.value, "v=spf1 ~all");
+    }
+
+    #[test]
+    fn test_try_parse_nslookup_record_line_no_match() {
+        // Non-answer lines must return None
+        assert!(try_parse_nslookup_record_line("").is_none());
+        assert!(try_parse_nslookup_record_line("Server:\t8.8.8.8").is_none());
+        assert!(try_parse_nslookup_record_line("Non-authoritative answer:").is_none());
     }
 
     // ========================================================================
