@@ -9,6 +9,13 @@ use tempfile::TempDir;
 
 use super::run;
 
+/// Stub analytics config for tests — analytics disabled, no cost override.
+const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
+    enabled: false,
+    input_cost_per_mtok: None,
+    session_id: None,
+};
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -53,7 +60,7 @@ fn test_index_build_succeeds_with_source_files() {
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
 
-    let result = run(&index_args(project.path(), cache.path())).unwrap();
+    let result = run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
 
     assert_eq!(result, ExitCode::SUCCESS, "index build should succeed");
 }
@@ -63,7 +70,7 @@ fn test_index_writes_skidx_and_skpost() {
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
 
-    run(&index_args(project.path(), cache.path())).unwrap();
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
 
     assert!(
         find_file_with_ext(cache.path(), "skidx"),
@@ -80,7 +87,7 @@ fn test_index_writes_manifest_sidecar() {
     let project = make_project();
     let cache = tempfile::tempdir().unwrap();
 
-    run(&index_args(project.path(), cache.path())).unwrap();
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
 
     assert!(
         find_file_with_ext(cache.path(), "skfiles"),
@@ -100,7 +107,7 @@ fn test_index_empty_directory_returns_success() {
 
     let cache = tempfile::tempdir().unwrap();
 
-    let result = run(&index_args(root, cache.path())).unwrap();
+    let result = run(&index_args(root, cache.path()), &TEST_ANALYTICS).unwrap();
 
     assert_eq!(result, ExitCode::SUCCESS, "empty dir should still succeed");
 }
@@ -117,8 +124,8 @@ fn test_index_incremental_second_build_succeeds() {
     let cache = tempfile::tempdir().unwrap();
     let args = index_args(project.path(), cache.path());
 
-    let r1 = run(&args).unwrap();
-    let r2 = run(&args).unwrap();
+    let r1 = run(&args, &TEST_ANALYTICS).unwrap();
+    let r2 = run(&args, &TEST_ANALYTICS).unwrap();
 
     assert_eq!(r1, ExitCode::SUCCESS);
     assert_eq!(r2, ExitCode::SUCCESS);
@@ -136,14 +143,14 @@ fn test_index_incremental_cache_hits_verified_via_manifest() {
     let args = index_args(project.path(), cache.path());
 
     // First build — cold start, no cache.
-    let r1 = run(&args).unwrap();
+    let r1 = run(&args, &TEST_ANALYTICS).unwrap();
     assert_eq!(r1, ExitCode::SUCCESS, "first build should succeed");
 
     let manifest1 =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     // Second build — should hit the manifest cache for all unchanged files.
-    let r2 = run(&args).unwrap();
+    let r2 = run(&args, &TEST_ANALYTICS).unwrap();
     assert_eq!(r2, ExitCode::SUCCESS, "second build should succeed");
 
     let manifest2 =
@@ -194,7 +201,7 @@ fn test_index_incremental_modified_file_reindexed() {
     let args = index_args(project.path(), cache.path());
 
     // First build — record the SHA for src/main.rs before modification.
-    run(&args).unwrap();
+    run(&args, &TEST_ANALYTICS).unwrap();
     let manifest1 =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
     let sha_before = manifest1
@@ -211,7 +218,7 @@ fn test_index_incremental_modified_file_reindexed() {
     .unwrap();
 
     // Second build — should detect the change and re-classify.
-    let r2 = run(&args).unwrap();
+    let r2 = run(&args, &TEST_ANALYTICS).unwrap();
     assert_eq!(
         r2,
         ExitCode::SUCCESS,
@@ -243,7 +250,7 @@ fn test_index_force_flag_ignores_manifest() {
     let args = index_args(project.path(), cache.path());
 
     // First build to populate the manifest (creates cache entries for all files).
-    run(&args).unwrap();
+    run(&args, &TEST_ANALYTICS).unwrap();
 
     // Force rebuild via build_index directly so we can inspect IndexResult.
     // cache_hits must be zero — --force means the manifest is intentionally ignored.
@@ -320,7 +327,7 @@ fn test_index_mixed_languages() {
     .unwrap();
 
     let cache = tempfile::tempdir().unwrap();
-    let result = run(&index_args(root, cache.path())).unwrap();
+    let result = run(&index_args(root, cache.path()), &TEST_ANALYTICS).unwrap();
 
     assert_eq!(
         result,
@@ -356,7 +363,7 @@ fn test_index_max_files_limits_manifest_entries() {
     let mut args = index_args(root, cache.path());
     args.push("--max-files=2".to_string());
 
-    let result = run(&args).unwrap();
+    let result = run(&args, &TEST_ANALYTICS).unwrap();
     assert_eq!(result, ExitCode::SUCCESS, "--max-files=2 build should succeed");
 
     let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
@@ -373,18 +380,56 @@ fn test_index_max_files_limits_manifest_entries() {
 }
 
 // ============================================================================
+// Error propagation — unreadable / nonexistent root
+// ============================================================================
+
+#[test]
+fn test_index_unreadable_root_returns_error_or_empty() {
+    // Pass a nonexistent path as the project root. build_index must either:
+    //   (a) return Err (I/O failure propagated from walk_and_read), or
+    //   (b) succeed with file_count == 0 (walker found no entries).
+    // Either outcome is acceptable — what must NOT happen is a successful build
+    // that silently claims to have indexed files from a path that does not exist.
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let nonexistent = std::path::PathBuf::from("/nonexistent/path/that/cannot/exist/for/tests");
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: nonexistent,
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    match build_index(&config) {
+        Err(_) => {
+            // Acceptable: I/O error propagated up from walk or cache-dir creation.
+        }
+        Ok(result) => {
+            assert_eq!(
+                result.file_count, 0,
+                "build_index on a nonexistent root must index 0 files, got {}",
+                result.file_count
+            );
+        }
+    }
+}
+
+// ============================================================================
 // Help flag
 // ============================================================================
 
 #[test]
 fn test_index_help_returns_success() {
-    let result = run(&["--help".to_string()]).unwrap();
+    let result = run(&["--help".to_string()], &TEST_ANALYTICS).unwrap();
     assert_eq!(result, ExitCode::SUCCESS);
 }
 
 #[test]
 fn test_index_short_help_returns_success() {
-    let result = run(&["-h".to_string()]).unwrap();
+    let result = run(&["-h".to_string()], &TEST_ANALYTICS).unwrap();
     assert_eq!(result, ExitCode::SUCCESS);
 }
 
@@ -395,7 +440,7 @@ fn test_index_short_help_returns_success() {
 #[test]
 fn test_index_max_files_zero_is_rejected() {
     // --max-files=0 must produce an error, not a silently empty index.
-    let result = run(&["--max-files=0".to_string()]);
+    let result = run(&["--max-files=0".to_string()], &TEST_ANALYTICS);
     assert!(result.is_err(), "--max-files=0 should return an error");
     let msg = format!("{}", result.unwrap_err());
     assert!(
@@ -406,7 +451,7 @@ fn test_index_max_files_zero_is_rejected() {
 
 #[test]
 fn test_index_unknown_flag_is_rejected() {
-    let result = run(&["--unknown-flag".to_string()]);
+    let result = run(&["--unknown-flag".to_string()], &TEST_ANALYTICS);
     assert!(result.is_err(), "unknown flags should return an error");
 }
 

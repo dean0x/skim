@@ -201,6 +201,7 @@ fn test_walk_sha256_is_deterministic() {
     for (f1, f2) in files1.iter().zip(files2.iter()) {
         assert_eq!(f1.rel_path, f2.rel_path);
         assert_eq!(f1.sha256, f2.sha256);
+        assert_eq!(f1.lang, f2.lang, "lang detection must be deterministic for {}", f1.rel_path.display());
     }
 }
 
@@ -345,12 +346,13 @@ fn test_walk_too_large_skip_reason_contains_path_and_size() {
             panic!("skipped list should contain TooLarge for over_limit.rs, got: {skipped:?}")
         });
 
-    if let super::super::types::SkipReason::TooLarge { size, .. } = too_large_entry {
-        assert!(
-            *size > 5 * 1024 * 1024,
-            "TooLarge size should exceed 5 MiB, got {size}"
-        );
-    }
+    let super::super::types::SkipReason::TooLarge { size, .. } = too_large_entry else {
+        unreachable!("find() guarantees TooLarge variant")
+    };
+    assert!(
+        *size > 5 * 1024 * 1024,
+        "TooLarge size should exceed 5 MiB, got {size}"
+    );
 }
 
 #[test]
@@ -376,7 +378,7 @@ fn test_walk_skips_minified_js_file() {
     .unwrap();
 
     let root_canonical = root.canonicalize().unwrap();
-    let (files, _skipped) = walk_and_read(&root_canonical, 50_000).unwrap();
+    let (files, skipped) = walk_and_read(&root_canonical, 50_000).unwrap();
     let paths: Vec<PathBuf> = files.iter().map(|f| f.rel_path.clone()).collect();
 
     assert!(
@@ -386,6 +388,19 @@ fn test_walk_skips_minified_js_file() {
     assert!(
         paths.iter().any(|p| p.ends_with("normal.js")),
         "normal.js should be included, paths: {paths:?}"
+    );
+
+    // Confirm the skip was recorded with the correct reason.
+    let has_minified = skipped.iter().any(|r| {
+        matches!(
+            r,
+            super::super::types::SkipReason::Minified(path)
+            if path.ends_with("bundle.js")
+        )
+    });
+    assert!(
+        has_minified,
+        "skipped list should contain Minified for bundle.js, got: {skipped:?}"
     );
 }
 
