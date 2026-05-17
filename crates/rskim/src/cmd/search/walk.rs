@@ -16,8 +16,10 @@
 //! | Cap reached | `max_files` exceeded |
 
 use std::fs;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use ignore::WalkBuilder;
 use rskim_core::Language;
 use sha2::{Digest, Sha256};
@@ -37,6 +39,10 @@ const MINIFY_PROBE_BYTES: usize = 8192;
 /// Average line length (bytes) above which a file is considered minified.
 const MINIFY_AVG_LINE_BYTES: usize = 500;
 
+/// Maximum number of ancestors to traverse when looking for a `.git` root.
+/// 256 ancestors is far beyond any real filesystem depth.
+const MAX_ANCESTORS: usize = 256;
+
 // ============================================================================
 // Project root discovery
 // ============================================================================
@@ -48,12 +54,14 @@ const MINIFY_AVG_LINE_BYTES: usize = 500;
 ///
 /// # Errors
 ///
-/// Returns [`std::io::Error`] if `start` cannot be canonicalized.
-pub(super) fn discover_project_root(start: &Path) -> std::io::Result<PathBuf> {
-    let canonical = start.canonicalize()?;
+/// Returns `Err` if `start` cannot be canonicalized.
+pub(super) fn discover_project_root(start: &Path) -> anyhow::Result<PathBuf> {
+    let canonical = start
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize path: {}", start.display()))?;
 
     let mut current = canonical.as_path();
-    loop {
+    for _ in 0..MAX_ANCESTORS {
         if current.join(".git").exists() {
             return Ok(current.to_path_buf());
         }
@@ -83,13 +91,12 @@ pub(super) fn discover_project_root(start: &Path) -> std::io::Result<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns [`std::io::Error`] only for fatal walker setup errors. Per-file
-/// read errors are collected as [`SkipReason::ReadError`] and returned in the
-/// skipped list.
+/// Returns `Err` only for fatal walker setup errors. Per-file read errors are
+/// collected as [`SkipReason::ReadError`] and returned in the skipped list.
 pub(super) fn walk_and_read(
     root: &Path,
     max_files: usize,
-) -> std::io::Result<(Vec<ReadFile>, Vec<SkipReason>)> {
+) -> anyhow::Result<(Vec<ReadFile>, Vec<SkipReason>)> {
     let mut files: Vec<ReadFile> = Vec::new();
     let mut skipped: Vec<SkipReason> = Vec::new();
 
@@ -115,8 +122,14 @@ pub(super) fn walk_and_read(
         let entry = match entry_result {
             Ok(e) => e,
             Err(err) => {
+                // Extract the real path from the ignore::Error::WithPath
+                // variant instead of parsing the error message string.
+                let path = match &err {
+                    ignore::Error::WithPath { path, .. } => path.clone(),
+                    _ => PathBuf::new(),
+                };
                 skipped.push(SkipReason::ReadError {
-                    path: PathBuf::from(err.to_string()),
+                    path,
                     error: err.to_string(),
                 });
                 continue;
@@ -143,30 +156,44 @@ pub(super) fn walk_and_read(
             }
         };
 
-        // --- File too large ---
-        let metadata = match fs::metadata(abs_path) {
-            Ok(m) => m,
-            Err(e) => {
-                skipped.push(SkipReason::ReadError {
+        // --- Fast size pre-screen using DirEntry cached metadata (issue #2) ---
+        // entry.metadata() avoids an extra stat(2) syscall on 50 K-file repos.
+        // If it fails we fall through and let the open() path handle the error.
+        if let Ok(meta) = entry.metadata() {
+            let size = meta.len();
+            if size > MAX_FILE_BYTES {
+                skipped.push(SkipReason::TooLarge {
                     path: abs_path.to_path_buf(),
-                    error: e.to_string(),
+                    size,
                 });
                 continue;
             }
-        };
-        if metadata.len() > MAX_FILE_BYTES {
-            skipped.push(SkipReason::TooLarge {
-                path: abs_path.to_path_buf(),
-                size: metadata.len(),
-            });
-            continue;
         }
 
-        // --- Read content (catches non-UTF8) ---
-        let content = match fs::read_to_string(abs_path) {
+        // --- Open, size-check on handle, read (fixes TOCTOU race, issue #1) ---
+        // Open the file first so that the metadata check and the read operate
+        // on the same inode.  Pre-allocate the buffer to the known size so
+        // read_to_string does at most one allocation.
+        let content = match open_and_read(abs_path) {
             Ok(c) => c,
-            Err(_) => {
-                skipped.push(SkipReason::NonUtf8(abs_path.to_path_buf()));
+            Err(e) => {
+                // Distinguish non-UTF-8 content from other I/O errors (issue #3).
+                if e.kind() == io::ErrorKind::InvalidData {
+                    skipped.push(SkipReason::NonUtf8(abs_path.to_path_buf()));
+                } else if e.kind() == io::ErrorKind::Other
+                    && e.to_string().contains("too large")
+                {
+                    // File grew past the limit between the pre-screen and open.
+                    skipped.push(SkipReason::TooLarge {
+                        path: abs_path.to_path_buf(),
+                        size: MAX_FILE_BYTES + 1,
+                    });
+                } else {
+                    skipped.push(SkipReason::ReadError {
+                        path: abs_path.to_path_buf(),
+                        error: e.to_string(),
+                    });
+                }
                 continue;
             }
         };
@@ -200,6 +227,32 @@ pub(super) fn walk_and_read(
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+/// Open `path`, verify its on-disk size via the file handle (not a separate
+/// `stat(2)` call), then read it into a `String`.
+///
+/// Using the file handle for both the metadata check and the read prevents the
+/// TOCTOU race where a file could be swapped between the size check and the
+/// actual read.
+///
+/// # Errors
+///
+/// - `ErrorKind::InvalidData` — file content is not valid UTF-8
+/// - `ErrorKind::Other` with message "too large" — file exceeds [`MAX_FILE_BYTES`]
+/// - Other `io::Error` kinds — permission denied, I/O error, etc.
+fn open_and_read(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let size = meta.len();
+    if size > MAX_FILE_BYTES {
+        return Err(io::Error::other("too large"));
+    }
+    // Pre-size the buffer to avoid reallocation; +1 so read_to_string can
+    // detect EOF without an extra allocation.
+    let mut content = String::with_capacity((size as usize).saturating_add(1));
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
 
 /// Returns `true` if `lang` uses tree-sitter for parsing.
 ///

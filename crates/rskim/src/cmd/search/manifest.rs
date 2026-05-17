@@ -27,9 +27,10 @@
 //! is discarded (returns an empty manifest).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::{BufRead, BufReader, BufWriter, Write as IoWrite};
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -106,7 +107,7 @@ impl FileManifest {
     /// # Errors
     ///
     /// Only returns `Err` for unexpected I/O errors that aren't "file not found".
-    pub(super) fn load(project_root: PathBuf, cache_dir: PathBuf) -> std::io::Result<Self> {
+    pub(super) fn load(project_root: PathBuf, cache_dir: PathBuf) -> anyhow::Result<Self> {
         let manifest_path = cache_dir.join(Self::MANIFEST_FILENAME);
 
         let file = match std::fs::File::open(&manifest_path) {
@@ -115,7 +116,11 @@ impl FileManifest {
                 // Cold start — no manifest yet.
                 return Ok(Self::new(project_root, cache_dir));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to open manifest: {}", manifest_path.display())
+                });
+            }
         };
 
         let reader = BufReader::new(file);
@@ -150,7 +155,7 @@ impl FileManifest {
         }
 
         // --- Parse entry lines ---
-        let mut entries = HashMap::new();
+        let mut entries = HashMap::with_capacity(1024);
         for line_result in lines {
             let line = match line_result {
                 Ok(l) if l.trim().is_empty() => continue,
@@ -213,19 +218,24 @@ impl FileManifest {
             root: canonical_root.to_string_lossy().into_owned(),
         };
 
-        let mut tmp = NamedTempFile::new_in(&self.cache_dir)?;
+        let tmp = NamedTempFile::new_in(&self.cache_dir)?;
+        let mut buf = BufWriter::new(tmp);
 
         // Write header
         let header_json = serde_json::to_string(&header)?;
-        writeln!(tmp, "{header_json}")?;
+        writeln!(buf, "{header_json}")?;
 
         // Write entries (sorted for deterministic output)
         let mut paths: Vec<&str> = self.entries.keys().map(String::as_str).collect();
         paths.sort_unstable();
         for path in paths {
             let entry_json = serde_json::to_string(&self.entries[path])?;
-            writeln!(tmp, "{entry_json}")?;
+            writeln!(buf, "{entry_json}")?;
         }
+
+        // Flush the buffer before persisting so all bytes reach the temp file.
+        buf.flush()?;
+        let tmp = buf.into_inner().context("failed to flush manifest buffer")?;
 
         let manifest_path = self.cache_dir.join(Self::MANIFEST_FILENAME);
         tmp.persist(&manifest_path)
