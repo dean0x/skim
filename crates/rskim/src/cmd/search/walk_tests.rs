@@ -118,18 +118,44 @@ fn test_walk_finds_rust_and_python_files() {
 
 #[test]
 fn test_walk_skips_non_utf8_files() {
-    let dir = make_sample_tree();
-    let root = dir.path().canonicalize().unwrap();
+    // Use a supported extension (.rs) so that Language::from_path returns Some,
+    // which lets classify_entry proceed past the unsupported-language gate and
+    // exercise the actual non-UTF-8 detection code path (open_and_read returns
+    // ReadOutcome::NonUtf8 → SkipReason::NonUtf8).  A .bin file would be
+    // rejected earlier by the unsupported-language check, never reaching the
+    // UTF-8 read; that code path is already covered by test_walk_finds_rust_and_python_files.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Valid UTF-8 Rust source — should be accepted.
+    fs::write(root.join("valid.rs"), "fn main() {}\n").unwrap();
+    // Invalid UTF-8 content with a supported .rs extension — must be skipped
+    // via the non-UTF-8 code path, not the unsupported-language gate.
+    fs::write(root.join("invalid_utf8.rs"), b"\xFF\xFE not valid utf8 \x80").unwrap();
 
-    let (files, _skipped) = walk_and_read(&root, 50_000).unwrap();
+    let root = root.canonicalize().unwrap();
+    let (files, skipped) = walk_and_read(&root, 50_000).unwrap();
     let paths: Vec<PathBuf> = files.iter().map(|f| f.rel_path.clone()).collect();
 
-    // binary.bin must not appear
     assert!(
-        !paths
-            .iter()
-            .any(|p| p.extension().is_some_and(|e| e == "bin")),
-        "binary.bin should be skipped, paths: {paths:?}"
+        !paths.iter().any(|p| p.ends_with("invalid_utf8.rs")),
+        "invalid_utf8.rs should be skipped, paths: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("valid.rs")),
+        "valid.rs should be accepted, paths: {paths:?}"
+    );
+    // Confirm the skip was recorded with the correct reason.
+    let has_non_utf8 = skipped.iter().any(|r| {
+        matches!(
+            r,
+            super::super::types::SkipReason::NonUtf8(path)
+            if path.ends_with("invalid_utf8.rs")
+        )
+    });
+    assert!(
+        has_non_utf8,
+        "skipped list should contain NonUtf8 for invalid_utf8.rs, got: {skipped:?}"
     );
 }
 
@@ -161,10 +187,16 @@ fn test_walk_sha256_is_deterministic() {
     let dir = make_sample_tree();
     let root = dir.path().canonicalize().unwrap();
 
-    let (files1, _) = walk_and_read(&root, 50_000).unwrap();
-    let (files2, _) = walk_and_read(&root, 50_000).unwrap();
+    let (mut files1, _) = walk_and_read(&root, 50_000).unwrap();
+    let (mut files2, _) = walk_and_read(&root, 50_000).unwrap();
 
-    // Same root → same results in the same order
+    // Sort by rel_path before comparing so the assertion is order-independent.
+    // walk_and_read documents lexicographic ordering via sort_by_file_path, but
+    // sorting here makes the test robust if that contract ever changes: a broken
+    // sort would surface as a mismatched SHA rather than a flaky zip mismatch.
+    files1.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    files2.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
     assert_eq!(files1.len(), files2.len());
     for (f1, f2) in files1.iter().zip(files2.iter()) {
         assert_eq!(f1.rel_path, f2.rel_path);
