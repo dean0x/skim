@@ -16,7 +16,7 @@
 //! | Cap reached | `max_files` exceeded |
 
 use std::fs;
-use std::io::{self, Read as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -33,6 +33,13 @@ use super::types::{ReadFile, SkipReason};
 /// Maximum file size accepted for indexing (5 MiB).
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
+// Compile-time guard: MAX_FILE_BYTES must fit in a usize so the pre-allocation
+// in open_and_read (`size as usize`) is sound on every supported platform.
+const _: () = assert!(
+    MAX_FILE_BYTES <= usize::MAX as u64,
+    "MAX_FILE_BYTES exceeds usize::MAX — update the cast in open_and_read"
+);
+
 /// Number of bytes inspected when checking for minified files.
 const MINIFY_PROBE_BYTES: usize = 8192;
 
@@ -42,6 +49,26 @@ const MINIFY_AVG_LINE_BYTES: usize = 500;
 /// Maximum number of ancestors to traverse when looking for a `.git` root.
 /// 256 ancestors is far beyond any real filesystem depth.
 const MAX_ANCESTORS: usize = 256;
+
+// ============================================================================
+// Typed read outcome
+// ============================================================================
+
+/// Strongly-typed result of [`open_and_read`].
+///
+/// Using an enum instead of `io::Error` avoids string-matching on error messages
+/// to distinguish the "too large" case from genuine I/O failures.  The caller
+/// matches on variants and never inspects error message text.
+enum ReadOutcome {
+    /// File read successfully.
+    Ok(String),
+    /// File content is not valid UTF-8.
+    NonUtf8,
+    /// File size exceeds [`MAX_FILE_BYTES`] (checked via handle metadata).
+    TooLarge,
+    /// Any other I/O error (permission denied, broken pipe, etc.).
+    Io(std::io::Error),
+}
 
 // ============================================================================
 // Project root discovery
@@ -97,8 +124,11 @@ pub(super) fn walk_and_read(
     root: &Path,
     max_files: usize,
 ) -> anyhow::Result<(Vec<ReadFile>, Vec<SkipReason>)> {
-    let mut files: Vec<ReadFile> = Vec::new();
-    let mut skipped: Vec<SkipReason> = Vec::new();
+    // Pre-allocate based on max_files (capped at 4096) to avoid repeated
+    // reallocation on large repos.  Skipped entries are typically far fewer
+    // than accepted files, so 256 is a conservative but sufficient default.
+    let mut files: Vec<ReadFile> = Vec::with_capacity(max_files.min(4096));
+    let mut skipped: Vec<SkipReason> = Vec::with_capacity(256);
 
     let mut builder = WalkBuilder::new(root);
     builder
@@ -175,25 +205,24 @@ pub(super) fn walk_and_read(
         // on the same inode.  Pre-allocate the buffer to the known size so
         // read_to_string does at most one allocation.
         let content = match open_and_read(abs_path) {
-            Ok(c) => c,
-            Err(e) => {
-                // Distinguish non-UTF-8 content from other I/O errors (issue #3).
-                if e.kind() == io::ErrorKind::InvalidData {
-                    skipped.push(SkipReason::NonUtf8(abs_path.to_path_buf()));
-                } else if e.kind() == io::ErrorKind::Other
-                    && e.to_string().contains("too large")
-                {
-                    // File grew past the limit between the pre-screen and open.
-                    skipped.push(SkipReason::TooLarge {
-                        path: abs_path.to_path_buf(),
-                        size: MAX_FILE_BYTES + 1,
-                    });
-                } else {
-                    skipped.push(SkipReason::ReadError {
-                        path: abs_path.to_path_buf(),
-                        error: e.to_string(),
-                    });
-                }
+            ReadOutcome::Ok(c) => c,
+            ReadOutcome::NonUtf8 => {
+                skipped.push(SkipReason::NonUtf8(abs_path.to_path_buf()));
+                continue;
+            }
+            ReadOutcome::TooLarge => {
+                // File grew past the limit between the pre-screen and open.
+                skipped.push(SkipReason::TooLarge {
+                    path: abs_path.to_path_buf(),
+                    size: MAX_FILE_BYTES + 1,
+                });
+                continue;
+            }
+            ReadOutcome::Io(e) => {
+                skipped.push(SkipReason::ReadError {
+                    path: abs_path.to_path_buf(),
+                    error: e.to_string(),
+                });
                 continue;
             }
         };
@@ -235,23 +264,32 @@ pub(super) fn walk_and_read(
 /// TOCTOU race where a file could be swapped between the size check and the
 /// actual read.
 ///
-/// # Errors
-///
-/// - `ErrorKind::InvalidData` — file content is not valid UTF-8
-/// - `ErrorKind::Other` with message "too large" — file exceeds [`MAX_FILE_BYTES`]
-/// - Other `io::Error` kinds — permission denied, I/O error, etc.
-fn open_and_read(path: &Path) -> io::Result<String> {
-    let mut file = fs::File::open(path)?;
-    let meta = file.metadata()?;
+/// Returns a [`ReadOutcome`] variant rather than an `io::Error` so that the
+/// caller can match on typed cases without inspecting error message text.
+fn open_and_read(path: &Path) -> ReadOutcome {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return ReadOutcome::Io(e),
+    };
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => return ReadOutcome::Io(e),
+    };
     let size = meta.len();
     if size > MAX_FILE_BYTES {
-        return Err(io::Error::other("too large"));
+        return ReadOutcome::TooLarge;
     }
     // Pre-size the buffer to avoid reallocation; +1 so read_to_string can
     // detect EOF without an extra allocation.
+    // Safety: MAX_FILE_BYTES <= usize::MAX is guaranteed by the compile-time
+    // assertion above, so this cast is sound.
     let mut content = String::with_capacity((size as usize).saturating_add(1));
-    file.read_to_string(&mut content)?;
-    Ok(content)
+    match file.read_to_string(&mut content) {
+        Ok(_) => ReadOutcome::Ok(content),
+        // read_to_string returns InvalidData for non-UTF-8 content.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => ReadOutcome::NonUtf8,
+        Err(e) => ReadOutcome::Io(e),
+    }
 }
 
 /// Returns `true` if `lang` uses tree-sitter for parsing.
@@ -279,15 +317,19 @@ fn is_minified(content: &str) -> bool {
 }
 
 /// Compute the SHA-256 of `data` and return it as a 64-character lowercase hex string.
+///
+/// Uses a const nibble lookup table instead of `write!` format calls to avoid
+/// per-byte `fmt::Write` overhead on the hot path (called once per indexed file).
 pub(super) fn sha256_hex(data: &[u8]) -> String {
-    use std::fmt::Write;
+    const NIBBLES: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(data);
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        // write! to a String is infallible — unwrap is safe here.
-        write!(hex, "{byte:02x}").unwrap();
+    let mut hex = vec![0u8; 64];
+    for (i, byte) in digest.iter().enumerate() {
+        hex[i * 2] = NIBBLES[(byte >> 4) as usize];
+        hex[i * 2 + 1] = NIBBLES[(byte & 0x0f) as usize];
     }
-    hex
+    // SAFETY: NIBBLES contains only ASCII hex characters, so hex is always valid UTF-8.
+    unsafe { String::from_utf8_unchecked(hex) }
 }
 
 // ============================================================================
