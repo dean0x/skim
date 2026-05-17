@@ -18,9 +18,12 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Context as _;
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use rskim_core::Language;
 use sha2::{Digest, Sha256};
 
@@ -189,7 +192,9 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     };
 
     // --- Minification check (tree-sitter languages only) ---
-    if is_tree_sitter_language(lang) && is_minified(&content) {
+    // Serde-based languages (JSON, YAML, TOML) produce long lines by design;
+    // skip the minification check for them.
+    if !lang.is_serde_based() && is_minified(&content) {
         return EntryOutcome::Skip(SkipReason::Minified(abs_path.to_path_buf()));
     }
 
@@ -216,7 +221,8 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
 ///
 /// # Ordering
 ///
-/// Files are returned in lexicographic path order (from `sort_by_file_path`).
+/// Files are returned in lexicographic path order (sorted after parallel
+/// collection for deterministic output).
 ///
 /// # Errors
 ///
@@ -226,11 +232,11 @@ pub(super) fn walk_and_read(
     root: &Path,
     max_files: usize,
 ) -> anyhow::Result<(Vec<ReadFile>, Vec<SkipReason>)> {
-    // Pre-allocate based on max_files (capped at 4096) to avoid repeated
-    // reallocation on large repos.  Skipped entries are typically far fewer
-    // than accepted files, so 256 is a conservative but sufficient default.
-    let mut files: Vec<ReadFile> = Vec::with_capacity(max_files.min(4096));
-    let mut skipped: Vec<SkipReason> = Vec::with_capacity(256);
+    let files = Arc::new(Mutex::new(Vec::with_capacity(max_files.min(4096))));
+    let skipped = Arc::new(Mutex::new(Vec::<SkipReason>::with_capacity(256)));
+    let file_count = Arc::new(AtomicUsize::new(0));
+    let cap_reached = Arc::new(AtomicBool::new(false));
+    let root_buf = root.to_path_buf();
 
     let mut builder = WalkBuilder::new(root);
     builder
@@ -241,45 +247,72 @@ pub(super) fn walk_and_read(
         .ignore(true)
         .parents(true)
         .require_git(false)
-        .follow_links(false)
-        .sort_by_file_path(|a, b| a.cmp(b));
+        .follow_links(false);
 
-    for entry_result in builder.build() {
-        // Stop once we've hit the cap.
-        if files.len() >= max_files {
-            skipped.push(SkipReason::CapReached);
-            break;
-        }
-
-        let entry = match entry_result {
-            Ok(e) => e,
-            Err(err) => {
-                // Extract the real path from the ignore::Error::WithPath
-                // variant instead of parsing the error message string.
-                let path = match &err {
-                    ignore::Error::WithPath { path, .. } => path.clone(),
-                    _ => PathBuf::new(),
-                };
-                if skipped.len() < MAX_SKIP_REASONS {
-                    skipped.push(SkipReason::ReadError {
-                        path,
-                        error: err.to_string(),
-                    });
+    builder.build_parallel().run(|| {
+        let files = Arc::clone(&files);
+        let skipped = Arc::clone(&skipped);
+        let file_count = Arc::clone(&file_count);
+        let cap_reached = Arc::clone(&cap_reached);
+        let root = root_buf.clone();
+        Box::new(move |entry_result| {
+            if file_count.load(Ordering::Relaxed) >= max_files {
+                if !cap_reached.swap(true, Ordering::Relaxed) {
+                    let mut s = skipped.lock().unwrap();
+                    if s.len() < MAX_SKIP_REASONS {
+                        s.push(SkipReason::CapReached);
+                    }
                 }
-                continue;
+                return WalkState::Quit;
             }
-        };
-
-        match classify_entry(&entry, root) {
-            EntryOutcome::Accept(file) => files.push(file),
-            EntryOutcome::Skip(reason) => {
-                if skipped.len() < MAX_SKIP_REASONS {
-                    skipped.push(reason);
+            match entry_result {
+                Ok(entry) => match classify_entry(&entry, &root) {
+                    EntryOutcome::Accept(file) => {
+                        file_count.fetch_add(1, Ordering::Relaxed);
+                        files.lock().unwrap().push(file);
+                    }
+                    EntryOutcome::Skip(reason) => {
+                        let mut s = skipped.lock().unwrap();
+                        if s.len() < MAX_SKIP_REASONS {
+                            s.push(reason);
+                        }
+                    }
+                    EntryOutcome::Transparent => {}
+                },
+                Err(err) => {
+                    let path = match &err {
+                        ignore::Error::WithPath { path, .. } => path.clone(),
+                        _ => PathBuf::new(),
+                    };
+                    let mut s = skipped.lock().unwrap();
+                    if s.len() < MAX_SKIP_REASONS {
+                        s.push(SkipReason::ReadError {
+                            path,
+                            error: err.to_string(),
+                        });
+                    }
                 }
             }
-            EntryOutcome::Transparent => {}
-        }
-    }
+            WalkState::Continue
+        })
+    });
+
+    let mut files = Arc::try_unwrap(files)
+        .expect("all parallel walker threads completed")
+        .into_inner()
+        .expect("no thread panicked while holding lock");
+    let skipped = Arc::try_unwrap(skipped)
+        .expect("all parallel walker threads completed")
+        .into_inner()
+        .expect("no thread panicked while holding lock");
+
+    // Parallel threads may over-collect beyond max_files due to TOCTOU on the
+    // atomic counter (multiple threads may pass the cap check before any of them
+    // increments it).
+    files.truncate(max_files);
+
+    // Sort after parallel collection for deterministic output.
+    files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     Ok((files, skipped))
 }
@@ -321,14 +354,6 @@ fn open_and_read(path: &Path) -> ReadOutcome {
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => ReadOutcome::NonUtf8,
         Err(e) => ReadOutcome::Io(e),
     }
-}
-
-/// Returns `true` if `lang` uses tree-sitter for parsing.
-///
-/// Non-tree-sitter languages (JSON, YAML, TOML) are excluded from the minify
-/// check because their format makes long lines normal (e.g. minified JSON).
-fn is_tree_sitter_language(lang: Language) -> bool {
-    !lang.is_serde_based()
 }
 
 /// Returns `true` if the content appears minified.
