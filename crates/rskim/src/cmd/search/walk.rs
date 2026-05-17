@@ -228,10 +228,14 @@ fn is_minified(content: &str) -> bool {
 
 /// Compute the SHA-256 of `data` and return it as a 64-character lowercase hex string.
 pub(super) fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        // write! to a String is infallible — unwrap is safe here.
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    hex
 }
 
 // ============================================================================

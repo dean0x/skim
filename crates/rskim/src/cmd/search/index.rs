@@ -36,8 +36,8 @@ use super::walk::{discover_project_root, walk_and_read};
 /// Field map type: byte ranges mapped to their AST-derived search fields.
 type FieldMap = Vec<(std::ops::Range<usize>, SearchField)>;
 
-/// Classified file: (index, field_map, cache_hit).
-type ClassifiedFile = (usize, FieldMap, bool);
+/// Classified file: field_map and whether it was a manifest cache hit.
+type ClassifiedFile = (FieldMap, bool);
 
 // ============================================================================
 // Public entry point
@@ -92,36 +92,15 @@ fn parse_args(args: &[String]) -> anyhow::Result<IndexConfig> {
 
         if arg == "--force" {
             force = true;
-        } else if let Some(val) = arg.strip_prefix("--root=") {
+        } else if let Some(val) = next_value(args, &mut i, "--root")? {
             root = Some(PathBuf::from(val));
-        } else if arg == "--root" {
-            i += 1;
-            let val = args
-                .get(i)
-                .ok_or_else(|| anyhow::anyhow!("--root requires a value"))?;
-            root = Some(PathBuf::from(val));
-        } else if let Some(val) = arg.strip_prefix("--max-files=") {
+        } else if let Some(val) = next_value(args, &mut i, "--max-files")? {
             max_files = Some(
                 val.parse::<usize>()
                     .map_err(|_| anyhow::anyhow!("--max-files requires a positive integer"))?,
             );
-        } else if arg == "--max-files" {
-            i += 1;
-            let val = args
-                .get(i)
-                .ok_or_else(|| anyhow::anyhow!("--max-files requires a value"))?;
-            max_files = Some(
-                val.parse::<usize>()
-                    .map_err(|_| anyhow::anyhow!("--max-files requires a positive integer"))?,
-            );
-        } else if let Some(val) = arg.strip_prefix("--index-dir=") {
+        } else if let Some(val) = next_value(args, &mut i, "--index-dir")? {
             // Internal/test flag: override the cache directory.
-            cache_dir_override = Some(PathBuf::from(val));
-        } else if arg == "--index-dir" {
-            i += 1;
-            let val = args
-                .get(i)
-                .ok_or_else(|| anyhow::anyhow!("--index-dir requires a value"))?;
             cache_dir_override = Some(PathBuf::from(val));
         } else {
             anyhow::bail!("skim search index: unknown argument: {arg}");
@@ -145,6 +124,31 @@ fn parse_args(args: &[String]) -> anyhow::Result<IndexConfig> {
         force,
         cache_dir_override,
     })
+}
+
+/// Extract the value for a `--flag=val` or `--flag val` argument pair.
+///
+/// Returns `Ok(Some(val))` if the current arg matches `flag`, advancing `i` for
+/// the space-separated form. Returns `Ok(None)` if this arg is not `flag`.
+fn next_value<'a>(
+    args: &'a [String],
+    i: &mut usize,
+    flag: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    let arg = &args[*i];
+    let eq_prefix = format!("{flag}=");
+
+    if let Some(val) = arg.strip_prefix(&eq_prefix) {
+        return Ok(Some(val));
+    }
+    if arg == flag {
+        *i += 1;
+        let val = args
+            .get(*i)
+            .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))?;
+        return Ok(Some(val.as_str()));
+    }
+    Ok(None)
 }
 
 // ============================================================================
@@ -187,38 +191,29 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     };
 
     // 4. Classify in parallel: for each file, either use cached field_map or call
-    //    classify_source. We collect (index, field_map, cache_hit) triples.
+    //    classify_source. Results are in the same order as read_files.
     let classified: Vec<ClassifiedFile> = read_files
             .par_iter()
-            .enumerate()
-            .map(|(idx, rf)| {
+            .map(|rf| {
                 let path_key = rf.rel_path.to_string_lossy().replace('\\', "/");
-                let (field_map, cache_hit) = if let Some(entry) = manifest.lookup(&path_key) {
-                    if entry.sha256 == rf.sha256 {
-                        // Cache hit: reuse field_map
-                        let fm = decode_field_map(&entry.field_map);
-                        (fm, true)
-                    } else {
-                        // SHA mismatch: re-classify
-                        let fm = run_classify(&rf.content, rf.lang);
-                        (fm, false)
-                    }
-                } else {
-                    // No entry: fresh classify
-                    let fm = run_classify(&rf.content, rf.lang);
-                    (fm, false)
-                };
-                (idx, field_map, cache_hit)
+                if let Some(entry) = manifest.lookup(&path_key)
+                    && entry.sha256 == rf.sha256
+                {
+                    // Cache hit: reuse field_map
+                    return (decode_field_map(&entry.field_map), true);
+                }
+                // SHA mismatch or no entry: fresh classify
+                (run_classify(&rf.content, rf.lang), false)
             })
             .collect();
 
-    let cache_hits = u32::try_from(classified.iter().filter(|(_, _, hit)| *hit).count())
+    let cache_hits = u32::try_from(classified.iter().filter(|(_, hit)| *hit).count())
         .unwrap_or(u32::MAX);
 
     // 5. Build the index sequentially (NgramIndexBuilder is not Sync).
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;
     for (idx, rf) in read_files.iter().enumerate() {
-        let (_, ref field_map, _) = classified[idx];
+        let (ref field_map, _) = classified[idx];
         builder.add_file_classified(FileId(idx as u32), &rf.content, rf.lang, field_map)?;
     }
     // build() flushes index.skidx + index.skpost
@@ -227,7 +222,7 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     // 6. Write the manifest sidecar (written last — marks index as coherent).
     let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
     for (idx, rf) in read_files.iter().enumerate() {
-        let (_, ref field_map, _) = classified[idx];
+        let (ref field_map, _) = classified[idx];
         let path_key = rf.rel_path.to_string_lossy().replace('\\', "/");
         new_manifest.insert(ManifestEntry {
             path: path_key,
@@ -280,16 +275,15 @@ fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
 ///
 /// Used as a stable directory name in the search cache.
 fn project_root_hash(canonical_root: &Path) -> String {
+    use std::fmt::Write;
     let input = canonical_root.to_string_lossy();
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
+    let digest = Sha256::digest(input.as_bytes());
     // Take first 8 bytes → 16 hex chars
-    digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    hex
 }
 
 // ============================================================================
