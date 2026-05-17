@@ -6,8 +6,8 @@
 //! 1. `discover_project_root(cwd)` → walk up to `.git`, fall back to cwd
 //! 2. Resolve cache dir: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/`
 //! 3. `walk_metadata(root, max_files)` → metadata-only WalkEntry list (sorted)
-//! 4. Producer thread: for each entry, reads content, computes SHA, applies
-//!    4-tier mtime/SHA cache, classifies; sends ProcessedFile on bounded channel
+//! 4. Producer thread: for each entry, reads content, computes SHA-256, applies
+//!    2-tier SHA cache, classifies; sends ProcessedFile on bounded channel
 //! 5. Consumer thread: receives ProcessedFile, calls add_file_classified, inserts
 //!    manifest entry, drops content → peak memory bounded by channel capacity
 //! 6. `builder.build()` flushes index; manifest written after (marks coherence)
@@ -15,6 +15,10 @@
 //!
 //! **Incremental build** (manifest exists, no `--force`):
 //! - SHA-256 match → reuse cached field_map (cache hit, no classify_source call).
+//! - SHA-256 mismatch → classify_source and write fresh field_map (cache miss).
+//! - Mtime is stored in the manifest for potential future aggressive-mode
+//!   optimisation (skip SHA on mtime match) but is not consulted for cache
+//!   decisions in the current safe mode — SHA is the sole authority.
 //! - Always write a fresh manifest after build.
 
 use std::path::{Path, PathBuf};
@@ -161,6 +165,14 @@ pub(super) struct Pipeline<'cfg> {
 /// 64 × 5 MiB max file size = 320 MiB worst-case buffered in the channel.
 const CHANNEL_CAPACITY: usize = 64;
 
+/// Aggregated output from [`Pipeline::consume`].
+struct ConsumeResult {
+    /// Number of files successfully added to the index.
+    file_count: u32,
+    /// Number of files whose cached `field_map` was reused (SHA match).
+    cache_hits: u32,
+}
+
 impl<'cfg> Pipeline<'cfg> {
     /// Initialise the pipeline: resolve the cache directory and create it.
     ///
@@ -181,11 +193,16 @@ impl<'cfg> Pipeline<'cfg> {
     }
 
     /// Run the streaming pipeline and return the final [`IndexResult`].
+    ///
+    /// Orchestrates three stages:
+    /// 1. [`Self::walk`] — metadata-only directory walk.
+    /// 2. [`Self::spawn_producer`] — producer thread that reads + classifies files.
+    /// 3. [`Self::consume`] — consumer loop that indexes and builds the manifest.
     pub(super) fn run(self) -> anyhow::Result<IndexResult> {
+        let debug_enabled = crate::debug::is_debug_enabled();
+
         // Stage 1: Metadata-only walk (no content reading).
-        let (walk_entries, walk_skips) =
-            walk_metadata(&self.config.root, self.config.effective_max_files())?;
-        let walk_skip_count = walk_skips.len();
+        let (walk_entries, walk_skip_count) = self.walk()?;
 
         if walk_entries.is_empty() {
             // Nothing to index — write an empty manifest and return early.
@@ -199,63 +216,125 @@ impl<'cfg> Pipeline<'cfg> {
             });
         }
 
-        // Stage 2: Load the manifest for incremental builds.
-        let manifest = if self.config.force {
-            FileManifest::new(self.config.root.clone(), self.cache_dir.clone())
+        // Stage 2: Load the manifest for incremental builds, then spawn producer.
+        let manifest = self.load_manifest()?;
+        let (producer_handle, rx, producer_skips) =
+            Self::spawn_producer(walk_entries, manifest, self.config.force, debug_enabled);
+
+        // Stage 3: Consume processed files, build the index.
+        let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
+        let mut new_manifest =
+            FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+        let ConsumeResult { file_count, cache_hits } =
+            Self::consume(&mut builder, &mut new_manifest, rx, debug_enabled);
+
+        // Wait for the producer to finish and propagate any panic.
+        producer_handle.join().map_err(|e| {
+            anyhow::anyhow!(
+                "producer thread panicked: {:?}",
+                e.downcast_ref::<String>()
+                    .map(String::as_str)
+                    .unwrap_or("<non-string panic>")
+            )
+        })?;
+
+        // Finalize: flush index then write manifest (marks index as coherent).
+        let _layer = builder.build()?;
+        new_manifest.save()?;
+
+        let total_skipped = to_u32_capped(walk_skip_count)
+            .saturating_add(producer_skips.load(Ordering::Relaxed));
+
+        Ok(IndexResult {
+            file_count,
+            skipped: total_skipped,
+            cache_hits,
+            duration: self.start.elapsed(),
+        })
+    }
+
+    /// Stage 1: walk the project root and return `(entries, skip_count)`.
+    fn walk(&self) -> anyhow::Result<(Vec<WalkEntry>, usize)> {
+        let (entries, skips) =
+            walk_metadata(&self.config.root, self.config.effective_max_files())?;
+        Ok((entries, skips.len()))
+    }
+
+    /// Stage 2a: load or create the [`FileManifest`] based on `--force`.
+    fn load_manifest(&self) -> anyhow::Result<FileManifest> {
+        if self.config.force {
+            Ok(FileManifest::new(
+                self.config.root.clone(),
+                self.cache_dir.clone(),
+            ))
         } else {
-            FileManifest::load(self.config.root.clone(), self.cache_dir.clone())?
-        };
+            FileManifest::load(self.config.root.clone(), self.cache_dir.clone())
+        }
+    }
 
-        // Stage 3: Streaming producer → consumer.
-        //
-        // The producer iterates the sorted walk_entries, reads each file,
-        // applies 4-tier cache logic, and sends ProcessedFile on a bounded
-        // channel.  The consumer (this thread) receives, indexes, and drops
-        // content immediately — keeping peak memory bounded.
+    /// Stage 2b: spawn the producer thread.
+    ///
+    /// Returns a join handle, the receiving end of the bounded channel, and a
+    /// shared skip counter that the producer increments on read/classify errors.
+    fn spawn_producer(
+        walk_entries: Vec<WalkEntry>,
+        manifest: FileManifest,
+        force: bool,
+        debug_enabled: bool,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        crossbeam_channel::Receiver<ProcessedFile>,
+        Arc<AtomicU32>,
+    ) {
         let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(CHANNEL_CAPACITY);
-
-        // Producer-side skip counter (read errors, minification, size errors
-        // discovered during content read).
         let producer_skips = Arc::new(AtomicU32::new(0));
         let producer_skips_clone = Arc::clone(&producer_skips);
 
-        let debug_enabled = crate::debug::is_debug_enabled();
-        let force = self.config.force;
-
-        // Spawn producer thread.
-        let producer_handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             for entry in &walk_entries {
                 match read_and_classify(entry, &manifest, force, debug_enabled) {
                     Ok(pf) => {
-                        // Send blocks when the channel is full — this is the
-                        // backpressure mechanism that limits peak memory.
+                        // Send blocks when channel is full — backpressure limits peak memory.
                         if tx.send(pf).is_err() {
-                            // Consumer dropped the receiver (fatal error on consumer side).
-                            // Break so the producer doesn't spin fruitlessly.
+                            // Consumer dropped receiver (fatal error on consumer side).
                             break;
                         }
                     }
                     Err(_reason) => {
-                        // Count read/minification errors; continue with next file.
                         producer_skips_clone.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-            // `tx` is dropped here, which closes the channel and signals EOF to consumer.
+            // `tx` dropped here closes the channel, signalling EOF to consumer.
         });
 
-        // Consumer: receives ProcessedFile, builds the index sequentially.
-        //
-        // `next_file_id` only increments after a successful `add_file_classified`,
-        // preserving the builder's sequential FileId invariant even on errors.
-        let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
-        let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+        (handle, rx, producer_skips)
+    }
+
+    /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one, and build
+    /// the new manifest.
+    ///
+    /// Returns aggregated counts. Errors on individual files are fail-soft: the
+    /// file is skipped and indexing continues. On `FileId` overflow the loop
+    /// breaks early and the partial result is returned — the caller's
+    /// `builder.build()` + `new_manifest.save()` still execute, preserving
+    /// the fail-soft contract.
+    ///
+    /// # Invariant
+    ///
+    /// `next_file_id` only advances after a successful `add_file_classified`,
+    /// preserving the builder's sequential `FileId` requirement even on errors.
+    fn consume(
+        builder: &mut NgramIndexBuilder,
+        new_manifest: &mut FileManifest,
+        rx: crossbeam_channel::Receiver<ProcessedFile>,
+        debug_enabled: bool,
+    ) -> ConsumeResult {
         let mut next_file_id: u32 = 0;
         let mut cache_hits: u32 = 0;
 
         for pf in rx {
-            // Fail-soft: a classify or builder error on one file must not abort
-            // a 50 K-file build.
+            // Fail-soft: a builder error on one file must not abort a 50 K-file build.
             if let Err(e) = builder.add_file_classified(
                 FileId(next_file_id),
                 &pf.content,
@@ -272,10 +351,20 @@ impl<'cfg> Pipeline<'cfg> {
                 continue;
             }
 
-            // Success: advance counter and record in manifest.
-            next_file_id = next_file_id.checked_add(1).ok_or_else(|| {
-                anyhow::anyhow!("next_file_id overflows u32; too many files in index")
-            })?;
+            // Success: advance counter.
+            // On overflow (>4 billion files) break rather than abort — work already
+            // indexed is flushed by the caller's builder.build() + new_manifest.save().
+            let Some(next) = next_file_id.checked_add(1) else {
+                if debug_enabled {
+                    eprintln!(
+                        "skim search index [debug]: next_file_id overflows u32; \
+                         flushing {} files and stopping",
+                        next_file_id
+                    );
+                }
+                break;
+            };
+            next_file_id = next;
             if pf.cache_hit {
                 cache_hits = cache_hits.saturating_add(1);
             }
@@ -288,33 +377,10 @@ impl<'cfg> Pipeline<'cfg> {
                 field_map: encode_field_map(&pf.field_map),
                 mtime: pf.mtime,
             });
-            // `pf.content` is dropped here — memory released immediately.
+            // `pf.content` dropped here — memory released immediately.
         }
 
-        // Wait for the producer to finish and propagate any panic.
-        producer_handle.join().map_err(|e| {
-            anyhow::anyhow!(
-                "producer thread panicked: {:?}",
-                e.downcast_ref::<String>()
-                    .map(String::as_str)
-                    .unwrap_or("<non-string panic>")
-            )
-        })?;
-
-        // build() flushes index.skidx + index.skpost.
-        let _layer = builder.build()?;
-        // Manifest written last — marks index as coherent.
-        new_manifest.save()?;
-
-        let total_skipped =
-            to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
-
-        Ok(IndexResult {
-            file_count: next_file_id,
-            skipped: total_skipped,
-            cache_hits,
-            duration: self.start.elapsed(),
-        })
+        ConsumeResult { file_count: next_file_id, cache_hits }
     }
 }
 
@@ -322,8 +388,16 @@ impl<'cfg> Pipeline<'cfg> {
 // Streaming producer helper
 // ============================================================================
 
-/// Read a file's content, apply 4-tier mtime/SHA cache logic, and produce a
+/// Read a file's content, apply 2-tier SHA cache logic, and produce a
 /// [`ProcessedFile`] — or a [`SkipReason`] if the file should be excluded.
+///
+/// Cache tiers:
+/// - SHA match → reuse `field_map` from manifest (cache hit, no classify call).
+/// - SHA mismatch or `--force` → run `classify_source` (cache miss).
+///
+/// Mtime is stored in the manifest for forward-looking aggressive-mode support
+/// (where mtime mismatch could skip SHA entirely) but is not read here — SHA is
+/// the sole cache authority in safe mode.
 ///
 /// Called by the producer thread for each [`WalkEntry`].
 fn read_and_classify(
@@ -358,27 +432,17 @@ fn read_and_classify(
     // Always compute SHA — it is the correctness guarantee.
     let sha = sha256_hex(content.as_bytes());
 
-    // 4-tier cache logic.
+    // 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
     let path_key = entry.rel_path.to_string_lossy().replace('\\', "/");
 
-    if !force
-        && let Some(cached) = manifest.lookup(&path_key)
-        && cached.sha256 == sha
-    {
-        // SHA match → reuse field_map (cache hit).
-        return Ok(ProcessedFile {
-            rel_path: entry.rel_path.clone(),
-            lang: entry.lang,
-            content,
-            sha256: sha,
-            mtime: entry.mtime,
-            field_map: decode_field_map(&cached.field_map),
-            cache_hit: true,
-        });
-    }
-
-    // Cache miss or --force → classify.
-    let field_map = run_classify(&content, entry.lang, debug);
+    let (field_map, cache_hit) =
+        if !force && let Some(cached) = manifest.lookup(&path_key) && cached.sha256 == sha {
+            // SHA match → reuse field_map (cache hit).
+            (decode_field_map(&cached.field_map), true)
+        } else {
+            // Cache miss or --force → classify.
+            (run_classify(&content, entry.lang, debug), false)
+        };
 
     Ok(ProcessedFile {
         rel_path: entry.rel_path.clone(),
@@ -387,7 +451,7 @@ fn read_and_classify(
         sha256: sha,
         mtime: entry.mtime,
         field_map,
-        cache_hit: false,
+        cache_hit,
     })
 }
 
