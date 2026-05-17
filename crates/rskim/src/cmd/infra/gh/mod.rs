@@ -67,6 +67,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "gh",
     env_overrides: &[],
     install_hint: "Install gh: https://cli.github.com/",
+    skip_ansi_strip: false,
 };
 
 // ============================================================================

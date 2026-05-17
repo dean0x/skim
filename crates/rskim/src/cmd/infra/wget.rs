@@ -23,6 +23,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "wget",
     env_overrides: &[],
     install_hint: "Install wget via your package manager",
+    skip_ansi_strip: false,
 };
 
 static RE_WGET_HTTP_STATUS: LazyLock<Regex> =

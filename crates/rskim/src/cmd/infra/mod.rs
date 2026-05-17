@@ -1,10 +1,11 @@
-//! Infrastructure tool handler — dispatches to infra parsers (#116, #117, #131)
+//! Infrastructure tool handler — dispatches to infra parsers (#116, #117, #131, #168)
 //!
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
-//! `aws`, `curl`, `docker`, `gh`, `kubectl`, `terraform`, `wget`.
+//! `aws`, `curl`, `dig`, `docker`, `gh`, `kubectl`, `nslookup`, `terraform`, `wget`.
 
 pub(crate) mod aws;
 pub(crate) mod curl;
+pub(crate) mod dns;
 pub(crate) mod docker;
 pub(crate) mod gh;
 pub(crate) mod kubectl;
@@ -22,9 +23,11 @@ use crate::runner::CommandOutput;
 const KNOWN_TOOLS: &[&str] = &[
     "aws",
     "curl",
+    "dig",
     "docker",
     "gh",
     "kubectl",
+    "nslookup",
     "terraform",
     "wget",
 ];
@@ -60,9 +63,11 @@ pub(crate) fn run(
     match tool_name.as_str() {
         "aws" => aws::run(tool_args, &ctx),
         "curl" => curl::run(tool_args, &ctx),
+        "dig" => dns::run_dig(tool_args, &ctx),
         "docker" => docker::run(tool_args, &ctx),
         "gh" => gh::run(tool_args, &ctx),
         "kubectl" => kubectl::run(tool_args, &ctx),
+        "nslookup" => dns::run_nslookup(tool_args, &ctx),
         "terraform" => terraform::run(tool_args, &ctx),
         "wget" => wget::run(tool_args, &ctx),
         _ => {
@@ -158,6 +163,14 @@ pub(crate) struct InfraToolConfig<'a> {
     pub env_overrides: &'a [(&'a str, &'a str)],
     /// Hint printed when the tool binary is not found.
     pub install_hint: &'a str,
+    /// When `true`, skip ANSI escape stripping on the raw command output.
+    ///
+    /// `strip_ansi_escapes` treats ASCII control codes — including `\t` (0x09) —
+    /// as part of escape sequences and drops them. DNS tools (dig, nslookup) use
+    /// TABs as field separators in their structured output; stripping would remove
+    /// those separators and cause record-line regex to fail, falling through to
+    /// Passthrough. Set `true` for dig and nslookup.
+    pub skip_ansi_strip: bool,
 }
 
 /// Execute an infra tool, parse its output, and emit the result.
@@ -187,7 +200,7 @@ pub(crate) fn run_infra_tool(
             show_stats: ctx.show_stats,
             output_format: ctx.output_format(),
             family: "infra",
-            skip_ansi_strip: false,
+            skip_ansi_strip: config.skip_ansi_strip,
             rec: crate::analytics::RecordingContext {
                 enabled: ctx.analytics_enabled,
                 command_type: crate::analytics::CommandType::Infra,

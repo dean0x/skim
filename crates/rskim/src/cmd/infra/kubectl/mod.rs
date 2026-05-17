@@ -27,6 +27,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "kubectl",
     env_overrides: &[],
     install_hint: "Install kubectl: https://kubernetes.io/docs/tasks/tools/",
+    skip_ansi_strip: false,
 };
 
 /// Global kubectl flags that accept a value in the following token.

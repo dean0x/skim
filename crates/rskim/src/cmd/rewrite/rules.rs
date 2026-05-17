@@ -1,7 +1,7 @@
 //! Declarative rewrite rule table.
 //!
-//! 146 rules grouped into 8 category arrays: TEST (16), BUILD (12), GIT (7),
-//! LINT (42), PKG (24), INFRA (26), FILE_OPS (16), DB (3).
+//! 148 rules grouped into 8 category arrays: TEST (16), BUILD (12), GIT (7),
+//! LINT (42), PKG (24), INFRA (28), FILE_OPS (16), DB (3).
 //! Only `engine.rs` consumes `all_rules()`.
 //!
 //! v2.8.0: Flat dispatch — `rewrite_to` uses tool names directly
@@ -1177,7 +1177,7 @@ const PKG_RULES: &[RewriteRule] = &[
 ];
 
 // ============================================================================
-// INFRA rules (26)
+// INFRA rules (28)
 // ============================================================================
 
 /// Docker global value-consuming flags used by all seven docker rules.
@@ -1367,6 +1367,32 @@ const INFRA_RULES: &[RewriteRule] = &[
             "--upload-file",
             "-T",
         ],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // dig
+    //
+    // Skip `+short`, `+yaml`, `+json`, `+trace` — these produce output formats
+    // that are already minimal (short), structured for other consumers (yaml/json),
+    // or streaming diagnostic (trace). skim only wraps standard dig output.
+    RewriteRule {
+        prefix: &["dig"],
+        rewrite_to: &["skim", "dig"],
+        skip_if_flag_prefix: &["+short", "+yaml", "+json", "+trace"],
+        category: RewriteCategory::Infra,
+        exclude_pipe_source: false,
+        skip_if_middle_contains_eq: false,
+        global_value_flags: &[],
+        require_flag: &[],
+    },
+    // nslookup
+    RewriteRule {
+        prefix: &["nslookup"],
+        rewrite_to: &["skim", "nslookup"],
+        skip_if_flag_prefix: &[],
         category: RewriteCategory::Infra,
         exclude_pipe_source: false,
         skip_if_middle_contains_eq: false,
@@ -1846,8 +1872,8 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(16) + BUILD(12) + GIT(7) + LINT(42) + PKG(24) + INFRA(26) + FILE_OPS(16) + DB(3)
-    const EXPECTED_RULE_COUNT: usize = 16 + 12 + 7 + 42 + 24 + 26 + 16 + 3;
+    /// TEST(16) + BUILD(12) + GIT(7) + LINT(42) + PKG(24) + INFRA(28) + FILE_OPS(16) + DB(3)
+    const EXPECTED_RULE_COUNT: usize = 16 + 12 + 7 + 42 + 24 + 28 + 16 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {

@@ -1,0 +1,18 @@
+; <<>> DiG 9.10.6 <<>> nonexistent.thisdoesnotexist.invalid
+;; global options: +cmd
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1864
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 1, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags:; udp: 1232
+;; QUESTION SECTION:
+;nonexistent.thisdoesnotexist.invalid. IN A
+
+;; AUTHORITY SECTION:
+.			10800	IN	SOA	a.root-servers.net. nstld.verisign-grs.com. 2026051601 1800 900 604800 86400
+
+;; Query time: 9 msec
+;; SERVER: 192.168.1.1#53(192.168.1.1)
+;; WHEN: Sat May 16 23:20:40 IDT 2026
+;; MSG SIZE  rcvd: 140

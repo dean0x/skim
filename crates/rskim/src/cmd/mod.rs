@@ -222,9 +222,11 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     // Infrastructure
     "aws",
     "curl",
+    "dig",
     "docker",
     "gh",
     "kubectl",
+    "nslookup",
     "terraform",
     "wget",
     // Database
@@ -940,9 +942,8 @@ pub(crate) fn dispatch(
             lint::run(&prepend(subcommand, args), analytics)
         }
         "npm" | "pip" | "pnpm" | "yarn" => pkg::run(&prepend(subcommand, args), analytics),
-        "aws" | "curl" | "docker" | "gh" | "kubectl" | "terraform" | "wget" => {
-            infra::run(&prepend(subcommand, args), analytics)
-        }
+        "aws" | "curl" | "dig" | "docker" | "gh" | "kubectl" | "nslookup" | "terraform"
+        | "wget" => infra::run(&prepend(subcommand, args), analytics),
         "mysql" | "psql" | "sqlite3" => db::run(&prepend(subcommand, args), analytics),
         "df" | "diff" | "du" | "env" | "find" | "grep" | "ls" | "printenv" | "ps" | "rg"
         | "tree" | "wc" => file::run(&prepend(subcommand, args), analytics),

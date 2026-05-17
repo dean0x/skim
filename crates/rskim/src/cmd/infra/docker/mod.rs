@@ -37,6 +37,7 @@ const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
     program: "docker",
     env_overrides: &[],
     install_hint: "Install Docker: https://docs.docker.com/get-docker/",
+    skip_ansi_strip: false,
 };
 
 /// Global docker flags that accept a value in the following token.
