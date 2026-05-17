@@ -256,55 +256,26 @@ pub(super) fn walk_and_read(
         let cap_reached = Arc::clone(&cap_reached);
         let root = root_buf.clone();
         Box::new(move |entry_result| {
-            if file_count.load(Ordering::Relaxed) >= max_files {
-                if !cap_reached.swap(true, Ordering::Relaxed) {
-                    let mut s = skipped.lock().unwrap();
-                    if s.len() < MAX_SKIP_REASONS {
-                        s.push(SkipReason::CapReached);
-                    }
-                }
-                return WalkState::Quit;
-            }
-            match entry_result {
-                Ok(entry) => match classify_entry(&entry, &root) {
-                    EntryOutcome::Accept(file) => {
-                        file_count.fetch_add(1, Ordering::Relaxed);
-                        files.lock().unwrap().push(file);
-                    }
-                    EntryOutcome::Skip(reason) => {
-                        let mut s = skipped.lock().unwrap();
-                        if s.len() < MAX_SKIP_REASONS {
-                            s.push(reason);
-                        }
-                    }
-                    EntryOutcome::Transparent => {}
-                },
-                Err(err) => {
-                    let path = match &err {
-                        ignore::Error::WithPath { path, .. } => path.clone(),
-                        _ => PathBuf::new(),
-                    };
-                    let mut s = skipped.lock().unwrap();
-                    if s.len() < MAX_SKIP_REASONS {
-                        s.push(SkipReason::ReadError {
-                            path,
-                            error: err.to_string(),
-                        });
-                    }
-                }
-            }
-            WalkState::Continue
+            handle_entry(
+                entry_result,
+                &files,
+                &skipped,
+                &file_count,
+                &cap_reached,
+                max_files,
+                &root,
+            )
         })
     });
 
     let mut files = Arc::try_unwrap(files)
-        .expect("all parallel walker threads completed")
+        .map_err(|_| anyhow::anyhow!("parallel walker Arc still has multiple owners after completion"))?
         .into_inner()
-        .expect("no thread panicked while holding lock");
+        .unwrap_or_else(|e| e.into_inner());
     let skipped = Arc::try_unwrap(skipped)
-        .expect("all parallel walker threads completed")
+        .map_err(|_| anyhow::anyhow!("parallel walker Arc still has multiple owners after completion"))?
         .into_inner()
-        .expect("no thread panicked while holding lock");
+        .unwrap_or_else(|e| e.into_inner());
 
     // Parallel threads may over-collect beyond max_files due to TOCTOU on the
     // atomic counter (multiple threads may pass the cap check before any of them
@@ -315,6 +286,73 @@ pub(super) fn walk_and_read(
     files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
     Ok((files, skipped))
+}
+
+// ============================================================================
+// Walker entry handler
+// ============================================================================
+
+/// Process a single walker entry result and update shared state.
+///
+/// Extracted from the `build_parallel` closure to reduce nesting depth and
+/// enable independent unit testing.  The parallel walker API requires a
+/// `Box<dyn FnMut(…) -> WalkState>` closure; this function holds all the
+/// logic so the closure is a thin delegation layer.
+///
+/// # Mutex poisoning
+///
+/// All `.lock()` calls use `unwrap_or_else(|e| e.into_inner())` so that a
+/// panic in one parallel thread does not cascade-abort the remaining threads
+/// via a poisoned-lock panic.
+fn handle_entry(
+    entry_result: Result<ignore::DirEntry, ignore::Error>,
+    files: &Mutex<Vec<ReadFile>>,
+    skipped: &Mutex<Vec<SkipReason>>,
+    file_count: &AtomicUsize,
+    cap_reached: &AtomicBool,
+    max_files: usize,
+    root: &Path,
+) -> WalkState {
+    if file_count.load(Ordering::Relaxed) >= max_files {
+        if !cap_reached.swap(true, Ordering::Relaxed) {
+            let mut s = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            if s.len() < MAX_SKIP_REASONS {
+                s.push(SkipReason::CapReached);
+            }
+        }
+        return WalkState::Quit;
+    }
+
+    match entry_result {
+        Ok(entry) => match classify_entry(&entry, root) {
+            EntryOutcome::Accept(file) => {
+                file_count.fetch_add(1, Ordering::Relaxed);
+                files.lock().unwrap_or_else(|e| e.into_inner()).push(file);
+            }
+            EntryOutcome::Skip(reason) => {
+                let mut s = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                if s.len() < MAX_SKIP_REASONS {
+                    s.push(reason);
+                }
+            }
+            EntryOutcome::Transparent => {}
+        },
+        Err(err) => {
+            let path = match &err {
+                ignore::Error::WithPath { path, .. } => path.clone(),
+                _ => PathBuf::new(),
+            };
+            let mut s = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            if s.len() < MAX_SKIP_REASONS {
+                s.push(SkipReason::ReadError {
+                    path,
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+
+    WalkState::Continue
 }
 
 // ============================================================================
