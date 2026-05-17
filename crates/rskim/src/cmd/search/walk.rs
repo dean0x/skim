@@ -269,11 +269,11 @@ pub(super) fn walk_and_read(
     });
 
     let mut files = Arc::try_unwrap(files)
-        .map_err(|_| anyhow::anyhow!("parallel walker Arc still has multiple owners after completion"))?
+        .map_err(|_| anyhow::anyhow!("files Arc still has multiple owners after walker completion"))?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
     let skipped = Arc::try_unwrap(skipped)
-        .map_err(|_| anyhow::anyhow!("parallel walker Arc still has multiple owners after completion"))?
+        .map_err(|_| anyhow::anyhow!("skipped Arc still has multiple owners after walker completion"))?
         .into_inner()
         .unwrap_or_else(|e| e.into_inner());
 
@@ -315,9 +315,9 @@ fn handle_entry(
 ) -> WalkState {
     if file_count.load(Ordering::Relaxed) >= max_files {
         if !cap_reached.swap(true, Ordering::Relaxed) {
-            let mut s = skipped.lock().unwrap_or_else(|e| e.into_inner());
-            if s.len() < MAX_SKIP_REASONS {
-                s.push(SkipReason::CapReached);
+            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() < MAX_SKIP_REASONS {
+                guard.push(SkipReason::CapReached);
             }
         }
         return WalkState::Quit;
@@ -330,9 +330,9 @@ fn handle_entry(
                 files.lock().unwrap_or_else(|e| e.into_inner()).push(file);
             }
             EntryOutcome::Skip(reason) => {
-                let mut s = skipped.lock().unwrap_or_else(|e| e.into_inner());
-                if s.len() < MAX_SKIP_REASONS {
-                    s.push(reason);
+                let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.len() < MAX_SKIP_REASONS {
+                    guard.push(reason);
                 }
             }
             EntryOutcome::Transparent => {}
@@ -342,9 +342,9 @@ fn handle_entry(
                 ignore::Error::WithPath { path, .. } => path.clone(),
                 _ => PathBuf::new(),
             };
-            let mut s = skipped.lock().unwrap_or_else(|e| e.into_inner());
-            if s.len() < MAX_SKIP_REASONS {
-                s.push(SkipReason::ReadError {
+            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() < MAX_SKIP_REASONS {
+                guard.push(SkipReason::ReadError {
                     path,
                     error: err.to_string(),
                 });

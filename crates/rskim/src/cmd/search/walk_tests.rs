@@ -112,8 +112,11 @@ fn test_walk_finds_rust_and_python_files() {
         "build.py not found in {paths:?}"
     );
 
-    // binary.bin has non-UTF8 content → should be skipped
-    let _ = skipped; // some files will be skipped (binary, unsupported, etc.)
+    // binary.bin has non-UTF8 content → should be skipped; skipped list is non-empty
+    assert!(
+        !skipped.is_empty(),
+        "binary.bin and unsupported files should produce skip reasons"
+    );
 }
 
 #[test]

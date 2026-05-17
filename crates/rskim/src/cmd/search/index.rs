@@ -322,15 +322,15 @@ fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
 ///
 /// Used as a stable directory name in the search cache.
 fn project_root_hash(canonical_root: &Path) -> String {
-    use std::fmt::Write;
     let input = canonical_root.to_string_lossy();
     let digest = Sha256::digest(input.as_bytes());
     // Take first 8 bytes → 16 hex chars
-    let mut hex = String::with_capacity(16);
-    for byte in digest.iter().take(8) {
-        write!(hex, "{byte:02x}").expect("write! to String is infallible");
-    }
-    hex
+    digest
+        .iter()
+        .take(8)
+        .flat_map(|byte| [b"0123456789abcdef"[(byte >> 4) as usize], b"0123456789abcdef"[(byte & 0x0f) as usize]])
+        .map(|b| b as char)
+        .collect()
 }
 
 // ============================================================================
