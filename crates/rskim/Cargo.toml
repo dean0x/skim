@@ -42,6 +42,7 @@ crossterm = { workspace = true }
 tree-sitter = { workspace = true }
 quick-xml = { workspace = true }
 tempfile = { workspace = true }
+crossbeam-channel = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

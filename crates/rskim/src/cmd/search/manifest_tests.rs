@@ -26,6 +26,7 @@ fn sample_entry(path: &str, sha256: &str) -> ManifestEntry {
         sha256: sha256.to_string(),
         lang: "rust".to_string(),
         field_map: encode_field_map(&sample_field_map()),
+        mtime: None,
     }
 }
 
@@ -76,6 +77,7 @@ fn test_manifest_roundtrip_multiple_entries() {
             sha256: format!("{:0>64}", i),
             lang: "rust".to_string(),
             field_map: encode_field_map(&sample_field_map()),
+            mtime: None,
         })
         .collect();
 
@@ -307,5 +309,72 @@ fn test_wrong_root_returns_empty_manifest() {
     assert!(
         loaded.lookup("src/x.rs").is_none(),
         "manifest from different root should not be used"
+    );
+}
+
+// ============================================================================
+// Mtime pre-screening
+// ============================================================================
+
+/// Inserting a ManifestEntry with `mtime: Some(...)`, saving, and loading
+/// should preserve the value exactly.
+#[test]
+fn test_mtime_persisted_in_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    let mtime_value: u64 = 1_700_000_000;
+    let entry = ManifestEntry {
+        path: "src/x.rs".to_string(),
+        sha256: "a".repeat(64),
+        lang: "rust".to_string(),
+        field_map: vec![],
+        mtime: Some(mtime_value),
+    };
+
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(entry);
+    manifest.save().unwrap();
+
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
+    let found = loaded.lookup("src/x.rs").unwrap();
+    assert_eq!(
+        found.mtime,
+        Some(mtime_value),
+        "mtime must survive save/load roundtrip"
+    );
+}
+
+/// A manifest written without a `mtime` field (e.g. by an older version of
+/// skim) must deserialize cleanly with `mtime: None`.
+#[test]
+fn test_mtime_backward_compat_none() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+    let path = cache_dir.join("index.skfiles");
+
+    // Write a manifest with no `mtime` field in the entry.
+    let mut f = std::fs::File::create(&path).unwrap();
+    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    writeln!(f, "{header}").unwrap();
+    // Deliberately omit `mtime` to simulate an old manifest format.
+    let entry_json = serde_json::json!({
+        "path": "src/old.rs",
+        "sha256": "b".repeat(64),
+        "lang": "rust",
+        "field_map": []
+    });
+    writeln!(f, "{entry_json}").unwrap();
+    drop(f);
+
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    let found = manifest.lookup("src/old.rs").unwrap();
+    assert_eq!(
+        found.mtime, None,
+        "mtime should be None when field is absent (backward compat)"
     );
 }

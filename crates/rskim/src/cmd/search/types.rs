@@ -2,8 +2,11 @@
 //!
 //! All types here are pure data — no I/O, no side effects.
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use rskim_search::SearchField;
 
 // ============================================================================
 // Configuration
@@ -76,10 +79,59 @@ pub(super) enum SkipReason {
 }
 
 // ============================================================================
-// Per-file read result
+// Streaming pipeline types
 // ============================================================================
 
-/// A successfully read file ready for classification.
+/// A directory entry produced by [`super::walk::walk_metadata`].
+///
+/// Contains only metadata — no file content. The streaming producer reads
+/// content on demand, decoupling the walk from the read phase.
+#[derive(Debug)]
+pub(super) struct WalkEntry {
+    /// Absolute path to the file.
+    pub abs_path: PathBuf,
+    /// Path relative to the project root.
+    pub rel_path: PathBuf,
+    /// Detected source language.
+    pub lang: rskim_core::Language,
+    /// File modification time as seconds since UNIX_EPOCH.
+    ///
+    /// `None` when the platform does not expose mtime or the syscall fails.
+    pub mtime: Option<u64>,
+}
+
+/// A fully processed file ready for indexing, produced by the streaming producer.
+///
+/// Content is held here until the consumer calls `add_file_classified` and then
+/// drops it — limiting peak memory to (channel capacity × average file size).
+#[derive(Debug)]
+pub(super) struct ProcessedFile {
+    /// Path relative to the project root (used as the manifest key).
+    pub rel_path: PathBuf,
+    /// Detected source language.
+    pub lang: rskim_core::Language,
+    /// Full file content as UTF-8.
+    pub content: String,
+    /// Hex-encoded SHA-256 of `content` (64 lowercase hex chars).
+    pub sha256: String,
+    /// File modification time forwarded from [`WalkEntry`].
+    pub mtime: Option<u64>,
+    /// Pre-computed or cache-reused field map.
+    pub field_map: Vec<(Range<usize>, SearchField)>,
+    /// `true` when field_map was reused from the manifest cache (no classify call).
+    pub cache_hit: bool,
+}
+
+// ============================================================================
+// Per-file read result (retained for tests via walk_and_read)
+// ============================================================================
+
+/// A successfully read file — produced by the test-only [`super::walk::walk_and_read`].
+///
+/// In production the streaming pipeline uses [`WalkEntry`] + [`ProcessedFile`]
+/// instead. This type is kept for the walk unit tests which exercise the
+/// integrated walk-and-read code path.
+#[cfg(test)]
 #[derive(Debug)]
 pub(super) struct ReadFile {
     /// Path relative to the project root.
@@ -88,6 +140,10 @@ pub(super) struct ReadFile {
     pub lang: rskim_core::Language,
     /// Full file content as UTF-8 string.
     pub content: String,
-    /// Hex-encoded SHA-256 of `content` (lowercase, 64 chars).
-    pub sha256: String,
+    /// File modification time as seconds since UNIX_EPOCH.
+    ///
+    /// `None` when the platform does not expose mtime or the syscall fails.
+    /// Only used as a fast pre-screening hint; SHA-256 remains the correctness
+    /// guarantee for cache invalidation.
+    pub mtime: Option<u64>,
 }

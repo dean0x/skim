@@ -492,3 +492,126 @@ fn find_file_with_ext_depth(dir: &Path, ext: &str, max_depth: usize) -> bool {
 fn find_file_with_ext(dir: &Path, ext: &str) -> bool {
     find_file_with_ext_depth(dir, ext, 5)
 }
+
+/// After a full build, the manifest must contain a 64-char lowercase hex SHA-256
+/// for every indexed file (SHA computed in classify phase).
+#[test]
+fn test_sha_computed_in_classify_phase() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    for path in &["src/main.rs", "src/lib.rs", "build.py"] {
+        let entry = manifest
+            .lookup(path)
+            .unwrap_or_else(|| panic!("manifest must contain {path}"));
+        assert_eq!(
+            entry.sha256.len(),
+            64,
+            "sha256 for {path} must be 64 chars, got {}",
+            entry.sha256.len()
+        );
+        assert!(
+            entry.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+            "sha256 for {path} must be hex, got: {}",
+            entry.sha256
+        );
+    }
+}
+
+// ============================================================================
+// Streaming pipeline — unique pipeline-level tests
+// ============================================================================
+
+/// Streaming build on a normal project produces exact file_count and zero
+/// cache_hits on cold start.
+#[test]
+fn test_streaming_produces_same_result() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    let result = build_index(&config).expect("streaming build must succeed");
+    // make_project() creates 3 source files (main.rs, lib.rs, build.py).
+    assert_eq!(result.file_count, 3, "should index all 3 source files");
+    assert_eq!(result.cache_hits, 0, "cold start must have zero cache hits");
+}
+
+/// A minified JS file in the project appears in the skipped count.
+#[test]
+fn test_streaming_skipped_includes_minified() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    // Normal source file.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    // Minified JS (single long line, no newlines).
+    fs::write(root.join("bundle.js"), "x".repeat(10_000)).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    let result = build_index(&config).expect("build with minified file must succeed");
+    assert!(
+        result.skipped > 0,
+        "minified file should appear in skipped count, got skipped={}",
+        result.skipped
+    );
+    assert_eq!(result.file_count, 1, "only main.rs should be indexed");
+}
+
+/// With `max_files=2`, the streaming pipeline indexes exactly 2 files.
+#[test]
+fn test_streaming_respects_max_files() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    for i in 0..8 {
+        fs::write(
+            root.join(format!("file_{i:02}.rs")),
+            format!("fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: Some(2),
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    let result = build_index(&config).expect("capped streaming build must succeed");
+    assert_eq!(
+        result.file_count, 2,
+        "streaming must respect max_files=2; got file_count={}",
+        result.file_count
+    );
+}

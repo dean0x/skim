@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::{discover_project_root, walk_and_read};
+use super::{discover_project_root, sha256_hex, walk_and_read, walk_metadata};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -173,18 +173,20 @@ fn test_walk_sha256_is_64_hex_chars() {
 
     let (files, _) = walk_and_read(&root, 50_000).unwrap();
     for f in &files {
+        // SHA is now computed by the classify phase; derive it from content here.
+        let sha = sha256_hex(f.content.as_bytes());
         assert_eq!(
-            f.sha256.len(),
+            sha.len(),
             64,
             "sha256 of {} should be 64 hex chars, got {}",
             f.rel_path.display(),
-            f.sha256.len()
+            sha.len()
         );
         assert!(
-            f.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
             "sha256 of {} contains non-hex chars: {}",
             f.rel_path.display(),
-            f.sha256
+            sha
         );
     }
 }
@@ -204,10 +206,16 @@ fn test_walk_sha256_is_deterministic() {
     files1.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     files2.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
+    // SHA is now computed by the classify phase; derive it from content here.
     assert_eq!(files1.len(), files2.len());
     for (f1, f2) in files1.iter().zip(files2.iter()) {
         assert_eq!(f1.rel_path, f2.rel_path);
-        assert_eq!(f1.sha256, f2.sha256);
+        assert_eq!(
+            sha256_hex(f1.content.as_bytes()),
+            sha256_hex(f2.content.as_bytes()),
+            "sha256 of {} must be deterministic across two walks",
+            f1.rel_path.display()
+        );
         assert_eq!(
             f1.lang,
             f2.lang,
@@ -227,7 +235,8 @@ fn test_walk_sha256_changes_when_content_changes() {
         .iter()
         .find(|f| f.rel_path.ends_with("main.rs"))
         .unwrap();
-    let sha_before = main_before.sha256.clone();
+    // SHA is now computed by the classify phase; derive it from content here.
+    let sha_before = sha256_hex(main_before.content.as_bytes());
 
     // Modify the file
     fs::write(
@@ -241,9 +250,10 @@ fn test_walk_sha256_changes_when_content_changes() {
         .iter()
         .find(|f| f.rel_path.ends_with("main.rs"))
         .unwrap();
+    let sha_after = sha256_hex(main_after.content.as_bytes());
 
     assert_ne!(
-        sha_before, main_after.sha256,
+        sha_before, sha_after,
         "SHA should change after file modification"
     );
 }
@@ -454,6 +464,102 @@ fn test_walk_skips_git_directory() {
             !p.starts_with(".git"),
             ".git files should be excluded, found: {}",
             p.display()
+        );
+    }
+}
+
+// ============================================================================
+// Mtime pre-screening
+// ============================================================================
+
+/// Walk returns `mtime: Some(...)` for all accepted files on platforms that
+/// expose modification times (every platform we support does).
+#[test]
+fn test_mtime_populated_in_walk() {
+    let dir = make_sample_tree();
+    let root = dir.path().canonicalize().unwrap();
+
+    let (files, _) = walk_and_read(&root, 50_000).unwrap();
+    assert!(
+        !files.is_empty(),
+        "make_sample_tree() must produce at least one accepted file"
+    );
+    for f in &files {
+        assert!(
+            f.mtime.is_some(),
+            "mtime should be Some for {} on a platform that exposes mtime",
+            f.rel_path.display()
+        );
+    }
+}
+
+// ============================================================================
+// walk_metadata
+// ============================================================================
+
+/// `walk_metadata` returns entries sorted by `rel_path` (lexicographic).
+#[test]
+fn test_walk_metadata_returns_sorted_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("z_last.rs"), "fn z() {}\n").unwrap();
+    fs::write(root.join("a_first.rs"), "fn a() {}\n").unwrap();
+    fs::write(root.join("m_middle.rs"), "fn m() {}\n").unwrap();
+
+    let root = root.canonicalize().unwrap();
+    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    let paths: Vec<PathBuf> = entries.iter().map(|e| e.rel_path.clone()).collect();
+
+    // Must be sorted lexicographically.
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(
+        paths, sorted,
+        "walk_metadata entries must be sorted by rel_path"
+    );
+}
+
+/// `walk_metadata` respects the `max_files` cap — returns at most `max_files` entries.
+#[test]
+fn test_walk_metadata_respects_max_files_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    for i in 0..12 {
+        fs::write(
+            root.join(format!("file_{i:02}.rs")),
+            format!("fn f{i}() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let root = root.canonicalize().unwrap();
+    let (entries, _) = walk_metadata(&root, 3).unwrap();
+    assert_eq!(
+        entries.len(),
+        3,
+        "walk_metadata should return at most max_files=3 entries, got {}",
+        entries.len()
+    );
+}
+
+/// All `WalkEntry` values from `walk_metadata` should carry `mtime: Some(...)`.
+#[test]
+fn test_walk_metadata_includes_mtime() {
+    let dir = make_sample_tree();
+    let root = dir.path().canonicalize().unwrap();
+
+    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    assert!(
+        !entries.is_empty(),
+        "make_sample_tree() must produce at least one entry"
+    );
+    for e in &entries {
+        assert!(
+            e.mtime.is_some(),
+            "WalkEntry for {} should have mtime: Some(...)",
+            e.rel_path.display()
         );
     }
 }
