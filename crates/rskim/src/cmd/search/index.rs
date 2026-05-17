@@ -183,7 +183,7 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
 
     // 4a. Pre-compute path keys once (avoids duplicate allocation in classify +
     //     manifest write phases — each key is a heap allocation).
-    let mut path_keys: Vec<String> = read_files
+    let path_keys: Vec<String> = read_files
         .iter()
         .map(|rf| rf.rel_path.to_string_lossy().replace('\\', "/"))
         .collect();
@@ -192,8 +192,8 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     //     call classify_source. Results are in the same order as read_files.
     //
     // Hoist the debug flag once before entering the rayon worker pool to avoid
-    // a syscall (env::var_os) on every classify error across parallel workers.
-    let debug_enabled = std::env::var_os("SKIM_DEBUG").is_some();
+    // a syscall on every classify error across parallel workers.
+    let debug_enabled = crate::debug::is_debug_enabled();
     let classified: Vec<ClassifiedFile> = read_files
         .par_iter()
         .zip(path_keys.par_iter())
@@ -213,19 +213,27 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
 
     // 5. Build the index sequentially (NgramIndexBuilder is not Sync).
     // 6. Accumulate manifest entries in the same pass (avoids a second enumerate loop).
+    //
+    // Consume path_keys via into_iter() zipped with classified so ownership
+    // transfer is explicit — no implicit indexing invariant, no empty strings
+    // left behind in the vec.
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;
     let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
-    for (idx, rf) in read_files.iter().enumerate() {
-        let field_map = &classified[idx].0;
+    for (idx, ((rf, (field_map, _)), path_key)) in read_files
+        .iter()
+        .zip(classified.into_iter())
+        .zip(path_keys.into_iter())
+        .enumerate()
+    {
         // Guard against usize overflow into FileId(u32) on pathological inputs.
         let file_id = u32::try_from(idx)
             .map_err(|_| anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files"))?;
-        builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, field_map)?;
+        builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, &field_map)?;
         new_manifest.insert(ManifestEntry {
-            path: std::mem::take(&mut path_keys[idx]),
+            path: path_key,
             sha256: rf.sha256.clone(),
             lang: rf.lang.as_str().to_string(),
-            field_map: encode_field_map(field_map),
+            field_map: encode_field_map(&field_map),
         });
     }
     // build() flushes index.skidx + index.skpost; manifest written after (marks coherence).
