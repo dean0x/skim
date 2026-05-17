@@ -134,7 +134,11 @@ fn test_walk_skips_non_utf8_files() {
     fs::write(root.join("valid.rs"), "fn main() {}\n").unwrap();
     // Invalid UTF-8 content with a supported .rs extension — must be skipped
     // via the non-UTF-8 code path, not the unsupported-language gate.
-    fs::write(root.join("invalid_utf8.rs"), b"\xFF\xFE not valid utf8 \x80").unwrap();
+    fs::write(
+        root.join("invalid_utf8.rs"),
+        b"\xFF\xFE not valid utf8 \x80",
+    )
+    .unwrap();
 
     let root = root.canonicalize().unwrap();
     let (files, skipped) = walk_and_read(&root, 50_000).unwrap();
@@ -204,7 +208,12 @@ fn test_walk_sha256_is_deterministic() {
     for (f1, f2) in files1.iter().zip(files2.iter()) {
         assert_eq!(f1.rel_path, f2.rel_path);
         assert_eq!(f1.sha256, f2.sha256);
-        assert_eq!(f1.lang, f2.lang, "lang detection must be deterministic for {}", f1.rel_path.display());
+        assert_eq!(
+            f1.lang,
+            f2.lang,
+            "lang detection must be deterministic for {}",
+            f1.rel_path.display()
+        );
     }
 }
 
