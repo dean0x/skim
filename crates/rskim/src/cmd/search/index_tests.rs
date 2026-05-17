@@ -126,18 +126,8 @@ fn test_index_incremental_second_build_succeeds() {
 
 #[test]
 fn test_index_incremental_cache_hits_verified_via_manifest() {
-    // Verify that the second build actually reuses cached data rather than just
-    // not crashing.  Cache hits are observable through the manifest: when a file
-    // is served from cache its SHA-256 is identical to the first build.  If the
-    // second build re-classified every file the SHAs would still match (content
-    // unchanged), but the field_map entries would be re-computed from scratch.
-    //
-    // The incremental path is: SHA match → reuse field_map from manifest.
-    // We verify this by asserting that:
-    //   (a) both builds succeed,
-    //   (b) every entry in the second build's manifest has the same SHA as the
-    //       first build — proving the walker recognised unchanged files and the
-    //       pipeline produced a coherent manifest on both runs.
+    // Verify that the incremental path (SHA match → reuse field_map) produces
+    // identical manifest entries across two consecutive builds on unchanged files.
     use super::super::manifest::FileManifest;
 
     let project = make_project();

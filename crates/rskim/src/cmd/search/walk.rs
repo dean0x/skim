@@ -61,11 +61,11 @@ const MAX_ANCESTORS: usize = 256;
 /// matches on variants and never inspects error message text.
 enum ReadOutcome {
     /// File read successfully.
-    Ok(String),
+    Content(String),
     /// File content is not valid UTF-8.
     NonUtf8,
-    /// File size exceeds [`MAX_FILE_BYTES`] (checked via handle metadata).
-    TooLarge,
+    /// File size (from the open file handle's metadata) exceeds [`MAX_FILE_BYTES`].
+    TooLarge(u64),
     /// Any other I/O error (permission denied, broken pipe, etc.).
     Io(std::io::Error),
 }
@@ -205,16 +205,16 @@ pub(super) fn walk_and_read(
         // on the same inode.  Pre-allocate the buffer to the known size so
         // read_to_string does at most one allocation.
         let content = match open_and_read(abs_path) {
-            ReadOutcome::Ok(c) => c,
+            ReadOutcome::Content(c) => c,
             ReadOutcome::NonUtf8 => {
                 skipped.push(SkipReason::NonUtf8(abs_path.to_path_buf()));
                 continue;
             }
-            ReadOutcome::TooLarge => {
+            ReadOutcome::TooLarge(size) => {
                 // File grew past the limit between the pre-screen and open.
                 skipped.push(SkipReason::TooLarge {
                     path: abs_path.to_path_buf(),
-                    size: MAX_FILE_BYTES + 1,
+                    size,
                 });
                 continue;
             }
@@ -277,7 +277,7 @@ fn open_and_read(path: &Path) -> ReadOutcome {
     };
     let size = meta.len();
     if size > MAX_FILE_BYTES {
-        return ReadOutcome::TooLarge;
+        return ReadOutcome::TooLarge(size);
     }
     // Pre-size the buffer to avoid reallocation; +1 so read_to_string can
     // detect EOF without an extra allocation.
@@ -285,7 +285,7 @@ fn open_and_read(path: &Path) -> ReadOutcome {
     // assertion above, so this cast is sound.
     let mut content = String::with_capacity((size as usize).saturating_add(1));
     match file.read_to_string(&mut content) {
-        Ok(_) => ReadOutcome::Ok(content),
+        Ok(_) => ReadOutcome::Content(content),
         // read_to_string returns InvalidData for non-UTF-8 content.
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => ReadOutcome::NonUtf8,
         Err(e) => ReadOutcome::Io(e),

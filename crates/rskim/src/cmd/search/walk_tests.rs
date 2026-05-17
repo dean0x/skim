@@ -267,19 +267,17 @@ fn test_walk_skips_files_over_5mb() {
     );
 }
 
-/// Verify that the `open_and_read` TooLarge path is exercised when a file
-/// exceeds `MAX_FILE_BYTES` at open time.
+/// Verify that `SkipReason::TooLarge` carries the correct path and a size
+/// that reflects the actual file size (not a sentinel).
 ///
 /// The walker has two size checks:
 ///   1. A fast pre-screen on `DirEntry` metadata before opening the file.
 ///   2. A second check inside `open_and_read` on the opened file handle
 ///      (guards against TOCTOU growth between pre-screen and read).
 ///
-/// Both paths produce `SkipReason::TooLarge`.  This test exercises case 1
-/// (the pre-screen), which is the reliable codepath in a non-concurrent test.
-/// The `open_and_read` fallback (case 2) is structurally identical and is
-/// covered by the typed `ReadOutcome::TooLarge` enum variant returning the
-/// same `SkipReason::TooLarge` in `walk_and_read`.
+/// Both paths produce `SkipReason::TooLarge { size }` where `size` is the
+/// real byte count from the metadata.  This test exercises case 1 (the
+/// pre-screen), which is the reliable codepath in a non-concurrent test.
 #[test]
 fn test_walk_too_large_skip_reason_contains_path_and_size() {
     let dir = tempfile::tempdir().unwrap();
@@ -302,19 +300,20 @@ fn test_walk_too_large_skip_reason_contains_path_and_size() {
 
     // The skipped list must contain a TooLarge entry with the correct path
     // and a size field that reflects the actual file size.
-    let too_large_entry = skipped.iter().find(|r| {
-        matches!(
-            r,
-            super::super::types::SkipReason::TooLarge { path, .. }
-            if path.ends_with("over_limit.rs")
-        )
-    });
-    assert!(
-        too_large_entry.is_some(),
-        "skipped list should contain TooLarge for over_limit.rs, got: {skipped:?}"
-    );
+    let too_large_entry = skipped
+        .iter()
+        .find(|r| {
+            matches!(
+                r,
+                super::super::types::SkipReason::TooLarge { path, .. }
+                if path.ends_with("over_limit.rs")
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("skipped list should contain TooLarge for over_limit.rs, got: {skipped:?}")
+        });
 
-    if let Some(super::super::types::SkipReason::TooLarge { size, .. }) = too_large_entry {
+    if let super::super::types::SkipReason::TooLarge { size, .. } = too_large_entry {
         assert!(
             *size > 5 * 1024 * 1024,
             "TooLarge size should exceed 5 MiB, got {size}"
