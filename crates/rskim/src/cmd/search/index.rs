@@ -193,22 +193,22 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     // 4. Classify in parallel: for each file, either use cached field_map or call
     //    classify_source. Results are in the same order as read_files.
     let classified: Vec<ClassifiedFile> = read_files
-            .par_iter()
-            .map(|rf| {
-                let path_key = rf.rel_path.to_string_lossy().replace('\\', "/");
-                if let Some(entry) = manifest.lookup(&path_key)
-                    && entry.sha256 == rf.sha256
-                {
-                    // Cache hit: reuse field_map
-                    return (decode_field_map(&entry.field_map), true);
-                }
-                // SHA mismatch or no entry: fresh classify
-                (run_classify(&rf.content, rf.lang), false)
-            })
-            .collect();
+        .par_iter()
+        .map(|rf| {
+            let path_key = rf.rel_path.to_string_lossy().replace('\\', "/");
+            if let Some(entry) = manifest.lookup(&path_key)
+                && entry.sha256 == rf.sha256
+            {
+                // Cache hit: reuse field_map
+                return (decode_field_map(&entry.field_map), true);
+            }
+            // SHA mismatch or no entry: fresh classify
+            (run_classify(&rf.content, rf.lang), false)
+        })
+        .collect();
 
-    let cache_hits = u32::try_from(classified.iter().filter(|(_, hit)| *hit).count())
-        .unwrap_or(u32::MAX);
+    let cache_hits =
+        u32::try_from(classified.iter().filter(|(_, hit)| *hit).count()).unwrap_or(u32::MAX);
 
     // 5. Build the index sequentially (NgramIndexBuilder is not Sync).
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;

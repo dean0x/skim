@@ -21,7 +21,11 @@ fn make_project() -> TempDir {
     fs::create_dir_all(root.join(".git")).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
 
-    fs::write(root.join("src/main.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"hello\"); }\n",
+    )
+    .unwrap();
     fs::write(
         root.join("src/lib.rs"),
         "pub fn add(a: u32, b: u32) -> u32 { a + b }\n",

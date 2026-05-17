@@ -66,7 +66,10 @@ fn test_manifest_roundtrip_single_entry() {
     let root = dir.path().to_path_buf();
     let cache_dir = dir.path().to_path_buf();
 
-    let entry = sample_entry("src/main.rs", "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111");
+    let entry = sample_entry(
+        "src/main.rs",
+        "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+    );
     let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
     manifest.insert(entry.clone());
     manifest.save().unwrap();
@@ -150,7 +153,10 @@ fn test_lookup_present_returns_entry() {
     let root = dir.path().to_path_buf();
     let cache_dir = dir.path().to_path_buf();
 
-    let entry = sample_entry("src/foo.ts", "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222");
+    let entry = sample_entry(
+        "src/foo.ts",
+        "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+    );
     let mut manifest = FileManifest::new(root, cache_dir);
     manifest.insert(entry.clone());
 
@@ -180,7 +186,11 @@ fn test_load_corrupted_file_returns_empty_manifest() {
     let cache_dir = dir.path().to_path_buf();
 
     // Write garbage to the manifest file
-    fs::write(cache_dir.join("index.skfiles"), b"this is not valid jsonl\x00\xFF").unwrap();
+    fs::write(
+        cache_dir.join("index.skfiles"),
+        b"this is not valid jsonl\x00\xFF",
+    )
+    .unwrap();
 
     let manifest = FileManifest::load(root, cache_dir).unwrap();
     // Should return an empty manifest (invalid lines silently skipped or whole file skipped).
@@ -212,9 +222,15 @@ fn test_save_is_atomic_existing_file_replaced() {
 
     let loaded = FileManifest::load(root, cache_dir).unwrap();
     // Only the second manifest's entries should be present.
-    assert!(loaded.lookup("b.rs").is_some(), "b.rs should be in manifest");
+    assert!(
+        loaded.lookup("b.rs").is_some(),
+        "b.rs should be in manifest"
+    );
     // a.rs was in the first manifest; since m2 replaced it completely, a.rs should NOT be there.
-    assert!(loaded.lookup("a.rs").is_none(), "a.rs should not be in second manifest");
+    assert!(
+        loaded.lookup("a.rs").is_none(),
+        "a.rs should not be in second manifest"
+    );
 }
 
 // ============================================================================

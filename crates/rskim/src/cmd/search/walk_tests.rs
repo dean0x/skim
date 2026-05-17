@@ -35,7 +35,11 @@ fn make_sample_tree() -> TempDir {
     fs::create_dir_all(root.join("src")).unwrap();
 
     fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-    fs::write(root.join("src/lib.rs"), "pub fn add(a: u32, b: u32) -> u32 { a + b }\n").unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+    )
+    .unwrap();
     fs::write(root.join("build.py"), "print('hello')\n").unwrap();
     fs::write(root.join("README.md"), "# Hello\n").unwrap();
     fs::write(root.join("data.json"), "{\"key\": 1}\n").unwrap();
@@ -122,7 +126,9 @@ fn test_walk_skips_non_utf8_files() {
 
     // binary.bin must not appear
     assert!(
-        !paths.iter().any(|p| p.extension().is_some_and(|e| e == "bin")),
+        !paths
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "bin")),
         "binary.bin should be skipped, paths: {paths:?}"
     );
 }
@@ -179,7 +185,11 @@ fn test_walk_sha256_changes_when_content_changes() {
     let sha_before = main_before.sha256.clone();
 
     // Modify the file
-    fs::write(root.join("src/main.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() { println!(\"hello\"); }\n",
+    )
+    .unwrap();
 
     let (files_after, _) = walk_and_read(&root, 50_000).unwrap();
     let main_after = files_after
@@ -187,7 +197,10 @@ fn test_walk_sha256_changes_when_content_changes() {
         .find(|f| f.rel_path.ends_with("main.rs"))
         .unwrap();
 
-    assert_ne!(sha_before, main_after.sha256, "SHA should change after file modification");
+    assert_ne!(
+        sha_before, main_after.sha256,
+        "SHA should change after file modification"
+    );
 }
 
 #[test]
@@ -198,12 +211,21 @@ fn test_walk_respects_max_files_cap() {
     fs::create_dir_all(root.join(".git")).unwrap();
     // Create 10 files
     for i in 0..10 {
-        fs::write(root.join(format!("file_{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+        fs::write(
+            root.join(format!("file_{i}.rs")),
+            format!("fn f{i}() {{}}\n"),
+        )
+        .unwrap();
     }
 
     // Cap at 3
     let (files, _skipped) = walk_and_read(&root.canonicalize().unwrap(), 3).unwrap();
-    assert_eq!(files.len(), 3, "walker should stop at max_files=3, got {}", files.len());
+    assert_eq!(
+        files.len(),
+        3,
+        "walker should stop at max_files=3, got {}",
+        files.len()
+    );
 }
 
 #[test]
