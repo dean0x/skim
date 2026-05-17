@@ -1,17 +1,18 @@
 //! Search subcommand — code search via layered n-gram indexing.
 //!
-//! This is a CLI stub wiring the `search` subcommand into the dispatch table.
-//! The full search implementation will be provided by the `rskim-search` library
-//! crate (dependency not yet wired in).
-//!
 //! # Architecture
 //!
-//! All I/O lives here (this file). Business logic will live in:
-//! - `rskim-search` crate: types, traits, indexing layer implementations
-//!
-//! Search is not yet implemented; this stub allows the subcommand to be
-//! registered, help text to be discoverable, and the dispatch sync guard
-//! test to pass.
+//! All I/O lives here (this module). Business logic is split across:
+//! - `types` — shared configuration and result types
+//! - `walk` — project-root discovery and file traversal
+//! - `manifest` — JSONL sidecar for incremental build caching
+//! - `index` — full pipeline orchestration (`skim search index`)
+//! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
+
+mod index;
+mod manifest;
+mod types;
+mod walk;
 
 use std::process::ExitCode;
 
@@ -21,8 +22,10 @@ use std::process::ExitCode;
 
 /// Run the `skim search` subcommand.
 ///
-/// Currently a stub: prints help when invoked with no args or `--help`, and
-/// returns `ExitCode::FAILURE` with an informative message for all other inputs.
+/// Dispatches to:
+/// - `skim search index [OPTIONS]` — build or update the search index
+/// - `skim search [OPTIONS] <QUERY>` — (not yet implemented)
+/// - No args / `--help` / `-h` — print help
 pub(crate) fn run(
     args: &[String],
     _analytics: &crate::analytics::AnalyticsConfig,
@@ -31,6 +34,12 @@ pub(crate) fn run(
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
         return Ok(ExitCode::SUCCESS);
+    }
+
+    // `skim search index [OPTIONS]` — build the index
+    if args.first().is_some_and(|a| a == "index") {
+        let rest = &args[1..];
+        return index::run(rest);
     }
 
     // Has a query arg → not yet implemented
@@ -45,12 +54,15 @@ pub(crate) fn run(
 fn print_help() {
     println!(
         "\
-Usage: skim search [OPTIONS] <QUERY>
+Usage: skim search <SUBCOMMAND|QUERY> [OPTIONS]
 
 Search code using layered n-gram indexing.
 
+Subcommands:
+  index    Build or update the search index for the current project
+
 Arguments:
-  <QUERY>    Search query string
+  <QUERY>    Search query string (direct query mode, index must exist)
 
 Options:
   --lang <LANG>    Filter by language (e.g., rust, typescript)
@@ -60,6 +72,8 @@ Options:
   -h, --help       Print this help message
 
 Examples:
+  skim search index              Build the search index
+  skim search index --force      Rebuild from scratch
   skim search \"fn parse\"
   skim search --lang rust \"impl Iterator\"
   skim search --ast \"function_declaration\" --json"
