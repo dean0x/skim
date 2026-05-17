@@ -290,6 +290,9 @@ impl<'cfg> Pipeline<'cfg> {
         let producer_skips = Arc::new(AtomicU32::new(0));
         let producer_skips_clone = Arc::clone(&producer_skips);
 
+        // Both `walk_entries` and `manifest` are moved into the producer thread.
+        // `Vec<WalkEntry>` and `FileManifest` must be `Send`; the compiler
+        // enforces this at the `thread::spawn` call site.
         let handle = std::thread::spawn(move || {
             for entry in &walk_entries {
                 match read_and_classify(entry, &manifest, force, debug_enabled) {
@@ -472,7 +475,7 @@ fn to_u32_capped(n: usize) -> u32 {
 /// On error, falls back to an empty field map so indexing continues. The
 /// failure is logged to stderr when `debug` is true (i.e. `SKIM_DEBUG` was
 /// set), which matches the existing debug gate used throughout the codebase.
-/// The caller hoists the env-var check once before the rayon worker pool so
+/// The caller hoists the env-var check once before the producer thread so
 /// that this function never performs a syscall on the hot path.
 fn run_classify(
     content: &str,

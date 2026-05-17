@@ -2,8 +2,9 @@
 //!
 //! # File cap
 //!
-//! `walk_and_read` stops after `max_files` files have been accepted. Skipped
-//! files (unsupported language, too large, non-UTF8) do not count toward the cap.
+//! `walk_metadata` (production) and `walk_and_read` (tests) stop after
+//! `max_files` files have been accepted. Skipped files (unsupported language,
+//! too large, non-UTF8) do not count toward the cap.
 //!
 //! # Skip conditions (in order checked)
 //!
@@ -327,8 +328,10 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
         }
     };
 
-    // Fast size pre-screen via cached DirEntry metadata.
-    if let Ok(meta) = entry.metadata() {
+    // Capture metadata once; use it for both the size pre-screen and mtime
+    // extraction so the walker never calls entry.metadata() twice per file.
+    let meta_opt = entry.metadata().ok();
+    if let Some(ref meta) = meta_opt {
         let size = meta.len();
         if size > MAX_FILE_BYTES {
             return MetaOutcome::Skip(SkipReason::TooLarge {
@@ -338,7 +341,12 @@ fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome
         }
     }
 
-    let mtime = mtime_secs(entry);
+    let mtime = meta_opt.and_then(|m| {
+        m.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+    });
     let rel_path = abs_path
         .strip_prefix(root)
         .unwrap_or(abs_path)
@@ -387,45 +395,15 @@ pub(super) fn walk_metadata(
         let cap_reached = Arc::clone(&cap_reached);
         let root = root_buf.clone();
         Box::new(move |entry_result| {
-            if entry_count.load(Ordering::Relaxed) >= max_files {
-                if !cap_reached.swap(true, Ordering::Relaxed) {
-                    let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.len() < MAX_SKIP_REASONS {
-                        guard.push(SkipReason::CapReached);
-                    }
-                }
-                return WalkState::Quit;
-            }
-
-            match entry_result {
-                Ok(entry) => match classify_entry_metadata(&entry, &root) {
-                    MetaOutcome::Accept(we) => {
-                        entry_count.fetch_add(1, Ordering::Relaxed);
-                        entries.lock().unwrap_or_else(|e| e.into_inner()).push(we);
-                    }
-                    MetaOutcome::Skip(reason) => {
-                        let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
-                        if guard.len() < MAX_SKIP_REASONS {
-                            guard.push(reason);
-                        }
-                    }
-                    MetaOutcome::Transparent => {}
-                },
-                Err(err) => {
-                    let path = match &err {
-                        ignore::Error::WithPath { path, .. } => path.clone(),
-                        _ => PathBuf::new(),
-                    };
-                    let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.len() < MAX_SKIP_REASONS {
-                        guard.push(SkipReason::ReadError {
-                            path,
-                            error: err.to_string(),
-                        });
-                    }
-                }
-            }
-            WalkState::Continue
+            handle_metadata_entry(
+                entry_result,
+                &entries,
+                &skipped,
+                &entry_count,
+                &cap_reached,
+                max_files,
+                &root,
+            )
         })
     });
 
@@ -453,8 +431,72 @@ pub(super) fn walk_metadata(
 }
 
 // ============================================================================
-// Walker entry handler
+// Walker entry handlers
 // ============================================================================
+
+/// Process a single walker entry result for the metadata-only walk.
+///
+/// Extracted from the [`walk_metadata`] `build_parallel` closure to reduce
+/// nesting depth and enable independent unit testing.  The parallel walker API
+/// requires a `Box<dyn FnMut(…) -> WalkState>` closure; this function holds
+/// all the logic so the closure is a thin delegation layer.
+///
+/// Mirrors [`handle_entry`] (the equivalent helper for [`walk_and_read`]).
+///
+/// # Mutex poisoning
+///
+/// All `.lock()` calls use `unwrap_or_else(|e| e.into_inner())` so that a
+/// panic in one parallel thread does not cascade-abort the remaining threads
+/// via a poisoned-lock panic.
+fn handle_metadata_entry(
+    entry_result: Result<ignore::DirEntry, ignore::Error>,
+    entries: &Mutex<Vec<WalkEntry>>,
+    skipped: &Mutex<Vec<SkipReason>>,
+    entry_count: &AtomicUsize,
+    cap_reached: &AtomicBool,
+    max_files: usize,
+    root: &Path,
+) -> WalkState {
+    if entry_count.load(Ordering::Relaxed) >= max_files {
+        if !cap_reached.swap(true, Ordering::Relaxed) {
+            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() < MAX_SKIP_REASONS {
+                guard.push(SkipReason::CapReached);
+            }
+        }
+        return WalkState::Quit;
+    }
+
+    match entry_result {
+        Ok(entry) => match classify_entry_metadata(&entry, root) {
+            MetaOutcome::Accept(we) => {
+                entry_count.fetch_add(1, Ordering::Relaxed);
+                entries.lock().unwrap_or_else(|e| e.into_inner()).push(we);
+            }
+            MetaOutcome::Skip(reason) => {
+                let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                if guard.len() < MAX_SKIP_REASONS {
+                    guard.push(reason);
+                }
+            }
+            MetaOutcome::Transparent => {}
+        },
+        Err(err) => {
+            let path = match &err {
+                ignore::Error::WithPath { path, .. } => path.clone(),
+                _ => PathBuf::new(),
+            };
+            let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() < MAX_SKIP_REASONS {
+                guard.push(SkipReason::ReadError {
+                    path,
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+    WalkState::Continue
+}
 
 /// Process a single walker entry result and update shared state.
 ///
@@ -529,6 +571,11 @@ fn handle_entry(
 /// Returns `None` if the platform does not expose mtime or the syscall fails.
 /// Used as a fast pre-screening hint; SHA-256 is always the correctness
 /// guarantee for cache invalidation.
+///
+/// Only called from the test-only [`classify_entry`]. Production code
+/// ([`classify_entry_metadata`]) captures a single [`std::fs::Metadata`] for
+/// both size pre-screening and mtime extraction to avoid double syscalls.
+#[cfg(test)]
 fn mtime_secs(entry: &ignore::DirEntry) -> Option<u64> {
     entry
         .metadata()
