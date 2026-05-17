@@ -27,7 +27,10 @@ use ignore::{WalkBuilder, WalkState};
 use rskim_core::Language;
 use sha2::{Digest, Sha256};
 
-use super::types::{ReadFile, SkipReason};
+use super::types::{SkipReason, WalkEntry};
+
+#[cfg(test)]
+use super::types::ReadFile;
 
 // ============================================================================
 // Constants
@@ -70,7 +73,7 @@ const MAX_SKIP_REASONS: usize = 10_000;
 /// Using an enum instead of `io::Error` avoids string-matching on error messages
 /// to distinguish the "too large" case from genuine I/O failures.  The caller
 /// matches on variants and never inspects error message text.
-enum ReadOutcome {
+pub(super) enum ReadOutcome {
     /// File read successfully.
     Content(String),
     /// File content is not valid UTF-8.
@@ -114,13 +117,14 @@ pub(super) fn discover_project_root(start: &Path) -> anyhow::Result<PathBuf> {
 }
 
 // ============================================================================
-// File walking
+// File walking (batch) — retained for tests; streaming pipeline uses walk_metadata
 // ============================================================================
 
 /// Outcome of classifying a single [`ignore::DirEntry`].
 ///
 /// `Transparent` covers non-file entries (directories, symlinks) that should be
 /// silently skipped without recording a reason.
+#[cfg(test)]
 enum EntryOutcome {
     /// Entry is a readable source file ready to be added to the index.
     Accept(ReadFile),
@@ -136,6 +140,7 @@ enum EntryOutcome {
 /// metadata), file reading, and minification detection.  The caller is
 /// responsible for the file-count cap and for guarding the `skipped` vector
 /// length against [`MAX_SKIP_REASONS`].
+#[cfg(test)]
 fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     // Only process regular files.
     let file_type = match entry.file_type() {
@@ -225,11 +230,11 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
     })
 }
 
-/// Walk `root` recursively, read each source file, compute its SHA-256, and
-/// return the list of [`ReadFile`]s along with collected [`SkipReason`]s.
+/// Walk `root` recursively, read each source file, and return the list of
+/// [`ReadFile`]s along with collected [`SkipReason`]s.
 ///
-/// The walker respects `.gitignore` and other ignore files, skips hidden
-/// directories, and does not follow symbolic links.
+/// Retained for use in tests. The production streaming pipeline uses
+/// [`walk_metadata`] + per-file reading in the producer thread.
 ///
 /// # Ordering
 ///
@@ -240,6 +245,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
 ///
 /// Returns `Err` only for fatal walker setup errors. Per-file read errors are
 /// collected as [`SkipReason::ReadError`] and returned in the skipped list.
+#[cfg(test)]
 pub(super) fn walk_and_read(
     root: &Path,
     max_files: usize,
@@ -305,6 +311,187 @@ pub(super) fn walk_and_read(
 }
 
 // ============================================================================
+// Metadata-only walk (streaming pipeline)
+// ============================================================================
+
+/// Outcome of classifying a single [`ignore::DirEntry`] without reading content.
+///
+/// Used by [`walk_metadata`] / [`classify_entry_metadata`] which perform language
+/// detection and fast size pre-screening only.  Content reading is deferred to
+/// the streaming producer.
+enum MetaOutcome {
+    Accept(WalkEntry),
+    Skip(SkipReason),
+    Transparent,
+}
+
+/// Classify a single directory entry without reading its content.
+///
+/// Checks: file type, language detection, fast size pre-screen (DirEntry
+/// metadata).  No I/O beyond the metadata already cached by the walker.
+fn classify_entry_metadata(entry: &ignore::DirEntry, root: &Path) -> MetaOutcome {
+    let file_type = match entry.file_type() {
+        Some(ft) => ft,
+        None => return MetaOutcome::Transparent,
+    };
+    if !file_type.is_file() {
+        return MetaOutcome::Transparent;
+    }
+
+    let abs_path = entry.path();
+
+    // Language detection.
+    let lang = match Language::from_path(abs_path) {
+        Some(l) => l,
+        None => {
+            return MetaOutcome::Skip(SkipReason::UnsupportedLanguage(abs_path.to_path_buf()));
+        }
+    };
+
+    // Fast size pre-screen via cached DirEntry metadata.
+    if let Ok(meta) = entry.metadata() {
+        let size = meta.len();
+        if size > MAX_FILE_BYTES {
+            return MetaOutcome::Skip(SkipReason::TooLarge {
+                path: abs_path.to_path_buf(),
+                size,
+            });
+        }
+    }
+
+    // Extract mtime.
+    let mtime: Option<u64> = entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| {
+            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        });
+
+    let rel_path = abs_path
+        .strip_prefix(root)
+        .unwrap_or(abs_path)
+        .to_path_buf();
+
+    MetaOutcome::Accept(WalkEntry {
+        abs_path: abs_path.to_path_buf(),
+        rel_path,
+        lang,
+        mtime,
+    })
+}
+
+/// Walk `root` recursively, collecting file metadata without reading content.
+///
+/// Returns a sorted (lexicographic by `rel_path`) list of [`WalkEntry`]s and
+/// collected [`SkipReason`]s.  Content reading is deferred to the streaming
+/// producer in the index pipeline.
+///
+/// # Ordering
+///
+/// Entries are sorted by `rel_path` after parallel collection, giving
+/// deterministic FileId assignment in the consumer.
+///
+/// # Errors
+///
+/// Returns `Err` only for fatal walker-setup errors. Per-file metadata errors
+/// are collected as [`SkipReason::ReadError`] in the skipped list.
+pub(super) fn walk_metadata(
+    root: &Path,
+    max_files: usize,
+) -> anyhow::Result<(Vec<WalkEntry>, Vec<SkipReason>)> {
+    let entries = Arc::new(Mutex::new(Vec::with_capacity(max_files.min(4096))));
+    let skipped = Arc::new(Mutex::new(Vec::<SkipReason>::with_capacity(256)));
+    let entry_count = Arc::new(AtomicUsize::new(0));
+    let cap_reached = Arc::new(AtomicBool::new(false));
+    let root_buf = root.to_path_buf();
+
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .require_git(false)
+        .follow_links(false);
+
+    builder.build_parallel().run(|| {
+        let entries = Arc::clone(&entries);
+        let skipped = Arc::clone(&skipped);
+        let entry_count = Arc::clone(&entry_count);
+        let cap_reached = Arc::clone(&cap_reached);
+        let root = root_buf.clone();
+        Box::new(move |entry_result| {
+            if entry_count.load(Ordering::Relaxed) >= max_files {
+                if !cap_reached.swap(true, Ordering::Relaxed) {
+                    let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.len() < MAX_SKIP_REASONS {
+                        guard.push(SkipReason::CapReached);
+                    }
+                }
+                return WalkState::Quit;
+            }
+
+            match entry_result {
+                Ok(entry) => match classify_entry_metadata(&entry, &root) {
+                    MetaOutcome::Accept(we) => {
+                        entry_count.fetch_add(1, Ordering::Relaxed);
+                        entries.lock().unwrap_or_else(|e| e.into_inner()).push(we);
+                    }
+                    MetaOutcome::Skip(reason) => {
+                        let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.len() < MAX_SKIP_REASONS {
+                            guard.push(reason);
+                        }
+                    }
+                    MetaOutcome::Transparent => {}
+                },
+                Err(err) => {
+                    let path = match &err {
+                        ignore::Error::WithPath { path, .. } => path.clone(),
+                        _ => PathBuf::new(),
+                    };
+                    let mut guard = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.len() < MAX_SKIP_REASONS {
+                        guard.push(SkipReason::ReadError {
+                            path,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+            WalkState::Continue
+        })
+    });
+
+    let mut entries = Arc::try_unwrap(entries)
+        .map_err(|_| {
+            anyhow::anyhow!("entries Arc still has multiple owners after walker completion")
+        })?
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+    let skipped = Arc::try_unwrap(skipped)
+        .map_err(|_| {
+            anyhow::anyhow!("skipped Arc still has multiple owners after walker completion")
+        })?
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Parallel threads may over-collect beyond max_files due to TOCTOU on the
+    // atomic counter.
+    entries.truncate(max_files);
+
+    // Sort for deterministic FileId assignment in the consumer.
+    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    Ok((entries, skipped))
+}
+
+// ============================================================================
 // Walker entry handler
 // ============================================================================
 
@@ -320,6 +507,7 @@ pub(super) fn walk_and_read(
 /// All `.lock()` calls use `unwrap_or_else(|e| e.into_inner())` so that a
 /// panic in one parallel thread does not cascade-abort the remaining threads
 /// via a poisoned-lock panic.
+#[cfg(test)]
 fn handle_entry(
     entry_result: Result<ignore::DirEntry, ignore::Error>,
     files: &Mutex<Vec<ReadFile>>,
@@ -384,7 +572,7 @@ fn handle_entry(
 ///
 /// Returns a [`ReadOutcome`] variant rather than an `io::Error` so that the
 /// caller can match on typed cases without inspecting error message text.
-fn open_and_read(path: &Path) -> ReadOutcome {
+pub(super) fn open_and_read(path: &Path) -> ReadOutcome {
     let mut file = match fs::File::open(path) {
         Ok(f) => f,
         Err(e) => return ReadOutcome::Io(e),
@@ -415,7 +603,7 @@ fn open_and_read(path: &Path) -> ReadOutcome {
 /// Minification heuristic: probe the first [`MINIFY_PROBE_BYTES`] bytes. If
 /// they contain no newlines, or the average bytes-per-line exceeds
 /// [`MINIFY_AVG_LINE_BYTES`], the file is considered minified.
-fn is_minified(content: &str) -> bool {
+pub(super) fn is_minified(content: &str) -> bool {
     let probe_len = content.len().min(MINIFY_PROBE_BYTES);
     // probe_len <= content.len(), so the slice is always in-bounds.
     let probe = &content.as_bytes()[..probe_len];

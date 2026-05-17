@@ -2,50 +2,37 @@
 //!
 //! # Data flow
 //!
-//! **Full build** (no manifest, or `--force`):
+//! **Streaming build** (Commit 3):
 //! 1. `discover_project_root(cwd)` → walk up to `.git`, fall back to cwd
 //! 2. Resolve cache dir: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/`
-//! 3. `walk_and_read(root, max_files)` → per-file content + mtime
-//! 4. Classify in parallel (rayon): compute SHA-256, apply 4-tier mtime/SHA
-//!    cache logic, call `classify_source` on misses → field_map
-//! 5. Build (sequential): `NgramIndexBuilder::new()` + `add_file_classified()` + `build()`
-//! 6. Write manifest atomically (last — marks index as coherent)
+//! 3. `walk_metadata(root, max_files)` → metadata-only WalkEntry list (sorted)
+//! 4. Producer thread: for each entry, reads content, computes SHA, applies
+//!    4-tier mtime/SHA cache, classifies; sends ProcessedFile on bounded channel
+//! 5. Consumer thread: receives ProcessedFile, calls add_file_classified, inserts
+//!    manifest entry, drops content → peak memory bounded by channel capacity
+//! 6. `builder.build()` flushes index; manifest written after (marks coherence)
 //! 7. Print summary to stderr
 //!
 //! **Incremental build** (manifest exists, no `--force`):
-//! - Same walk+read (all files must be read for bigram extraction).
-//! - Load manifest → 4-tier cache: SHA-256 match → reuse cached field_map.
+//! - SHA-256 match → reuse cached field_map (cache hit, no classify_source call).
 //! - Always write a fresh manifest after build.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
-use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, SearchField, classify_source};
+use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, classify_source};
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
-use super::types::{IndexConfig, IndexResult, ReadFile, SkipReason};
-use super::walk::{discover_project_root, sha256_hex, walk_and_read};
-
-// ============================================================================
-// Internal type aliases (avoid complex inline types)
-// ============================================================================
-
-/// Field map type: byte ranges mapped to their AST-derived search fields.
-type FieldMap = Vec<(std::ops::Range<usize>, SearchField)>;
-
-/// Classified file: SHA-256, field_map, and whether it was a manifest cache hit.
-type ClassifiedFile = (String, FieldMap, bool);
-
-/// Intermediate result from [`Pipeline::build_and_write`].
-struct BuildResult {
-    file_count: u32,
-    cache_hits: u32,
-}
+use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
+use super::walk::{
+    discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata, ReadOutcome,
+};
 
 // ============================================================================
 // Public entry point
@@ -167,14 +154,22 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
 
 /// Orchestrates the index build pipeline as discrete, testable stages.
 ///
-/// Each stage method has a single responsibility; `run()` chains them together.
-/// All I/O side effects are confined to `new()`, `load_manifest()`, and
-/// `build_and_write()`.
+/// `run()` implements a bounded-channel streaming design:
+/// - A producer thread walks + reads files, sending [`ProcessedFile`]s.
+/// - The consumer (main thread) receives, indexes, and immediately drops content.
+///
+/// Peak memory is bounded by `CHANNEL_CAPACITY × avg_file_size` rather than
+/// the total project size.
 pub(super) struct Pipeline<'cfg> {
     config: &'cfg IndexConfig,
     cache_dir: PathBuf,
     start: Instant,
 }
+
+/// Bounded channel capacity: at most this many `ProcessedFile`s buffered in flight.
+///
+/// 64 × 5 MiB max file size = 320 MiB worst-case buffered in the channel.
+const CHANNEL_CAPACITY: usize = 64;
 
 impl<'cfg> Pipeline<'cfg> {
     /// Initialise the pipeline: resolve the cache directory and create it.
@@ -195,178 +190,218 @@ impl<'cfg> Pipeline<'cfg> {
         })
     }
 
-    /// Run all pipeline stages and return the final [`IndexResult`].
+    /// Run the streaming pipeline and return the final [`IndexResult`].
     pub(super) fn run(self) -> anyhow::Result<IndexResult> {
-        // Stage 1: Walk the project tree and read source files.
-        let (read_files, skipped_reasons) = self.walk()?;
-        let skipped_count = to_u32_capped(skipped_reasons.len());
+        // Stage 1: Metadata-only walk (no content reading).
+        let (walk_entries, walk_skips) = walk_metadata(&self.config.root, self.config.effective_max_files())?;
+        let walk_skip_count = walk_skips.len();
 
-        if read_files.is_empty() {
+        if walk_entries.is_empty() {
             // Nothing to index — write an empty manifest and return early.
             let manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
             manifest.save()?;
             return Ok(IndexResult {
                 file_count: 0,
-                skipped: skipped_count,
+                skipped: to_u32_capped(walk_skip_count),
                 cache_hits: 0,
                 duration: self.start.elapsed(),
             });
         }
 
         // Stage 2: Load the manifest for incremental builds.
-        let manifest = self.load_manifest()?;
-
-        // Stage 3: Pre-compute path keys (avoids duplicate allocations later).
-        let path_keys: Vec<String> = read_files
-            .iter()
-            .map(|rf| rf.rel_path.to_string_lossy().replace('\\', "/"))
-            .collect();
-
-        // Stage 4: Classify files (parallel: SHA + 4-tier cache logic).
-        let classified = self.classify(&read_files, &path_keys, &manifest);
-
-        // Stage 5 + 6: Build index + write manifest (sequential).
-        let build_result = self.build_and_write(&read_files, classified, path_keys)?;
-
-        Ok(IndexResult {
-            file_count: build_result.file_count,
-            skipped: skipped_count,
-            cache_hits: build_result.cache_hits,
-            duration: self.start.elapsed(),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Private stages
-    // -----------------------------------------------------------------------
-
-    /// Walk the project root and read all source files.
-    fn walk(&self) -> anyhow::Result<(Vec<ReadFile>, Vec<SkipReason>)> {
-        let max_files = self.config.effective_max_files();
-        walk_and_read(&self.config.root, max_files)
-    }
-
-    /// Load (or create an empty) [`FileManifest`] for incremental builds.
-    ///
-    /// Returns an empty manifest when `config.force` is `true`.
-    fn load_manifest(&self) -> anyhow::Result<FileManifest> {
-        if self.config.force {
-            Ok(FileManifest::new(
-                self.config.root.clone(),
-                self.cache_dir.clone(),
-            ))
+        let manifest = if self.config.force {
+            FileManifest::new(self.config.root.clone(), self.cache_dir.clone())
         } else {
-            FileManifest::load(self.config.root.clone(), self.cache_dir.clone())
-        }
-    }
+            FileManifest::load(self.config.root.clone(), self.cache_dir.clone())?
+        };
 
-    /// Classify files in parallel using the four-tier mtime/SHA cache logic.
-    ///
-    /// For each file, SHA-256 is always computed. If SHA matches the manifest
-    /// entry, the cached field_map is reused (cache hit). Otherwise
-    /// `classify_source` is called to produce a fresh field_map.
-    ///
-    /// Results are in the same order as `files`.
-    fn classify(
-        &self,
-        files: &[ReadFile],
-        path_keys: &[String],
-        manifest: &FileManifest,
-    ) -> Vec<ClassifiedFile> {
-        // Hoist the debug flag once before the rayon worker pool to avoid a
-        // syscall on every classify error across parallel workers.
+        // Stage 3: Streaming producer → consumer.
+        //
+        // The producer iterates the sorted walk_entries, reads each file,
+        // applies 4-tier cache logic, and sends ProcessedFile on a bounded
+        // channel.  The consumer (this thread) receives, indexes, and drops
+        // content immediately — keeping peak memory bounded.
+        let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(CHANNEL_CAPACITY);
+
+        // Producer-side skip counter (read errors, minification, size errors
+        // discovered during content read).
+        let producer_skips = Arc::new(AtomicU32::new(0));
+        let producer_skips_clone = Arc::clone(&producer_skips);
+
         let debug_enabled = crate::debug::is_debug_enabled();
         let force = self.config.force;
 
-        files
-            .par_iter()
-            .zip(path_keys.par_iter())
-            .map(|(rf, path_key)| {
-                // Always compute SHA-256 — it is the correctness guarantee.
-                let sha = sha256_hex(rf.content.as_bytes());
+        // Clone data needed by the producer thread.
+        let root_for_producer = self.config.root.clone();
 
-                if force {
-                    // --force: skip all cache logic.
-                    return (sha, run_classify(&rf.content, rf.lang, debug_enabled), false);
+        // Spawn producer thread.
+        let producer_handle = std::thread::spawn(move || {
+            for entry in &walk_entries {
+                match read_and_classify(entry, &root_for_producer, &manifest, force, debug_enabled) {
+                    Ok(pf) => {
+                        // Send blocks when the channel is full — this is the
+                        // backpressure mechanism that limits peak memory.
+                        if tx.send(pf).is_err() {
+                            // Consumer dropped the receiver (fatal error on consumer side).
+                            // Break so the producer doesn't spin fruitlessly.
+                            break;
+                        }
+                    }
+                    Err(_reason) => {
+                        // Count read/minification errors; continue with next file.
+                        producer_skips_clone.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
+            }
+            // `tx` is dropped here, which closes the channel and signals EOF to consumer.
+        });
 
-                if let Some(entry) = manifest.lookup(path_key)
-                    && entry.sha256 == sha
-                {
-                    // SHA matches → safe to reuse field_map regardless of mtime.
-                    return (sha, decode_field_map(&entry.field_map), true);
-                    // If SHA mismatches, fall through to fresh classify.
-                }
-
-                // No entry or SHA mismatch → classify.
-                (sha, run_classify(&rf.content, rf.lang, debug_enabled), false)
-            })
-            .collect()
-    }
-
-    /// Build the n-gram index and atomically write the manifest.
-    ///
-    /// Iterates `files` and `classified` together. A manual `next_file_id`
-    /// counter ensures the builder's sequential `FileId` invariant is preserved
-    /// even when `add_file_classified` fails (fail-soft path). The previous
-    /// `enumerate()` approach had a latent bug: a fail-soft `continue` advanced
-    /// the loop index while `builder.file_count` stayed behind, causing the
-    /// builder to reject all subsequent files.
-    fn build_and_write(
-        &self,
-        files: &[ReadFile],
-        classified: Vec<ClassifiedFile>,
-        path_keys: Vec<String>,
-    ) -> anyhow::Result<BuildResult> {
-        let debug_enabled = crate::debug::is_debug_enabled();
-
-        let cache_hits = to_u32_capped(classified.iter().filter(|(_, _, hit)| *hit).count());
-
+        // Consumer: receives ProcessedFile, builds the index sequentially.
+        //
+        // `next_file_id` only increments after a successful `add_file_classified`,
+        // preserving the builder's sequential FileId invariant even on errors.
         let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
-        let mut new_manifest =
-            FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+        let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
         let mut next_file_id: u32 = 0;
+        let mut cache_hits: u32 = 0;
 
-        for ((rf, (sha, field_map, _)), path_key) in
-            files.iter().zip(classified).zip(path_keys)
-        {
-            // Fail-soft: a single file failure must not abort a 50 K-file build.
-            // IMPORTANT: only advance `next_file_id` after a successful add so the
-            // builder's sequential FileId invariant is never violated.
-            if let Err(e) =
-                builder.add_file_classified(FileId(next_file_id), &rf.content, rf.lang, &field_map)
-            {
+        for pf in rx {
+            // Fail-soft: a classify or builder error on one file must not abort
+            // a 50 K-file build.
+            if let Err(e) = builder.add_file_classified(
+                FileId(next_file_id),
+                &pf.content,
+                pf.lang,
+                &pf.field_map,
+            ) {
                 if debug_enabled {
                     eprintln!(
                         "skim search index [debug]: add_file_classified failed for {:?}: {e}",
-                        rf.rel_path
+                        pf.rel_path
                     );
                 }
+                // Do NOT increment next_file_id — invariant preserved.
                 continue;
             }
-            // Increment only on success.
+
+            // Success: advance counter and record in manifest.
             next_file_id = next_file_id.checked_add(1).ok_or_else(|| {
                 anyhow::anyhow!("next_file_id overflows u32; too many files in index")
             })?;
+            if pf.cache_hit {
+                cache_hits = cache_hits.saturating_add(1);
+            }
+
+            let path_key = pf.rel_path.to_string_lossy().replace('\\', "/");
             new_manifest.insert(ManifestEntry {
                 path: path_key,
-                sha256: sha,
-                lang: rf.lang.as_str().to_string(),
-                field_map: encode_field_map(&field_map),
-                mtime: rf.mtime,
+                sha256: pf.sha256,
+                lang: pf.lang.as_str().to_string(),
+                field_map: encode_field_map(&pf.field_map),
+                mtime: pf.mtime,
             });
+            // `pf.content` is dropped here — memory released immediately.
         }
+
+        // Wait for the producer to finish and propagate any panic.
+        producer_handle.join().map_err(|e| {
+            anyhow::anyhow!(
+                "producer thread panicked: {:?}",
+                e.downcast_ref::<String>()
+                    .map(String::as_str)
+                    .unwrap_or("<non-string panic>")
+            )
+        })?;
 
         // build() flushes index.skidx + index.skpost.
         let _layer = builder.build()?;
         // Manifest written last — marks index as coherent.
         new_manifest.save()?;
 
-        Ok(BuildResult {
+        let total_skipped = to_u32_capped(walk_skip_count)
+            .saturating_add(producer_skips.load(Ordering::Relaxed));
+
+        Ok(IndexResult {
             file_count: next_file_id,
+            skipped: total_skipped,
             cache_hits,
+            duration: self.start.elapsed(),
         })
     }
+}
+
+// ============================================================================
+// Streaming producer helper
+// ============================================================================
+
+/// Read a file's content, apply 4-tier mtime/SHA cache logic, and produce a
+/// [`ProcessedFile`] — or a [`SkipReason`] if the file should be excluded.
+///
+/// Called by the producer thread for each [`WalkEntry`].
+fn read_and_classify(
+    entry: &WalkEntry,
+    _root: &Path,
+    manifest: &FileManifest,
+    force: bool,
+    debug: bool,
+) -> Result<ProcessedFile, SkipReason> {
+    // Read content (size check + UTF-8 validation).
+    let content = match open_and_read(&entry.abs_path) {
+        ReadOutcome::Content(c) => c,
+        ReadOutcome::NonUtf8 => return Err(SkipReason::NonUtf8(entry.abs_path.clone())),
+        ReadOutcome::TooLarge(size) => {
+            return Err(SkipReason::TooLarge {
+                path: entry.abs_path.clone(),
+                size,
+            });
+        }
+        ReadOutcome::Io(e) => {
+            return Err(SkipReason::ReadError {
+                path: entry.abs_path.clone(),
+                error: e.to_string(),
+            });
+        }
+    };
+
+    // Minification check (tree-sitter languages only).
+    if !entry.lang.is_serde_based() && is_minified(&content) {
+        return Err(SkipReason::Minified(entry.abs_path.clone()));
+    }
+
+    // Always compute SHA — it is the correctness guarantee.
+    let sha = sha256_hex(content.as_bytes());
+
+    // 4-tier cache logic.
+    let path_key = entry.rel_path.to_string_lossy().replace('\\', "/");
+
+    if !force
+        && let Some(cached) = manifest.lookup(&path_key)
+        && cached.sha256 == sha
+    {
+        // SHA match → reuse field_map (cache hit).
+        return Ok(ProcessedFile {
+            rel_path: entry.rel_path.clone(),
+            lang: entry.lang,
+            content,
+            sha256: sha,
+            mtime: entry.mtime,
+            field_map: decode_field_map(&cached.field_map),
+            cache_hit: true,
+        });
+    }
+
+    // Cache miss or --force → classify.
+    let field_map = run_classify(&content, entry.lang, debug);
+
+    Ok(ProcessedFile {
+        rel_path: entry.rel_path.clone(),
+        lang: entry.lang,
+        content,
+        sha256: sha,
+        mtime: entry.mtime,
+        field_map,
+        cache_hit: false,
+    })
 }
 
 // ============================================================================

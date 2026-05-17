@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::{discover_project_root, sha256_hex, walk_and_read};
+use super::{discover_project_root, sha256_hex, walk_and_read, walk_metadata};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -489,6 +489,73 @@ fn test_mtime_populated_in_walk() {
             f.mtime.is_some(),
             "mtime should be Some for {} on a platform that exposes mtime",
             f.rel_path.display()
+        );
+    }
+}
+
+// ============================================================================
+// walk_metadata — Commit 3 tests
+// ============================================================================
+
+/// `walk_metadata` returns entries sorted by `rel_path` (lexicographic).
+#[test]
+fn test_walk_metadata_returns_sorted_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("z_last.rs"), "fn z() {}\n").unwrap();
+    fs::write(root.join("a_first.rs"), "fn a() {}\n").unwrap();
+    fs::write(root.join("m_middle.rs"), "fn m() {}\n").unwrap();
+
+    let root = root.canonicalize().unwrap();
+    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    let paths: Vec<PathBuf> = entries.iter().map(|e| e.rel_path.clone()).collect();
+
+    // Must be sorted lexicographically.
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(
+        paths, sorted,
+        "walk_metadata entries must be sorted by rel_path"
+    );
+}
+
+/// `walk_metadata` respects the `max_files` cap — returns at most `max_files` entries.
+#[test]
+fn test_walk_metadata_respects_max_files_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    for i in 0..12 {
+        fs::write(root.join(format!("file_{i:02}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+    }
+
+    let root = root.canonicalize().unwrap();
+    let (entries, _) = walk_metadata(&root, 3).unwrap();
+    assert_eq!(
+        entries.len(),
+        3,
+        "walk_metadata should return at most max_files=3 entries, got {}",
+        entries.len()
+    );
+}
+
+/// All `WalkEntry` values from `walk_metadata` should carry `mtime: Some(...)`.
+#[test]
+fn test_walk_metadata_includes_mtime() {
+    let dir = make_sample_tree();
+    let root = dir.path().canonicalize().unwrap();
+
+    let (entries, _) = walk_metadata(&root, 50_000).unwrap();
+    assert!(
+        !entries.is_empty(),
+        "make_sample_tree() must produce at least one entry"
+    );
+    for e in &entries {
+        assert!(
+            e.mtime.is_some(),
+            "WalkEntry for {} should have mtime: Some(...)",
+            e.rel_path.display()
         );
     }
 }
