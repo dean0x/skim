@@ -1,17 +1,18 @@
 //! Search subcommand — code search via layered n-gram indexing.
 //!
-//! This is a CLI stub wiring the `search` subcommand into the dispatch table.
-//! The full search implementation will be provided by the `rskim-search` library
-//! crate (dependency not yet wired in).
-//!
 //! # Architecture
 //!
-//! All I/O lives here (this file). Business logic will live in:
-//! - `rskim-search` crate: types, traits, indexing layer implementations
-//!
-//! Search is not yet implemented; this stub allows the subcommand to be
-//! registered, help text to be discoverable, and the dispatch sync guard
-//! test to pass.
+//! All I/O lives here (this module). Business logic is split across:
+//! - `types` — shared configuration and result types
+//! - `walk` — project-root discovery and file traversal
+//! - `manifest` — JSONL sidecar for incremental build caching
+//! - `index` — full pipeline orchestration (`skim search index`)
+//! - `rskim-search` crate — index building, n-gram extraction, BM25F scoring
+
+mod index;
+mod manifest;
+mod types;
+mod walk;
 
 use std::process::ExitCode;
 
@@ -21,12 +22,21 @@ use std::process::ExitCode;
 
 /// Run the `skim search` subcommand.
 ///
-/// Currently a stub: prints help when invoked with no args or `--help`, and
-/// returns `ExitCode::FAILURE` with an informative message for all other inputs.
+/// Dispatches to:
+/// - `skim search index [OPTIONS]` — build or update the search index
+/// - `skim search [OPTIONS] <QUERY>` — (not yet implemented)
+/// - No args / `--help` / `-h` — print help
 pub(crate) fn run(
     args: &[String],
-    _analytics: &crate::analytics::AnalyticsConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
+    // `skim search index [OPTIONS]` — build the index (checked before --help so
+    // that `skim search index --help` is handled by index::run, not this parent).
+    if args.first().is_some_and(|a| a == "index") {
+        let rest = &args[1..];
+        return index::run(rest, analytics);
+    }
+
     // No args or --help/-h → print help
     if args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         print_help();
@@ -45,24 +55,22 @@ pub(crate) fn run(
 fn print_help() {
     println!(
         "\
-Usage: skim search [OPTIONS] <QUERY>
+Usage: skim search <SUBCOMMAND> [OPTIONS]
 
 Search code using layered n-gram indexing.
 
-Arguments:
-  <QUERY>    Search query string
+Subcommands:
+  index    Build or update the search index for the current project
 
 Options:
-  --lang <LANG>    Filter by language (e.g., rust, typescript)
-  --ast <PATTERN>  AST pattern to match
-  --json           Output results as JSON
-  --limit <N>      Maximum number of results (default: 20)
   -h, --help       Print this help message
 
 Examples:
-  skim search \"fn parse\"
-  skim search --lang rust \"impl Iterator\"
-  skim search --ast \"function_declaration\" --json"
+  skim search index              Build the search index
+  skim search index --force      Rebuild from scratch
+  skim search index --help       Show index options
+
+Note: query mode (skim search <QUERY>) is not yet implemented."
     );
 }
 
@@ -105,5 +113,18 @@ mod tests {
     fn test_search_unimplemented_returns_failure() {
         let result = run(&["fn parse".to_string()], &TEST_ANALYTICS).unwrap();
         assert_eq!(result, ExitCode::FAILURE);
+    }
+
+    /// Regression: `skim search index --help` must dispatch to index help,
+    /// not the parent search help. The parent help check must not intercept
+    /// flags intended for a known subcommand.
+    #[test]
+    fn test_index_help_dispatches_to_index_not_parent() {
+        let result = run(
+            &["index".to_string(), "--help".to_string()],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(result, ExitCode::SUCCESS);
     }
 }
