@@ -34,7 +34,7 @@ pub(crate) fn run(
     // that `skim search index --help` is handled by index::run, not this parent).
     if args.first().is_some_and(|a| a == "index") {
         let rest = &args[1..];
-        return index::run(rest);
+        return index::run(rest, _analytics);
     }
 
     // No args or --help/-h → print help

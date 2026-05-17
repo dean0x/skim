@@ -57,7 +57,10 @@ type ClassifiedFile = (FieldMap, bool);
 /// Returns `Err` only for fatal I/O failures. User-facing errors (unsupported
 /// languages, too-large files) are counted and reported to stderr but do not
 /// cause a non-zero exit code.
-pub(super) fn run(args: &[String]) -> anyhow::Result<ExitCode> {
+pub(super) fn run(
+    args: &[String],
+    _analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
     let cli = match IndexCli::try_parse_from(
         std::iter::once(&"skim search index".to_string()).chain(args),
     ) {
@@ -214,21 +217,32 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     // 5. Build the index sequentially (NgramIndexBuilder is not Sync).
     // 6. Accumulate manifest entries in the same pass (avoids a second enumerate loop).
     //
-    // Consume path_keys via into_iter() zipped with classified so ownership
-    // transfer is explicit — no implicit indexing invariant, no empty strings
-    // left behind in the vec.
+    // Zip-consume path_keys and classified so their ownership is transferred
+    // explicitly — no indexing invariant to maintain, no residual entries.
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;
     let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
     for (idx, ((rf, (field_map, _)), path_key)) in read_files
         .iter()
-        .zip(classified.into_iter())
-        .zip(path_keys.into_iter())
+        .zip(classified)
+        .zip(path_keys)
         .enumerate()
     {
         // Guard against usize overflow into FileId(u32) on pathological inputs.
         let file_id = u32::try_from(idx)
             .map_err(|_| anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files"))?;
-        builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, &field_map)?;
+        // Fail-soft: a single file that fails to index should not abort a
+        // 50 K-file build. Log the error under debug and continue.
+        if let Err(e) =
+            builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, &field_map)
+        {
+            if debug_enabled {
+                eprintln!(
+                    "skim search index [debug]: add_file_classified failed for {:?}: {e}",
+                    rf.rel_path
+                );
+            }
+            continue;
+        }
         new_manifest.insert(ManifestEntry {
             path: path_key,
             sha256: rf.sha256.clone(),
@@ -314,7 +328,7 @@ fn project_root_hash(canonical_root: &Path) -> String {
     // Take first 8 bytes → 16 hex chars
     let mut hex = String::with_capacity(16);
     for byte in digest.iter().take(8) {
-        write!(hex, "{byte:02x}").unwrap();
+        write!(hex, "{byte:02x}").expect("write! to String is infallible");
     }
     hex
 }
