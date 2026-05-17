@@ -55,29 +55,22 @@ pub(crate) fn run(
 fn print_help() {
     println!(
         "\
-Usage: skim search <SUBCOMMAND|QUERY> [OPTIONS]
+Usage: skim search <SUBCOMMAND> [OPTIONS]
 
 Search code using layered n-gram indexing.
 
 Subcommands:
   index    Build or update the search index for the current project
 
-Arguments:
-  <QUERY>    Search query string (direct query mode, index must exist)
-
 Options:
-  --lang <LANG>    Filter by language (e.g., rust, typescript)
-  --ast <PATTERN>  AST pattern to match
-  --json           Output results as JSON
-  --limit <N>      Maximum number of results (default: 20)
   -h, --help       Print this help message
 
 Examples:
   skim search index              Build the search index
   skim search index --force      Rebuild from scratch
-  skim search \"fn parse\"
-  skim search --lang rust \"impl Iterator\"
-  skim search --ast \"function_declaration\" --json"
+  skim search index --help       Show index options
+
+Note: query mode (skim search <QUERY>) is not yet implemented."
     );
 }
 
