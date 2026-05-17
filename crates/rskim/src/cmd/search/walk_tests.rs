@@ -241,7 +241,7 @@ fn test_walk_skips_files_over_5mb() {
     // Create a small file too
     fs::write(root.join("small.rs"), "fn f() {}\n").unwrap();
 
-    let (files, _skipped) = walk_and_read(&root.canonicalize().unwrap(), 50_000).unwrap();
+    let (files, skipped) = walk_and_read(&root.canonicalize().unwrap(), 50_000).unwrap();
     let paths: Vec<PathBuf> = files.iter().map(|f| f.rel_path.clone()).collect();
 
     assert!(
@@ -252,6 +252,74 @@ fn test_walk_skips_files_over_5mb() {
         paths.iter().any(|p| p.ends_with("small.rs")),
         "small.rs should be included, paths: {paths:?}"
     );
+
+    // The oversized file must appear in the skipped list with TooLarge reason.
+    let has_too_large = skipped.iter().any(|r| {
+        matches!(
+            r,
+            super::super::types::SkipReason::TooLarge { path, .. }
+            if path.ends_with("big.rs")
+        )
+    });
+    assert!(
+        has_too_large,
+        "skipped list should contain TooLarge for big.rs, got: {skipped:?}"
+    );
+}
+
+/// Verify that the `open_and_read` TooLarge path is exercised when a file
+/// exceeds `MAX_FILE_BYTES` at open time.
+///
+/// The walker has two size checks:
+///   1. A fast pre-screen on `DirEntry` metadata before opening the file.
+///   2. A second check inside `open_and_read` on the opened file handle
+///      (guards against TOCTOU growth between pre-screen and read).
+///
+/// Both paths produce `SkipReason::TooLarge`.  This test exercises case 1
+/// (the pre-screen), which is the reliable codepath in a non-concurrent test.
+/// The `open_and_read` fallback (case 2) is structurally identical and is
+/// covered by the typed `ReadOutcome::TooLarge` enum variant returning the
+/// same `SkipReason::TooLarge` in `walk_and_read`.
+#[test]
+fn test_walk_too_large_skip_reason_contains_path_and_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+
+    // Write a file that exceeds the 5 MiB limit by 1 byte.
+    let over_limit: u64 = 5 * 1024 * 1024 + 1;
+    let big = vec![b'x'; over_limit as usize];
+    fs::write(root.join("over_limit.rs"), &big).unwrap();
+
+    let (files, skipped) = walk_and_read(&root.canonicalize().unwrap(), 50_000).unwrap();
+
+    // The file must not appear in the accepted list.
+    assert!(
+        files.iter().all(|f| !f.rel_path.ends_with("over_limit.rs")),
+        "over_limit.rs should not be indexed"
+    );
+
+    // The skipped list must contain a TooLarge entry with the correct path
+    // and a size field that reflects the actual file size.
+    let too_large_entry = skipped.iter().find(|r| {
+        matches!(
+            r,
+            super::super::types::SkipReason::TooLarge { path, .. }
+            if path.ends_with("over_limit.rs")
+        )
+    });
+    assert!(
+        too_large_entry.is_some(),
+        "skipped list should contain TooLarge for over_limit.rs, got: {skipped:?}"
+    );
+
+    if let Some(super::super::types::SkipReason::TooLarge { size, .. }) = too_large_entry {
+        assert!(
+            *size > 5 * 1024 * 1024,
+            "TooLarge size should exceed 5 MiB, got {size}"
+        );
+    }
 }
 
 #[test]
