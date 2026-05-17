@@ -218,6 +218,71 @@ fn test_save_is_atomic_existing_file_replaced() {
 }
 
 // ============================================================================
+// Safety limits
+// ============================================================================
+
+#[test]
+fn test_load_stops_at_entry_cap() {
+    use super::MAX_MANIFEST_ENTRIES;
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // Write a manifest with more entries than MAX_MANIFEST_ENTRIES.
+    let path = cache_dir.join("index.skfiles");
+    let mut f = std::fs::File::create(&path).unwrap();
+
+    // Header line
+    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    writeln!(f, "{header}").unwrap();
+
+    // Write MAX_MANIFEST_ENTRIES + 10 entry lines.
+    for i in 0..(MAX_MANIFEST_ENTRIES + 10) {
+        let entry = serde_json::json!({
+            "path": format!("src/file_{i}.rs"),
+            "sha256": "a".repeat(64),
+            "lang": "rust",
+            "field_map": []
+        });
+        writeln!(f, "{entry}").unwrap();
+    }
+    drop(f);
+
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    // Must not exceed the cap (entries beyond the cap are simply ignored).
+    assert!(
+        manifest.entries.len() <= MAX_MANIFEST_ENTRIES,
+        "entry count {} exceeds MAX_MANIFEST_ENTRIES {}",
+        manifest.entries.len(),
+        MAX_MANIFEST_ENTRIES
+    );
+}
+
+#[test]
+fn test_load_oversized_file_returns_empty_manifest() {
+    use super::MAX_MANIFEST_FILE_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+    let path = cache_dir.join("index.skfiles");
+
+    // Create a sparse file that reports a size exceeding the limit without
+    // allocating real disk space (seek-then-write a single byte at the end).
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(MAX_MANIFEST_FILE_BYTES + 1).unwrap();
+    drop(file);
+
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    assert!(
+        manifest.lookup("anything").is_none(),
+        "oversized manifest should be discarded and return empty"
+    );
+}
+
+// ============================================================================
 // Wrong-root detection
 // ============================================================================
 

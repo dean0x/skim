@@ -61,6 +61,25 @@ pub(super) struct ManifestEntry {
 }
 
 // ============================================================================
+// Safety limits
+// ============================================================================
+
+/// Maximum number of entries accepted from a manifest file.
+///
+/// Guards against unbounded memory growth from a corrupted manifest with
+/// millions of lines. 60 000 files far exceeds any realistic monorepo.
+const MAX_MANIFEST_ENTRIES: usize = 60_000;
+
+/// Maximum manifest file size accepted before parsing.
+///
+/// A single multi-gigabyte line (no newlines) would cause `BufReader::lines`
+/// to allocate that entire line into a `String`. Reject oversized files up
+/// front rather than discovering OOM mid-parse.
+///
+/// 256 MiB is several orders of magnitude larger than any realistic manifest.
+const MAX_MANIFEST_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+// ============================================================================
 // Manifest store
 // ============================================================================
 
@@ -123,6 +142,15 @@ impl FileManifest {
             }
         };
 
+        // Guard: reject suspiciously large manifest files before allocating
+        // line buffers. A single line without a newline would allocate the
+        // entire file content into one String — cap to MAX_MANIFEST_FILE_BYTES.
+        if let Ok(meta) = file.metadata() {
+            if meta.len() > MAX_MANIFEST_FILE_BYTES {
+                return Ok(Self::new(project_root, cache_dir));
+            }
+        }
+
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
@@ -157,13 +185,20 @@ impl FileManifest {
         // --- Parse entry lines ---
         let mut entries = HashMap::with_capacity(1024);
         for line_result in lines {
+            // Hard cap: stop reading if the manifest is unreasonably large.
+            // Protects against corrupted files with millions of valid entries.
+            if entries.len() >= MAX_MANIFEST_ENTRIES {
+                break;
+            }
+
             let line = match line_result {
                 Ok(l) if l.trim().is_empty() => continue,
                 Ok(l) => l,
                 Err(_) => continue,
             };
             if let Ok(entry) = serde_json::from_str::<ManifestEntry>(&line) {
-                entries.insert(entry.path.clone(), entry);
+                let key = entry.path.clone();
+                entries.insert(key, entry);
             }
             // Silently skip unparseable lines (partial-write recovery).
         }
@@ -181,7 +216,10 @@ impl FileManifest {
 
     /// Insert or replace an entry (keyed by `entry.path`).
     pub(super) fn insert(&mut self, entry: ManifestEntry) {
-        self.entries.insert(entry.path.clone(), entry);
+        // Clone the key from the entry before the move so the entry itself
+        // is stored once without an extra heap allocation for a separate key.
+        let key = entry.path.clone();
+        self.entries.insert(key, entry);
     }
 
     // -----------------------------------------------------------------------
@@ -236,6 +274,11 @@ impl FileManifest {
         // Flush the buffer before persisting so all bytes reach the temp file.
         buf.flush()?;
         let tmp = buf.into_inner().context("failed to flush manifest buffer")?;
+
+        // Sync data to storage before renaming so that the manifest is not
+        // left with zeros or partial content after a power loss that occurs
+        // between the OS page-cache flush and the physical write.
+        tmp.as_file().sync_data()?;
 
         let manifest_path = self.cache_dir.join(Self::MANIFEST_FILENAME);
         tmp.persist(&manifest_path)
