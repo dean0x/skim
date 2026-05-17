@@ -269,10 +269,8 @@ fn is_tree_sitter_language(lang: Language) -> bool {
 /// [`MINIFY_AVG_LINE_BYTES`], the file is considered minified.
 fn is_minified(content: &str) -> bool {
     let probe_len = content.len().min(MINIFY_PROBE_BYTES);
-    let probe = content
-        .as_bytes()
-        .get(..probe_len)
-        .unwrap_or(content.as_bytes());
+    // probe_len <= content.len(), so the slice is always in-bounds.
+    let probe = &content.as_bytes()[..probe_len];
     let newline_count = probe.iter().filter(|&&b| b == b'\n').count();
     if newline_count == 0 {
         return probe.len() > MINIFY_AVG_LINE_BYTES;

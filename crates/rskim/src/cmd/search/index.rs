@@ -160,7 +160,7 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     // 2. Walk and read all source files.
     let max_files = config.effective_max_files();
     let (read_files, skipped_reasons) = walk_and_read(&config.root, max_files)?;
-    let skipped_count = u32::try_from(skipped_reasons.len()).unwrap_or(u32::MAX);
+    let skipped_count = to_u32_capped(skipped_reasons.len());
 
     if read_files.is_empty() {
         // Nothing to index — write an empty manifest and return.
@@ -205,25 +205,18 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
         })
         .collect();
 
-    let cache_hits =
-        u32::try_from(classified.iter().filter(|(_, hit)| *hit).count()).unwrap_or(u32::MAX);
+    let cache_hits = to_u32_capped(classified.iter().filter(|(_, hit)| *hit).count());
 
     // 5. Build the index sequentially (NgramIndexBuilder is not Sync).
+    // 6. Accumulate manifest entries in the same pass (avoids a second enumerate loop).
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;
+    let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
     for (idx, rf) in read_files.iter().enumerate() {
-        let (ref field_map, _) = classified[idx];
+        let field_map = &classified[idx].0;
         // Guard against usize overflow into FileId(u32) on pathological inputs.
         let file_id = u32::try_from(idx)
             .map_err(|_| anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files"))?;
         builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, field_map)?;
-    }
-    // build() flushes index.skidx + index.skpost
-    let _layer = builder.build()?;
-
-    // 6. Write the manifest sidecar (written last — marks index as coherent).
-    let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
-    for (idx, rf) in read_files.iter().enumerate() {
-        let (ref field_map, _) = classified[idx];
         new_manifest.insert(ManifestEntry {
             path: path_keys[idx].clone(),
             sha256: rf.sha256.clone(),
@@ -231,9 +224,11 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
             field_map: encode_field_map(field_map),
         });
     }
+    // build() flushes index.skidx + index.skpost; manifest written after (marks coherence).
+    let _layer = builder.build()?;
     new_manifest.save()?;
 
-    let file_count = u32::try_from(read_files.len()).unwrap_or(u32::MAX);
+    let file_count = to_u32_capped(read_files.len());
 
     Ok(IndexResult {
         file_count,
@@ -246,6 +241,14 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+/// Saturating cast from `usize` to `u32`.
+///
+/// Returns `u32::MAX` on overflow — used for counters that only need
+/// approximate values for display when the file count exceeds 4 billion.
+fn to_u32_capped(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
 
 /// Call `classify_source` and return the field_map.
 ///
