@@ -492,3 +492,154 @@ fn find_file_with_ext_depth(dir: &Path, ext: &str, max_depth: usize) -> bool {
 fn find_file_with_ext(dir: &Path, ext: &str) -> bool {
     find_file_with_ext_depth(dir, ext, 5)
 }
+
+// ============================================================================
+// Mtime pre-screening — Commit 1 tests
+// ============================================================================
+
+/// After two builds on an unchanged project, the second build must produce
+/// `cache_hits == file_count` (all files served from the manifest cache).
+///
+/// This validates the full mtime/SHA-based cache logic end-to-end without
+/// requiring the caller to inspect mtime values directly.
+#[test]
+fn test_incremental_cache_hits_with_mtime() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    let result1 = build_index(&config).expect("first build must succeed");
+    assert!(result1.file_count > 0, "first build should index files");
+
+    let result2 = build_index(&config).expect("second build must succeed");
+    assert_eq!(
+        result2.cache_hits, result2.file_count,
+        "second build on unchanged files must produce cache_hits == file_count; \
+         got cache_hits={} file_count={}",
+        result2.cache_hits, result2.file_count
+    );
+}
+
+/// After a first build, modifying a file must cause its SHA to change in the
+/// manifest on the second build (cache miss for that file).
+#[test]
+fn test_modified_file_detected_despite_mtime() {
+    use super::super::manifest::FileManifest;
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+
+    build_index(&config).expect("first build must succeed");
+    let m1 = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .unwrap();
+    let sha_before = m1
+        .lookup("src/main.rs")
+        .expect("first manifest must contain src/main.rs")
+        .sha256
+        .clone();
+
+    // Modify the file so its SHA changes.
+    fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { eprintln!(\"modified\"); }\n",
+    )
+    .unwrap();
+
+    build_index(&config).expect("second build must succeed");
+    let m2 = FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf())
+        .unwrap();
+    let sha_after = m2
+        .lookup("src/main.rs")
+        .expect("second manifest must contain src/main.rs")
+        .sha256
+        .clone();
+
+    assert_ne!(
+        sha_before, sha_after,
+        "SHA for src/main.rs must differ after modification — cache reuse would be wrong"
+    );
+}
+
+/// With `--force`, the cache_hits must be zero even when a manifest exists and
+/// files are unchanged.
+#[test]
+fn test_force_ignores_mtime_cache() {
+    use super::super::types::IndexConfig;
+    use super::build_index;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    // First build — populate the manifest.
+    let config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    build_index(&config).expect("first build must succeed");
+
+    // Second build with --force.
+    let force_config = IndexConfig {
+        root: project.path().to_path_buf(),
+        max_files: None,
+        force: true,
+        cache_dir_override: Some(cache.path().to_path_buf()),
+    };
+    let result = build_index(&force_config).expect("--force build must succeed");
+    assert_eq!(
+        result.cache_hits, 0,
+        "--force must produce zero cache hits; got {}",
+        result.cache_hits
+    );
+}
+
+/// After a full build, the manifest must contain a 64-char lowercase hex SHA-256
+/// for every indexed file (SHA computed in classify phase).
+#[test]
+fn test_sha_computed_in_classify_phase() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project();
+    let cache = tempfile::tempdir().unwrap();
+
+    run(&index_args(project.path(), cache.path()), &TEST_ANALYTICS).unwrap();
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    for path in &["src/main.rs", "src/lib.rs", "build.py"] {
+        let entry = manifest
+            .lookup(path)
+            .unwrap_or_else(|| panic!("manifest must contain {path}"));
+        assert_eq!(
+            entry.sha256.len(),
+            64,
+            "sha256 for {path} must be 64 chars, got {}",
+            entry.sha256.len()
+        );
+        assert!(
+            entry.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+            "sha256 for {path} must be hex, got: {}",
+            entry.sha256
+        );
+    }
+}

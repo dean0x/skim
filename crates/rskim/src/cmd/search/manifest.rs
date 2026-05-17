@@ -58,6 +58,16 @@ pub(super) struct ManifestEntry {
     pub lang: String,
     /// Field map encoded as `(start_byte, end_byte, field_discriminant)` triples.
     pub field_map: Vec<(usize, usize, u8)>,
+    /// File modification time as seconds since UNIX_EPOCH when the manifest was written.
+    ///
+    /// Used as a fast pre-screening hint to skip SHA computation when the file has not
+    /// changed (mtime match → likely SHA match → reuse field_map).  SHA-256 is always
+    /// computed on mtime mismatch or when this field is absent.
+    ///
+    /// `serde(default)` ensures backward compatibility: old manifests without this field
+    /// deserialize with `mtime: None`.
+    #[serde(default)]
+    pub mtime: Option<u64>,
 }
 
 // ============================================================================

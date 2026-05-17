@@ -88,6 +88,10 @@ pub(super) struct ReadFile {
     pub lang: rskim_core::Language,
     /// Full file content as UTF-8 string.
     pub content: String,
-    /// Hex-encoded SHA-256 of `content` (lowercase, 64 chars).
-    pub sha256: String,
+    /// File modification time as seconds since UNIX_EPOCH.
+    ///
+    /// `None` when the platform does not expose mtime or the syscall fails.
+    /// Only used as a fast pre-screening hint; SHA-256 remains the correctness
+    /// guarantee for cache invalidation.
+    pub mtime: Option<u64>,
 }

@@ -28,7 +28,7 @@ use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, SearchField, classif
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
 use super::types::{IndexConfig, IndexResult};
-use super::walk::{discover_project_root, walk_and_read};
+use super::walk::{discover_project_root, sha256_hex, walk_and_read};
 
 // ============================================================================
 // Internal type alias (avoids complex type in Vec)
@@ -37,8 +37,8 @@ use super::walk::{discover_project_root, walk_and_read};
 /// Field map type: byte ranges mapped to their AST-derived search fields.
 type FieldMap = Vec<(std::ops::Range<usize>, SearchField)>;
 
-/// Classified file: field_map and whether it was a manifest cache hit.
-type ClassifiedFile = (FieldMap, bool);
+/// Classified file: SHA-256, field_map, and whether it was a manifest cache hit.
+type ClassifiedFile = (String, FieldMap, bool);
 
 // ============================================================================
 // Public entry point
@@ -191,8 +191,16 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
         .map(|rf| rf.rel_path.to_string_lossy().replace('\\', "/"))
         .collect();
 
-    // 4b. Classify in parallel: for each file, either use cached field_map or
-    //     call classify_source. Results are in the same order as read_files.
+    // 4b. Classify in parallel: for each file, compute SHA-256, then apply the
+    //     four-tier mtime/SHA cache logic:
+    //
+    //   Tier 1: mtime match + SHA match   → reuse field_map (cache hit)
+    //   Tier 2: mtime match + SHA mismatch → fresh classify (rare – concurrent write)
+    //   Tier 3: mtime mismatch + SHA match → reuse field_map (clock skew / copy)
+    //   Tier 4: mtime mismatch + SHA mismatch → fresh classify
+    //
+    // SHA is *always* computed — mtime is only a fast pre-screening hint.
+    // Results are in the same order as read_files.
     //
     // Hoist the debug flag once before entering the rayon worker pool to avoid
     // a syscall on every classify error across parallel workers.
@@ -201,35 +209,49 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
         .par_iter()
         .zip(path_keys.par_iter())
         .map(|(rf, path_key)| {
-            if let Some(entry) = manifest.lookup(path_key)
-                && entry.sha256 == rf.sha256
-            {
-                // Cache hit: reuse field_map
-                return (decode_field_map(&entry.field_map), true);
+            // Always compute SHA-256 — it is the correctness guarantee.
+            let sha = sha256_hex(rf.content.as_bytes());
+
+            if config.force {
+                // --force: skip all cache logic.
+                return (sha, run_classify(&rf.content, rf.lang, debug_enabled), false);
             }
-            // SHA mismatch or no entry: fresh classify
-            (run_classify(&rf.content, rf.lang, debug_enabled), false)
+
+            if let Some(entry) = manifest.lookup(path_key)
+                && entry.sha256 == sha
+            {
+                // SHA matches → safe to reuse field_map regardless of mtime.
+                return (sha, decode_field_map(&entry.field_map), true);
+                // If SHA mismatches, fall through to fresh classify.
+            }
+
+            // No entry or SHA mismatch → classify.
+            (sha, run_classify(&rf.content, rf.lang, debug_enabled), false)
         })
         .collect();
 
-    let cache_hits = to_u32_capped(classified.iter().filter(|(_, hit)| *hit).count());
+    let cache_hits = to_u32_capped(classified.iter().filter(|(_, _, hit)| *hit).count());
 
     // 5. Build the index sequentially (NgramIndexBuilder is not Sync).
     // 6. Accumulate manifest entries in the same pass (avoids a second enumerate loop).
     //
-    // Zip-consume path_keys and classified so their ownership is transferred
-    // explicitly — no indexing invariant to maintain, no residual entries.
+    // Use a manual `next_file_id` counter that only increments after a successful
+    // `add_file_classified`. The previous `enumerate()` approach had a latent bug:
+    // if `add_file_classified` failed and we `continue`d, the next iteration would
+    // pass `idx+1` while `builder.file_count` was still at `idx`, causing the
+    // builder's sequential-invariant check to reject ALL subsequent files.
     let mut builder = NgramIndexBuilder::new(cache_dir.clone())?;
     let mut new_manifest = FileManifest::new(config.root.clone(), cache_dir);
-    for (idx, ((rf, (field_map, _)), path_key)) in
-        read_files.iter().zip(classified).zip(path_keys).enumerate()
+    let mut next_file_id: u32 = 0;
+    for ((rf, (sha, field_map, _)), path_key) in
+        read_files.iter().zip(classified).zip(path_keys)
     {
         // Guard against usize overflow into FileId(u32) on pathological inputs.
-        let file_id = u32::try_from(idx).map_err(|_| {
-            anyhow::anyhow!("file index {idx} overflows FileId(u32); too many files")
-        })?;
+        let file_id = next_file_id;
         // Fail-soft: a single file that fails to index should not abort a
         // 50 K-file build. Log the error under debug and continue.
+        // IMPORTANT: only advance `next_file_id` after a successful add so the
+        // builder's sequential FileId invariant is never violated.
         if let Err(e) =
             builder.add_file_classified(FileId(file_id), &rf.content, rf.lang, &field_map)
         {
@@ -241,18 +263,23 @@ fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
             }
             continue;
         }
+        // Increment only on success.
+        next_file_id = next_file_id.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("next_file_id overflows u32; too many files in index")
+        })?;
         new_manifest.insert(ManifestEntry {
             path: path_key,
-            sha256: rf.sha256.clone(),
+            sha256: sha,
             lang: rf.lang.as_str().to_string(),
             field_map: encode_field_map(&field_map),
+            mtime: rf.mtime,
         });
     }
     // build() flushes index.skidx + index.skpost; manifest written after (marks coherence).
     let _layer = builder.build()?;
     new_manifest.save()?;
 
-    let file_count = to_u32_capped(read_files.len());
+    let file_count = next_file_id;
 
     Ok(IndexResult {
         file_count,

@@ -198,8 +198,20 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
         return EntryOutcome::Skip(SkipReason::Minified(abs_path.to_path_buf()));
     }
 
-    // --- Compute SHA-256 and build relative path ---
-    let sha256 = sha256_hex(content.as_bytes());
+    // --- Extract mtime (used as a fast pre-screening hint; SHA remains authoritative) ---
+    // Convert SystemTime → seconds since UNIX_EPOCH.  Returns None on any failure
+    // (e.g. platform does not expose mtime, or the time is before the epoch).
+    let mtime: Option<u64> = entry
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| {
+            t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        });
+
+    // --- Build relative path ---
     let rel_path = abs_path
         .strip_prefix(root)
         .unwrap_or(abs_path)
@@ -209,7 +221,7 @@ fn classify_entry(entry: &ignore::DirEntry, root: &Path) -> EntryOutcome {
         rel_path,
         lang,
         content,
-        sha256,
+        mtime,
     })
 }
 
