@@ -105,11 +105,17 @@ fn test_empty_query_short_circuits_inner_layer() {
 
 #[test]
 fn test_oversized_query_returns_invalid_query_error() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    // PanicLayer proves the oversized-query check short-circuits before the
+    // inner layer is reached.
+    let engine = QueryEngine::new(Box::new(PanicLayer));
     let long_query = "a".repeat(MAX_QUERY_BYTES + 1);
-    let result = engine.search(&SearchQuery::new(long_query));
-    assert!(result.is_err());
-    let msg = format!("{}", result.unwrap_err());
+    let err = engine.search(&SearchQuery::new(long_query)).unwrap_err();
+    assert!(
+        matches!(err, SearchError::InvalidQuery(_)),
+        "expected InvalidQuery variant, got {:?}",
+        err
+    );
+    let msg = format!("{err}");
     assert!(
         msg.contains(&MAX_QUERY_BYTES.to_string()),
         "error message should contain max length: {msg}"
@@ -127,55 +133,73 @@ fn test_query_at_exact_max_length_succeeds() {
 
 #[test]
 fn test_invalid_bm25f_config_rejected_before_search() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    // PanicLayer proves the BM25F validation short-circuits before the inner
+    // layer is reached.
+    let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
     let mut bad_config = BM25FConfig::default();
     bad_config.k1 = -1.0;
     query.bm25f_config = Some(bad_config);
 
-    let result = engine.search(&query);
-    assert!(result.is_err());
-    let msg = format!("{}", result.unwrap_err());
+    let err = engine.search(&query).unwrap_err();
+    assert!(
+        matches!(err, SearchError::InvalidQuery(_)),
+        "expected InvalidQuery variant, got {:?}",
+        err
+    );
+    let msg = format!("{err}");
     assert!(msg.contains("k1"), "error message should mention k1: {msg}");
 }
 
 #[test]
 fn test_nan_bm25f_config_rejected() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
     let mut bad_config = BM25FConfig::default();
     bad_config.k1 = f32::NAN;
     query.bm25f_config = Some(bad_config);
 
-    let result = engine.search(&query);
-    assert!(result.is_err(), "NaN k1 should produce an error");
+    let err = engine.search(&query).unwrap_err();
+    assert!(
+        matches!(err, SearchError::InvalidQuery(_)),
+        "NaN k1 must produce InvalidQuery variant, got {:?}",
+        err
+    );
 }
 
 #[test]
 fn test_infinity_bm25f_config_rejected() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
     let mut bad_config = BM25FConfig::default();
     bad_config.k1 = f32::INFINITY;
     query.bm25f_config = Some(bad_config);
 
-    let result = engine.search(&query);
-    assert!(result.is_err());
-    let msg = format!("{}", result.unwrap_err());
+    let err = engine.search(&query).unwrap_err();
+    assert!(
+        matches!(err, SearchError::InvalidQuery(_)),
+        "expected InvalidQuery variant, got {:?}",
+        err
+    );
+    let msg = format!("{err}");
     assert!(msg.contains("k1"), "error message should mention k1: {msg}");
 }
 
 #[test]
 fn test_neg_infinity_bm25f_config_rejected() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let engine = QueryEngine::new(Box::new(PanicLayer));
     let mut query = SearchQuery::new("foo");
     let mut bad_config = BM25FConfig::default();
     bad_config.k1 = f32::NEG_INFINITY;
     query.bm25f_config = Some(bad_config);
 
-    let result = engine.search(&query);
-    assert!(result.is_err());
-    let msg = format!("{}", result.unwrap_err());
+    let err = engine.search(&query).unwrap_err();
+    assert!(
+        matches!(err, SearchError::InvalidQuery(_)),
+        "expected InvalidQuery variant, got {:?}",
+        err
+    );
+    let msg = format!("{err}");
     assert!(msg.contains("k1"), "error message should mention k1: {msg}");
 }
 
@@ -231,6 +255,63 @@ fn test_search_delegates_to_inner_layer() {
     assert_eq!(
         received.offset, original_query.offset,
         "QueryEngine must forward the offset unchanged"
+    );
+    assert_eq!(
+        received.ast_pattern, original_query.ast_pattern,
+        "QueryEngine must forward the ast_pattern unchanged"
+    );
+    assert_eq!(
+        received.temporal_flags, original_query.temporal_flags,
+        "QueryEngine must forward the temporal_flags unchanged"
+    );
+    // BM25FConfig contains f32 — compare via Debug since SearchQuery does not
+    // derive PartialEq.
+    assert_eq!(
+        format!("{:?}", received.bm25f_config),
+        format!("{:?}", original_query.bm25f_config),
+        "QueryEngine must forward the bm25f_config unchanged"
+    );
+}
+
+#[test]
+fn test_search_delegates_populated_fields_to_inner_layer() {
+    // Exercises the delegation path with all optional fields populated.
+    // Complements test_search_delegates_to_inner_layer which uses all-None defaults.
+    let spy = Arc::new(SpyLayer::new());
+    let engine = QueryEngine::new(Box::new(Arc::clone(&spy)));
+
+    let mut original_query = SearchQuery::new("processEvent");
+    original_query.lang = Some(rskim_core::Language::Rust);
+    original_query.ast_pattern = Some("fn_decl".to_string());
+    original_query.temporal_flags = Some(crate::TemporalFlags {
+        modified_within_days: Some(30),
+    });
+    original_query.limit = Some(10);
+    original_query.offset = Some(5);
+    original_query.bm25f_config = Some(BM25FConfig::default());
+
+    engine.search(&original_query).unwrap();
+
+    let received = spy
+        .take_received()
+        .expect("inner layer must have been called for a valid query");
+
+    assert_eq!(received.text, original_query.text, "text unchanged");
+    assert_eq!(received.lang, original_query.lang, "lang unchanged");
+    assert_eq!(
+        received.ast_pattern, original_query.ast_pattern,
+        "ast_pattern unchanged"
+    );
+    assert_eq!(
+        received.temporal_flags, original_query.temporal_flags,
+        "temporal_flags unchanged"
+    );
+    assert_eq!(received.limit, original_query.limit, "limit unchanged");
+    assert_eq!(received.offset, original_query.offset, "offset unchanged");
+    assert_eq!(
+        format!("{:?}", received.bm25f_config),
+        format!("{:?}", original_query.bm25f_config),
+        "bm25f_config unchanged"
     );
 }
 
