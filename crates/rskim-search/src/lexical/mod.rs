@@ -5,6 +5,8 @@
 //! - [`classify_source`] — map source byte ranges to [`crate::SearchField`] variants.
 //! - [`bm25f_score`] — compute the BM25F score for a single query term.
 //! - [`dominant_field`] — return the [`crate::SearchField`] with the highest TF.
+//! - [`QueryEngine`] — [`crate::SearchLayer`] decorator that validates queries at the trust boundary.
+//! - [`MAX_QUERY_BYTES`] — maximum allowed byte length for a query text string.
 //!
 //! # Format impact
 //!
@@ -14,8 +16,10 @@
 
 pub mod classifier;
 pub mod config;
+pub mod query;
 pub mod scoring;
 
 pub use classifier::classify_source;
 pub use config::{BM25FConfig, FIELD_COUNT};
+pub use query::{MAX_QUERY_BYTES, QueryEngine};
 pub use scoring::{bm25f_score, dominant_field};
