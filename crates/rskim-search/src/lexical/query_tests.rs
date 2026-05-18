@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::index::NgramIndexBuilder;
@@ -40,6 +40,16 @@ impl SearchLayer for SpyLayer {
 
     fn name(&self) -> &str {
         "spy"
+    }
+}
+
+impl SearchLayer for Arc<SpyLayer> {
+    fn search(&self, query: &SearchQuery) -> crate::Result<Vec<SearchResult>> {
+        (**self).search(query)
+    }
+
+    fn name(&self) -> &str {
+        (**self).name()
     }
 }
 
@@ -198,20 +208,8 @@ fn test_happy_path_finds_matching_file() {
 fn test_search_delegates_to_inner_layer() {
     // SpyLayer records whatever query it receives; QueryEngine must forward the
     // exact query unchanged (same text, same struct fields).
-    let spy = std::sync::Arc::new(SpyLayer::new());
-    let spy_clone = std::sync::Arc::clone(&spy);
-
-    struct ArcSpyLayer(std::sync::Arc<SpyLayer>);
-    impl SearchLayer for ArcSpyLayer {
-        fn search(&self, query: &SearchQuery) -> crate::Result<Vec<SearchResult>> {
-            self.0.search(query)
-        }
-        fn name(&self) -> &str {
-            "arc-spy"
-        }
-    }
-
-    let engine = QueryEngine::new(Box::new(ArcSpyLayer(spy_clone)));
+    let spy = Arc::new(SpyLayer::new());
+    let engine = QueryEngine::new(Box::new(Arc::clone(&spy)));
     let original_query = SearchQuery::new("processEvent");
     engine.search(&original_query).unwrap();
 
