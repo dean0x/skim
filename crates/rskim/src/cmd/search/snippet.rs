@@ -105,23 +105,15 @@ pub(super) fn extract_snippet(
 
     // Mtime guard: if the manifest recorded an mtime and it doesn't match
     // the file's current mtime, the file has changed — positions are stale.
-    if let Some(Some(stored_mtime)) = manifest_entry.map(|e| e.mtime) {
+    if let Some(stored_mtime) = manifest_entry.and_then(|e| e.mtime) {
         let current_mtime = std::fs::metadata(&abs_path)
             .ok()
             .and_then(|m| m.modified().ok())
-            .and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_secs())
-            });
-        match current_mtime {
-            Some(cur) if cur == stored_mtime => {
-                // Mtime matches — positions are likely valid.
-            }
-            _ => {
-                // Mtime differs or unreadable — stale, skip snippet.
-                return None;
-            }
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        if current_mtime != Some(stored_mtime) {
+            // Mtime differs or unreadable — stale, skip snippet.
+            return None;
         }
     }
 

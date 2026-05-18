@@ -199,30 +199,34 @@ pub(super) fn check_staleness(cache_dir: &Path, project_root: &Path) -> Stalenes
 pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
-    analytics: &crate::analytics::AnalyticsConfig,
+    _analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<bool> {
     use super::index::build_index;
     use super::types::IndexConfig;
 
-    let _ = analytics; // analytics recording is fire-and-forget; reserved for future use
+    let staleness = check_staleness(cache_dir, root);
+    if matches!(staleness, StalenessCheck::Current) {
+        return Ok(false);
+    }
 
-    match check_staleness(cache_dir, root) {
-        StalenessCheck::Current => Ok(false),
+    // All rebuild paths share the same config.
+    let config = IndexConfig {
+        root: root.to_path_buf(),
+        max_files: None,
+        force: false,
+        cache_dir_override: Some(cache_dir.to_path_buf()),
+    };
+
+    match staleness {
+        StalenessCheck::Current => unreachable!(),
         StalenessCheck::NoIndex => {
             eprintln!("skim search: building index…");
-            let config = IndexConfig {
-                root: root.to_path_buf(),
-                max_files: None,
-                force: false,
-                cache_dir_override: Some(cache_dir.to_path_buf()),
-            };
             let result = build_index(&config)?;
             eprintln!(
                 "skim search: indexed {} files in {:.1}s",
                 result.file_count,
                 result.duration.as_secs_f64()
             );
-            Ok(true)
         }
         StalenessCheck::HeadChanged { stored, current } => {
             if crate::debug::is_debug_enabled() {
@@ -234,29 +238,17 @@ pub(super) fn auto_refresh_if_stale(
             } else {
                 eprintln!("skim search: index stale (HEAD changed), refreshing…");
             }
-            let config = IndexConfig {
-                root: root.to_path_buf(),
-                max_files: None,
-                force: false,
-                cache_dir_override: Some(cache_dir.to_path_buf()),
-            };
             build_index(&config)?;
-            Ok(true)
         }
         StalenessCheck::NoStoredHead => {
             // Manifest exists but no HEAD recorded — could be an old build.
             // Trigger a rebuild to get a fresh manifest with HEAD stored.
             eprintln!("skim search: refreshing index (no HEAD recorded)…");
-            let config = IndexConfig {
-                root: root.to_path_buf(),
-                max_files: None,
-                force: false,
-                cache_dir_override: Some(cache_dir.to_path_buf()),
-            };
             build_index(&config)?;
-            Ok(true)
         }
     }
+
+    Ok(true)
 }
 
 // ============================================================================

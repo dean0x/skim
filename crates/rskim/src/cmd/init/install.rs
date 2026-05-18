@@ -312,17 +312,15 @@ fn execute_install(
         }
 
         // Spawn a background build — non-blocking, non-fatal.
-        let _ = std::env::current_exe().ok().and_then(|exe| {
-            std::process::Command::new(&exe)
+        if let Some(exe) = std::env::current_exe().ok()
+            && let Ok(child) = std::process::Command::new(&exe)
                 .args(["search", "--build"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .ok()
-                .map(|child| {
-                    eprintln!("  Search index build started (PID {})", child.id());
-                })
-        });
+        {
+            eprintln!("  Search index build started (PID {})", child.id());
+        }
     }
 
     Ok(())

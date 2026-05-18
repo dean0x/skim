@@ -15,11 +15,10 @@ use std::time::Instant;
 
 use rskim_search::{NgramIndexReader, QueryEngine, SearchLayer, SearchQuery};
 
-use super::index::build_index;
 use super::manifest::FileManifest;
 use super::snippet::extract_snippet;
-use super::staleness::{StalenessCheck, check_staleness};
-use super::types::{IndexConfig, QueryConfig, QueryOutput, ResolvedResult};
+use super::staleness::auto_refresh_if_stale;
+use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
 // ============================================================================
 // Query execution
@@ -53,7 +52,7 @@ pub(super) fn execute_query(
     let root = &config.root;
 
     // Ensure the index is built and current.
-    ensure_index_ready(root, cache_dir, analytics)?;
+    auto_refresh_if_stale(root, cache_dir, analytics)?;
 
     // Open the reader.
     let reader = NgramIndexReader::open(cache_dir)?;
@@ -77,8 +76,6 @@ pub(super) fn execute_query(
     let total = results.len();
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let _ = analytics; // future: record query analytics
-
     Ok(QueryOutput {
         query: config.text.clone(),
         total,
@@ -86,63 +83,6 @@ pub(super) fn execute_query(
         duration_ms,
         index_stats: Some(stats),
     })
-}
-
-/// Ensure the index is present and not stale, building or refreshing as needed.
-fn ensure_index_ready(
-    root: &Path,
-    cache_dir: &Path,
-    _analytics: &crate::analytics::AnalyticsConfig,
-) -> anyhow::Result<()> {
-    match check_staleness(cache_dir, root) {
-        StalenessCheck::Current => {
-            // Index is up to date — nothing to do.
-        }
-        StalenessCheck::NoIndex => {
-            eprintln!("skim search: building index…");
-            let config = IndexConfig {
-                root: root.to_path_buf(),
-                max_files: None,
-                force: false,
-                cache_dir_override: Some(cache_dir.to_path_buf()),
-            };
-            let result = build_index(&config)?;
-            eprintln!(
-                "skim search: indexed {} files in {:.1}s",
-                result.file_count,
-                result.duration.as_secs_f64()
-            );
-        }
-        StalenessCheck::HeadChanged { stored, current } => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search [debug]: HEAD changed ({} -> {}), refreshing…",
-                    &stored[..8.min(stored.len())],
-                    &current[..8.min(current.len())]
-                );
-            } else {
-                eprintln!("skim search: index stale (HEAD changed), refreshing…");
-            }
-            let config = IndexConfig {
-                root: root.to_path_buf(),
-                max_files: None,
-                force: false,
-                cache_dir_override: Some(cache_dir.to_path_buf()),
-            };
-            build_index(&config)?;
-        }
-        StalenessCheck::NoStoredHead => {
-            eprintln!("skim search: refreshing index (no HEAD recorded)…");
-            let config = IndexConfig {
-                root: root.to_path_buf(),
-                max_files: None,
-                force: false,
-                cache_dir_override: Some(cache_dir.to_path_buf()),
-            };
-            build_index(&config)?;
-        }
-    }
-    Ok(())
 }
 
 /// Map `FileId`s to paths and extract snippets.
@@ -158,10 +98,9 @@ fn resolve_paths_and_snippets(
             let path = sorted_paths.get(r.file_id.0 as usize)?;
 
             let manifest_entry = manifest.lookup(path);
-            let match_positions: Vec<std::ops::Range<usize>> = r.match_positions.clone();
 
             let (line_number, snippet) =
-                match extract_snippet(root, path, &match_positions, manifest_entry) {
+                match extract_snippet(root, path, &r.match_positions, manifest_entry) {
                     Some((ln, ctx)) => (Some(ln), Some(ctx)),
                     None => (None, None),
                 };
@@ -172,7 +111,7 @@ fn resolve_paths_and_snippets(
                 field: r.field.name().to_string(),
                 line_number,
                 snippet,
-                match_positions,
+                match_positions: r.match_positions.clone(),
             })
         })
         .collect()
