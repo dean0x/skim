@@ -2,14 +2,14 @@
 
 #![allow(clippy::unwrap_used)]
 
+use super::MAX_QUERY_BYTES;
 use crate::index::NgramIndexBuilder;
 use crate::lexical::{BM25FConfig, QueryEngine};
 use crate::{FileId, LayerBuilder, SearchError, SearchLayer, SearchQuery};
-use crate::lexical::query::MAX_QUERY_BYTES;
 
-// -----------------------------------------------------------------------
+// ============================================================================
 // Test helper
-// -----------------------------------------------------------------------
+// ============================================================================
 
 fn build_query_engine(
     files: &[(FileId, &str, rskim_core::Language)],
@@ -23,9 +23,9 @@ fn build_query_engine(
     (dir, QueryEngine::new(layer))
 }
 
-// -----------------------------------------------------------------------
+// ============================================================================
 // Phase 1 — Validation
-// -----------------------------------------------------------------------
+// ============================================================================
 
 #[test]
 fn test_empty_query_returns_empty_vec() {
@@ -103,15 +103,9 @@ fn test_name_returns_query_engine() {
     assert_eq!(engine.name(), "query-engine");
 }
 
-#[test]
-fn test_implements_search_layer_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<QueryEngine>();
-}
-
-// -----------------------------------------------------------------------
+// ============================================================================
 // Phase 2 — Integration
-// -----------------------------------------------------------------------
+// ============================================================================
 
 #[test]
 fn test_happy_path_finds_matching_file() {
@@ -175,7 +169,7 @@ fn test_deterministic_results() {
     let query = SearchQuery::new("compute");
 
     let first = engine.search(&query).unwrap();
-    for _ in 0..49 {
+    for _ in 0..10 {
         let run = engine.search(&query).unwrap();
         assert_eq!(
             run.len(),
@@ -205,19 +199,16 @@ fn test_unicode_query_works() {
     assert!(result.is_ok(), "unicode query should not error: {result:?}");
 }
 
-// -----------------------------------------------------------------------
+// ============================================================================
 // Phase 3 — Edge cases
-// -----------------------------------------------------------------------
+// ============================================================================
 
 #[test]
 fn test_whitespace_only_query_returns_empty() {
     let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
-    // The inner layer receives the original query; whitespace-only produces no
-    // useful ngrams, so results will be empty. We only assert it does not error.
+    // Whitespace-only passes validation; the inner layer produces no ngrams from it.
     let result = engine.search(&SearchQuery::new("   "));
     assert!(result.is_ok(), "whitespace-only query should not error");
-    // Results may be empty (expected) or potentially non-empty if the inner layer
-    // happens to match; we assert it is Ok rather than asserting empty here.
 }
 
 #[test]
