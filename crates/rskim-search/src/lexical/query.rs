@@ -37,12 +37,16 @@ pub struct QueryEngine {
 
 impl QueryEngine {
     /// Wrap an existing [`SearchLayer`] with query validation.
+    #[must_use]
     pub fn new(inner: Box<dyn SearchLayer>) -> Self {
         Self { inner }
     }
 }
 
 impl SearchLayer for QueryEngine {
+    // Intentional defense-in-depth: the inner layer may also validate empty
+    // text and BM25F config, but we validate at the decorator boundary so the
+    // behaviour is independent of the inner layer.
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
         if query.text.is_empty() {
             return Ok(Vec::new());
