@@ -18,7 +18,10 @@ mod types;
 pub mod weights;
 
 pub use index::{NgramIndexBuilder, NgramIndexReader};
-pub use lexical::{BM25FConfig, FIELD_COUNT, MAX_QUERY_BYTES, QueryEngine, bm25f_score, classify_source, dominant_field};
+pub use lexical::{
+    BM25FConfig, FIELD_COUNT, MAX_QUERY_BYTES, QueryEngine, bm25f_score, classify_source,
+    dominant_field,
+};
 pub use ngram::{
     BORDER_MULTIPLIER, Ngram, extract_ngrams, extract_ngrams_with_weights, extract_query_ngrams,
     extract_query_ngrams_with_weights,

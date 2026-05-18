@@ -89,7 +89,8 @@ fn build_query_engine(
 
 #[test]
 fn test_empty_query_returns_empty_vec() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let (_dir, engine) =
+        build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
     let result = engine.search(&SearchQuery::new("")).unwrap();
     assert!(result.is_empty(), "empty query should return empty vec");
 }
@@ -100,7 +101,10 @@ fn test_empty_query_short_circuits_inner_layer() {
     // reaches the inner layer for empty queries.
     let engine = QueryEngine::new(Box::new(PanicLayer));
     let result = engine.search(&SearchQuery::new("")).unwrap();
-    assert!(result.is_empty(), "empty query short-circuit must return empty vec");
+    assert!(
+        result.is_empty(),
+        "empty query short-circuit must return empty vec"
+    );
 }
 
 #[test]
@@ -124,7 +128,8 @@ fn test_oversized_query_returns_invalid_query_error() {
 
 #[test]
 fn test_query_at_exact_max_length_succeeds() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let (_dir, engine) =
+        build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
     let exact_query = "a".repeat(MAX_QUERY_BYTES);
     // Must not return an InvalidQuery error; empty results are fine
     let result = engine.search(&SearchQuery::new(exact_query));
@@ -207,7 +212,8 @@ fn test_neg_infinity_bm25f_config_rejected() {
 
 #[test]
 fn test_name_returns_query_engine() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let (_dir, engine) =
+        build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
     assert_eq!(engine.name(), "query-engine");
 }
 
@@ -334,19 +340,23 @@ fn test_search_delegates_populated_fields_to_inner_layer() {
 #[test]
 fn test_deterministic_results() {
     let (_dir, engine) = build_query_engine(&[
-        (FileId(0), "fn computeHash(input: &str) -> u64 {}", rskim_core::Language::Rust),
-        (FileId(1), "fn computeSum(a: i32, b: i32) -> i32 {}", rskim_core::Language::Rust),
+        (
+            FileId(0),
+            "fn computeHash(input: &str) -> u64 {}",
+            rskim_core::Language::Rust,
+        ),
+        (
+            FileId(1),
+            "fn computeSum(a: i32, b: i32) -> i32 {}",
+            rskim_core::Language::Rust,
+        ),
     ]);
     let query = SearchQuery::new("compute");
 
     let first = engine.search(&query).unwrap();
     for _ in 0..10 {
         let run = engine.search(&query).unwrap();
-        assert_eq!(
-            run.len(),
-            first.len(),
-            "result count changed across runs"
-        );
+        assert_eq!(run.len(), first.len(), "result count changed across runs");
         for (a, b) in run.iter().zip(first.iter()) {
             assert_eq!(a.file_id, b.file_id, "file_id ordering changed");
             assert!(
@@ -376,7 +386,8 @@ fn test_unicode_query_works() {
 
 #[test]
 fn test_whitespace_only_query_returns_empty() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let (_dir, engine) =
+        build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
     // Whitespace-only passes validation; the inner layer produces no ngrams from it.
     let result = engine.search(&SearchQuery::new("   "));
     assert!(result.is_ok(), "whitespace-only query should not error");
@@ -384,17 +395,27 @@ fn test_whitespace_only_query_returns_empty() {
 
 #[test]
 fn test_single_char_query_returns_empty() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let (_dir, engine) =
+        build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
     let result = engine.search(&SearchQuery::new("x")).unwrap();
     // Single character cannot form a bigram, so the index returns nothing
-    assert!(result.is_empty(), "single-char query should return empty results");
+    assert!(
+        result.is_empty(),
+        "single-char query should return empty results"
+    );
 }
 
 #[test]
 fn test_no_matching_ngrams_returns_empty() {
-    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
-    let result = engine.search(&SearchQuery::new("xyz123uniquetoken")).unwrap();
-    assert!(result.is_empty(), "query with no indexed ngrams should return empty results");
+    let (_dir, engine) =
+        build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let result = engine
+        .search(&SearchQuery::new("xyz123uniquetoken"))
+        .unwrap();
+    assert!(
+        result.is_empty(),
+        "query with no indexed ngrams should return empty results"
+    );
 }
 
 #[test]
@@ -404,8 +425,12 @@ fn test_lang_filter_passes_through() {
 
     let dir = tempfile::tempdir().unwrap();
     let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
-    builder.add_file(FileId(0), rust_content, rskim_core::Language::Rust).unwrap();
-    builder.add_file(FileId(1), py_content, rskim_core::Language::Python).unwrap();
+    builder
+        .add_file(FileId(0), rust_content, rskim_core::Language::Rust)
+        .unwrap();
+    builder
+        .add_file(FileId(1), py_content, rskim_core::Language::Python)
+        .unwrap();
     let layer = builder.build().unwrap();
     let engine = QueryEngine::new(layer);
 
@@ -427,9 +452,21 @@ fn test_lang_filter_passes_through() {
 #[test]
 fn test_pagination_passes_through() {
     let (_dir, engine) = build_query_engine(&[
-        (FileId(0), "fn alpha_handler() {}", rskim_core::Language::Rust),
-        (FileId(1), "fn alpha_processor() {}", rskim_core::Language::Rust),
-        (FileId(2), "fn alpha_worker() {}", rskim_core::Language::Rust),
+        (
+            FileId(0),
+            "fn alpha_handler() {}",
+            rskim_core::Language::Rust,
+        ),
+        (
+            FileId(1),
+            "fn alpha_processor() {}",
+            rskim_core::Language::Rust,
+        ),
+        (
+            FileId(2),
+            "fn alpha_worker() {}",
+            rskim_core::Language::Rust,
+        ),
     ]);
 
     // Get all results first
