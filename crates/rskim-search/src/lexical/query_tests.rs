@@ -165,6 +165,8 @@ fn test_nan_bm25f_config_rejected() {
         "NaN k1 must produce InvalidQuery variant, got {:?}",
         err
     );
+    let msg = format!("{err}");
+    assert!(msg.contains("k1"), "error message should mention k1: {msg}");
 }
 
 #[test]
@@ -242,19 +244,11 @@ fn test_search_delegates_to_inner_layer() {
         .expect("inner layer must have been called for a valid query");
     assert_eq!(
         received.text, original_query.text,
-        "QueryEngine must forward the query text unchanged"
+        "QueryEngine must forward the text unchanged"
     );
     assert_eq!(
         received.lang, original_query.lang,
-        "QueryEngine must forward the lang filter unchanged"
-    );
-    assert_eq!(
-        received.limit, original_query.limit,
-        "QueryEngine must forward the limit unchanged"
-    );
-    assert_eq!(
-        received.offset, original_query.offset,
-        "QueryEngine must forward the offset unchanged"
+        "QueryEngine must forward the lang unchanged"
     );
     assert_eq!(
         received.ast_pattern, original_query.ast_pattern,
@@ -263,6 +257,14 @@ fn test_search_delegates_to_inner_layer() {
     assert_eq!(
         received.temporal_flags, original_query.temporal_flags,
         "QueryEngine must forward the temporal_flags unchanged"
+    );
+    assert_eq!(
+        received.limit, original_query.limit,
+        "QueryEngine must forward the limit unchanged"
+    );
+    assert_eq!(
+        received.offset, original_query.offset,
+        "QueryEngine must forward the offset unchanged"
     );
     // BM25FConfig contains f32 — compare via Debug since SearchQuery does not
     // derive PartialEq.
@@ -296,22 +298,36 @@ fn test_search_delegates_populated_fields_to_inner_layer() {
         .take_received()
         .expect("inner layer must have been called for a valid query");
 
-    assert_eq!(received.text, original_query.text, "text unchanged");
-    assert_eq!(received.lang, original_query.lang, "lang unchanged");
+    assert_eq!(
+        received.text, original_query.text,
+        "QueryEngine must forward the text unchanged"
+    );
+    assert_eq!(
+        received.lang, original_query.lang,
+        "QueryEngine must forward the lang unchanged"
+    );
     assert_eq!(
         received.ast_pattern, original_query.ast_pattern,
-        "ast_pattern unchanged"
+        "QueryEngine must forward the ast_pattern unchanged"
     );
     assert_eq!(
         received.temporal_flags, original_query.temporal_flags,
-        "temporal_flags unchanged"
+        "QueryEngine must forward the temporal_flags unchanged"
     );
-    assert_eq!(received.limit, original_query.limit, "limit unchanged");
-    assert_eq!(received.offset, original_query.offset, "offset unchanged");
+    assert_eq!(
+        received.limit, original_query.limit,
+        "QueryEngine must forward the limit unchanged"
+    );
+    assert_eq!(
+        received.offset, original_query.offset,
+        "QueryEngine must forward the offset unchanged"
+    );
+    // BM25FConfig contains f32 — compare via Debug since SearchQuery does not
+    // derive PartialEq.
     assert_eq!(
         format!("{:?}", received.bm25f_config),
         format!("{:?}", original_query.bm25f_config),
-        "bm25f_config unchanged"
+        "QueryEngine must forward the bm25f_config unchanged"
     );
 }
 
