@@ -19,5 +19,5 @@ pub mod scoring;
 
 pub use classifier::classify_source;
 pub use config::{BM25FConfig, FIELD_COUNT};
-pub use query::QueryEngine;
+pub use query::{MAX_QUERY_BYTES, QueryEngine};
 pub use scoring::{bm25f_score, dominant_field};
