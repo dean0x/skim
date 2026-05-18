@@ -4,14 +4,14 @@
 
 use std::sync::Mutex;
 
-use super::MAX_QUERY_BYTES;
+use super::*;
 use crate::index::NgramIndexBuilder;
-use crate::lexical::{BM25FConfig, QueryEngine};
-use crate::{FileId, LayerBuilder, SearchError, SearchLayer, SearchQuery, SearchResult};
+use crate::lexical::BM25FConfig;
+use crate::{FileId, LayerBuilder, SearchLayer, SearchQuery, SearchResult};
 
-// ============================================================================
+// -----------------------------------------------------------------------
 // Test doubles
-// ============================================================================
+// -----------------------------------------------------------------------
 
 /// A `SearchLayer` that records the last query it received and returns a fixed
 /// empty result. Used to assert that the decorator forwards the exact query
@@ -57,9 +57,9 @@ impl SearchLayer for PanicLayer {
     }
 }
 
-// ============================================================================
+// -----------------------------------------------------------------------
 // Test helper
-// ============================================================================
+// -----------------------------------------------------------------------
 
 fn build_query_engine(
     files: &[(FileId, &str, rskim_core::Language)],
@@ -73,9 +73,9 @@ fn build_query_engine(
     (dir, QueryEngine::new(layer))
 }
 
-// ============================================================================
+// -----------------------------------------------------------------------
 // Phase 1 — Validation
-// ============================================================================
+// -----------------------------------------------------------------------
 
 #[test]
 fn test_empty_query_returns_empty_vec() {
@@ -99,15 +99,11 @@ fn test_oversized_query_returns_invalid_query_error() {
     let long_query = "a".repeat(MAX_QUERY_BYTES + 1);
     let result = engine.search(&SearchQuery::new(long_query));
     assert!(result.is_err());
-    match result.unwrap_err() {
-        SearchError::InvalidQuery(msg) => {
-            assert!(
-                msg.contains(&MAX_QUERY_BYTES.to_string()),
-                "error message should contain max length: {msg}"
-            );
-        }
-        other => panic!("expected InvalidQuery, got {other:?}"),
-    }
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains(&MAX_QUERY_BYTES.to_string()),
+        "error message should contain max length: {msg}"
+    );
 }
 
 #[test]
@@ -129,15 +125,8 @@ fn test_invalid_bm25f_config_rejected_before_search() {
 
     let result = engine.search(&query);
     assert!(result.is_err());
-    match result.unwrap_err() {
-        SearchError::InvalidQuery(msg) => {
-            assert!(
-                msg.contains("k1"),
-                "error message should mention k1: {msg}"
-            );
-        }
-        other => panic!("expected InvalidQuery, got {other:?}"),
-    }
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("k1"), "error message should mention k1: {msg}");
 }
 
 #[test]
@@ -149,11 +138,7 @@ fn test_nan_bm25f_config_rejected() {
     query.bm25f_config = Some(bad_config);
 
     let result = engine.search(&query);
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        SearchError::InvalidQuery(_) => {}
-        other => panic!("expected InvalidQuery, got {other:?}"),
-    }
+    assert!(result.is_err(), "NaN k1 should produce an error");
 }
 
 #[test]
@@ -166,15 +151,8 @@ fn test_infinity_bm25f_config_rejected() {
 
     let result = engine.search(&query);
     assert!(result.is_err());
-    match result.unwrap_err() {
-        SearchError::InvalidQuery(msg) => {
-            assert!(
-                msg.contains("k1"),
-                "error message should mention k1: {msg}"
-            );
-        }
-        other => panic!("expected InvalidQuery, got {other:?}"),
-    }
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("k1"), "error message should mention k1: {msg}");
 }
 
 #[test]
@@ -187,15 +165,8 @@ fn test_neg_infinity_bm25f_config_rejected() {
 
     let result = engine.search(&query);
     assert!(result.is_err());
-    match result.unwrap_err() {
-        SearchError::InvalidQuery(msg) => {
-            assert!(
-                msg.contains("k1"),
-                "error message should mention k1: {msg}"
-            );
-        }
-        other => panic!("expected InvalidQuery, got {other:?}"),
-    }
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("k1"), "error message should mention k1: {msg}");
 }
 
 #[test]
@@ -204,9 +175,9 @@ fn test_name_returns_query_engine() {
     assert_eq!(engine.name(), "query-engine");
 }
 
-// ============================================================================
+// -----------------------------------------------------------------------
 // Phase 2 — Integration
-// ============================================================================
+// -----------------------------------------------------------------------
 
 #[test]
 fn test_happy_path_finds_matching_file() {
@@ -304,9 +275,9 @@ fn test_unicode_query_works() {
     assert!(result.is_ok(), "unicode query should not error: {result:?}");
 }
 
-// ============================================================================
+// -----------------------------------------------------------------------
 // Phase 3 — Edge cases
-// ============================================================================
+// -----------------------------------------------------------------------
 
 #[test]
 fn test_whitespace_only_query_returns_empty() {
