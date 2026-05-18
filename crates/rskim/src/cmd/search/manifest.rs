@@ -45,6 +45,13 @@ pub(super) struct ManifestHeader {
     pub version: u32,
     /// Canonical path of the project root when the manifest was written.
     pub root: String,
+    /// The git HEAD commit SHA or ref that was current when the manifest was
+    /// written. Used for staleness detection on subsequent queries.
+    ///
+    /// `serde(default)` preserves backward compat: old manifests without this
+    /// field deserialize with `git_head: None`.
+    #[serde(default)]
+    pub git_head: Option<String>,
 }
 
 /// One line per indexed file.
@@ -101,6 +108,11 @@ pub(super) struct FileManifest {
     cache_dir: PathBuf,
     /// Entries keyed by `ManifestEntry::path`.
     entries: HashMap<String, ManifestEntry>,
+    /// Git HEAD SHA stored when the manifest was last written.
+    ///
+    /// Set via [`Self::set_git_head`], persisted by [`Self::save`], and
+    /// recovered by [`Self::stored_git_head`] after a [`Self::load`].
+    git_head: Option<String>,
 }
 
 impl FileManifest {
@@ -120,6 +132,7 @@ impl FileManifest {
             project_root,
             cache_dir,
             entries: HashMap::new(),
+            git_head: None,
         }
     }
 
@@ -218,6 +231,7 @@ impl FileManifest {
             project_root,
             cache_dir,
             entries,
+            git_head: header.git_head,
         })
     }
 
@@ -242,6 +256,43 @@ impl FileManifest {
         self.entries.get(path)
     }
 
+    /// Return entry paths sorted alphabetically.
+    ///
+    /// # Invariant
+    ///
+    /// The index build pipeline walks files in sorted order and assigns
+    /// `FileId`s sequentially (0, 1, 2, …) in the consumer loop.
+    /// Therefore `sorted_paths()[n]` is the path for `FileId(n)`.  Query
+    /// result resolution depends on this invariant — do not change the sort
+    /// order without also updating the index builder.
+    pub(super) fn sorted_paths(&self) -> Vec<&str> {
+        let mut paths: Vec<&str> = self.entries.keys().map(String::as_str).collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// Return the total number of indexed entries.
+    ///
+    /// Used in tests and future callers that need the count without loading all paths.
+    #[allow(dead_code)]
+    pub(super) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return the git HEAD that was recorded when the index was last built.
+    ///
+    /// `None` when the manifest was written by an older skim version that did
+    /// not store git HEAD, or when no HEAD was available at build time (e.g.
+    /// a non-git project).
+    pub(super) fn stored_git_head(&self) -> Option<&str> {
+        self.git_head.as_deref()
+    }
+
+    /// Set the git HEAD to record in the next [`Self::save`] call.
+    pub(super) fn set_git_head(&mut self, head: Option<String>) {
+        self.git_head = head;
+    }
+
     // -----------------------------------------------------------------------
     // Persistence
     // -----------------------------------------------------------------------
@@ -263,6 +314,7 @@ impl FileManifest {
         let header = ManifestHeader {
             version: Self::FORMAT_VERSION,
             root: canonical_root.to_string_lossy().into_owned(),
+            git_head: self.git_head.clone(),
         };
 
         let tmp = NamedTempFile::new_in(&self.cache_dir)?;

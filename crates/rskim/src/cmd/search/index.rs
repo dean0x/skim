@@ -31,6 +31,7 @@ use clap::Parser;
 use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, classify_source};
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
+use super::staleness::read_git_head;
 use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
 use super::walk::{
     ReadOutcome, discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata,
@@ -210,7 +211,8 @@ impl<'cfg> Pipeline<'cfg> {
 
         if walk_entries.is_empty() {
             // Nothing to index — write an empty manifest and return early.
-            let manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+            let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+            manifest.set_git_head(read_git_head(&self.config.root));
             manifest.save()?;
             return Ok(IndexResult {
                 file_count: 0,
@@ -245,6 +247,9 @@ impl<'cfg> Pipeline<'cfg> {
 
         // Finalize: flush index then write manifest (marks index as coherent).
         let _layer = builder.build()?;
+        // Record the current git HEAD in the manifest so staleness detection
+        // can compare it on the next query without spawning a git subprocess.
+        new_manifest.set_git_head(read_git_head(&self.config.root));
         new_manifest.save()?;
 
         let total_skipped =
@@ -511,7 +516,7 @@ fn run_classify(
 ///
 /// The base cache dir is resolved via `SKIM_CACHE_DIR` (if set) or
 /// `~/.cache/skim/`.
-fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
+pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
     let base = crate::cmd::resolve_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to resolve skim cache directory"))?;
 

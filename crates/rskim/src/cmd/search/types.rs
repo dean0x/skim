@@ -7,6 +7,84 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use rskim_search::SearchField;
+use serde::Serialize;
+
+// ============================================================================
+// Snippet types
+// ============================================================================
+
+/// A single line in a snippet context window.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct SnippetLine {
+    /// 1-indexed line number in the original source file.
+    pub line_number: u32,
+    /// Raw text of the line (no trailing newline).
+    pub content: String,
+    /// `true` for the primary match line; `false` for context lines.
+    pub is_match: bool,
+}
+
+/// A window of source lines surrounding a search match.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct SnippetContext {
+    /// Lines in the context window, ordered by line number.
+    pub lines: Vec<SnippetLine>,
+}
+
+// ============================================================================
+// Query types
+// ============================================================================
+
+/// Configuration for a query execution run.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(super) struct QueryConfig {
+    /// The raw query text.
+    pub text: String,
+    /// Maximum number of results to return (default: 20).
+    pub limit: usize,
+    /// When `true`, output JSON instead of human-readable text.
+    pub json: bool,
+    /// Project root (absolute path).
+    pub root: PathBuf,
+    /// Cache directory containing the index files.
+    pub cache_dir: PathBuf,
+}
+
+/// A search result with the file path resolved and snippet extracted.
+#[derive(Debug, Serialize)]
+#[allow(dead_code)]
+pub(super) struct ResolvedResult {
+    /// Repo-relative path (forward slashes, no leading `.`).
+    pub path: String,
+    /// BM25F relevance score (higher is better).
+    pub score: f64,
+    /// Name of the AST field type (e.g. `"function_signature"`).
+    pub field: String,
+    /// 1-indexed line number of the primary match within the file.
+    pub line_number: Option<u32>,
+    /// Source context window surrounding the match.
+    pub snippet: Option<SnippetContext>,
+    /// Byte-position ranges within the file content where query terms appear.
+    #[serde(skip)]
+    pub match_positions: Vec<Range<usize>>,
+}
+
+/// Output produced by a query execution run.
+#[derive(Debug, Serialize)]
+pub(super) struct QueryOutput {
+    /// The original query text.
+    pub query: String,
+    /// Total number of results returned (≤ limit).
+    pub total: usize,
+    /// Resolved and enriched results.
+    pub results: Vec<ResolvedResult>,
+    /// Wall-clock duration of the query in milliseconds.
+    pub duration_ms: u64,
+    /// Index statistics (included when available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_stats: Option<rskim_search::IndexStats>,
+}
 
 // ============================================================================
 // Configuration

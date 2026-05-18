@@ -300,7 +300,47 @@ fn execute_install(
         inject_guidance(agent, global, env)?;
     }
 
+    // Search: install git hooks and start a background index build.
+    // Non-fatal: failures here must not abort the agent hook setup above.
+    // find_git_root_from_cwd already verifies .git exists, so the inner
+    // .git check is redundant — collapse both conditions.
+    if let Some(project_root) = find_git_root_from_cwd() {
+        if let Err(e) = crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
+            eprintln!("  Note: could not install search hooks: {e}");
+        } else {
+            println!("  {} Search hooks installed", check_mark(true));
+        }
+
+        // Spawn a background build — non-blocking, non-fatal.
+        let _ = std::env::current_exe().ok().and_then(|exe| {
+            std::process::Command::new(&exe)
+                .args(["search", "--build"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()
+                .map(|child| {
+                    eprintln!("  Search index build started (PID {})", child.id());
+                })
+        });
+    }
+
     Ok(())
+}
+
+/// Walk up from `cwd` looking for a directory that contains `.git`.
+///
+/// Returns `None` when no `.git` is found within 256 ancestors.
+fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut current = cwd.as_path();
+    for _ in 0..256 {
+        if current.join(".git").exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+    None
 }
 
 // ============================================================================
