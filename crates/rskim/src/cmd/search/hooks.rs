@@ -27,7 +27,8 @@ use std::path::Path;
 
 const MARKER_START: &str = "# skim-search-start";
 const MARKER_END: &str = "# skim-search-end";
-const HOOK_BLOCK: &str = "# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end";
+const HOOK_BLOCK: &str =
+    "# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end";
 const SHEBANG: &str = "#!/bin/sh";
 
 /// Hook filenames to install into.

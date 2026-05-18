@@ -25,10 +25,7 @@ pub(super) enum StalenessCheck {
     /// Index is up to date — stored HEAD matches current HEAD.
     Current,
     /// HEAD has advanced since the last index build.
-    HeadChanged {
-        stored: String,
-        current: String,
-    },
+    HeadChanged { stored: String, current: String },
     /// Manifest exists but was written without a git_head field
     /// (built by an older skim version, or a non-git project at build time).
     NoStoredHead,
@@ -56,12 +53,8 @@ pub(super) fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
     if dot_git.is_file() {
         // Worktree: .git is a file containing "gitdir: <absolute-or-relative-path>"
         let content = std::fs::read_to_string(&dot_git).ok()?;
-        let gitdir_line = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))?;
-        let target = gitdir_line
-            .strip_prefix("gitdir:")
-            .map(str::trim)?;
+        let gitdir_line = content.lines().find(|l| l.starts_with("gitdir:"))?;
+        let target = gitdir_line.strip_prefix("gitdir:").map(str::trim)?;
         let target_path = PathBuf::from(target);
         if target_path.is_absolute() {
             Some(target_path)
@@ -165,11 +158,10 @@ pub(super) fn check_staleness(cache_dir: &Path, project_root: &Path) -> Stalenes
     }
 
     // Load manifest to get stored git HEAD.
-    let manifest =
-        match FileManifest::load(project_root.to_path_buf(), cache_dir.to_path_buf()) {
-            Ok(m) => m,
-            Err(_) => return StalenessCheck::NoStoredHead,
-        };
+    let manifest = match FileManifest::load(project_root.to_path_buf(), cache_dir.to_path_buf()) {
+        Ok(m) => m,
+        Err(_) => return StalenessCheck::NoStoredHead,
+    };
 
     let stored = match manifest.stored_git_head() {
         Some(h) => h.to_string(),

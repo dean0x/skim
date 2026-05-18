@@ -42,11 +42,7 @@ fn create_test_project(root: &std::path::Path) {
 }
 
 /// Build a QueryConfig pointing at `root` and `cache_dir`.
-fn make_config(
-    root: &std::path::Path,
-    cache_dir: &std::path::Path,
-    text: &str,
-) -> QueryConfig {
+fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) -> QueryConfig {
     QueryConfig {
         text: text.to_string(),
         limit: 20,
@@ -128,10 +124,7 @@ fn test_execute_query_empty_query_returns_empty_results() {
 
     let config = make_config(&root, &cache_dir, "");
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
-    assert!(
-        output.results.is_empty(),
-        "empty query → empty results"
-    );
+    assert!(output.results.is_empty(), "empty query → empty results");
 }
 
 // ============================================================================
@@ -150,8 +143,10 @@ fn test_format_text_output_empty_results() {
     let mut buf = BufWriter::new(Vec::new());
     format_text_output(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
-    assert!(s.contains("no results") || s.is_empty() || s.contains("nothing"),
-        "empty result message should mention query or 'no results', got: {s:?}");
+    assert!(
+        s.contains("no results") || s.is_empty() || s.contains("nothing"),
+        "empty result message should mention query or 'no results', got: {s:?}"
+    );
 }
 
 #[test]

@@ -85,11 +85,7 @@ fn test_install_preserves_existing_content() {
     create_git_repo(dir.path());
 
     let hook_path = dir.path().join(".git").join("hooks").join("post-commit");
-    fs::write(
-        &hook_path,
-        "#!/bin/sh\necho 'existing hook'\n",
-    )
-    .unwrap();
+    fs::write(&hook_path, "#!/bin/sh\necho 'existing hook'\n").unwrap();
 
     install_search_hooks(dir.path()).unwrap();
 

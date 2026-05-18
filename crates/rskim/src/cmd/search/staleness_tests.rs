@@ -3,8 +3,6 @@
 #![allow(clippy::unwrap_used)]
 
 use std::fs;
-use std::io::Write as _;
-use std::path::PathBuf;
 
 use tempfile::tempdir;
 
@@ -59,7 +57,10 @@ fn test_resolve_git_dir_returns_git_dir_when_directory() {
     fs::create_dir_all(&git_path).unwrap();
 
     let result = resolve_git_dir(dir.path());
-    assert!(result.is_some(), "should resolve git dir when .git is a directory");
+    assert!(
+        result.is_some(),
+        "should resolve git dir when .git is a directory"
+    );
     assert_eq!(result.unwrap(), git_path);
 }
 
@@ -152,10 +153,7 @@ fn test_read_git_head_loose_ref_takes_priority_over_packed() {
     let packed_sha = "2222222222222222222222222222222222222222";
     create_fake_git_repo(dir.path(), "ref: refs/heads/main\n");
     create_ref_file(dir.path(), "refs/heads/main", loose_sha);
-    write_packed_refs(
-        dir.path(),
-        &format!("{packed_sha} refs/heads/main\n"),
-    );
+    write_packed_refs(dir.path(), &format!("{packed_sha} refs/heads/main\n"));
 
     let result = read_git_head(dir.path());
     assert_eq!(

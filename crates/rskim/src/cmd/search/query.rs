@@ -158,8 +158,7 @@ fn resolve_paths_and_snippets(
             let path = sorted_paths.get(r.file_id.0 as usize)?;
 
             let manifest_entry = manifest.lookup(path);
-            let match_positions: Vec<std::ops::Range<usize>> =
-                r.match_positions.clone();
+            let match_positions: Vec<std::ops::Range<usize>> = r.match_positions.clone();
 
             let (line_number, snippet) =
                 match extract_snippet(root, path, &match_positions, manifest_entry) {
@@ -202,10 +201,7 @@ pub(super) fn format_text_output(
     }
 
     for r in &output.results {
-        let line_info = r
-            .line_number
-            .map(|ln| format!(":{ln}"))
-            .unwrap_or_default();
+        let line_info = r.line_number.map(|ln| format!(":{ln}")).unwrap_or_default();
         writeln!(
             w,
             "{}{}  [{}]  score: {:.2}",
@@ -221,11 +217,7 @@ pub(super) fn format_text_output(
         writeln!(w)?;
     }
 
-    writeln!(
-        w,
-        "{} result(s) in {}ms",
-        output.total, output.duration_ms
-    )?;
+    writeln!(w, "{} result(s) in {}ms", output.total, output.duration_ms)?;
 
     Ok(())
 }

@@ -26,8 +26,6 @@ use std::io::{BufWriter, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-
-
 // ============================================================================
 // Public entry point
 // ============================================================================
@@ -84,7 +82,13 @@ pub(crate) fn run(
 
     // Query mode: remaining args after flags are the query text.
     if !flags.query_text.is_empty() {
-        return run_query(&flags.query_text, flags.limit, flags.json, &flags.root_override, analytics);
+        return run_query(
+            &flags.query_text,
+            flags.limit,
+            flags.json,
+            &flags.root_override,
+            analytics,
+        );
     }
 
     print_help();
@@ -175,9 +179,7 @@ fn parse_flags(args: &[String]) -> Flags {
 // Shared project-root + cache-dir resolution
 // ============================================================================
 
-fn resolve_root_and_cache(
-    root_override: &Option<PathBuf>,
-) -> anyhow::Result<(PathBuf, PathBuf)> {
+fn resolve_root_and_cache(root_override: &Option<PathBuf>) -> anyhow::Result<(PathBuf, PathBuf)> {
     let root = match root_override {
         Some(r) => r.canonicalize().unwrap_or_else(|_| r.clone()),
         None => {

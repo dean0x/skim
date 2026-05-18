@@ -1,6 +1,7 @@
 //! Tests for the snippet extraction module (snippet.rs).
 
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::single_range_in_vec_init)]
 
 use std::fs;
 
@@ -22,7 +23,11 @@ fn test_byte_offset_to_line_start_of_file() {
 fn test_byte_offset_to_line_second_line() {
     let content = b"line1\nline2\nline3\n";
     // "line2" starts at offset 6
-    assert_eq!(byte_offset_to_line(content, 6), 2, "start of line2 → line 2");
+    assert_eq!(
+        byte_offset_to_line(content, 6),
+        2,
+        "start of line2 → line 2"
+    );
 }
 
 #[test]
