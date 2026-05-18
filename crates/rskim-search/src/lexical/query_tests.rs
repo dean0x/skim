@@ -2,10 +2,60 @@
 
 #![allow(clippy::unwrap_used)]
 
+use std::sync::Mutex;
+
 use super::MAX_QUERY_BYTES;
 use crate::index::NgramIndexBuilder;
 use crate::lexical::{BM25FConfig, QueryEngine};
-use crate::{FileId, LayerBuilder, SearchError, SearchLayer, SearchQuery};
+use crate::{FileId, LayerBuilder, SearchError, SearchLayer, SearchQuery, SearchResult};
+
+// ============================================================================
+// Test doubles
+// ============================================================================
+
+/// A `SearchLayer` that records the last query it received and returns a fixed
+/// empty result. Used to assert that the decorator forwards the exact query
+/// unchanged to the inner layer.
+struct SpyLayer {
+    received: Mutex<Option<SearchQuery>>,
+}
+
+impl SpyLayer {
+    fn new() -> Self {
+        Self {
+            received: Mutex::new(None),
+        }
+    }
+
+    fn take_received(&self) -> Option<SearchQuery> {
+        self.received.lock().unwrap().take()
+    }
+}
+
+impl SearchLayer for SpyLayer {
+    fn search(&self, query: &SearchQuery) -> crate::Result<Vec<SearchResult>> {
+        *self.received.lock().unwrap() = Some(query.clone());
+        Ok(vec![])
+    }
+
+    fn name(&self) -> &str {
+        "spy"
+    }
+}
+
+/// A `SearchLayer` that panics if `search` is ever called. Used to prove that
+/// a short-circuit path in `QueryEngine` never reaches the inner layer.
+struct PanicLayer;
+
+impl SearchLayer for PanicLayer {
+    fn search(&self, _query: &SearchQuery) -> crate::Result<Vec<SearchResult>> {
+        panic!("PanicLayer::search was called — inner layer must not be reached");
+    }
+
+    fn name(&self) -> &str {
+        "panic"
+    }
+}
 
 // ============================================================================
 // Test helper
@@ -32,6 +82,15 @@ fn test_empty_query_returns_empty_vec() {
     let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
     let result = engine.search(&SearchQuery::new("")).unwrap();
     assert!(result.is_empty(), "empty query should return empty vec");
+}
+
+#[test]
+fn test_empty_query_short_circuits_inner_layer() {
+    // PanicLayer panics if search() is called — proves the decorator never
+    // reaches the inner layer for empty queries.
+    let engine = QueryEngine::new(Box::new(PanicLayer));
+    let result = engine.search(&SearchQuery::new("")).unwrap();
+    assert!(result.is_empty(), "empty query short-circuit must return empty vec");
 }
 
 #[test]
@@ -98,6 +157,48 @@ fn test_nan_bm25f_config_rejected() {
 }
 
 #[test]
+fn test_infinity_bm25f_config_rejected() {
+    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let mut query = SearchQuery::new("foo");
+    let mut bad_config = BM25FConfig::default();
+    bad_config.k1 = f32::INFINITY;
+    query.bm25f_config = Some(bad_config);
+
+    let result = engine.search(&query);
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        SearchError::InvalidQuery(msg) => {
+            assert!(
+                msg.contains("k1"),
+                "error message should mention k1: {msg}"
+            );
+        }
+        other => panic!("expected InvalidQuery, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_neg_infinity_bm25f_config_rejected() {
+    let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
+    let mut query = SearchQuery::new("foo");
+    let mut bad_config = BM25FConfig::default();
+    bad_config.k1 = f32::NEG_INFINITY;
+    query.bm25f_config = Some(bad_config);
+
+    let result = engine.search(&query);
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        SearchError::InvalidQuery(msg) => {
+            assert!(
+                msg.contains("k1"),
+                "error message should mention k1: {msg}"
+            );
+        }
+        other => panic!("expected InvalidQuery, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_name_returns_query_engine() {
     let (_dir, engine) = build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
     assert_eq!(engine.name(), "query-engine");
@@ -124,40 +225,44 @@ fn test_happy_path_finds_matching_file() {
 
 #[test]
 fn test_search_delegates_to_inner_layer() {
-    // Build a separate inner layer with the same data to compare results
-    let dir = tempfile::tempdir().unwrap();
-    let content = "fn processEvent(event: Event) -> Result<(), Error> {}";
-    let lang = rskim_core::Language::Rust;
+    // SpyLayer records whatever query it receives; QueryEngine must forward the
+    // exact query unchanged (same text, same struct fields).
+    let spy = std::sync::Arc::new(SpyLayer::new());
+    let spy_clone = std::sync::Arc::clone(&spy);
 
-    let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
-    builder.add_file(FileId(0), content, lang).unwrap();
-    let inner = builder.build().unwrap();
-
-    let dir2 = tempfile::tempdir().unwrap();
-    let mut builder2 = NgramIndexBuilder::new(dir2.path().to_path_buf()).unwrap();
-    builder2.add_file(FileId(0), content, lang).unwrap();
-    let inner2 = builder2.build().unwrap();
-
-    let engine = QueryEngine::new(inner);
-
-    let query = SearchQuery::new("processEvent");
-    let engine_results = engine.search(&query).unwrap();
-    let inner_results = inner2.search(&query).unwrap();
-
-    assert_eq!(
-        engine_results.len(),
-        inner_results.len(),
-        "QueryEngine should delegate to inner layer: result counts differ"
-    );
-    for (a, b) in engine_results.iter().zip(inner_results.iter()) {
-        assert_eq!(a.file_id, b.file_id, "file_ids must match");
-        assert!(
-            (a.score - b.score).abs() < 1e-10,
-            "scores must match: {} vs {}",
-            a.score,
-            b.score
-        );
+    struct ArcSpyLayer(std::sync::Arc<SpyLayer>);
+    impl SearchLayer for ArcSpyLayer {
+        fn search(&self, query: &SearchQuery) -> crate::Result<Vec<SearchResult>> {
+            self.0.search(query)
+        }
+        fn name(&self) -> &str {
+            "arc-spy"
+        }
     }
+
+    let engine = QueryEngine::new(Box::new(ArcSpyLayer(spy_clone)));
+    let original_query = SearchQuery::new("processEvent");
+    engine.search(&original_query).unwrap();
+
+    let received = spy
+        .take_received()
+        .expect("inner layer must have been called for a valid query");
+    assert_eq!(
+        received.text, original_query.text,
+        "QueryEngine must forward the query text unchanged"
+    );
+    assert_eq!(
+        received.lang, original_query.lang,
+        "QueryEngine must forward the lang filter unchanged"
+    );
+    assert_eq!(
+        received.limit, original_query.limit,
+        "QueryEngine must forward the limit unchanged"
+    );
+    assert_eq!(
+        received.offset, original_query.offset,
+        "QueryEngine must forward the offset unchanged"
+    );
 }
 
 #[test]
@@ -263,10 +368,11 @@ fn test_pagination_passes_through() {
 
     // Get all results first
     let all_results = engine.search(&SearchQuery::new("alpha")).unwrap();
-    if all_results.len() < 2 {
-        // Not enough results to test pagination; skip
-        return;
-    }
+    assert!(
+        all_results.len() >= 2,
+        "expected at least 2 results to test pagination, got {}",
+        all_results.len()
+    );
 
     // Paginated: offset=1, limit=1
     let mut paginated_query = SearchQuery::new("alpha");
