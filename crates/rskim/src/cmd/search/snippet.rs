@@ -20,6 +20,17 @@ use super::types::{SnippetContext, SnippetLine};
 /// Default number of context lines above and below the match.
 pub(super) const DEFAULT_CONTEXT: u32 = 3;
 
+/// Outcome of attempting to extract a snippet.
+#[derive(Debug)]
+pub(super) enum SnippetOutcome {
+    /// Successfully extracted a snippet.
+    Ok(u32, SnippetContext),
+    /// File has changed since indexing (mtime mismatch) — positions may be stale.
+    Stale,
+    /// File deleted, unreadable, empty positions, or non-UTF8.
+    Unavailable,
+}
+
 // ============================================================================
 // Byte-offset → line number
 // ============================================================================
@@ -83,22 +94,18 @@ pub(super) fn extract_context_window(
 
 /// Extract a snippet for a search result.
 ///
-/// Returns `None` when:
-/// - `match_positions` is empty (no match to anchor on).
-/// - The file no longer exists or cannot be read.
-/// - The file's mtime differs from `manifest_entry.mtime` — the file has
-///   changed since indexing and the byte offsets may be stale.
-///
-/// On success, returns `(match_line_number, context_window)` where
-/// `match_line_number` is the 1-indexed line of the first match position.
+/// Returns:
+/// - `SnippetOutcome::Ok(line, ctx)` on success.
+/// - `SnippetOutcome::Stale` when the file's mtime differs from manifest (changed since indexing).
+/// - `SnippetOutcome::Unavailable` when positions are empty, file is deleted/unreadable, or non-UTF8.
 pub(super) fn extract_snippet(
     root: &Path,
     rel_path: &str,
     match_positions: &[Range<usize>],
     manifest_entry: Option<&ManifestEntry>,
-) -> Option<(u32, SnippetContext)> {
+) -> SnippetOutcome {
     if match_positions.is_empty() {
-        return None;
+        return SnippetOutcome::Unavailable;
     }
 
     let abs_path = root.join(rel_path);
@@ -112,14 +119,19 @@ pub(super) fn extract_snippet(
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
         if current_mtime != Some(stored_mtime) {
-            // Mtime differs or unreadable — stale, skip snippet.
-            return None;
+            return SnippetOutcome::Stale;
         }
     }
 
     // Read file content.
-    let content = std::fs::read(&abs_path).ok()?;
-    let text = std::str::from_utf8(&content).ok()?;
+    let content = match std::fs::read(&abs_path) {
+        Ok(c) => c,
+        Err(_) => return SnippetOutcome::Unavailable,
+    };
+    let text = match std::str::from_utf8(&content) {
+        Ok(t) => t,
+        Err(_) => return SnippetOutcome::Unavailable,
+    };
 
     // Use the first match position to locate the match line.
     let first_match_start = match_positions[0].start;
@@ -127,10 +139,10 @@ pub(super) fn extract_snippet(
 
     let ctx_lines = extract_context_window(text, match_line, DEFAULT_CONTEXT);
     if ctx_lines.is_empty() {
-        return None;
+        return SnippetOutcome::Unavailable;
     }
 
-    Some((match_line, SnippetContext { lines: ctx_lines }))
+    SnippetOutcome::Ok(match_line, SnippetContext { lines: ctx_lines })
 }
 
 // ============================================================================

@@ -172,6 +172,7 @@ fn test_format_text_output_includes_path_and_score() {
                 },
             ],
         }),
+        stale: false,
         match_positions: vec![],
     };
 

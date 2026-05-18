@@ -241,7 +241,7 @@ fn run_update(
 // ============================================================================
 
 fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode> {
-    let (_, cache_dir) = resolve_root_and_cache(root_override)?;
+    let (root, cache_dir) = resolve_root_and_cache(root_override)?;
 
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
@@ -256,9 +256,21 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
     let stats = reader.stats();
 
+    let manifest = manifest::FileManifest::load(root.clone(), cache_dir.clone())?;
+    let git_head = manifest.stored_git_head().map(str::to_string);
+    let staleness_status = staleness::check_staleness(&cache_dir, &root);
+
     let mut out = BufWriter::new(std::io::stdout());
     if json {
-        writeln!(out, "{}", serde_json::to_string_pretty(&stats)?)?;
+        let extended = serde_json::json!({
+            "file_count": stats.file_count,
+            "total_ngrams": stats.total_ngrams,
+            "index_size_bytes": stats.index_size_bytes,
+            "last_updated": stats.last_updated,
+            "git_head": git_head,
+            "staleness": format!("{staleness_status:?}"),
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", stats.file_count)?;
@@ -267,6 +279,12 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         if let Some(ts) = stats.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
         }
+        writeln!(
+            out,
+            "  git HEAD      : {}",
+            git_head.as_deref().unwrap_or("(none)")
+        )?;
+        writeln!(out, "  staleness     : {staleness_status:?}")?;
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)

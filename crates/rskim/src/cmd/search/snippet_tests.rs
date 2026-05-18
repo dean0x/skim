@@ -7,7 +7,7 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{byte_offset_to_line, extract_context_window, extract_snippet};
+use super::{SnippetOutcome, byte_offset_to_line, extract_context_window, extract_snippet};
 
 // ============================================================================
 // byte_offset_to_line
@@ -134,14 +134,20 @@ fn test_extract_snippet_returns_none_for_empty_positions() {
     fs::write(&file_path, "fn foo() {}\n").unwrap();
 
     let result = extract_snippet(&root, "src/lib.rs", &[], None);
-    assert!(result.is_none(), "empty positions → None");
+    assert!(
+        matches!(result, SnippetOutcome::Unavailable),
+        "empty positions → Unavailable"
+    );
 }
 
 #[test]
 fn test_extract_snippet_returns_none_for_deleted_file() {
     let dir = tempdir().unwrap();
     let result = extract_snippet(dir.path(), "src/deleted.rs", &[0..3], None);
-    assert!(result.is_none(), "deleted file → None");
+    assert!(
+        matches!(result, SnippetOutcome::Unavailable),
+        "deleted file → Unavailable"
+    );
 }
 
 #[test]
@@ -154,8 +160,10 @@ fn test_extract_snippet_basic_match() {
     fs::write(src_dir.join("lib.rs"), content).unwrap();
 
     let result = extract_snippet(&root, "src/lib.rs", &[0..3], None);
-    assert!(result.is_some(), "valid file + positions → Some");
-    let (line_no, ctx) = result.unwrap();
+    let (line_no, ctx) = match result {
+        SnippetOutcome::Ok(ln, ctx) => (ln, ctx),
+        other => panic!("expected Ok, got {other:?}"),
+    };
     assert_eq!(line_no, 1, "match at offset 0 → line 1");
     assert!(!ctx.lines.is_empty());
     // The match line should be marked
@@ -187,12 +195,10 @@ fn test_extract_snippet_stale_mtime_returns_none() {
     };
 
     let result = extract_snippet(&root, "src/mod.rs", &[0..2], Some(&entry));
-    // If the file's actual mtime doesn't match the stale manifest mtime, return None.
+    // If the file's actual mtime doesn't match the stale manifest mtime, return Stale.
     // (The file was just written so its mtime should be much newer than epoch+1.)
-    // This test may be timing-sensitive on platforms where the FS clock resolution
-    // is very coarse, but 1-second-since-epoch vs "now" is safe.
     assert!(
-        result.is_none(),
-        "stale mtime in manifest → None (file may have changed)"
+        matches!(result, SnippetOutcome::Stale),
+        "stale mtime in manifest → Stale, got {result:?}"
     );
 }

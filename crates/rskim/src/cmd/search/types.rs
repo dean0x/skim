@@ -65,6 +65,8 @@ pub(super) struct ResolvedResult {
     pub line_number: Option<u32>,
     /// Source context window surrounding the match.
     pub snippet: Option<SnippetContext>,
+    /// `true` when the file has changed since indexing (mtime mismatch or deleted).
+    pub stale: bool,
     /// Byte-position ranges within the file content where query terms appear.
     #[serde(skip)]
     pub match_positions: Vec<Range<usize>>,

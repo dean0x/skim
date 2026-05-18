@@ -16,7 +16,7 @@ use std::time::Instant;
 use rskim_search::{NgramIndexReader, QueryEngine, SearchLayer, SearchQuery};
 
 use super::manifest::FileManifest;
-use super::snippet::extract_snippet;
+use super::snippet::{SnippetOutcome, extract_snippet};
 use super::staleness::auto_refresh_if_stale;
 use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
@@ -99,10 +99,11 @@ fn resolve_paths_and_snippets(
 
             let manifest_entry = manifest.lookup(path);
 
-            let (line_number, snippet) =
+            let (line_number, snippet, stale) =
                 match extract_snippet(root, path, &r.match_positions, manifest_entry) {
-                    Some((ln, ctx)) => (Some(ln), Some(ctx)),
-                    None => (None, None),
+                    SnippetOutcome::Ok(ln, ctx) => (Some(ln), Some(ctx), false),
+                    SnippetOutcome::Stale => (None, None, true),
+                    SnippetOutcome::Unavailable => (None, None, false),
                 };
 
             Some(ResolvedResult {
@@ -111,6 +112,7 @@ fn resolve_paths_and_snippets(
                 field: r.field.name().to_string(),
                 line_number,
                 snippet,
+                stale,
                 match_positions: r.match_positions.clone(),
             })
         })
@@ -141,10 +143,11 @@ pub(super) fn format_text_output(
 
     for r in &output.results {
         let line_info = r.line_number.map(|ln| format!(":{ln}")).unwrap_or_default();
+        let stale_tag = if r.stale { "  [stale]" } else { "" };
         writeln!(
             w,
-            "{}{}  [{}]  score: {:.2}",
-            r.path, line_info, r.field, r.score
+            "{}{}  [{}]  score: {:.2}{}",
+            r.path, line_info, r.field, r.score, stale_tag
         )?;
 
         if let Some(ctx) = &r.snippet {
