@@ -40,8 +40,8 @@ impl std::fmt::Display for StalenessCheck {
             StalenessCheck::HeadChanged { stored, current } => write!(
                 f,
                 "stale (HEAD changed: {}…→{}…)",
-                &stored[..8.min(stored.len())],
-                &current[..8.min(current.len())]
+                stored.get(..8).unwrap_or(stored),
+                current.get(..8).unwrap_or(current),
             ),
             StalenessCheck::NoStoredHead => write!(f, "stale (no HEAD recorded)"),
             StalenessCheck::NoIndex => write!(f, "no index"),
@@ -153,7 +153,7 @@ fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
 }
 
 /// Return `true` if `s` looks like a 40-character (SHA-1) or 64-character
-/// (SHA-256) lowercase hex commit hash.
+/// (SHA-256) hex commit hash.
 ///
 /// Git repos using `extensions.objectFormat = sha256` emit 64-hex-char hashes.
 /// Accepting both lengths avoids silent staleness degradation in SHA-256 repos.
@@ -287,8 +287,8 @@ pub(super) fn auto_refresh_if_stale(
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: HEAD changed ({} -> {}), refreshing index…",
-                    &stored[..8.min(stored.len())],
-                    &current[..8.min(current.len())]
+                    stored.get(..8).unwrap_or(&stored),
+                    current.get(..8).unwrap_or(&current)
                 );
             } else {
                 eprintln!("skim search: index stale (HEAD changed), refreshing…");
