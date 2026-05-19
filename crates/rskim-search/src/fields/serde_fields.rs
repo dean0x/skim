@@ -86,8 +86,15 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 i += 1;
             }
             b'}' => {
+                // Guard pop symmetrically with the push: only pop when the
+                // matching `{` was shallow enough to have pushed an entry.
+                // brace_depth > MAX_JSON_DEPTH means the opening `{` did NOT push,
+                // so do not pop. Check BEFORE saturating_sub so the comparison
+                // is against the depth at which the `{` was processed.
+                if brace_depth <= MAX_JSON_DEPTH {
+                    in_key_stack.pop();
+                }
                 brace_depth = brace_depth.saturating_sub(1);
-                in_key_stack.pop();
                 i += 1;
             }
             b'[' => {
@@ -157,28 +164,31 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
 /// `after_key` is the byte index immediately after the key's closing `"`.
 fn classify_json_key_at_depth0(bytes: &[u8], after_key: usize, len: usize) -> SearchField {
     let mut j = after_key;
-    // Skip whitespace before colon.
-    while j < len
-        && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
-    {
-        j += 1;
-    }
-    // Skip colon.
+    j = skip_json_whitespace(bytes, j, len);
     if j < len && bytes[j] == b':' {
         j += 1;
     }
-    // Skip whitespace after colon.
-    while j < len
-        && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
-    {
-        j += 1;
-    }
-    // If the next character opens an object or array, this key names a container.
+    j = skip_json_whitespace(bytes, j, len);
     if j < len && (bytes[j] == b'{' || bytes[j] == b'[') {
         SearchField::TypeDefinition
     } else {
         SearchField::SymbolName
     }
+}
+
+/// Skip JSON whitespace (space, tab, newline, carriage-return) from `pos`.
+///
+/// Returns the index of the first non-whitespace byte, or `len` if the end
+/// of input is reached.
+#[inline]
+fn skip_json_whitespace(bytes: &[u8], pos: usize, len: usize) -> usize {
+    let mut i = pos;
+    while i < len
+        && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+    {
+        i += 1;
+    }
+    i
 }
 
 /// Scan a JSON string starting at `pos` (the opening `"`).
@@ -346,6 +356,11 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                         if str_end > actual_val_start && bytes[str_end - 1] == b'\n' {
                             str_end -= 1;
                         }
+                        // Also strip \r for Windows-style \r\n line endings, consistent
+                        // with CRLF handling elsewhere in this scanner.
+                        if str_end > actual_val_start && bytes[str_end - 1] == b'\r' {
+                            str_end -= 1;
+                        }
                         if str_end > actual_val_start {
                             ranges.push((actual_val_start..str_end, SearchField::StringLiteral));
                         }
@@ -378,11 +393,7 @@ fn strip_list_prefix<'a>(
     line_end: usize,
 ) -> (usize, usize, &'a [u8]) {
     if rest.starts_with(b"- ") || rest == b"-\n" || rest == b"-\r\n" || rest == b"-" {
-        let list_item_offset = if rest.len() >= 2 && rest[1] == b' ' {
-            2
-        } else {
-            1
-        };
+        let list_item_offset = if rest.starts_with(b"- ") { 2 } else { 1 };
         let new_rest_start = rest_start + list_item_offset;
         let new_rest = &bytes[new_rest_start..line_end];
         // List items get an effective indent of indent + 1 (nested under the list key).
@@ -472,16 +483,13 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
             }
             b'[' => {
                 // Section header: `[section]` or `[[array]]`.
-                let header_start = i;
-                let header_end = eol;
-                // Find the closing `]` (or `]]`).
-                if let Some(close) = bytes[i..eol].iter().rposition(|&b| b == b']') {
-                    let close_abs = i + close + 1;
-                    ranges.push((header_start..close_abs, SearchField::TypeDefinition));
-                } else {
-                    // Malformed — skip to EOL.
-                    ranges.push((header_start..header_end, SearchField::TypeDefinition));
-                }
+                // Find the closing `]` (or `]]`); fall back to EOL for malformed input.
+                let header_end = bytes[i..eol]
+                    .iter()
+                    .rposition(|&b| b == b']')
+                    .map(|close| i + close + 1)
+                    .unwrap_or(eol);
+                ranges.push((i..header_end, SearchField::TypeDefinition));
                 i = (eol + 1).min(len);
                 continue;
             }
@@ -490,11 +498,9 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 // Find the `=` sign (but not inside a string).
                 if let Some(eq_rel) = find_toml_eq_sign(&bytes[i..eol]) {
                     let eq_abs = i + eq_rel;
-                    // Key: from i to eq_abs (trimming trailing whitespace).
-                    let key_end = eq_abs;
-                    let key_text = &bytes[i..key_end];
-                    let trimmed_key_end = key_end
-                        - key_text
+                    // Key: from i to eq_abs, trimming trailing whitespace.
+                    let trimmed_key_end = eq_abs
+                        - bytes[i..eq_abs]
                             .iter()
                             .rev()
                             .take_while(|&&b| b == b' ' || b == b'\t')

@@ -192,6 +192,36 @@ fn f_json_08_non_string_values_are_other() {
     // Just verifies it doesn't panic and is contiguous.
 }
 
+/// F-JSON-09: JSON nested beyond MAX_JSON_DEPTH (1024) does not panic and
+/// produces contiguous output covering the full source.
+///
+/// Exercises the asymmetry guard in the `}` handler: braces beyond the cap
+/// must not pop entries from shallower scopes.
+#[test]
+fn f_json_09_depth_beyond_max_json_depth_cap() {
+    // Build a JSON object nested to 1025 levels (one past MAX_JSON_DEPTH).
+    let depth = 1025usize;
+    let mut source = String::with_capacity(depth * 2 + 20);
+    // Opening braces with a key at the innermost level.
+    for _ in 0..depth {
+        source.push('{');
+    }
+    source.push_str(r#""k":"v""#);
+    for _ in 0..depth {
+        source.push('}');
+    }
+
+    let ranges = classify_json(&source);
+    // Must not panic and output must be contiguous.
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+    // Output must not be empty (at minimum the key/value strings are classified).
+    assert!(
+        !ranges.is_empty(),
+        "ranges must not be empty for deeply nested JSON; ranges: {ranges:?}"
+    );
+}
+
 // ============================================================================
 // YAML tests
 // ============================================================================
@@ -284,6 +314,41 @@ fn f_yaml_06_list_parent_type_def_item_key_symbol() {
         type_def_texts.iter().any(|t| t.contains("items")),
         "'items' should be TypeDefinition; type_def texts: {type_def_texts:?}; ranges: {ranges:?}"
     );
+}
+
+/// F-YAML-07: quoted string value StringLiteral range excludes the trailing newline byte.
+///
+/// The scanner explicitly trims `\n` (and `\r` for CRLF) so the newline is not
+/// boosted with StringLiteral weight in BM25F scoring.
+#[test]
+fn f_yaml_07_quoted_string_excludes_trailing_newline() {
+    let source = "key: \"value\"\n";
+    let ranges = classify_yaml(source);
+    assert_contiguous(&ranges, source.len());
+
+    // Find the StringLiteral range.
+    let str_ranges: Vec<_> = ranges
+        .iter()
+        .filter(|(_, f)| *f == SearchField::StringLiteral)
+        .collect();
+    assert!(
+        !str_ranges.is_empty(),
+        "expected a StringLiteral range; ranges: {ranges:?}"
+    );
+
+    for (r, _) in &str_ranges {
+        let last_byte = source.as_bytes()[r.end - 1];
+        assert_ne!(
+            last_byte, b'\n',
+            "StringLiteral range must not end with \\n; range: {r:?}, text: {:?}",
+            &source[r.clone()]
+        );
+        assert_ne!(
+            last_byte, b'\r',
+            "StringLiteral range must not end with \\r; range: {r:?}, text: {:?}",
+            &source[r.clone()]
+        );
+    }
 }
 
 // ============================================================================
@@ -459,6 +524,26 @@ fn f_toml_10_triple_single_quote_backslash_literal() {
     );
 }
 
+/// F-TOML-11: quoted TOML key containing `=` is classified as a single SymbolName.
+///
+/// `find_toml_eq_sign` skips over `=` inside double-quoted key strings.
+/// This test exercises that backslash-escape-aware path.
+#[test]
+fn f_toml_11_escaped_eq_in_quoted_key() {
+    // TOML spec: quoted keys may contain any characters including `=`.
+    // The `=` inside the quotes must NOT be treated as the key-value separator.
+    let source = "\"path=here\" = \"value\"\n";
+    let ranges = classify_toml(source);
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+
+    let sym_texts = field_text(source, &ranges, SearchField::SymbolName);
+    assert!(
+        sym_texts.iter().any(|t| t.contains("path=here")),
+        "quoted key with '=' inside must be a single SymbolName; sym texts: {sym_texts:?}; ranges: {ranges:?}"
+    );
+}
+
 // ============================================================================
 // Markdown tests
 // ============================================================================
@@ -567,6 +652,34 @@ fn f_md_08_list_is_comment() {
     assert!(
         has_field(&ranges, SearchField::Comment),
         "list should be Comment; ranges: {ranges:?}"
+    );
+}
+
+/// F-MD-09: classify_markdown's own size guard fires before tree-sitter work.
+///
+/// The Markdown classifier has an independent `MAX_SOURCE_BYTES` check (lines
+/// 50-55 of markdown.rs) separate from the dispatcher guard in `classify_source`.
+/// This test calls `classify_markdown` directly with a source that is exactly one
+/// byte over the limit and verifies that `SearchError::FileTooLarge` is returned
+/// with the correct `size` and `limit` values.
+///
+/// The input is a flat space-padded string; the size check fires before any
+/// tree-sitter parsing, so this does not cause a slow parse.
+#[test]
+fn f_md_09_size_guard_returns_file_too_large() {
+    use crate::lexical::classifier::MAX_SOURCE_BYTES;
+    use crate::SearchError;
+
+    let oversized = " ".repeat(MAX_SOURCE_BYTES + 1);
+    let err = classify_markdown(&oversized)
+        .expect_err("classify_markdown must return Err for sources over MAX_SOURCE_BYTES");
+
+    assert!(
+        matches!(err, SearchError::FileTooLarge { size, limit }
+            if size == MAX_SOURCE_BYTES + 1 && limit == MAX_SOURCE_BYTES),
+        "expected FileTooLarge {{ size: {}, limit: {} }}, got: {err:?}",
+        MAX_SOURCE_BYTES + 1,
+        MAX_SOURCE_BYTES,
     );
 }
 
