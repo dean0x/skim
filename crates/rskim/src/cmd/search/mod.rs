@@ -58,68 +58,67 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Parse flags.
-    let flags = parse_flags(args);
+    // Parse flags — propagate errors (invalid --limit, unrecognised flags, etc.).
+    let flags = parse_flags(args)?;
 
-    if flags.build {
-        return run_build(false, &flags.root_override, analytics);
+    match flags.action {
+        SearchAction::Build => run_build(false, &flags.root_override, analytics),
+        SearchAction::Rebuild => run_build(true, &flags.root_override, analytics),
+        SearchAction::Update => run_update(&flags.root_override, analytics),
+        SearchAction::Stats => run_stats(flags.json, &flags.root_override),
+        SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
+        SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
+        SearchAction::Query(ref text) if !text.is_empty() => {
+            run_query(text, flags.limit, flags.json, &flags.root_override, analytics)
+        }
+        SearchAction::Query(_) => {
+            // Empty query (no positional args and no action flag) → help.
+            print_help();
+            Ok(ExitCode::SUCCESS)
+        }
     }
-    if flags.rebuild {
-        return run_build(true, &flags.root_override, analytics);
-    }
-    if flags.update {
-        return run_update(&flags.root_override, analytics);
-    }
-    if flags.stats {
-        return run_stats(flags.json, &flags.root_override);
-    }
-    if flags.install_hooks {
-        return run_install_hooks(&flags.root_override);
-    }
-    if flags.remove_hooks {
-        return run_remove_hooks(&flags.root_override);
-    }
-
-    // Query mode: remaining args after flags are the query text.
-    if !flags.query_text.is_empty() {
-        return run_query(
-            &flags.query_text,
-            flags.limit,
-            flags.json,
-            &flags.root_override,
-            analytics,
-        );
-    }
-
-    print_help();
-    Ok(ExitCode::SUCCESS)
 }
 
 // ============================================================================
 // Parsed flags
 // ============================================================================
 
+/// The action the user wants to perform, derived from CLI flags.
+///
+/// Encodes the mutually-exclusive mode flags as a single enum variant so that
+/// dispatch is a `match` rather than a cascade of `if flags.X` checks.
+#[derive(Debug, PartialEq)]
+enum SearchAction {
+    Build,
+    Rebuild,
+    Update,
+    Stats,
+    InstallHooks,
+    RemoveHooks,
+    /// Run a search query with the given text.
+    Query(String),
+}
+
+/// Parsed flags from the CLI args passed to `skim search`.
 #[derive(Debug)]
 struct Flags {
-    build: bool,
-    rebuild: bool,
-    update: bool,
-    stats: bool,
-    install_hooks: bool,
-    remove_hooks: bool,
+    action: SearchAction,
     json: bool,
     limit: usize,
     root_override: Option<PathBuf>,
-    query_text: String,
 }
 
-fn parse_flags(args: &[String]) -> Flags {
-    let mut build = false;
-    let mut rebuild = false;
-    let mut update = false;
-    let mut stats = false;
-    let mut install_hooks = false;
-    let mut remove_hooks = false;
+/// Parse the flags from `args`.
+///
+/// # Errors
+///
+/// - `--limit` / `-n` without a following value.
+/// - `--limit` / `-n` value that is not a valid `usize`.
+/// - `--limit=<value>` with a non-numeric value.
+/// - `--root` without a following value.
+/// - Unrecognised flags (tokens beginning with `--`).
+fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
+    let mut action_flag: Option<SearchAction> = None;
     let mut json = false;
     let mut limit: usize = 20;
     let mut root_override: Option<PathBuf> = None;
@@ -128,51 +127,65 @@ fn parse_flags(args: &[String]) -> Flags {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--build" => build = true,
-            "--rebuild" => rebuild = true,
-            "--update" => update = true,
-            "--stats" => stats = true,
-            "--install-hooks" => install_hooks = true,
-            "--remove-hooks" => remove_hooks = true,
-            "--json" | "-j" => json = true,
+            "--build" => action_flag = Some(SearchAction::Build),
+            "--rebuild" => action_flag = Some(SearchAction::Rebuild),
+            "--update" => action_flag = Some(SearchAction::Update),
+            "--stats" => action_flag = Some(SearchAction::Stats),
+            "--install-hooks" => action_flag = Some(SearchAction::InstallHooks),
+            "--remove-hooks" => action_flag = Some(SearchAction::RemoveHooks),
+            "--json" => json = true,
             "--limit" | "-n" => {
                 i += 1;
-                if let Some(n) = args.get(i).and_then(|v| v.parse::<usize>().ok()) {
-                    limit = n;
-                }
+                let raw = args.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--limit requires a value (e.g. --limit 10)")
+                })?;
+                limit = raw.parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "--limit value must be a positive integer, got {:?}",
+                        raw
+                    )
+                })?;
             }
             "--root" => {
                 i += 1;
-                if let Some(val) = args.get(i) {
-                    root_override = Some(PathBuf::from(val));
-                }
+                let val = args.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--root requires a path value (e.g. --root /path/to/project)")
+                })?;
+                root_override = Some(PathBuf::from(val));
             }
             s if s.starts_with("--limit=") => {
-                if let Ok(n) = s.trim_start_matches("--limit=").parse::<usize>() {
-                    limit = n;
-                }
+                let raw = s.trim_start_matches("--limit=");
+                limit = raw.parse::<usize>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "--limit value must be a positive integer, got {:?}",
+                        raw
+                    )
+                })?;
             }
             s if s.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
             }
-            // Positional arg (query text) or unrecognised flag treated as query
+            s if s.starts_with("--") => {
+                anyhow::bail!(
+                    "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
+                     --stats, --install-hooks, --remove-hooks, --json, --limit, --root",
+                    s
+                );
+            }
+            // Positional arg — part of the query text.
             s => query_parts.push(s.to_string()),
         }
         i += 1;
     }
 
-    Flags {
-        build,
-        rebuild,
-        update,
-        stats,
-        install_hooks,
-        remove_hooks,
+    let action = action_flag.unwrap_or_else(|| SearchAction::Query(query_parts.join(" ")));
+
+    Ok(Flags {
+        action,
         json,
         limit,
         root_override,
-        query_text: query_parts.join(" "),
-    }
+    })
 }
 
 // ============================================================================
@@ -256,9 +269,12 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
     let stats = reader.stats();
 
-    let manifest = manifest::FileManifest::load(root.clone(), cache_dir.clone())?;
-    let git_head = manifest.stored_git_head().map(str::to_string);
-    let (staleness_status, _) = staleness::check_staleness(&cache_dir, &root);
+    // check_staleness returns the loaded manifest as part of its work.
+    // Reuse it here instead of loading the manifest a second time.
+    let (staleness_status, loaded_manifest) = staleness::check_staleness(&cache_dir, &root);
+    let git_head = loaded_manifest
+        .as_ref()
+        .and_then(|m| m.stored_git_head().map(str::to_string));
 
     let mut out = BufWriter::new(std::io::stdout());
     if json {
@@ -268,7 +284,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             "index_size_bytes": stats.index_size_bytes,
             "last_updated": stats.last_updated,
             "git_head": git_head,
-            "staleness": format!("{staleness_status:?}"),
+            "staleness": staleness_status.to_string(),
         });
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
@@ -284,7 +300,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             "  git HEAD      : {}",
             git_head.as_deref().unwrap_or("(none)")
         )?;
-        writeln!(out, "  staleness     : {staleness_status:?}")?;
+        writeln!(out, "  staleness     : {staleness_status}")?;
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
@@ -430,62 +446,159 @@ mod tests {
         assert_eq!(result, ExitCode::SUCCESS);
     }
 
+    // ============================================================================
+    // parse_flags — action dispatch
+    // ============================================================================
+
     #[test]
     fn test_parse_flags_build() {
-        let flags = parse_flags(&["--build".to_string()]);
-        assert!(flags.build);
-        assert!(!flags.rebuild);
+        let flags = parse_flags(&["--build".to_string()]).unwrap();
+        assert_eq!(flags.action, SearchAction::Build);
     }
 
     #[test]
     fn test_parse_flags_rebuild() {
-        let flags = parse_flags(&["--rebuild".to_string()]);
-        assert!(flags.rebuild);
-        assert!(!flags.build);
+        let flags = parse_flags(&["--rebuild".to_string()]).unwrap();
+        assert_eq!(flags.action, SearchAction::Rebuild);
     }
 
     #[test]
+    fn test_stats_flag_parsed_correctly() {
+        let flags = parse_flags(&["--stats".to_string()]).unwrap();
+        assert_eq!(flags.action, SearchAction::Stats);
+    }
+
+    #[test]
+    fn test_install_hooks_flag_parsed() {
+        let flags = parse_flags(&["--install-hooks".to_string()]).unwrap();
+        assert_eq!(flags.action, SearchAction::InstallHooks);
+    }
+
+    #[test]
+    fn test_remove_hooks_flag_parsed() {
+        let flags = parse_flags(&["--remove-hooks".to_string()]).unwrap();
+        assert_eq!(flags.action, SearchAction::RemoveHooks);
+    }
+
+    // ============================================================================
+    // parse_flags — modifier flags
+    // ============================================================================
+
+    #[test]
     fn test_parse_flags_limit() {
-        let flags = parse_flags(&["--limit".to_string(), "5".to_string()]);
+        let flags = parse_flags(&["--limit".to_string(), "5".to_string()]).unwrap();
         assert_eq!(flags.limit, 5);
     }
 
     #[test]
     fn test_parse_flags_limit_equals() {
-        let flags = parse_flags(&["--limit=10".to_string()]);
+        let flags = parse_flags(&["--limit=10".to_string()]).unwrap();
         assert_eq!(flags.limit, 10);
     }
 
     #[test]
+    fn test_parse_flags_short_n() {
+        let flags = parse_flags(&["-n".to_string(), "3".to_string()]).unwrap();
+        assert_eq!(flags.limit, 3);
+    }
+
+    #[test]
     fn test_parse_flags_json() {
-        let flags = parse_flags(&["--json".to_string()]);
+        let flags = parse_flags(&["--json".to_string()]).unwrap();
         assert!(flags.json);
     }
 
     #[test]
+    fn test_parse_flags_root_space() {
+        let flags = parse_flags(&["--root".to_string(), "/tmp/proj".to_string()]).unwrap();
+        assert_eq!(flags.root_override, Some(PathBuf::from("/tmp/proj")));
+    }
+
+    #[test]
+    fn test_parse_flags_root_equals() {
+        let flags = parse_flags(&["--root=/tmp/other".to_string()]).unwrap();
+        assert_eq!(flags.root_override, Some(PathBuf::from("/tmp/other")));
+    }
+
+    // ============================================================================
+    // parse_flags — query text
+    // ============================================================================
+
+    #[test]
     fn test_parse_flags_query_text() {
-        let flags = parse_flags(&["fn".to_string(), "parse_url".to_string()]);
-        assert_eq!(flags.query_text, "fn parse_url");
-    }
-
-    /// Removed regression test: query text is no longer FAILURE — it dispatches
-    /// to query execution now. The test that checked FAILURE on query args was
-    /// testing the old stub. This comment documents the intentional removal.
-    #[test]
-    fn test_stats_flag_parsed_correctly() {
-        let flags = parse_flags(&["--stats".to_string()]);
-        assert!(flags.stats);
+        let flags = parse_flags(&["fn".to_string(), "parse_url".to_string()]).unwrap();
+        assert_eq!(flags.action, SearchAction::Query("fn parse_url".to_string()));
     }
 
     #[test]
-    fn test_install_hooks_flag_parsed() {
-        let flags = parse_flags(&["--install-hooks".to_string()]);
-        assert!(flags.install_hooks);
+    fn test_parse_flags_combined_json_limit_query() {
+        let flags = parse_flags(&[
+            "--json".to_string(),
+            "--limit".to_string(),
+            "5".to_string(),
+            "authenticate".to_string(),
+        ])
+        .unwrap();
+        assert!(flags.json);
+        assert_eq!(flags.limit, 5);
+        assert_eq!(flags.action, SearchAction::Query("authenticate".to_string()));
+    }
+
+    // ============================================================================
+    // parse_flags — error cases
+    // ============================================================================
+
+    #[test]
+    fn test_parse_flags_limit_missing_value_is_error() {
+        let err = parse_flags(&["--limit".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--limit requires a value"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
-    fn test_remove_hooks_flag_parsed() {
-        let flags = parse_flags(&["--remove-hooks".to_string()]);
-        assert!(flags.remove_hooks);
+    fn test_parse_flags_limit_non_numeric_is_error() {
+        let err = parse_flags(&["--limit".to_string(), "abc".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("positive integer"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_limit_equals_non_numeric_is_error() {
+        let err = parse_flags(&["--limit=abc".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("positive integer"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_root_missing_value_is_error() {
+        let err = parse_flags(&["--root".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--root requires a path"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_unrecognised_flag_is_error() {
+        let err = parse_flags(&["--unknown-flag".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("unrecognised flag"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_short_n_missing_value_is_error() {
+        let err = parse_flags(&["-n".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--limit requires a value"),
+            "unexpected error message: {err}"
+        );
     }
 }

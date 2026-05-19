@@ -143,9 +143,10 @@ fn test_format_text_output_empty_results() {
     let mut buf = BufWriter::new(Vec::new());
     format_text_output(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    // format_text_output writes "no results for <query>" on empty results.
     assert!(
-        s.contains("no results") || s.is_empty() || s.contains("nothing"),
-        "empty result message should mention query or 'no results', got: {s:?}"
+        s.contains("no results"),
+        "empty result output must contain 'no results', got: {s:?}"
     );
 }
 
@@ -188,6 +189,103 @@ fn test_format_text_output_includes_path_and_score() {
     format_text_output(&output, &mut buf).unwrap();
     let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(s.contains("src/auth.rs"), "output should contain path");
+}
+
+// ============================================================================
+// [stale] marker
+// ============================================================================
+
+#[test]
+fn test_format_text_output_includes_stale_marker() {
+    use crate::cmd::search::types::{ResolvedResult, SnippetContext, SnippetLine};
+
+    let result = ResolvedResult {
+        path: "src/old.rs".to_string(),
+        score: 5.0,
+        field: "function_signature".to_string(),
+        line_number: Some(10),
+        snippet: Some(SnippetContext {
+            lines: vec![SnippetLine {
+                line_number: 10,
+                content: "pub fn old_fn()".to_string(),
+                is_match: true,
+            }],
+        }),
+        stale: true,
+        match_positions: vec![],
+    };
+
+    let output = QueryOutput {
+        query: "old_fn".to_string(),
+        total: 1,
+        results: vec![result],
+        duration_ms: 2,
+        index_stats: None,
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+    assert!(
+        s.contains("[stale]"),
+        "stale result must include '[stale]' marker in output, got: {s:?}"
+    );
+}
+
+// ============================================================================
+// Edge cases: no .git, corrupt index
+// ============================================================================
+
+#[test]
+fn test_execute_query_no_git_dir_returns_ok_or_graceful_err() {
+    // Project root with no .git — should not panic, must return Ok or Err.
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // No .git directory — non-git project.
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+    let config = make_config(&root, &cache_dir, "main");
+
+    // Must not panic. Either succeeds (0 or more results) or fails gracefully.
+    match execute_query(&config, &TEST_ANALYTICS) {
+        Ok(output) => {
+            assert_eq!(output.query, "main");
+        }
+        Err(e) => {
+            // Acceptable: I/O or index error — but no panic.
+            let msg = e.to_string();
+            assert!(!msg.is_empty(), "error message must not be empty");
+        }
+    }
+}
+
+#[test]
+fn test_execute_query_corrupt_index_returns_err_not_panic() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Write garbage bytes into the index file.
+    fs::write(cache_dir.join("index.skidx"), b"this is not a valid index\xff\x00\xde\xad").unwrap();
+
+    let config = make_config(&root, &cache_dir, "authenticate");
+
+    // A corrupt index must return Err rather than panic.
+    // (auto_refresh_if_stale may rebuild and succeed — both outcomes are acceptable.)
+    match execute_query(&config, &TEST_ANALYTICS) {
+        Ok(_) => {
+            // Rebuild succeeded after detecting corruption — acceptable.
+        }
+        Err(e) => {
+            // Graceful error — confirm non-empty message.
+            assert!(!e.to_string().is_empty(), "error message must not be empty");
+        }
+    }
 }
 
 // ============================================================================

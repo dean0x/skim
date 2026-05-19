@@ -33,6 +33,22 @@ pub(super) enum StalenessCheck {
     NoIndex,
 }
 
+impl std::fmt::Display for StalenessCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StalenessCheck::Current => write!(f, "current"),
+            StalenessCheck::HeadChanged { stored, current } => write!(
+                f,
+                "stale (HEAD changed: {}…→{}…)",
+                &stored[..8.min(stored.len())],
+                &current[..8.min(current.len())]
+            ),
+            StalenessCheck::NoStoredHead => write!(f, "stale (no HEAD recorded)"),
+            StalenessCheck::NoIndex => write!(f, "no index"),
+        }
+    }
+}
+
 // ============================================================================
 // Git HEAD resolution
 // ============================================================================
@@ -86,6 +102,11 @@ pub(super) fn read_git_head(project_root: &Path) -> Option<String> {
     let head_str = head_content.trim();
 
     if let Some(ref_path) = head_str.strip_prefix("ref: ") {
+        // Validate the ref path to prevent path traversal attacks via a
+        // crafted `.git/HEAD` (e.g. `ref: ../../etc/shadow`).
+        if !ref_path.starts_with("refs/") {
+            return None;
+        }
         // Symbolic ref — resolve through loose refs then packed-refs
         resolve_symbolic_ref(&git_dir, ref_path)
     } else if is_hex_sha(head_str) {
@@ -131,9 +152,13 @@ fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
     None
 }
 
-/// Return `true` if `s` looks like a 40-character lowercase hex SHA-1.
+/// Return `true` if `s` looks like a 40-character (SHA-1) or 64-character
+/// (SHA-256) lowercase hex commit hash.
+///
+/// Git repos using `extensions.objectFormat = sha256` emit 64-hex-char hashes.
+/// Accepting both lengths avoids silent staleness degradation in SHA-256 repos.
 fn is_hex_sha(s: &str) -> bool {
-    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ============================================================================
@@ -142,47 +167,69 @@ fn is_hex_sha(s: &str) -> bool {
 
 /// Compare the manifest's stored git HEAD against the current HEAD.
 ///
+/// Returns the staleness outcome alongside the loaded manifest (when one
+/// exists and was successfully parsed). Callers can consume the manifest
+/// directly rather than re-loading it.
+///
+/// # Staleness rules
+///
+/// | stored HEAD  | current HEAD | outcome               |
+/// |-------------|-------------|----------------------|
+/// | absent       | absent       | `Current` (non-git, no change possible) |
+/// | absent       | present      | `NoStoredHead` (git repo appeared; rebuild) |
+/// | present      | absent       | `Current` (git unreadable, assume unchanged) |
+/// | present      | present      | `Current` or `HeadChanged` (compare) |
+///
 /// Returns [`StalenessCheck::NoIndex`] when no `index.skidx` file exists in
 /// `cache_dir` (cold start — index has never been built).
 ///
-/// Returns [`StalenessCheck::NoStoredHead`] when the manifest exists but has no
-/// recorded git HEAD (old skim version or non-git project at build time).
-///
-/// Returns [`StalenessCheck::Current`] or [`StalenessCheck::HeadChanged`]
-/// by comparing stored vs current HEAD.
-pub(super) fn check_staleness(cache_dir: &Path, project_root: &Path) -> StalenessCheck {
+/// Returns [`StalenessCheck::NoStoredHead`] only when the manifest has no
+/// stored HEAD **and** the project is currently a git repo (i.e. git HEAD
+/// appeared since the last build — rebuild is warranted).
+pub(super) fn check_staleness(
+    cache_dir: &Path,
+    project_root: &Path,
+) -> (StalenessCheck, Option<FileManifest>) {
     // Cold start: no index file.
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
-        return StalenessCheck::NoIndex;
+        return (StalenessCheck::NoIndex, None);
     }
 
     // Load manifest to get stored git HEAD.
     let manifest = match FileManifest::load(project_root.to_path_buf(), cache_dir.to_path_buf()) {
         Ok(m) => m,
-        Err(_) => return StalenessCheck::NoStoredHead,
+        Err(_) => return (StalenessCheck::NoStoredHead, None),
     };
 
-    let stored = match manifest.stored_git_head() {
-        Some(h) => h.to_string(),
-        None => return StalenessCheck::NoStoredHead,
-    };
+    let stored = manifest.stored_git_head().map(str::to_string);
 
     // Read current HEAD.
-    let current = match read_git_head(project_root) {
-        Some(h) => h,
-        None => {
-            // Non-git project or can't read HEAD — treat as NoStoredHead if
-            // the manifest also has no HEAD stored.
-            return StalenessCheck::NoStoredHead;
+    let current = read_git_head(project_root);
+
+    let outcome = match (stored.as_deref(), current.as_deref()) {
+        // Non-git project (both None): nothing can have changed.
+        (None, None) => StalenessCheck::Current,
+        // Git repo appeared since last build — rebuild to record HEAD.
+        (None, Some(_)) => StalenessCheck::NoStoredHead,
+        // Git is unreadable (worktree detached, submodule, fs error).
+        // Stored HEAD exists so the project was a git repo at build time;
+        // assume the index is still valid rather than triggering a rebuild.
+        (Some(_), None) => StalenessCheck::Current,
+        // Both present — compare.
+        (Some(s), Some(c)) => {
+            if s == c {
+                StalenessCheck::Current
+            } else {
+                StalenessCheck::HeadChanged {
+                    stored: s.to_string(),
+                    current: c.to_string(),
+                }
+            }
         }
     };
 
-    if stored == current {
-        StalenessCheck::Current
-    } else {
-        StalenessCheck::HeadChanged { stored, current }
-    }
+    (outcome, Some(manifest))
 }
 
 // ============================================================================
@@ -191,8 +238,10 @@ pub(super) fn check_staleness(cache_dir: &Path, project_root: &Path) -> Stalenes
 
 /// Check for staleness and rebuild the index if needed.
 ///
-/// Returns `true` when the index was refreshed, `false` when it was already
-/// current.
+/// Returns `(refreshed, manifest)` where:
+/// - `refreshed` is `true` when the index was rebuilt, `false` when already current.
+/// - `manifest` is the [`FileManifest`] loaded from disk after any rebuild, ready
+///   for callers (e.g. query execution) to use without a second load.
 ///
 /// This is a convenience wrapper for the query path: call it before opening
 /// the reader so callers always get a fresh index.
@@ -200,13 +249,19 @@ pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, FileManifest)> {
     use super::index::build_index;
     use super::types::IndexConfig;
 
-    let staleness = check_staleness(cache_dir, root);
+    let (staleness, existing_manifest) = check_staleness(cache_dir, root);
+
     if matches!(staleness, StalenessCheck::Current) {
-        return Ok(false);
+        // Index is current — return the manifest we already loaded.
+        let manifest = existing_manifest.unwrap_or_else(|| {
+            // Defensive fallback: should not happen (Current implies manifest loaded).
+            FileManifest::new(root.to_path_buf(), cache_dir.to_path_buf())
+        });
+        return Ok((false, manifest));
     }
 
     // All rebuild paths share the same config.
@@ -241,14 +296,17 @@ pub(super) fn auto_refresh_if_stale(
             build_index(&config)?;
         }
         StalenessCheck::NoStoredHead => {
-            // Manifest exists but no HEAD recorded — could be an old build.
-            // Trigger a rebuild to get a fresh manifest with HEAD stored.
+            // Manifest exists but no HEAD recorded — could be an old build or
+            // a git repo that appeared since the last non-git build.
+            // Rebuild to get a fresh manifest with HEAD stored.
             eprintln!("skim search: refreshing index (no HEAD recorded)…");
             build_index(&config)?;
         }
     }
 
-    Ok(true)
+    // After a rebuild, load the freshly written manifest for the caller.
+    let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
+    Ok((true, manifest))
 }
 
 // ============================================================================
