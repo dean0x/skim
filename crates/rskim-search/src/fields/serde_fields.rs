@@ -246,7 +246,6 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
             .unwrap_or(len);
 
         let line = &bytes[line_start..line_end];
-        let line_len = line_end - line_start;
 
         // Calculate indent (leading spaces).
         let indent = line.iter().take_while(|&&b| b == b' ').count();
@@ -316,34 +315,20 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 let actual_val_start = eff_rest_start + value_start_rel + space_skip;
 
                 if actual_val_start < line_end {
-                    let remaining = &bytes[actual_val_start..line_end];
-                    // Check for inline comment.
-                    let val_content_end = find_yaml_inline_comment_start(remaining, actual_val_start, line_end);
-
-                    if actual_val_start < val_content_end {
-                        let first_val_byte = bytes[actual_val_start];
-                        if first_val_byte == b'"' || first_val_byte == b'\'' {
-                            // Quoted string value → StringLiteral.
-                            ranges.push((actual_val_start..val_content_end, SearchField::StringLiteral));
-                        }
-                        // Unquoted values (scalars, flow indicators) → Other (gap fill).
+                    let first_val_byte = bytes[actual_val_start];
+                    if first_val_byte == b'"' || first_val_byte == b'\'' {
+                        // Quoted string value → StringLiteral.
+                        // Inline comment detection is not implemented: values like
+                        // "http://x.com # not a comment" would cause false positives.
+                        // TODO: YAML spec coverage — inline comment classification.
+                        ranges.push((actual_val_start..line_end, SearchField::StringLiteral));
                     }
-
-                    // Classify inline comment if present.
-                    if val_content_end < line_end {
-                        // Find the `#` position.
-                        let comment_content = &bytes[val_content_end..line_end];
-                        if let Some(hash_rel) = comment_content.iter().position(|&b| b == b'#') {
-                            let hash_abs = val_content_end + hash_rel;
-                            ranges.push((hash_abs..line_end, SearchField::Comment));
-                        }
-                    }
+                    // Unquoted values (scalars, flow indicators) → Other (gap fill).
                 }
             }
         }
 
         line_start = line_end;
-        let _ = line_len;
     }
 
     fill_gaps_and_merge(ranges, len)
@@ -369,27 +354,6 @@ fn find_yaml_key_colon(line_content: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-/// Find the start of an inline YAML comment within a value region.
-///
-/// Returns the absolute byte offset of the `#` that starts the comment, or
-/// `line_end` if no inline comment is present.
-///
-/// A YAML inline comment is ` #` (space + hash) that is not inside a quoted
-/// string. This is a simplified heuristic: it looks for ` #` that is not
-/// preceded by an odd number of quote characters.
-fn find_yaml_inline_comment_start(
-    _remaining: &[u8],
-    val_start: usize,
-    line_end: usize,
-) -> usize {
-    // Simplified: trim trailing whitespace+newline from value region.
-    // Inline comments would need more state to handle properly inside quotes.
-    // For now, return line_end to mark the entire value as content.
-    // This avoids false positives on values like "http://x.com # not a comment".
-    let _ = (val_start, line_end); // suppress unused warnings
-    line_end
 }
 
 // ============================================================================
@@ -420,9 +384,7 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
     let mut i = 0usize;
 
     while i < len {
-        // Skip leading whitespace on the current line.
-        let line_start = i;
-        // Skip spaces/tabs.
+        // Skip leading whitespace on the current line (spaces/tabs only).
         while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
             i += 1;
         }
@@ -493,8 +455,6 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 }
             }
         }
-
-        let _ = line_start;
     }
 
     fill_gaps_and_merge(ranges, len)

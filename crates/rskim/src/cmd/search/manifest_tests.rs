@@ -236,8 +236,9 @@ fn test_load_stops_at_entry_cap() {
     let path = cache_dir.join("index.skfiles");
     let mut f = std::fs::File::create(&path).unwrap();
 
-    // Header line
-    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    // Header line — use current FORMAT_VERSION so the version check passes
+    // and load actually parses entry lines (testing the entry cap, not version mismatch).
+    let header = serde_json::json!({"version": FileManifest::FORMAT_VERSION, "root": root.to_string_lossy()});
     writeln!(f, "{header}").unwrap();
 
     // Write MAX_MANIFEST_ENTRIES + 10 entry lines.
@@ -409,7 +410,8 @@ fn test_git_head_roundtrip() {
     );
 }
 
-/// Backward compat: old manifest without git_head → stored_git_head returns None.
+/// Backward compat: manifest at current FORMAT_VERSION but without `git_head`
+/// in the header JSON → `stored_git_head()` returns `None` via `serde(default)`.
 #[test]
 fn test_git_head_backward_compat_none() {
     use std::io::Write as _;
@@ -420,8 +422,9 @@ fn test_git_head_backward_compat_none() {
     let path = cache_dir.join("index.skfiles");
 
     let mut f = std::fs::File::create(&path).unwrap();
-    // Write header without git_head field (old format).
-    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    // Write header at current FORMAT_VERSION but omit git_head — tests
+    // that serde(default) correctly yields None for the missing field.
+    let header = serde_json::json!({"version": FileManifest::FORMAT_VERSION, "root": root.to_string_lossy()});
     writeln!(f, "{header}").unwrap();
     drop(f);
 
@@ -429,7 +432,7 @@ fn test_git_head_backward_compat_none() {
     assert_eq!(
         manifest.stored_git_head(),
         None,
-        "old manifest without git_head should return None"
+        "manifest without git_head field should return None via serde(default)"
     );
 }
 
