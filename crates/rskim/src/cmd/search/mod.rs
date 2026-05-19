@@ -229,7 +229,7 @@ fn run_update(
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
-    let refreshed = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+    let (refreshed, _manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
     if !refreshed {
         eprintln!("skim search: index is current");
     }
@@ -258,7 +258,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
 
     let manifest = manifest::FileManifest::load(root.clone(), cache_dir.clone())?;
     let git_head = manifest.stored_git_head().map(str::to_string);
-    let staleness_status = staleness::check_staleness(&cache_dir, &root);
+    let (staleness_status, _) = staleness::check_staleness(&cache_dir, &root);
 
     let mut out = BufWriter::new(std::io::stdout());
     if json {

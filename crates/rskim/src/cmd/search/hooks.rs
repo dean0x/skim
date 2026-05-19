@@ -21,6 +21,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use tempfile::NamedTempFile;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -169,28 +171,34 @@ fn strip_block(content: &str) -> String {
     }
 }
 
-/// Atomically write `content` to `hook_path` via a sibling `.tmp` file.
+/// Atomically write `content` to `hook_path` via an unpredictably-named temp
+/// file in the same directory (so the rename is always on the same filesystem).
+///
+/// Using `NamedTempFile::new_in` instead of a fixed `.tmp` suffix avoids
+/// a symlink/TOCTOU attack where an adversary pre-creates a predictable path
+/// and redirects the write to an arbitrary target.
 ///
 /// On Unix, sets executable permission (0o755) so the hook can be run by git.
 fn write_hook_atomic(hook_path: &Path, content: &str) -> anyhow::Result<()> {
-    let tmp_path = hook_path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp_path, content) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    // Set executable permission before rename.
+    let parent = hook_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("hook path has no parent directory"))?;
+
+    let mut tmp = NamedTempFile::new_in(parent)?;
+
+    use std::io::Write as _;
+    tmp.write_all(content.as_bytes())?;
+
+    // Set executable permission before persist.
     #[cfg(unix)]
     {
         let perms = std::fs::Permissions::from_mode(0o755);
-        if let Err(e) = std::fs::set_permissions(&tmp_path, perms) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e.into());
-        }
+        std::fs::set_permissions(tmp.path(), perms)?;
     }
-    if let Err(e) = std::fs::rename(&tmp_path, hook_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
+
+    tmp.persist(hook_path)
+        .map_err(|e| anyhow::anyhow!("failed to persist hook file: {}", e))?;
+
     Ok(())
 }
 

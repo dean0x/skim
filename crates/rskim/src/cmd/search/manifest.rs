@@ -26,7 +26,7 @@
 //! match the `project_root` passed to `FileManifest::load`, the entire manifest
 //! is discarded (returns an empty manifest).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, BufWriter, Write as IoWrite};
 use std::path::PathBuf;
 
@@ -106,8 +106,10 @@ pub(super) struct FileManifest {
     project_root: PathBuf,
     /// Directory where the `index.skfiles` sidecar lives.
     cache_dir: PathBuf,
-    /// Entries keyed by `ManifestEntry::path`.
-    entries: HashMap<String, ManifestEntry>,
+    /// Entries keyed by `ManifestEntry::path`, stored in sorted order via
+    /// [`BTreeMap`] so that [`Self::sorted_paths`] and [`Self::save`] never
+    /// need to sort the keys — iteration order is alphabetical by construction.
+    entries: BTreeMap<String, ManifestEntry>,
     /// Git HEAD SHA stored when the manifest was last written.
     ///
     /// Set via [`Self::set_git_head`], persisted by [`Self::save`], and
@@ -131,7 +133,7 @@ impl FileManifest {
         Self {
             project_root,
             cache_dir,
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
             git_head: None,
         }
     }
@@ -207,7 +209,7 @@ impl FileManifest {
         }
 
         // --- Parse entry lines ---
-        let mut entries = HashMap::with_capacity(1024);
+        let mut entries = BTreeMap::new();
         for line_result in lines {
             // Hard cap: stop reading if the manifest is unreasonably large.
             // Protects against corrupted files with millions of valid entries.
@@ -265,10 +267,11 @@ impl FileManifest {
     /// Therefore `sorted_paths()[n]` is the path for `FileId(n)`.  Query
     /// result resolution depends on this invariant — do not change the sort
     /// order without also updating the index builder.
+    ///
+    /// Because `entries` is a [`BTreeMap`], keys are always in alphabetical
+    /// order — iteration is O(n) with no additional allocation or sort.
     pub(super) fn sorted_paths(&self) -> Vec<&str> {
-        let mut paths: Vec<&str> = self.entries.keys().map(String::as_str).collect();
-        paths.sort_unstable();
-        paths
+        self.entries.keys().map(String::as_str).collect()
     }
 
     /// Return the total number of indexed entries.
@@ -324,11 +327,9 @@ impl FileManifest {
         let header_json = serde_json::to_string(&header)?;
         writeln!(buf, "{header_json}")?;
 
-        // Write entries (sorted for deterministic output)
-        let mut paths: Vec<&str> = self.entries.keys().map(String::as_str).collect();
-        paths.sort_unstable();
-        for path in paths {
-            let entry_json = serde_json::to_string(&self.entries[path])?;
+        // Write entries in sorted order (BTreeMap guarantees alphabetical iteration).
+        for entry in self.entries.values() {
+            let entry_json = serde_json::to_string(entry)?;
             writeln!(buf, "{entry_json}")?;
         }
 
