@@ -339,12 +339,14 @@ fn f_yaml_07_quoted_string_excludes_trailing_newline() {
     for (r, _) in &str_ranges {
         let last_byte = source.as_bytes()[r.end - 1];
         assert_ne!(
-            last_byte, b'\n',
+            last_byte,
+            b'\n',
             "StringLiteral range must not end with \\n; range: {r:?}, text: {:?}",
             &source[r.clone()]
         );
         assert_ne!(
-            last_byte, b'\r',
+            last_byte,
+            b'\r',
             "StringLiteral range must not end with \\r; range: {r:?}, text: {:?}",
             &source[r.clone()]
         );
@@ -667,8 +669,8 @@ fn f_md_08_list_is_comment() {
 /// tree-sitter parsing, so this does not cause a slow parse.
 #[test]
 fn f_md_09_size_guard_returns_file_too_large() {
-    use crate::lexical::classifier::MAX_SOURCE_BYTES;
     use crate::SearchError;
+    use crate::lexical::classifier::MAX_SOURCE_BYTES;
 
     let oversized = " ".repeat(MAX_SOURCE_BYTES + 1);
     let err = classify_markdown(&oversized)
