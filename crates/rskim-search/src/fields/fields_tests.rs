@@ -396,6 +396,69 @@ fn f_toml_06_acceptance_test() {
     );
 }
 
+/// F-TOML-07: triple-double-quote basic multi-line string is StringLiteral.
+#[test]
+fn f_toml_07_triple_double_quote_is_string_literal() {
+    let source = "desc = \"\"\"\nline one\nline two\n\"\"\"\n";
+    let ranges = classify_toml(source);
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+
+    let str_texts = field_text(source, &ranges, SearchField::StringLiteral);
+    assert!(
+        str_texts.iter().any(|t| t.contains("line one")),
+        "triple-double-quote value should be StringLiteral; str texts: {str_texts:?}; ranges: {ranges:?}"
+    );
+}
+
+/// F-TOML-08: triple-single-quote literal multi-line string is StringLiteral.
+#[test]
+fn f_toml_08_triple_single_quote_is_string_literal() {
+    let source = "desc = '''\nline one\nline two\n'''\n";
+    let ranges = classify_toml(source);
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+
+    let str_texts = field_text(source, &ranges, SearchField::StringLiteral);
+    assert!(
+        str_texts.iter().any(|t| t.contains("line one")),
+        "triple-single-quote value should be StringLiteral; str texts: {str_texts:?}; ranges: {ranges:?}"
+    );
+}
+
+/// F-TOML-09: triple-double-quote string with embedded quotes inside.
+#[test]
+fn f_toml_09_triple_double_quote_with_embedded_quotes() {
+    // A triple-double-quoted string may contain `"` and `""` without terminating.
+    let source = "msg = \"\"\"\nHe said \"hello\" to me.\n\"\"\"\n";
+    let ranges = classify_toml(source);
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+
+    let str_texts = field_text(source, &ranges, SearchField::StringLiteral);
+    assert!(
+        str_texts.iter().any(|t| t.contains("hello")),
+        "embedded quotes inside triple-double-quote should remain StringLiteral; str texts: {str_texts:?}; ranges: {ranges:?}"
+    );
+}
+
+/// F-TOML-10: triple-single-quote string with embedded backslash (treated literally, not as escape).
+#[test]
+fn f_toml_10_triple_single_quote_backslash_literal() {
+    // In TOML literal strings (single-quoted), backslash is NOT an escape.
+    // This also holds for triple-single-quoted strings.
+    let source = "path = '''\nC:\\Users\\skim\n'''\n";
+    let ranges = classify_toml(source);
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+
+    let str_texts = field_text(source, &ranges, SearchField::StringLiteral);
+    assert!(
+        str_texts.iter().any(|t| t.contains("skim")),
+        "backslash in triple-single-quote should be literal, content still StringLiteral; str texts: {str_texts:?}; ranges: {ranges:?}"
+    );
+}
+
 // ============================================================================
 // Markdown tests
 // ============================================================================

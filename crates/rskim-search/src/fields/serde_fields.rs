@@ -125,42 +125,8 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 if in_object && in_key {
                     // Key string: determine whether this should be TypeDefinition or SymbolName.
                     // TypeDefinition: depth-0 key (brace_depth == 1) AND value is object/array.
-                    // We determine this by looking ahead past whitespace after the colon.
-                    // The current position is the key's opening quote, so we need to check
-                    // what follows the closing quote + colon + whitespace.
                     let field = if brace_depth == 1 && !inside_array_at_root {
-                        // Look ahead: skip past this string, whitespace, colon, whitespace
-                        // to see if the next char is `{` or `[`.
-                        let after_key = str_end;
-                        let mut j = after_key;
-                        // Skip whitespace
-                        while j < len
-                            && (bytes[j] == b' '
-                                || bytes[j] == b'\t'
-                                || bytes[j] == b'\n'
-                                || bytes[j] == b'\r')
-                        {
-                            j += 1;
-                        }
-                        // Skip colon
-                        if j < len && bytes[j] == b':' {
-                            j += 1;
-                        }
-                        // Skip whitespace
-                        while j < len
-                            && (bytes[j] == b' '
-                                || bytes[j] == b'\t'
-                                || bytes[j] == b'\n'
-                                || bytes[j] == b'\r')
-                        {
-                            j += 1;
-                        }
-                        // Check if next char is `{` or `[`
-                        if j < len && (bytes[j] == b'{' || bytes[j] == b'[') {
-                            SearchField::TypeDefinition
-                        } else {
-                            SearchField::SymbolName
-                        }
+                        classify_json_key_at_depth0(bytes, str_end, len)
                     } else {
                         SearchField::SymbolName
                     };
@@ -179,6 +145,40 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
     }
 
     fill_gaps_and_merge(ranges, len)
+}
+
+/// Determine the [`SearchField`] for a depth-0 JSON key by looking ahead past
+/// the closing quote, optional whitespace, colon, and optional whitespace to
+/// check whether the next character is `{` or `[`.
+///
+/// Returns [`SearchField::TypeDefinition`] if the value is an object or array,
+/// [`SearchField::SymbolName`] otherwise.
+///
+/// `after_key` is the byte index immediately after the key's closing `"`.
+fn classify_json_key_at_depth0(bytes: &[u8], after_key: usize, len: usize) -> SearchField {
+    let mut j = after_key;
+    // Skip whitespace before colon.
+    while j < len
+        && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
+    {
+        j += 1;
+    }
+    // Skip colon.
+    if j < len && bytes[j] == b':' {
+        j += 1;
+    }
+    // Skip whitespace after colon.
+    while j < len
+        && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r')
+    {
+        j += 1;
+    }
+    // If the next character opens an object or array, this key names a container.
+    if j < len && (bytes[j] == b'{' || bytes[j] == b'[') {
+        SearchField::TypeDefinition
+    } else {
+        SearchField::SymbolName
+    }
 }
 
 /// Scan a JSON string starting at `pos` (the opening `"`).
@@ -295,19 +295,7 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
         // List item lines can have an inline key: `  - name: foo`
         // We strip the `- ` prefix and re-classify the remainder.
         let (eff_indent, eff_rest_start, eff_rest) =
-            if rest.starts_with(b"- ") || rest == b"-\n" || rest == b"-\r\n" || rest == b"-" {
-                let list_item_offset = if rest.len() >= 2 && rest[1] == b' ' {
-                    2
-                } else {
-                    1
-                };
-                let new_rest_start = rest_start + list_item_offset;
-                let new_rest = &bytes[new_rest_start..line_end];
-                // List items get an effective indent of indent + 1 (nested under the list key).
-                (indent + 1, new_rest_start, new_rest)
-            } else {
-                (indent, rest_start, rest)
-            };
+            strip_list_prefix(bytes, indent, rest_start, rest, line_end);
 
         // --- Key detection: look for `: ` or `:\n` or `:\r\n` or end-of-line-colon.
         // We need to find the key text and the colon position.
@@ -371,6 +359,37 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
     }
 
     fill_gaps_and_merge(ranges, len)
+}
+
+/// Strip the YAML list-item prefix (`- ` or `-`) from a line's content bytes.
+///
+/// Returns `(effective_indent, effective_rest_start, effective_rest)`:
+/// - `effective_indent`: the indent level to use for key classification
+///   (incremented by 1 for list items so they are treated as nested)
+/// - `effective_rest_start`: absolute byte index of the content after the prefix
+/// - `effective_rest`: byte slice of the remaining line content
+///
+/// If the line does not start with a list prefix, the inputs are returned unchanged.
+fn strip_list_prefix<'a>(
+    bytes: &'a [u8],
+    indent: usize,
+    rest_start: usize,
+    rest: &'a [u8],
+    line_end: usize,
+) -> (usize, usize, &'a [u8]) {
+    if rest.starts_with(b"- ") || rest == b"-\n" || rest == b"-\r\n" || rest == b"-" {
+        let list_item_offset = if rest.len() >= 2 && rest[1] == b' ' {
+            2
+        } else {
+            1
+        };
+        let new_rest_start = rest_start + list_item_offset;
+        let new_rest = &bytes[new_rest_start..line_end];
+        // List items get an effective indent of indent + 1 (nested under the list key).
+        (indent + 1, new_rest_start, new_rest)
+    } else {
+        (indent, rest_start, rest)
+    }
 }
 
 /// Find the position of the `:` in a YAML key on a line's content bytes.
