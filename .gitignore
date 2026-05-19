@@ -20,7 +20,6 @@ flamegraph.svg
 .DS_Store
 
 # Documentation scratch folder (local notes, not for version control)
-.docs/
 
 # Claude Code project instructions (local development only)
 CLAUDE.md
@@ -45,7 +44,6 @@ criterion/
 
 # Launch materials (marketing)
 /launch/
-.memory/
 
 .codenames
 
