@@ -47,6 +47,13 @@ pub(crate) fn classify_markdown(source: &str) -> crate::Result<Vec<(Range<usize>
 
     let len = source.len();
 
+    if len > crate::lexical::classifier::MAX_SOURCE_BYTES {
+        return Err(crate::SearchError::FileTooLarge {
+            size: len,
+            limit: crate::lexical::classifier::MAX_SOURCE_BYTES,
+        });
+    }
+
     // Attempt to parse with the Markdown grammar. If the parser cannot be
     // initialised (grammar missing), return a single Other range.
     let mut parser = match rskim_core::Parser::new(Language::Markdown) {

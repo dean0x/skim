@@ -83,13 +83,12 @@ fn test_source_exceeding_limit_returns_error() {
 #[ignore = "allocates 100 MiB — run explicitly with --ignored"]
 fn test_source_at_limit_boundary_does_not_error() {
     // A source of exactly MAX_SOURCE_BYTES bytes must NOT be rejected.
-    // We use JSON (non-tree-sitter) so this stays fast even at 100 MiB;
-    // it returns a single Other range without touching the parser.
+    // We use JSON so this stays fast even at 100 MiB; the format-specific
+    // scanner classifies without tree-sitter overhead.
     let at_limit = " ".repeat(MAX_SOURCE_BYTES);
     let result = classify_source(&at_limit, rskim_core::Language::Json);
-    // Json parser returns an error (unsupported for tree-sitter), but the
-    // size guard must not fire — the error, if any, comes from the parser,
-    // not from FileTooLarge.
+    // The size guard must not fire at exactly the limit — any result other
+    // than FileTooLarge (Ok or a scanner error) is acceptable here.
     match result {
         Err(crate::SearchError::FileTooLarge { .. }) => {
             panic!("MAX_SOURCE_BYTES itself must not trigger FileTooLarge");

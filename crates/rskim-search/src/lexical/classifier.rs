@@ -10,11 +10,16 @@
 //! 4. Fill uncovered gaps with `SearchField::Other`, then merge adjacent same-field
 //!    ranges.
 //!
-//! # Non-tree-sitter languages
+//! # Format-specific dispatchers
 //!
-//! For languages where [`rskim_core::Language::to_tree_sitter`] returns `None`
-//! (JSON, YAML, TOML), the entire source is classified as
-//! [`SearchField::Other`] — a single range `0..source.len()`.
+//! JSON, YAML, TOML, and Markdown are dispatched to dedicated classifiers
+//! **before** the generic tree-sitter path:
+//!
+//! - JSON/YAML/TOML: lightweight std-only scanners (infallible, no tree-sitter).
+//! - Markdown: tree-sitter via [`rskim_core`] with custom heading-level logic.
+//!
+//! Only languages that are not handled by a dedicated classifier reach the
+//! generic tree-sitter path below.
 //!
 //! # Invariants
 //!
