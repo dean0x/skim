@@ -83,13 +83,12 @@ fn test_source_exceeding_limit_returns_error() {
 #[ignore = "allocates 100 MiB — run explicitly with --ignored"]
 fn test_source_at_limit_boundary_does_not_error() {
     // A source of exactly MAX_SOURCE_BYTES bytes must NOT be rejected.
-    // We use JSON (non-tree-sitter) so this stays fast even at 100 MiB;
-    // it returns a single Other range without touching the parser.
+    // We use JSON so this stays fast even at 100 MiB; the format-specific
+    // scanner classifies without tree-sitter overhead.
     let at_limit = " ".repeat(MAX_SOURCE_BYTES);
     let result = classify_source(&at_limit, rskim_core::Language::Json);
-    // Json parser returns an error (unsupported for tree-sitter), but the
-    // size guard must not fire — the error, if any, comes from the parser,
-    // not from FileTooLarge.
+    // The size guard must not fire at exactly the limit — any result other
+    // than FileTooLarge (Ok or a scanner error) is acceptable here.
     match result {
         Err(crate::SearchError::FileTooLarge { .. }) => {
             panic!("MAX_SOURCE_BYTES itself must not trigger FileTooLarge");
@@ -102,34 +101,56 @@ fn test_source_at_limit_boundary_does_not_error() {
 // Non-tree-sitter languages (JSON, YAML, TOML)
 // -----------------------------------------------------------------------
 
+/// JSON is now classified with format-specific field mapping (not single-Other).
+/// Verifies contiguity and presence of structural fields.
 #[test]
-fn test_json_classified_as_single_other() {
+fn test_json_field_mapping_non_trivial() {
     let source = r#"{"key": "value"}"#;
     let ranges = classify_source(source, rskim_core::Language::Json).unwrap();
-    assert_eq!(ranges.len(), 1, "JSON should return single range");
-    assert_eq!(
-        ranges[0].1,
-        SearchField::Other,
-        "JSON range should be Other"
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+    // With format-specific classification, "key" must be SymbolName.
+    let has_symbol = ranges.iter().any(|(_, f)| *f == SearchField::SymbolName);
+    assert!(
+        has_symbol,
+        "JSON classify_source must produce SymbolName for key; got: {ranges:?}"
     );
-    assert_eq!(ranges[0].0.start, 0);
-    assert_eq!(ranges[0].0.end, source.len());
 }
 
+/// YAML is now classified with format-specific field mapping (not single-Other).
+/// Verifies contiguity and presence of structural fields.
 #[test]
-fn test_yaml_classified_as_single_other() {
+fn test_yaml_field_mapping_non_trivial() {
     let source = "key: value\n";
     let ranges = classify_source(source, rskim_core::Language::Yaml).unwrap();
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(ranges[0].1, SearchField::Other);
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+    // "key" at indent-0 must be TypeDefinition.
+    let has_type_def = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::TypeDefinition);
+    assert!(
+        has_type_def,
+        "YAML classify_source must produce TypeDefinition for root key; got: {ranges:?}"
+    );
 }
 
+/// TOML is now classified with format-specific field mapping (not single-Other).
+/// Verifies contiguity and presence of structural fields.
 #[test]
-fn test_toml_classified_as_single_other() {
+fn test_toml_field_mapping_non_trivial() {
     let source = "[package]\nname = \"skim\"\n";
     let ranges = classify_source(source, rskim_core::Language::Toml).unwrap();
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(ranges[0].1, SearchField::Other);
+    assert_contiguous(&ranges, source.len());
+    assert_field_lengths_sum(&ranges, source.len());
+    // [package] must be TypeDefinition.
+    let has_type_def = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::TypeDefinition);
+    assert!(
+        has_type_def,
+        "TOML classify_source must produce TypeDefinition for section; got: {ranges:?}"
+    );
 }
 
 // -----------------------------------------------------------------------

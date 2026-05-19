@@ -10,6 +10,7 @@
 //!
 //! CLI/binary code in `crates/rskim/src/cmd/search/mod.rs` handles user-facing I/O.
 
+pub(crate) mod fields;
 pub mod index;
 pub mod lexical;
 pub mod ngram;

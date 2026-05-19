@@ -122,7 +122,12 @@ impl FileManifest {
     pub const MANIFEST_FILENAME: &'static str = "index.skfiles";
 
     /// Current format version — bump this on any breaking schema change.
-    pub const FORMAT_VERSION: u32 = 1;
+    ///
+    /// v1 → v2: Custom field mapping for JSON/YAML/TOML/Markdown (Issue #193).
+    /// Existing v1 indexes must be re-indexed because field classifications have
+    /// changed: previously all bytes were Other; now structural elements receive
+    /// TypeDefinition, SymbolName, StringLiteral, etc.
+    pub const FORMAT_VERSION: u32 = 2;
 
     // -----------------------------------------------------------------------
     // Constructors

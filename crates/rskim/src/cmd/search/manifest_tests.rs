@@ -236,8 +236,9 @@ fn test_load_stops_at_entry_cap() {
     let path = cache_dir.join("index.skfiles");
     let mut f = std::fs::File::create(&path).unwrap();
 
-    // Header line
-    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    // Header line — use current FORMAT_VERSION so the version check passes
+    // and load actually parses entry lines (testing the entry cap, not version mismatch).
+    let header = serde_json::json!({"version": FileManifest::FORMAT_VERSION, "root": root.to_string_lossy()});
     writeln!(f, "{header}").unwrap();
 
     // Write MAX_MANIFEST_ENTRIES + 10 entry lines.
@@ -346,10 +347,16 @@ fn test_mtime_persisted_in_manifest() {
     );
 }
 
-/// A manifest written without a `mtime` field (e.g. by an older version of
-/// skim) must deserialize cleanly with `mtime: None`.
+/// A manifest written with a stale `version` field (e.g. by an older version
+/// of skim) must be silently discarded and replaced with an empty manifest.
+///
+/// This test was previously named `test_mtime_backward_compat_none` and verified
+/// that a v1 manifest entry without a `mtime` field was loaded with `mtime: None`.
+/// After bumping FORMAT_VERSION to 2 (Issue #193: custom field mapping for
+/// JSON/YAML/TOML/Markdown), v1 manifests are intentionally rejected — skim
+/// must re-index from scratch to pick up the new field classifications.
 #[test]
-fn test_mtime_backward_compat_none() {
+fn test_stale_version_manifest_triggers_cold_start() {
     use std::io::Write as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -357,11 +364,10 @@ fn test_mtime_backward_compat_none() {
     let cache_dir = root.clone();
     let path = cache_dir.join("index.skfiles");
 
-    // Write a manifest with no `mtime` field in the entry.
+    // Write a v1 manifest (FORMAT_VERSION is now 2).
     let mut f = std::fs::File::create(&path).unwrap();
     let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
     writeln!(f, "{header}").unwrap();
-    // Deliberately omit `mtime` to simulate an old manifest format.
     let entry_json = serde_json::json!({
         "path": "src/old.rs",
         "sha256": "b".repeat(64),
@@ -371,11 +377,12 @@ fn test_mtime_backward_compat_none() {
     writeln!(f, "{entry_json}").unwrap();
     drop(f);
 
+    // Loading a v1 manifest against FORMAT_VERSION 2 must produce an empty
+    // manifest (cold start), not preserve the v1 entries.
     let manifest = FileManifest::load(root, cache_dir).unwrap();
-    let found = manifest.lookup("src/old.rs").unwrap();
-    assert_eq!(
-        found.mtime, None,
-        "mtime should be None when field is absent (backward compat)"
+    assert!(
+        manifest.lookup("src/old.rs").is_none(),
+        "v1 manifest must be discarded on version mismatch — cold start required"
     );
 }
 
@@ -403,7 +410,8 @@ fn test_git_head_roundtrip() {
     );
 }
 
-/// Backward compat: old manifest without git_head → stored_git_head returns None.
+/// Backward compat: manifest at current FORMAT_VERSION but without `git_head`
+/// in the header JSON → `stored_git_head()` returns `None` via `serde(default)`.
 #[test]
 fn test_git_head_backward_compat_none() {
     use std::io::Write as _;
@@ -414,8 +422,9 @@ fn test_git_head_backward_compat_none() {
     let path = cache_dir.join("index.skfiles");
 
     let mut f = std::fs::File::create(&path).unwrap();
-    // Write header without git_head field (old format).
-    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    // Write header at current FORMAT_VERSION but omit git_head — tests
+    // that serde(default) correctly yields None for the missing field.
+    let header = serde_json::json!({"version": FileManifest::FORMAT_VERSION, "root": root.to_string_lossy()});
     writeln!(f, "{header}").unwrap();
     drop(f);
 
@@ -423,7 +432,7 @@ fn test_git_head_backward_compat_none() {
     assert_eq!(
         manifest.stored_git_head(),
         None,
-        "old manifest without git_head should return None"
+        "manifest without git_head field should return None via serde(default)"
     );
 }
 
