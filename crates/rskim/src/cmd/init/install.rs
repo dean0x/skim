@@ -300,7 +300,63 @@ fn execute_install(
         inject_guidance(agent, global, env)?;
     }
 
+    // Search: install git hooks and start a background index build.
+    // Non-fatal: failures here must not abort the agent hook setup above.
+    // find_git_root_from_cwd already verifies .git exists, so the inner
+    // .git check is redundant — collapse both conditions.
+    if let Some(project_root) = find_git_root_from_cwd() {
+        if let Err(e) = crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
+            eprintln!("  Note: could not install search hooks: {e}");
+        } else {
+            println!("  {} Search hooks installed", check_mark(true));
+        }
+
+        // Spawn a background build — fire-and-forget, non-blocking, non-fatal.
+        //
+        // The `Child` handle is intentionally dropped without calling `wait()`.
+        // On Unix the child process is reparented to init (PID 1) when this
+        // process exits and will be reaped there.  The `skim init` command exits
+        // immediately after this block, so the window for a zombie entry in the
+        // process table is negligible.  The build lock in `build_index` prevents
+        // concurrent writes when multiple callers overlap.
+        if let Some(exe) = std::env::current_exe().ok()
+            && let Ok(child) = std::process::Command::new(&exe)
+                .args(["search", "--build"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        {
+            eprintln!("  Search index build started (PID {})", child.id());
+            drop(child); // Detach: do not wait for the background process.
+        }
+    }
+
     Ok(())
+}
+
+/// Walk up from `cwd` looking for a directory that contains `.git`.
+///
+/// Returns `None` when no `.git` is found within 256 ancestors.
+///
+/// # Note
+///
+/// `crate::cmd::search::walk::discover_project_root` performs a similar walk
+/// but returns `anyhow::Result<PathBuf>` (falling back to `cwd` when no `.git`
+/// is found) and canonicalises the start path first.  This function has
+/// different semantics: callers here need `None` to mean "not a git repo" so
+/// they can skip hook installation entirely.  The two functions are kept separate
+/// to preserve the distinct caller contracts; they share the same 256-ancestor
+/// bound to prevent unbounded traversal.
+fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut current = cwd.as_path();
+    for _ in 0..256 {
+        if current.join(".git").exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+    None
 }
 
 // ============================================================================

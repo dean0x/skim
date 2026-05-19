@@ -27,10 +27,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use anyhow::Context as _;
 use clap::Parser;
 use rskim_search::{FileId, LayerBuilder, NgramIndexBuilder, classify_source};
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
+use super::staleness::read_git_head;
 use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
 use super::walk::{
     ReadOutcome, discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata,
@@ -146,8 +148,37 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 /// Returns an [`IndexResult`] with counts and duration. Callers that need only
 /// an exit code (e.g. [`run`]) wrap this; tests that need to inspect counts
 /// call it directly.
+///
+/// # Concurrency
+///
+/// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` before
+/// running the pipeline. If another process holds the lock the call blocks until
+/// that build completes and then proceeds with its own build. This serialises
+/// all callers — `skim init` background spawn, git-hook `--update`, and direct
+/// `--build` / `--rebuild` — protecting `index.skidx` and `index.skfiles` from
+/// concurrent writes.
+///
+/// The lock is released when the returned [`IndexResult`] (or the `Err`) drops,
+/// i.e. at the end of this function. The lock file itself is never deleted so
+/// the OS can reuse it across processes.
 pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
-    Pipeline::new(config)?.run()
+    let pipeline = Pipeline::new(config)?;
+
+    // Acquire the advisory build lock before touching index files.
+    let lock_path = pipeline.cache_dir.join(".skim-build.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open build lock: {}", lock_path.display()))?;
+    lock_file
+        .lock()
+        .with_context(|| "failed to acquire exclusive build lock")?;
+
+    // Lock is held for the duration of the build. `lock_file` drops (and
+    // releases the lock) when this function returns.
+    pipeline.run()
 }
 
 /// Orchestrates the index build pipeline as discrete, testable stages.
@@ -209,8 +240,13 @@ impl<'cfg> Pipeline<'cfg> {
         let (walk_entries, walk_skip_count) = self.walk()?;
 
         if walk_entries.is_empty() {
-            // Nothing to index — write an empty manifest and return early.
-            let manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+            // Nothing to index — flush an empty index and manifest so that
+            // `check_staleness` can find `index.skidx` and treat the project
+            // as indexed rather than returning `NoIndex` on every query.
+            let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
+            let _layer = builder.build()?;
+            let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+            manifest.set_git_head(read_git_head(&self.config.root));
             manifest.save()?;
             return Ok(IndexResult {
                 file_count: 0,
@@ -245,6 +281,9 @@ impl<'cfg> Pipeline<'cfg> {
 
         // Finalize: flush index then write manifest (marks index as coherent).
         let _layer = builder.build()?;
+        // Record the current git HEAD in the manifest so staleness detection
+        // can compare it on the next query without spawning a git subprocess.
+        new_manifest.set_git_head(read_git_head(&self.config.root));
         new_manifest.save()?;
 
         let total_skipped =
@@ -511,7 +550,7 @@ fn run_classify(
 ///
 /// The base cache dir is resolved via `SKIM_CACHE_DIR` (if set) or
 /// `~/.cache/skim/`.
-fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
+pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
     let base = crate::cmd::resolve_cache_dir()
         .ok_or_else(|| anyhow::anyhow!("failed to resolve skim cache directory"))?;
 

@@ -26,7 +26,7 @@
 //! match the `project_root` passed to `FileManifest::load`, the entire manifest
 //! is discarded (returns an empty manifest).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, BufWriter, Write as IoWrite};
 use std::path::PathBuf;
 
@@ -45,6 +45,13 @@ pub(super) struct ManifestHeader {
     pub version: u32,
     /// Canonical path of the project root when the manifest was written.
     pub root: String,
+    /// The git HEAD commit SHA or ref that was current when the manifest was
+    /// written. Used for staleness detection on subsequent queries.
+    ///
+    /// `serde(default)` preserves backward compat: old manifests without this
+    /// field deserialize with `git_head: None`.
+    #[serde(default)]
+    pub git_head: Option<String>,
 }
 
 /// One line per indexed file.
@@ -99,8 +106,15 @@ pub(super) struct FileManifest {
     project_root: PathBuf,
     /// Directory where the `index.skfiles` sidecar lives.
     cache_dir: PathBuf,
-    /// Entries keyed by `ManifestEntry::path`.
-    entries: HashMap<String, ManifestEntry>,
+    /// Entries keyed by `ManifestEntry::path`, stored in sorted order via
+    /// [`BTreeMap`] so that [`Self::sorted_paths`] and [`Self::save`] never
+    /// need to sort the keys — iteration order is alphabetical by construction.
+    entries: BTreeMap<String, ManifestEntry>,
+    /// Git HEAD SHA stored when the manifest was last written.
+    ///
+    /// Set via [`Self::set_git_head`], persisted by [`Self::save`], and
+    /// recovered by [`Self::stored_git_head`] after a [`Self::load`].
+    git_head: Option<String>,
 }
 
 impl FileManifest {
@@ -119,7 +133,8 @@ impl FileManifest {
         Self {
             project_root,
             cache_dir,
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
+            git_head: None,
         }
     }
 
@@ -194,7 +209,7 @@ impl FileManifest {
         }
 
         // --- Parse entry lines ---
-        let mut entries = HashMap::with_capacity(1024);
+        let mut entries = BTreeMap::new();
         for line_result in lines {
             // Hard cap: stop reading if the manifest is unreasonably large.
             // Protects against corrupted files with millions of valid entries.
@@ -218,6 +233,7 @@ impl FileManifest {
             project_root,
             cache_dir,
             entries,
+            git_head: header.git_head,
         })
     }
 
@@ -242,6 +258,44 @@ impl FileManifest {
         self.entries.get(path)
     }
 
+    /// Return entry paths sorted alphabetically.
+    ///
+    /// # Invariant
+    ///
+    /// The index build pipeline walks files in sorted order and assigns
+    /// `FileId`s sequentially (0, 1, 2, …) in the consumer loop.
+    /// Therefore `sorted_paths()[n]` is the path for `FileId(n)`.  Query
+    /// result resolution depends on this invariant — do not change the sort
+    /// order without also updating the index builder.
+    ///
+    /// Because `entries` is a [`BTreeMap`], keys are always in alphabetical
+    /// order — iteration is O(n) with no additional allocation or sort.
+    pub(super) fn sorted_paths(&self) -> Vec<&str> {
+        self.entries.keys().map(String::as_str).collect()
+    }
+
+    /// Return the total number of indexed entries.
+    ///
+    /// Used in tests and future callers that need the count without loading all paths.
+    #[allow(dead_code)]
+    pub(super) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return the git HEAD that was recorded when the index was last built.
+    ///
+    /// `None` when the manifest was written by an older skim version that did
+    /// not store git HEAD, or when no HEAD was available at build time (e.g.
+    /// a non-git project).
+    pub(super) fn stored_git_head(&self) -> Option<&str> {
+        self.git_head.as_deref()
+    }
+
+    /// Set the git HEAD to record in the next [`Self::save`] call.
+    pub(super) fn set_git_head(&mut self, head: Option<String>) {
+        self.git_head = head;
+    }
+
     // -----------------------------------------------------------------------
     // Persistence
     // -----------------------------------------------------------------------
@@ -263,6 +317,7 @@ impl FileManifest {
         let header = ManifestHeader {
             version: Self::FORMAT_VERSION,
             root: canonical_root.to_string_lossy().into_owned(),
+            git_head: self.git_head.clone(),
         };
 
         let tmp = NamedTempFile::new_in(&self.cache_dir)?;
@@ -272,11 +327,9 @@ impl FileManifest {
         let header_json = serde_json::to_string(&header)?;
         writeln!(buf, "{header_json}")?;
 
-        // Write entries (sorted for deterministic output)
-        let mut paths: Vec<&str> = self.entries.keys().map(String::as_str).collect();
-        paths.sort_unstable();
-        for path in paths {
-            let entry_json = serde_json::to_string(&self.entries[path])?;
+        // Write entries in sorted order (BTreeMap guarantees alphabetical iteration).
+        for entry in self.entries.values() {
+            let entry_json = serde_json::to_string(entry)?;
             writeln!(buf, "{entry_json}")?;
         }
 

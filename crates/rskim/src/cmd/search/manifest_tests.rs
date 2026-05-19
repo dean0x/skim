@@ -378,3 +378,112 @@ fn test_mtime_backward_compat_none() {
         "mtime should be None when field is absent (backward compat)"
     );
 }
+
+// ============================================================================
+// git_head extensions
+// ============================================================================
+
+/// Roundtrip: set_git_head → save → load → stored_git_head returns same value.
+#[test]
+fn test_git_head_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    let sha = "abc1234def5678901234567890123456789012345".to_string();
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.set_git_head(Some(sha.clone()));
+    manifest.save().unwrap();
+
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(
+        loaded.stored_git_head(),
+        Some(sha.as_str()),
+        "git_head must survive save/load roundtrip"
+    );
+}
+
+/// Backward compat: old manifest without git_head → stored_git_head returns None.
+#[test]
+fn test_git_head_backward_compat_none() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+    let path = cache_dir.join("index.skfiles");
+
+    let mut f = std::fs::File::create(&path).unwrap();
+    // Write header without git_head field (old format).
+    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    writeln!(f, "{header}").unwrap();
+    drop(f);
+
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(
+        manifest.stored_git_head(),
+        None,
+        "old manifest without git_head should return None"
+    );
+}
+
+/// sorted_paths returns entry paths in alphabetical order.
+#[test]
+fn test_sorted_paths_invariant() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().to_path_buf();
+
+    let paths = ["src/z.rs", "src/a.rs", "src/m.rs", "README.md"];
+    let mut manifest = FileManifest::new(root, cache_dir);
+    for p in &paths {
+        manifest.insert(ManifestEntry {
+            path: p.to_string(),
+            sha256: "a".repeat(64),
+            lang: "rust".to_string(),
+            field_map: vec![],
+            mtime: None,
+        });
+    }
+
+    let sorted = manifest.sorted_paths();
+    assert_eq!(sorted.len(), paths.len());
+    for i in 1..sorted.len() {
+        assert!(
+            sorted[i - 1] <= sorted[i],
+            "paths should be sorted: {} > {}",
+            sorted[i - 1],
+            sorted[i]
+        );
+    }
+    // Verify specific order
+    assert_eq!(sorted[0], "README.md");
+    assert_eq!(sorted[1], "src/a.rs");
+    assert_eq!(sorted[2], "src/m.rs");
+    assert_eq!(sorted[3], "src/z.rs");
+}
+
+/// entry_count returns the number of entries.
+#[test]
+fn test_entry_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().to_path_buf();
+
+    let mut manifest = FileManifest::new(root, cache_dir);
+    assert_eq!(manifest.entry_count(), 0);
+
+    manifest.insert(sample_entry("a.rs", &"a".repeat(64)));
+    assert_eq!(manifest.entry_count(), 1);
+
+    manifest.insert(sample_entry("b.rs", &"b".repeat(64)));
+    assert_eq!(manifest.entry_count(), 2);
+}
+
+/// sorted_paths on empty manifest returns empty vec.
+#[test]
+fn test_sorted_paths_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = FileManifest::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+    assert!(manifest.sorted_paths().is_empty());
+}
