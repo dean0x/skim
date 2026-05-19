@@ -87,7 +87,7 @@ pub(crate) fn run(
 ///
 /// Encodes the mutually-exclusive mode flags as a single enum variant so that
 /// dispatch is a `match` rather than a cascade of `if flags.X` checks.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 enum SearchAction {
     Build,
     Rebuild,
@@ -133,18 +133,22 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             "--stats" => action_flag = Some(SearchAction::Stats),
             "--install-hooks" => action_flag = Some(SearchAction::InstallHooks),
             "--remove-hooks" => action_flag = Some(SearchAction::RemoveHooks),
-            "--json" => json = true,
+            "--json" | "-j" => json = true,
             "--limit" | "-n" => {
                 i += 1;
                 let raw = args.get(i).ok_or_else(|| {
                     anyhow::anyhow!("--limit requires a value (e.g. --limit 10)")
                 })?;
-                limit = raw.parse::<usize>().map_err(|_| {
+                let parsed = raw.parse::<usize>().map_err(|_| {
                     anyhow::anyhow!(
                         "--limit value must be a positive integer, got {:?}",
                         raw
                     )
                 })?;
+                if parsed == 0 {
+                    anyhow::bail!("--limit must be >= 1 (got 0)");
+                }
+                limit = parsed;
             }
             "--root" => {
                 i += 1;
@@ -155,12 +159,16 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             }
             s if s.starts_with("--limit=") => {
                 let raw = s.trim_start_matches("--limit=");
-                limit = raw.parse::<usize>().map_err(|_| {
+                let parsed = raw.parse::<usize>().map_err(|_| {
                     anyhow::anyhow!(
                         "--limit value must be a positive integer, got {:?}",
                         raw
                     )
                 })?;
+                if parsed == 0 {
+                    anyhow::bail!("--limit must be >= 1 (got 0)");
+                }
+                limit = parsed;
             }
             s if s.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));
@@ -168,7 +176,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             s if s.starts_with("--") => {
                 anyhow::bail!(
                     "unrecognised flag {:?}. Valid flags: --build, --rebuild, --update, \
-                     --stats, --install-hooks, --remove-hooks, --json, --limit, --root",
+                     --stats, --install-hooks, --remove-hooks, --json, -j, --limit, --root",
                     s
                 );
             }
@@ -406,7 +414,6 @@ Examples:
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::process::ExitCode;
 
     /// Stub analytics config for tests — analytics disabled, no cost override.
     const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
@@ -600,5 +607,50 @@ mod tests {
             err.to_string().contains("--limit requires a value"),
             "unexpected error message: {err}"
         );
+    }
+
+    // ============================================================================
+    // Regression: -j short alias for --json (issue mod.rs:136)
+    // ============================================================================
+
+    #[test]
+    fn test_parse_flags_short_j_sets_json() {
+        let flags = parse_flags(&["-j".to_string()]).unwrap();
+        assert!(flags.json, "-j must set json=true");
+    }
+
+    #[test]
+    fn test_parse_flags_short_j_combined_with_query() {
+        let flags = parse_flags(&["-j".to_string(), "authenticate".to_string()]).unwrap();
+        assert!(flags.json);
+        assert_eq!(flags.action, SearchAction::Query("authenticate".to_string()));
+    }
+
+    // ============================================================================
+    // Regression: --limit 0 must be rejected (issue mod.rs:142)
+    // ============================================================================
+
+    #[test]
+    fn test_parse_flags_limit_zero_space_is_error() {
+        let err = parse_flags(&["--limit".to_string(), "0".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--limit must be >= 1"),
+            "expected rejection of 0, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_limit_zero_equals_is_error() {
+        let err = parse_flags(&["--limit=0".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("--limit must be >= 1"),
+            "expected rejection of 0, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_flags_limit_one_is_valid() {
+        let flags = parse_flags(&["--limit".to_string(), "1".to_string()]).unwrap();
+        assert_eq!(flags.limit, 1);
     }
 }
