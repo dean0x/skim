@@ -127,7 +127,9 @@ fn test_yaml_field_mapping_non_trivial() {
     assert_contiguous(&ranges, source.len());
     assert_field_lengths_sum(&ranges, source.len());
     // "key" at indent-0 must be TypeDefinition.
-    let has_type_def = ranges.iter().any(|(_, f)| *f == SearchField::TypeDefinition);
+    let has_type_def = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::TypeDefinition);
     assert!(
         has_type_def,
         "YAML classify_source must produce TypeDefinition for root key; got: {ranges:?}"
@@ -143,7 +145,9 @@ fn test_toml_field_mapping_non_trivial() {
     assert_contiguous(&ranges, source.len());
     assert_field_lengths_sum(&ranges, source.len());
     // [package] must be TypeDefinition.
-    let has_type_def = ranges.iter().any(|(_, f)| *f == SearchField::TypeDefinition);
+    let has_type_def = ranges
+        .iter()
+        .any(|(_, f)| *f == SearchField::TypeDefinition);
     assert!(
         has_type_def,
         "TOML classify_source must produce TypeDefinition for section; got: {ranges:?}"

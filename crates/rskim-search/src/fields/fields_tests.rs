@@ -640,7 +640,8 @@ fn i_02_classify_source_yaml_dispatch() {
     assert_contiguous(&ranges, source.len());
 
     assert!(
-        has_field(&ranges, SearchField::TypeDefinition) || has_field(&ranges, SearchField::SymbolName),
+        has_field(&ranges, SearchField::TypeDefinition)
+            || has_field(&ranges, SearchField::SymbolName),
         "YAML classify_source should produce TypeDefinition or SymbolName; ranges: {ranges:?}"
     );
 }

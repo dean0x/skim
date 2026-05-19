@@ -126,7 +126,12 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                         let after_key = str_end;
                         let mut j = after_key;
                         // Skip whitespace
-                        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+                        while j < len
+                            && (bytes[j] == b' '
+                                || bytes[j] == b'\t'
+                                || bytes[j] == b'\n'
+                                || bytes[j] == b'\r')
+                        {
                             j += 1;
                         }
                         // Skip colon
@@ -134,7 +139,12 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                             j += 1;
                         }
                         // Skip whitespace
-                        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+                        while j < len
+                            && (bytes[j] == b' '
+                                || bytes[j] == b'\t'
+                                || bytes[j] == b'\n'
+                                || bytes[j] == b'\r')
+                        {
                             j += 1;
                         }
                         // Check if next char is `{` or `[`
@@ -276,15 +286,20 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
         // --- List items: `- ` or `- ` then key/value on same line
         // List item lines can have an inline key: `  - name: foo`
         // We strip the `- ` prefix and re-classify the remainder.
-        let (eff_indent, eff_rest_start, eff_rest) = if rest.starts_with(b"- ") || rest == b"-\n" || rest == b"-\r\n" || rest == b"-" {
-            let list_item_offset = if rest.len() >= 2 && rest[1] == b' ' { 2 } else { 1 };
-            let new_rest_start = rest_start + list_item_offset;
-            let new_rest = &bytes[new_rest_start..line_end];
-            // List items get an effective indent of indent + 1 (nested under the list key).
-            (indent + 1, new_rest_start, new_rest)
-        } else {
-            (indent, rest_start, rest)
-        };
+        let (eff_indent, eff_rest_start, eff_rest) =
+            if rest.starts_with(b"- ") || rest == b"-\n" || rest == b"-\r\n" || rest == b"-" {
+                let list_item_offset = if rest.len() >= 2 && rest[1] == b' ' {
+                    2
+                } else {
+                    1
+                };
+                let new_rest_start = rest_start + list_item_offset;
+                let new_rest = &bytes[new_rest_start..line_end];
+                // List items get an effective indent of indent + 1 (nested under the list key).
+                (indent + 1, new_rest_start, new_rest)
+            } else {
+                (indent, rest_start, rest)
+            };
 
         // --- Key detection: look for `: ` or `:\n` or `:\r\n` or end-of-line-colon.
         // We need to find the key text and the colon position.
@@ -301,7 +316,12 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
 
             // Trim trailing whitespace from key.
             let key_text = &bytes[key_start..key_end];
-            let trimmed_end = key_end - key_text.iter().rev().take_while(|&&b| b == b' ' || b == b'\t').count();
+            let trimmed_end = key_end
+                - key_text
+                    .iter()
+                    .rev()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
             if trimmed_end > key_start {
                 ranges.push((key_start..trimmed_end, key_field));
             }
@@ -311,7 +331,10 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
             if value_start_rel < eff_rest.len() {
                 let value_bytes = &eff_rest[value_start_rel..];
                 // Skip leading space after colon.
-                let space_skip = value_bytes.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                let space_skip = value_bytes
+                    .iter()
+                    .take_while(|&&b| b == b' ' || b == b'\t')
+                    .count();
                 let actual_val_start = eff_rest_start + value_start_rel + space_skip;
 
                 if actual_val_start < line_end {
@@ -394,7 +417,11 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
         }
 
         // Find end of line.
-        let eol = bytes[i..].iter().position(|&b| b == b'\n').map(|p| i + p).unwrap_or(len);
+        let eol = bytes[i..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| i + p)
+            .unwrap_or(len);
 
         match bytes[i] {
             b'\n' | b'\r' => {
@@ -431,7 +458,12 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                     // Key: from i to eq_abs (trimming trailing whitespace).
                     let key_end = eq_abs;
                     let key_text = &bytes[i..key_end];
-                    let trimmed_key_end = key_end - key_text.iter().rev().take_while(|&&b| b == b' ' || b == b'\t').count();
+                    let trimmed_key_end = key_end
+                        - key_text
+                            .iter()
+                            .rev()
+                            .take_while(|&&b| b == b' ' || b == b'\t')
+                            .count();
                     if trimmed_key_end > i {
                         ranges.push((i..trimmed_key_end, SearchField::SymbolName));
                     }
@@ -441,7 +473,10 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                     if val_region_start < eol {
                         let val_bytes = &bytes[val_region_start..eol];
                         // Skip leading whitespace.
-                        let ws_skip = val_bytes.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                        let ws_skip = val_bytes
+                            .iter()
+                            .take_while(|&&b| b == b' ' || b == b'\t')
+                            .count();
                         let val_start = val_region_start + ws_skip;
 
                         if val_start < eol {
@@ -499,7 +534,8 @@ fn classify_toml_value(
         }
         b'\'' => {
             // Check for triple-quote (literal string).
-            if bytes.get(val_start + 1) == Some(&b'\'') && bytes.get(val_start + 2) == Some(&b'\'') {
+            if bytes.get(val_start + 1) == Some(&b'\'') && bytes.get(val_start + 2) == Some(&b'\'')
+            {
                 let end = scan_triple_quote(bytes, val_start, b'\'', len);
                 ranges.push((val_start..end, SearchField::StringLiteral));
                 *i = end;
@@ -535,7 +571,8 @@ fn classify_toml_inline_comment(
         if b == b'#' {
             let hash_abs = from + j;
             // Make sure it's preceded by whitespace (not inside a string or URL).
-            let preceded_by_ws = hash_abs == 0 || bytes[hash_abs - 1] == b' ' || bytes[hash_abs - 1] == b'\t';
+            let preceded_by_ws =
+                hash_abs == 0 || bytes[hash_abs - 1] == b' ' || bytes[hash_abs - 1] == b'\t';
             if preceded_by_ws {
                 ranges.push((hash_abs..eol, SearchField::Comment));
                 return;

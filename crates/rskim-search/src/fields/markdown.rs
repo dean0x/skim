@@ -40,9 +40,7 @@ use crate::lexical::classifier::build_field_ranges;
 /// [`crate::lexical::classifier::classify_source`] fires. The Markdown parser
 /// itself is fault-tolerant — syntax errors produce error nodes rather than
 /// parse failures.
-pub(crate) fn classify_markdown(
-    source: &str,
-) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
+pub(crate) fn classify_markdown(source: &str) -> crate::Result<Vec<(Range<usize>, SearchField)>> {
     if source.is_empty() {
         return Ok(Vec::new());
     }
