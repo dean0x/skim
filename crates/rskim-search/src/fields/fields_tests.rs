@@ -657,11 +657,11 @@ fn f_md_08_list_is_comment() {
 
 /// F-MD-09: classify_markdown's own size guard fires before tree-sitter work.
 ///
-/// The Markdown classifier has an independent `MAX_SOURCE_BYTES` check (lines
-/// 50-55 of markdown.rs) separate from the dispatcher guard in `classify_source`.
-/// This test calls `classify_markdown` directly with a source that is exactly one
-/// byte over the limit and verifies that `SearchError::FileTooLarge` is returned
-/// with the correct `size` and `limit` values.
+/// The Markdown classifier has an independent `MAX_SOURCE_BYTES` check separate
+/// from the dispatcher guard in `classify_source`. This test calls
+/// `classify_markdown` directly with a source that is exactly one byte over the
+/// limit and verifies that `SearchError::FileTooLarge` is returned with the
+/// correct `size` and `limit` values.
 ///
 /// The input is a flat space-padded string; the size check fires before any
 /// tree-sitter parsing, so this does not cause a slow parse.

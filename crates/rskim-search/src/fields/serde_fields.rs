@@ -86,11 +86,9 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 i += 1;
             }
             b'}' => {
-                // Guard pop symmetrically with the push: only pop when the
-                // matching `{` was shallow enough to have pushed an entry.
-                // brace_depth > MAX_JSON_DEPTH means the opening `{` did NOT push,
-                // so do not pop. Check BEFORE saturating_sub so the comparison
-                // is against the depth at which the `{` was processed.
+                // Only pop if we pushed: opening braces beyond MAX_JSON_DEPTH
+                // do not push, so closing ones must not pop. Check before
+                // saturating_sub so the comparison uses the pre-decrement depth.
                 if brace_depth <= MAX_JSON_DEPTH {
                     in_key_stack.pop();
                 }
@@ -183,9 +181,7 @@ fn classify_json_key_at_depth0(bytes: &[u8], after_key: usize, len: usize) -> Se
 #[inline]
 fn skip_json_whitespace(bytes: &[u8], pos: usize, len: usize) -> usize {
     let mut i = pos;
-    while i < len
-        && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
-    {
+    while i < len && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
         i += 1;
     }
     i
@@ -347,7 +343,7 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                     let first_val_byte = bytes[actual_val_start];
                     if first_val_byte == b'"' || first_val_byte == b'\'' {
                         // Quoted string value → StringLiteral.
-                        // Trim the trailing newline so the '\n' byte is not boosted
+                        // Trim trailing \n and \r so line-ending bytes are not boosted
                         // with StringLiteral weight, which would skew BM25F scores.
                         // Inline comment detection is not implemented: values like
                         // "http://x.com # not a comment" would cause false positives.
@@ -356,8 +352,6 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                         if str_end > actual_val_start && bytes[str_end - 1] == b'\n' {
                             str_end -= 1;
                         }
-                        // Also strip \r for Windows-style \r\n line endings, consistent
-                        // with CRLF handling elsewhere in this scanner.
                         if str_end > actual_val_start && bytes[str_end - 1] == b'\r' {
                             str_end -= 1;
                         }
