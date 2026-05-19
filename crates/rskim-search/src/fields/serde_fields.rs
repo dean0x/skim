@@ -56,6 +56,11 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
 
     let mut ranges: Vec<(Range<usize>, SearchField)> = Vec::new();
 
+    // Maximum nesting depth tracked on `in_key_stack`. Beyond this depth we
+    // still parse correctly (brace_depth keeps counting) but stop pushing new
+    // entries to avoid unbounded heap growth on pathologically deep input.
+    const MAX_JSON_DEPTH: usize = 1024;
+
     // Stack-based depth tracking:
     // - brace_depth: count of currently open `{` objects
     // - bracket_depth: count of currently open `[` arrays
@@ -65,7 +70,7 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
     //   * flips back to true after `,` or `{`
     let mut brace_depth: usize = 0;
     let mut bracket_depth: usize = 0;
-    let mut in_key_stack: Vec<bool> = Vec::new(); // one entry per `{` opened
+    let mut in_key_stack: Vec<bool> = Vec::new(); // one entry per `{` opened (up to MAX_JSON_DEPTH)
     let mut i = 0;
 
     while i < len {
@@ -74,7 +79,10 @@ pub(crate) fn classify_json(source: &str) -> Vec<(Range<usize>, SearchField)> {
             b'{' => {
                 brace_depth += 1;
                 // Start of an object: next token expected is a key (or `}`).
-                in_key_stack.push(true);
+                // Only track state up to MAX_JSON_DEPTH to bound heap usage.
+                if brace_depth <= MAX_JSON_DEPTH {
+                    in_key_stack.push(true);
+                }
                 i += 1;
             }
             b'}' => {
@@ -341,10 +349,18 @@ pub(crate) fn classify_yaml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                     let first_val_byte = bytes[actual_val_start];
                     if first_val_byte == b'"' || first_val_byte == b'\'' {
                         // Quoted string value → StringLiteral.
+                        // Trim the trailing newline so the '\n' byte is not boosted
+                        // with StringLiteral weight, which would skew BM25F scores.
                         // Inline comment detection is not implemented: values like
                         // "http://x.com # not a comment" would cause false positives.
                         // TODO: YAML spec coverage — inline comment classification.
-                        ranges.push((actual_val_start..line_end, SearchField::StringLiteral));
+                        let mut str_end = line_end;
+                        if str_end > actual_val_start && bytes[str_end - 1] == b'\n' {
+                            str_end -= 1;
+                        }
+                        if str_end > actual_val_start {
+                            ranges.push((actual_val_start..str_end, SearchField::StringLiteral));
+                        }
                     }
                     // Unquoted values (scalars, flow indicators) → Other (gap fill).
                 }
@@ -432,7 +448,7 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
             b'#' => {
                 // Full-line comment.
                 ranges.push((i..eol, SearchField::Comment));
-                i = eol + 1;
+                i = (eol + 1).min(len);
                 continue;
             }
             b'[' => {
@@ -447,7 +463,7 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                     // Malformed — skip to EOL.
                     ranges.push((header_start..header_end, SearchField::TypeDefinition));
                 }
-                i = eol + 1;
+                i = (eol + 1).min(len);
                 continue;
             }
             _ => {
@@ -486,7 +502,7 @@ pub(crate) fn classify_toml(source: &str) -> Vec<(Range<usize>, SearchField)> {
                 }
                 // Advance to end of line (classify_toml_value may have advanced `i` for multi-line strings).
                 if i <= eol {
-                    i = eol + 1;
+                    i = (eol + 1).min(len);
                 }
             }
         }
@@ -587,8 +603,17 @@ fn classify_toml_inline_comment(
 fn find_toml_eq_sign(content: &[u8]) -> Option<usize> {
     let mut in_str = false;
     let mut str_char = b'"';
-    for (i, &b) in content.iter().enumerate() {
+    let mut i = 0;
+    while i < content.len() {
+        let b = content[i];
         if in_str {
+            // Handle backslash escape inside double-quoted strings only.
+            // Single-quoted TOML literal strings treat backslash as literal.
+            if b == b'\\' && str_char == b'"' {
+                // Skip the escaped character entirely.
+                i += 2;
+                continue;
+            }
             if b == str_char {
                 in_str = false;
             }
@@ -603,6 +628,7 @@ fn find_toml_eq_sign(content: &[u8]) -> Option<usize> {
                 _ => {}
             }
         }
+        i += 1;
     }
     None
 }
