@@ -108,6 +108,20 @@ struct Flags {
     root_override: Option<PathBuf>,
 }
 
+/// Parse and validate a `--limit` value string.
+///
+/// Accepts any positive (>= 1) `usize`. Returns an error for non-numeric
+/// values or zero.
+fn parse_limit_value(raw: &str) -> anyhow::Result<usize> {
+    let parsed = raw.parse::<usize>().map_err(|_| {
+        anyhow::anyhow!("--limit value must be a positive integer, got {:?}", raw)
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("--limit must be >= 1 (got 0)");
+    }
+    Ok(parsed)
+}
+
 /// Parse the flags from `args`.
 ///
 /// # Errors
@@ -139,16 +153,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
                 let raw = args.get(i).ok_or_else(|| {
                     anyhow::anyhow!("--limit requires a value (e.g. --limit 10)")
                 })?;
-                let parsed = raw.parse::<usize>().map_err(|_| {
-                    anyhow::anyhow!(
-                        "--limit value must be a positive integer, got {:?}",
-                        raw
-                    )
-                })?;
-                if parsed == 0 {
-                    anyhow::bail!("--limit must be >= 1 (got 0)");
-                }
-                limit = parsed;
+                limit = parse_limit_value(raw)?;
             }
             "--root" => {
                 i += 1;
@@ -159,16 +164,7 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             }
             s if s.starts_with("--limit=") => {
                 let raw = s.trim_start_matches("--limit=");
-                let parsed = raw.parse::<usize>().map_err(|_| {
-                    anyhow::anyhow!(
-                        "--limit value must be a positive integer, got {:?}",
-                        raw
-                    )
-                })?;
-                if parsed == 0 {
-                    anyhow::bail!("--limit must be >= 1 (got 0)");
-                }
-                limit = parsed;
+                limit = parse_limit_value(raw)?;
             }
             s if s.starts_with("--root=") => {
                 root_override = Some(PathBuf::from(s.trim_start_matches("--root=")));

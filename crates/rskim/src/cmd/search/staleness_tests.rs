@@ -477,20 +477,20 @@ fn test_auto_refresh_non_git_project_no_rebuild_loop() {
 
 #[test]
 fn test_display_current() {
-    let s = format!("{}", StalenessCheck::Current);
-    assert_eq!(s, "current");
+    assert_eq!(StalenessCheck::Current.to_string(), "current");
 }
 
 #[test]
 fn test_display_no_stored_head() {
-    let s = format!("{}", StalenessCheck::NoStoredHead);
-    assert_eq!(s, "stale (no HEAD recorded)");
+    assert_eq!(
+        StalenessCheck::NoStoredHead.to_string(),
+        "stale (no HEAD recorded)"
+    );
 }
 
 #[test]
 fn test_display_no_index() {
-    let s = format!("{}", StalenessCheck::NoIndex);
-    assert_eq!(s, "no index");
+    assert_eq!(StalenessCheck::NoIndex.to_string(), "no index");
 }
 
 #[test]
@@ -498,8 +498,8 @@ fn test_display_head_changed_full_sha() {
     // Full 40-char SHAs — both are truncated to 8 chars in the output.
     let stored = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111".to_string();
     let current = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222".to_string();
-    let s = format!("{}", StalenessCheck::HeadChanged { stored, current });
-    assert_eq!(s, "stale (HEAD changed: aaaa1111\u{2026}\u{2192}bbbb2222\u{2026})");
+    let s = StalenessCheck::HeadChanged { stored, current }.to_string();
+    assert_eq!(s, "stale (HEAD changed: aaaa1111…→bbbb2222…)");
 }
 
 #[test]
@@ -508,9 +508,9 @@ fn test_display_head_changed_short_stored_sha() {
     // the full string. This guards against panicking on short/corrupt content.
     let stored = "abc".to_string();
     let current = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222".to_string();
-    let s = format!("{}", StalenessCheck::HeadChanged { stored, current });
+    let s = StalenessCheck::HeadChanged { stored, current }.to_string();
     // stored is printed in full ("abc"), current is truncated to 8 chars.
-    assert_eq!(s, "stale (HEAD changed: abc\u{2026}\u{2192}bbbb2222\u{2026})");
+    assert_eq!(s, "stale (HEAD changed: abc…→bbbb2222…)");
 }
 
 #[test]
@@ -518,8 +518,8 @@ fn test_display_head_changed_short_current_sha() {
     // Current SHA shorter than 8 bytes.
     let stored = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111".to_string();
     let current = "xy".to_string();
-    let s = format!("{}", StalenessCheck::HeadChanged { stored, current });
-    assert_eq!(s, "stale (HEAD changed: aaaa1111\u{2026}\u{2192}xy\u{2026})");
+    let s = StalenessCheck::HeadChanged { stored, current }.to_string();
+    assert_eq!(s, "stale (HEAD changed: aaaa1111…→xy…)");
 }
 
 #[test]
@@ -527,6 +527,6 @@ fn test_display_head_changed_exactly_8_chars() {
     // Exactly 8 characters — .get(..8) succeeds and returns the full string.
     let stored = "12345678".to_string();
     let current = "abcdef01".to_string();
-    let s = format!("{}", StalenessCheck::HeadChanged { stored, current });
-    assert_eq!(s, "stale (HEAD changed: 12345678\u{2026}\u{2192}abcdef01\u{2026})");
+    let s = StalenessCheck::HeadChanged { stored, current }.to_string();
+    assert_eq!(s, "stale (HEAD changed: 12345678…→abcdef01…)");
 }
