@@ -143,7 +143,26 @@ pub fn classify_source(
         });
     }
 
-    // For non-tree-sitter languages (JSON, YAML, TOML), classify all bytes as Other.
+    // Format-specific classifiers dispatched BEFORE the generic tree-sitter path.
+    // These scanners handle non-tree-sitter formats (JSON, YAML, TOML) and the
+    // Markdown tree-sitter grammar which needs custom heading-level logic.
+    match lang {
+        Language::Json => {
+            return Ok(crate::fields::serde_fields::classify_json(source));
+        }
+        Language::Yaml => {
+            return Ok(crate::fields::serde_fields::classify_yaml(source));
+        }
+        Language::Toml => {
+            return Ok(crate::fields::serde_fields::classify_toml(source));
+        }
+        Language::Markdown => {
+            return crate::fields::markdown::classify_markdown(source);
+        }
+        _ => {}
+    }
+
+    // Generic tree-sitter path for all other languages.
     let mut parser = match rskim_core::Parser::new(lang) {
         Ok(p) => p,
         Err(_) => {
@@ -198,7 +217,25 @@ pub fn classify_source(
 /// Implements "innermost wins": processes ranges in reverse (children first)
 /// so deeper nodes claim bytes before their parents. Uncovered bytes become
 /// [`SearchField::Other`]. Adjacent same-field ranges are merged.
-fn build_field_ranges(
+///
+/// # Preconditions
+///
+/// - `node_ranges` must be in **pre-order** (parents before children). The
+///   reverse-iteration loop relies on children appearing after their parents.
+/// - Ranges may overlap; the algorithm resolves overlaps via interval subtraction
+///   so the deepest (innermost) node wins each byte.
+/// - `source_len` must equal the byte length of the source that was parsed.
+///
+/// # Output guarantees
+///
+/// The returned `Vec` is:
+/// - Sorted ascending by `range.start`.
+/// - Non-overlapping (no two ranges share a byte).
+/// - Contiguous (covers every byte `0..source_len`).
+/// - `sum(range.end - range.start) == source_len`.
+/// - For empty input (`node_ranges.is_empty()`), returns a single `Other`
+///   range covering `0..source_len`.
+pub(crate) fn build_field_ranges(
     node_ranges: Vec<(Range<usize>, SearchField)>,
     source_len: usize,
 ) -> Vec<(Range<usize>, SearchField)> {
@@ -247,7 +284,7 @@ fn build_field_ranges(
 }
 
 /// Merge adjacent ranges that share the same field into a single range.
-fn merge_adjacent(ranges: &mut Vec<(Range<usize>, SearchField)>) {
+pub(crate) fn merge_adjacent(ranges: &mut Vec<(Range<usize>, SearchField)>) {
     if ranges.len() <= 1 {
         return;
     }

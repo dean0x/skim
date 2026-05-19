@@ -346,10 +346,16 @@ fn test_mtime_persisted_in_manifest() {
     );
 }
 
-/// A manifest written without a `mtime` field (e.g. by an older version of
-/// skim) must deserialize cleanly with `mtime: None`.
+/// A manifest written with a stale `version` field (e.g. by an older version
+/// of skim) must be silently discarded and replaced with an empty manifest.
+///
+/// This test was previously named `test_mtime_backward_compat_none` and verified
+/// that a v1 manifest entry without a `mtime` field was loaded with `mtime: None`.
+/// After bumping FORMAT_VERSION to 2 (Issue #193: custom field mapping for
+/// JSON/YAML/TOML/Markdown), v1 manifests are intentionally rejected — skim
+/// must re-index from scratch to pick up the new field classifications.
 #[test]
-fn test_mtime_backward_compat_none() {
+fn test_stale_version_manifest_triggers_cold_start() {
     use std::io::Write as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -357,11 +363,10 @@ fn test_mtime_backward_compat_none() {
     let cache_dir = root.clone();
     let path = cache_dir.join("index.skfiles");
 
-    // Write a manifest with no `mtime` field in the entry.
+    // Write a v1 manifest (FORMAT_VERSION is now 2).
     let mut f = std::fs::File::create(&path).unwrap();
     let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
     writeln!(f, "{header}").unwrap();
-    // Deliberately omit `mtime` to simulate an old manifest format.
     let entry_json = serde_json::json!({
         "path": "src/old.rs",
         "sha256": "b".repeat(64),
@@ -371,11 +376,12 @@ fn test_mtime_backward_compat_none() {
     writeln!(f, "{entry_json}").unwrap();
     drop(f);
 
+    // Loading a v1 manifest against FORMAT_VERSION 2 must produce an empty
+    // manifest (cold start), not preserve the v1 entries.
     let manifest = FileManifest::load(root, cache_dir).unwrap();
-    let found = manifest.lookup("src/old.rs").unwrap();
-    assert_eq!(
-        found.mtime, None,
-        "mtime should be None when field is absent (backward compat)"
+    assert!(
+        manifest.lookup("src/old.rs").is_none(),
+        "v1 manifest must be discarded on version mismatch — cold start required"
     );
 }
 
