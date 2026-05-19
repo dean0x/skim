@@ -51,8 +51,9 @@ pub(super) fn execute_query(
     let cache_dir = &config.cache_dir;
     let root = &config.root;
 
-    // Ensure the index is built and current.
-    auto_refresh_if_stale(root, cache_dir, analytics)?;
+    // Ensure the index is built and current.  The returned manifest is reused
+    // below to avoid a second load from disk (duplicate-manifest-load fix).
+    let (_refreshed, manifest) = auto_refresh_if_stale(root, cache_dir, analytics)?;
 
     // Open the reader.
     let reader = NgramIndexReader::open(cache_dir)?;
@@ -66,8 +67,7 @@ pub(super) fn execute_query(
     // Execute the search.
     let raw_results = engine.search(&sq)?;
 
-    // Load manifest for FileId → path resolution.
-    let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
+    // Use the manifest returned by auto_refresh_if_stale (already loaded).
     let sorted = manifest.sorted_paths();
 
     // Resolve and enrich results.

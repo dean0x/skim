@@ -6,7 +6,9 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{StalenessCheck, auto_refresh_if_stale, check_staleness, read_git_head, resolve_git_dir};
+use super::{
+    StalenessCheck, auto_refresh_if_stale, check_staleness, read_git_head, resolve_git_dir,
+};
 
 // Minimal analytics config for tests — analytics recording is disabled.
 const TEST_ANALYTICS: crate::analytics::AnalyticsConfig = crate::analytics::AnalyticsConfig {
@@ -363,10 +365,12 @@ fn test_auto_refresh_returns_false_when_current() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _manifest) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
-    assert!(!refreshed, "index is current — should not trigger a rebuild");
+    assert!(
+        !refreshed,
+        "index is current — should not trigger a rebuild"
+    );
 }
 
 #[test]
@@ -380,8 +384,7 @@ fn test_auto_refresh_returns_manifest_when_current() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (_refreshed, manifest) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (_refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     // The returned manifest should reflect the stored HEAD.
     assert_eq!(
@@ -408,8 +411,7 @@ fn test_auto_refresh_rebuilds_on_head_changed() {
     fs::write(git_dir.join("HEAD"), format!("{new_sha}\n")).unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, manifest) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     assert!(refreshed, "HEAD changed — index should be rebuilt");
     assert_eq!(
@@ -433,8 +435,7 @@ fn test_auto_refresh_rebuilds_on_no_stored_head() {
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, manifest) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     assert!(
         refreshed,
@@ -456,10 +457,8 @@ fn test_auto_refresh_non_git_project_no_rebuild_loop() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (first_refreshed, _) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    let (second_refreshed, _) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (first_refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (second_refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
 
     assert!(
         !first_refreshed,

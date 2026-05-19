@@ -271,7 +271,11 @@ fn test_execute_query_corrupt_index_returns_err_not_panic() {
     create_test_project(&root);
 
     // Write garbage bytes into the index file.
-    fs::write(cache_dir.join("index.skidx"), b"this is not a valid index\xff\x00\xde\xad").unwrap();
+    fs::write(
+        cache_dir.join("index.skidx"),
+        b"this is not a valid index\xff\x00\xde\xad",
+    )
+    .unwrap();
 
     let config = make_config(&root, &cache_dir, "authenticate");
 

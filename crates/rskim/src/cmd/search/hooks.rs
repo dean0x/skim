@@ -157,12 +157,14 @@ fn strip_block(content: &str) -> String {
     }
     let end_byte = end_pos + MARKER_END.len();
 
-    // Trim the newline immediately after the end marker (if any).
-    let after_end = &content[end_byte..];
-    let skip_newline = if after_end.starts_with('\n') { 1 } else { 0 };
-
     let before = content[..start_pos].trim_end_matches('\n');
-    let after = &content[end_byte + skip_newline..];
+    // Consume the newline immediately after the end marker (if any).
+    let after_start = if content[end_byte..].starts_with('\n') {
+        end_byte + 1
+    } else {
+        end_byte
+    };
+    let after = &content[after_start..];
 
     if before.is_empty() {
         after.to_string()

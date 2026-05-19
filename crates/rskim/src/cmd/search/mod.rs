@@ -68,9 +68,13 @@ pub(crate) fn run(
         SearchAction::Stats => run_stats(flags.json, &flags.root_override),
         SearchAction::InstallHooks => run_install_hooks(&flags.root_override),
         SearchAction::RemoveHooks => run_remove_hooks(&flags.root_override),
-        SearchAction::Query(ref text) if !text.is_empty() => {
-            run_query(text, flags.limit, flags.json, &flags.root_override, analytics)
-        }
+        SearchAction::Query(ref text) if !text.is_empty() => run_query(
+            text,
+            flags.limit,
+            flags.json,
+            &flags.root_override,
+            analytics,
+        ),
         SearchAction::Query(_) => {
             // Empty query (no positional args and no action flag) → help.
             print_help();
@@ -113,9 +117,9 @@ struct Flags {
 /// Accepts any positive (>= 1) `usize`. Returns an error for non-numeric
 /// values or zero.
 fn parse_limit_value(raw: &str) -> anyhow::Result<usize> {
-    let parsed = raw.parse::<usize>().map_err(|_| {
-        anyhow::anyhow!("--limit value must be a positive integer, got {:?}", raw)
-    })?;
+    let parsed = raw
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("--limit value must be a positive integer, got {:?}", raw))?;
     if parsed == 0 {
         anyhow::bail!("--limit must be >= 1 (got 0)");
     }
@@ -150,9 +154,9 @@ fn parse_flags(args: &[String]) -> anyhow::Result<Flags> {
             "--json" | "-j" => json = true,
             "--limit" | "-n" => {
                 i += 1;
-                let raw = args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--limit requires a value (e.g. --limit 10)")
-                })?;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--limit requires a value (e.g. --limit 10)"))?;
                 limit = parse_limit_value(raw)?;
             }
             "--root" => {
@@ -530,7 +534,10 @@ mod tests {
     #[test]
     fn test_parse_flags_query_text() {
         let flags = parse_flags(&["fn".to_string(), "parse_url".to_string()]).unwrap();
-        assert_eq!(flags.action, SearchAction::Query("fn parse_url".to_string()));
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("fn parse_url".to_string())
+        );
     }
 
     #[test]
@@ -544,7 +551,10 @@ mod tests {
         .unwrap();
         assert!(flags.json);
         assert_eq!(flags.limit, 5);
-        assert_eq!(flags.action, SearchAction::Query("authenticate".to_string()));
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("authenticate".to_string())
+        );
     }
 
     // ============================================================================
@@ -619,7 +629,10 @@ mod tests {
     fn test_parse_flags_short_j_combined_with_query() {
         let flags = parse_flags(&["-j".to_string(), "authenticate".to_string()]).unwrap();
         assert!(flags.json);
-        assert_eq!(flags.action, SearchAction::Query("authenticate".to_string()));
+        assert_eq!(
+            flags.action,
+            SearchAction::Query("authenticate".to_string())
+        );
     }
 
     // ============================================================================
