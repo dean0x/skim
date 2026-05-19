@@ -118,11 +118,14 @@ pub(super) fn extract_snippet(
 
     let abs_path = root.join(rel_path);
 
+    // Single stat(2) call shared by both the mtime guard and the size guard below.
+    let meta = std::fs::metadata(&abs_path).ok();
+
     // Mtime guard: if the manifest recorded an mtime and it doesn't match
     // the file's current mtime, the file has changed — positions are stale.
     if let Some(stored_mtime) = manifest_entry.and_then(|e| e.mtime) {
-        let current_mtime = std::fs::metadata(&abs_path)
-            .ok()
+        let current_mtime = meta
+            .as_ref()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
@@ -134,9 +137,7 @@ pub(super) fn extract_snippet(
     // Size guard: reject files larger than 5 MB to match the index-build cap and
     // bound peak memory when 20 results are resolved simultaneously.
     const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
-    let file_size = std::fs::metadata(&abs_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     if file_size > MAX_SNIPPET_FILE_BYTES {
         return SnippetOutcome::Unavailable;
     }
@@ -151,9 +152,7 @@ pub(super) fn extract_snippet(
         Err(_) => return SnippetOutcome::Unavailable,
     };
 
-    // Use the first match position to locate the match line.
-    let first_match_start = match_positions[0].start;
-    let match_line = byte_offset_to_line(&content, first_match_start);
+    let match_line = byte_offset_to_line(&content, match_positions[0].start);
 
     let ctx_lines = extract_context_window(text, match_line, DEFAULT_CONTEXT);
     if ctx_lines.is_empty() {
