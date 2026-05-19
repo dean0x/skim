@@ -63,8 +63,8 @@ pub(super) fn extract_context_window(
     match_line: u32,
     context: u32,
 ) -> Vec<SnippetLine> {
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len() as u32;
+    let line_count = content.lines().count();
+    let total_lines = u32::try_from(line_count).unwrap_or(u32::MAX);
 
     if total_lines == 0 {
         return Vec::new();
@@ -74,14 +74,22 @@ pub(super) fn extract_context_window(
     let match_line = match_line.max(1).min(total_lines);
 
     let start = match_line.saturating_sub(context).max(1);
-    let end = (match_line + context).min(total_lines);
+    let end = match_line.saturating_add(context).min(total_lines);
 
-    (start..=end)
-        .map(|ln| {
-            let idx = (ln - 1) as usize;
+    // Collect only the window lines — skip lines before the window, take only
+    // what is needed, avoiding a full-file allocation for large files.
+    let skip = (start - 1) as usize;
+    let take = (end - start + 1) as usize;
+    content
+        .lines()
+        .enumerate()
+        .skip(skip)
+        .take(take)
+        .map(|(idx, line_text)| {
+            let ln = (idx + 1) as u32;
             SnippetLine {
                 line_number: ln,
-                content: lines[idx].to_string(),
+                content: line_text.to_string(),
                 is_match: ln == match_line,
             }
         })
@@ -121,6 +129,16 @@ pub(super) fn extract_snippet(
         if current_mtime != Some(stored_mtime) {
             return SnippetOutcome::Stale;
         }
+    }
+
+    // Size guard: reject files larger than 5 MB to match the index-build cap and
+    // bound peak memory when 20 results are resolved simultaneously.
+    const MAX_SNIPPET_FILE_BYTES: u64 = 5 * 1024 * 1024;
+    let file_size = std::fs::metadata(&abs_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if file_size > MAX_SNIPPET_FILE_BYTES {
+        return SnippetOutcome::Unavailable;
     }
 
     // Read file content.

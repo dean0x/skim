@@ -62,6 +62,23 @@ fn test_byte_offset_to_line_offset_at_newline() {
     assert_eq!(byte_offset_to_line(content, 3), 1);
 }
 
+#[test]
+fn test_byte_offset_to_line_out_of_bounds_offset_is_clamped() {
+    // Offset larger than content length must not panic and must return a valid
+    // (clamped) line number — specifically the last line of the file.
+    let content = b"line1\nline2\n";
+    let huge_offset = content.len() + 9999;
+    // The safe_offset clamp in byte_offset_to_line means this is equivalent to
+    // passing content.len() exactly, which counts both newlines → line 3.
+    let result = byte_offset_to_line(content, huge_offset);
+    assert!(
+        result >= 1,
+        "out-of-bounds offset must yield a positive line number, got {result}"
+    );
+    // Clamping to content.len() (12) counts 2 newlines → reports line 3.
+    assert_eq!(result, 3, "clamped to end-of-content → line 3");
+}
+
 // ============================================================================
 // extract_context_window
 // ============================================================================
