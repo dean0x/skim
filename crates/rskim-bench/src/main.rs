@@ -14,14 +14,14 @@ use clap::{Parser, Subcommand};
 
 use rskim_bench::{
     configs,
-    harness::{aggregate_results, run_on_files, BenchConfig},
+    harness::{BenchConfig, aggregate_results, run_on_files},
     report,
     tuning::coordinate_descent,
     types::IndexedFile,
 };
 use rskim_research::{
     clone::{FileSource, GitCloneSource},
-    config::{load_corpus_config, CorpusConfig},
+    config::{CorpusConfig, load_corpus_config},
 };
 use rskim_search::{FileId, LayerBuilder};
 
@@ -258,17 +258,19 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
         })
         .collect();
 
-    let qrels = rskim_bench::qrel::generate_qrels(&qrel_inputs)
-        .context("generating qrels for tuning")?;
+    let qrels =
+        rskim_bench::qrel::generate_qrels(&qrel_inputs).context("generating qrels for tuning")?;
 
     // Build index once for all tuning evaluations
     let index_dir = tempfile::tempdir().context("creating temp index dir")?;
-    let mut builder =
-        rskim_search::NgramIndexBuilder::new(index_dir.path().to_path_buf())
-            .context("creating index builder")?;
+    let mut builder = rskim_search::NgramIndexBuilder::new(index_dir.path().to_path_buf())
+        .context("creating index builder")?;
 
     for f in &all_indexed {
-        let content = all_contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or("");
+        let content = all_contents
+            .get(&f.file_id)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         builder
             .add_file(f.file_id, content, f.language)
             .context("indexing file")?;
@@ -278,16 +280,11 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     // Filter to train split
     let train_qrels: Vec<_> = qrels
         .iter()
-        .filter(|q| {
-            rskim_bench::split::assign_split(&q.query) == rskim_bench::split::Split::Train
-        })
+        .filter(|q| rskim_bench::split::assign_split(&q.query) == rskim_bench::split::Split::Train)
         .cloned()
         .collect();
 
-    eprintln!(
-        "Tuning on {} train qrels",
-        train_qrels.len()
-    );
+    eprintln!("Tuning on {} train qrels", train_qrels.len());
 
     let idx_path = index_dir.path().to_path_buf();
 
@@ -310,8 +307,7 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
 
     eprintln!(
         "Tuning complete. Best MRR: {:.4}, passes: {}",
-        tuning_result.best_train_mrr,
-        tuning_result.passes_needed
+        tuning_result.best_train_mrr, tuning_result.passes_needed
     );
 
     // Build final bench result with tuned config
@@ -330,19 +326,20 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     ];
 
     let tune_index_dir = tempfile::tempdir().context("temp dir for final evaluation")?;
-    let mut final_result =
-        run_on_files(&all_indexed, &all_contents, &bench_configs, tune_index_dir.path())
-            .context("running final evaluation with tuned config")?;
+    let mut final_result = run_on_files(
+        &all_indexed,
+        &all_contents,
+        &bench_configs,
+        tune_index_dir.path(),
+    )
+    .context("running final evaluation with tuned config")?;
     final_result.repo_url = "aggregate".to_string();
 
     let bench_result = aggregate_results(vec![final_result]);
 
     match args.output.as_str() {
         "json" => {
-            println!(
-                "{}",
-                report::to_json(&bench_result, Some(&tuning_result))?
-            );
+            println!("{}", report::to_json(&bench_result, Some(&tuning_result))?);
         }
         _ => {
             print!(
@@ -358,13 +355,8 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
 fn run_report(args: ReportArgs) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&args.input)
         .with_context(|| format!("reading bench result from {}", args.input.display()))?;
-    let bench_result: rskim_bench::types::BenchResult =
-        serde_json::from_str(&raw).with_context(|| {
-            format!(
-                "deserialising bench result from {}",
-                args.input.display()
-            )
-        })?;
+    let bench_result: rskim_bench::types::BenchResult = serde_json::from_str(&raw)
+        .with_context(|| format!("deserialising bench result from {}", args.input.display()))?;
 
     match args.format.as_str() {
         "json" => {
@@ -384,7 +376,11 @@ fn run_qrels(args: QrelsArgs) -> anyhow::Result<()> {
     for repo_entry in &corpus.repos {
         let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
 
-        if args.repo.as_ref().is_some_and(|f| !repo_name.contains(f.as_str())) {
+        if args
+            .repo
+            .as_ref()
+            .is_some_and(|f| !repo_name.contains(f.as_str()))
+        {
             continue;
         }
 

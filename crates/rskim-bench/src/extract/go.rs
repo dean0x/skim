@@ -261,8 +261,12 @@ func (c *Calculator) Add(x int) int { return c.value + x }
 type Computer interface { Compute(x int) int }
 "#;
         let symbols = extract(&fixture_path(), content);
-        let has_fn = symbols.iter().any(|s| s.field == SearchField::FunctionSignature);
-        let has_type = symbols.iter().any(|s| s.field == SearchField::TypeDefinition);
+        let has_fn = symbols
+            .iter()
+            .any(|s| s.field == SearchField::FunctionSignature);
+        let has_type = symbols
+            .iter()
+            .any(|s| s.field == SearchField::TypeDefinition);
         let has_import = symbols.iter().any(|s| s.field == SearchField::ImportExport);
         assert!(has_fn, "should extract function symbols");
         assert!(has_type, "should extract type symbols");

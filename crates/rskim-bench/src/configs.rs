@@ -98,7 +98,11 @@ mod tests {
     #[test]
     fn uniform_all_boosts_equal() {
         let cfg = uniform();
-        assert!(cfg.field_boosts.iter().all(|&b| (b - 1.0).abs() < f32::EPSILON));
+        assert!(
+            cfg.field_boosts
+                .iter()
+                .all(|&b| (b - 1.0).abs() < f32::EPSILON)
+        );
         assert!(cfg.field_b.iter().all(|&b| (b - 0.75).abs() < f32::EPSILON));
     }
 

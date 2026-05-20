@@ -8,10 +8,10 @@ use std::path::PathBuf;
 
 use rskim_bench::{
     configs,
-    harness::{aggregate_results, run_on_files, BenchConfig},
+    harness::{BenchConfig, aggregate_results, run_on_files},
     metrics::{mrr, precision_at_k, reciprocal_rank},
     report,
-    split::{assign_split, Split},
+    split::{Split, assign_split},
     tuning::{coordinate_descent, result_to_config},
     types::{BenchResult, ConfigMetrics, IndexedFile, RepoBenchResult},
 };
@@ -145,10 +145,7 @@ fn coordinate_descent_converges_within_3_passes() {
 #[test]
 fn empty_ranked_list_contributes_zero_mrr() {
     let rr = reciprocal_rank(&[], FileId(1));
-    assert!(
-        (rr - 0.0).abs() < f64::EPSILON,
-        "empty results → RR=0"
-    );
+    assert!((rr - 0.0).abs() < f64::EPSILON, "empty results → RR=0");
 
     // MRR over [1.0, 0.0, 0.5] includes the zero
     let rrs = [1.0, 0.0, 0.5];
@@ -258,12 +255,24 @@ fn report_includes_per_repo_and_aggregate() {
     let val: serde_json::Value = serde_json::from_str(&json).unwrap();
 
     assert!(val["repos"].is_array(), "should have repos array");
-    assert!(val["aggregate_train"].is_array(), "should have aggregate_train");
-    assert!(val["aggregate_test"].is_array(), "should have aggregate_test");
-    assert!(!val["repos"].as_array().unwrap().is_empty(), "repos should not be empty");
+    assert!(
+        val["aggregate_train"].is_array(),
+        "should have aggregate_train"
+    );
+    assert!(
+        val["aggregate_test"].is_array(),
+        "should have aggregate_test"
+    );
+    assert!(
+        !val["repos"].as_array().unwrap().is_empty(),
+        "repos should not be empty"
+    );
 
     let md = report::to_markdown(&result, None);
-    assert!(md.contains("Aggregate Results"), "markdown should include aggregate section");
+    assert!(
+        md.contains("Aggregate Results"),
+        "markdown should include aggregate section"
+    );
     assert!(md.contains("repo"), "markdown should reference repo name");
 }
 
@@ -356,6 +365,12 @@ fn precision_at_5_consistent_with_rr_at_rank_1() {
     let p5 = precision_at_k(&ranked, FileId(1), 5);
     let rr = reciprocal_rank(&ranked, FileId(1));
 
-    assert!((p5 - 0.2).abs() < f64::EPSILON, "P@5 with relevant at rank 1 = 0.2");
-    assert!((rr - 1.0).abs() < f64::EPSILON, "RR with relevant at rank 1 = 1.0");
+    assert!(
+        (p5 - 0.2).abs() < f64::EPSILON,
+        "P@5 with relevant at rank 1 = 0.2"
+    );
+    assert!(
+        (rr - 1.0).abs() < f64::EPSILON,
+        "RR with relevant at rank 1 = 1.0"
+    );
 }

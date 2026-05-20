@@ -43,10 +43,7 @@ const B_CANDIDATES: &[f32] = &[0.0, 0.25, 0.5, 0.75, 1.0];
 /// # Returns
 ///
 /// `TuningResult` with the best config found, convergence trace, and pass count.
-pub fn coordinate_descent<F>(
-    initial_config: Option<BM25FConfig>,
-    mut evaluate: F,
-) -> TuningResult
+pub fn coordinate_descent<F>(initial_config: Option<BM25FConfig>, mut evaluate: F) -> TuningResult
 where
     F: FnMut(BM25FConfig) -> f64,
 {
@@ -179,7 +176,8 @@ pub fn result_to_config(result: &TuningResult) -> anyhow::Result<BM25FConfig> {
         field_boosts: boosts,
         field_b: b,
     };
-    cfg.validate().context("tuning result produced invalid config")?;
+    cfg.validate()
+        .context("tuning result produced invalid config")?;
     Ok(cfg)
 }
 

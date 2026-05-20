@@ -45,11 +45,7 @@ pub fn to_markdown(result: &BenchResult, tuning: Option<&TuningResult>) -> Strin
 
     // Per-repo results
     for repo in &result.repos {
-        let repo_name = repo
-            .repo_url
-            .rsplit('/')
-            .next()
-            .unwrap_or(&repo.repo_url);
+        let repo_name = repo.repo_url.rsplit('/').next().unwrap_or(&repo.repo_url);
         md.push_str(&format!("## Repo: {repo_name}\n\n"));
         md.push_str(&format!("- Qrels: {}\n\n", repo.qrel_count));
 
@@ -74,11 +70,7 @@ pub fn to_markdown(result: &BenchResult, tuning: Option<&TuningResult>) -> Strin
             for step in &t.convergence_history {
                 md.push_str(&format!(
                     "| {} | {} | {:.4} | {:.4} | +{:.6} |\n",
-                    step.pass,
-                    step.parameter,
-                    step.from_value,
-                    step.to_value,
-                    step.mrr_improvement,
+                    step.pass, step.parameter, step.from_value, step.to_value, step.mrr_improvement,
                 ));
             }
             md.push('\n');

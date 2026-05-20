@@ -4,14 +4,14 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
 
-use rskim_search::{BM25FConfig, FileId, LayerBuilder, NgramIndexBuilder, SearchLayer, SearchQuery};
+use rskim_search::{
+    BM25FConfig, FileId, LayerBuilder, NgramIndexBuilder, SearchLayer, SearchQuery,
+};
 
 use crate::metrics::{mrr, precision_at_k, rank_of, reciprocal_rank};
-use crate::qrel::{generate_qrels, validate_qrel_coverage, QrelInput};
+use crate::qrel::{QrelInput, generate_qrels, validate_qrel_coverage};
 use crate::split::partition;
-use crate::types::{
-    BenchResult, ConfigMetrics, IndexedFile, Qrel, RepoBenchResult,
-};
+use crate::types::{BenchResult, ConfigMetrics, IndexedFile, Qrel, RepoBenchResult};
 
 /// Configuration for a single benchmark run.
 pub struct BenchConfig {
@@ -42,10 +42,7 @@ pub fn run_on_files(
     let qrel_inputs: Vec<QrelInput> = files
         .iter()
         .map(|f| {
-            let content = contents
-                .get(&f.file_id)
-                .cloned()
-                .unwrap_or_default();
+            let content = contents.get(&f.file_id).cloned().unwrap_or_default();
             QrelInput {
                 file_id: f.file_id,
                 path: f.path.clone(),
@@ -66,11 +63,14 @@ pub fn run_on_files(
     let (train_qrels, test_qrels) = partition_qrels(&all_qrels);
 
     // Build the base index (using the default config)
-    let mut builder = NgramIndexBuilder::new(index_dir.to_path_buf())
-        .context("creating index builder")?;
+    let mut builder =
+        NgramIndexBuilder::new(index_dir.to_path_buf()).context("creating index builder")?;
 
     for file in files {
-        let content = contents.get(&file.file_id).map(|s| s.as_str()).unwrap_or("");
+        let content = contents
+            .get(&file.file_id)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         builder
             .add_file(file.file_id, content, file.language)
             .with_context(|| format!("indexing file {:?}", file.path))?;
@@ -292,8 +292,16 @@ pub enum LogLevel { Debug, Info, Warn, Error }
         let mut result = run_on_files(&files, &contents, &configs, dir.path()).unwrap();
         result.repo_url = "test://repo".to_string();
 
-        assert_eq!(result.train_metrics.len(), 2, "should have metrics for 2 configs");
-        assert_eq!(result.test_metrics.len(), 2, "should have metrics for 2 configs");
+        assert_eq!(
+            result.train_metrics.len(),
+            2,
+            "should have metrics for 2 configs"
+        );
+        assert_eq!(
+            result.test_metrics.len(),
+            2,
+            "should have metrics for 2 configs"
+        );
         assert!(result.qrel_count >= 10, "should have at least 10 qrels");
     }
 
@@ -312,7 +320,10 @@ pub enum LogLevel { Debug, Info, Warn, Error }
 
         let reader = rskim_search::NgramIndexReader::open(dir.path()).unwrap();
         let metrics = evaluate_split(&reader, &[], "uniform").unwrap();
-        assert!((metrics.mrr - 0.0).abs() < f64::EPSILON, "empty split → MRR=0");
+        assert!(
+            (metrics.mrr - 0.0).abs() < f64::EPSILON,
+            "empty split → MRR=0"
+        );
         assert_eq!(metrics.query_count, 0);
     }
 

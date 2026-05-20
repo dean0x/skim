@@ -226,7 +226,10 @@ class Calculator:
             .filter(|s| s.field == SearchField::FunctionSignature)
             .map(|s| s.name.as_str())
             .collect();
-        assert!(fn_names.contains(&"add"), "method 'add' should be extracted");
+        assert!(
+            fn_names.contains(&"add"),
+            "method 'add' should be extracted"
+        );
         assert!(
             fn_names.contains(&"multiply"),
             "method 'multiply' should be extracted"
@@ -252,8 +255,12 @@ class Calculator:
         return x + y
 "#;
         let symbols = extract(&fixture_path(), content);
-        let has_fn = symbols.iter().any(|s| s.field == SearchField::FunctionSignature);
-        let has_class = symbols.iter().any(|s| s.field == SearchField::TypeDefinition);
+        let has_fn = symbols
+            .iter()
+            .any(|s| s.field == SearchField::FunctionSignature);
+        let has_class = symbols
+            .iter()
+            .any(|s| s.field == SearchField::TypeDefinition);
         assert!(has_fn, "should extract function symbols");
         assert!(has_class, "should extract class symbols");
     }

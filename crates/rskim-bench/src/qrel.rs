@@ -191,10 +191,7 @@ fn stratify(candidates: Vec<(FileId, crate::extract::ExtractedSymbol)>) -> Vec<Q
 /// # Errors
 ///
 /// Returns an error listing which file IDs are missing from the index.
-pub fn validate_qrel_coverage(
-    qrels: &[Qrel],
-    indexed_ids: &HashSet<FileId>,
-) -> anyhow::Result<()> {
+pub fn validate_qrel_coverage(qrels: &[Qrel], indexed_ids: &HashSet<FileId>) -> anyhow::Result<()> {
     let missing: Vec<FileId> = qrels
         .iter()
         .filter(|q| !indexed_ids.contains(&q.relevant_file_id))
@@ -279,7 +276,10 @@ pub fn stop_service(name: &str) {}
     #[test]
     fn deduplication_keeps_first_occurrence() {
         // Two files both define "calculate" — only the first file's ID should appear
-        let file0 = make_file(0, Language::Rust, r#"
+        let file0 = make_file(
+            0,
+            Language::Rust,
+            r#"
 pub fn calculate_sum(a: i32) -> i32 { a }
 pub fn process_data(x: i32) -> i32 { x }
 pub struct DataStore { items: Vec<i32> }
@@ -290,11 +290,16 @@ pub fn load_config(path: &str) -> String { String::new() }
 pub fn validate_token(t: &str) -> bool { true }
 pub fn parse_arguments(args: &[String]) -> bool { true }
 pub fn cleanup_resources() {}
-"#);
-        let file1 = make_file(1, Language::Rust, r#"
+"#,
+        );
+        let file1 = make_file(
+            1,
+            Language::Rust,
+            r#"
 pub fn calculate_sum(b: f64) -> f64 { b }
 pub fn other_function(y: i32) -> i32 { y }
-"#);
+"#,
+        );
         let qrels = generate_qrels(&[file0, file1]).unwrap();
         let calc_qrels: Vec<&Qrel> = qrels
             .iter()
@@ -315,10 +320,14 @@ pub fn other_function(y: i32) -> i32 { y }
         // Create 6 files all defining the same symbol → DF=6 > MAX_DF=5, should be excluded
         let mut files: Vec<QrelInput> = (0..6u32)
             .map(|i| {
-                make_file(i, Language::Rust, r#"
+                make_file(
+                    i,
+                    Language::Rust,
+                    r#"
 pub fn common_function_name(x: i32) -> i32 { x }
 pub fn unique_helper_one() {}
-"#)
+"#,
+                )
             })
             .collect();
 
@@ -342,9 +351,7 @@ pub fn unique_seventh_function(g: i32) -> i32 { g }
         ));
 
         let qrels = generate_qrels(&files).unwrap();
-        let common = qrels
-            .iter()
-            .find(|q| q.query == "common_function_name");
+        let common = qrels.iter().find(|q| q.query == "common_function_name");
         assert!(
             common.is_none(),
             "common_function_name (DF=6) should be excluded by max-DF filter"
