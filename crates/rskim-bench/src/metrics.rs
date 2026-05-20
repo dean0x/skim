@@ -5,10 +5,6 @@
 
 use rskim_search::FileId;
 
-// ============================================================================
-// Core metric functions
-// ============================================================================
-
 /// Compute the Reciprocal Rank of the first relevant result.
 ///
 /// Returns 1/rank where rank is the 1-indexed position of the first relevant

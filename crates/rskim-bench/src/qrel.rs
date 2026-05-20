@@ -6,13 +6,12 @@
 //!
 //! # Pipeline
 //!
-//! 1. Extract symbols from each file using `extract::extract_symbols`
+//! 1. Extract symbols from each file; compute DF per symbol name in the same pass
 //! 2. Filter: name ≥ 4 bytes, at least one alpha character
 //! 3. Deduplicate: first occurrence wins (deterministic if files are sorted)
-//! 4. Compute document frequency (DF) per symbol name
-//! 5. Filter: DF ≤ 5 (exclude overly common symbols)
-//! 6. Stratify: ~15 TypeDefinition, ~15 FunctionSignature, ~10 ImportExport, ~10 SymbolName
-//! 7. Error if < 10 queries remain
+//! 4. Filter: DF ≤ 5 (exclude overly common symbols)
+//! 5. Stratify: ~15 TypeDefinition, ~15 FunctionSignature, ~10 ImportExport, ~10 SymbolName
+//! 6. Error if < 10 queries remain
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -61,11 +60,22 @@ pub struct QrelInput {
 /// Returns an error if fewer than `MIN_QUERIES` qrels are generated after
 /// all filtering and stratification.
 pub fn generate_qrels(files: &[QrelInput]) -> anyhow::Result<Vec<Qrel>> {
-    // Phase 1: Extract all symbols from all files
+    // Phase 1: Extract all symbols and compute document frequency (DF) in one pass.
+    // DF = number of distinct files that define a given name (before deduplication).
     let mut raw_symbols: Vec<(FileId, crate::extract::ExtractedSymbol)> = Vec::new();
+    let mut df_map: HashMap<String, HashSet<FileId>> = HashMap::new();
+
     for file in files {
         let symbols = extract::extract_symbols(&file.path, &file.content, file.language);
         for sym in symbols {
+            let passes_filter =
+                sym.name.len() >= MIN_NAME_LEN && sym.name.chars().any(|c| c.is_alphabetic());
+            if passes_filter {
+                df_map
+                    .entry(sym.name.clone())
+                    .or_default()
+                    .insert(file.file_id);
+            }
             raw_symbols.push((file.file_id, sym));
         }
     }
@@ -85,29 +95,7 @@ pub fn generate_qrels(files: &[QrelInput]) -> anyhow::Result<Vec<Qrel>> {
         .filter(|(_, sym)| seen_names.insert(sym.name.clone()))
         .collect();
 
-    // Phase 4: Compute document frequency (DF) per symbol name
-    // Count how many distinct files each name appears in (across all extracted symbols)
-    // For this step, we need to know DF _before_ deduplication removed duplicates —
-    // but since we want DF > 1 to indicate the name exists in multiple files,
-    // we compute DF from the deduped set (each entry already has a unique name→file mapping).
-    // DF here means "how many distinct files define this symbol name".
-    // Since dedup kept first occurrence, DF ≤ 1 by construction — we need a fresh pass.
-    //
-    // Re-compute DF from the original extracted symbols (before dedup).
-    let mut df_map: HashMap<String, HashSet<FileId>> = HashMap::new();
-    for file in files {
-        let symbols = extract::extract_symbols(&file.path, &file.content, file.language);
-        for sym in symbols {
-            if sym.name.len() >= MIN_NAME_LEN && sym.name.chars().any(|c| c.is_alphabetic()) {
-                df_map
-                    .entry(sym.name.clone())
-                    .or_default()
-                    .insert(file.file_id);
-            }
-        }
-    }
-
-    // Phase 5: Apply DF filter to deduped candidates
+    // Phase 4: Apply DF filter to deduped candidates
     let df_filtered: Vec<(FileId, crate::extract::ExtractedSymbol)> = deduped
         .into_iter()
         .filter(|(_, sym)| {
@@ -118,10 +106,10 @@ pub fn generate_qrels(files: &[QrelInput]) -> anyhow::Result<Vec<Qrel>> {
         })
         .collect();
 
-    // Phase 6: Stratify by field type
+    // Phase 5: Stratify by field type
     let qrels = stratify(df_filtered);
 
-    // Phase 7: Validate minimum count
+    // Phase 6: Validate minimum count
     if qrels.len() < MIN_QUERIES {
         bail!(
             "Too few qrels after filtering: {} (minimum required: {}). \
@@ -196,10 +184,6 @@ fn stratify(candidates: Vec<(FileId, crate::extract::ExtractedSymbol)>) -> Vec<Q
 
     result
 }
-
-// ============================================================================
-// Public validation helper
-// ============================================================================
 
 /// Verify all qrel `relevant_file_id` values exist in the provided set of
 /// indexed file IDs.

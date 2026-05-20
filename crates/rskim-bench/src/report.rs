@@ -5,12 +5,7 @@
 //! - Aggregate (macro-average) train + test metrics
 //! - Tuning convergence trace (if provided)
 
-
 use crate::types::{BenchResult, ConfigMetrics, TuningResult};
-
-// ============================================================================
-// JSON output
-// ============================================================================
 
 /// Serialise a `BenchResult` (and optional tuning result) to a JSON string.
 ///
@@ -33,10 +28,6 @@ pub fn to_json(
 
     serde_json::to_string_pretty(&obj)
 }
-
-// ============================================================================
-// Markdown output
-// ============================================================================
 
 /// Render a `BenchResult` as a Markdown report string.
 pub fn to_markdown(result: &BenchResult, tuning: Option<&TuningResult>) -> String {

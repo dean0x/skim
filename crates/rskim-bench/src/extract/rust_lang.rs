@@ -32,7 +32,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
     let mut cursor = root.walk();
     let mut symbols = Vec::new();
 
-    walk_node(root, &mut cursor, bytes, path, content, &mut symbols);
+    walk_node(root, &mut cursor, bytes, path, &mut symbols);
     symbols
 }
 
@@ -41,7 +41,6 @@ fn walk_node(
     cursor: &mut tree_sitter::TreeCursor<'_>,
     bytes: &[u8],
     path: &Path,
-    content: &str,
     symbols: &mut Vec<ExtractedSymbol>,
 ) {
     match node.kind() {
@@ -71,7 +70,7 @@ fn walk_node(
         }
         "use_declaration" => {
             // Extract the final segment of the use path (the imported name)
-            if let Some(segment) = extract_use_last_segment(node, bytes, content) {
+            if let Some(segment) = find_last_identifier(node, bytes) {
                 symbols.push(ExtractedSymbol {
                     name: segment.0,
                     file_path: path.to_path_buf(),
@@ -101,7 +100,7 @@ fn walk_node(
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            walk_node(child, cursor, bytes, path, content, symbols);
+            walk_node(child, cursor, bytes, path, symbols);
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -110,20 +109,12 @@ fn walk_node(
     }
 }
 
-/// Extract the last meaningful segment from a `use_declaration`.
+/// Find the last meaningful identifier in a use path.
 ///
 /// Handles:
 /// - `use foo::bar::Baz;` → "Baz"
-/// - `use foo::bar::*;` → skip (glob, not a named import)
-/// - `use foo::bar::{A, B};` → skip (group import handled by tree-sitter children)
-fn extract_use_last_segment(
-    node: tree_sitter::Node<'_>,
-    bytes: &[u8],
-    _content: &str,
-) -> Option<(String, std::ops::Range<usize>)> {
-    find_last_identifier(node, bytes)
-}
-
+/// - `use foo::bar::*;` → None (glob import, skipped)
+/// - `use foo::bar::{A, B};` → None (group import, skipped)
 fn find_last_identifier(
     node: tree_sitter::Node<'_>,
     bytes: &[u8],

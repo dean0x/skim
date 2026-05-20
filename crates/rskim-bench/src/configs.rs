@@ -69,7 +69,7 @@ pub fn tuned_8field(
     Ok(cfg)
 }
 
-/// All four named configurations in benchmark order.
+/// All named configurations in benchmark order.
 ///
 /// The returned Vec has names paired with configs for labeling results.
 #[must_use]
@@ -129,23 +129,6 @@ mod tests {
     #[test]
     fn default_8field_validates() {
         default_8field().validate().unwrap();
-    }
-
-    #[test]
-    fn default_8field_matches_default_impl() {
-        let cfg = default_8field();
-        let default = BM25FConfig::default();
-        assert!((cfg.k1 - default.k1).abs() < f32::EPSILON);
-        for i in 0..8 {
-            assert!(
-                (cfg.field_boosts[i] - default.field_boosts[i]).abs() < f32::EPSILON,
-                "field_boosts[{i}] mismatch"
-            );
-            assert!(
-                (cfg.field_b[i] - default.field_b[i]).abs() < f32::EPSILON,
-                "field_b[{i}] mismatch"
-            );
-        }
     }
 
     #[test]

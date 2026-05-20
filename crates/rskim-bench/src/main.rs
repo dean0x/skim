@@ -21,13 +21,9 @@ use rskim_bench::{
 };
 use rskim_research::{
     clone::{FileSource, GitCloneSource},
-    config::load_corpus_config,
+    config::{load_corpus_config, CorpusConfig},
 };
 use rskim_search::{FileId, LayerBuilder};
-
-// ============================================================================
-// CLI definition
-// ============================================================================
 
 /// BM25F parameter tuning benchmark harness.
 #[derive(Debug, Parser)]
@@ -46,10 +42,6 @@ enum Command {
     /// Print qrel judgments for a repo (debug/inspection).
     Qrels(QrelsArgs),
 }
-
-// ============================================================================
-// Bench subcommand
-// ============================================================================
 
 #[derive(Debug, Parser)]
 struct BenchArgs {
@@ -70,10 +62,6 @@ struct BenchArgs {
     repos: Vec<String>,
 }
 
-// ============================================================================
-// Tune subcommand
-// ============================================================================
-
 #[derive(Debug, Parser)]
 struct TuneArgs {
     /// Path to the corpus directory.
@@ -88,10 +76,6 @@ struct TuneArgs {
     #[arg(long, default_value = "markdown")]
     output: String,
 }
-
-// ============================================================================
-// Qrels subcommand
-// ============================================================================
 
 #[derive(Debug, Parser)]
 struct QrelsArgs {
@@ -108,10 +92,6 @@ struct QrelsArgs {
     repo: Option<String>,
 }
 
-// ============================================================================
-// Main entry point
-// ============================================================================
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -121,32 +101,31 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-// ============================================================================
-// Command implementations
-// ============================================================================
-
 fn default_corpus_config() -> PathBuf {
-    // Walk up from executable location to find corpus.toml
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(|p| p.join("rskim-research").join("corpus.toml"))
         .unwrap_or_else(|| PathBuf::from("corpus.toml"))
 }
 
-fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
-    let config_path = args
-        .corpus_config
-        .unwrap_or_else(default_corpus_config);
-
+/// Load corpus config and prepare the GitCloneSource, creating the corpus dir if absent.
+fn open_corpus(
+    corpus_config: Option<PathBuf>,
+    corpus_dir: &PathBuf,
+) -> anyhow::Result<(CorpusConfig, GitCloneSource)> {
+    let config_path = corpus_config.unwrap_or_else(default_corpus_config);
     let corpus = load_corpus_config(&config_path)
         .with_context(|| format!("loading corpus config from {}", config_path.display()))?;
-
-    std::fs::create_dir_all(&args.corpus_dir)
-        .with_context(|| format!("creating corpus dir {}", args.corpus_dir.display()))?;
-
+    std::fs::create_dir_all(corpus_dir)
+        .with_context(|| format!("creating corpus dir {}", corpus_dir.display()))?;
     let source = GitCloneSource {
-        corpus_dir: args.corpus_dir.clone(),
+        corpus_dir: corpus_dir.clone(),
     };
+    Ok((corpus, source))
+}
+
+fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
+    let (corpus, source) = open_corpus(args.corpus_config, &args.corpus_dir)?;
 
     let bench_configs = vec![
         BenchConfig {
@@ -225,19 +204,7 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
 }
 
 fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
-    let config_path = args
-        .corpus_config
-        .unwrap_or_else(default_corpus_config);
-
-    let corpus = load_corpus_config(&config_path)
-        .with_context(|| format!("loading corpus config from {}", config_path.display()))?;
-
-    std::fs::create_dir_all(&args.corpus_dir)
-        .with_context(|| format!("creating corpus dir {}", args.corpus_dir.display()))?;
-
-    let source = GitCloneSource {
-        corpus_dir: args.corpus_dir.clone(),
-    };
+    let (corpus, source) = open_corpus(args.corpus_config, &args.corpus_dir)?;
 
     // Load all files from all repos for tuning
     let mut all_indexed: Vec<IndexedFile> = Vec::new();
@@ -375,19 +342,7 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
 }
 
 fn run_qrels(args: QrelsArgs) -> anyhow::Result<()> {
-    let config_path = args
-        .corpus_config
-        .unwrap_or_else(default_corpus_config);
-
-    let corpus = load_corpus_config(&config_path)
-        .with_context(|| format!("loading corpus config from {}", config_path.display()))?;
-
-    std::fs::create_dir_all(&args.corpus_dir)
-        .with_context(|| format!("creating corpus dir {}", args.corpus_dir.display()))?;
-
-    let source = GitCloneSource {
-        corpus_dir: args.corpus_dir,
-    };
+    let (corpus, source) = open_corpus(args.corpus_config, &args.corpus_dir)?;
 
     for repo_entry in &corpus.repos {
         let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");

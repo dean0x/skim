@@ -133,8 +133,8 @@ pub fn evaluate_split(
     }
 
     let mut rrs: Vec<f64> = Vec::with_capacity(qrels.len());
-    let mut p_at_5s: Vec<f64> = Vec::with_capacity(qrels.len());
-    let mut p_at_10s: Vec<f64> = Vec::with_capacity(qrels.len());
+    let mut p_at_5_sum = 0.0f64;
+    let mut p_at_10_sum = 0.0f64;
     let mut found_at_rank_1 = 0usize;
 
     for qrel in qrels {
@@ -144,30 +144,18 @@ pub fn evaluate_split(
         let results = layer.search(&query).unwrap_or_default();
         let ranked: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
 
-        let rr = reciprocal_rank(&ranked, qrel.relevant_file_id);
-        let p5 = precision_at_k(&ranked, qrel.relevant_file_id, 5);
-        let p10 = precision_at_k(&ranked, qrel.relevant_file_id, 10);
-        let rank = rank_of(&ranked, qrel.relevant_file_id);
-
-        rrs.push(rr);
-        p_at_5s.push(p5);
-        p_at_10s.push(p10);
-        if rank == 1 {
+        rrs.push(reciprocal_rank(&ranked, qrel.relevant_file_id));
+        p_at_5_sum += precision_at_k(&ranked, qrel.relevant_file_id, 5);
+        p_at_10_sum += precision_at_k(&ranked, qrel.relevant_file_id, 10);
+        if rank_of(&ranked, qrel.relevant_file_id) == 1 {
             found_at_rank_1 += 1;
         }
     }
 
+    let n = qrels.len() as f64;
     let mrr_val = mrr(&rrs);
-    let p_at_5 = if p_at_5s.is_empty() {
-        0.0
-    } else {
-        p_at_5s.iter().sum::<f64>() / p_at_5s.len() as f64
-    };
-    let p_at_10 = if p_at_10s.is_empty() {
-        0.0
-    } else {
-        p_at_10s.iter().sum::<f64>() / p_at_10s.len() as f64
-    };
+    let p_at_5 = p_at_5_sum / n;
+    let p_at_10 = p_at_10_sum / n;
 
     Ok(ConfigMetrics {
         config_name: config_name.to_string(),

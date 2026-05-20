@@ -30,7 +30,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
     let mut cursor = root.walk();
     let mut symbols = Vec::new();
 
-    walk_node(root, &mut cursor, bytes, path, content, &mut symbols);
+    walk_node(root, &mut cursor, bytes, path, &mut symbols);
     symbols
 }
 
@@ -39,7 +39,6 @@ fn walk_node(
     cursor: &mut tree_sitter::TreeCursor<'_>,
     bytes: &[u8],
     path: &Path,
-    content: &str,
     symbols: &mut Vec<ExtractedSymbol>,
 ) {
     match node.kind() {
@@ -61,7 +60,7 @@ fn walk_node(
         }
         "import_spec" => {
             // Extract last segment of the import path string
-            if let Some(seg) = extract_import_path_last_segment(node, bytes, content) {
+            if let Some(seg) = extract_import_path_last_segment(node, bytes) {
                 symbols.push(ExtractedSymbol {
                     name: seg.0,
                     file_path: path.to_path_buf(),
@@ -77,7 +76,7 @@ fn walk_node(
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            walk_node(child, cursor, bytes, path, content, symbols);
+            walk_node(child, cursor, bytes, path, symbols);
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -118,7 +117,6 @@ fn extract_type_specs(
 fn extract_import_path_last_segment(
     node: tree_sitter::Node<'_>,
     bytes: &[u8],
-    _content: &str,
 ) -> Option<(String, std::ops::Range<usize>)> {
     // import_spec has a `path` field (interpreted_string_literal)
     if let Some(path_node) = node.child_by_field_name("path")
