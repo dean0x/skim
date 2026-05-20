@@ -41,6 +41,8 @@ enum Command {
     Tune(TuneArgs),
     /// Print qrel judgments for a repo (debug/inspection).
     Qrels(QrelsArgs),
+    /// Render a saved bench result JSON file as markdown or JSON.
+    Report(ReportArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -92,12 +94,24 @@ struct QrelsArgs {
     repo: Option<String>,
 }
 
+#[derive(Debug, Parser)]
+struct ReportArgs {
+    /// Path to a saved JSON bench result file (produced by `bench --output json`).
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Output format: "json" or "markdown".
+    #[arg(long, default_value = "markdown")]
+    format: String,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Bench(args) => run_bench(args),
         Command::Tune(args) => run_tune(args),
         Command::Qrels(args) => run_qrels(args),
+        Command::Report(args) => run_report(args),
     }
 }
 
@@ -335,6 +349,29 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
                 "{}",
                 report::to_markdown(&bench_result, Some(&tuning_result))
             );
+        }
+    }
+
+    Ok(())
+}
+
+fn run_report(args: ReportArgs) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(&args.input)
+        .with_context(|| format!("reading bench result from {}", args.input.display()))?;
+    let bench_result: rskim_bench::types::BenchResult =
+        serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "deserialising bench result from {}",
+                args.input.display()
+            )
+        })?;
+
+    match args.format.as_str() {
+        "json" => {
+            println!("{}", report::to_json(&bench_result, None)?);
+        }
+        _ => {
+            print!("{}", report::to_markdown(&bench_result, None));
         }
     }
 
