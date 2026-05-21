@@ -7,10 +7,10 @@
 //! - `report`  — render a saved bench result as markdown
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use rskim_bench::{
     configs,
@@ -24,6 +24,25 @@ use rskim_research::{
     config::{CorpusConfig, load_corpus_config},
 };
 use rskim_search::{FileId, LayerBuilder};
+
+/// Output format for bench, tune, and report subcommands.
+#[derive(Debug, Clone, Default, ValueEnum)]
+enum OutputFormat {
+    /// Human-readable markdown table (default).
+    #[default]
+    Markdown,
+    /// Machine-readable JSON.
+    Json,
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Markdown => write!(f, "markdown"),
+            OutputFormat::Json => write!(f, "json"),
+        }
+    }
+}
 
 /// BM25F parameter tuning benchmark harness.
 #[derive(Debug, Parser)]
@@ -55,9 +74,9 @@ struct BenchArgs {
     #[arg(long)]
     corpus_config: Option<PathBuf>,
 
-    /// Output format: json or markdown.
-    #[arg(long, default_value = "markdown")]
-    output: String,
+    /// Output format.
+    #[arg(long, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
 
     /// Restrict to specific repo names (e.g. fd flask gin).
     #[arg(long)]
@@ -74,9 +93,9 @@ struct TuneArgs {
     #[arg(long)]
     corpus_config: Option<PathBuf>,
 
-    /// Output format: json or markdown.
-    #[arg(long, default_value = "markdown")]
-    output: String,
+    /// Output format.
+    #[arg(long, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Parser)]
@@ -96,13 +115,13 @@ struct QrelsArgs {
 
 #[derive(Debug, Parser)]
 struct ReportArgs {
-    /// Path to a saved JSON bench result file (produced by `bench --output json`).
+    /// Path to a saved JSON bench result file (produced by `bench --format json`).
     #[arg(long)]
     input: PathBuf,
 
-    /// Output format: "json" or "markdown".
-    #[arg(long, default_value = "markdown")]
-    format: String,
+    /// Output format.
+    #[arg(long, default_value_t = OutputFormat::Markdown)]
+    format: OutputFormat,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -125,7 +144,7 @@ fn default_corpus_config() -> PathBuf {
 /// Load corpus config and prepare the GitCloneSource, creating the corpus dir if absent.
 fn open_corpus(
     corpus_config: Option<PathBuf>,
-    corpus_dir: &PathBuf,
+    corpus_dir: &Path,
 ) -> anyhow::Result<(CorpusConfig, GitCloneSource)> {
     let config_path = corpus_config.unwrap_or_else(default_corpus_config);
     let corpus = load_corpus_config(&config_path)
@@ -133,7 +152,7 @@ fn open_corpus(
     std::fs::create_dir_all(corpus_dir)
         .with_context(|| format!("creating corpus dir {}", corpus_dir.display()))?;
     let source = GitCloneSource {
-        corpus_dir: corpus_dir.clone(),
+        corpus_dir: corpus_dir.to_path_buf(),
     };
     Ok((corpus, source))
 }
@@ -179,16 +198,20 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
         let indexed: Vec<IndexedFile> = sorted_files
             .iter()
             .enumerate()
-            .map(|(i, f)| IndexedFile {
-                file_id: FileId(i as u32),
-                path: f.path.clone(),
-                language: f.language,
+            .map(|(i, f)| {
+                let id = u32::try_from(i).context("too many files in repo")?;
+                Ok(IndexedFile {
+                    file_id: FileId(id),
+                    path: f.path.clone(),
+                    language: f.language,
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let mut contents: HashMap<FileId, String> = HashMap::new();
         for (i, f) in sorted_files.iter().enumerate() {
-            contents.insert(FileId(i as u32), f.content.clone());
+            let id = u32::try_from(i).context("too many files in repo")?;
+            contents.insert(FileId(id), f.content.clone());
         }
 
         let index_dir = tempfile::tempdir().context("creating temp index dir")?;
@@ -205,11 +228,11 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
 
     let bench_result = aggregate_results(repo_results);
 
-    match args.output.as_str() {
-        "json" => {
+    match args.format {
+        OutputFormat::Json => {
             println!("{}", report::to_json(&bench_result, None)?);
         }
-        _ => {
+        OutputFormat::Markdown => {
             print!("{}", report::to_markdown(&bench_result, None));
         }
     }
@@ -237,7 +260,9 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
 
         for f in source_files {
             let fid = FileId(file_id_counter);
-            file_id_counter += 1;
+            file_id_counter = file_id_counter
+                .checked_add(1)
+                .context("file_id_counter overflow: too many files across all repos")?;
             all_indexed.push(IndexedFile {
                 file_id: fid,
                 path: f.path.clone(),
@@ -288,22 +313,42 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
 
     let idx_path = index_dir.path().to_path_buf();
 
+    // Error counter shared across closure invocations. coordinate_descent requires an f64
+    // return value (0.0 signals a failed evaluation), so errors are visible on stderr rather
+    // than propagated. We cap logging at the first 5 errors to avoid flooding output.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let eval_error_count = std::sync::Arc::new(AtomicU32::new(0));
+    let eval_error_count_clone = eval_error_count.clone();
+
     let tuning_result = coordinate_descent(None, move |cfg: rskim_search::BM25FConfig| {
         let reader = match rskim_search::NgramIndexReader::open_with_config(&idx_path, cfg) {
             Ok(r) => r,
-            Err(_) => return 0.0,
+            Err(e) => {
+                let n = eval_error_count_clone.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!("[tune] index open failed (error #{n}): {e:#}");
+                }
+                return 0.0;
+            }
         };
-        let metrics = rskim_bench::harness::evaluate_split(&reader, &train_qrels, "tuning")
-            .unwrap_or_else(|_| rskim_bench::types::ConfigMetrics {
-                config_name: "tuning".to_string(),
-                mrr: 0.0,
-                precision_at_5: 0.0,
-                precision_at_10: 0.0,
-                query_count: 0,
-                found_at_rank_1: 0,
-            });
-        metrics.mrr
+        match rskim_bench::harness::evaluate_split(&reader, &train_qrels, "tuning") {
+            Ok(metrics) => metrics.mrr,
+            Err(e) => {
+                let n = eval_error_count_clone.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!("[tune] evaluate_split failed (error #{n}): {e:#}");
+                }
+                0.0
+            }
+        }
     });
+
+    let total_errors = eval_error_count.load(Ordering::Relaxed);
+    if total_errors > 0 {
+        eprintln!(
+            "[tune] {total_errors} evaluation(s) failed and returned 0.0 MRR — results may be unreliable."
+        );
+    }
 
     eprintln!(
         "Tuning complete. Best MRR: {:.4}, passes: {}",
@@ -337,11 +382,11 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
 
     let bench_result = aggregate_results(vec![final_result]);
 
-    match args.output.as_str() {
-        "json" => {
+    match args.format {
+        OutputFormat::Json => {
             println!("{}", report::to_json(&bench_result, Some(&tuning_result))?);
         }
-        _ => {
+        OutputFormat::Markdown => {
             print!(
                 "{}",
                 report::to_markdown(&bench_result, Some(&tuning_result))
@@ -358,11 +403,11 @@ fn run_report(args: ReportArgs) -> anyhow::Result<()> {
     let bench_result: rskim_bench::types::BenchResult = serde_json::from_str(&raw)
         .with_context(|| format!("deserialising bench result from {}", args.input.display()))?;
 
-    match args.format.as_str() {
-        "json" => {
+    match args.format {
+        OutputFormat::Json => {
             println!("{}", report::to_json(&bench_result, None)?);
         }
-        _ => {
+        OutputFormat::Markdown => {
             print!("{}", report::to_markdown(&bench_result, None));
         }
     }
@@ -395,13 +440,16 @@ fn run_qrels(args: QrelsArgs) -> anyhow::Result<()> {
         let qrel_inputs: Vec<rskim_bench::qrel::QrelInput> = source_files
             .iter()
             .enumerate()
-            .map(|(i, f)| rskim_bench::qrel::QrelInput {
-                file_id: FileId(i as u32),
-                path: f.path.clone(),
-                language: f.language,
-                content: f.content.clone(),
+            .map(|(i, f)| {
+                let id = u32::try_from(i).context("too many files in repo")?;
+                Ok(rskim_bench::qrel::QrelInput {
+                    file_id: FileId(id),
+                    path: f.path.clone(),
+                    language: f.language,
+                    content: f.content.clone(),
+                })
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let qrels = rskim_bench::qrel::generate_qrels(&qrel_inputs)
             .with_context(|| format!("generating qrels for {repo_name}"))?;
