@@ -227,12 +227,8 @@ pub fn aggregate_results(repos: Vec<RepoBenchResult>) -> anyhow::Result<BenchRes
         );
     }
 
-    // Collect config names from the first repo (all repos use same configs)
-    let config_names: Vec<String> = repos[0]
-        .train_metrics
-        .iter()
-        .map(|m| m.config_name.clone())
-        .collect();
+    // Reuse the validated names from the first repo to drive macro-averaging.
+    let config_names: Vec<String> = expected_train_names.iter().map(|s| s.to_string()).collect();
 
     let aggregate_train = macro_average(&repos, &config_names, |r| &r.train_metrics);
     let aggregate_test = macro_average(&repos, &config_names, |r| &r.test_metrics);

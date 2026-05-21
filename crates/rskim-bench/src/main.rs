@@ -391,14 +391,14 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     // Error counter shared across closure invocations. coordinate_descent requires an f64
     // return value (0.0 signals a failed evaluation), so errors are visible on stderr rather
     // than propagated. We cap logging at the first 5 errors to avoid flooding output.
-    let eval_error_count = Arc::new(AtomicU32::new(0));
-    let counter = eval_error_count.clone();
+    let error_count = Arc::new(AtomicU32::new(0));
+    let error_count_ref = Arc::clone(&error_count);
 
     let tuning_result = coordinate_descent(None, move |cfg: rskim_search::BM25FConfig| {
         match rskim_bench::harness::evaluate_split(&reader, &train_qrels, "tuning", Some(cfg)) {
             Ok(metrics) => metrics.mrr,
             Err(e) => {
-                let n = counter.fetch_add(1, Ordering::Relaxed);
+                let n = error_count_ref.fetch_add(1, Ordering::Relaxed);
                 if n < 5 {
                     eprintln!("[tune] evaluate_split failed (error #{n}): {e:#}");
                 }
@@ -407,7 +407,7 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
         }
     });
 
-    let total_errors = eval_error_count.load(Ordering::Relaxed);
+    let total_errors = error_count.load(Ordering::Relaxed);
     if total_errors > 0 {
         eprintln!(
             "[tune] {total_errors} evaluation(s) failed and returned 0.0 MRR — results may be unreliable."

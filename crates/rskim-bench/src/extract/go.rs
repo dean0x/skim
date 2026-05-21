@@ -35,7 +35,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                 }
                 "type_declaration" => {
                     // type_declaration contains one or more type_spec children
-                    extract_type_specs(node, bytes, Arc::clone(&path), symbols);
+                    extract_type_specs(node, bytes, &path, symbols);
                 }
                 "import_spec" => {
                     // Extract last segment of the import path string
@@ -58,7 +58,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
 fn extract_type_specs(
     node: tree_sitter::Node<'_>,
     bytes: &[u8],
-    path: Arc<PathBuf>,
+    path: &Arc<PathBuf>,
     symbols: &mut Vec<ExtractedSymbol>,
 ) {
     let child_count = node.named_child_count();
@@ -70,7 +70,7 @@ fn extract_type_specs(
         {
             symbols.push(ExtractedSymbol {
                 name: name.to_string(),
-                file_path: Arc::clone(&path),
+                file_path: Arc::clone(path),
                 field: SearchField::TypeDefinition,
                 byte_range: name_node.byte_range(),
             });
