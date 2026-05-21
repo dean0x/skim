@@ -241,8 +241,7 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
         .iter()
         .filter(|repo_entry| {
             let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
-            args.repos.is_empty()
-                || args.repos.iter().any(|r| repo_name.contains(r.as_str()))
+            args.repos.is_empty() || args.repos.iter().any(|r| repo_name.contains(r.as_str()))
         })
         .collect();
 
@@ -481,7 +480,11 @@ fn run_qrels(args: QrelsArgs) -> anyhow::Result<()> {
     for repo_entry in &corpus.repos {
         let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
 
-        if args.repo.as_ref().is_some_and(|r| !repo_name.contains(r.as_str())) {
+        if args
+            .repo
+            .as_ref()
+            .is_some_and(|r| !repo_name.contains(r.as_str()))
+        {
             continue;
         }
 
@@ -496,7 +499,11 @@ fn run_qrels(args: QrelsArgs) -> anyhow::Result<()> {
                 file_id: f.file_id,
                 path: f.path.clone(),
                 language: f.language,
-                content: loaded.contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or(""),
+                content: loaded
+                    .contents
+                    .get(&f.file_id)
+                    .map(|s| s.as_str())
+                    .unwrap_or(""),
             })
             .collect();
 

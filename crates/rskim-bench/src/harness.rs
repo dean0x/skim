@@ -80,8 +80,7 @@ pub fn run_on_files(
     let _base_layer = builder.build().context("building index")?;
     // Open reader once with the default config; BM25F parameters are overridden
     // per-query via SearchQuery::bm25f_config (single-reader pattern).
-    let reader = rskim_search::NgramIndexReader::open(index_dir)
-        .context("opening index reader")?;
+    let reader = rskim_search::NgramIndexReader::open(index_dir).context("opening index reader")?;
 
     // Evaluate each config on train and test splits
     let mut train_metrics = Vec::new();

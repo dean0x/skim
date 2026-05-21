@@ -90,11 +90,7 @@ pub fn generate_qrels(files: &[QrelInput<'_>]) -> anyhow::Result<Vec<Qrel>> {
     // so the default branch is unreachable in practice.
     let df_filtered: Vec<(FileId, crate::extract::ExtractedSymbol)> = deduped
         .into_iter()
-        .filter(|(_, sym)| {
-            df_map
-                .get(&sym.name)
-                .is_none_or(|ids| ids.len() <= MAX_DF)
-        })
+        .filter(|(_, sym)| df_map.get(&sym.name).is_none_or(|ids| ids.len() <= MAX_DF))
         .collect();
 
     // Phase 5: Stratify by field type

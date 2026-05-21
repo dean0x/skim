@@ -173,7 +173,8 @@ fn all_configs_produce_results_for_same_query() {
         })
         .collect();
 
-    let result = run_on_files(&files, &contents, &bench_configs, dir.path(), "test://repo").unwrap();
+    let result =
+        run_on_files(&files, &contents, &bench_configs, dir.path(), "test://repo").unwrap();
 
     // All configs should have the same query count on each split
     let train_counts: Vec<usize> = result.train_metrics.iter().map(|m| m.query_count).collect();
@@ -315,7 +316,8 @@ fn full_pipeline_produces_non_zero_metrics() {
         },
     ];
 
-    let result = run_on_files(&files, &contents, &bench_configs, dir.path(), "test://repo").unwrap();
+    let result =
+        run_on_files(&files, &contents, &bench_configs, dir.path(), "test://repo").unwrap();
 
     // At least one config must have processed queries (sanity check that the
     // pipeline ran at all).
@@ -362,9 +364,23 @@ fn aggregate_results_macro_average() {
         bm25f: configs::uniform(),
     }];
 
-    let r1 = run_on_files(&files, &contents, &bench_configs, dir1.path(), "https://github.com/test/repo1").unwrap();
+    let r1 = run_on_files(
+        &files,
+        &contents,
+        &bench_configs,
+        dir1.path(),
+        "https://github.com/test/repo1",
+    )
+    .unwrap();
 
-    let r2 = run_on_files(&files, &contents, &bench_configs, dir2.path(), "https://github.com/test/repo2").unwrap();
+    let r2 = run_on_files(
+        &files,
+        &contents,
+        &bench_configs,
+        dir2.path(),
+        "https://github.com/test/repo2",
+    )
+    .unwrap();
 
     let aggregated = aggregate_results(vec![r1, r2]).unwrap();
     assert_eq!(aggregated.repos.len(), 2);
@@ -416,7 +432,10 @@ fn extract_symbols_dispatch_integration() {
         "pub fn test_func(x: i32) -> i32 { x }",
         Language::Rust,
     );
-    assert!(!rust_symbols.is_empty(), "Rust extraction should find symbols");
+    assert!(
+        !rust_symbols.is_empty(),
+        "Rust extraction should find symbols"
+    );
     assert!(
         rust_symbols
             .iter()
@@ -430,7 +449,10 @@ fn extract_symbols_dispatch_integration() {
         "def test_func(x: int) -> int:\n    return x",
         Language::Python,
     );
-    assert!(!py_symbols.is_empty(), "Python extraction should find symbols");
+    assert!(
+        !py_symbols.is_empty(),
+        "Python extraction should find symbols"
+    );
 
     // Go: should extract symbols
     let go_symbols = rskim_bench::extract::extract_symbols(
@@ -530,7 +552,10 @@ fn aggregate_results_rejects_mismatched_config_names() {
     let result = aggregate_results(vec![repo1, repo2]);
     assert!(result.is_err(), "should reject mismatched config names");
     assert!(
-        result.unwrap_err().to_string().contains("config name mismatch"),
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("config name mismatch"),
         "error message should say 'config name mismatch'"
     );
 }
