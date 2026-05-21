@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn top_two_boost_fields_returns_highest_indices() {
-        let boosts: [f32; 8] = [1.0, 5.0, 2.0, 8.0, 0.5, 3.0, 4.0, 1.0];
+        let boosts: [f32; FIELD_COUNT] = [1.0, 5.0, 2.0, 8.0, 0.5, 3.0, 4.0, 1.0];
         let top2 = top_two_boost_fields(&boosts);
         // Field 3 has boost 8.0, field 1 has boost 5.0
         let mut sorted = top2;
@@ -282,7 +282,7 @@ mod tests {
     fn custom_initial_config_is_used() {
         // Start from a config where k1 is already optimal (1.5)
         // → no k1 improvement step should be needed
-        let initial = crate::configs::tuned_8field(1.5, [1.0; 8], [0.75; 8]).unwrap();
+        let initial = crate::configs::tuned_8field(1.5, [1.0; FIELD_COUNT], [0.75; FIELD_COUNT]).unwrap();
         let result = coordinate_descent(Some(initial), mock_evaluator);
         // k1 should stay at 1.5 since it's already optimal
         assert!(

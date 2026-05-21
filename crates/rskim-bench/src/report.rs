@@ -130,6 +130,7 @@ fn metrics_table(metrics: &[ConfigMetrics]) -> String {
 mod tests {
     use super::*;
     use crate::types::RepoBenchResult;
+    use rskim_search::FIELD_COUNT;
 
     fn sample_result() -> BenchResult {
         let metrics = vec![
@@ -183,8 +184,8 @@ mod tests {
         let result = sample_result();
         let tuning = TuningResult {
             best_k1: 1.5,
-            best_field_boosts: [5.0; 8],
-            best_field_b: [0.75; 8],
+            best_field_boosts: [5.0; FIELD_COUNT],
+            best_field_b: [0.75; FIELD_COUNT],
             best_train_mrr: 0.75,
             convergence_history: vec![],
             passes_needed: 2,
@@ -217,8 +218,8 @@ mod tests {
         let result = sample_result();
         let tuning = TuningResult {
             best_k1: 1.5,
-            best_field_boosts: [5.0; 8],
-            best_field_b: [0.75; 8],
+            best_field_boosts: [5.0; FIELD_COUNT],
+            best_field_b: [0.75; FIELD_COUNT],
             best_train_mrr: 0.75,
             convergence_history: vec![crate::types::ConvergenceStep {
                 pass: 1,

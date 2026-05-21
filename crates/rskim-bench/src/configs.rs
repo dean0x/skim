@@ -137,29 +137,29 @@ mod tests {
 
     #[test]
     fn tuned_8field_valid_params() {
-        let cfg = tuned_8field(1.5, [2.0; 8], [0.5; 8]).unwrap();
+        let cfg = tuned_8field(1.5, [2.0; FIELD_COUNT], [0.5; FIELD_COUNT]).unwrap();
         assert!((cfg.k1 - 1.5).abs() < f32::EPSILON);
     }
 
     #[test]
     fn tuned_8field_invalid_k1() {
-        let result = tuned_8field(-1.0, [1.0; 8], [0.75; 8]);
+        let result = tuned_8field(-1.0, [1.0; FIELD_COUNT], [0.75; FIELD_COUNT]);
         assert!(result.is_err(), "negative k1 should be rejected");
     }
 
     #[test]
     fn tuned_8field_invalid_b_out_of_range() {
-        let mut b = [0.75; 8];
+        let mut b = [0.75; FIELD_COUNT];
         b[3] = 1.5; // out of [0, 1]
-        let result = tuned_8field(1.2, [1.0; 8], b);
+        let result = tuned_8field(1.2, [1.0; FIELD_COUNT], b);
         assert!(result.is_err(), "b > 1.0 should be rejected");
     }
 
     #[test]
     fn tuned_8field_invalid_negative_boost() {
-        let mut boosts = [1.0; 8];
+        let mut boosts = [1.0; FIELD_COUNT];
         boosts[2] = -0.5;
-        let result = tuned_8field(1.2, boosts, [0.75; 8]);
+        let result = tuned_8field(1.2, boosts, [0.75; FIELD_COUNT]);
         assert!(result.is_err(), "negative boost should be rejected");
     }
 
