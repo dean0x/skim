@@ -14,6 +14,7 @@ use crate::split::partition;
 use crate::types::{BenchResult, ConfigMetrics, IndexedFile, Qrel, RepoBenchResult};
 
 /// Configuration for a single benchmark run.
+#[derive(Debug)]
 pub struct BenchConfig {
     pub name: String,
     pub bm25f: BM25FConfig,
@@ -141,7 +142,9 @@ pub fn evaluate_split(
         let mut query = SearchQuery::new(&qrel.query);
         query.limit = Some(TOP_K);
 
-        let results = layer.search(&query).unwrap_or_default();
+        let results = layer
+            .search(&query)
+            .with_context(|| format!("searching for query '{}'", qrel.query))?;
         let ranked: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
 
         rrs.push(reciprocal_rank(&ranked, qrel.relevant_file_id));
@@ -200,7 +203,7 @@ fn macro_average<F>(
     get_metrics: F,
 ) -> Vec<ConfigMetrics>
 where
-    F: Fn(&RepoBenchResult) -> &Vec<ConfigMetrics>,
+    F: Fn(&RepoBenchResult) -> &[ConfigMetrics],
 {
     config_names
         .iter()
