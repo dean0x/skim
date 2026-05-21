@@ -11,12 +11,12 @@ use crate::types::{BenchResult, ConfigMetrics, TuningResult};
 ///
 /// # Errors
 ///
-/// Returns `serde_json::Error` if serialisation fails (should not happen in
-/// practice with the types used here).
+/// Returns an error if serialisation fails (should not happen in practice
+/// with the types used here).
 pub fn to_json(
     result: &BenchResult,
     tuning: Option<&TuningResult>,
-) -> Result<String, serde_json::Error> {
+) -> anyhow::Result<String> {
     let mut obj = serde_json::to_value(result)?;
 
     if let Some(t) = tuning {
@@ -26,7 +26,7 @@ pub fn to_json(
         }
     }
 
-    serde_json::to_string_pretty(&obj)
+    Ok(serde_json::to_string_pretty(&obj)?)
 }
 
 /// Render a `BenchResult` as a Markdown report string.
