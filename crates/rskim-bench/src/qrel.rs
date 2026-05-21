@@ -68,9 +68,7 @@ pub fn generate_qrels(files: &[QrelInput<'_>]) -> anyhow::Result<Vec<Qrel>> {
     for file in files {
         let symbols = extract::extract_symbols(&file.path, file.content, file.language);
         for sym in symbols {
-            let passes_filter =
-                sym.name.len() >= MIN_NAME_LEN && sym.name.chars().any(|c| c.is_alphabetic());
-            if passes_filter {
+            if sym.name.len() >= MIN_NAME_LEN && sym.name.chars().any(|c| c.is_alphabetic()) {
                 df_map
                     .entry(sym.name.clone())
                     .or_default()
@@ -79,9 +77,6 @@ pub fn generate_qrels(files: &[QrelInput<'_>]) -> anyhow::Result<Vec<Qrel>> {
             }
         }
     }
-
-    // Phase 2 (implicit): filter was applied inline above; raw_symbols contains
-    // only symbols that passed name-length and alphabetic checks.
 
     // Phase 3: Deduplicate — first occurrence of each name wins
     let mut seen_names: HashSet<String> = HashSet::new();
@@ -138,12 +133,11 @@ fn stratify(candidates: Vec<(FileId, crate::extract::ExtractedSymbol)>) -> Vec<Q
     ];
 
     let mut result: Vec<Qrel> = Vec::new();
-    let mut deficits: Vec<(SearchField, usize)> = Vec::new();
+    let mut total_deficit: usize = 0;
 
     for (field, target) in targets {
         let pool = by_field.remove(&field).unwrap_or_default();
         let take = pool.len().min(target);
-        let deficit = if take < 5 { target - take } else { 0 };
 
         for (fid, sym) in pool.iter().take(take) {
             result.push(Qrel {
@@ -153,22 +147,19 @@ fn stratify(candidates: Vec<(FileId, crate::extract::ExtractedSymbol)>) -> Vec<Q
             });
         }
 
-        if deficit > 0 {
-            deficits.push((field, deficit));
+        if take < 5 {
+            total_deficit += target - take;
         }
     }
 
-    // Backfill: if any field had < 5 symbols, take from the largest available pool
-    if !deficits.is_empty() {
-        // Find the largest remaining pool across all field types
+    // Backfill: if any field had < 5 symbols, take from remaining pools
+    if total_deficit > 0 {
         let mut overflow_pool: Vec<(FileId, crate::extract::ExtractedSymbol)> =
             by_field.into_values().flatten().collect();
         // Sort for determinism
         overflow_pool.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
-        let total_deficit: usize = deficits.iter().map(|(_, d)| *d).sum();
         let take = overflow_pool.len().min(total_deficit);
-
         for (fid, sym) in overflow_pool.iter().take(take) {
             result.push(Qrel {
                 query: sym.name.clone(),

@@ -328,10 +328,8 @@ fn make_train_qrels(
         })
         .collect();
 
-    let all_qrels =
-        rskim_bench::qrel::generate_qrels(&qrel_inputs).context("generating qrels")?;
-
-    let train_qrels = all_qrels
+    let train_qrels = rskim_bench::qrel::generate_qrels(&qrel_inputs)
+        .context("generating qrels")?
         .into_iter()
         .filter(|q| rskim_bench::split::assign_split(&q.query) == rskim_bench::split::Split::Train)
         .collect();
@@ -483,11 +481,7 @@ fn run_qrels(args: QrelsArgs) -> anyhow::Result<()> {
     for repo_entry in &corpus.repos {
         let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
 
-        if args
-            .repo
-            .as_ref()
-            .is_some_and(|f| !repo_name.contains(f.as_str()))
-        {
+        if args.repo.as_ref().is_some_and(|r| !repo_name.contains(r.as_str())) {
             continue;
         }
 
