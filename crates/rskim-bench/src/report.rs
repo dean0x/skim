@@ -28,18 +28,24 @@ pub fn to_json(result: &BenchResult, tuning: Option<&TuningResult>) -> anyhow::R
     Ok(serde_json::to_string_pretty(&obj)?)
 }
 
-/// Map a `SearchField` to its PascalCase display name.
-fn field_display_name(field: SearchField) -> &'static str {
-    match field {
-        SearchField::TypeDefinition => "TypeDefinition",
-        SearchField::FunctionSignature => "FunctionSignature",
-        SearchField::SymbolName => "SymbolName",
-        SearchField::ImportExport => "ImportExport",
-        SearchField::FunctionBody => "FunctionBody",
-        SearchField::Comment => "Comment",
-        SearchField::StringLiteral => "StringLiteral",
-        SearchField::Other => "Other",
-    }
+/// Convert a `SearchField` snake_case name to PascalCase for display.
+///
+/// Derives the display name from `SearchField::name()` so that adding a new
+/// variant only requires updating one place (the authoritative `name()` match
+/// in rskim-search). A bench-only PascalCase variant is not warranted; deriving
+/// it programmatically keeps the two crates in sync without cross-crate coupling.
+fn field_display_name(field: SearchField) -> String {
+    field
+        .name()
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect()
 }
 
 /// Render the tuning summary, convergence trace, and field boosts table.
@@ -143,7 +149,7 @@ fn metrics_table(metrics: &[ConfigMetrics]) -> String {
 mod tests {
     use super::*;
     use crate::types::RepoBenchResult;
-    use rskim_search::{FIELD_COUNT, SearchField};
+    use rskim_search::FIELD_COUNT;
 
     fn sample_result() -> BenchResult {
         let metrics = vec![

@@ -188,22 +188,41 @@ pub fn aggregate_results(repos: Vec<RepoBenchResult>) -> anyhow::Result<BenchRes
         });
     }
 
-    // Validate that all repos use the same config names in the same order
-    let expected_names: Vec<&str> = repos[0]
+    // Validate that all repos use the same config names in the same order,
+    // for both train and test splits. A mismatch in either split indicates
+    // repos were evaluated with different config sets, making macro-averaging
+    // meaningless.
+    let expected_train_names: Vec<&str> = repos[0]
         .train_metrics
+        .iter()
+        .map(|m| m.config_name.as_str())
+        .collect();
+    let expected_test_names: Vec<&str> = repos[0]
+        .test_metrics
         .iter()
         .map(|m| m.config_name.as_str())
         .collect();
 
     for repo in &repos[1..] {
-        let names: Vec<&str> = repo
+        let train_names: Vec<&str> = repo
             .train_metrics
             .iter()
             .map(|m| m.config_name.as_str())
             .collect();
         anyhow::ensure!(
-            names == expected_names,
-            "config name mismatch: repo '{}' has {names:?}, expected {expected_names:?}",
+            train_names == expected_train_names,
+            "train config name mismatch: repo '{}' has {train_names:?}, expected {expected_train_names:?}",
+            repo.repo_url
+        );
+
+        let test_names: Vec<&str> = repo
+            .test_metrics
+            .iter()
+            .map(|m| m.config_name.as_str())
+            .collect();
+        anyhow::ensure!(
+            test_names == expected_test_names,
+            "test config name mismatch: repo '{}' has {test_names:?}, expected {expected_test_names:?}",
             repo.repo_url
         );
     }
@@ -363,6 +382,45 @@ pub enum LogLevel { Debug, Info, Warn, Error }
         assert!(result.repos.is_empty());
         assert!(result.aggregate_train.is_empty());
         assert!(result.aggregate_test.is_empty());
+    }
+
+    fn make_repo(url: &str, train_name: &str, test_name: &str) -> RepoBenchResult {
+        let make_metric = |name: &str| ConfigMetrics {
+            config_name: name.to_string(),
+            mrr: 0.5,
+            precision_at_5: 0.3,
+            precision_at_10: 0.2,
+            query_count: 10,
+            found_at_rank_1: 5,
+        };
+        RepoBenchResult {
+            repo_url: url.to_string(),
+            train_metrics: vec![make_metric(train_name)],
+            test_metrics: vec![make_metric(test_name)],
+            qrel_count: 10,
+        }
+    }
+
+    #[test]
+    fn aggregate_rejects_train_config_name_mismatch() {
+        let repo1 = make_repo("url1", "cfg_a", "cfg_a");
+        let repo2 = make_repo("url2", "cfg_b", "cfg_a"); // train name differs
+        let err = aggregate_results(vec![repo1, repo2]).unwrap_err();
+        assert!(
+            err.to_string().contains("train config name mismatch"),
+            "expected train mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_rejects_test_config_name_mismatch() {
+        let repo1 = make_repo("url1", "cfg_a", "cfg_a");
+        let repo2 = make_repo("url2", "cfg_a", "cfg_b"); // test name differs, train matches
+        let err = aggregate_results(vec![repo1, repo2]).unwrap_err();
+        assert!(
+            err.to_string().contains("test config name mismatch"),
+            "expected test mismatch error, got: {err}"
+        );
     }
 
     #[test]
