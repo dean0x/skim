@@ -3,6 +3,8 @@
 //! These tests run the full pipeline (extract → index → qrel → evaluate) using
 //! synthetic in-memory content, avoiding network access or corpus cloning.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

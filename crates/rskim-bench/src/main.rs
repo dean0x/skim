@@ -361,8 +361,13 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
         for mut f in lr.indexed.drain(..) {
             let old_id = f.file_id;
             f.file_id = FileId(global_id);
-            if let Some(content) = lr.contents.remove(&old_id) {
-                all_contents.insert(FileId(global_id), content);
+            let content = lr.contents.remove(&old_id);
+            debug_assert!(
+                content.is_some(),
+                "invariant: every IndexedFile must have a corresponding content entry (old_id={old_id:?})"
+            );
+            if let Some(c) = content {
+                all_contents.insert(FileId(global_id), c);
             }
             all_indexed.push(f);
             global_id = global_id
@@ -406,6 +411,15 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     if total_errors > 0 {
         eprintln!(
             "[tune] {total_errors} evaluation(s) failed and returned 0.0 MRR — results may be unreliable."
+        );
+    }
+
+    // If every evaluation errored out and best MRR is 0.0, the result is
+    // meaningless. Bail rather than silently propagating a bogus config.
+    if tuning_result.best_train_mrr == 0.0 && total_errors > 0 {
+        anyhow::bail!(
+            "tuning produced 0.0 MRR with {total_errors} evaluation error(s); \
+             all coordinate-descent evaluations may have failed — check stderr for details"
         );
     }
 
