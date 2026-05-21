@@ -9,6 +9,9 @@
 //! Extractors use tree-sitter directly (not rskim-core) because the Language
 //! abstraction in rskim-core keeps `to_tree_sitter()` crate-private. We depend
 //! on the grammar crates from the workspace directly.
+//!
+//! The `walk_ast` helper eliminates the parser-setup / tree-walk boilerplate
+//! that was duplicated across all three language modules.
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -30,6 +33,63 @@ pub struct ExtractedSymbol {
     pub field: SearchField,
     /// Byte range of the symbol name within the source.
     pub byte_range: Range<usize>,
+}
+
+/// Walk a tree-sitter AST and collect extracted symbols.
+///
+/// Handles: parser creation, language setup, parsing, root cursor, and recursive
+/// traversal. Language modules provide only the node-level visitor logic.
+///
+/// Returns an empty `Vec` if the parser cannot be configured or the content
+/// cannot be parsed.
+pub(crate) fn walk_ast<F>(
+    content: &str,
+    ts_language: tree_sitter::Language,
+    mut visit: F,
+) -> Vec<ExtractedSymbol>
+where
+    F: FnMut(tree_sitter::Node<'_>, &[u8], &mut Vec<ExtractedSymbol>),
+{
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&ts_language).is_err() {
+        return vec![];
+    }
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return vec![],
+    };
+
+    let bytes = content.as_bytes();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut symbols = Vec::new();
+
+    walk_nodes(root, &mut cursor, bytes, &mut symbols, &mut visit);
+    symbols
+}
+
+/// Recursive node visitor used by `walk_ast`.
+fn walk_nodes<F>(
+    node: tree_sitter::Node<'_>,
+    cursor: &mut tree_sitter::TreeCursor<'_>,
+    bytes: &[u8],
+    symbols: &mut Vec<ExtractedSymbol>,
+    visit: &mut F,
+) where
+    F: FnMut(tree_sitter::Node<'_>, &[u8], &mut Vec<ExtractedSymbol>),
+{
+    visit(node, bytes, symbols);
+
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            walk_nodes(child, cursor, bytes, symbols, visit);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        cursor.goto_parent();
+    }
 }
 
 /// Dispatch to the correct language extractor.

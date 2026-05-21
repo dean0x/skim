@@ -14,75 +14,43 @@ use super::ExtractedSymbol;
 
 /// Extract named symbols from Go source using tree-sitter.
 pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
-    let mut parser = tree_sitter::Parser::new();
-    let lang: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
-    if parser.set_language(&lang).is_err() {
-        return vec![];
-    }
-
-    let tree = match parser.parse(content, None) {
-        Some(t) => t,
-        None => return vec![],
-    };
-
-    let bytes = content.as_bytes();
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    let mut symbols = Vec::new();
-
-    walk_node(root, &mut cursor, bytes, path, &mut symbols);
-    symbols
-}
-
-fn walk_node(
-    node: tree_sitter::Node<'_>,
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    bytes: &[u8],
-    path: &Path,
-    symbols: &mut Vec<ExtractedSymbol>,
-) {
-    match node.kind() {
-        "function_declaration" | "method_declaration" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(name) = name_node.utf8_text(bytes)
-            {
-                symbols.push(ExtractedSymbol {
-                    name: name.to_string(),
-                    file_path: path.to_path_buf(),
-                    field: SearchField::FunctionSignature,
-                    byte_range: name_node.byte_range(),
-                });
+    let path = path.to_path_buf();
+    super::walk_ast(
+        content,
+        tree_sitter_go::LANGUAGE.into(),
+        move |node, bytes, symbols| {
+            match node.kind() {
+                "function_declaration" | "method_declaration" => {
+                    if let Some(name_node) = node.child_by_field_name("name")
+                        && let Ok(name) = name_node.utf8_text(bytes)
+                    {
+                        symbols.push(ExtractedSymbol {
+                            name: name.to_string(),
+                            file_path: path.clone(),
+                            field: SearchField::FunctionSignature,
+                            byte_range: name_node.byte_range(),
+                        });
+                    }
+                }
+                "type_declaration" => {
+                    // type_declaration contains one or more type_spec children
+                    extract_type_specs(node, bytes, &path, symbols);
+                }
+                "import_spec" => {
+                    // Extract last segment of the import path string
+                    if let Some(seg) = extract_import_path_last_segment(node, bytes) {
+                        symbols.push(ExtractedSymbol {
+                            name: seg.0,
+                            file_path: path.clone(),
+                            field: SearchField::ImportExport,
+                            byte_range: seg.1,
+                        });
+                    }
+                }
+                _ => {}
             }
-        }
-        "type_declaration" => {
-            // type_declaration contains one or more type_spec children
-            extract_type_specs(node, bytes, path, symbols);
-        }
-        "import_spec" => {
-            // Extract last segment of the import path string
-            if let Some(seg) = extract_import_path_last_segment(node, bytes) {
-                symbols.push(ExtractedSymbol {
-                    name: seg.0,
-                    file_path: path.to_path_buf(),
-                    field: SearchField::ImportExport,
-                    byte_range: seg.1,
-                });
-            }
-        }
-        _ => {}
-    }
-
-    // Recurse into children
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            walk_node(child, cursor, bytes, path, symbols);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-        cursor.goto_parent();
-    }
+        },
+    )
 }
 
 /// Extract type names from `type_declaration` → `type_spec` children.

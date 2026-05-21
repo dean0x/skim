@@ -159,6 +159,63 @@ fn open_corpus(
     Ok((corpus, Box::new(source)))
 }
 
+/// Pre-loaded files from a single repository.
+struct LoadedRepo {
+    indexed: Vec<IndexedFile>,
+    contents: HashMap<FileId, String>,
+    repo_url: String,
+}
+
+/// Fetch, sort, and assign FileIds to all files from a repository.
+///
+/// IDs are assigned sequentially starting at `id_offset`.
+/// Returns the loaded repo and the next available ID.
+///
+/// # Errors
+///
+/// Returns an error if fetching files fails or if the number of files
+/// exceeds `u32::MAX`.
+fn load_repo_files(
+    source: &dyn FileSource,
+    repo_entry: &rskim_research::config::RepoEntry,
+    id_offset: u32,
+) -> anyhow::Result<(LoadedRepo, u32)> {
+    let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
+
+    let mut source_files = source
+        .fetch_files(repo_entry)
+        .with_context(|| format!("fetching files for {repo_name}"))?;
+
+    // Sort by path for determinism (AC24)
+    source_files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut indexed = Vec::with_capacity(source_files.len());
+    let mut contents = HashMap::with_capacity(source_files.len());
+    let mut next_id = id_offset;
+
+    for f in source_files {
+        let fid = FileId(next_id);
+        next_id = next_id
+            .checked_add(1)
+            .context("FileId overflow: too many files")?;
+        indexed.push(IndexedFile {
+            file_id: fid,
+            path: f.path,
+            language: f.language,
+        });
+        contents.insert(fid, f.content);
+    }
+
+    Ok((
+        LoadedRepo {
+            indexed,
+            contents,
+            repo_url: repo_entry.url.clone(),
+        },
+        next_id,
+    ))
+}
+
 fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
     let (corpus, source) = open_corpus(args.corpus_config, &args.corpus_dir)?;
 
@@ -189,37 +246,17 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
 
         eprintln!("Benchmarking repo: {repo_name}");
 
-        let source_files = source
-            .fetch_files(repo_entry)
-            .with_context(|| format!("fetching files for {repo_name}"))?;
-
-        // Sort files by path for determinism (AC24)
-        let mut sorted_files = source_files;
-        sorted_files.sort_by(|a, b| a.path.cmp(&b.path));
-
-        let indexed: Vec<IndexedFile> = sorted_files
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let id = u32::try_from(i).context("too many files in repo")?;
-                Ok(IndexedFile {
-                    file_id: FileId(id),
-                    path: f.path.clone(),
-                    language: f.language,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let mut contents: HashMap<FileId, String> = HashMap::new();
-        for (i, f) in sorted_files.iter().enumerate() {
-            let id = u32::try_from(i).context("too many files in repo")?;
-            contents.insert(FileId(id), f.content.clone());
-        }
-
+        let (loaded, _) = load_repo_files(&*source, repo_entry, 0)?;
         let index_dir = tempfile::tempdir().context("creating temp index dir")?;
 
-        let result = run_on_files(&indexed, &contents, &bench_configs, index_dir.path(), &repo_entry.url)
-            .with_context(|| format!("running benchmark on {repo_name}"))?;
+        let result = run_on_files(
+            &loaded.indexed,
+            &loaded.contents,
+            &bench_configs,
+            index_dir.path(),
+            &loaded.repo_url,
+        )
+        .with_context(|| format!("running benchmark on {repo_name}"))?;
         repo_results.push(result);
     }
 
@@ -244,7 +281,7 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
 fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     let (corpus, source) = open_corpus(args.corpus_config, &args.corpus_dir)?;
 
-    // Load all files from all repos for tuning
+    // Load all files from all repos for tuning, assigning globally unique IDs
     let mut all_indexed: Vec<IndexedFile> = Vec::new();
     let mut all_contents: HashMap<FileId, String> = HashMap::new();
     let mut file_id_counter = 0u32;
@@ -253,34 +290,20 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
         let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
         eprintln!("Loading repo: {repo_name}");
 
-        let mut source_files = source
-            .fetch_files(repo_entry)
-            .with_context(|| format!("fetching files for {repo_name}"))?;
-
-        source_files.sort_by(|a, b| a.path.cmp(&b.path));
-
-        for f in source_files {
-            let fid = FileId(file_id_counter);
-            file_id_counter = file_id_counter
-                .checked_add(1)
-                .context("file_id_counter overflow: too many files across all repos")?;
-            all_indexed.push(IndexedFile {
-                file_id: fid,
-                path: f.path.clone(),
-                language: f.language,
-            });
-            all_contents.insert(fid, f.content);
-        }
+        let (loaded, next_id) = load_repo_files(&*source, repo_entry, file_id_counter)?;
+        file_id_counter = next_id;
+        all_indexed.extend(loaded.indexed);
+        all_contents.extend(loaded.contents);
     }
 
     // Build qrel inputs
-    let qrel_inputs: Vec<rskim_bench::qrel::QrelInput> = all_indexed
+    let qrel_inputs: Vec<rskim_bench::qrel::QrelInput<'_>> = all_indexed
         .iter()
         .map(|f| rskim_bench::qrel::QrelInput {
             file_id: f.file_id,
             path: f.path.clone(),
             language: f.language,
-            content: all_contents.get(&f.file_id).cloned().unwrap_or_default(),
+            content: all_contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or_default(),
         })
         .collect();
 
@@ -431,25 +454,18 @@ fn run_qrels(args: QrelsArgs) -> anyhow::Result<()> {
 
         eprintln!("Generating qrels for: {repo_name}");
 
-        let mut source_files = source
-            .fetch_files(repo_entry)
-            .with_context(|| format!("fetching files for {repo_name}"))?;
+        let (loaded, _) = load_repo_files(&*source, repo_entry, 0)?;
 
-        source_files.sort_by(|a, b| a.path.cmp(&b.path));
-
-        let qrel_inputs: Vec<rskim_bench::qrel::QrelInput> = source_files
+        let qrel_inputs: Vec<rskim_bench::qrel::QrelInput<'_>> = loaded
+            .indexed
             .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let id = u32::try_from(i).context("too many files in repo")?;
-                Ok(rskim_bench::qrel::QrelInput {
-                    file_id: FileId(id),
-                    path: f.path.clone(),
-                    language: f.language,
-                    content: f.content.clone(),
-                })
+            .map(|f| rskim_bench::qrel::QrelInput {
+                file_id: f.file_id,
+                path: f.path.clone(),
+                language: f.language,
+                content: loaded.contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or(""),
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect();
 
         let qrels = rskim_bench::qrel::generate_qrels(&qrel_inputs)
             .with_context(|| format!("generating qrels for {repo_name}"))?;

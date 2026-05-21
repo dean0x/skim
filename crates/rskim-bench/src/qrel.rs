@@ -43,11 +43,11 @@ const MIN_QUERIES: usize = 10;
 
 /// An input file for qrel generation.
 #[derive(Debug)]
-pub struct QrelInput {
+pub struct QrelInput<'a> {
     pub file_id: FileId,
     pub path: PathBuf,
     pub language: rskim_core::Language,
-    pub content: String,
+    pub content: &'a str,
 }
 
 /// Generate relevance judgments from a collection of indexed files.
@@ -59,14 +59,14 @@ pub struct QrelInput {
 ///
 /// Returns an error if fewer than `MIN_QUERIES` qrels are generated after
 /// all filtering and stratification.
-pub fn generate_qrels(files: &[QrelInput]) -> anyhow::Result<Vec<Qrel>> {
+pub fn generate_qrels(files: &[QrelInput<'_>]) -> anyhow::Result<Vec<Qrel>> {
     // Phase 1: Extract all symbols and compute document frequency (DF) in one pass.
     // DF = number of distinct files that define a given name (before deduplication).
     let mut raw_symbols: Vec<(FileId, crate::extract::ExtractedSymbol)> = Vec::new();
     let mut df_map: HashMap<String, HashSet<FileId>> = HashMap::new();
 
     for file in files {
-        let symbols = extract::extract_symbols(&file.path, &file.content, file.language);
+        let symbols = extract::extract_symbols(&file.path, file.content, file.language);
         for sym in symbols {
             let passes_filter =
                 sym.name.len() >= MIN_NAME_LEN && sym.name.chars().any(|c| c.is_alphabetic());
@@ -214,12 +214,12 @@ mod tests {
     use super::*;
     use rskim_core::Language;
 
-    fn make_file(id: u32, lang: Language, content: &str) -> QrelInput {
+    fn make_file<'a>(id: u32, lang: Language, content: &'a str) -> QrelInput<'a> {
         QrelInput {
             file_id: FileId(id),
             path: PathBuf::from(format!("file_{id}.rs")),
             language: lang,
-            content: content.to_string(),
+            content,
         }
     }
 

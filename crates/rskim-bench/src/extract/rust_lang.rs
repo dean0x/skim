@@ -16,97 +16,65 @@ use super::ExtractedSymbol;
 
 /// Extract named symbols from Rust source using tree-sitter.
 pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
-    let mut parser = tree_sitter::Parser::new();
-    let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-    if parser.set_language(&lang).is_err() {
-        return vec![];
-    }
-
-    let tree = match parser.parse(content, None) {
-        Some(t) => t,
-        None => return vec![],
-    };
-
-    let bytes = content.as_bytes();
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    let mut symbols = Vec::new();
-
-    walk_node(root, &mut cursor, bytes, path, &mut symbols);
-    symbols
-}
-
-fn walk_node(
-    node: tree_sitter::Node<'_>,
-    cursor: &mut tree_sitter::TreeCursor<'_>,
-    bytes: &[u8],
-    path: &Path,
-    symbols: &mut Vec<ExtractedSymbol>,
-) {
-    match node.kind() {
-        "function_item" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(name) = name_node.utf8_text(bytes)
-            {
-                symbols.push(ExtractedSymbol {
-                    name: name.to_string(),
-                    file_path: path.to_path_buf(),
-                    field: SearchField::FunctionSignature,
-                    byte_range: name_node.byte_range(),
-                });
+    let path = path.to_path_buf();
+    super::walk_ast(
+        content,
+        tree_sitter_rust::LANGUAGE.into(),
+        move |node, bytes, symbols| {
+            match node.kind() {
+                "function_item" => {
+                    if let Some(name_node) = node.child_by_field_name("name")
+                        && let Ok(name) = name_node.utf8_text(bytes)
+                    {
+                        symbols.push(ExtractedSymbol {
+                            name: name.to_string(),
+                            file_path: path.clone(),
+                            field: SearchField::FunctionSignature,
+                            byte_range: name_node.byte_range(),
+                        });
+                    }
+                }
+                "struct_item" | "enum_item" | "type_item" => {
+                    if let Some(name_node) = node.child_by_field_name("name")
+                        && let Ok(name) = name_node.utf8_text(bytes)
+                    {
+                        symbols.push(ExtractedSymbol {
+                            name: name.to_string(),
+                            file_path: path.clone(),
+                            field: SearchField::TypeDefinition,
+                            byte_range: name_node.byte_range(),
+                        });
+                    }
+                }
+                "use_declaration" => {
+                    // Extract the final segment of the use path (the imported name)
+                    if let Some(segment) = find_last_identifier(node, bytes) {
+                        symbols.push(ExtractedSymbol {
+                            name: segment.0,
+                            file_path: path.clone(),
+                            field: SearchField::ImportExport,
+                            byte_range: segment.1,
+                        });
+                    }
+                }
+                "impl_item" => {
+                    // Extract the type being implemented (if it's a simple identifier)
+                    if let Some(type_node) = node.child_by_field_name("type")
+                        && type_node.kind() == "type_identifier"
+                        && let Ok(name) = type_node.utf8_text(bytes)
+                    {
+                        symbols.push(ExtractedSymbol {
+                            name: name.to_string(),
+                            file_path: path.clone(),
+                            field: SearchField::SymbolName,
+                            byte_range: type_node.byte_range(),
+                        });
+                    }
+                }
+                _ => {}
             }
-        }
-        "struct_item" | "enum_item" | "type_item" => {
-            if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(name) = name_node.utf8_text(bytes)
-            {
-                symbols.push(ExtractedSymbol {
-                    name: name.to_string(),
-                    file_path: path.to_path_buf(),
-                    field: SearchField::TypeDefinition,
-                    byte_range: name_node.byte_range(),
-                });
-            }
-        }
-        "use_declaration" => {
-            // Extract the final segment of the use path (the imported name)
-            if let Some(segment) = find_last_identifier(node, bytes) {
-                symbols.push(ExtractedSymbol {
-                    name: segment.0,
-                    file_path: path.to_path_buf(),
-                    field: SearchField::ImportExport,
-                    byte_range: segment.1,
-                });
-            }
-        }
-        "impl_item" => {
-            // Extract the type being implemented (if it's a simple identifier)
-            if let Some(type_node) = node.child_by_field_name("type")
-                && type_node.kind() == "type_identifier"
-                && let Ok(name) = type_node.utf8_text(bytes)
-            {
-                symbols.push(ExtractedSymbol {
-                    name: name.to_string(),
-                    file_path: path.to_path_buf(),
-                    field: SearchField::SymbolName,
-                    byte_range: type_node.byte_range(),
-                });
-            }
-        }
-        _ => {}
-    }
-
-    // Recurse into children
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            walk_node(child, cursor, bytes, path, symbols);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-        cursor.goto_parent();
-    }
+        },
+    )
 }
 
 /// Find the last meaningful identifier in a use path.

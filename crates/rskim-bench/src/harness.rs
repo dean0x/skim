@@ -43,16 +43,13 @@ pub fn run_on_files(
     repo_url: &str,
 ) -> anyhow::Result<RepoBenchResult> {
     // Build qrel input list from indexed files
-    let qrel_inputs: Vec<QrelInput> = files
+    let qrel_inputs: Vec<QrelInput<'_>> = files
         .iter()
-        .map(|f| {
-            let content = contents.get(&f.file_id).cloned().unwrap_or_default();
-            QrelInput {
-                file_id: f.file_id,
-                path: f.path.clone(),
-                language: f.language,
-                content,
-            }
+        .map(|f| QrelInput {
+            file_id: f.file_id,
+            path: f.path.clone(),
+            language: f.language,
+            content: contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or(""),
         })
         .collect();
 
