@@ -13,10 +13,7 @@ use crate::types::{BenchResult, ConfigMetrics, TuningResult};
 ///
 /// Returns an error if serialisation fails (should not happen in practice
 /// with the types used here).
-pub fn to_json(
-    result: &BenchResult,
-    tuning: Option<&TuningResult>,
-) -> anyhow::Result<String> {
+pub fn to_json(result: &BenchResult, tuning: Option<&TuningResult>) -> anyhow::Result<String> {
     let mut obj = serde_json::to_value(result)?;
 
     if let Some(t) = tuning {

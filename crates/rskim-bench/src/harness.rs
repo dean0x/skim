@@ -156,15 +156,12 @@ pub fn evaluate_split(
     }
 
     let n = qrels.len() as f64;
-    let mrr_val = mrr(&rrs);
-    let p_at_5 = p_at_5_sum / n;
-    let p_at_10 = p_at_10_sum / n;
 
     Ok(ConfigMetrics {
         config_name: config_name.to_string(),
-        mrr: mrr_val,
-        precision_at_5: p_at_5,
-        precision_at_10: p_at_10,
+        mrr: mrr(&rrs),
+        precision_at_5: p_at_5_sum / n,
+        precision_at_10: p_at_10_sum / n,
         query_count: qrels.len(),
         found_at_rank_1,
     })

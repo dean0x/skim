@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -316,15 +318,14 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     // Error counter shared across closure invocations. coordinate_descent requires an f64
     // return value (0.0 signals a failed evaluation), so errors are visible on stderr rather
     // than propagated. We cap logging at the first 5 errors to avoid flooding output.
-    use std::sync::atomic::{AtomicU32, Ordering};
-    let eval_error_count = std::sync::Arc::new(AtomicU32::new(0));
-    let eval_error_count_clone = eval_error_count.clone();
+    let eval_error_count = Arc::new(AtomicU32::new(0));
+    let counter = eval_error_count.clone();
 
     let tuning_result = coordinate_descent(None, move |cfg: rskim_search::BM25FConfig| {
         let reader = match rskim_search::NgramIndexReader::open_with_config(&idx_path, cfg) {
             Ok(r) => r,
             Err(e) => {
-                let n = eval_error_count_clone.fetch_add(1, Ordering::Relaxed);
+                let n = counter.fetch_add(1, Ordering::Relaxed);
                 if n < 5 {
                     eprintln!("[tune] index open failed (error #{n}): {e:#}");
                 }
@@ -334,7 +335,7 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
         match rskim_bench::harness::evaluate_split(&reader, &train_qrels, "tuning") {
             Ok(metrics) => metrics.mrr,
             Err(e) => {
-                let n = eval_error_count_clone.fetch_add(1, Ordering::Relaxed);
+                let n = counter.fetch_add(1, Ordering::Relaxed);
                 if n < 5 {
                     eprintln!("[tune] evaluate_split failed (error #{n}): {e:#}");
                 }

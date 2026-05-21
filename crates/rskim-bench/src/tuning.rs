@@ -15,6 +15,7 @@
 //! The evaluator is injected as a closure so tests can use mock data without
 //! network access.
 
+use anyhow::Context;
 use rskim_search::{BM25FConfig, FIELD_COUNT};
 
 use crate::types::{ConvergenceStep, TuningResult};
@@ -160,8 +161,6 @@ where
 /// Returns an error if the reconstructed config fails validation (shouldn't
 /// happen with well-formed tuning results).
 pub fn result_to_config(result: &TuningResult) -> anyhow::Result<BM25FConfig> {
-    use anyhow::Context;
-
     let cfg = BM25FConfig {
         k1: result.best_k1,
         field_boosts: result.best_field_boosts,
@@ -282,7 +281,8 @@ mod tests {
     fn custom_initial_config_is_used() {
         // Start from a config where k1 is already optimal (1.5)
         // → no k1 improvement step should be needed
-        let initial = crate::configs::tuned_8field(1.5, [1.0; FIELD_COUNT], [0.75; FIELD_COUNT]).unwrap();
+        let initial =
+            crate::configs::tuned_8field(1.5, [1.0; FIELD_COUNT], [0.75; FIELD_COUNT]).unwrap();
         let result = coordinate_descent(Some(initial), mock_evaluator);
         // k1 should stay at 1.5 since it's already optimal
         assert!(

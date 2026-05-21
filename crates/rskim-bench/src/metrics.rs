@@ -49,7 +49,10 @@ pub fn mrr(rrs: &[f64]) -> f64 {
         return 0.0;
     }
     let result = rrs.iter().sum::<f64>() / rrs.len() as f64;
-    debug_assert!(result.is_finite(), "MRR must be finite; check input rrs for NaN/Inf");
+    debug_assert!(
+        result.is_finite(),
+        "MRR must be finite; check input rrs for NaN/Inf"
+    );
     result
 }
 

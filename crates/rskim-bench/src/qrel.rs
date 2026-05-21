@@ -75,34 +75,30 @@ pub fn generate_qrels(files: &[QrelInput]) -> anyhow::Result<Vec<Qrel>> {
                     .entry(sym.name.clone())
                     .or_default()
                     .insert(file.file_id);
+                raw_symbols.push((file.file_id, sym));
             }
-            raw_symbols.push((file.file_id, sym));
         }
     }
 
-    // Phase 2: Filter — name length >= MIN_NAME_LEN, at least one alpha char
-    let filtered: Vec<(FileId, crate::extract::ExtractedSymbol)> = raw_symbols
-        .into_iter()
-        .filter(|(_, sym)| {
-            sym.name.len() >= MIN_NAME_LEN && sym.name.chars().any(|c| c.is_alphabetic())
-        })
-        .collect();
+    // Phase 2 (implicit): filter was applied inline above; raw_symbols contains
+    // only symbols that passed name-length and alphabetic checks.
 
     // Phase 3: Deduplicate — first occurrence of each name wins
     let mut seen_names: HashSet<String> = HashSet::new();
-    let deduped: Vec<(FileId, crate::extract::ExtractedSymbol)> = filtered
+    let deduped: Vec<(FileId, crate::extract::ExtractedSymbol)> = raw_symbols
         .into_iter()
         .filter(|(_, sym)| seen_names.insert(sym.name.clone()))
         .collect();
 
-    // Phase 4: Apply DF filter to deduped candidates
+    // Phase 4: Apply DF filter to deduped candidates.
+    // Every name in deduped is guaranteed to be in df_map (built in Phase 1),
+    // so the default branch is unreachable in practice.
     let df_filtered: Vec<(FileId, crate::extract::ExtractedSymbol)> = deduped
         .into_iter()
         .filter(|(_, sym)| {
             df_map
                 .get(&sym.name)
-                .map(|ids| ids.len() <= MAX_DF)
-                .unwrap_or(true)
+                .is_none_or(|ids| ids.len() <= MAX_DF)
         })
         .collect();
 
