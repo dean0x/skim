@@ -5,7 +5,8 @@
 //! - `class_definition`   → class name    → TypeDefinition
 //! - `import_from_statement` → imported names → ImportExport
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rskim_search::SearchField;
 
@@ -13,7 +14,7 @@ use super::ExtractedSymbol;
 
 /// Extract named symbols from Python source using tree-sitter.
 pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
-    let path = path.to_path_buf();
+    let path = Arc::new(path.to_path_buf());
     super::walk_ast(
         content,
         tree_sitter_python::LANGUAGE.into(),
@@ -25,7 +26,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                     {
                         symbols.push(ExtractedSymbol {
                             name: name.to_string(),
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::FunctionSignature,
                             byte_range: name_node.byte_range(),
                         });
@@ -37,7 +38,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                     {
                         symbols.push(ExtractedSymbol {
                             name: name.to_string(),
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::TypeDefinition,
                             byte_range: name_node.byte_range(),
                         });
@@ -45,7 +46,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                 }
                 "import_from_statement" => {
                     // Extract all `name` child nodes (the imported names)
-                    extract_import_names(node, bytes, &path, symbols);
+                    extract_import_names(node, bytes, Arc::clone(&path), symbols);
                 }
                 _ => {}
             }
@@ -59,7 +60,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
 fn extract_import_names(
     node: tree_sitter::Node<'_>,
     bytes: &[u8],
-    path: &Path,
+    path: Arc<PathBuf>,
     symbols: &mut Vec<ExtractedSymbol>,
 ) {
     let child_count = node.child_count();
@@ -74,7 +75,7 @@ fn extract_import_names(
                 {
                     symbols.push(ExtractedSymbol {
                         name: name.to_string(),
-                        file_path: path.to_path_buf(),
+                        file_path: Arc::clone(&path),
                         field: SearchField::ImportExport,
                         byte_range: last.byte_range(),
                     });
@@ -86,7 +87,7 @@ fn extract_import_names(
                 {
                     symbols.push(ExtractedSymbol {
                         name: name.to_string(),
-                        file_path: path.to_path_buf(),
+                        file_path: Arc::clone(&path),
                         field: SearchField::ImportExport,
                         byte_range: alias.byte_range(),
                     });
@@ -111,7 +112,7 @@ fn last_named_child(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code -- unwrap acceptable
 mod tests {
     use std::path::PathBuf;
 

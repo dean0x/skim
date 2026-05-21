@@ -6,7 +6,8 @@
 //! - `type_declaration`      → type spec name → TypeDefinition
 //! - `import_spec`           → last path segment → ImportExport
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rskim_search::SearchField;
 
@@ -14,7 +15,7 @@ use super::ExtractedSymbol;
 
 /// Extract named symbols from Go source using tree-sitter.
 pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
-    let path = path.to_path_buf();
+    let path = Arc::new(path.to_path_buf());
     super::walk_ast(
         content,
         tree_sitter_go::LANGUAGE.into(),
@@ -26,7 +27,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                     {
                         symbols.push(ExtractedSymbol {
                             name: name.to_string(),
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::FunctionSignature,
                             byte_range: name_node.byte_range(),
                         });
@@ -34,14 +35,14 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                 }
                 "type_declaration" => {
                     // type_declaration contains one or more type_spec children
-                    extract_type_specs(node, bytes, &path, symbols);
+                    extract_type_specs(node, bytes, Arc::clone(&path), symbols);
                 }
                 "import_spec" => {
                     // Extract last segment of the import path string
                     if let Some(seg) = extract_import_path_last_segment(node, bytes) {
                         symbols.push(ExtractedSymbol {
                             name: seg.0,
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::ImportExport,
                             byte_range: seg.1,
                         });
@@ -57,7 +58,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
 fn extract_type_specs(
     node: tree_sitter::Node<'_>,
     bytes: &[u8],
-    path: &Path,
+    path: Arc<PathBuf>,
     symbols: &mut Vec<ExtractedSymbol>,
 ) {
     let child_count = node.named_child_count();
@@ -69,7 +70,7 @@ fn extract_type_specs(
         {
             symbols.push(ExtractedSymbol {
                 name: name.to_string(),
-                file_path: path.to_path_buf(),
+                file_path: Arc::clone(&path),
                 field: SearchField::TypeDefinition,
                 byte_range: name_node.byte_range(),
             });
@@ -106,7 +107,7 @@ fn extract_import_path_last_segment(
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code -- unwrap acceptable
 mod tests {
     use std::path::PathBuf;
 

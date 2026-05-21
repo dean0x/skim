@@ -9,6 +9,7 @@
 //! - `impl_item`     → type name (if simple identifier) → SymbolName
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rskim_search::SearchField;
 
@@ -16,7 +17,7 @@ use super::ExtractedSymbol;
 
 /// Extract named symbols from Rust source using tree-sitter.
 pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
-    let path = path.to_path_buf();
+    let path = Arc::new(path.to_path_buf());
     super::walk_ast(
         content,
         tree_sitter_rust::LANGUAGE.into(),
@@ -28,7 +29,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                     {
                         symbols.push(ExtractedSymbol {
                             name: name.to_string(),
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::FunctionSignature,
                             byte_range: name_node.byte_range(),
                         });
@@ -40,7 +41,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                     {
                         symbols.push(ExtractedSymbol {
                             name: name.to_string(),
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::TypeDefinition,
                             byte_range: name_node.byte_range(),
                         });
@@ -51,7 +52,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                     if let Some(segment) = find_last_identifier(node, bytes) {
                         symbols.push(ExtractedSymbol {
                             name: segment.0,
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::ImportExport,
                             byte_range: segment.1,
                         });
@@ -65,7 +66,7 @@ pub fn extract(path: &Path, content: &str) -> Vec<ExtractedSymbol> {
                     {
                         symbols.push(ExtractedSymbol {
                             name: name.to_string(),
-                            file_path: path.clone(),
+                            file_path: Arc::clone(&path),
                             field: SearchField::SymbolName,
                             byte_range: type_node.byte_range(),
                         });
@@ -119,7 +120,7 @@ fn find_last_identifier(
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code -- unwrap acceptable
 mod tests {
     use std::path::PathBuf;
 

@@ -15,6 +15,7 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rskim_search::SearchField;
 
@@ -28,7 +29,7 @@ pub struct ExtractedSymbol {
     /// The symbol name (e.g. function name, type name, import path segment).
     pub name: String,
     /// Path of the file this symbol was extracted from.
-    pub file_path: PathBuf,
+    pub file_path: Arc<PathBuf>,
     /// The search field category for this symbol.
     pub field: SearchField,
     /// Byte range of the symbol name within the source.
@@ -42,7 +43,7 @@ pub struct ExtractedSymbol {
 /// of allocating a new one per call.
 ///
 /// Returns an empty `Vec` if the content cannot be parsed.
-pub(crate) fn walk_ast_with_parser<F>(
+fn walk_ast_with_parser<F>(
     parser: &mut tree_sitter::Parser,
     content: &str,
     mut visit: F,
@@ -60,7 +61,7 @@ where
     let mut cursor = root.walk();
     let mut symbols = Vec::new();
 
-    walk_nodes(root, &mut cursor, bytes, &mut symbols, &mut visit);
+    walk_nodes(root, &mut cursor, bytes, &mut symbols, &mut visit, 0);
     symbols
 }
 
@@ -86,6 +87,10 @@ where
     walk_ast_with_parser(&mut parser, content, visit)
 }
 
+/// Maximum recursion depth for `walk_nodes`. Prevents stack overflow on
+/// pathological or deeply-nested external repo files.
+const MAX_WALK_DEPTH: usize = 256;
+
 /// Recursive node visitor used by `walk_ast`.
 fn walk_nodes<F>(
     node: tree_sitter::Node<'_>,
@@ -93,15 +98,20 @@ fn walk_nodes<F>(
     bytes: &[u8],
     symbols: &mut Vec<ExtractedSymbol>,
     visit: &mut F,
+    depth: usize,
 ) where
     F: FnMut(tree_sitter::Node<'_>, &[u8], &mut Vec<ExtractedSymbol>),
 {
+    if depth > MAX_WALK_DEPTH {
+        return;
+    }
+
     visit(node, bytes, symbols);
 
     if cursor.goto_first_child() {
         loop {
             let child = cursor.node();
-            walk_nodes(child, cursor, bytes, symbols, visit);
+            walk_nodes(child, cursor, bytes, symbols, visit, depth + 1);
             if !cursor.goto_next_sibling() {
                 break;
             }
