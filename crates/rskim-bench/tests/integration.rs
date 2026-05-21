@@ -203,26 +203,45 @@ fn all_configs_produce_results_for_same_query() {
 
 #[test]
 fn file_id_assignment_deterministic_when_sorted() {
-    let paths = vec![
+    // Two different orderings of the same file set.
+    let ordering_a = vec![
+        PathBuf::from("src/c.rs"),
         PathBuf::from("src/a.rs"),
         PathBuf::from("src/b.rs"),
+    ];
+    let ordering_b = vec![
+        PathBuf::from("src/b.rs"),
         PathBuf::from("src/c.rs"),
+        PathBuf::from("src/a.rs"),
     ];
 
-    // Assign FileIds in sorted order twice
-    let run1: Vec<(FileId, PathBuf)> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (FileId(i as u32), p.clone()))
-        .collect();
+    // Mirror the production pattern from main.rs (AC24): sort by path, then
+    // assign FileIds sequentially via enumerate.
+    let assign_ids = |mut paths: Vec<PathBuf>| -> Vec<(PathBuf, FileId)> {
+        paths.sort();
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (p, FileId(i as u32)))
+            .collect()
+    };
 
-    let run2: Vec<(FileId, PathBuf)> = paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (FileId(i as u32), p.clone()))
-        .collect();
+    let run_a = assign_ids(ordering_a);
+    let run_b = assign_ids(ordering_b);
 
-    assert_eq!(run1, run2, "FileId assignment must be deterministic");
+    // (1) IDs must be sequential starting from 0.
+    for (expected_id, (_, fid)) in run_a.iter().enumerate() {
+        assert_eq!(
+            fid.0, expected_id as u32,
+            "FileId at position {expected_id} should equal {expected_id}"
+        );
+    }
+
+    // (2) Both orderings must produce the same (path, FileId) mapping.
+    assert_eq!(
+        run_a, run_b,
+        "FileId assignment must be identical regardless of initial ordering"
+    );
 }
 
 // ============================================================================
@@ -298,16 +317,28 @@ fn full_pipeline_produces_non_zero_metrics() {
 
     let result = run_on_files(&files, &contents, &bench_configs, dir.path()).unwrap();
 
-    // At least one config should find something
+    // At least one config must have processed queries (sanity check that the
+    // pipeline ran at all).
+    let any_nonzero_query_count = result
+        .train_metrics
+        .iter()
+        .chain(result.test_metrics.iter())
+        .any(|m| m.query_count > 0);
+    assert!(
+        any_nonzero_query_count,
+        "at least one config should have query_count > 0 (pipeline must run queries)"
+    );
+
+    // At least one config must return a relevant result (guards against search
+    // returning nothing relevant for any query).
     let any_nonzero_mrr = result
         .train_metrics
         .iter()
         .chain(result.test_metrics.iter())
-        .any(|m| m.mrr > 0.0 || m.query_count > 0);
-
+        .any(|m| m.mrr > 0.0);
     assert!(
         any_nonzero_mrr,
-        "at least one config should have query_count > 0 or non-zero MRR"
+        "at least one config should have MRR > 0.0 (search must find relevant results)"
     );
     assert!(
         result.qrel_count >= 10,
