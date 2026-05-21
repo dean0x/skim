@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
+use rayon::prelude::*;
 
 use rskim_bench::{
     configs,
@@ -234,35 +235,40 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
         },
     ];
 
-    let mut repo_results = Vec::new();
+    // Filter repos first, then process in parallel
+    let filtered_repos: Vec<_> = corpus
+        .repos
+        .iter()
+        .filter(|repo_entry| {
+            let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
+            args.repos.is_empty()
+                || args.repos.iter().any(|r| repo_name.contains(r.as_str()))
+        })
+        .collect();
 
-    for repo_entry in &corpus.repos {
-        let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
-
-        // Apply repo filter
-        if !args.repos.is_empty() && !args.repos.iter().any(|r| repo_name.contains(r.as_str())) {
-            continue;
-        }
-
-        eprintln!("Benchmarking repo: {repo_name}");
-
-        let (loaded, _) = load_repo_files(&*source, repo_entry, 0)?;
-        let index_dir = tempfile::tempdir().context("creating temp index dir")?;
-
-        let result = run_on_files(
-            &loaded.indexed,
-            &loaded.contents,
-            &bench_configs,
-            index_dir.path(),
-            &loaded.repo_url,
-        )
-        .with_context(|| format!("running benchmark on {repo_name}"))?;
-        repo_results.push(result);
-    }
-
-    if repo_results.is_empty() {
+    if filtered_repos.is_empty() {
         anyhow::bail!("No repos matched. Use --repos to filter, or check corpus config.");
     }
+
+    let repo_results: Vec<rskim_bench::types::RepoBenchResult> = filtered_repos
+        .par_iter()
+        .map(|repo_entry| {
+            let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
+            eprintln!("Benchmarking repo: {repo_name}");
+
+            let (loaded, _) = load_repo_files(&*source, repo_entry, 0)?;
+            let index_dir = tempfile::tempdir().context("creating temp index dir")?;
+
+            run_on_files(
+                &loaded.indexed,
+                &loaded.contents,
+                &bench_configs,
+                index_dir.path(),
+                &loaded.repo_url,
+            )
+            .with_context(|| format!("running benchmark on {repo_name}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let bench_result = aggregate_results(repo_results)?;
 
@@ -336,19 +342,36 @@ fn make_train_qrels(
 fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     let (corpus, source) = open_corpus(args.corpus_config, &args.corpus_dir)?;
 
-    // Load all files from all repos for tuning, assigning globally unique IDs
+    // Load all repos in parallel (file I/O dominates; IDs start at 0 for each repo).
+    let loaded_repos: Vec<LoadedRepo> = corpus
+        .repos
+        .par_iter()
+        .map(|repo_entry| {
+            let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
+            eprintln!("Loading repo: {repo_name}");
+            let (loaded, _) = load_repo_files(&*source, repo_entry, 0)?;
+            Ok(loaded)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // Reassign globally unique IDs sequentially so the combined corpus has
+    // no duplicate FileIds. (IDs were local-to-repo during parallel load.)
     let mut all_indexed: Vec<IndexedFile> = Vec::new();
     let mut all_contents: HashMap<FileId, String> = HashMap::new();
-    let mut file_id_counter = 0u32;
+    let mut global_id = 0u32;
 
-    for repo_entry in &corpus.repos {
-        let repo_name = repo_entry.url.rsplit('/').next().unwrap_or("unknown");
-        eprintln!("Loading repo: {repo_name}");
-
-        let (loaded, next_id) = load_repo_files(&*source, repo_entry, file_id_counter)?;
-        file_id_counter = next_id;
-        all_indexed.extend(loaded.indexed);
-        all_contents.extend(loaded.contents);
+    for mut lr in loaded_repos {
+        for mut f in lr.indexed.drain(..) {
+            let old_id = f.file_id;
+            f.file_id = FileId(global_id);
+            if let Some(content) = lr.contents.remove(&old_id) {
+                all_contents.insert(FileId(global_id), content);
+            }
+            all_indexed.push(f);
+            global_id = global_id
+                .checked_add(1)
+                .context("FileId overflow: too many files across all repos")?;
+        }
     }
 
     // Build index and generate train qrels
