@@ -3,11 +3,11 @@
 //! All configurations are validated at construction time so callers receive a
 //! guaranteed-valid `BM25FConfig` without needing to call `validate()`.
 
-use rskim_search::BM25FConfig;
+use rskim_search::{BM25FConfig, FIELD_COUNT};
 
-// FIELD_COUNT = 8 from rskim_search
-// Field order: TypeDefinition=0, FunctionSignature=1, SymbolName=2, ImportExport=3,
-//              FunctionBody=4, Comment=5, StringLiteral=6, Other=7
+// Field order (SearchField discriminants):
+// TypeDefinition=0, FunctionSignature=1, SymbolName=2, ImportExport=3,
+// FunctionBody=4, Comment=5, StringLiteral=6, Other=7
 
 /// Uniform configuration: all fields equally weighted.
 ///
@@ -17,8 +17,8 @@ use rskim_search::BM25FConfig;
 pub fn uniform() -> BM25FConfig {
     BM25FConfig {
         k1: 1.2,
-        field_boosts: [1.0; 8],
-        field_b: [0.75; 8],
+        field_boosts: [1.0; FIELD_COUNT],
+        field_b: [0.75; FIELD_COUNT],
     }
 }
 
@@ -34,7 +34,7 @@ pub fn sourcegraph_style() -> BM25FConfig {
         // TypeDefinition=0, FunctionSignature=1, SymbolName=2, ImportExport=3
         // FunctionBody=4, Comment=5, StringLiteral=6, Other=7
         field_boosts: [3.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0, 1.0],
-        field_b: [0.75; 8],
+        field_b: [0.75; FIELD_COUNT],
     }
 }
 
@@ -57,8 +57,8 @@ pub fn default_8field() -> BM25FConfig {
 /// - each `b[i]` must be finite and in [0.0, 1.0]
 pub fn tuned_8field(
     k1: f32,
-    boosts: [f32; 8],
-    b: [f32; 8],
+    boosts: [f32; FIELD_COUNT],
+    b: [f32; FIELD_COUNT],
 ) -> Result<BM25FConfig, rskim_search::SearchError> {
     let cfg = BM25FConfig {
         k1,
@@ -86,7 +86,7 @@ pub fn all_named() -> Vec<(&'static str, BM25FConfig)> {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code — unwrap acceptable for test assertions
 mod tests {
     use super::*;
 

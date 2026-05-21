@@ -213,7 +213,7 @@ pub fn validate_qrel_coverage(qrels: &[Qrel], indexed_ids: &HashSet<FileId>) -> 
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
     use rskim_core::Language;

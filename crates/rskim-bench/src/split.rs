@@ -57,7 +57,7 @@ where
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code — unwrap acceptable for test assertions
 mod tests {
     use super::*;
 

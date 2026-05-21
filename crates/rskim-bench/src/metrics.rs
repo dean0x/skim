@@ -48,7 +48,9 @@ pub fn mrr(rrs: &[f64]) -> f64 {
     if rrs.is_empty() {
         return 0.0;
     }
-    rrs.iter().sum::<f64>() / rrs.len() as f64
+    let result = rrs.iter().sum::<f64>() / rrs.len() as f64;
+    debug_assert!(result.is_finite(), "MRR must be finite; check input rrs for NaN/Inf");
+    result
 }
 
 /// Compute Precision@K: fraction of the top-K results that are relevant.
@@ -77,7 +79,7 @@ pub fn precision_at_k(ranked: &[FileId], relevant_id: FileId, k: usize) -> f64 {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code — unwrap acceptable for test assertions
 mod tests {
     use super::*;
 

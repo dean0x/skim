@@ -90,8 +90,8 @@ pub fn to_markdown(result: &BenchResult, tuning: Option<&TuningResult>) -> Strin
             "Other",
         ];
         for (i, name) in field_names.iter().enumerate() {
-            let boost = t.best_field_boosts.get(i).copied().unwrap_or(0.0);
-            let b = t.best_field_b.get(i).copied().unwrap_or(0.0);
+            let boost = t.best_field_boosts[i];
+            let b = t.best_field_b[i];
             md.push_str(&format!("| {name} | {boost:.2} | {b:.2} |\n"));
         }
         md.push('\n');
@@ -126,7 +126,7 @@ fn metrics_table(metrics: &[ConfigMetrics]) -> String {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code — unwrap acceptable for test assertions
 mod tests {
     use super::*;
     use crate::types::RepoBenchResult;
@@ -183,8 +183,8 @@ mod tests {
         let result = sample_result();
         let tuning = TuningResult {
             best_k1: 1.5,
-            best_field_boosts: vec![5.0; 8],
-            best_field_b: vec![0.75; 8],
+            best_field_boosts: [5.0; 8],
+            best_field_b: [0.75; 8],
             best_train_mrr: 0.75,
             convergence_history: vec![],
             passes_needed: 2,
@@ -217,8 +217,8 @@ mod tests {
         let result = sample_result();
         let tuning = TuningResult {
             best_k1: 1.5,
-            best_field_boosts: vec![5.0; 8],
-            best_field_b: vec![0.75; 8],
+            best_field_boosts: [5.0; 8],
+            best_field_b: [0.75; 8],
             best_train_mrr: 0.75,
             convergence_history: vec![crate::types::ConvergenceStep {
                 pass: 1,

@@ -15,7 +15,7 @@
 //! The evaluator is injected as a closure so tests can use mock data without
 //! network access.
 
-use rskim_search::BM25FConfig;
+use rskim_search::{BM25FConfig, FIELD_COUNT};
 
 use crate::types::{ConvergenceStep, TuningResult};
 
@@ -79,7 +79,7 @@ where
         }
 
         // -- Sweep per-field boosts --
-        for field_idx in 0..8 {
+        for field_idx in 0..FIELD_COUNT {
             for &boost_candidate in BOOST_CANDIDATES {
                 let mut new_boosts = current.field_boosts;
                 new_boosts[field_idx] = boost_candidate;
@@ -145,8 +145,8 @@ where
 
     TuningResult {
         best_k1: current.k1,
-        best_field_boosts: current.field_boosts.to_vec(),
-        best_field_b: current.field_b.to_vec(),
+        best_field_boosts: current.field_boosts,
+        best_field_b: current.field_b,
         best_train_mrr: current_mrr,
         convergence_history: history,
         passes_needed,
@@ -162,19 +162,10 @@ where
 pub fn result_to_config(result: &TuningResult) -> anyhow::Result<BM25FConfig> {
     use anyhow::Context;
 
-    let mut boosts = [0.0f32; 8];
-    let mut b = [0.0f32; 8];
-    for (i, &v) in result.best_field_boosts.iter().take(8).enumerate() {
-        boosts[i] = v;
-    }
-    for (i, &v) in result.best_field_b.iter().take(8).enumerate() {
-        b[i] = v;
-    }
-
     let cfg = BM25FConfig {
         k1: result.best_k1,
-        field_boosts: boosts,
-        field_b: b,
+        field_boosts: result.best_field_boosts,
+        field_b: result.best_field_b,
     };
     cfg.validate()
         .context("tuning result produced invalid config")?;
@@ -182,8 +173,8 @@ pub fn result_to_config(result: &TuningResult) -> anyhow::Result<BM25FConfig> {
 }
 
 /// Return the indices of the two fields with the highest boosts.
-fn top_two_boost_fields(boosts: &[f32; 8]) -> [usize; 2] {
-    let mut indexed: [(f32, usize); 8] = std::array::from_fn(|i| (boosts[i], i));
+fn top_two_boost_fields(boosts: &[f32; FIELD_COUNT]) -> [usize; 2] {
+    let mut indexed: [(f32, usize); FIELD_COUNT] = std::array::from_fn(|i| (boosts[i], i));
     // Sort descending by boost value
     indexed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     [indexed[0].1, indexed[1].1]
@@ -194,7 +185,7 @@ fn top_two_boost_fields(boosts: &[f32; 8]) -> [usize; 2] {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used)] // test code — unwrap acceptable for test assertions
 mod tests {
     use super::*;
 

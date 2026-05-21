@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use rskim_search::{FileId, SearchField};
+use rskim_search::{FIELD_COUNT, FileId, SearchField};
 
 /// A single relevance judgment: the file that is the ground-truth for a query.
 ///
@@ -18,19 +18,6 @@ pub struct Qrel {
     pub relevant_file_id: FileId,
     /// The field type that produced this symbol.
     pub field: SearchField,
-}
-
-/// Per-query evaluation result for a single configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvalResult {
-    /// Query text.
-    pub query: String,
-    /// Reciprocal rank for this query (0.0 if not found in top results).
-    pub reciprocal_rank: f64,
-    /// Whether the relevant file was found in the top-K results.
-    pub found_in_top_k: bool,
-    /// Rank of the first relevant result (1-indexed; 0 means not found).
-    pub rank: usize,
 }
 
 /// Metrics for a single configuration on a single corpus.
@@ -94,8 +81,10 @@ pub struct ConvergenceStep {
 pub struct TuningResult {
     /// Best BM25F configuration found.
     pub best_k1: f32,
-    pub best_field_boosts: Vec<f32>,
-    pub best_field_b: Vec<f32>,
+    /// Per-field boost weights, one per `SearchField` variant (length == `FIELD_COUNT`).
+    pub best_field_boosts: [f32; FIELD_COUNT],
+    /// Per-field b parameters, one per `SearchField` variant (length == `FIELD_COUNT`).
+    pub best_field_b: [f32; FIELD_COUNT],
     /// MRR achieved by the best config on the train split.
     pub best_train_mrr: f64,
     /// Convergence history.
