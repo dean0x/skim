@@ -203,7 +203,10 @@ pub fn result_to_config(result: &TuningResult) -> anyhow::Result<BM25FConfig> {
 }
 
 /// Compile-time guard: top_two_boost_fields unconditionally indexes [0] and [1].
-const _: () = assert!(FIELD_COUNT >= 2, "FIELD_COUNT must be >= 2 for top_two_boost_fields");
+const _: () = assert!(
+    FIELD_COUNT >= 2,
+    "FIELD_COUNT must be >= 2 for top_two_boost_fields"
+);
 
 /// Return the indices of the two fields with the highest boosts.
 fn top_two_boost_fields(boosts: &[f32; FIELD_COUNT]) -> [usize; 2] {
