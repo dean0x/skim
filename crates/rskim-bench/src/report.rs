@@ -5,6 +5,8 @@
 //! - Aggregate (macro-average) train + test metrics
 //! - Tuning convergence trace (if provided)
 
+use rskim_search::SearchField;
+
 use crate::types::{BenchResult, ConfigMetrics, TuningResult};
 
 /// Serialise a `BenchResult` (and optional tuning result) to a JSON string.
@@ -24,6 +26,56 @@ pub fn to_json(result: &BenchResult, tuning: Option<&TuningResult>) -> anyhow::R
     }
 
     Ok(serde_json::to_string_pretty(&obj)?)
+}
+
+/// Map a `SearchField` to its PascalCase display name.
+fn field_display_name(field: SearchField) -> &'static str {
+    match field {
+        SearchField::TypeDefinition => "TypeDefinition",
+        SearchField::FunctionSignature => "FunctionSignature",
+        SearchField::SymbolName => "SymbolName",
+        SearchField::ImportExport => "ImportExport",
+        SearchField::FunctionBody => "FunctionBody",
+        SearchField::Comment => "Comment",
+        SearchField::StringLiteral => "StringLiteral",
+        SearchField::Other => "Other",
+    }
+}
+
+/// Render the tuning summary, convergence trace, and field boosts table.
+fn tuning_section(t: &TuningResult) -> String {
+    let mut md = String::new();
+
+    md.push_str("## Tuning Results\n\n");
+    md.push_str(&format!("- Best k1: {:.3}\n", t.best_k1));
+    md.push_str(&format!("- Best train MRR: {:.4}\n", t.best_train_mrr));
+    md.push_str(&format!("- Passes needed: {}\n\n", t.passes_needed));
+
+    if !t.convergence_history.is_empty() {
+        md.push_str("### Convergence Trace\n\n");
+        md.push_str("| Pass | Parameter | From | To | MRR Improvement |\n");
+        md.push_str("|------|-----------|------|----|-----------------|\n");
+        for step in &t.convergence_history {
+            md.push_str(&format!(
+                "| {} | {} | {:.4} | {:.4} | +{:.6} |\n",
+                step.pass, step.parameter, step.from_value, step.to_value, step.mrr_improvement,
+            ));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("### Best Field Boosts\n\n");
+    md.push_str("| Field | Boost | b |\n");
+    md.push_str("|-------|-------|---|\n");
+    for (i, field) in SearchField::ALL.iter().enumerate() {
+        let name = field_display_name(*field);
+        let boost = t.best_field_boosts[i];
+        let b = t.best_field_b[i];
+        md.push_str(&format!("| {name} | {boost:.2} | {b:.2} |\n"));
+    }
+    md.push('\n');
+
+    md
 }
 
 /// Render a `BenchResult` as a Markdown report string.
@@ -55,43 +107,7 @@ pub fn to_markdown(result: &BenchResult, tuning: Option<&TuningResult>) -> Strin
 
     // Tuning convergence trace
     if let Some(t) = tuning {
-        md.push_str("## Tuning Results\n\n");
-        md.push_str(&format!("- Best k1: {:.3}\n", t.best_k1));
-        md.push_str(&format!("- Best train MRR: {:.4}\n", t.best_train_mrr));
-        md.push_str(&format!("- Passes needed: {}\n\n", t.passes_needed));
-
-        if !t.convergence_history.is_empty() {
-            md.push_str("### Convergence Trace\n\n");
-            md.push_str("| Pass | Parameter | From | To | MRR Improvement |\n");
-            md.push_str("|------|-----------|------|----|-----------------|\n");
-            for step in &t.convergence_history {
-                md.push_str(&format!(
-                    "| {} | {} | {:.4} | {:.4} | +{:.6} |\n",
-                    step.pass, step.parameter, step.from_value, step.to_value, step.mrr_improvement,
-                ));
-            }
-            md.push('\n');
-        }
-
-        md.push_str("### Best Field Boosts\n\n");
-        md.push_str("| Field | Boost | b |\n");
-        md.push_str("|-------|-------|---|\n");
-        let field_names = [
-            "TypeDefinition",
-            "FunctionSignature",
-            "SymbolName",
-            "ImportExport",
-            "FunctionBody",
-            "Comment",
-            "StringLiteral",
-            "Other",
-        ];
-        for (i, name) in field_names.iter().enumerate() {
-            let boost = t.best_field_boosts[i];
-            let b = t.best_field_b[i];
-            md.push_str(&format!("| {name} | {boost:.2} | {b:.2} |\n"));
-        }
-        md.push('\n');
+        md.push_str(&tuning_section(t));
     }
 
     md
@@ -127,7 +143,7 @@ fn metrics_table(metrics: &[ConfigMetrics]) -> String {
 mod tests {
     use super::*;
     use crate::types::RepoBenchResult;
-    use rskim_search::FIELD_COUNT;
+    use rskim_search::{FIELD_COUNT, SearchField};
 
     fn sample_result() -> BenchResult {
         let metrics = vec![

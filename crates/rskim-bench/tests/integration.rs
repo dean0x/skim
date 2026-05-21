@@ -173,7 +173,7 @@ fn all_configs_produce_results_for_same_query() {
         })
         .collect();
 
-    let result = run_on_files(&files, &contents, &bench_configs, dir.path()).unwrap();
+    let result = run_on_files(&files, &contents, &bench_configs, dir.path(), "test://repo").unwrap();
 
     // All configs should have the same query count on each split
     let train_counts: Vec<usize> = result.train_metrics.iter().map(|m| m.query_count).collect();
@@ -315,7 +315,7 @@ fn full_pipeline_produces_non_zero_metrics() {
         },
     ];
 
-    let result = run_on_files(&files, &contents, &bench_configs, dir.path()).unwrap();
+    let result = run_on_files(&files, &contents, &bench_configs, dir.path(), "test://repo").unwrap();
 
     // At least one config must have processed queries (sanity check that the
     // pipeline ran at all).
@@ -362,11 +362,9 @@ fn aggregate_results_macro_average() {
         bm25f: configs::uniform(),
     }];
 
-    let mut r1 = run_on_files(&files, &contents, &bench_configs, dir1.path()).unwrap();
-    r1.repo_url = "https://github.com/test/repo1".to_string();
+    let r1 = run_on_files(&files, &contents, &bench_configs, dir1.path(), "https://github.com/test/repo1").unwrap();
 
-    let mut r2 = run_on_files(&files, &contents, &bench_configs, dir2.path()).unwrap();
-    r2.repo_url = "https://github.com/test/repo2".to_string();
+    let r2 = run_on_files(&files, &contents, &bench_configs, dir2.path(), "https://github.com/test/repo2").unwrap();
 
     let aggregated = aggregate_results(vec![r1, r2]);
     assert_eq!(aggregated.repos.len(), 2);

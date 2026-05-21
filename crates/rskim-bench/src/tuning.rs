@@ -35,6 +35,56 @@ const BOOST_CANDIDATES: &[f32] = &[0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]
 /// Candidate b values.
 const B_CANDIDATES: &[f32] = &[0.0, 0.25, 0.5, 0.75, 1.0];
 
+/// Sweep a single BM25F parameter over its candidates, keeping the best.
+///
+/// Updates `current`, `current_mrr`, and `history` in-place when a candidate
+/// improves over the current best.
+///
+/// # Arguments
+/// * `current` — current best config (mutated in-place on improvement)
+/// * `current_mrr` — MRR of current best (mutated in-place on improvement)
+/// * `history` — convergence trace (extended on improvement)
+/// * `pass` — current pass index for trace labelling
+/// * `param_name` — display name for the parameter being swept
+/// * `candidates` — candidate values to try
+/// * `get_value` — extracts the current parameter value from a config
+/// * `make_candidate` — produces a new config with the candidate value applied
+/// * `evaluate` — closure that scores a config and returns MRR
+#[allow(clippy::too_many_arguments)]
+fn sweep_parameter<G>(
+    current: &mut BM25FConfig,
+    current_mrr: &mut f64,
+    history: &mut Vec<ConvergenceStep>,
+    pass: usize,
+    param_name: &str,
+    candidates: &[f32],
+    get_value: impl Fn(&BM25FConfig) -> f32,
+    make_candidate: impl Fn(&BM25FConfig, f32) -> BM25FConfig,
+    evaluate: &mut G,
+) where
+    G: FnMut(BM25FConfig) -> f64,
+{
+    let from_value = get_value(current) as f64;
+    for &val in candidates {
+        let candidate = make_candidate(current, val);
+        if candidate.validate().is_err() {
+            continue;
+        }
+        let candidate_mrr = evaluate(candidate);
+        if candidate_mrr > *current_mrr {
+            history.push(ConvergenceStep {
+                pass,
+                parameter: param_name.to_string(),
+                from_value,
+                to_value: val as f64,
+                mrr_improvement: candidate_mrr - *current_mrr,
+            });
+            *current = candidate;
+            *current_mrr = candidate_mrr;
+        }
+    }
+}
+
 /// Run coordinate descent tuning.
 ///
 /// # Arguments
@@ -57,83 +107,58 @@ where
         let pass_start_mrr = current_mrr;
 
         // -- Sweep k1 --
-        for &k1_candidate in K1_CANDIDATES {
-            let candidate = BM25FConfig {
-                k1: k1_candidate,
-                ..current
-            };
-            if candidate.validate().is_err() {
-                continue;
-            }
-            let candidate_mrr = evaluate(candidate);
-            if candidate_mrr > current_mrr {
-                history.push(ConvergenceStep {
-                    pass,
-                    parameter: "k1".to_string(),
-                    from_value: current.k1 as f64,
-                    to_value: k1_candidate as f64,
-                    mrr_improvement: candidate_mrr - current_mrr,
-                });
-                current = candidate;
-                current_mrr = candidate_mrr;
-            }
-        }
+        sweep_parameter(
+            &mut current,
+            &mut current_mrr,
+            &mut history,
+            pass,
+            "k1",
+            K1_CANDIDATES,
+            |c| c.k1,
+            |c, v| BM25FConfig { k1: v, ..*c },
+            &mut evaluate,
+        );
 
         // -- Sweep per-field boosts --
         for field_idx in 0..FIELD_COUNT {
-            for &boost_candidate in BOOST_CANDIDATES {
-                let mut new_boosts = current.field_boosts;
-                new_boosts[field_idx] = boost_candidate;
-                let candidate = BM25FConfig {
-                    k1: current.k1,
-                    field_boosts: new_boosts,
-                    field_b: current.field_b,
-                };
-                if candidate.validate().is_err() {
-                    continue;
-                }
-                let candidate_mrr = evaluate(candidate);
-                if candidate_mrr > current_mrr {
-                    history.push(ConvergenceStep {
-                        pass,
-                        parameter: format!("boost[{field_idx}]"),
-                        from_value: current.field_boosts[field_idx] as f64,
-                        to_value: boost_candidate as f64,
-                        mrr_improvement: candidate_mrr - current_mrr,
-                    });
-                    current = candidate;
-                    current_mrr = candidate_mrr;
-                }
-            }
+            sweep_parameter(
+                &mut current,
+                &mut current_mrr,
+                &mut history,
+                pass,
+                &format!("boost[{field_idx}]"),
+                BOOST_CANDIDATES,
+                |c| c.field_boosts[field_idx],
+                |c, v| {
+                    let mut boosts = c.field_boosts;
+                    boosts[field_idx] = v;
+                    BM25FConfig {
+                        field_boosts: boosts,
+                        ..*c
+                    }
+                },
+                &mut evaluate,
+            );
         }
 
         // -- Sweep b for top-2 highest-boost fields --
         let top2_fields = top_two_boost_fields(&current.field_boosts);
         for field_idx in top2_fields {
-            for &b_candidate in B_CANDIDATES {
-                let mut new_b = current.field_b;
-                new_b[field_idx] = b_candidate;
-                let candidate = BM25FConfig {
-                    k1: current.k1,
-                    field_boosts: current.field_boosts,
-                    field_b: new_b,
-                };
-                if candidate.validate().is_err() {
-                    continue;
-                }
-                let candidate_mrr = evaluate(candidate);
-                if candidate_mrr > current_mrr {
-                    history.push(ConvergenceStep {
-                        pass,
-                        parameter: format!("b[{field_idx}]"),
-                        from_value: current.field_b[field_idx] as f64,
-                        to_value: b_candidate as f64,
-                        mrr_improvement: candidate_mrr - current_mrr,
-                    });
-                    current = candidate;
-                    current_mrr = candidate_mrr;
-                }
-            }
+            sweep_parameter(
+                &mut current,
+                &mut current_mrr,
+                &mut history,
+                pass,
+                &format!("b[{field_idx}]"),
+                B_CANDIDATES,
+                |c| c.field_b[field_idx],
+                |c, v| {
+                    let mut b = c.field_b;
+                    b[field_idx] = v;
+                    BM25FConfig { field_b: b, ..*c }
+                },
+                &mut evaluate,
+            );
         }
 
         passes_needed = pass;

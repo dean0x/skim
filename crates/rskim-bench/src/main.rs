@@ -143,11 +143,11 @@ fn default_corpus_config() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("corpus.toml"))
 }
 
-/// Load corpus config and prepare the GitCloneSource, creating the corpus dir if absent.
+/// Load corpus config and prepare the file source, creating the corpus dir if absent.
 fn open_corpus(
     corpus_config: Option<PathBuf>,
     corpus_dir: &Path,
-) -> anyhow::Result<(CorpusConfig, GitCloneSource)> {
+) -> anyhow::Result<(CorpusConfig, Box<dyn FileSource>)> {
     let config_path = corpus_config.unwrap_or_else(default_corpus_config);
     let corpus = load_corpus_config(&config_path)
         .with_context(|| format!("loading corpus config from {}", config_path.display()))?;
@@ -156,7 +156,7 @@ fn open_corpus(
     let source = GitCloneSource {
         corpus_dir: corpus_dir.to_path_buf(),
     };
-    Ok((corpus, source))
+    Ok((corpus, Box::new(source)))
 }
 
 fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
@@ -218,9 +218,8 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
 
         let index_dir = tempfile::tempdir().context("creating temp index dir")?;
 
-        let mut result = run_on_files(&indexed, &contents, &bench_configs, index_dir.path())
+        let result = run_on_files(&indexed, &contents, &bench_configs, index_dir.path(), &repo_entry.url)
             .with_context(|| format!("running benchmark on {repo_name}"))?;
-        result.repo_url = repo_entry.url.clone();
         repo_results.push(result);
     }
 
@@ -372,14 +371,14 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     ];
 
     let tune_index_dir = tempfile::tempdir().context("temp dir for final evaluation")?;
-    let mut final_result = run_on_files(
+    let final_result = run_on_files(
         &all_indexed,
         &all_contents,
         &bench_configs,
         tune_index_dir.path(),
+        "aggregate",
     )
     .context("running final evaluation with tuned config")?;
-    final_result.repo_url = "aggregate".to_string();
 
     let bench_result = aggregate_results(vec![final_result]);
 

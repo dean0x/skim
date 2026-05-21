@@ -27,8 +27,10 @@ pub struct BenchConfig {
 ///
 /// # Arguments
 /// * `files` — files with assigned IDs, sorted by path for determinism
+/// * `contents` — map from file ID to file content
 /// * `configs` — named BM25F configurations to compare
 /// * `index_dir` — writable directory for the index files
+/// * `repo_url` — URL of the repo being benchmarked (stored in the result)
 ///
 /// # Errors
 ///
@@ -38,6 +40,7 @@ pub fn run_on_files(
     contents: &HashMap<FileId, String>,
     configs: &[BenchConfig],
     index_dir: &std::path::Path,
+    repo_url: &str,
 ) -> anyhow::Result<RepoBenchResult> {
     // Build qrel input list from indexed files
     let qrel_inputs: Vec<QrelInput> = files
@@ -100,7 +103,7 @@ pub fn run_on_files(
     }
 
     Ok(RepoBenchResult {
-        repo_url: String::new(), // filled in by caller
+        repo_url: repo_url.to_string(),
         train_metrics,
         test_metrics,
         qrel_count: all_qrels.len(),
@@ -289,8 +292,7 @@ pub enum LogLevel { Debug, Info, Warn, Error }
             },
         ];
 
-        let mut result = run_on_files(&files, &contents, &configs, dir.path()).unwrap();
-        result.repo_url = "test://repo".to_string();
+        let result = run_on_files(&files, &contents, &configs, dir.path(), "test://repo").unwrap();
 
         assert_eq!(
             result.train_metrics.len(),
