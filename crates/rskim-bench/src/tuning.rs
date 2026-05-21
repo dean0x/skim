@@ -35,27 +35,34 @@ const BOOST_CANDIDATES: &[f32] = &[0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]
 /// Candidate b values.
 const B_CANDIDATES: &[f32] = &[0.0, 0.25, 0.5, 0.75, 1.0];
 
+/// Mutable sweep state threaded through each `sweep_parameter` call.
+///
+/// Grouping these four fields eliminates the four-argument prefix that
+/// previously caused a clippy `too_many_arguments` warning on `sweep_parameter`.
+struct SweepState {
+    /// Current best configuration; updated in-place when a candidate improves MRR.
+    current: BM25FConfig,
+    /// MRR of the current best; updated in-place on improvement.
+    current_mrr: f64,
+    /// Convergence trace; extended on improvement.
+    history: Vec<ConvergenceStep>,
+    /// Pass index used for trace labelling.
+    pass: usize,
+}
+
 /// Sweep a single BM25F parameter over its candidates, keeping the best.
 ///
-/// Updates `current`, `current_mrr`, and `history` in-place when a candidate
-/// improves over the current best.
+/// Updates `state` in-place when a candidate improves over the current best.
 ///
 /// # Arguments
-/// * `current` — current best config (mutated in-place on improvement)
-/// * `current_mrr` — MRR of current best (mutated in-place on improvement)
-/// * `history` — convergence trace (extended on improvement)
-/// * `pass` — current pass index for trace labelling
+/// * `state` — mutable sweep state (config, MRR, history, pass index)
 /// * `param_name` — display name for the parameter being swept
 /// * `candidates` — candidate values to try
 /// * `get_value` — extracts the current parameter value from a config
 /// * `make_candidate` — produces a new config with the candidate value applied
 /// * `evaluate` — closure that scores a config and returns MRR
-#[allow(clippy::too_many_arguments)]
 fn sweep_parameter<G>(
-    current: &mut BM25FConfig,
-    current_mrr: &mut f64,
-    history: &mut Vec<ConvergenceStep>,
-    pass: usize,
+    state: &mut SweepState,
     param_name: &str,
     candidates: &[f32],
     get_value: impl Fn(&BM25FConfig) -> f32,
@@ -64,23 +71,25 @@ fn sweep_parameter<G>(
 ) where
     G: FnMut(BM25FConfig) -> f64,
 {
-    let from_value = get_value(current) as f64;
     for &val in candidates {
-        let candidate = make_candidate(current, val);
+        let candidate = make_candidate(&state.current, val);
         if candidate.validate().is_err() {
             continue;
         }
         let candidate_mrr = evaluate(candidate);
-        if candidate_mrr > *current_mrr {
-            history.push(ConvergenceStep {
-                pass,
+        if candidate_mrr > state.current_mrr {
+            // Capture from_value here so it reflects the current best at the
+            // moment of improvement, not a stale snapshot from sweep start.
+            let from_value = get_value(&state.current) as f64;
+            state.history.push(ConvergenceStep {
+                pass: state.pass,
                 parameter: param_name.to_string(),
                 from_value,
                 to_value: val as f64,
-                mrr_improvement: candidate_mrr - *current_mrr,
+                mrr_improvement: candidate_mrr - state.current_mrr,
             });
-            *current = candidate;
-            *current_mrr = candidate_mrr;
+            state.current = candidate;
+            state.current_mrr = candidate_mrr;
         }
     }
 }
@@ -98,20 +107,23 @@ pub fn coordinate_descent<F>(initial_config: Option<BM25FConfig>, mut evaluate: 
 where
     F: FnMut(BM25FConfig) -> f64,
 {
-    let mut current = initial_config.unwrap_or_default();
-    let mut current_mrr = evaluate(current);
-    let mut history: Vec<ConvergenceStep> = Vec::new();
+    let initial = initial_config.unwrap_or_default();
+    let initial_mrr = evaluate(initial);
+    let mut state = SweepState {
+        current: initial,
+        current_mrr: initial_mrr,
+        history: Vec::new(),
+        pass: 0,
+    };
     let mut passes_needed = 0;
 
     for pass in 1..=MAX_PASSES {
-        let pass_start_mrr = current_mrr;
+        state.pass = pass;
+        let pass_start_mrr = state.current_mrr;
 
         // -- Sweep k1 --
         sweep_parameter(
-            &mut current,
-            &mut current_mrr,
-            &mut history,
-            pass,
+            &mut state,
             "k1",
             K1_CANDIDATES,
             |c| c.k1,
@@ -122,10 +134,7 @@ where
         // -- Sweep per-field boosts --
         for field_idx in 0..FIELD_COUNT {
             sweep_parameter(
-                &mut current,
-                &mut current_mrr,
-                &mut history,
-                pass,
+                &mut state,
                 &format!("boost[{field_idx}]"),
                 BOOST_CANDIDATES,
                 |c| c.field_boosts[field_idx],
@@ -142,13 +151,10 @@ where
         }
 
         // -- Sweep b for top-2 highest-boost fields --
-        let top2_fields = top_two_boost_fields(&current.field_boosts);
+        let top2_fields = top_two_boost_fields(&state.current.field_boosts);
         for field_idx in top2_fields {
             sweep_parameter(
-                &mut current,
-                &mut current_mrr,
-                &mut history,
-                pass,
+                &mut state,
                 &format!("b[{field_idx}]"),
                 B_CANDIDATES,
                 |c| c.field_b[field_idx],
@@ -163,18 +169,18 @@ where
 
         passes_needed = pass;
 
-        let improvement = current_mrr - pass_start_mrr;
+        let improvement = state.current_mrr - pass_start_mrr;
         if improvement < CONVERGENCE_THRESHOLD {
             break;
         }
     }
 
     TuningResult {
-        best_k1: current.k1,
-        best_field_boosts: current.field_boosts,
-        best_field_b: current.field_b,
-        best_train_mrr: current_mrr,
-        convergence_history: history,
+        best_k1: state.current.k1,
+        best_field_boosts: state.current.field_boosts,
+        best_field_b: state.current.field_b,
+        best_train_mrr: state.current_mrr,
+        convergence_history: state.history,
         passes_needed,
     }
 }
@@ -195,6 +201,9 @@ pub fn result_to_config(result: &TuningResult) -> anyhow::Result<BM25FConfig> {
         .context("tuning result produced invalid config")?;
     Ok(cfg)
 }
+
+/// Compile-time guard: top_two_boost_fields unconditionally indexes [0] and [1].
+const _: () = assert!(FIELD_COUNT >= 2, "FIELD_COUNT must be >= 2 for top_two_boost_fields");
 
 /// Return the indices of the two fields with the highest boosts.
 fn top_two_boost_fields(boosts: &[f32; FIELD_COUNT]) -> [usize; 2] {
