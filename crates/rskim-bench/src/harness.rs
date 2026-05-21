@@ -1,0 +1,473 @@
+//! Benchmark harness — orchestrates clone → index → qrel → eval per repo.
+
+use std::collections::{HashMap, HashSet};
+
+use anyhow::Context;
+
+use rskim_search::{
+    BM25FConfig, FileId, LayerBuilder, NgramIndexBuilder, SearchLayer, SearchQuery,
+};
+
+use crate::metrics::{mrr, precision_at_k, rank_of, reciprocal_rank};
+use crate::qrel::{QrelInput, generate_qrels, validate_qrel_coverage};
+use crate::split::partition;
+use crate::types::{BenchResult, ConfigMetrics, IndexedFile, Qrel, RepoBenchResult};
+
+/// Configuration for a single benchmark run.
+#[derive(Debug)]
+pub struct BenchConfig {
+    pub name: String,
+    pub bm25f: BM25FConfig,
+}
+
+/// Run the full benchmark on pre-loaded files for a single repo.
+///
+/// This is the low-level harness used by both the CLI and integration tests.
+/// The caller is responsible for loading files and assigning `FileId`s.
+///
+/// # Arguments
+/// * `files` — files with assigned IDs, sorted by path for determinism
+/// * `contents` — map from file ID to file content
+/// * `configs` — named BM25F configurations to compare
+/// * `index_dir` — writable directory for the index files
+/// * `repo_url` — URL of the repo being benchmarked (stored in the result)
+///
+/// # Errors
+///
+/// Returns an error if indexing fails or no qrels can be generated.
+pub fn run_on_files(
+    files: &[IndexedFile],
+    contents: &HashMap<FileId, String>,
+    configs: &[BenchConfig],
+    index_dir: &std::path::Path,
+    repo_url: &str,
+) -> anyhow::Result<RepoBenchResult> {
+    // Build qrel input list from indexed files
+    let qrel_inputs: Vec<QrelInput<'_>> = files
+        .iter()
+        .map(|f| QrelInput {
+            file_id: f.file_id,
+            path: f.path.clone(),
+            language: f.language,
+            content: contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or(""),
+        })
+        .collect();
+
+    // Generate qrels
+    let all_qrels = generate_qrels(&qrel_inputs).context("generating qrels")?;
+
+    // Validate coverage
+    let indexed_ids: HashSet<FileId> = files.iter().map(|f| f.file_id).collect();
+    validate_qrel_coverage(&all_qrels, &indexed_ids).context("validating qrel coverage")?;
+
+    // Split into train/test
+    let (train_qrels, test_qrels) = partition_qrels(&all_qrels);
+
+    // Build the base index (using the default config)
+    let mut builder =
+        NgramIndexBuilder::new(index_dir.to_path_buf()).context("creating index builder")?;
+
+    for file in files {
+        let content = contents
+            .get(&file.file_id)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        builder
+            .add_file(file.file_id, content, file.language)
+            .with_context(|| format!("indexing file {:?}", file.path))?;
+    }
+
+    let _base_layer = builder.build().context("building index")?;
+    // Open reader once with the default config; BM25F parameters are overridden
+    // per-query via SearchQuery::bm25f_config (single-reader pattern).
+    let reader = rskim_search::NgramIndexReader::open(index_dir).context("opening index reader")?;
+
+    // Evaluate each config on train and test splits
+    let mut train_metrics = Vec::new();
+    let mut test_metrics = Vec::new();
+
+    for config in configs {
+        let train_m = evaluate_split(&reader, &train_qrels, &config.name, Some(config.bm25f))
+            .with_context(|| format!("evaluating train split for config '{}'", config.name))?;
+        let test_m = evaluate_split(&reader, &test_qrels, &config.name, Some(config.bm25f))
+            .with_context(|| format!("evaluating test split for config '{}'", config.name))?;
+
+        train_metrics.push(train_m);
+        test_metrics.push(test_m);
+    }
+
+    Ok(RepoBenchResult {
+        repo_url: repo_url.to_string(),
+        train_metrics,
+        test_metrics,
+        qrel_count: all_qrels.len(),
+    })
+}
+
+/// Partition qrels into train/test using deterministic split.
+fn partition_qrels(qrels: &[Qrel]) -> (Vec<Qrel>, Vec<Qrel>) {
+    partition(qrels, |q| q.query.as_str())
+}
+
+/// Evaluate a list of qrels against a search layer.
+///
+/// Returns `ConfigMetrics` with MRR, Precision@5, Precision@10.
+///
+/// # Arguments
+/// * `layer` — the index reader to query
+/// * `qrels` — relevance judgments to evaluate
+/// * `config_name` — name recorded in the output metrics
+/// * `bm25f_override` — when `Some`, overrides the reader's default BM25F
+///   config on a per-query basis (uses `SearchQuery::bm25f_config`)
+pub fn evaluate_split(
+    layer: &dyn SearchLayer,
+    qrels: &[Qrel],
+    config_name: &str,
+    bm25f_override: Option<BM25FConfig>,
+) -> anyhow::Result<ConfigMetrics> {
+    const TOP_K: usize = 20;
+
+    if qrels.is_empty() {
+        return Ok(ConfigMetrics {
+            config_name: config_name.to_string(),
+            mrr: 0.0,
+            precision_at_5: 0.0,
+            precision_at_10: 0.0,
+            query_count: 0,
+            found_at_rank_1: 0,
+        });
+    }
+
+    let mut rrs: Vec<f64> = Vec::with_capacity(qrels.len());
+    let mut p_at_5_sum = 0.0f64;
+    let mut p_at_10_sum = 0.0f64;
+    let mut found_at_rank_1 = 0usize;
+
+    for qrel in qrels {
+        let mut query = SearchQuery::new(&qrel.query);
+        query.limit = Some(TOP_K);
+        query.bm25f_config = bm25f_override;
+
+        let results = layer
+            .search(&query)
+            .with_context(|| format!("searching for query '{}'", qrel.query))?;
+        let ranked: Vec<FileId> = results.iter().map(|r| r.file_id).collect();
+
+        rrs.push(reciprocal_rank(&ranked, qrel.relevant_file_id));
+        p_at_5_sum += precision_at_k(&ranked, qrel.relevant_file_id, 5);
+        p_at_10_sum += precision_at_k(&ranked, qrel.relevant_file_id, 10);
+        if rank_of(&ranked, qrel.relevant_file_id) == 1 {
+            found_at_rank_1 += 1;
+        }
+    }
+
+    let n = qrels.len() as f64;
+
+    Ok(ConfigMetrics {
+        config_name: config_name.to_string(),
+        mrr: mrr(&rrs),
+        precision_at_5: p_at_5_sum / n,
+        precision_at_10: p_at_10_sum / n,
+        query_count: qrels.len(),
+        found_at_rank_1,
+    })
+}
+
+/// Aggregate `RepoBenchResult` values into a single macro-average `BenchResult`.
+///
+/// # Errors
+///
+/// Returns an error if repos have mismatched config names. All repos must have
+/// identical config name orderings (produced by the same `bench_configs` slice).
+pub fn aggregate_results(repos: Vec<RepoBenchResult>) -> anyhow::Result<BenchResult> {
+    if repos.is_empty() {
+        return Ok(BenchResult {
+            repos,
+            aggregate_train: vec![],
+            aggregate_test: vec![],
+        });
+    }
+
+    // Validate that all repos use the same config names in the same order,
+    // for both train and test splits. A mismatch in either split indicates
+    // repos were evaluated with different config sets, making macro-averaging
+    // meaningless.
+    let expected_train_names: Vec<&str> = repos[0]
+        .train_metrics
+        .iter()
+        .map(|m| m.config_name.as_str())
+        .collect();
+    let expected_test_names: Vec<&str> = repos[0]
+        .test_metrics
+        .iter()
+        .map(|m| m.config_name.as_str())
+        .collect();
+
+    for repo in &repos[1..] {
+        let train_names: Vec<&str> = repo
+            .train_metrics
+            .iter()
+            .map(|m| m.config_name.as_str())
+            .collect();
+        anyhow::ensure!(
+            train_names == expected_train_names,
+            "train config name mismatch: repo '{}' has {train_names:?}, expected {expected_train_names:?}",
+            repo.repo_url
+        );
+
+        let test_names: Vec<&str> = repo
+            .test_metrics
+            .iter()
+            .map(|m| m.config_name.as_str())
+            .collect();
+        anyhow::ensure!(
+            test_names == expected_test_names,
+            "test config name mismatch: repo '{}' has {test_names:?}, expected {expected_test_names:?}",
+            repo.repo_url
+        );
+    }
+
+    // Reuse the validated names from the first repo to drive macro-averaging.
+    let config_names: Vec<String> = expected_train_names.iter().map(|s| s.to_string()).collect();
+
+    let aggregate_train = macro_average(&repos, &config_names, |r| &r.train_metrics);
+    let aggregate_test = macro_average(&repos, &config_names, |r| &r.test_metrics);
+
+    Ok(BenchResult {
+        repos,
+        aggregate_train,
+        aggregate_test,
+    })
+}
+
+fn macro_average<F>(
+    repos: &[RepoBenchResult],
+    config_names: &[String],
+    get_metrics: F,
+) -> Vec<ConfigMetrics>
+where
+    F: Fn(&RepoBenchResult) -> &[ConfigMetrics],
+{
+    config_names
+        .iter()
+        .map(|name| {
+            let matching: Vec<&ConfigMetrics> = repos
+                .iter()
+                .flat_map(|r| get_metrics(r).iter())
+                .filter(|m| &m.config_name == name)
+                .collect();
+
+            if matching.is_empty() {
+                return ConfigMetrics {
+                    config_name: name.clone(),
+                    mrr: 0.0,
+                    precision_at_5: 0.0,
+                    precision_at_10: 0.0,
+                    query_count: 0,
+                    found_at_rank_1: 0,
+                };
+            }
+
+            let n = matching.len() as f64;
+            ConfigMetrics {
+                config_name: name.clone(),
+                mrr: matching.iter().map(|m| m.mrr).sum::<f64>() / n,
+                precision_at_5: matching.iter().map(|m| m.precision_at_5).sum::<f64>() / n,
+                precision_at_10: matching.iter().map(|m| m.precision_at_10).sum::<f64>() / n,
+                query_count: matching.iter().map(|m| m.query_count).sum(),
+                found_at_rank_1: matching.iter().map(|m| m.found_at_rank_1).sum(),
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::configs;
+
+    fn make_rust_files_with_content() -> (Vec<IndexedFile>, HashMap<FileId, String>) {
+        let content = r#"
+pub fn compute_value(x: i32) -> i32 { x }
+pub fn process_item(s: &str) -> String { s.to_string() }
+pub fn handle_event(e: u32) {}
+pub struct DataModel { id: u32 }
+pub struct UserRecord { name: String }
+pub struct ConfigEntry { key: String }
+pub fn validate_data(d: &str) -> bool { true }
+pub fn format_output(v: i32) -> String { format!("{}", v) }
+pub fn load_resource(path: &str) -> Vec<u8> { vec![] }
+pub fn save_state(key: &str, val: i32) {}
+pub fn init_logger(level: u8) {}
+pub enum LogLevel { Debug, Info, Warn, Error }
+"#;
+        let file_id = FileId(0);
+        let indexed = IndexedFile {
+            file_id,
+            path: PathBuf::from("src/lib.rs"),
+            language: rskim_core::Language::Rust,
+        };
+        let mut contents = HashMap::new();
+        contents.insert(file_id, content.to_string());
+        (vec![indexed], contents)
+    }
+
+    #[test]
+    fn run_on_files_with_two_configs() {
+        let (files, contents) = make_rust_files_with_content();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let configs = vec![
+            BenchConfig {
+                name: "uniform".to_string(),
+                bm25f: configs::uniform(),
+            },
+            BenchConfig {
+                name: "default_8field".to_string(),
+                bm25f: configs::default_8field(),
+            },
+        ];
+
+        let result = run_on_files(&files, &contents, &configs, dir.path(), "test://repo").unwrap();
+
+        assert_eq!(
+            result.train_metrics.len(),
+            2,
+            "should have metrics for 2 configs"
+        );
+        assert_eq!(
+            result.test_metrics.len(),
+            2,
+            "should have metrics for 2 configs"
+        );
+        assert!(result.qrel_count >= 10, "should have at least 10 qrels");
+    }
+
+    #[test]
+    fn empty_split_produces_zero_mrr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (files, contents) = make_rust_files_with_content();
+
+        // Build index
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        for f in &files {
+            let c = contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or("");
+            builder.add_file(f.file_id, c, f.language).unwrap();
+        }
+        let _layer = builder.build().unwrap();
+
+        let reader = rskim_search::NgramIndexReader::open(dir.path()).unwrap();
+        let metrics = evaluate_split(&reader, &[], "uniform", None).unwrap();
+        assert!(
+            (metrics.mrr - 0.0).abs() < f64::EPSILON,
+            "empty split → MRR=0"
+        );
+        assert_eq!(metrics.query_count, 0);
+    }
+
+    #[test]
+    fn aggregate_empty_repos_returns_empty_result() {
+        let result = aggregate_results(vec![]).unwrap();
+        assert!(result.repos.is_empty());
+        assert!(result.aggregate_train.is_empty());
+        assert!(result.aggregate_test.is_empty());
+    }
+
+    fn make_repo(url: &str, train_name: &str, test_name: &str) -> RepoBenchResult {
+        let make_metric = |name: &str| ConfigMetrics {
+            config_name: name.to_string(),
+            mrr: 0.5,
+            precision_at_5: 0.3,
+            precision_at_10: 0.2,
+            query_count: 10,
+            found_at_rank_1: 5,
+        };
+        RepoBenchResult {
+            repo_url: url.to_string(),
+            train_metrics: vec![make_metric(train_name)],
+            test_metrics: vec![make_metric(test_name)],
+            qrel_count: 10,
+        }
+    }
+
+    #[test]
+    fn aggregate_rejects_train_config_name_mismatch() {
+        let repo1 = make_repo("url1", "cfg_a", "cfg_a");
+        let repo2 = make_repo("url2", "cfg_b", "cfg_a"); // train name differs
+        let err = aggregate_results(vec![repo1, repo2]).unwrap_err();
+        assert!(
+            err.to_string().contains("train config name mismatch"),
+            "expected train mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_rejects_test_config_name_mismatch() {
+        let repo1 = make_repo("url1", "cfg_a", "cfg_a");
+        let repo2 = make_repo("url2", "cfg_a", "cfg_b"); // test name differs, train matches
+        let err = aggregate_results(vec![repo1, repo2]).unwrap_err();
+        assert!(
+            err.to_string().contains("test config name mismatch"),
+            "expected test mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn aggregate_two_repos_averages_mrr() {
+        let repo1 = RepoBenchResult {
+            repo_url: "url1".to_string(),
+            train_metrics: vec![ConfigMetrics {
+                config_name: "cfg".to_string(),
+                mrr: 0.8,
+                precision_at_5: 0.5,
+                precision_at_10: 0.3,
+                query_count: 10,
+                found_at_rank_1: 8,
+            }],
+            test_metrics: vec![ConfigMetrics {
+                config_name: "cfg".to_string(),
+                mrr: 0.6,
+                precision_at_5: 0.4,
+                precision_at_10: 0.2,
+                query_count: 5,
+                found_at_rank_1: 3,
+            }],
+            qrel_count: 15,
+        };
+        let repo2 = RepoBenchResult {
+            repo_url: "url2".to_string(),
+            train_metrics: vec![ConfigMetrics {
+                config_name: "cfg".to_string(),
+                mrr: 0.4,
+                precision_at_5: 0.3,
+                precision_at_10: 0.2,
+                query_count: 10,
+                found_at_rank_1: 4,
+            }],
+            test_metrics: vec![ConfigMetrics {
+                config_name: "cfg".to_string(),
+                mrr: 0.2,
+                precision_at_5: 0.1,
+                precision_at_10: 0.1,
+                query_count: 5,
+                found_at_rank_1: 1,
+            }],
+            qrel_count: 15,
+        };
+        let result = aggregate_results(vec![repo1, repo2]).unwrap();
+        let agg_train = &result.aggregate_train[0];
+        // (0.8 + 0.4) / 2 = 0.6
+        assert!(
+            (agg_train.mrr - 0.6).abs() < 1e-9,
+            "aggregate train MRR should be 0.6, got {}",
+            agg_train.mrr
+        );
+    }
+}

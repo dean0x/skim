@@ -1,0 +1,39 @@
+[package]
+name = "rskim-bench"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "BM25F parameter tuning harness for rskim-search"
+repository = "https://github.com/dean0x/skim"
+publish = false
+
+[[bin]]
+name = "rskim-bench"
+path = "src/main.rs"
+
+[lib]
+name = "rskim_bench"
+path = "src/lib.rs"
+
+[dependencies]
+rskim-search = { path = "../rskim-search" }
+rskim-core = { path = "../rskim-core" }
+rskim-research = { path = "../rskim-research" }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
