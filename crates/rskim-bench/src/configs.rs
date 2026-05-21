@@ -86,7 +86,7 @@ pub fn all_named() -> Vec<(&'static str, BM25FConfig)> {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // test code — unwrap acceptable for test assertions
+#[allow(clippy::unwrap_used, clippy::panic)] // test code — unwrap/panic acceptable for test assertions
 mod tests {
     use super::*;
 
