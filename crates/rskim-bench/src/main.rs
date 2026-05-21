@@ -335,7 +335,10 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
 
     eprintln!("Tuning on {} train qrels", train_qrels.len());
 
-    let idx_path = index_dir.path().to_path_buf();
+    // Open reader once; BM25F config is overridden per-evaluation via
+    // SearchQuery::bm25f_config (single-reader pattern, item 8).
+    let reader = rskim_search::NgramIndexReader::open(index_dir.path())
+        .context("opening index for tuning")?;
 
     // Error counter shared across closure invocations. coordinate_descent requires an f64
     // return value (0.0 signals a failed evaluation), so errors are visible on stderr rather
@@ -344,17 +347,7 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     let counter = eval_error_count.clone();
 
     let tuning_result = coordinate_descent(None, move |cfg: rskim_search::BM25FConfig| {
-        let reader = match rskim_search::NgramIndexReader::open_with_config(&idx_path, cfg) {
-            Ok(r) => r,
-            Err(e) => {
-                let n = counter.fetch_add(1, Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!("[tune] index open failed (error #{n}): {e:#}");
-                }
-                return 0.0;
-            }
-        };
-        match rskim_bench::harness::evaluate_split(&reader, &train_qrels, "tuning") {
+        match rskim_bench::harness::evaluate_split(&reader, &train_qrels, "tuning", Some(cfg)) {
             Ok(metrics) => metrics.mrr,
             Err(e) => {
                 let n = counter.fetch_add(1, Ordering::Relaxed);

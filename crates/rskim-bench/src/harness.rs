@@ -78,21 +78,19 @@ pub fn run_on_files(
     }
 
     let _base_layer = builder.build().context("building index")?;
-    // Note: the layer is built above to flush index files to disk.
-    // We then open per-config readers below.
+    // Open reader once with the default config; BM25F parameters are overridden
+    // per-query via SearchQuery::bm25f_config (single-reader pattern).
+    let reader = rskim_search::NgramIndexReader::open(index_dir)
+        .context("opening index reader")?;
 
     // Evaluate each config on train and test splits
     let mut train_metrics = Vec::new();
     let mut test_metrics = Vec::new();
 
     for config in configs {
-        // Open index with this config's BM25F parameters
-        let reader = rskim_search::NgramIndexReader::open_with_config(index_dir, config.bm25f)
-            .with_context(|| format!("opening index with config '{}'", config.name))?;
-
-        let train_m = evaluate_split(&reader, &train_qrels, &config.name)
+        let train_m = evaluate_split(&reader, &train_qrels, &config.name, Some(config.bm25f))
             .with_context(|| format!("evaluating train split for config '{}'", config.name))?;
-        let test_m = evaluate_split(&reader, &test_qrels, &config.name)
+        let test_m = evaluate_split(&reader, &test_qrels, &config.name, Some(config.bm25f))
             .with_context(|| format!("evaluating test split for config '{}'", config.name))?;
 
         train_metrics.push(train_m);
@@ -115,10 +113,18 @@ fn partition_qrels(qrels: &[Qrel]) -> (Vec<Qrel>, Vec<Qrel>) {
 /// Evaluate a list of qrels against a search layer.
 ///
 /// Returns `ConfigMetrics` with MRR, Precision@5, Precision@10.
+///
+/// # Arguments
+/// * `layer` — the index reader to query
+/// * `qrels` — relevance judgments to evaluate
+/// * `config_name` — name recorded in the output metrics
+/// * `bm25f_override` — when `Some`, overrides the reader's default BM25F
+///   config on a per-query basis (uses `SearchQuery::bm25f_config`)
 pub fn evaluate_split(
     layer: &dyn SearchLayer,
     qrels: &[Qrel],
     config_name: &str,
+    bm25f_override: Option<BM25FConfig>,
 ) -> anyhow::Result<ConfigMetrics> {
     const TOP_K: usize = 20;
 
@@ -141,6 +147,7 @@ pub fn evaluate_split(
     for qrel in qrels {
         let mut query = SearchQuery::new(&qrel.query);
         query.limit = Some(TOP_K);
+        query.bm25f_config = bm25f_override;
 
         let results = layer
             .search(&query)
@@ -318,7 +325,7 @@ pub enum LogLevel { Debug, Info, Warn, Error }
         let _layer = builder.build().unwrap();
 
         let reader = rskim_search::NgramIndexReader::open(dir.path()).unwrap();
-        let metrics = evaluate_split(&reader, &[], "uniform").unwrap();
+        let metrics = evaluate_split(&reader, &[], "uniform", None).unwrap();
         assert!(
             (metrics.mrr - 0.0).abs() < f64::EPSILON,
             "empty split → MRR=0"

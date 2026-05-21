@@ -35,25 +35,21 @@ pub struct ExtractedSymbol {
     pub byte_range: Range<usize>,
 }
 
-/// Walk a tree-sitter AST and collect extracted symbols.
+/// Walk a tree-sitter AST and collect extracted symbols using a pre-created parser.
 ///
-/// Handles: parser creation, language setup, parsing, root cursor, and recursive
-/// traversal. Language modules provide only the node-level visitor logic.
+/// Accepts a mutable reference to an already-configured `Parser` so that
+/// callers processing many files can reuse a single parser instance instead
+/// of allocating a new one per call.
 ///
-/// Returns an empty `Vec` if the parser cannot be configured or the content
-/// cannot be parsed.
-pub(crate) fn walk_ast<F>(
+/// Returns an empty `Vec` if the content cannot be parsed.
+pub(crate) fn walk_ast_with_parser<F>(
+    parser: &mut tree_sitter::Parser,
     content: &str,
-    ts_language: tree_sitter::Language,
     mut visit: F,
 ) -> Vec<ExtractedSymbol>
 where
     F: FnMut(tree_sitter::Node<'_>, &[u8], &mut Vec<ExtractedSymbol>),
 {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&ts_language).is_err() {
-        return vec![];
-    }
     let tree = match parser.parse(content, None) {
         Some(t) => t,
         None => return vec![],
@@ -66,6 +62,28 @@ where
 
     walk_nodes(root, &mut cursor, bytes, &mut symbols, &mut visit);
     symbols
+}
+
+/// Walk a tree-sitter AST and collect extracted symbols.
+///
+/// Handles: parser creation, language setup, parsing, root cursor, and recursive
+/// traversal. Language modules provide only the node-level visitor logic.
+///
+/// Returns an empty `Vec` if the parser cannot be configured or the content
+/// cannot be parsed.
+pub(crate) fn walk_ast<F>(
+    content: &str,
+    ts_language: tree_sitter::Language,
+    visit: F,
+) -> Vec<ExtractedSymbol>
+where
+    F: FnMut(tree_sitter::Node<'_>, &[u8], &mut Vec<ExtractedSymbol>),
+{
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&ts_language).is_err() {
+        return vec![];
+    }
+    walk_ast_with_parser(&mut parser, content, visit)
 }
 
 /// Recursive node visitor used by `walk_ast`.
