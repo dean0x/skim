@@ -4,7 +4,7 @@
 //! synthetic in-memory content, avoiding network access or corpus cloning.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rskim_bench::{
     configs,
@@ -366,7 +366,7 @@ fn aggregate_results_macro_average() {
 
     let r2 = run_on_files(&files, &contents, &bench_configs, dir2.path(), "https://github.com/test/repo2").unwrap();
 
-    let aggregated = aggregate_results(vec![r1, r2]);
+    let aggregated = aggregate_results(vec![r1, r2]).unwrap();
     assert_eq!(aggregated.repos.len(), 2);
     assert_eq!(aggregated.aggregate_train.len(), 1);
     assert_eq!(aggregated.aggregate_test.len(), 1);
@@ -401,5 +401,136 @@ fn precision_at_5_consistent_with_rr_at_rank_1() {
     assert!(
         (rr - 1.0).abs() < f64::EPSILON,
         "RR with relevant at rank 1 = 1.0"
+    );
+}
+
+// ============================================================================
+// Item 11: extract_symbols dispatch integration test
+// ============================================================================
+
+#[test]
+fn extract_symbols_dispatch_integration() {
+    // Rust: should extract symbols
+    let rust_symbols = rskim_bench::extract::extract_symbols(
+        Path::new("test.rs"),
+        "pub fn test_func(x: i32) -> i32 { x }",
+        Language::Rust,
+    );
+    assert!(!rust_symbols.is_empty(), "Rust extraction should find symbols");
+    assert!(
+        rust_symbols
+            .iter()
+            .any(|s| s.field == rskim_search::SearchField::FunctionSignature),
+        "Rust extraction should find a FunctionSignature"
+    );
+
+    // Python: should extract symbols
+    let py_symbols = rskim_bench::extract::extract_symbols(
+        Path::new("test.py"),
+        "def test_func(x: int) -> int:\n    return x",
+        Language::Python,
+    );
+    assert!(!py_symbols.is_empty(), "Python extraction should find symbols");
+
+    // Go: should extract symbols
+    let go_symbols = rskim_bench::extract::extract_symbols(
+        Path::new("test.go"),
+        "package main\n\nfunc TestFunc(x int) int { return x }",
+        Language::Go,
+    );
+    assert!(!go_symbols.is_empty(), "Go extraction should find symbols");
+
+    // Unsupported: should return empty
+    let ts_symbols = rskim_bench::extract::extract_symbols(
+        Path::new("test.ts"),
+        "function test() {}",
+        Language::TypeScript,
+    );
+    assert!(
+        ts_symbols.is_empty(),
+        "Unsupported language should return empty"
+    );
+}
+
+// ============================================================================
+// Item 12: run_on_files error-path test
+// ============================================================================
+
+#[test]
+fn run_on_files_too_few_qrels_returns_error() {
+    let file = IndexedFile {
+        file_id: FileId(0),
+        path: PathBuf::from("test.rs"),
+        language: Language::Rust,
+    };
+    let mut contents = HashMap::new();
+    contents.insert(FileId(0), "fn x() {}".to_string());
+
+    let dir = tempfile::tempdir().unwrap();
+    let configs = vec![BenchConfig {
+        name: "test".to_string(),
+        bm25f: configs::uniform(),
+    }];
+
+    let result = run_on_files(&[file], &contents, &configs, dir.path(), "test://repo");
+    assert!(result.is_err(), "should error with too few qrels");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("qrel") || err_msg.contains("Qrel"),
+        "error should mention qrels, got: {err_msg}"
+    );
+}
+
+// ============================================================================
+// Item 13: aggregate_results mismatch validation
+// ============================================================================
+
+#[test]
+fn aggregate_results_rejects_mismatched_config_names() {
+    let repo1 = RepoBenchResult {
+        repo_url: "repo1".to_string(),
+        train_metrics: vec![ConfigMetrics {
+            config_name: "cfg_a".to_string(),
+            mrr: 0.5,
+            precision_at_5: 0.3,
+            precision_at_10: 0.2,
+            query_count: 10,
+            found_at_rank_1: 5,
+        }],
+        test_metrics: vec![ConfigMetrics {
+            config_name: "cfg_a".to_string(),
+            mrr: 0.4,
+            precision_at_5: 0.2,
+            precision_at_10: 0.1,
+            query_count: 5,
+            found_at_rank_1: 2,
+        }],
+        qrel_count: 15,
+    };
+    let repo2 = RepoBenchResult {
+        repo_url: "repo2".to_string(),
+        train_metrics: vec![ConfigMetrics {
+            config_name: "cfg_b".to_string(), // different!
+            mrr: 0.6,
+            precision_at_5: 0.4,
+            precision_at_10: 0.3,
+            query_count: 10,
+            found_at_rank_1: 6,
+        }],
+        test_metrics: vec![ConfigMetrics {
+            config_name: "cfg_b".to_string(),
+            mrr: 0.5,
+            precision_at_5: 0.3,
+            precision_at_10: 0.2,
+            query_count: 5,
+            found_at_rank_1: 3,
+        }],
+        qrel_count: 15,
+    };
+    let result = aggregate_results(vec![repo1, repo2]);
+    assert!(result.is_err(), "should reject mismatched config names");
+    assert!(
+        result.unwrap_err().to_string().contains("config name mismatch"),
+        "error message should say 'config name mismatch'"
     );
 }

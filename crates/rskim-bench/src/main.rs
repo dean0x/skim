@@ -264,7 +264,7 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
         anyhow::bail!("No repos matched. Use --repos to filter, or check corpus config.");
     }
 
-    let bench_result = aggregate_results(repo_results);
+    let bench_result = aggregate_results(repo_results)?;
 
     match args.format {
         OutputFormat::Json => {
@@ -276,6 +276,61 @@ fn run_bench(args: BenchArgs) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Build a search index from pre-loaded files into `index_dir`.
+///
+/// # Errors
+///
+/// Returns an error if the index builder cannot be created, a file cannot be
+/// added, or the build step fails.
+fn build_index(
+    files: &[IndexedFile],
+    contents: &HashMap<FileId, String>,
+    index_dir: &Path,
+) -> anyhow::Result<()> {
+    let mut builder = rskim_search::NgramIndexBuilder::new(index_dir.to_path_buf())
+        .context("creating index builder")?;
+
+    for f in files {
+        let content = contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or("");
+        builder
+            .add_file(f.file_id, content, f.language)
+            .with_context(|| format!("indexing file {:?}", f.path))?;
+    }
+
+    let _layer = builder.build().context("building index")?;
+    Ok(())
+}
+
+/// Generate qrels for `files` and filter to the train split.
+///
+/// # Errors
+///
+/// Returns an error if qrel generation fails (too few symbols).
+fn make_train_qrels(
+    files: &[IndexedFile],
+    contents: &HashMap<FileId, String>,
+) -> anyhow::Result<Vec<rskim_bench::types::Qrel>> {
+    let qrel_inputs: Vec<rskim_bench::qrel::QrelInput<'_>> = files
+        .iter()
+        .map(|f| rskim_bench::qrel::QrelInput {
+            file_id: f.file_id,
+            path: f.path.clone(),
+            language: f.language,
+            content: contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or(""),
+        })
+        .collect();
+
+    let all_qrels =
+        rskim_bench::qrel::generate_qrels(&qrel_inputs).context("generating qrels")?;
+
+    let train_qrels = all_qrels
+        .into_iter()
+        .filter(|q| rskim_bench::split::assign_split(&q.query) == rskim_bench::split::Split::Train)
+        .collect();
+
+    Ok(train_qrels)
 }
 
 fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
@@ -296,43 +351,11 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
         all_contents.extend(loaded.contents);
     }
 
-    // Build qrel inputs
-    let qrel_inputs: Vec<rskim_bench::qrel::QrelInput<'_>> = all_indexed
-        .iter()
-        .map(|f| rskim_bench::qrel::QrelInput {
-            file_id: f.file_id,
-            path: f.path.clone(),
-            language: f.language,
-            content: all_contents.get(&f.file_id).map(|s| s.as_str()).unwrap_or_default(),
-        })
-        .collect();
-
-    let qrels =
-        rskim_bench::qrel::generate_qrels(&qrel_inputs).context("generating qrels for tuning")?;
-
-    // Build index once for all tuning evaluations
+    // Build index and generate train qrels
     let index_dir = tempfile::tempdir().context("creating temp index dir")?;
-    let mut builder = rskim_search::NgramIndexBuilder::new(index_dir.path().to_path_buf())
-        .context("creating index builder")?;
+    build_index(&all_indexed, &all_contents, index_dir.path())?;
 
-    for f in &all_indexed {
-        let content = all_contents
-            .get(&f.file_id)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        builder
-            .add_file(f.file_id, content, f.language)
-            .context("indexing file")?;
-    }
-    let _base = builder.build().context("building index")?;
-
-    // Filter to train split
-    let train_qrels: Vec<_> = qrels
-        .iter()
-        .filter(|q| rskim_bench::split::assign_split(&q.query) == rskim_bench::split::Split::Train)
-        .cloned()
-        .collect();
-
+    let train_qrels = make_train_qrels(&all_indexed, &all_contents)?;
     eprintln!("Tuning on {} train qrels", train_qrels.len());
 
     // Open reader once; BM25F config is overridden per-evaluation via
@@ -396,7 +419,7 @@ fn run_tune(args: TuneArgs) -> anyhow::Result<()> {
     )
     .context("running final evaluation with tuned config")?;
 
-    let bench_result = aggregate_results(vec![final_result]);
+    let bench_result = aggregate_results(vec![final_result])?;
 
     match args.format {
         OutputFormat::Json => {

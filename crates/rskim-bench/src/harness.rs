@@ -175,13 +175,38 @@ pub fn evaluate_split(
 }
 
 /// Aggregate `RepoBenchResult` values into a single macro-average `BenchResult`.
-pub fn aggregate_results(repos: Vec<RepoBenchResult>) -> BenchResult {
+///
+/// # Errors
+///
+/// Returns an error if repos have mismatched config names. All repos must have
+/// identical config name orderings (produced by the same `bench_configs` slice).
+pub fn aggregate_results(repos: Vec<RepoBenchResult>) -> anyhow::Result<BenchResult> {
     if repos.is_empty() {
-        return BenchResult {
+        return Ok(BenchResult {
             repos,
             aggregate_train: vec![],
             aggregate_test: vec![],
-        };
+        });
+    }
+
+    // Validate that all repos use the same config names in the same order
+    let expected_names: Vec<&str> = repos[0]
+        .train_metrics
+        .iter()
+        .map(|m| m.config_name.as_str())
+        .collect();
+
+    for repo in &repos[1..] {
+        let names: Vec<&str> = repo
+            .train_metrics
+            .iter()
+            .map(|m| m.config_name.as_str())
+            .collect();
+        anyhow::ensure!(
+            names == expected_names,
+            "config name mismatch: repo '{}' has {names:?}, expected {expected_names:?}",
+            repo.repo_url
+        );
     }
 
     // Collect config names from the first repo (all repos use same configs)
@@ -194,11 +219,11 @@ pub fn aggregate_results(repos: Vec<RepoBenchResult>) -> BenchResult {
     let aggregate_train = macro_average(&repos, &config_names, |r| &r.train_metrics);
     let aggregate_test = macro_average(&repos, &config_names, |r| &r.test_metrics);
 
-    BenchResult {
+    Ok(BenchResult {
         repos,
         aggregate_train,
         aggregate_test,
-    }
+    })
 }
 
 fn macro_average<F>(
@@ -335,7 +360,7 @@ pub enum LogLevel { Debug, Info, Warn, Error }
 
     #[test]
     fn aggregate_empty_repos_returns_empty_result() {
-        let result = aggregate_results(vec![]);
+        let result = aggregate_results(vec![]).unwrap();
         assert!(result.repos.is_empty());
         assert!(result.aggregate_train.is_empty());
         assert!(result.aggregate_test.is_empty());
@@ -383,7 +408,7 @@ pub enum LogLevel { Debug, Info, Warn, Error }
             }],
             qrel_count: 15,
         };
-        let result = aggregate_results(vec![repo1, repo2]);
+        let result = aggregate_results(vec![repo1, repo2]).unwrap();
         let agg_train = &result.aggregate_train[0];
         // (0.8 + 0.4) / 2 = 0.6
         assert!(
