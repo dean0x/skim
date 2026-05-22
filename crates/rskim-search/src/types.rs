@@ -347,10 +347,7 @@ pub struct SearchResult {
 /// Counts newlines in `content[..offset]`. The offset is clamped to
 /// `content.len()` so out-of-bounds values never panic. Returns `1` for
 /// offset `0` or any offset in empty content.
-///
-/// This is the library counterpart of the CLI's `snippet::byte_offset_to_line`;
-/// the two are intentionally kept separate — this one returns `usize` while
-/// the CLI copy returns `u32` for display formatting.
+#[must_use]
 pub fn byte_offset_to_line(content: &[u8], offset: usize) -> usize {
     let safe_offset = offset.min(content.len());
     let newlines = content[..safe_offset]
@@ -367,23 +364,18 @@ pub fn byte_offset_to_line(content: &[u8], offset: usize) -> usize {
 /// 1-indexed), matching the convention used by [`SearchResult::line_range`].
 ///
 /// Returns `0..0` when `match_positions` is empty.
+#[must_use]
 pub fn compute_line_range(content: &[u8], match_positions: &[Range<usize>]) -> Range<usize> {
     if match_positions.is_empty() {
         return 0..0;
     }
 
-    let mut min_line = usize::MAX;
-    let mut max_line = 0usize;
+    let lines = match_positions
+        .iter()
+        .map(|pos| byte_offset_to_line(content, pos.start));
 
-    for pos in match_positions {
-        let line = byte_offset_to_line(content, pos.start);
-        if line < min_line {
-            min_line = line;
-        }
-        if line > max_line {
-            max_line = line;
-        }
-    }
+    let min_line = lines.clone().min().unwrap_or(1);
+    let max_line = lines.max().unwrap_or(1);
 
     min_line..(max_line + 1)
 }
