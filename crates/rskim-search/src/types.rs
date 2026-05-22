@@ -339,6 +339,56 @@ pub struct SearchResult {
 }
 
 // ============================================================================
+// Line-range utilities
+// ============================================================================
+
+/// Map a byte offset within `content` to a **1-indexed** line number.
+///
+/// Counts newlines in `content[..offset]`. The offset is clamped to
+/// `content.len()` so out-of-bounds values never panic. Returns `1` for
+/// offset `0` or any offset in empty content.
+///
+/// This is the library counterpart of the CLI's `snippet::byte_offset_to_line`;
+/// the two are intentionally kept separate — this one returns `usize` while
+/// the CLI copy returns `u32` for display formatting.
+pub fn byte_offset_to_line(content: &[u8], offset: usize) -> usize {
+    let safe_offset = offset.min(content.len());
+    let newlines = content[..safe_offset]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    newlines + 1
+}
+
+/// Compute the line range spanned by a set of byte-position `match_positions`.
+///
+/// For each position the start byte is converted to a 1-indexed line number via
+/// [`byte_offset_to_line`]. Returns `min_line..(max_line + 1)` (exclusive end,
+/// 1-indexed), matching the convention used by [`SearchResult::line_range`].
+///
+/// Returns `0..0` when `match_positions` is empty.
+pub fn compute_line_range(content: &[u8], match_positions: &[Range<usize>]) -> Range<usize> {
+    if match_positions.is_empty() {
+        return 0..0;
+    }
+
+    let mut min_line = usize::MAX;
+    let mut max_line = 0usize;
+
+    for pos in match_positions {
+        let line = byte_offset_to_line(content, pos.start);
+        if line < min_line {
+            min_line = line;
+        }
+        if line > max_line {
+            max_line = line;
+        }
+    }
+
+    min_line..(max_line + 1)
+}
+
+// ============================================================================
 // Index Statistics
 // ============================================================================
 
@@ -983,5 +1033,77 @@ mod tests {
             q.bm25f_config.is_none(),
             "new() should initialise bm25f_config to None"
         );
+    }
+
+    // ========================================================================
+    // byte_offset_to_line (library version, returns usize, 1-indexed)
+    // ========================================================================
+
+    #[test]
+    fn test_lib_byte_offset_start_of_file() {
+        assert_eq!(byte_offset_to_line(b"hello\nworld", 0), 1);
+    }
+
+    #[test]
+    fn test_lib_byte_offset_second_line() {
+        assert_eq!(byte_offset_to_line(b"hello\nworld", 6), 2);
+    }
+
+    #[test]
+    fn test_lib_byte_offset_at_newline() {
+        // newline byte itself is end of line 1
+        assert_eq!(byte_offset_to_line(b"hello\nworld", 5), 1);
+    }
+
+    #[test]
+    fn test_lib_byte_offset_middle_of_line() {
+        assert_eq!(byte_offset_to_line(b"hello\nworld", 8), 2);
+    }
+
+    #[test]
+    fn test_lib_byte_offset_empty_content() {
+        assert_eq!(byte_offset_to_line(b"", 0), 1);
+    }
+
+    #[test]
+    fn test_lib_byte_offset_clamped() {
+        assert_eq!(byte_offset_to_line(b"hello", 999), 1);
+    }
+
+    #[test]
+    fn test_lib_byte_offset_last_byte() {
+        assert_eq!(byte_offset_to_line(b"a\nb\nc", 4), 3);
+    }
+
+    // ========================================================================
+    // compute_line_range
+    // ========================================================================
+
+    #[test]
+    fn test_line_range_empty_positions() {
+        assert_eq!(compute_line_range(b"hello\nworld", &[]), 0..0);
+    }
+
+    #[test]
+    fn test_line_range_single_position() {
+        // offset 2 on "a\nb\nc" -> line 2 (byte 2 = 'b')
+        assert_eq!(compute_line_range(b"a\nb\nc", &[2..3]), 2..3);
+    }
+
+    #[test]
+    fn test_line_range_multi_line_span() {
+        // offsets 0 (line 1) and 6 (line 4) on "a\nb\nc\nd\ne"
+        assert_eq!(compute_line_range(b"a\nb\nc\nd\ne", &[0..1, 6..7]), 1..5);
+    }
+
+    #[test]
+    fn test_line_range_same_line() {
+        assert_eq!(compute_line_range(b"hello world", &[0..3, 6..9]), 1..2);
+    }
+
+    #[test]
+    fn test_line_range_adjacent_lines() {
+        // offsets 0 (line 1) and 2 (line 2) on "a\nb\nc"
+        assert_eq!(compute_line_range(b"a\nb\nc", &[0..1, 2..3]), 1..3);
     }
 }

@@ -177,8 +177,8 @@ fn test_extract_snippet_basic_match() {
     fs::write(src_dir.join("lib.rs"), content).unwrap();
 
     let result = extract_snippet(&root, "src/lib.rs", &[0..3], None);
-    let (line_no, ctx) = match result {
-        SnippetOutcome::Ok(ln, ctx) => (ln, ctx),
+    let (line_no, _lr, ctx) = match result {
+        SnippetOutcome::Ok(ln, lr, ctx) => (ln, lr, ctx),
         other => panic!("expected Ok, got {other:?}"),
     };
     assert_eq!(line_no, 1, "match at offset 0 → line 1");
@@ -187,6 +187,27 @@ fn test_extract_snippet_basic_match() {
     let match_line = ctx.lines.iter().find(|l| l.is_match).unwrap();
     assert_eq!(match_line.line_number, 1);
     assert!(match_line.content.contains("fn foo"));
+}
+
+#[test]
+fn test_extract_snippet_computes_line_range() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    // 5 lines: "aa\n" = 3 bytes each, last "ee\n" = 3 bytes
+    // line 1 offset 0, line 2 offset 3, line 3 offset 6, line 4 offset 9, line 5 offset 12
+    let content = "aa\nbb\ncc\ndd\nee\n";
+    fs::write(src_dir.join("multi.rs"), content).unwrap();
+
+    // Match positions on line 2 (offset 3) and line 4 (offset 9)
+    let result = extract_snippet(&root, "src/multi.rs", &[3..5, 9..11], None);
+    let (line_no, lr, _ctx) = match result {
+        SnippetOutcome::Ok(ln, lr, ctx) => (ln, lr, ctx),
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    assert_eq!(line_no, 2, "primary match line from first position");
+    assert_eq!(lr, 2..5, "line_range spans lines 2-4 inclusive (2..5 exclusive)");
 }
 
 #[test]

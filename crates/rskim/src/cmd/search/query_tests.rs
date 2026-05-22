@@ -159,6 +159,7 @@ fn test_format_text_output_includes_path_and_score() {
         score: 12.34,
         field: "function_signature".to_string(),
         line_number: Some(2),
+        line_range: Some(2..3),
         snippet: Some(SnippetContext {
             lines: vec![
                 SnippetLine {
@@ -204,6 +205,7 @@ fn test_format_text_output_includes_stale_marker() {
         score: 5.0,
         field: "function_signature".to_string(),
         line_number: Some(10),
+        line_range: Some(10..11),
         snippet: Some(SnippetContext {
             lines: vec![SnippetLine {
                 line_number: 10,

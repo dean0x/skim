@@ -24,7 +24,15 @@ pub(super) const DEFAULT_CONTEXT: u32 = 3;
 #[derive(Debug)]
 pub(super) enum SnippetOutcome {
     /// Successfully extracted a snippet.
-    Ok(u32, SnippetContext),
+    ///
+    /// Fields: `(primary_match_line_u32, line_range, context)`.
+    ///
+    /// - `primary_match_line_u32` — 1-indexed line number of the first match
+    ///   position, as a `u32` for display formatting.
+    /// - `line_range` — 1-indexed, exclusive-end `Range<usize>` spanning all
+    ///   match positions, computed by [`rskim_search::compute_line_range`].
+    /// - `context` — source lines surrounding the primary match.
+    Ok(u32, std::ops::Range<usize>, SnippetContext),
     /// File has changed since indexing (mtime mismatch) — positions may be stale.
     Stale,
     /// File deleted, unreadable, empty positions, or non-UTF8.
@@ -154,12 +162,14 @@ pub(super) fn extract_snippet(
 
     let match_line = byte_offset_to_line(&content, match_positions[0].start);
 
+    let line_range = rskim_search::compute_line_range(&content, match_positions);
+
     let ctx_lines = extract_context_window(text, match_line, DEFAULT_CONTEXT);
     if ctx_lines.is_empty() {
         return SnippetOutcome::Unavailable;
     }
 
-    SnippetOutcome::Ok(match_line, SnippetContext { lines: ctx_lines })
+    SnippetOutcome::Ok(match_line, line_range, SnippetContext { lines: ctx_lines })
 }
 
 // ============================================================================
