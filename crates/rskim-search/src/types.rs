@@ -328,7 +328,7 @@ pub struct SearchResult {
     pub file_id: FileId,
     /// Relevance score (higher is more relevant); layer-specific scale
     pub score: f64,
-    /// Source lines spanned by this match (0-indexed, exclusive end)
+    /// Source lines spanned by this match (1-indexed, exclusive end; 0..0 when not yet computed)
     pub line_range: Range<usize>,
     /// Byte-position ranges within the source where query terms appear
     pub match_positions: Vec<Range<usize>>,
@@ -370,12 +370,10 @@ pub fn compute_line_range(content: &[u8], match_positions: &[Range<usize>]) -> R
         return 0..0;
     }
 
-    let lines = match_positions
+    let (min_line, max_line) = match_positions
         .iter()
-        .map(|pos| byte_offset_to_line(content, pos.start));
-
-    let min_line = lines.clone().min().unwrap_or(1);
-    let max_line = lines.max().unwrap_or(1);
+        .map(|pos| byte_offset_to_line(content, pos.start))
+        .fold((usize::MAX, 0usize), |(mn, mx), line| (mn.min(line), mx.max(line)));
 
     min_line..(max_line + 1)
 }
