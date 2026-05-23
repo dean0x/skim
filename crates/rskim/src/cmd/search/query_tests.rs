@@ -295,6 +295,61 @@ fn test_execute_query_corrupt_index_returns_err_not_panic() {
 }
 
 // ============================================================================
+// ResolvedResult JSON serialization
+// ============================================================================
+
+/// line_range: Some(5..13) must serialise as {"start":5,"end":13} in JSON output.
+#[test]
+fn test_resolved_result_line_range_some_serializes_start_end() {
+    use crate::cmd::search::types::ResolvedResult;
+
+    let result = ResolvedResult {
+        path: "src/lib.rs".to_string(),
+        score: 1.0,
+        field: "function_signature".to_string(),
+        line_number: Some(5),
+        line_range: Some(5..13),
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+    };
+
+    let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
+    assert_eq!(
+        value["line_range"]["start"], 5,
+        "line_range.start must be 5"
+    );
+    assert_eq!(
+        value["line_range"]["end"], 13,
+        "line_range.end must be 13"
+    );
+}
+
+/// line_range: None must serialise as JSON null.
+#[test]
+fn test_resolved_result_line_range_none_serializes_null() {
+    use crate::cmd::search::types::ResolvedResult;
+
+    let result = ResolvedResult {
+        path: "src/lib.rs".to_string(),
+        score: 1.0,
+        field: "function_signature".to_string(),
+        line_number: None,
+        line_range: None,
+        snippet: None,
+        stale: false,
+        match_positions: vec![],
+    };
+
+    let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
+    assert!(
+        value["line_range"].is_null(),
+        "line_range must be null when None, got: {:?}",
+        value["line_range"]
+    );
+}
+
+// ============================================================================
 // format_json_output
 // ============================================================================
 
