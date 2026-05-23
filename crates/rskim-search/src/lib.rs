@@ -31,6 +31,6 @@ pub use temporal::{GixSource, is_fix_commit};
 pub use types::{
     CommitInfo, FieldClassifier, FileChangeInfo, FileId, HistoryResult, IndexStats, LayerBuilder,
     NodeInfo, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
-    TemporalFlags, TemporalMetadata, TemporalSource,
+    TemporalFlags, TemporalMetadata, TemporalSource, byte_offset_to_line, compute_line_range,
 };
 pub use weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT, bigram_weight};

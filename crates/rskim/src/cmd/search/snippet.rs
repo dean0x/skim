@@ -24,28 +24,22 @@ pub(super) const DEFAULT_CONTEXT: u32 = 3;
 #[derive(Debug)]
 pub(super) enum SnippetOutcome {
     /// Successfully extracted a snippet.
-    Ok(u32, SnippetContext),
+    ///
+    /// - `match_line`: 1-indexed line number of the **first** match position
+    ///   (as `u32` for display formatting).
+    /// - `line_range`: 1-indexed exclusive-end range spanning **all** match
+    ///   positions (may differ from `match_line` when the first position is not
+    ///   the minimum-line position across all positions).
+    /// - `context`: surrounding source lines.
+    Ok {
+        match_line: u32,
+        line_range: std::ops::Range<usize>,
+        context: SnippetContext,
+    },
     /// File has changed since indexing (mtime mismatch) — positions may be stale.
     Stale,
     /// File deleted, unreadable, empty positions, or non-UTF8.
     Unavailable,
-}
-
-// ============================================================================
-// Byte-offset → line number
-// ============================================================================
-
-/// Map a byte offset within `content` to a 1-indexed line number.
-///
-/// Counts newlines in `content[..offset]`. Returns `1` for offset `0` or
-/// any offset in an empty file.
-pub(super) fn byte_offset_to_line(content: &[u8], offset: usize) -> u32 {
-    let safe_offset = offset.min(content.len());
-    let newlines = content[..safe_offset]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count();
-    (newlines as u32).saturating_add(1)
 }
 
 // ============================================================================
@@ -103,7 +97,7 @@ pub(super) fn extract_context_window(
 /// Extract a snippet for a search result.
 ///
 /// Returns:
-/// - `SnippetOutcome::Ok(line, ctx)` on success.
+/// - `SnippetOutcome::Ok(line, line_range, ctx)` on success.
 /// - `SnippetOutcome::Stale` when the file's mtime differs from manifest (changed since indexing).
 /// - `SnippetOutcome::Unavailable` when positions are empty, file is deleted/unreadable, or non-UTF8.
 pub(super) fn extract_snippet(
@@ -152,14 +146,20 @@ pub(super) fn extract_snippet(
         Err(_) => return SnippetOutcome::Unavailable,
     };
 
-    let match_line = byte_offset_to_line(&content, match_positions[0].start);
+    let match_line = rskim_search::byte_offset_to_line(&content, match_positions[0].start) as u32;
+
+    let line_range = rskim_search::compute_line_range(&content, match_positions);
 
     let ctx_lines = extract_context_window(text, match_line, DEFAULT_CONTEXT);
     if ctx_lines.is_empty() {
         return SnippetOutcome::Unavailable;
     }
 
-    SnippetOutcome::Ok(match_line, SnippetContext { lines: ctx_lines })
+    SnippetOutcome::Ok {
+        match_line,
+        line_range,
+        context: SnippetContext { lines: ctx_lines },
+    }
 }
 
 // ============================================================================

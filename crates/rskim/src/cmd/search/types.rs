@@ -63,6 +63,12 @@ pub(super) struct ResolvedResult {
     pub field: String,
     /// 1-indexed line number of the primary match within the file.
     pub line_number: Option<u32>,
+    /// 1-indexed, exclusive-end line range spanned by all match positions.
+    ///
+    /// `None` when snippet extraction is unavailable (stale, deleted, or non-UTF8).
+    /// Populated from [`rskim_search::compute_line_range`] during snippet extraction.
+    /// Serialises as `{"start": N, "end": M}` in `--format json` output.
+    pub line_range: Option<Range<usize>>,
     /// Source context window surrounding the match.
     pub snippet: Option<SnippetContext>,
     /// `true` when the file has changed since indexing (mtime mismatch or deleted).

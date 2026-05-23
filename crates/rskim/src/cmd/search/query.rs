@@ -99,11 +99,15 @@ fn resolve_paths_and_snippets(
 
             let manifest_entry = manifest.lookup(path);
 
-            let (line_number, snippet, stale) =
+            let (line_number, line_range, snippet, stale) =
                 match extract_snippet(root, path, &r.match_positions, manifest_entry) {
-                    SnippetOutcome::Ok(ln, ctx) => (Some(ln), Some(ctx), false),
-                    SnippetOutcome::Stale => (None, None, true),
-                    SnippetOutcome::Unavailable => (None, None, false),
+                    SnippetOutcome::Ok {
+                        match_line,
+                        line_range,
+                        context,
+                    } => (Some(match_line), Some(line_range), Some(context), false),
+                    SnippetOutcome::Stale => (None, None, None, true),
+                    SnippetOutcome::Unavailable => (None, None, None, false),
                 };
 
             Some(ResolvedResult {
@@ -111,6 +115,7 @@ fn resolve_paths_and_snippets(
                 score: r.score,
                 field: r.field.name().to_string(),
                 line_number,
+                line_range,
                 snippet,
                 stale,
                 match_positions: r.match_positions.clone(),

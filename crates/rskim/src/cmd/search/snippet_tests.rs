@@ -7,77 +7,7 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{SnippetOutcome, byte_offset_to_line, extract_context_window, extract_snippet};
-
-// ============================================================================
-// byte_offset_to_line
-// ============================================================================
-
-#[test]
-fn test_byte_offset_to_line_start_of_file() {
-    let content = b"line1\nline2\nline3\n";
-    assert_eq!(byte_offset_to_line(content, 0), 1, "offset 0 → line 1");
-}
-
-#[test]
-fn test_byte_offset_to_line_second_line() {
-    let content = b"line1\nline2\nline3\n";
-    // "line2" starts at offset 6
-    assert_eq!(
-        byte_offset_to_line(content, 6),
-        2,
-        "start of line2 → line 2"
-    );
-}
-
-#[test]
-fn test_byte_offset_to_line_middle_of_line() {
-    let content = b"hello\nworld\n";
-    // offset 8 is in "world" (after the 'o')
-    assert_eq!(
-        byte_offset_to_line(content, 8),
-        2,
-        "middle of second line → line 2"
-    );
-}
-
-#[test]
-fn test_byte_offset_to_line_last_line_no_trailing_newline() {
-    let content = b"a\nb\nc";
-    // offset 4 is 'c' on line 3 (no trailing newline)
-    assert_eq!(byte_offset_to_line(content, 4), 3);
-}
-
-#[test]
-fn test_byte_offset_to_line_empty_file() {
-    let content = b"";
-    // Edge: empty file, offset 0
-    assert_eq!(byte_offset_to_line(content, 0), 1);
-}
-
-#[test]
-fn test_byte_offset_to_line_offset_at_newline() {
-    let content = b"abc\ndef\n";
-    // offset 3 is the newline at end of "abc" — still on line 1
-    assert_eq!(byte_offset_to_line(content, 3), 1);
-}
-
-#[test]
-fn test_byte_offset_to_line_out_of_bounds_offset_is_clamped() {
-    // Offset larger than content length must not panic and must return a valid
-    // (clamped) line number — specifically the last line of the file.
-    let content = b"line1\nline2\n";
-    let huge_offset = content.len() + 9999;
-    // The safe_offset clamp in byte_offset_to_line means this is equivalent to
-    // passing content.len() exactly, which counts both newlines → line 3.
-    let result = byte_offset_to_line(content, huge_offset);
-    assert!(
-        result >= 1,
-        "out-of-bounds offset must yield a positive line number, got {result}"
-    );
-    // Clamping to content.len() (12) counts 2 newlines → reports line 3.
-    assert_eq!(result, 3, "clamped to end-of-content → line 3");
-}
+use super::{SnippetOutcome, extract_context_window, extract_snippet};
 
 // ============================================================================
 // extract_context_window
@@ -177,16 +107,49 @@ fn test_extract_snippet_basic_match() {
     fs::write(src_dir.join("lib.rs"), content).unwrap();
 
     let result = extract_snippet(&root, "src/lib.rs", &[0..3], None);
-    let (line_no, ctx) = match result {
-        SnippetOutcome::Ok(ln, ctx) => (ln, ctx),
-        other => panic!("expected Ok, got {other:?}"),
+    let SnippetOutcome::Ok {
+        match_line,
+        context: ctx,
+        ..
+    } = result
+    else {
+        panic!("expected Ok, got {result:?}");
     };
-    assert_eq!(line_no, 1, "match at offset 0 → line 1");
+    assert_eq!(match_line, 1, "match at offset 0 → line 1");
     assert!(!ctx.lines.is_empty());
     // The match line should be marked
-    let match_line = ctx.lines.iter().find(|l| l.is_match).unwrap();
-    assert_eq!(match_line.line_number, 1);
-    assert!(match_line.content.contains("fn foo"));
+    let matched = ctx.lines.iter().find(|l| l.is_match).unwrap();
+    assert_eq!(matched.line_number, 1);
+    assert!(matched.content.contains("fn foo"));
+}
+
+#[test]
+fn test_extract_snippet_computes_line_range() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let src_dir = root.join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    // 5 lines: "aa\n" = 3 bytes each, last "ee\n" = 3 bytes
+    // line 1 offset 0, line 2 offset 3, line 3 offset 6, line 4 offset 9, line 5 offset 12
+    let content = "aa\nbb\ncc\ndd\nee\n";
+    fs::write(src_dir.join("multi.rs"), content).unwrap();
+
+    // Match positions on line 2 (offset 3) and line 4 (offset 9)
+    let result = extract_snippet(&root, "src/multi.rs", &[3..5, 9..11], None);
+    let SnippetOutcome::Ok {
+        match_line,
+        line_range,
+        ..
+    } = result
+    else {
+        panic!("expected Ok, got {result:?}");
+    };
+    assert_eq!(match_line, 2, "primary match line from first position");
+    assert_eq!(
+        line_range,
+        2..5,
+        "line_range spans lines 2-4 inclusive (2..5 exclusive)"
+    );
 }
 
 #[test]
