@@ -7,77 +7,7 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{SnippetOutcome, byte_offset_to_line, extract_context_window, extract_snippet};
-
-// ============================================================================
-// byte_offset_to_line
-// ============================================================================
-
-#[test]
-fn test_byte_offset_to_line_start_of_file() {
-    let content = b"line1\nline2\nline3\n";
-    assert_eq!(byte_offset_to_line(content, 0), 1, "offset 0 → line 1");
-}
-
-#[test]
-fn test_byte_offset_to_line_second_line() {
-    let content = b"line1\nline2\nline3\n";
-    // "line2" starts at offset 6
-    assert_eq!(
-        byte_offset_to_line(content, 6),
-        2,
-        "start of line2 → line 2"
-    );
-}
-
-#[test]
-fn test_byte_offset_to_line_middle_of_line() {
-    let content = b"hello\nworld\n";
-    // offset 8 is in "world" (after the 'o')
-    assert_eq!(
-        byte_offset_to_line(content, 8),
-        2,
-        "middle of second line → line 2"
-    );
-}
-
-#[test]
-fn test_byte_offset_to_line_last_line_no_trailing_newline() {
-    let content = b"a\nb\nc";
-    // offset 4 is 'c' on line 3 (no trailing newline)
-    assert_eq!(byte_offset_to_line(content, 4), 3);
-}
-
-#[test]
-fn test_byte_offset_to_line_empty_file() {
-    let content = b"";
-    // Edge: empty file, offset 0
-    assert_eq!(byte_offset_to_line(content, 0), 1);
-}
-
-#[test]
-fn test_byte_offset_to_line_offset_at_newline() {
-    let content = b"abc\ndef\n";
-    // offset 3 is the newline at end of "abc" — still on line 1
-    assert_eq!(byte_offset_to_line(content, 3), 1);
-}
-
-#[test]
-fn test_byte_offset_to_line_out_of_bounds_offset_is_clamped() {
-    // Offset larger than content length must not panic and must return a valid
-    // (clamped) line number — specifically the last line of the file.
-    let content = b"line1\nline2\n";
-    let huge_offset = content.len() + 9999;
-    // The safe_offset clamp in byte_offset_to_line means this is equivalent to
-    // passing content.len() exactly, which counts both newlines → line 3.
-    let result = byte_offset_to_line(content, huge_offset);
-    assert!(
-        result >= 1,
-        "out-of-bounds offset must yield a positive line number, got {result}"
-    );
-    // Clamping to content.len() (12) counts 2 newlines → reports line 3.
-    assert_eq!(result, 3, "clamped to end-of-content → line 3");
-}
+use super::{SnippetOutcome, extract_context_window, extract_snippet};
 
 // ============================================================================
 // extract_context_window
@@ -178,7 +108,7 @@ fn test_extract_snippet_basic_match() {
 
     let result = extract_snippet(&root, "src/lib.rs", &[0..3], None);
     let (line_no, _lr, ctx) = match result {
-        SnippetOutcome::Ok(ln, lr, ctx) => (ln, lr, ctx),
+        SnippetOutcome::Ok { match_line, line_range, context } => (match_line, line_range, context),
         other => panic!("expected Ok, got {other:?}"),
     };
     assert_eq!(line_no, 1, "match at offset 0 → line 1");
@@ -203,7 +133,7 @@ fn test_extract_snippet_computes_line_range() {
     // Match positions on line 2 (offset 3) and line 4 (offset 9)
     let result = extract_snippet(&root, "src/multi.rs", &[3..5, 9..11], None);
     let (line_no, lr, _ctx) = match result {
-        SnippetOutcome::Ok(ln, lr, ctx) => (ln, lr, ctx),
+        SnippetOutcome::Ok { match_line, line_range, context } => (match_line, line_range, context),
         other => panic!("expected Ok, got {other:?}"),
     };
     assert_eq!(line_no, 2, "primary match line from first position");
