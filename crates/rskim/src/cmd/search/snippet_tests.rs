@@ -107,16 +107,20 @@ fn test_extract_snippet_basic_match() {
     fs::write(src_dir.join("lib.rs"), content).unwrap();
 
     let result = extract_snippet(&root, "src/lib.rs", &[0..3], None);
-    let (line_no, _lr, ctx) = match result {
-        SnippetOutcome::Ok { match_line, line_range, context } => (match_line, line_range, context),
-        other => panic!("expected Ok, got {other:?}"),
+    let SnippetOutcome::Ok {
+        match_line,
+        context: ctx,
+        ..
+    } = result
+    else {
+        panic!("expected Ok, got {result:?}");
     };
-    assert_eq!(line_no, 1, "match at offset 0 → line 1");
+    assert_eq!(match_line, 1, "match at offset 0 → line 1");
     assert!(!ctx.lines.is_empty());
     // The match line should be marked
-    let match_line = ctx.lines.iter().find(|l| l.is_match).unwrap();
-    assert_eq!(match_line.line_number, 1);
-    assert!(match_line.content.contains("fn foo"));
+    let matched = ctx.lines.iter().find(|l| l.is_match).unwrap();
+    assert_eq!(matched.line_number, 1);
+    assert!(matched.content.contains("fn foo"));
 }
 
 #[test]
@@ -132,12 +136,20 @@ fn test_extract_snippet_computes_line_range() {
 
     // Match positions on line 2 (offset 3) and line 4 (offset 9)
     let result = extract_snippet(&root, "src/multi.rs", &[3..5, 9..11], None);
-    let (line_no, lr, _ctx) = match result {
-        SnippetOutcome::Ok { match_line, line_range, context } => (match_line, line_range, context),
-        other => panic!("expected Ok, got {other:?}"),
+    let SnippetOutcome::Ok {
+        match_line,
+        line_range,
+        ..
+    } = result
+    else {
+        panic!("expected Ok, got {result:?}");
     };
-    assert_eq!(line_no, 2, "primary match line from first position");
-    assert_eq!(lr, 2..5, "line_range spans lines 2-4 inclusive (2..5 exclusive)");
+    assert_eq!(match_line, 2, "primary match line from first position");
+    assert_eq!(
+        line_range,
+        2..5,
+        "line_range spans lines 2-4 inclusive (2..5 exclusive)"
+    );
 }
 
 #[test]

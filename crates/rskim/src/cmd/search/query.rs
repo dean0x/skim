@@ -101,9 +101,11 @@ fn resolve_paths_and_snippets(
 
             let (line_number, line_range, snippet, stale) =
                 match extract_snippet(root, path, &r.match_positions, manifest_entry) {
-                    SnippetOutcome::Ok { match_line, line_range, context } => {
-                        (Some(match_line), Some(line_range), Some(context), false)
-                    }
+                    SnippetOutcome::Ok {
+                        match_line,
+                        line_range,
+                        context,
+                    } => (Some(match_line), Some(line_range), Some(context), false),
                     SnippetOutcome::Stale => (None, None, None, true),
                     SnippetOutcome::Unavailable => (None, None, None, false),
                 };

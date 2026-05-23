@@ -319,10 +319,7 @@ fn test_resolved_result_line_range_some_serializes_start_end() {
         value["line_range"]["start"], 5,
         "line_range.start must be 5"
     );
-    assert_eq!(
-        value["line_range"]["end"], 13,
-        "line_range.end must be 13"
-    );
+    assert_eq!(value["line_range"]["end"], 13, "line_range.end must be 13");
 }
 
 /// line_range: None must serialise as JSON null.

@@ -146,8 +146,7 @@ pub(super) fn extract_snippet(
         Err(_) => return SnippetOutcome::Unavailable,
     };
 
-    let match_line =
-        rskim_search::byte_offset_to_line(&content, match_positions[0].start) as u32;
+    let match_line = rskim_search::byte_offset_to_line(&content, match_positions[0].start) as u32;
 
     let line_range = rskim_search::compute_line_range(&content, match_positions);
 

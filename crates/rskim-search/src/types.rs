@@ -373,7 +373,9 @@ pub fn compute_line_range(content: &[u8], match_positions: &[Range<usize>]) -> R
     let (min_line, max_line) = match_positions
         .iter()
         .map(|pos| byte_offset_to_line(content, pos.start))
-        .fold((usize::MAX, 0usize), |(mn, mx), line| (mn.min(line), mx.max(line)));
+        .fold((usize::MAX, 0usize), |(mn, mx), line| {
+            (mn.min(line), mx.max(line))
+        });
 
     min_line..(max_line + 1)
 }
@@ -1075,6 +1077,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn test_line_range_single_position() {
         // offset 2 on "a\nb\nc" -> line 2 (byte 2 = 'b')
         assert_eq!(compute_line_range(b"a\nb\nc", &[2..3]), 2..3);
