@@ -21,9 +21,9 @@
 //! let partners = reader.pairs_for_file(FileId(0)).unwrap();
 //! ```
 
-pub(crate) mod builder;
-pub(crate) mod format;
-pub(crate) mod reader;
+mod builder;
+mod format;
+mod reader;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 

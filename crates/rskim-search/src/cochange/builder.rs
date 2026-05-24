@@ -48,7 +48,6 @@ impl CochangeMatrixBuilder {
     /// # Errors
     ///
     /// Returns [`SearchError::Io`] if `output_dir` does not exist.
-    #[must_use = "this returns a Result that should be checked"]
     pub fn new(output_dir: PathBuf) -> Result<Self> {
         if !output_dir.exists() {
             return Err(SearchError::Io(std::io::Error::new(
@@ -73,7 +72,6 @@ impl CochangeMatrixBuilder {
     /// - [`SearchError::IndexCorrupted`] if the number of accumulated pairs
     ///   exceeds [`MAX_PAIRS`].
     /// - [`SearchError::Io`] if writing fails.
-    #[must_use = "this returns a Result that should be checked"]
     pub fn build(
         &self,
         history: &HistoryResult,

@@ -282,6 +282,11 @@ pub(crate) fn lookup_pair(pairs_data: &[u8], file_a: u32, file_b: u32) -> Result
 
 /// Compute the CRC32 checksum of `data`.
 ///
+/// CRC32 detects accidental corruption (bit flips, truncation) but is NOT a
+/// cryptographic integrity check — it does not protect against intentional
+/// tampering. This is acceptable because `.skcc` files are derived caches
+/// rebuildable from git history.
+///
 /// The header checksum covers the `FileCommitEntry` array bytes concatenated
 /// with the `PairEntry` array bytes.
 pub(crate) fn compute_checksum(data: &[u8]) -> u32 {
