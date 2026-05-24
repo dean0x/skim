@@ -318,7 +318,7 @@ fn test_max_pairs_safety_cap_returns_capacity_exceeded() {
     let history = make_history(vec![vec!["a.rs", "b.rs", "c.rs"]]);
     let path_map = make_path_map(&["a.rs", "b.rs", "c.rs"]);
 
-    let result = builder.build_with_max_pairs(&history, &path_map, 2);
+    let result = builder.build_with_limit(&history, &path_map, 2);
     assert!(result.is_err(), "should fail when pair count exceeds limit");
     let err = result.err().unwrap();
     assert!(

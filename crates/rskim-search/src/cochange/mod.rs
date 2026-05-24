@@ -25,7 +25,7 @@ mod builder;
 mod format;
 mod reader;
 #[cfg(test)]
-pub(crate) mod test_helpers;
+pub(super) mod test_helpers;
 
 pub use builder::CochangeMatrixBuilder;
 pub use reader::CochangeMatrixReader;

@@ -6,6 +6,7 @@
 //! The output file is written atomically via [`tempfile::NamedTempFile`] + `persist`
 //! (rename), so readers never observe a partial write.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -82,19 +83,9 @@ impl CochangeMatrixBuilder {
 
     /// Like [`build`] but with a caller-supplied `max_pairs` limit.
     ///
-    /// Intended for unit tests that need to trigger the safety cap without
-    /// generating 2 million distinct pairs.
-    #[cfg(test)]
-    pub(crate) fn build_with_max_pairs(
-        &self,
-        history: &HistoryResult,
-        path_map: &HashMap<PathBuf, FileId>,
-        max_pairs: usize,
-    ) -> Result<CochangeStats> {
-        self.build_with_limit(history, path_map, max_pairs)
-    }
-
-    fn build_with_limit(
+    /// `pub(crate)` so tests can trigger the safety cap with a small limit
+    /// without generating 2 million distinct pairs.
+    pub(crate) fn build_with_limit(
         &self,
         history: &HistoryResult,
         path_map: &HashMap<PathBuf, FileId>,
@@ -212,12 +203,10 @@ fn generate_pairs(
     pair_counts: &mut HashMap<(u32, u32), u32>,
     max_pairs: usize,
 ) -> Result<()> {
-    for i in 0..ids.len() {
-        for j in (i + 1)..ids.len() {
-            let a = ids[i];
-            let b = ids[j];
+    for (idx, &a) in ids.iter().enumerate() {
+        for &b in &ids[idx + 1..] {
             // a < b guaranteed by construction; self-pairs (a==b) impossible
-            // when i != j and all IDs in a commit are distinct paths.
+            // because ids is sorted and deduplicated.
             debug_assert!(a < b, "canonical pair invariant: a({a}) < b({b})");
 
             // Use Entry API for a single hash probe in the common (under-
@@ -225,7 +214,6 @@ fn generate_pairs(
             // against inserting new keys while still allowing increments to
             // existing ones — the Occupied/Vacant match handles both in a
             // single lookup.
-            use std::collections::hash_map::Entry;
             if pair_counts.len() < max_pairs {
                 // Under capacity: entry() is safe to insert; single probe.
                 let count = pair_counts.entry((a, b)).or_insert(0);
