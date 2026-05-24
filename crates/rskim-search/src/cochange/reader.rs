@@ -20,9 +20,11 @@
 //!
 //! # SAFETY
 //!
-//! The mmap is created read-only.  If another process truncates or overwrites
-//! `cochange.skcc` concurrently, behaviour is undefined — this is an inherent
-//! constraint of mmap-based indexes.
+//! The mmap is created read-only. The builder uses atomic rename
+//! (tempfile::persist) to write new `.skcc` files, so on POSIX systems
+//! existing mmaps continue referencing the old inode even after a rebuild.
+//! On Windows, concurrent build + read is not safe — callers must
+//! serialize access.
 
 use std::path::Path;
 
@@ -66,12 +68,12 @@ impl CochangeMatrixReader {
     ///
     /// - [`SearchError::Io`] if `cochange.skcc` cannot be opened.
     /// - [`SearchError::IndexCorrupted`] if validation fails.
-    #[must_use = "dropping the reader immediately means no queries can be made"]
     pub fn open(dir: &Path) -> Result<Self> {
         let path = dir.join("cochange.skcc");
         let file = std::fs::File::open(&path)?;
 
-        // SAFETY: The file is not modified after mapping. See module-level note.
+        // SAFETY: read-only mmap. On POSIX, atomic-rename in builder means
+        // concurrent rebuilds don't invalidate this mapping. See module-level note.
         let mmap = unsafe { Mmap::map(&file) }?;
 
         let header = decode_header(&mmap)?;
@@ -132,7 +134,6 @@ impl CochangeMatrixReader {
     /// # Errors
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the pair data is malformed.
-    #[must_use = "ignoring the co-change count discards the query result"]
     pub fn pair_count(&self, a: FileId, b: FileId) -> Result<u32> {
         if a == b {
             return Ok(0);
@@ -151,7 +152,6 @@ impl CochangeMatrixReader {
     /// # Errors
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the underlying data is malformed.
-    #[must_use = "ignoring the Jaccard similarity discards the query result"]
     pub fn jaccard(&self, a: FileId, b: FileId) -> Result<f64> {
         if a == b {
             return Ok(0.0);
@@ -174,12 +174,17 @@ impl CochangeMatrixReader {
     ///
     /// # Complexity
     ///
-    /// **O(pair_count)** — performs a full linear scan over all pair entries.
-    /// At the `MAX_PAIRS` cap of 2,000,000 pairs this reads up to ~24 MB per
-    /// call.  Pairs are stored sorted by `(file_a, file_b)`, so `file_a`
-    /// matches form a contiguous range — a future optimisation could use
-    /// binary search on the `file_a` dimension to reduce this to
-    /// O(log(pair_count) + k) where k is the number of matching pairs.
+    /// **O(log(pair_count) + k)** where k is the number of matching pairs.
+    ///
+    /// Pairs are stored sorted by `(file_a, file_b)` with the invariant
+    /// `file_a < file_b`. For a query `id`:
+    /// - Entries where `file_a == id` form a **contiguous** block. Binary
+    ///   search locates the start of that block in O(log n), then a short
+    ///   forward scan collects all `file_a` matches.
+    /// - Entries where `file_b == id` must have `file_a < id`, so they lie
+    ///   entirely **before** the `file_a` block. Only that prefix is scanned
+    ///   linearly (O(start)), which is bounded by how many files have a lower
+    ///   ID than `id`.
     ///
     /// Returns an empty Vec for unknown `file_id` values.
     ///
@@ -192,14 +197,43 @@ impl CochangeMatrixReader {
         let n = pairs_data.len() / PAIR_ENTRY_SIZE;
         let mut results: Vec<(FileId, u32)> = Vec::new();
 
-        for i in 0..n {
+        // Binary search for the first entry where file_a >= id.
+        // This is the lower bound of the contiguous file_a == id block.
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let offset = mid * PAIR_ENTRY_SIZE;
+            let entry = super::format::decode_pair(&pairs_data[offset..offset + PAIR_ENTRY_SIZE])?;
+            if entry.file_a < id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let file_a_start = lo;
+
+        // Scan the prefix [0, file_a_start) for file_b == id matches.
+        // These entries have file_a < id (by invariant file_a < file_b, any
+        // entry where file_b == id must have file_a < id).
+        for i in 0..file_a_start {
             let offset = i * PAIR_ENTRY_SIZE;
             let entry = super::format::decode_pair(&pairs_data[offset..offset + PAIR_ENTRY_SIZE])?;
-            if entry.file_a == id {
-                results.push((FileId(entry.file_b), entry.count));
-            } else if entry.file_b == id {
+            if entry.file_b == id {
                 results.push((FileId(entry.file_a), entry.count));
             }
+        }
+
+        // Scan forward from file_a_start while file_a == id (contiguous block).
+        let mut i = file_a_start;
+        while i < n {
+            let offset = i * PAIR_ENTRY_SIZE;
+            let entry = super::format::decode_pair(&pairs_data[offset..offset + PAIR_ENTRY_SIZE])?;
+            if entry.file_a != id {
+                break;
+            }
+            results.push((FileId(entry.file_b), entry.count));
+            i += 1;
         }
 
         // Sort by count descending; tie-break by FileId ascending for determinism.
