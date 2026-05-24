@@ -161,7 +161,9 @@ fn test_coupling_max_files_skip_exceeds() {
     let builder = CochangeMatrixBuilder::new(tmp.path().to_path_buf()).unwrap();
 
     // Create a commit with COUPLING_MAX_FILES + 1 files
-    let paths: Vec<String> = (0..=COUPLING_MAX_FILES).map(|i| format!("f{i}.rs")).collect();
+    let paths: Vec<String> = (0..=COUPLING_MAX_FILES)
+        .map(|i| format!("f{i}.rs"))
+        .collect();
     let path_strs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let history = make_history(vec![path_strs.clone()]);
     let path_map = make_path_map(&path_strs);
@@ -181,7 +183,9 @@ fn test_coupling_max_files_exactly_at_limit_processed() {
     let builder = CochangeMatrixBuilder::new(tmp.path().to_path_buf()).unwrap();
 
     // Exactly COUPLING_MAX_FILES files — should be processed
-    let paths: Vec<String> = (0..COUPLING_MAX_FILES).map(|i| format!("f{i}.rs")).collect();
+    let paths: Vec<String> = (0..COUPLING_MAX_FILES)
+        .map(|i| format!("f{i}.rs"))
+        .collect();
     let path_strs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let history = make_history(vec![path_strs.clone()]);
     let path_map = make_path_map(&path_strs);
@@ -242,7 +246,9 @@ fn test_commits_processed_counts_all_commits() {
     let builder = CochangeMatrixBuilder::new(tmp.path().to_path_buf()).unwrap();
 
     // 3 commits, one is too large to produce pairs but still counted
-    let paths: Vec<String> = (0..=COUPLING_MAX_FILES).map(|i| format!("f{i}.rs")).collect();
+    let paths: Vec<String> = (0..=COUPLING_MAX_FILES)
+        .map(|i| format!("f{i}.rs"))
+        .collect();
     let path_strs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let history = make_history(vec![
         vec!["a.rs", "b.rs"],
@@ -251,7 +257,9 @@ fn test_commits_processed_counts_all_commits() {
     ]);
     let mut path_map = make_path_map(&["a.rs", "b.rs", "c.rs"]);
     for (i, p) in path_strs.iter().enumerate() {
-        path_map.entry(PathBuf::from(p)).or_insert(FileId(i as u32 + 100));
+        path_map
+            .entry(PathBuf::from(p))
+            .or_insert(FileId(i as u32 + 100));
     }
 
     let stats = builder.build(&history, &path_map).unwrap();
@@ -289,10 +297,7 @@ fn test_build_then_read_roundtrip() {
     let builder = CochangeMatrixBuilder::new(tmp.path().to_path_buf()).unwrap();
 
     // Two commits: (a,b) and (a,b,c)
-    let history = make_history(vec![
-        vec!["a.rs", "b.rs"],
-        vec!["a.rs", "b.rs", "c.rs"],
-    ]);
+    let history = make_history(vec![vec!["a.rs", "b.rs"], vec!["a.rs", "b.rs", "c.rs"]]);
     let path_map = make_path_map(&["a.rs", "b.rs", "c.rs"]);
 
     let stats = builder.build(&history, &path_map).unwrap();
@@ -333,5 +338,8 @@ fn test_duplicate_paths_in_commit_deduplicated() {
     use crate::cochange::CochangeMatrixReader;
     let reader = CochangeMatrixReader::open(tmp.path()).unwrap();
     let count = reader.pair_count(FileId(0), FileId(1)).unwrap();
-    assert_eq!(count, 1, "co-change count should be 1, not inflated by duplicates");
+    assert_eq!(
+        count, 1,
+        "co-change count should be 1, not inflated by duplicates"
+    );
 }

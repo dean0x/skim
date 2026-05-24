@@ -113,11 +113,7 @@ pub(crate) struct PairEntry {
 ///
 /// Returns [`SearchError::IndexCorrupted`] if the range would overflow `usize`
 /// or exceeds `data.len()`, rather than panicking.
-fn read_array<const N: usize>(
-    data: &[u8],
-    start: usize,
-    context: &'static str,
-) -> Result<[u8; N]> {
+fn read_array<const N: usize>(data: &[u8], start: usize, context: &'static str) -> Result<[u8; N]> {
     let end = start
         .checked_add(N)
         .ok_or_else(|| SearchError::IndexCorrupted(format!("{context}: offset overflow")))?;
@@ -256,11 +252,7 @@ pub(crate) fn decode_pair(data: &[u8]) -> Result<PairEntry> {
 ///
 /// Returns `Ok(Some(count))` if found, `Ok(None)` if absent, or
 /// [`SearchError::IndexCorrupted`] if the slice is malformed.
-pub(crate) fn lookup_pair(
-    pairs_data: &[u8],
-    file_a: u32,
-    file_b: u32,
-) -> Result<Option<u32>> {
+pub(crate) fn lookup_pair(pairs_data: &[u8], file_a: u32, file_b: u32) -> Result<Option<u32>> {
     if !pairs_data.len().is_multiple_of(PAIR_ENTRY_SIZE) {
         return Err(SearchError::IndexCorrupted(format!(
             "pairs_data length {} is not a multiple of PAIR_ENTRY_SIZE {}; likely corrupt",

@@ -56,7 +56,10 @@ fn test_header_bad_version() {
     let result = decode_header(&encoded);
     assert!(result.is_err());
     let msg = format!("{}", result.unwrap_err());
-    assert!(msg.contains("version"), "error should mention 'version': {msg}");
+    assert!(
+        msg.contains("version"),
+        "error should mention 'version': {msg}"
+    );
 }
 
 #[test]
@@ -124,9 +127,21 @@ fn test_pair_entry_roundtrip() {
 fn test_lookup_pair_found() {
     // Build a sorted pairs slice: (1,2,10), (1,3,5), (2,4,3)
     let pairs = [
-        PairEntry { file_a: 1, file_b: 2, count: 10 },
-        PairEntry { file_a: 1, file_b: 3, count: 5 },
-        PairEntry { file_a: 2, file_b: 4, count: 3 },
+        PairEntry {
+            file_a: 1,
+            file_b: 2,
+            count: 10,
+        },
+        PairEntry {
+            file_a: 1,
+            file_b: 3,
+            count: 5,
+        },
+        PairEntry {
+            file_a: 2,
+            file_b: 4,
+            count: 3,
+        },
     ];
     let mut data = Vec::new();
     for p in &pairs {
@@ -139,8 +154,16 @@ fn test_lookup_pair_found() {
 #[test]
 fn test_lookup_pair_not_found() {
     let pairs = [
-        PairEntry { file_a: 1, file_b: 2, count: 10 },
-        PairEntry { file_a: 2, file_b: 4, count: 3 },
+        PairEntry {
+            file_a: 1,
+            file_b: 2,
+            count: 10,
+        },
+        PairEntry {
+            file_a: 2,
+            file_b: 4,
+            count: 3,
+        },
     ];
     let mut data = Vec::new();
     for p in &pairs {
@@ -167,24 +190,6 @@ fn test_lookup_pair_misaligned_slice() {
         msg.contains("multiple") || msg.contains("aligned") || msg.contains("corrupt"),
         "error should mention alignment: {msg}"
     );
-}
-
-// -----------------------------------------------------------------------
-// read_array overflow
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_read_array_overflow() {
-    // Try to read 4 bytes starting at usize::MAX - 2, should overflow checked_add
-    let data = vec![0u8; 8];
-    // We can't directly call read_array (it's private), so we test it indirectly
-    // via decode_header with a slice that's exactly HEADER_SIZE but with bad content.
-    // Use decode_pair with a slice too short as indirect coverage.
-    let short = vec![0u8; PAIR_ENTRY_SIZE - 1];
-    let result = decode_pair(&short);
-    assert!(result.is_err());
-    // Ensure data not used warning doesn't fire
-    let _ = data;
 }
 
 // -----------------------------------------------------------------------

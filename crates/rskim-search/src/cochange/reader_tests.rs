@@ -122,11 +122,7 @@ fn test_pair_count_correct() {
 #[test]
 fn test_pair_count_canonical_order_transparent_to_caller() {
     let tmp = TempDir::new().unwrap();
-    let reader = build_matrix(
-        &tmp,
-        vec![vec!["a.rs", "b.rs"]],
-        &["a.rs", "b.rs"],
-    );
+    let reader = build_matrix(&tmp, vec![vec!["a.rs", "b.rs"]], &["a.rs", "b.rs"]);
 
     // Regardless of which order the caller passes the IDs, result is the same.
     assert_eq!(reader.pair_count(FileId(0), FileId(1)).unwrap(), 1);
@@ -136,11 +132,7 @@ fn test_pair_count_canonical_order_transparent_to_caller() {
 #[test]
 fn test_pair_count_absent_pair_returns_zero() {
     let tmp = TempDir::new().unwrap();
-    let reader = build_matrix(
-        &tmp,
-        vec![vec!["a.rs", "b.rs"]],
-        &["a.rs", "b.rs", "c.rs"],
-    );
+    let reader = build_matrix(&tmp, vec![vec!["a.rs", "b.rs"]], &["a.rs", "b.rs", "c.rs"]);
 
     // c.rs never co-changed with anyone
     assert_eq!(reader.pair_count(FileId(0), FileId(2)).unwrap(), 0);
@@ -214,16 +206,20 @@ fn test_file_commits_correct() {
     let tmp = TempDir::new().unwrap();
     let reader = build_matrix(
         &tmp,
-        vec![
-            vec!["a.rs", "b.rs"],
-            vec!["a.rs"],
-            vec!["a.rs"],
-        ],
+        vec![vec!["a.rs", "b.rs"], vec!["a.rs"], vec!["a.rs"]],
         &["a.rs", "b.rs"],
     );
 
-    assert_eq!(reader.file_commits(FileId(0)).unwrap(), 3, "a.rs in 3 commits");
-    assert_eq!(reader.file_commits(FileId(1)).unwrap(), 1, "b.rs in 1 commit");
+    assert_eq!(
+        reader.file_commits(FileId(0)).unwrap(),
+        3,
+        "a.rs in 3 commits"
+    );
+    assert_eq!(
+        reader.file_commits(FileId(1)).unwrap(),
+        1,
+        "b.rs in 1 commit"
+    );
 }
 
 #[test]
@@ -257,7 +253,11 @@ fn test_pairs_for_file_sorted_by_count_desc() {
     assert_eq!(pairs.len(), 2, "a.rs co-changes with 2 files");
 
     // First result should be the highest count (b.rs with count 2)
-    assert_eq!(pairs[0].0, FileId(1), "highest count partner should be first");
+    assert_eq!(
+        pairs[0].0,
+        FileId(1),
+        "highest count partner should be first"
+    );
     assert_eq!(pairs[0].1, 2);
 
     assert_eq!(pairs[1].0, FileId(2));

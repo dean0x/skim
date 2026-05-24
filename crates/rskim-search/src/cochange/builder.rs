@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use super::format::{
-    FILE_COMMIT_ENTRY_SIZE, FileCommitEntry, HEADER_SIZE, PAIR_ENTRY_SIZE, PairEntry, SKCC_MAGIC,
-    SkccHeader, encode_file_commit, encode_header, encode_pair, FORMAT_VERSION,
+    FILE_COMMIT_ENTRY_SIZE, FORMAT_VERSION, FileCommitEntry, HEADER_SIZE, PAIR_ENTRY_SIZE,
+    PairEntry, SKCC_MAGIC, SkccHeader, encode_file_commit, encode_header, encode_pair,
 };
 use crate::{CochangeStats, FileId, HistoryResult, Result, SearchError};
 
@@ -105,8 +105,7 @@ fn accumulate_pairs(
 ) -> Result<AccumulatedPairs> {
     let mut pair_counts: HashMap<(u32, u32), u32> =
         HashMap::with_capacity(history.commits.len().saturating_mul(4));
-    let mut file_commit_counts: HashMap<u32, u32> =
-        HashMap::with_capacity(path_map.len());
+    let mut file_commit_counts: HashMap<u32, u32> = HashMap::with_capacity(path_map.len());
 
     let mut commits_processed: u32 = 0;
     let mut commits_skipped_too_large: u32 = 0;
@@ -165,8 +164,8 @@ fn accumulate_pairs(
     }
 
     let stats = CochangeStats {
-        pair_count: 0,  // filled in after accumulation
-        file_count: 0,  // filled in after accumulation
+        pair_count: 0, // filled in after accumulation
+        file_count: 0, // filled in after accumulation
         commits_processed,
         commits_skipped_too_large,
         unknown_paths_skipped,
@@ -183,14 +182,21 @@ fn serialize(
     // Sort file_commit entries by file_id ascending.
     let mut file_entries: Vec<FileCommitEntry> = file_commit_counts
         .iter()
-        .map(|(&file_id, &commit_count)| FileCommitEntry { file_id, commit_count })
+        .map(|(&file_id, &commit_count)| FileCommitEntry {
+            file_id,
+            commit_count,
+        })
         .collect();
     file_entries.sort_unstable_by_key(|e| e.file_id);
 
     // Sort pair entries by (file_a, file_b) ascending.
     let mut pair_entries: Vec<PairEntry> = pair_counts
         .iter()
-        .map(|(&(file_a, file_b), &count)| PairEntry { file_a, file_b, count })
+        .map(|(&(file_a, file_b), &count)| PairEntry {
+            file_a,
+            file_b,
+            count,
+        })
         .collect();
     pair_entries.sort_unstable_by_key(|p| (p.file_a, p.file_b));
 

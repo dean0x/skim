@@ -72,9 +72,7 @@ impl CochangeMatrixReader {
         let fc_bytes = (header.file_count as usize)
             .checked_mul(FILE_COMMIT_ENTRY_SIZE)
             .ok_or_else(|| {
-                SearchError::IndexCorrupted(
-                    "file_count * FILE_COMMIT_ENTRY_SIZE overflow".into(),
-                )
+                SearchError::IndexCorrupted("file_count * FILE_COMMIT_ENTRY_SIZE overflow".into())
             })?;
         let pair_bytes = (header.pair_count as usize)
             .checked_mul(PAIR_ENTRY_SIZE)
@@ -146,8 +144,7 @@ impl CochangeMatrixReader {
         }
         let count_a = self.file_commits(a)?;
         let count_b = self.file_commits(b)?;
-        let denominator =
-            u64::from(count_a) + u64::from(count_b) - u64::from(count_ab);
+        let denominator = u64::from(count_a) + u64::from(count_b) - u64::from(count_ab);
         if denominator == 0 {
             return Ok(0.0);
         }
@@ -202,8 +199,7 @@ impl CochangeMatrixReader {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let offset = mid * FILE_COMMIT_ENTRY_SIZE;
-            let entry =
-                decode_file_commit(&fc_data[offset..offset + FILE_COMMIT_ENTRY_SIZE])?;
+            let entry = decode_file_commit(&fc_data[offset..offset + FILE_COMMIT_ENTRY_SIZE])?;
             match entry.file_id.cmp(&id) {
                 std::cmp::Ordering::Equal => return Ok(entry.commit_count),
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -226,8 +222,7 @@ impl CochangeMatrixReader {
 
     /// Slice of pair entries within the mmap.
     fn pairs_slice(&self) -> &[u8] {
-        let fc_end =
-            HEADER_SIZE + (self.header.file_count as usize) * FILE_COMMIT_ENTRY_SIZE;
+        let fc_end = HEADER_SIZE + (self.header.file_count as usize) * FILE_COMMIT_ENTRY_SIZE;
         let pairs_end = fc_end + (self.header.pair_count as usize) * PAIR_ENTRY_SIZE;
         &self.mmap[fc_end..pairs_end]
     }
