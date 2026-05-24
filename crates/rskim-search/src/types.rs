@@ -552,6 +552,14 @@ pub enum SearchError {
     /// cause proportional memory growth.
     #[error("File too large to classify: {size} bytes exceeds the {limit}-byte limit")]
     FileTooLarge { size: usize, limit: usize },
+
+    /// A build-time safety limit was exceeded (e.g. the co-change `MAX_PAIRS` cap).
+    ///
+    /// Distinct from [`SearchError::IndexCorrupted`], which signals corrupt
+    /// data on disk. This variant indicates that the input data is valid but
+    /// exceeds a pre-configured capacity bound.
+    #[error("Capacity exceeded: {0}")]
+    CapacityExceeded(String),
 }
 
 /// Result type alias for all rskim-search operations.

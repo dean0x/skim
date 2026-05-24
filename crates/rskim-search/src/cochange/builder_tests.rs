@@ -309,7 +309,7 @@ fn test_duplicate_paths_in_commit_deduplicated() {
 // -----------------------------------------------------------------------
 
 #[test]
-fn test_max_pairs_safety_cap_returns_index_corrupted() {
+fn test_max_pairs_safety_cap_returns_capacity_exceeded() {
     // Use a tiny max_pairs limit (2) so we can trigger the cap with 3 files
     // in a single commit — 3 files produce 3 distinct pairs: (0,1),(0,2),(1,2).
     // The first two pairs fill the cap; the third triggers the error.
@@ -321,6 +321,10 @@ fn test_max_pairs_safety_cap_returns_index_corrupted() {
     let result = builder.build_with_max_pairs(&history, &path_map, 2);
     assert!(result.is_err(), "should fail when pair count exceeds limit");
     let err = result.err().unwrap();
+    assert!(
+        matches!(err, crate::SearchError::CapacityExceeded(_)),
+        "expected CapacityExceeded, got: {err}"
+    );
     let msg = format!("{err}");
     assert!(
         msg.contains("safety limit") || msg.contains("pair"),
