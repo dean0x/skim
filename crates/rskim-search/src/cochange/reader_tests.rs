@@ -259,7 +259,10 @@ fn test_crc32_mismatch_detected() {
     use crate::cochange::format::HEADER_SIZE;
     let path = tmp.path().join("cochange.skcc");
     let mut data = std::fs::read(&path).unwrap();
-    assert!(data.len() > HEADER_SIZE, "test requires data section after header");
+    assert!(
+        data.len() > HEADER_SIZE,
+        "test requires data section after header"
+    );
     data[HEADER_SIZE] ^= 0xFF; // flip first byte after header
     std::fs::write(&path, &data).unwrap();
 

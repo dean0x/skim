@@ -6,8 +6,8 @@
 //! The output file is written atomically via [`tempfile::NamedTempFile`] + `persist`
 //! (rename), so readers never observe a partial write.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
@@ -93,10 +93,7 @@ impl CochangeMatrixBuilder {
     ) -> Result<CochangeStats> {
         let (pairs, file_counts, mut stats) = accumulate_pairs(history, path_map, max_pairs)?;
         stats.pair_count = u32::try_from(pairs.len()).map_err(|_| {
-            SearchError::IndexCorrupted(format!(
-                "pair_count {} exceeds u32::MAX",
-                pairs.len()
-            ))
+            SearchError::IndexCorrupted(format!("pair_count {} exceeds u32::MAX", pairs.len()))
         })?;
         stats.file_count = u32::try_from(file_counts.len()).map_err(|_| {
             SearchError::IndexCorrupted(format!(
