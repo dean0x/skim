@@ -236,9 +236,7 @@ fn serialize(
         .len()
         .checked_mul(FILE_COMMIT_ENTRY_SIZE)
         .ok_or_else(|| {
-            SearchError::IndexCorrupted(
-                "file_count * FILE_COMMIT_ENTRY_SIZE overflow".into(),
-            )
+            SearchError::IndexCorrupted("file_count * FILE_COMMIT_ENTRY_SIZE overflow".into())
         })?;
     let pair_bytes = pair_entries
         .len()
