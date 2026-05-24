@@ -330,7 +330,7 @@ fn test_pairs_for_file_higher_id() {
         partner_ids.contains(&1),
         "b.rs (FileId(1)) should be a partner of c.rs"
     );
-    for (_, count) in &pairs {
-        assert_eq!(*count, 1, "each partnership has count 1");
+    for &(_, count) in &pairs {
+        assert_eq!(count, 1, "each partnership has count 1");
     }
 }

@@ -87,10 +87,6 @@ impl CochangeMatrixReader {
             .ok_or_else(|| {
                 SearchError::IndexCorrupted("pair_count * PAIR_ENTRY_SIZE overflow".into())
             })?;
-        // Cache validated offsets: HEADER_SIZE → fc_end → pairs_end.
-        // These are computed once here with checked arithmetic and stored as
-        // struct fields so that `file_commit_slice` and `pairs_slice` never
-        // need to repeat potentially-overflowing multiplication.
         let fc_start = HEADER_SIZE;
         let fc_end = fc_start
             .checked_add(fc_bytes)
@@ -98,17 +94,16 @@ impl CochangeMatrixReader {
         let pairs_end = fc_end
             .checked_add(pair_bytes)
             .ok_or_else(|| SearchError::IndexCorrupted("pairs_end overflow".into()))?;
-        let expected_size = pairs_end;
 
-        if mmap.len() != expected_size {
+        if mmap.len() != pairs_end {
             return Err(SearchError::IndexCorrupted(format!(
-                "skcc size mismatch: expected {expected_size}, got {}",
+                "skcc size mismatch: expected {pairs_end}, got {}",
                 mmap.len()
             )));
         }
 
         // Verify CRC32 over file_commit ++ pair bytes.
-        let payload = &mmap[HEADER_SIZE..expected_size];
+        let payload = &mmap[HEADER_SIZE..pairs_end];
         let actual_checksum = compute_checksum(payload);
         if actual_checksum != header.checksum {
             return Err(SearchError::IndexCorrupted(format!(

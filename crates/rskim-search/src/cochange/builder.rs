@@ -231,8 +231,7 @@ fn serialize(
         .collect();
     pair_entries.sort_unstable_by_key(|p| (p.file_a, p.file_b));
 
-    // Serialise file_commit and pair arrays — use checked arithmetic to match
-    // reader.rs and catch hypothetical overflow on 32-bit targets.
+    // Compute byte counts with checked arithmetic to catch overflow on 32-bit targets.
     let fc_bytes = file_entries
         .len()
         .checked_mul(FILE_COMMIT_ENTRY_SIZE)
@@ -248,23 +247,24 @@ fn serialize(
             SearchError::IndexCorrupted("pair_count * PAIR_ENTRY_SIZE overflow".into())
         })?;
 
-    let mut fc_buf: Vec<u8> = Vec::with_capacity(fc_bytes);
+    // Assemble: header placeholder + file_commit + pairs.
+    let total = HEADER_SIZE
+        .checked_add(fc_bytes)
+        .and_then(|s| s.checked_add(pair_bytes))
+        .ok_or_else(|| SearchError::IndexCorrupted("total buffer size overflow".into()))?;
+    let mut buf = Vec::with_capacity(total);
+    buf.extend([0u8; HEADER_SIZE]); // placeholder, overwritten below
     for e in &file_entries {
-        fc_buf.extend_from_slice(&encode_file_commit(e));
+        buf.extend_from_slice(&encode_file_commit(e));
     }
-    let mut pair_buf: Vec<u8> = Vec::with_capacity(pair_bytes);
     for p in &pair_entries {
-        pair_buf.extend_from_slice(&encode_pair(p));
+        buf.extend_from_slice(&encode_pair(p));
     }
 
     // CRC32 over file_commit ++ pair bytes — delegate to format.rs so there
     // is a single source of truth for the checksum algorithm.
-    let mut payload: Vec<u8> = Vec::with_capacity(fc_bytes + pair_bytes);
-    payload.extend_from_slice(&fc_buf);
-    payload.extend_from_slice(&pair_buf);
-    let checksum = compute_checksum(&payload);
+    let checksum = compute_checksum(&buf[HEADER_SIZE..]);
 
-    // Build header.
     let pair_count = u32::try_from(pair_entries.len()).map_err(|_| {
         SearchError::IndexCorrupted(format!(
             "pair_count {} exceeds u32::MAX",
@@ -284,17 +284,7 @@ fn serialize(
         file_count,
         checksum,
     };
-
-    // Assemble: header + file_commit + pairs — use checked arithmetic to
-    // match reader.rs and guard against overflow on 32-bit targets.
-    let total = HEADER_SIZE
-        .checked_add(fc_bytes)
-        .and_then(|s| s.checked_add(pair_bytes))
-        .ok_or_else(|| SearchError::IndexCorrupted("total buffer size overflow".into()))?;
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&encode_header(&header));
-    buf.extend_from_slice(&fc_buf);
-    buf.extend_from_slice(&pair_buf);
+    buf[..HEADER_SIZE].copy_from_slice(&encode_header(&header));
 
     Ok(buf)
 }

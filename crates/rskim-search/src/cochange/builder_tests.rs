@@ -323,7 +323,7 @@ fn test_max_pairs_safety_cap_returns_index_corrupted() {
     let err = result.err().unwrap();
     let msg = format!("{err}");
     assert!(
-        msg.contains("safety limit") || msg.contains("IndexCorrupted") || msg.contains("pair"),
+        msg.contains("safety limit") || msg.contains("pair"),
         "error should describe the safety cap: {msg}"
     );
 }
