@@ -2,53 +2,13 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 
 use super::{COUPLING_MAX_FILES, CochangeMatrixBuilder};
-use crate::{CommitInfo, FileChangeInfo, FileId, HistoryResult, TemporalMetadata};
-
-// -----------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------
-
-fn make_history(commits: Vec<Vec<&str>>) -> HistoryResult {
-    let commit_list = commits
-        .into_iter()
-        .enumerate()
-        .map(|(i, paths)| CommitInfo {
-            hash: format!("{i:040x}"),
-            timestamp: i as i64,
-            author: "test".to_string(),
-            message: "test commit".to_string(),
-            changed_files: paths
-                .into_iter()
-                .map(|p| FileChangeInfo {
-                    path: PathBuf::from(p),
-                    additions: 1,
-                    deletions: 0,
-                })
-                .collect(),
-        })
-        .collect();
-    HistoryResult {
-        commits: commit_list,
-        metadata: TemporalMetadata {
-            is_shallow: false,
-            commit_count: 0,
-        },
-    }
-}
-
-fn make_path_map(paths: &[&str]) -> HashMap<PathBuf, FileId> {
-    paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (PathBuf::from(p), FileId(i as u32)))
-        .collect()
-}
+use crate::FileId;
+use crate::cochange::test_helpers::{make_history, make_path_map};
 
 // -----------------------------------------------------------------------
 // Constructor validation
@@ -341,5 +301,29 @@ fn test_duplicate_paths_in_commit_deduplicated() {
     assert_eq!(
         count, 1,
         "co-change count should be 1, not inflated by duplicates"
+    );
+}
+
+// -----------------------------------------------------------------------
+// MAX_PAIRS safety cap → IndexCorrupted
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_max_pairs_safety_cap_returns_index_corrupted() {
+    // Use a tiny max_pairs limit (2) so we can trigger the cap with 3 files
+    // in a single commit — 3 files produce 3 distinct pairs: (0,1),(0,2),(1,2).
+    // The first two pairs fill the cap; the third triggers the error.
+    let tmp = TempDir::new().unwrap();
+    let builder = CochangeMatrixBuilder::new(tmp.path().to_path_buf()).unwrap();
+    let history = make_history(vec![vec!["a.rs", "b.rs", "c.rs"]]);
+    let path_map = make_path_map(&["a.rs", "b.rs", "c.rs"]);
+
+    let result = builder.build_with_max_pairs(&history, &path_map, 2);
+    assert!(result.is_err(), "should fail when pair count exceeds limit");
+    let err = result.err().unwrap();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("safety limit") || msg.contains("IndexCorrupted") || msg.contains("pair"),
+        "error should describe the safety cap: {msg}"
     );
 }

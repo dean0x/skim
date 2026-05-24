@@ -79,7 +79,30 @@ impl CochangeMatrixBuilder {
         history: &HistoryResult,
         path_map: &HashMap<PathBuf, FileId>,
     ) -> Result<CochangeStats> {
-        let (pairs, file_counts, mut stats) = accumulate_pairs(history, path_map)?;
+        self.build_with_limit(history, path_map, MAX_PAIRS)
+    }
+
+    /// Like [`build`] but with a caller-supplied `max_pairs` limit.
+    ///
+    /// Intended for unit tests that need to trigger the safety cap without
+    /// generating 2 million distinct pairs.
+    #[cfg(test)]
+    pub(crate) fn build_with_max_pairs(
+        &self,
+        history: &HistoryResult,
+        path_map: &HashMap<PathBuf, FileId>,
+        max_pairs: usize,
+    ) -> Result<CochangeStats> {
+        self.build_with_limit(history, path_map, max_pairs)
+    }
+
+    fn build_with_limit(
+        &self,
+        history: &HistoryResult,
+        path_map: &HashMap<PathBuf, FileId>,
+        max_pairs: usize,
+    ) -> Result<CochangeStats> {
+        let (pairs, file_counts, mut stats) = accumulate_pairs(history, path_map, max_pairs)?;
         stats.pair_count = u32::try_from(pairs.len()).unwrap_or(u32::MAX);
         stats.file_count = u32::try_from(file_counts.len()).unwrap_or(u32::MAX);
 
@@ -101,10 +124,15 @@ type AccumulatedPairs = (HashMap<(u32, u32), u32>, HashMap<u32, u32>, CochangeSt
 /// Iterate all commits, resolve paths, generate canonical (min,max) pairs,
 /// and track per-file commit counts.
 ///
+/// `max_pairs` caps the number of distinct pairs; exceeding it returns
+/// [`SearchError::IndexCorrupted`].  Production callers pass [`MAX_PAIRS`];
+/// tests may pass a smaller value to exercise the error path cheaply.
+///
 /// Returns `(pair_counts, file_commit_counts, stats)`.
 fn accumulate_pairs(
     history: &HistoryResult,
     path_map: &HashMap<PathBuf, FileId>,
+    max_pairs: usize,
 ) -> Result<AccumulatedPairs> {
     let mut pair_counts: HashMap<(u32, u32), u32> =
         HashMap::with_capacity(history.commits.len().saturating_mul(4));
@@ -154,8 +182,8 @@ fn accumulate_pairs(
                 // when i != j and all IDs in a commit are distinct paths.
                 debug_assert!(a < b, "canonical pair invariant: a({a}) < b({b})");
 
-                // Check MAX_PAIRS before inserting a new entry.
-                if !pair_counts.contains_key(&(a, b)) && pair_counts.len() >= MAX_PAIRS {
+                // Check max_pairs limit before inserting a new entry.
+                if !pair_counts.contains_key(&(a, b)) && pair_counts.len() >= max_pairs {
                     return Err(SearchError::IndexCorrupted(
                         "co-change pair count exceeds safety limit".into(),
                     ));

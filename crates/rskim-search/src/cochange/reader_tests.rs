@@ -2,55 +2,14 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tempfile::TempDir;
 
 use super::CochangeMatrixReader;
-use crate::{CommitInfo, FileChangeInfo, FileId, HistoryResult, TemporalMetadata};
-
+use crate::FileId;
 use crate::cochange::CochangeMatrixBuilder;
-
-// -----------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------
-
-fn make_history(commits: Vec<Vec<&str>>) -> HistoryResult {
-    let commit_list = commits
-        .into_iter()
-        .enumerate()
-        .map(|(i, paths)| CommitInfo {
-            hash: format!("{i:040x}"),
-            timestamp: i as i64,
-            author: "test".to_string(),
-            message: "test commit".to_string(),
-            changed_files: paths
-                .into_iter()
-                .map(|p| FileChangeInfo {
-                    path: PathBuf::from(p),
-                    additions: 1,
-                    deletions: 0,
-                })
-                .collect(),
-        })
-        .collect();
-    HistoryResult {
-        commits: commit_list,
-        metadata: TemporalMetadata {
-            is_shallow: false,
-            commit_count: 0,
-        },
-    }
-}
-
-fn make_path_map(paths: &[&str]) -> HashMap<PathBuf, FileId> {
-    paths
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (PathBuf::from(p), FileId(i as u32)))
-        .collect()
-}
+use crate::cochange::test_helpers::{make_history, make_path_map};
 
 fn build_matrix(tmp: &TempDir, commits: Vec<Vec<&str>>, paths: &[&str]) -> CochangeMatrixReader {
     let history = make_history(commits);
@@ -312,4 +271,66 @@ fn test_crc32_mismatch_detected() {
         msg.contains("checksum") || msg.contains("corrupt"),
         "error should mention checksum: {msg}"
     );
+}
+
+// -----------------------------------------------------------------------
+// Jaccard perfect coupling (1.0)
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_jaccard_perfect_coupling() {
+    // a and b co-change in every commit; neither appears alone.
+    // Jaccard = 3 / (3 + 3 - 3) = 3/3 = 1.0
+    let tmp = TempDir::new().unwrap();
+    let reader = build_matrix(
+        &tmp,
+        vec![
+            vec!["a.rs", "b.rs"],
+            vec!["a.rs", "b.rs"],
+            vec!["a.rs", "b.rs"],
+        ],
+        &["a.rs", "b.rs"],
+    );
+
+    let j = reader.jaccard(FileId(0), FileId(1)).unwrap();
+    assert!(
+        (j - 1.0_f64).abs() < 1e-9,
+        "Jaccard should be 1.0 for perfectly coupled files, got {j:.9}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// pairs_for_file — file appears only as the higher ID
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_pairs_for_file_higher_id() {
+    // Setup: three files a(0), b(1), c(2).
+    // Commits: (a,c) and (b,c).
+    // Canonical pairs stored: (0,2) and (1,2).
+    // c has FileId(2) — it always appears as file_b (higher ID) in both pairs.
+    let tmp = TempDir::new().unwrap();
+    let reader = build_matrix(
+        &tmp,
+        vec![vec!["a.rs", "c.rs"], vec!["b.rs", "c.rs"]],
+        &["a.rs", "b.rs", "c.rs"],
+    );
+
+    // Querying FileId(2) exercises the `entry.file_b == id` branch.
+    let pairs = reader.pairs_for_file(FileId(2)).unwrap();
+    assert_eq!(pairs.len(), 2, "c.rs co-changes with both a.rs and b.rs");
+
+    // Both partners should be present; counts are 1 each.
+    let partner_ids: Vec<u32> = pairs.iter().map(|(fid, _)| fid.0).collect();
+    assert!(
+        partner_ids.contains(&0),
+        "a.rs (FileId(0)) should be a partner of c.rs"
+    );
+    assert!(
+        partner_ids.contains(&1),
+        "b.rs (FileId(1)) should be a partner of c.rs"
+    );
+    for (_, count) in &pairs {
+        assert_eq!(*count, 1, "each partnership has count 1");
+    }
 }

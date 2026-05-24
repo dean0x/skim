@@ -6,6 +6,8 @@
 //! - The `index` module provides on-disk persistence via memory-mapped files.
 //! - The `ngram` module handles bigram extraction (pure, no I/O).
 //! - The `temporal` module parses git history via gix for temporal scoring.
+//! - The `cochange` module builds and queries a binary co-change matrix with
+//!   Jaccard similarity from git history.
 //! - Returns Result types throughout — no panics in non-test code.
 //!
 //! CLI/binary code in `crates/rskim/src/cmd/search/mod.rs` handles user-facing I/O.
