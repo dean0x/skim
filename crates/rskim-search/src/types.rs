@@ -165,6 +165,31 @@ impl SearchField {
 }
 
 // ============================================================================
+// Co-change Matrix Statistics
+// ============================================================================
+
+/// Statistics returned by [`crate::cochange::CochangeMatrixBuilder::build`].
+///
+/// Provides observability into the build process: how many pairs were
+/// accumulated, how many commits were processed, and how many were skipped
+/// due to the `COUPLING_MAX_FILES` cap or unknown path resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CochangeStats {
+    /// Number of distinct co-change pairs stored in the matrix.
+    pub pair_count: u32,
+    /// Number of distinct files referenced across all processed commits.
+    pub file_count: u32,
+    /// Number of commits iterated (regardless of path resolution success).
+    pub commits_processed: u32,
+    /// Number of commits skipped because they touched more than
+    /// `COUPLING_MAX_FILES` files.
+    pub commits_skipped_too_large: u32,
+    /// Number of file paths silently skipped because they were absent from the
+    /// path-to-[`FileId`] map supplied by the caller.
+    pub unknown_paths_skipped: u32,
+}
+
+// ============================================================================
 // Temporal Flags
 // ============================================================================
 

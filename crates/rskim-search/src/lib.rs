@@ -10,6 +10,7 @@
 //!
 //! CLI/binary code in `crates/rskim/src/cmd/search/mod.rs` handles user-facing I/O.
 
+pub mod cochange;
 pub(crate) mod fields;
 pub mod index;
 pub mod lexical;
@@ -18,6 +19,7 @@ pub mod temporal;
 mod types;
 pub mod weights;
 
+pub use cochange::{CochangeMatrixBuilder, CochangeMatrixReader};
 pub use index::{NgramIndexBuilder, NgramIndexReader};
 pub use lexical::{
     BM25FConfig, FIELD_COUNT, MAX_QUERY_BYTES, QueryEngine, bm25f_score, classify_source,
@@ -29,8 +31,9 @@ pub use ngram::{
 };
 pub use temporal::{GixSource, is_fix_commit};
 pub use types::{
-    CommitInfo, FieldClassifier, FileChangeInfo, FileId, HistoryResult, IndexStats, LayerBuilder,
-    NodeInfo, Result, SearchError, SearchField, SearchLayer, SearchQuery, SearchResult,
-    TemporalFlags, TemporalMetadata, TemporalSource, byte_offset_to_line, compute_line_range,
+    CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, HistoryResult, IndexStats,
+    LayerBuilder, NodeInfo, Result, SearchError, SearchField, SearchLayer, SearchQuery,
+    SearchResult, TemporalFlags, TemporalMetadata, TemporalSource, byte_offset_to_line,
+    compute_line_range,
 };
 pub use weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT, bigram_weight};
