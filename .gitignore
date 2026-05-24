@@ -49,3 +49,6 @@ criterion/
 
 # Generated research artifacts (reproducible via rskim-research run)
 crates/rskim-search/data/
+
+# Benchmark corpus (large, reproducible via download)
+.bench-corpus/

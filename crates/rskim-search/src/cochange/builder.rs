@@ -7,6 +7,7 @@
 //! (rename), so readers never observe a partial write.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
@@ -26,7 +27,7 @@ pub(crate) const COUPLING_MAX_FILES: usize = 50;
 
 /// Maximum number of distinct co-change pairs the builder will accumulate.
 ///
-/// Exceeding this limit returns `SearchError::IndexCorrupted` to protect
+/// Exceeding this limit returns [`SearchError::CapacityExceeded`] to protect
 /// against unbounded memory growth.
 pub(crate) const MAX_PAIRS: usize = 2_000_000;
 
@@ -48,7 +49,6 @@ impl CochangeMatrixBuilder {
     /// # Errors
     ///
     /// Returns [`SearchError::Io`] if `output_dir` does not exist.
-    #[must_use = "this returns a Result that should be checked"]
     pub fn new(output_dir: PathBuf) -> Result<Self> {
         if !output_dir.exists() {
             return Err(SearchError::Io(std::io::Error::new(
@@ -70,10 +70,9 @@ impl CochangeMatrixBuilder {
     ///
     /// # Errors
     ///
-    /// - [`SearchError::IndexCorrupted`] if the number of accumulated pairs
+    /// - [`SearchError::CapacityExceeded`] if the number of accumulated pairs
     ///   exceeds [`MAX_PAIRS`].
     /// - [`SearchError::Io`] if writing fails.
-    #[must_use = "this returns a Result that should be checked"]
     pub fn build(
         &self,
         history: &HistoryResult,
@@ -84,27 +83,24 @@ impl CochangeMatrixBuilder {
 
     /// Like [`build`] but with a caller-supplied `max_pairs` limit.
     ///
-    /// Intended for unit tests that need to trigger the safety cap without
-    /// generating 2 million distinct pairs.
-    #[cfg(test)]
-    pub(crate) fn build_with_max_pairs(
-        &self,
-        history: &HistoryResult,
-        path_map: &HashMap<PathBuf, FileId>,
-        max_pairs: usize,
-    ) -> Result<CochangeStats> {
-        self.build_with_limit(history, path_map, max_pairs)
-    }
-
-    fn build_with_limit(
+    /// `pub(crate)` so tests can trigger the safety cap with a small limit
+    /// without generating 2 million distinct pairs.
+    pub(crate) fn build_with_limit(
         &self,
         history: &HistoryResult,
         path_map: &HashMap<PathBuf, FileId>,
         max_pairs: usize,
     ) -> Result<CochangeStats> {
         let (pairs, file_counts, mut stats) = accumulate_pairs(history, path_map, max_pairs)?;
-        stats.pair_count = u32::try_from(pairs.len()).unwrap_or(u32::MAX);
-        stats.file_count = u32::try_from(file_counts.len()).unwrap_or(u32::MAX);
+        stats.pair_count = u32::try_from(pairs.len()).map_err(|_| {
+            SearchError::IndexCorrupted(format!("pair_count {} exceeds u32::MAX", pairs.len()))
+        })?;
+        stats.file_count = u32::try_from(file_counts.len()).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "file_count {} exceeds u32::MAX",
+                file_counts.len()
+            ))
+        })?;
 
         let data = serialize(&pairs, &file_counts)?;
         let out_path = self.output_dir.join("cochange.skcc");
@@ -125,7 +121,7 @@ type AccumulatedPairs = (HashMap<(u32, u32), u32>, HashMap<u32, u32>, CochangeSt
 /// and track per-file commit counts.
 ///
 /// `max_pairs` caps the number of distinct pairs; exceeding it returns
-/// [`SearchError::IndexCorrupted`].  Production callers pass [`MAX_PAIRS`];
+/// [`SearchError::CapacityExceeded`].  Production callers pass [`MAX_PAIRS`];
 /// tests may pass a smaller value to exercise the error path cheaply.
 ///
 /// Returns `(pair_counts, file_commit_counts, stats)`.
@@ -134,8 +130,10 @@ fn accumulate_pairs(
     path_map: &HashMap<PathBuf, FileId>,
     max_pairs: usize,
 ) -> Result<AccumulatedPairs> {
-    let mut pair_counts: HashMap<(u32, u32), u32> =
-        HashMap::with_capacity(history.commits.len().saturating_mul(4));
+    // Bound initial capacity by max_pairs / 4 so high-overlap repos don't
+    // over-allocate when the effective pair count is small relative to commits.
+    let initial_capacity = history.commits.len().min(max_pairs / 4);
+    let mut pair_counts: HashMap<(u32, u32), u32> = HashMap::with_capacity(initial_capacity);
     let mut file_commit_counts: HashMap<u32, u32> = HashMap::with_capacity(path_map.len());
 
     let mut commits_processed: u32 = 0;
@@ -174,24 +172,7 @@ fn accumulate_pairs(
         }
 
         // Generate canonical (min, max) pairs — skip self-pairs implicitly.
-        for i in 0..ids.len() {
-            for j in (i + 1)..ids.len() {
-                let a = ids[i].min(ids[j]);
-                let b = ids[i].max(ids[j]);
-                // a < b guaranteed by construction; self-pairs (a==b) impossible
-                // when i != j and all IDs in a commit are distinct paths.
-                debug_assert!(a < b, "canonical pair invariant: a({a}) < b({b})");
-
-                // Check max_pairs limit before inserting a new entry.
-                if !pair_counts.contains_key(&(a, b)) && pair_counts.len() >= max_pairs {
-                    return Err(SearchError::IndexCorrupted(
-                        "co-change pair count exceeds safety limit".into(),
-                    ));
-                }
-                let entry = pair_counts.entry((a, b)).or_insert(0);
-                *entry = entry.saturating_add(1);
-            }
-        }
+        generate_pairs(&ids, &mut pair_counts, max_pairs)?;
     }
 
     let stats = CochangeStats {
@@ -205,23 +186,69 @@ fn accumulate_pairs(
     Ok((pair_counts, file_commit_counts, stats))
 }
 
-/// Serialise accumulated data into the `cochange.skcc` on-disk format.
-fn serialize(
-    pair_counts: &HashMap<(u32, u32), u32>,
-    file_commit_counts: &HashMap<u32, u32>,
-) -> Result<Vec<u8>> {
-    // Sort file_commit entries by file_id ascending.
-    let mut file_entries: Vec<FileCommitEntry> = file_commit_counts
+/// Accumulate all canonical `(a, b)` pairs for the given sorted, deduped ID
+/// slice into `pair_counts`.
+///
+/// Since `ids` is sorted and deduplicated, `ids[i] < ids[j]` whenever `i < j`,
+/// so `a = ids[i]` and `b = ids[j]` is already in canonical order — no
+/// `.min()` / `.max()` required.
+///
+/// Returns [`SearchError::CapacityExceeded`] if inserting a new pair would
+/// exceed `max_pairs`.
+fn generate_pairs(
+    ids: &[u32],
+    pair_counts: &mut HashMap<(u32, u32), u32>,
+    max_pairs: usize,
+) -> Result<()> {
+    for (idx, &a) in ids.iter().enumerate() {
+        for &b in &ids[idx + 1..] {
+            // a < b guaranteed by construction; self-pairs (a==b) impossible
+            // because ids is sorted and deduplicated.
+            debug_assert!(a < b, "canonical pair invariant: a({a}) < b({b})");
+
+            // Use Entry API for a single hash probe in the common (under-
+            // capacity) case.  When the map is already full we must guard
+            // against inserting new keys while still allowing increments to
+            // existing ones — the Occupied/Vacant match handles both in a
+            // single lookup.
+            if pair_counts.len() < max_pairs {
+                // Under capacity: entry() is safe to insert; single probe.
+                let count = pair_counts.entry((a, b)).or_insert(0);
+                *count = count.saturating_add(1);
+            } else {
+                // At capacity: existing keys may still be incremented.
+                match pair_counts.entry((a, b)) {
+                    Entry::Occupied(mut occ) => {
+                        *occ.get_mut() = occ.get().saturating_add(1);
+                    }
+                    Entry::Vacant(_) => {
+                        return Err(SearchError::CapacityExceeded(
+                            "co-change pair count exceeds safety limit".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect and sort file-commit entries by `file_id` ascending.
+fn collect_sorted_file_entries(counts: &HashMap<u32, u32>) -> Vec<FileCommitEntry> {
+    let mut entries: Vec<FileCommitEntry> = counts
         .iter()
         .map(|(&file_id, &commit_count)| FileCommitEntry {
             file_id,
             commit_count,
         })
         .collect();
-    file_entries.sort_unstable_by_key(|e| e.file_id);
+    entries.sort_unstable_by_key(|e| e.file_id);
+    entries
+}
 
-    // Sort pair entries by (file_a, file_b) ascending.
-    let mut pair_entries: Vec<PairEntry> = pair_counts
+/// Collect and sort pair entries by `(file_a, file_b)` ascending.
+fn collect_sorted_pair_entries(counts: &HashMap<(u32, u32), u32>) -> Vec<PairEntry> {
+    let mut entries: Vec<PairEntry> = counts
         .iter()
         .map(|(&(file_a, file_b), &count)| PairEntry {
             file_a,
@@ -229,7 +256,17 @@ fn serialize(
             count,
         })
         .collect();
-    pair_entries.sort_unstable_by_key(|p| (p.file_a, p.file_b));
+    entries.sort_unstable_by_key(|p| (p.file_a, p.file_b));
+    entries
+}
+
+/// Serialise accumulated data into the `cochange.skcc` on-disk format.
+fn serialize(
+    pair_counts: &HashMap<(u32, u32), u32>,
+    file_commit_counts: &HashMap<u32, u32>,
+) -> Result<Vec<u8>> {
+    let file_entries = collect_sorted_file_entries(file_commit_counts);
+    let pair_entries = collect_sorted_pair_entries(pair_counts);
 
     // Compute byte counts with checked arithmetic to catch overflow on 32-bit targets.
     let fc_bytes = file_entries
@@ -295,6 +332,7 @@ fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(dir)?;
     use std::io::Write as _;
     tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
 
     #[cfg(unix)]
     {

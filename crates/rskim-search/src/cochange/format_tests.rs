@@ -193,6 +193,38 @@ fn test_lookup_pair_misaligned_slice() {
 }
 
 // -----------------------------------------------------------------------
+// FileCommitEntry truncation
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_file_commit_entry_truncated() {
+    let data = [0u8; 4]; // less than FILE_COMMIT_ENTRY_SIZE (8)
+    let result = decode_file_commit(&data);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("truncated") || msg.contains("bytes"),
+        "error should describe truncation: {msg}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// PairEntry truncation
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_pair_entry_truncated() {
+    let data = [0u8; 8]; // less than PAIR_ENTRY_SIZE (12)
+    let result = decode_pair(&data);
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("truncated") || msg.contains("bytes"),
+        "error should describe truncation: {msg}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Checksum determinism
 // -----------------------------------------------------------------------
 
