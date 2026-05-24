@@ -29,8 +29,8 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use super::format::{
-    FILE_COMMIT_ENTRY_SIZE, HEADER_SIZE, PAIR_ENTRY_SIZE, SkccHeader, compute_checksum,
-    decode_file_commit, decode_header, lookup_pair,
+    FILE_COMMIT_ENTRY_SIZE, HEADER_SIZE, PAIR_ENTRY_SIZE, compute_checksum, decode_file_commit,
+    decode_header, lookup_pair,
 };
 use crate::{FileId, Result, SearchError};
 
@@ -40,14 +40,21 @@ use crate::{FileId, Result, SearchError};
 
 /// Memory-mapped, read-only query layer for a co-change matrix.
 pub struct CochangeMatrixReader {
-    /// Decoded header (copied out of mmap for cheap access).
-    header: SkccHeader,
     // SAFETY: read-only after construction; see module-level SAFETY note.
     mmap: Mmap,
+    /// Byte offset where the file-commit section begins (always `HEADER_SIZE`).
+    fc_start: usize,
+    /// Byte offset where the file-commit section ends / pair section begins.
+    /// Computed once in `open()` with checked arithmetic and cached here so
+    /// that `file_commit_slice` and `pairs_slice` never repeat multiplication
+    /// that could overflow on 32-bit targets.
+    fc_end: usize,
+    /// Byte offset where the pair section ends (equals total file size).
+    pairs_end: usize,
 }
 
 // CochangeMatrixReader is automatically Send + Sync because all fields
-// (SkccHeader: Copy, Mmap: Send+Sync) satisfy the auto-trait bounds.
+// (Mmap: Send+Sync, usize: Send+Sync) satisfy the auto-trait bounds.
 
 impl CochangeMatrixReader {
     /// Open an existing co-change matrix from `dir`.
@@ -59,6 +66,7 @@ impl CochangeMatrixReader {
     ///
     /// - [`SearchError::Io`] if `cochange.skcc` cannot be opened.
     /// - [`SearchError::IndexCorrupted`] if validation fails.
+    #[must_use = "dropping the reader immediately means no queries can be made"]
     pub fn open(dir: &Path) -> Result<Self> {
         let path = dir.join("cochange.skcc");
         let file = std::fs::File::open(&path)?;
@@ -79,10 +87,18 @@ impl CochangeMatrixReader {
             .ok_or_else(|| {
                 SearchError::IndexCorrupted("pair_count * PAIR_ENTRY_SIZE overflow".into())
             })?;
-        let expected_size = HEADER_SIZE
+        // Cache validated offsets: HEADER_SIZE → fc_end → pairs_end.
+        // These are computed once here with checked arithmetic and stored as
+        // struct fields so that `file_commit_slice` and `pairs_slice` never
+        // need to repeat potentially-overflowing multiplication.
+        let fc_start = HEADER_SIZE;
+        let fc_end = fc_start
             .checked_add(fc_bytes)
-            .and_then(|s| s.checked_add(pair_bytes))
-            .ok_or_else(|| SearchError::IndexCorrupted("expected_size overflow".into()))?;
+            .ok_or_else(|| SearchError::IndexCorrupted("fc_end overflow".into()))?;
+        let pairs_end = fc_end
+            .checked_add(pair_bytes)
+            .ok_or_else(|| SearchError::IndexCorrupted("pairs_end overflow".into()))?;
+        let expected_size = pairs_end;
 
         if mmap.len() != expected_size {
             return Err(SearchError::IndexCorrupted(format!(
@@ -101,7 +117,12 @@ impl CochangeMatrixReader {
             )));
         }
 
-        Ok(Self { header, mmap })
+        Ok(Self {
+            mmap,
+            fc_start,
+            fc_end,
+            pairs_end,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -116,6 +137,7 @@ impl CochangeMatrixReader {
     /// # Errors
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the pair data is malformed.
+    #[must_use = "ignoring the co-change count discards the query result"]
     pub fn pair_count(&self, a: FileId, b: FileId) -> Result<u32> {
         if a == b {
             return Ok(0);
@@ -134,6 +156,7 @@ impl CochangeMatrixReader {
     /// # Errors
     ///
     /// Returns [`SearchError::IndexCorrupted`] if the underlying data is malformed.
+    #[must_use = "ignoring the Jaccard similarity discards the query result"]
     pub fn jaccard(&self, a: FileId, b: FileId) -> Result<f64> {
         if a == b {
             return Ok(0.0);
@@ -154,7 +177,15 @@ impl CochangeMatrixReader {
     /// Return all co-change partners for `file_id`, sorted by co-change count
     /// descending.
     ///
-    /// Performs a linear scan over all pair entries (O(pair_count)).
+    /// # Complexity
+    ///
+    /// **O(pair_count)** — performs a full linear scan over all pair entries.
+    /// At the `MAX_PAIRS` cap of 2,000,000 pairs this reads up to ~24 MB per
+    /// call.  Pairs are stored sorted by `(file_a, file_b)`, so `file_a`
+    /// matches form a contiguous range — a future optimisation could use
+    /// binary search on the `file_a` dimension to reduce this to
+    /// O(log(pair_count) + k) where k is the number of matching pairs.
+    ///
     /// Returns an empty Vec for unknown `file_id` values.
     ///
     /// # Errors
@@ -214,17 +245,17 @@ impl CochangeMatrixReader {
     // -----------------------------------------------------------------------
 
     /// Slice of file-commit entries within the mmap.
+    ///
+    /// Uses offsets cached at `open()` time — no arithmetic at call site.
     fn file_commit_slice(&self) -> &[u8] {
-        let fc_start = HEADER_SIZE;
-        let fc_end = fc_start + (self.header.file_count as usize) * FILE_COMMIT_ENTRY_SIZE;
-        &self.mmap[fc_start..fc_end]
+        &self.mmap[self.fc_start..self.fc_end]
     }
 
     /// Slice of pair entries within the mmap.
+    ///
+    /// Uses offsets cached at `open()` time — no arithmetic at call site.
     fn pairs_slice(&self) -> &[u8] {
-        let fc_end = HEADER_SIZE + (self.header.file_count as usize) * FILE_COMMIT_ENTRY_SIZE;
-        let pairs_end = fc_end + (self.header.pair_count as usize) * PAIR_ENTRY_SIZE;
-        &self.mmap[fc_end..pairs_end]
+        &self.mmap[self.fc_end..self.pairs_end]
     }
 }
 

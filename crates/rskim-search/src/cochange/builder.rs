@@ -13,7 +13,8 @@ use tempfile::NamedTempFile;
 
 use super::format::{
     FILE_COMMIT_ENTRY_SIZE, FORMAT_VERSION, FileCommitEntry, HEADER_SIZE, PAIR_ENTRY_SIZE,
-    PairEntry, SKCC_MAGIC, SkccHeader, encode_file_commit, encode_header, encode_pair,
+    PairEntry, SKCC_MAGIC, SkccHeader, compute_checksum, encode_file_commit, encode_header,
+    encode_pair,
 };
 use crate::{CochangeStats, FileId, HistoryResult, Result, SearchError};
 
@@ -47,6 +48,7 @@ impl CochangeMatrixBuilder {
     /// # Errors
     ///
     /// Returns [`SearchError::Io`] if `output_dir` does not exist.
+    #[must_use = "this returns a Result that should be checked"]
     pub fn new(output_dir: PathBuf) -> Result<Self> {
         if !output_dir.exists() {
             return Err(SearchError::Io(std::io::Error::new(
@@ -71,6 +73,7 @@ impl CochangeMatrixBuilder {
     /// - [`SearchError::IndexCorrupted`] if the number of accumulated pairs
     ///   exceeds [`MAX_PAIRS`].
     /// - [`SearchError::Io`] if writing fails.
+    #[must_use = "this returns a Result that should be checked"]
     pub fn build(
         &self,
         history: &HistoryResult,
@@ -200,9 +203,22 @@ fn serialize(
         .collect();
     pair_entries.sort_unstable_by_key(|p| (p.file_a, p.file_b));
 
-    // Serialise file_commit and pair arrays.
-    let fc_bytes = file_entries.len() * FILE_COMMIT_ENTRY_SIZE;
-    let pair_bytes = pair_entries.len() * PAIR_ENTRY_SIZE;
+    // Serialise file_commit and pair arrays — use checked arithmetic to match
+    // reader.rs and catch hypothetical overflow on 32-bit targets.
+    let fc_bytes = file_entries
+        .len()
+        .checked_mul(FILE_COMMIT_ENTRY_SIZE)
+        .ok_or_else(|| {
+            SearchError::IndexCorrupted(
+                "file_count * FILE_COMMIT_ENTRY_SIZE overflow".into(),
+            )
+        })?;
+    let pair_bytes = pair_entries
+        .len()
+        .checked_mul(PAIR_ENTRY_SIZE)
+        .ok_or_else(|| {
+            SearchError::IndexCorrupted("pair_count * PAIR_ENTRY_SIZE overflow".into())
+        })?;
 
     let mut fc_buf: Vec<u8> = Vec::with_capacity(fc_bytes);
     for e in &file_entries {
@@ -213,11 +229,12 @@ fn serialize(
         pair_buf.extend_from_slice(&encode_pair(p));
     }
 
-    // CRC32 over file_commit ++ pair bytes.
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(&fc_buf);
-    hasher.update(&pair_buf);
-    let checksum = hasher.finalize();
+    // CRC32 over file_commit ++ pair bytes — delegate to format.rs so there
+    // is a single source of truth for the checksum algorithm.
+    let mut payload: Vec<u8> = Vec::with_capacity(fc_bytes + pair_bytes);
+    payload.extend_from_slice(&fc_buf);
+    payload.extend_from_slice(&pair_buf);
+    let checksum = compute_checksum(&payload);
 
     // Build header.
     let pair_count = u32::try_from(pair_entries.len()).map_err(|_| {
@@ -240,8 +257,12 @@ fn serialize(
         checksum,
     };
 
-    // Assemble: header + file_commit + pairs.
-    let total = HEADER_SIZE + fc_bytes + pair_bytes;
+    // Assemble: header + file_commit + pairs — use checked arithmetic to
+    // match reader.rs and guard against overflow on 32-bit targets.
+    let total = HEADER_SIZE
+        .checked_add(fc_bytes)
+        .and_then(|s| s.checked_add(pair_bytes))
+        .ok_or_else(|| SearchError::IndexCorrupted("total buffer size overflow".into()))?;
     let mut buf = Vec::with_capacity(total);
     buf.extend_from_slice(&encode_header(&header));
     buf.extend_from_slice(&fc_buf);
@@ -251,10 +272,20 @@ fn serialize(
 }
 
 /// Atomically write `data` to `path` using a temp file in `dir`.
+///
+/// Sets explicit `0o644` permissions on Unix before persisting so that a
+/// permissive process umask cannot leave the file world-writable.
 fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp = NamedTempFile::new_in(dir)?;
     use std::io::Write as _;
     tmp.write_all(data)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
+    }
+
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
