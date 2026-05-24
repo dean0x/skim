@@ -46,9 +46,8 @@ pub struct CochangeMatrixReader {
     mmap: Mmap,
 }
 
-// SAFETY: Mmap is Send + Sync; all fields are immutable after construction.
-unsafe impl Send for CochangeMatrixReader {}
-unsafe impl Sync for CochangeMatrixReader {}
+// CochangeMatrixReader is automatically Send + Sync because all fields
+// (SkccHeader: Copy, Mmap: Send+Sync) satisfy the auto-trait bounds.
 
 impl CochangeMatrixReader {
     /// Open an existing co-change matrix from `dir`.
@@ -241,7 +240,7 @@ impl CochangeMatrixReader {
 /// Return `(min(a,b), max(a,b))` as `(u32, u32)`.
 #[inline]
 fn canonicalize(a: FileId, b: FileId) -> (u32, u32) {
-    if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) }
+    (a.0.min(b.0), a.0.max(b.0))
 }
 
 // ============================================================================

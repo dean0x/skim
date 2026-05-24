@@ -29,9 +29,6 @@ pub(crate) const COUPLING_MAX_FILES: usize = 50;
 /// against unbounded memory growth.
 pub(crate) const MAX_PAIRS: usize = 2_000_000;
 
-/// Return type of [`accumulate_pairs`]: (pair_counts, file_commit_counts, stats).
-type AccumulateResult = (HashMap<(u32, u32), u32>, HashMap<u32, u32>, CochangeStats);
-
 // ============================================================================
 // Public builder struct
 // ============================================================================
@@ -95,6 +92,9 @@ impl CochangeMatrixBuilder {
 // Private helpers
 // ============================================================================
 
+/// Intermediate accumulation result: `(pair_counts, file_commit_counts, stats)`.
+type AccumulatedPairs = (HashMap<(u32, u32), u32>, HashMap<u32, u32>, CochangeStats);
+
 /// Iterate all commits, resolve paths, generate canonical (min,max) pairs,
 /// and track per-file commit counts.
 ///
@@ -102,7 +102,7 @@ impl CochangeMatrixBuilder {
 fn accumulate_pairs(
     history: &HistoryResult,
     path_map: &HashMap<PathBuf, FileId>,
-) -> Result<AccumulateResult> {
+) -> Result<AccumulatedPairs> {
     let mut pair_counts: HashMap<(u32, u32), u32> =
         HashMap::with_capacity(history.commits.len().saturating_mul(4));
     let mut file_commit_counts: HashMap<u32, u32> =
@@ -122,6 +122,9 @@ fn accumulate_pairs(
         }
 
         // Resolve file IDs for this commit's changed files.
+        // Deduplicate because the same path can appear more than once in a
+        // commit (e.g. rename with modify). Without dedup, self-pairs (a==a)
+        // would violate the canonical-ordering invariant.
         let mut ids: Vec<u32> = Vec::with_capacity(commit.changed_files.len());
         for fc in &commit.changed_files {
             match path_map.get(&fc.path) {
@@ -131,6 +134,8 @@ fn accumulate_pairs(
                 }
             }
         }
+        ids.sort_unstable();
+        ids.dedup();
 
         // Update per-file commit counts.
         for &id in &ids {

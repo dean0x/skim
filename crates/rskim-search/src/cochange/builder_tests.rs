@@ -312,3 +312,26 @@ fn test_build_then_read_roundtrip() {
     let bc = reader.pair_count(FileId(1), FileId(2)).unwrap();
     assert_eq!(bc, 1, "b and c co-changed in 1 commit");
 }
+
+// -----------------------------------------------------------------------
+// Duplicate paths within a commit
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_duplicate_paths_in_commit_deduplicated() {
+    let tmp = TempDir::new().unwrap();
+    let builder = CochangeMatrixBuilder::new(tmp.path().to_path_buf()).unwrap();
+    // Same path appears twice in one commit — must not create self-pairs.
+    let history = make_history(vec![vec!["a.rs", "b.rs", "a.rs"]]);
+    let path_map = make_path_map(&["a.rs", "b.rs"]);
+
+    let stats = builder.build(&history, &path_map).unwrap();
+
+    // Only one canonical pair (a, b) should exist, with count 1.
+    assert_eq!(stats.pair_count, 1, "duplicate paths must be deduplicated");
+
+    use crate::cochange::CochangeMatrixReader;
+    let reader = CochangeMatrixReader::open(tmp.path()).unwrap();
+    let count = reader.pair_count(FileId(0), FileId(1)).unwrap();
+    assert_eq!(count, 1, "co-change count should be 1, not inflated by duplicates");
+}
