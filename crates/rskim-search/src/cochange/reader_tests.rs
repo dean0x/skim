@@ -147,7 +147,7 @@ fn test_jaccard_absent_pair_returns_zero() {
 }
 
 #[test]
-fn test_jaccard_zero_denominator_returns_zero() {
+fn test_jaccard_no_shared_commits_returns_zero() {
     // Both files appear in 0 commits each (empty matrix with unknown file IDs)
     let tmp = TempDir::new().unwrap();
     let reader = build_matrix(&tmp, vec![], &["a.rs", "b.rs"]);
@@ -256,11 +256,11 @@ fn test_crc32_mismatch_detected() {
     builder.build(&history, &path_map).unwrap();
 
     // Corrupt the file by flipping bytes in the data section (after the header)
+    use crate::cochange::format::HEADER_SIZE;
     let path = tmp.path().join("cochange.skcc");
     let mut data = std::fs::read(&path).unwrap();
-    if data.len() > 20 {
-        data[18] ^= 0xFF; // flip first byte after header
-    }
+    assert!(data.len() > HEADER_SIZE, "test requires data section after header");
+    data[HEADER_SIZE] ^= 0xFF; // flip first byte after header
     std::fs::write(&path, &data).unwrap();
 
     let result = CochangeMatrixReader::open(tmp.path());
@@ -270,6 +270,42 @@ fn test_crc32_mismatch_detected() {
     assert!(
         msg.contains("checksum") || msg.contains("corrupt"),
         "error should mention checksum: {msg}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Size mismatch detection (body truncated after valid header)
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_open_size_mismatch_detected() {
+    use crate::cochange::format::HEADER_SIZE;
+
+    let tmp = TempDir::new().unwrap();
+    // Build a valid matrix with some data
+    let builder = CochangeMatrixBuilder::new(tmp.path().to_path_buf()).unwrap();
+    let history = make_history(vec![vec!["a.rs", "b.rs"]]);
+    let path_map = make_path_map(&["a.rs", "b.rs"]);
+    builder.build(&history, &path_map).unwrap();
+
+    // Read the valid file, then truncate after header
+    let path = tmp.path().join("cochange.skcc");
+    let data = std::fs::read(&path).unwrap();
+    assert!(
+        data.len() > HEADER_SIZE + 1,
+        "valid matrix should have data after header"
+    );
+
+    // Keep header intact but remove some body bytes
+    let truncated = &data[..data.len() - 4];
+    std::fs::write(&path, truncated).unwrap();
+
+    let result = CochangeMatrixReader::open(tmp.path());
+    assert!(result.is_err());
+    let msg = format!("{}", result.err().unwrap());
+    assert!(
+        msg.contains("size mismatch") || msg.contains("checksum"),
+        "error should mention size mismatch or checksum: {msg}"
     );
 }
 
