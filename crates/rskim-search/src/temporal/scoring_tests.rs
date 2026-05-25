@@ -22,7 +22,7 @@ const HALF_LIFE: f64 = 30.0;
 fn make_commit(ts: u64, message: &str, files: &[&str]) -> CommitInfo {
     CommitInfo {
         hash: format!("{ts:040x}"),
-        timestamp: ts as i64,
+        timestamp: i64::try_from(ts).expect("timestamp overflow in test helper"),
         author: "test".to_string(),
         message: message.to_string(),
         changed_files: files
@@ -122,12 +122,18 @@ fn decay_always_in_unit_range() {
     }
 }
 
-/// `decay_weight` with zero half-life should panic in debug builds (debug_assert).
+/// `decay_weight` with zero half-life panics unconditionally (assert!).
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic]
+#[should_panic(expected = "half_life_days must be positive and finite")]
 fn decay_zero_half_life_panics() {
     let _ = decay_weight(1.0, 0.0);
+}
+
+/// `decay_weight` with NaN half-life panics unconditionally (assert!).
+#[test]
+#[should_panic(expected = "half_life_days must be positive and finite")]
+fn decay_nan_half_life_panics() {
+    let _ = decay_weight(1.0, f64::NAN);
 }
 
 /// `decay_weight` with NaN elapsed_days — result must be finite and in [0.0, 1.0].
@@ -180,6 +186,14 @@ fn decay_negative_infinity_elapsed() {
 fn compute_scores_zero_half_life_panics() {
     let commits = vec![make_commit(NOW, "feat", &["a.rs"])];
     let _ = compute_file_risk_scores(&commits, NOW, 0.0);
+}
+
+/// `compute_file_risk_scores` with negative half-life panics unconditionally (assert!).
+#[test]
+#[should_panic(expected = "half_life_days must be positive")]
+fn compute_scores_negative_half_life_panics() {
+    let commits = vec![make_commit(NOW, "feat", &["a.rs"])];
+    let _ = compute_file_risk_scores(&commits, NOW, -30.0);
 }
 
 // ============================================================================

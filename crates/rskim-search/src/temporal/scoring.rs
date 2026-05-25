@@ -38,7 +38,7 @@ pub const DEFAULT_HALF_LIFE_DAYS: f64 = 30.0;
 ///
 /// # Panics
 ///
-/// Panics in debug builds when `half_life_days <= 0.0`.
+/// Panics when `half_life_days <= 0.0` or is not finite.
 ///
 /// # Examples
 ///
@@ -55,7 +55,10 @@ pub const DEFAULT_HALF_LIFE_DAYS: f64 = 30.0;
 #[must_use]
 #[inline]
 pub fn decay_weight(elapsed_days: f64, half_life_days: f64) -> f64 {
-    debug_assert!(half_life_days > 0.0);
+    assert!(
+        half_life_days > 0.0 && half_life_days.is_finite(),
+        "half_life_days must be positive and finite, got {half_life_days}"
+    );
     // Treat NaN elapsed as zero (present-moment weight = 1.0) to prevent
     // NaN propagation into accumulators. clamp() alone does not sanitize NaN.
     let elapsed = if elapsed_days.is_nan() {
@@ -133,14 +136,14 @@ pub fn compute_file_risk_scores(
             // Reduces allocations from O(total_file_touches) to O(unique_files).
             let path_cow = file.path_str();
             let path_ref: &str = &path_cow;
-            let entry = if let Some(v) = accum.get_mut(path_ref) {
+            let (weighted_total, weighted_fix_total) = if let Some(v) = accum.get_mut(path_ref) {
                 v
             } else {
                 accum.entry(path_cow.into_owned()).or_insert((0.0, 0.0))
             };
-            entry.0 += w;
+            *weighted_total += w;
             if is_fix {
-                entry.1 += w;
+                *weighted_fix_total += w;
             }
         }
     }
