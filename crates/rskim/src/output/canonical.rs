@@ -758,9 +758,21 @@ impl DbResult {
             return output;
         }
 
-        // Compute column widths: max(header_len, max_value_len), capped at MAX_COL_WIDTH.
-        let display_rows: Vec<Vec<String>> = rows
-            .iter()
+        let display_rows = Self::truncate_display_rows(rows);
+        let widths = Self::compute_column_widths(columns, &display_rows);
+        Self::render_header(&mut output, columns, &widths);
+        Self::render_separator(&mut output, &widths);
+        Self::render_data_rows(&mut output, &display_rows, &widths);
+
+        output
+    }
+
+    /// Truncate `rows` to `MAX_DB_ROWS` and each cell value to `MAX_COL_WIDTH` chars.
+    ///
+    /// Cells that exceed `MAX_COL_WIDTH` characters are trimmed and suffixed with `…`.
+    /// This is a pure data transformation step, independent of rendering.
+    fn truncate_display_rows(rows: &[Vec<String>]) -> Vec<Vec<String>> {
+        rows.iter()
             .take(MAX_DB_ROWS)
             .map(|row| {
                 row.iter()
@@ -775,9 +787,16 @@ impl DbResult {
                     })
                     .collect()
             })
-            .collect();
+            .collect()
+    }
 
-        let widths: Vec<usize> = columns
+    /// Compute per-column display widths.
+    ///
+    /// Each width is `max(header_char_count, max_cell_char_count)`, capped at
+    /// `MAX_COL_WIDTH`.  Accepts pre-truncated `display_rows` so cell lengths are
+    /// already bounded.
+    fn compute_column_widths(columns: &[String], display_rows: &[Vec<String>]) -> Vec<usize> {
+        columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
@@ -789,9 +808,14 @@ impl DbResult {
                     .unwrap_or(0);
                 header_len.max(max_val)
             })
-            .collect();
+            .collect()
+    }
 
-        // Header row
+    /// Render the header row (column names) into `output`.
+    ///
+    /// Writes `"\n <col0> | <col1> | …"` using the pre-computed `widths`.
+    fn render_header(output: &mut String, columns: &[String], widths: &[usize]) {
+        use std::fmt::Write;
         let _ = write!(output, "\n ");
         for (i, col) in columns.iter().enumerate() {
             if i > 0 {
@@ -800,8 +824,13 @@ impl DbResult {
             let w = widths[i];
             let _ = write!(output, "{col:<w$}");
         }
+    }
 
-        // Separator
+    /// Render the separator line (dashes and `+` dividers) into `output`.
+    ///
+    /// Writes `"\n -…-+-…-+-…"` using the pre-computed `widths`.
+    fn render_separator(output: &mut String, widths: &[usize]) {
+        use std::fmt::Write;
         let _ = write!(output, "\n ");
         for (i, &w) in widths.iter().enumerate() {
             if i > 0 {
@@ -809,9 +838,15 @@ impl DbResult {
             }
             let _ = write!(output, "{}", "-".repeat(w + if i > 0 { 2 } else { 0 }));
         }
+    }
 
-        // Data rows
-        for row in &display_rows {
+    /// Render each data row into `output`.
+    ///
+    /// Writes `"\n <val0> | <val1> | …"` per row using the pre-computed `widths`.
+    /// Missing cells (row shorter than column count) are rendered as empty strings.
+    fn render_data_rows(output: &mut String, display_rows: &[Vec<String>], widths: &[usize]) {
+        use std::fmt::Write;
+        for row in display_rows {
             let _ = write!(output, "\n ");
             for (i, &w) in widths.iter().enumerate() {
                 if i > 0 {
@@ -821,8 +856,6 @@ impl DbResult {
                 let _ = write!(output, "{val:<w$}");
             }
         }
-
-        output
     }
 }
 
@@ -1891,6 +1924,88 @@ mod tests {
         assert_eq!(result.as_ref(), "");
         result.ensure_rendered();
         assert!(result.as_ref().contains("psql query 1 rows"));
+    }
+
+    // ========================================================================
+    // DbResult private helper unit tests (#214)
+    // ========================================================================
+
+    #[test]
+    fn test_truncate_display_rows_caps_at_max_db_rows() {
+        // Build MAX_DB_ROWS + 10 rows; only MAX_DB_ROWS should survive.
+        let rows: Vec<Vec<String>> = (0..MAX_DB_ROWS + 10)
+            .map(|i| vec![i.to_string()])
+            .collect();
+        let display = DbResult::truncate_display_rows(&rows);
+        assert_eq!(display.len(), MAX_DB_ROWS);
+    }
+
+    #[test]
+    fn test_truncate_display_rows_truncates_long_cell() {
+        // A cell longer than MAX_COL_WIDTH should be truncated to MAX_COL_WIDTH chars with '…'.
+        let long_val = "x".repeat(MAX_COL_WIDTH + 5);
+        let rows = vec![vec![long_val]];
+        let display = DbResult::truncate_display_rows(&rows);
+        let cell = &display[0][0];
+        assert_eq!(cell.chars().count(), MAX_COL_WIDTH);
+        assert!(cell.ends_with('…'));
+    }
+
+    #[test]
+    fn test_compute_column_widths_uses_header_when_wider() {
+        // Header "long_header" (11 chars) wider than data "x" (1 char).
+        let columns = vec!["long_header".to_string()];
+        let display_rows = vec![vec!["x".to_string()]];
+        let widths = DbResult::compute_column_widths(&columns, &display_rows);
+        assert_eq!(widths[0], 11);
+    }
+
+    #[test]
+    fn test_compute_column_widths_uses_data_when_wider() {
+        // Header "id" (2 chars) narrower than data "hello_world" (11 chars).
+        let columns = vec!["id".to_string()];
+        let display_rows = vec![vec!["hello_world".to_string()]];
+        let widths = DbResult::compute_column_widths(&columns, &display_rows);
+        assert_eq!(widths[0], 11);
+    }
+
+    #[test]
+    fn test_render_header_formats_columns_with_pipe_separators() {
+        let mut output = String::new();
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let widths = vec![2, 5];
+        DbResult::render_header(&mut output, &columns, &widths);
+        // Should start with newline + space, columns separated by " | "
+        assert!(output.starts_with("\n "));
+        assert!(output.contains("id"));
+        assert!(output.contains(" | "));
+        assert!(output.contains("name"));
+    }
+
+    #[test]
+    fn test_render_separator_uses_dashes_and_plus() {
+        let mut output = String::new();
+        let widths = vec![3, 4];
+        DbResult::render_separator(&mut output, &widths);
+        // First column: 3 dashes, second column: + then 6 chars (2 padding + 4 width)
+        assert!(output.starts_with("\n "));
+        assert!(output.contains("---"));
+        assert!(output.contains('+'));
+    }
+
+    #[test]
+    fn test_render_data_rows_writes_each_row() {
+        let mut output = String::new();
+        let display_rows = vec![
+            vec!["1".to_string(), "Alice".to_string()],
+            vec!["2".to_string(), "Bob".to_string()],
+        ];
+        let widths = vec![2, 5];
+        DbResult::render_data_rows(&mut output, &display_rows, &widths);
+        assert!(output.contains("Alice"));
+        assert!(output.contains("Bob"));
+        // Two rows means two leading "\n " sequences
+        assert_eq!(output.matches("\n ").count(), 2);
     }
 
     #[test]
