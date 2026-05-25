@@ -1,18 +1,16 @@
-//! Tests for [`TemporalDb`] — schema, CRUD, sync, persistence, and performance.
+//! Tests for [`TemporalDb`] — schema, CRUD, and meta operations.
 //!
 //! Uses `tempfile::TempDir` for isolation so every test gets a fresh database.
-//! Performance tests enforce the 10k-row acceptance criteria from the plan.
+//! Performance and persistence tests live in `storage_perf_tests.rs`.
 
 #![allow(clippy::unwrap_used)]
-
-use std::time::Instant;
 
 use tempfile::TempDir;
 
 use super::{
-    CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, RiskRow, TemporalDb,
+    storage_types::{CochangeRow, HotspotRow, RiskRow},
+    TemporalDb,
 };
-use crate::types::SearchError;
 
 // ============================================================================
 // Helper utilities
@@ -23,34 +21,6 @@ fn temp_db() -> (TempDir, TemporalDb) {
     let path = dir.path().join("temporal.db");
     let db = TemporalDb::open(&path).unwrap();
     (dir, db)
-}
-
-fn make_hotspot(n: usize) -> HotspotRow {
-    HotspotRow {
-        file_path: format!("src/file_{n}.rs"),
-        score: n as f64 / 10_000.0,
-        changes_30d: i64::try_from(n % 100).unwrap(),
-        changes_90d: i64::try_from(n % 200).unwrap(),
-    }
-}
-
-fn make_risk(n: usize) -> RiskRow {
-    RiskRow {
-        file_path: format!("src/file_{n}.rs"),
-        risk_score: n as f64 / 10_000.0,
-        total_commits: i64::try_from(n + 1).unwrap(),
-        fix_commits: i64::try_from(n % 5).unwrap(),
-        fix_density: (n % 5) as f64 / (n + 1) as f64,
-    }
-}
-
-fn make_cochange(n: usize) -> CochangeRow {
-    CochangeRow {
-        file_a: format!("src/file_{n}.rs"),
-        file_b: format!("src/file_{}.rs", n + 1),
-        count: i64::try_from(n + 1).unwrap(),
-        jaccard: n as f64 / 10_000.0,
-    }
 }
 
 // ============================================================================
@@ -349,205 +319,4 @@ fn set_meta_overwrites() {
     db.set_meta("k", "first").unwrap();
     db.set_meta("k", "second").unwrap();
     assert_eq!(db.get_meta("k").unwrap(), Some("second".to_string()));
-}
-
-// ============================================================================
-// Group 6: Persistence & Sync
-// ============================================================================
-
-#[test]
-fn data_survives_close_reopen() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("persist.db");
-
-    {
-        let db = TemporalDb::open(&path).unwrap();
-        let rows = vec![HotspotRow {
-            file_path: "persist.rs".to_string(),
-            score: 0.77,
-            changes_30d: 3,
-            changes_90d: 9,
-        }];
-        db.store_hotspots(&rows).unwrap();
-    } // db dropped here — connection closed
-
-    let db2 = TemporalDb::open(&path).unwrap();
-    let loaded = db2.load_hotspots().unwrap();
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].file_path, "persist.rs");
-    assert!((loaded[0].score - 0.77).abs() < f64::EPSILON);
-}
-
-#[test]
-fn sync_writes_all_tables_atomically() {
-    let (_dir, db) = temp_db();
-
-    let hotspots = vec![HotspotRow {
-        file_path: "h.rs".to_string(),
-        score: 1.0,
-        changes_30d: 1,
-        changes_90d: 2,
-    }];
-    let risks = vec![RiskRow {
-        file_path: "r.rs".to_string(),
-        risk_score: 0.5,
-        total_commits: 10,
-        fix_commits: 2,
-        fix_density: 0.2,
-    }];
-    let cochanges = vec![CochangeRow {
-        file_a: "c_a.rs".to_string(),
-        file_b: "c_b.rs".to_string(),
-        count: 3,
-        jaccard: 0.3,
-    }];
-
-    db.sync(&hotspots, &risks, &cochanges, "abc123").unwrap();
-
-    assert_eq!(db.load_hotspots().unwrap().len(), 1);
-    assert_eq!(db.load_risks().unwrap().len(), 1);
-    assert_eq!(db.load_cochanges().unwrap().len(), 1);
-}
-
-#[test]
-fn sync_sets_meta_keys() {
-    let (_dir, db) = temp_db();
-    db.sync(&[], &[], &[], "deadbeef").unwrap();
-
-    let head = db.get_meta(META_GIT_HEAD).unwrap();
-    let updated = db.get_meta(META_LAST_UPDATED).unwrap();
-
-    assert_eq!(head, Some("deadbeef".to_string()));
-    assert!(
-        updated.is_some(),
-        "META_LAST_UPDATED should be set after sync"
-    );
-    // Timestamp should be a plausible Unix epoch (> year 2020 = 1577836800).
-    let ts: u64 = updated.unwrap().parse().unwrap();
-    assert!(ts > 1_577_836_800, "timestamp should be after 2020, got {ts}");
-}
-
-// ============================================================================
-// Group 7: Performance (10k-row acceptance criteria)
-// ============================================================================
-
-#[test]
-fn load_10k_hotspots_under_100ms() {
-    let (_dir, db) = temp_db();
-    let rows: Vec<HotspotRow> = (0..10_000).map(make_hotspot).collect();
-    db.store_hotspots(&rows).unwrap();
-
-    let start = Instant::now();
-    let loaded = db.load_hotspots().unwrap();
-    let elapsed = start.elapsed();
-
-    assert_eq!(loaded.len(), 10_000);
-    assert!(
-        elapsed.as_millis() < 100,
-        "load_hotspots 10k rows took {}ms, expected <100ms",
-        elapsed.as_millis()
-    );
-}
-
-#[test]
-fn load_10k_risks_under_100ms() {
-    let (_dir, db) = temp_db();
-    let rows: Vec<RiskRow> = (0..10_000).map(make_risk).collect();
-    db.store_risks(&rows).unwrap();
-
-    let start = Instant::now();
-    let loaded = db.load_risks().unwrap();
-    let elapsed = start.elapsed();
-
-    assert_eq!(loaded.len(), 10_000);
-    assert!(
-        elapsed.as_millis() < 100,
-        "load_risks 10k rows took {}ms, expected <100ms",
-        elapsed.as_millis()
-    );
-}
-
-#[test]
-fn load_10k_cochanges_under_100ms() {
-    let (_dir, db) = temp_db();
-    let rows: Vec<CochangeRow> = (0..10_000).map(make_cochange).collect();
-    db.store_cochanges(&rows).unwrap();
-
-    let start = Instant::now();
-    let loaded = db.load_cochanges().unwrap();
-    let elapsed = start.elapsed();
-
-    assert_eq!(loaded.len(), 10_000);
-    assert!(
-        elapsed.as_millis() < 100,
-        "load_cochanges 10k rows took {}ms, expected <100ms",
-        elapsed.as_millis()
-    );
-}
-
-#[test]
-fn store_10k_hotspots_under_200ms() {
-    let (_dir, db) = temp_db();
-    let rows: Vec<HotspotRow> = (0..10_000).map(make_hotspot).collect();
-
-    let start = Instant::now();
-    db.store_hotspots(&rows).unwrap();
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed.as_millis() < 200,
-        "store_hotspots 10k rows took {}ms, expected <200ms",
-        elapsed.as_millis()
-    );
-}
-
-#[test]
-fn sync_10k_each_under_500ms() {
-    let (_dir, db) = temp_db();
-    let hotspots: Vec<HotspotRow> = (0..10_000).map(make_hotspot).collect();
-    let risks: Vec<RiskRow> = (0..10_000).map(make_risk).collect();
-    let cochanges: Vec<CochangeRow> = (0..10_000).map(make_cochange).collect();
-
-    let start = Instant::now();
-    db.sync(&hotspots, &risks, &cochanges, "perf_head").unwrap();
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed.as_millis() < 500,
-        "sync 10k×3 rows took {}ms, expected <500ms",
-        elapsed.as_millis()
-    );
-}
-
-// ============================================================================
-// Group 8: Error Handling
-// ============================================================================
-
-#[test]
-fn open_invalid_path() {
-    let result = TemporalDb::open(std::path::Path::new(
-        "/nonexistent/deeply/nested/path/temporal.db",
-    ));
-    assert!(
-        result.is_err(),
-        "opening an invalid path should return an error"
-    );
-}
-
-#[test]
-fn database_error_display() {
-    let err = SearchError::Database("something went wrong".to_string());
-    let display = err.to_string();
-    assert_eq!(display, "Database error: something went wrong");
-}
-
-#[test]
-fn database_error_variant_matchable() {
-    let err = SearchError::Database("test".to_string());
-    // Verify the variant is exhaustively matchable.
-    let matched = match err {
-        SearchError::Database(msg) => msg,
-        _ => panic!("wrong variant"),
-    };
-    assert_eq!(matched, "test");
 }
