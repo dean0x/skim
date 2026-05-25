@@ -1,21 +1,27 @@
-/// Temporal hotspot and bug-fix density scoring with exponential decay.
-///
-/// All functions are pure (no I/O, no side effects). Consumers supply the current
-/// epoch timestamp as `now_epoch` so that tests are fully deterministic.
-///
-/// # Algorithm overview
-///
-/// [`compute_file_risk_scores`] performs a single pass over the commit list,
-/// accumulating decay-weighted totals per file. Hotspot scores are then
-/// max-normalized so the busiest file always scores 1.0. Fix density is the
-/// ratio of fix-weighted touches to total weighted touches per file.
+//! Temporal hotspot and bug-fix density scoring with exponential decay.
+//!
+//! All functions are pure (no I/O, no side effects). Consumers supply the current
+//! epoch timestamp as `now_epoch` so that tests are fully deterministic.
+//!
+//! # Algorithm overview
+//!
+//! [`compute_file_risk_scores`] performs a single pass over the commit list,
+//! accumulating decay-weighted totals per file. Hotspot scores are then
+//! max-normalized so the busiest file always scores 1.0. Fix density is the
+//! ratio of fix-weighted touches to total weighted touches per file.
 use std::collections::HashMap;
 
 use crate::types::{CommitInfo, FileRiskScores};
 
-/// Default half-life (in days) used when callers do not supply a custom value.
+/// Default e-folding time (in days) used when callers do not supply a custom value.
 ///
-/// A 30-day half-life means commits from one month ago contribute ~37% as much
+/// **Naming note:** `half_life_days` follows the heatmap module convention and
+/// matches the parameter name in [`decay_weight`]. The underlying formula is
+/// `exp(-t / half_life_days)`, which is technically an *e-folding* decay — the
+/// value reaches `1/e ≈ 0.368` (not `0.5`) after one period. The doc comments
+/// say "~37%" throughout to reflect this accurately.
+///
+/// A 30-day period means commits from one month ago contribute ~37% as much
 /// weight as a commit made today.
 pub const DEFAULT_HALF_LIFE_DAYS: f64 = 30.0;
 
@@ -24,6 +30,11 @@ pub const DEFAULT_HALF_LIFE_DAYS: f64 = 30.0;
 /// Returns `exp(-elapsed_days / half_life_days)`, clamped to `[0.0, 1.0]`.
 /// A negative `elapsed_days` (future commit) is treated as zero elapsed time
 /// and therefore returns `1.0`.
+///
+/// **Naming note:** The parameter is called `half_life_days` to match the
+/// heatmap module convention, but the formula is an *e-folding* decay — the
+/// weight reaches `1/e ≈ 0.368` (not `0.5`) after one `half_life_days`
+/// period. This is intentional and documented in [`DEFAULT_HALF_LIFE_DAYS`].
 ///
 /// # Panics
 ///
@@ -45,7 +56,10 @@ pub const DEFAULT_HALF_LIFE_DAYS: f64 = 30.0;
 #[inline]
 pub fn decay_weight(elapsed_days: f64, half_life_days: f64) -> f64 {
     debug_assert!(half_life_days > 0.0);
-    (-elapsed_days / half_life_days).exp().clamp(0.0, 1.0)
+    // Treat NaN elapsed as zero (present-moment weight = 1.0) to prevent
+    // NaN propagation into accumulators. clamp() alone does not sanitize NaN.
+    let elapsed = if elapsed_days.is_nan() { 0.0 } else { elapsed_days };
+    (-elapsed / half_life_days).exp().clamp(0.0, 1.0)
 }
 
 /// Compute per-file hotspot and bug-fix density scores from a git commit history.
@@ -78,7 +92,7 @@ pub fn compute_file_risk_scores(
     now_epoch: u64,
     half_life_days: f64,
 ) -> HashMap<String, FileRiskScores> {
-    debug_assert!(half_life_days > 0.0);
+    assert!(half_life_days > 0.0, "half_life_days must be positive");
 
     if commits.is_empty() {
         return HashMap::new();
@@ -91,9 +105,10 @@ pub fn compute_file_risk_scores(
         .collect();
 
     // Accumulate per-file (weighted_total, weighted_fix_total).
-    // Pre-allocate with a reasonable bound; commits.len() is an upper bound
-    // on distinct files (each commit touches ≥1 file).
-    let mut accum: HashMap<String, (f64, f64)> = HashMap::with_capacity(commits.len().min(50_000));
+    // Unique files are typically 5–20× fewer than commits; use a conservative
+    // fraction of commit count rather than commits.len() which over-allocates.
+    let capacity = (commits.len() / 4).clamp(64, 50_000);
+    let mut accum: HashMap<String, (f64, f64)> = HashMap::with_capacity(capacity);
 
     for (commit, &is_fix) in commits.iter().zip(fix_flags.iter()) {
         // Clamp negative timestamps to 0 before converting.
@@ -109,11 +124,19 @@ pub fn compute_file_risk_scores(
         let w = decay_weight(elapsed, half_life_days);
 
         for file in &commit.changed_files {
-            let path = file.path_str().into_owned();
-            let (weighted_total, weighted_fix_total) = accum.entry(path).or_insert((0.0, 0.0));
-            *weighted_total += w;
+            // Avoid allocating a String for already-seen paths: probe with a
+            // borrowed &str first, only calling into_owned() for new entries.
+            // Reduces allocations from O(total_file_touches) to O(unique_files).
+            let path_cow = file.path_str();
+            let path_ref: &str = &path_cow;
+            let entry = if let Some(v) = accum.get_mut(path_ref) {
+                v
+            } else {
+                accum.entry(path_cow.into_owned()).or_insert((0.0, 0.0))
+            };
+            entry.0 += w;
             if is_fix {
-                *weighted_fix_total += w;
+                entry.1 += w;
             }
         }
     }
