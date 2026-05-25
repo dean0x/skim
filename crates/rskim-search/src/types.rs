@@ -265,7 +265,7 @@ pub struct CommitInfo {
 ///   recently — strong candidates for code-smell review.
 /// - `fix_density`: fraction of weighted commits that are classified as bug fixes.
 ///   A value of `1.0` means every weighted touch was a fix commit; `0.0` means none.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FileRiskScores {
     /// Decay-weighted commit frequency, max-normalized to `[0.0, 1.0]`.
     pub hotspot: f64,
