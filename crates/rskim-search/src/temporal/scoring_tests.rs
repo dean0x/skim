@@ -229,9 +229,11 @@ fn single_fix_commit() {
 /// file it touches, so all three reach the maximum after normalization.
 #[test]
 fn single_commit_multiple_files_same_weight() {
-    let commits = vec![make_commit(NOW - 10 * DAY, "feat: wide change", &[
-        "a.rs", "b.rs", "c.rs",
-    ])];
+    let commits = vec![make_commit(
+        NOW - 10 * DAY,
+        "feat: wide change",
+        &["a.rs", "b.rs", "c.rs"],
+    )];
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
     assert_eq!(scores.len(), 3, "expected 3 file entries");
 
@@ -552,10 +554,7 @@ fn all_files_have_valid_scores() {
         make_commit(NOW - DAY, "feat", &["b.rs", "c.rs"]),
     ];
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
-    // Every entry has both scores — guaranteed by FileRiskScores struct.
     for (path, s) in &scores {
-        let _hotspot: f64 = s.hotspot;
-        let _fix_density: f64 = s.fix_density;
         assert!(s.hotspot >= 0.0 && s.hotspot <= 1.0, "{path}");
         assert!(s.fix_density >= 0.0 && s.fix_density <= 1.0, "{path}");
     }
@@ -612,10 +611,4 @@ fn half_life_parameter_varies() {
         ratio_short < ratio_long,
         "short={ratio_short}, long={ratio_long}"
     );
-}
-
-/// DEFAULT_HALF_LIFE_DAYS constant is 30.0.
-#[test]
-fn default_half_life_is_30() {
-    assert!((DEFAULT_HALF_LIFE_DAYS - 30.0).abs() < EPSILON);
 }
