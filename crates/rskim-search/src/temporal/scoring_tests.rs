@@ -119,7 +119,7 @@ fn decay_always_in_unit_range() {
 #[cfg(debug_assertions)]
 #[should_panic]
 fn decay_zero_half_life_panics() {
-    decay_weight(1.0, 0.0);
+    let _ = decay_weight(1.0, 0.0);
 }
 
 // ============================================================================
@@ -386,9 +386,9 @@ fn single_file_all_commits() {
     assert!(approx_eq(scores["only.rs"].hotspot, 1.0));
 }
 
-/// Every file in the result has both `hotspot` and `fix_density` (structural guarantee).
+/// Every file in the result has both `hotspot` and `fix_density` in range [0, 1].
 #[test]
-fn same_keys_in_both_maps() {
+fn all_files_have_valid_scores() {
     let commits = vec![
         make_commit(NOW, "fix: bug", &["a.rs", "b.rs"]),
         make_commit(NOW - DAY, "feat", &["b.rs", "c.rs"]),
