@@ -319,7 +319,7 @@ mod tests {
         // psql prepare_args must not modify args (no injection)
         let original = vec!["-c".to_string(), "SELECT 1".to_string()];
         let args = original.clone();
-        // Invoke run_db_tool's prepare_args closure (it's |_| {})
+        // Invoke run_tool's prepare_args closure (it's |_| {})
         // We test by calling parse directly and checking no side effects on args
         let _ = parse_impl(&make_output("SELECT 1\n"));
         assert_eq!(args, original, "prepare_args must be a no-op for psql");

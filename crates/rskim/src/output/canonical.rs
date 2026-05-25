@@ -715,7 +715,7 @@ impl DbResult {
         row_count: usize,
         truncated: bool,
     ) -> Self {
-        let rendered = Self::render(&tool, &query_summary, &columns, &rows, row_count, truncated);
+        let rendered = Self::render(&tool, &columns, &rows, row_count, truncated);
         Self {
             tool,
             query_summary,
@@ -732,7 +732,6 @@ impl DbResult {
         if self.rendered.is_empty() {
             self.rendered = Self::render(
                 &self.tool,
-                &self.query_summary,
                 &self.columns,
                 &self.rows,
                 self.row_count,
@@ -743,7 +742,6 @@ impl DbResult {
 
     fn render(
         tool: &str,
-        _query_summary: &str,
         columns: &[String],
         rows: &[Vec<String>],
         row_count: usize,
@@ -827,14 +825,22 @@ impl DbResult {
     /// Render the separator line (dashes and `+` dividers) into `output`.
     ///
     /// Writes `"\n -…-+-…-+-…"` using the pre-computed `widths`.
+    ///
+    /// Non-first columns add 2 extra dashes to cover the two spaces in the
+    /// ` | ` separator used by the header and data rows.
     fn render_separator(output: &mut String, widths: &[usize]) {
         use std::fmt::Write;
+        // Each non-first column's dash run covers the column width plus the
+        // two flanking spaces from the " | " separator: "---+------".
+        const PADDING: usize = 2;
         let _ = write!(output, "\n ");
         for (i, &w) in widths.iter().enumerate() {
             if i > 0 {
                 let _ = write!(output, "+");
+                let _ = write!(output, "{}", "-".repeat(w + PADDING));
+            } else {
+                let _ = write!(output, "{}", "-".repeat(w));
             }
-            let _ = write!(output, "{}", "-".repeat(w + if i > 0 { 2 } else { 0 }));
         }
     }
 

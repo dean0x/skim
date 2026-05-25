@@ -65,11 +65,11 @@ const BINARY_NON_ASCII_FRACTION: f64 = 0.30;
 
 /// Prepend the `api` subcommand so the spawned command is `gh api [args]`.
 ///
-/// Called by `run_infra_tool` with the args slice _after_ the `"api"` token
+/// Called by `run_tool` with the args slice _after_ the `"api"` token
 /// has been stripped (see the `("api", _)` arm in `gh/mod.rs`).  We insert
 /// `"api"` at position 0 so that the runner executes `gh api <endpoint>`,
 /// not `gh <endpoint>`.  Stripping `"api"` before passing args allows
-/// `run_infra_tool` to detect piped-stdin mode via `args.is_empty()`.
+/// `run_tool` to detect piped-stdin mode via `args.is_empty()`.
 pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
     cmd_args.insert(0, "api".to_string());
 }

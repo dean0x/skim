@@ -412,8 +412,8 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// `strip_ansi_escapes` treats ASCII control codes — including `\t` (0x09) —
     /// as part of escape sequences and drops them. DB tools emit tab-separated
     /// (TSV) output; stripping would remove tab separators and cause all DB
-    /// parsers to fall through to Passthrough. Set `true` in `run_db_tool`,
-    /// `false` for all other families.
+    /// parsers to fall through to Passthrough. DB tools set `true`;
+    /// all other families set `false`.
     pub skip_ansi_strip: bool,
     /// Recording context constructed once by the family dispatcher.
     /// `run_parsed_command_with_mode` annotates `parse_tier` via

@@ -137,7 +137,7 @@ pub(crate) fn run_dig(
 /// terminal — matching exactly the interactive-mode case.
 ///
 /// The piped-stdin case (`echo '' | skim nslookup`) is safe: `should_read_stdin`
-/// in `run_infra_tool` detects the non-TTY pipe and reads stdin directly,
+/// in `run_tool` detects the non-TTY pipe and reads stdin directly,
 /// never spawning the nslookup binary at all.
 pub(crate) fn run_nslookup(
     args: &[String],
