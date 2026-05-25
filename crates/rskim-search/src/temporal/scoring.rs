@@ -93,8 +93,7 @@ pub fn compute_file_risk_scores(
     // Accumulate per-file (weighted_total, weighted_fix_total).
     // Pre-allocate with a reasonable bound; commits.len() is an upper bound
     // on distinct files (each commit touches ≥1 file).
-    let mut accum: HashMap<String, (f64, f64)> =
-        HashMap::with_capacity(commits.len().min(50_000));
+    let mut accum: HashMap<String, (f64, f64)> = HashMap::with_capacity(commits.len().min(50_000));
 
     for (commit, &is_fix) in commits.iter().zip(fix_flags.iter()) {
         // Clamp negative timestamps to 0 before converting.
@@ -111,24 +110,41 @@ pub fn compute_file_risk_scores(
 
         for file in &commit.changed_files {
             let path = file.path_str().into_owned();
-            let entry = accum.entry(path).or_insert((0.0, 0.0));
-            entry.0 += w;
+            let (weighted_total, weighted_fix_total) = accum.entry(path).or_insert((0.0, 0.0));
+            *weighted_total += w;
             if is_fix {
-                entry.1 += w;
+                *weighted_fix_total += w;
             }
         }
     }
 
     // Find the maximum weighted total for normalization.
-    let max_total = accum.values().map(|(total, _)| *total).fold(0.0_f64, f64::max);
+    let max_total = accum
+        .values()
+        .map(|&(total, _)| total)
+        .fold(0.0_f64, f64::max);
 
     // Build final scores.
     accum
         .into_iter()
         .map(|(path, (total, fix_total))| {
-            let hotspot = if max_total > 0.0 { total / max_total } else { 0.0 };
-            let fix_density = if total > f64::EPSILON { fix_total / total } else { 0.0 };
-            (path, FileRiskScores { hotspot, fix_density })
+            let hotspot = if max_total > 0.0 {
+                total / max_total
+            } else {
+                0.0
+            };
+            let fix_density = if total > f64::EPSILON {
+                fix_total / total
+            } else {
+                0.0
+            };
+            (
+                path,
+                FileRiskScores {
+                    hotspot,
+                    fix_density,
+                },
+            )
         })
         .collect()
 }

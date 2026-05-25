@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use crate::temporal::{compute_file_risk_scores, decay_weight, DEFAULT_HALF_LIFE_DAYS};
+use crate::temporal::{DEFAULT_HALF_LIFE_DAYS, compute_file_risk_scores, decay_weight};
 use crate::types::{CommitInfo, FileChangeInfo};
 
 // ============================================================================
@@ -88,7 +88,12 @@ fn decay_monotonically_decreasing() {
     let days = [0.0_f64, 10.0, 20.0, 30.0, 60.0, 90.0];
     let weights: Vec<f64> = days.iter().map(|&d| decay_weight(d, HALF_LIFE)).collect();
     for window in weights.windows(2) {
-        assert!(window[0] >= window[1], "{} should be >= {}", window[0], window[1]);
+        assert!(
+            window[0] >= window[1],
+            "{} should be >= {}",
+            window[0],
+            window[1]
+        );
     }
 }
 
@@ -109,7 +114,10 @@ fn decay_always_in_unit_range() {
     ];
     for (elapsed, half_life) in test_inputs {
         let w = decay_weight(elapsed, half_life);
-        assert!(w >= 0.0 && w <= 1.0, "out of range for ({elapsed}, {half_life}): {w}");
+        assert!(
+            w >= 0.0 && w <= 1.0,
+            "out of range for ({elapsed}, {half_life}): {w}"
+        );
         assert!(w.is_finite(), "non-finite for ({elapsed}, {half_life})");
     }
 }
@@ -141,7 +149,11 @@ fn single_commit_single_file() {
     assert_eq!(scores.len(), 1);
     let s = &scores["a.rs"];
     assert!(approx_eq(s.hotspot, 1.0), "hotspot={}", s.hotspot);
-    assert!(approx_eq(s.fix_density, 0.0), "fix_density={}", s.fix_density);
+    assert!(
+        approx_eq(s.fix_density, 0.0),
+        "fix_density={}",
+        s.fix_density
+    );
 }
 
 /// Single fix commit at NOW for one file → hotspot=1.0, fix_density=1.0.
@@ -151,7 +163,11 @@ fn single_fix_commit() {
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
     let s = &scores["a.rs"];
     assert!(approx_eq(s.hotspot, 1.0), "hotspot={}", s.hotspot);
-    assert!(approx_eq(s.fix_density, 1.0), "fix_density={}", s.fix_density);
+    assert!(
+        approx_eq(s.fix_density, 1.0),
+        "fix_density={}",
+        s.fix_density
+    );
 }
 
 /// Two commits at NOW, each touching a different file → both hotspot=1.0
@@ -197,7 +213,10 @@ fn hotspot_max_is_one() {
         make_commit(NOW - 10 * DAY, "feat", &["a.rs"]),
     ];
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
-    let max = scores.values().map(|s| s.hotspot).fold(f64::NEG_INFINITY, f64::max);
+    let max = scores
+        .values()
+        .map(|s| s.hotspot)
+        .fold(f64::NEG_INFINITY, f64::max);
     assert!(approx_eq(max, 1.0), "max={max}");
 }
 
@@ -209,7 +228,11 @@ fn zero_fix_density() {
         .collect();
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
     for (path, s) in &scores {
-        assert!(approx_eq(s.fix_density, 0.0), "{path}: fix_density={}", s.fix_density);
+        assert!(
+            approx_eq(s.fix_density, 0.0),
+            "{path}: fix_density={}",
+            s.fix_density
+        );
     }
 }
 
@@ -221,7 +244,11 @@ fn all_fix_density_one() {
         .collect();
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
     for (path, s) in &scores {
-        assert!(approx_eq(s.fix_density, 1.0), "{path}: fix_density={}", s.fix_density);
+        assert!(
+            approx_eq(s.fix_density, 1.0),
+            "{path}: fix_density={}",
+            s.fix_density
+        );
     }
 }
 
@@ -229,15 +256,35 @@ fn all_fix_density_one() {
 #[test]
 fn scores_in_unit_range() {
     let files = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"];
-    let messages = ["fix: bug", "feat: thing", "bug: crash", "add stuff", "revert bad"];
+    let messages = [
+        "fix: bug",
+        "feat: thing",
+        "bug: crash",
+        "add stuff",
+        "revert bad",
+    ];
     let mut commits = Vec::new();
-    for (i, (file, msg)) in files.iter().zip(messages.iter()).cycle().take(20).enumerate() {
+    for (i, (file, msg)) in files
+        .iter()
+        .zip(messages.iter())
+        .cycle()
+        .take(20)
+        .enumerate()
+    {
         commits.push(make_commit(NOW - (i as u64) * DAY, msg, &[file]));
     }
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
     for (path, s) in &scores {
-        assert!(s.hotspot >= 0.0 && s.hotspot <= 1.0, "{path}: hotspot={}", s.hotspot);
-        assert!(s.fix_density >= 0.0 && s.fix_density <= 1.0, "{path}: fix_density={}", s.fix_density);
+        assert!(
+            s.hotspot >= 0.0 && s.hotspot <= 1.0,
+            "{path}: hotspot={}",
+            s.hotspot
+        );
+        assert!(
+            s.fix_density >= 0.0 && s.fix_density <= 1.0,
+            "{path}: fix_density={}",
+            s.fix_density
+        );
     }
 }
 
@@ -267,7 +314,10 @@ fn mixed_fix_density() {
     ];
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
     let density = scores["a.rs"].fix_density;
-    assert!((density - 0.5).abs() < EPSILON, "expected ~0.5, got {density}");
+    assert!(
+        (density - 0.5).abs() < EPSILON,
+        "expected ~0.5, got {density}"
+    );
 }
 
 /// Fix commit is recent; non-fix is old → decay-weighted density > 0.5.
@@ -305,7 +355,11 @@ fn fix_keywords_recognized() {
         make_commit(NOW, "revert: bad feature", &["a.rs"]),
     ];
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
-    assert!(approx_eq(scores["a.rs"].fix_density, 1.0), "fix_density={}", scores["a.rs"].fix_density);
+    assert!(
+        approx_eq(scores["a.rs"].fix_density, 1.0),
+        "fix_density={}",
+        scores["a.rs"].fix_density
+    );
 }
 
 // ============================================================================
@@ -337,8 +391,16 @@ fn negative_timestamp() {
     };
     let scores = compute_file_risk_scores(&[commit], NOW, HALF_LIFE);
     let s = &scores["old.rs"];
-    assert!(s.hotspot >= 0.0 && s.hotspot <= 1.0, "hotspot={}", s.hotspot);
-    assert!(s.fix_density >= 0.0 && s.fix_density <= 1.0, "fix_density={}", s.fix_density);
+    assert!(
+        s.hotspot >= 0.0 && s.hotspot <= 1.0,
+        "hotspot={}",
+        s.hotspot
+    );
+    assert!(
+        s.fix_density >= 0.0 && s.fix_density <= 1.0,
+        "fix_density={}",
+        s.fix_density
+    );
     assert!(s.hotspot.is_finite());
     assert!(s.fix_density.is_finite());
 }
@@ -369,9 +431,20 @@ fn very_old_commits() {
     let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
     for (path, s) in &scores {
         assert!(s.hotspot.is_finite(), "{path}: hotspot is not finite");
-        assert!(s.fix_density.is_finite(), "{path}: fix_density is not finite");
-        assert!(s.hotspot >= 0.0 && s.hotspot <= 1.0, "{path}: hotspot={}", s.hotspot);
-        assert!(s.fix_density >= 0.0 && s.fix_density <= 1.0, "{path}: fix_density={}", s.fix_density);
+        assert!(
+            s.fix_density.is_finite(),
+            "{path}: fix_density is not finite"
+        );
+        assert!(
+            s.hotspot >= 0.0 && s.hotspot <= 1.0,
+            "{path}: hotspot={}",
+            s.hotspot
+        );
+        assert!(
+            s.fix_density >= 0.0 && s.fix_density <= 1.0,
+            "{path}: fix_density={}",
+            s.fix_density
+        );
     }
 }
 
@@ -412,7 +485,11 @@ fn all_files_have_valid_scores() {
 fn deterministic_results() {
     let commits: Vec<CommitInfo> = (0..10)
         .map(|i| {
-            let msg = if i % 3 == 0 { "fix: something" } else { "feat: thing" };
+            let msg = if i % 3 == 0 {
+                "fix: something"
+            } else {
+                "feat: thing"
+            };
             make_commit(NOW - i * DAY, msg, &["a.rs", "b.rs"])
         })
         .collect();
@@ -423,7 +500,10 @@ fn deterministic_results() {
         for (path, s) in &result {
             let f = &first[path];
             assert!(approx_eq(s.hotspot, f.hotspot), "{path}: hotspot differs");
-            assert!(approx_eq(s.fix_density, f.fix_density), "{path}: fix_density differs");
+            assert!(
+                approx_eq(s.fix_density, f.fix_density),
+                "{path}: fix_density differs"
+            );
         }
     }
 }
@@ -443,7 +523,10 @@ fn half_life_parameter_varies() {
     // → shorter half-life gives lower hotspot for the old file.
     let ratio_short = scores_short["b.rs"].hotspot / scores_short["a.rs"].hotspot;
     let ratio_long = scores_long["b.rs"].hotspot / scores_long["a.rs"].hotspot;
-    assert!(ratio_short < ratio_long, "short={ratio_short}, long={ratio_long}");
+    assert!(
+        ratio_short < ratio_long,
+        "short={ratio_short}, long={ratio_long}"
+    );
 }
 
 /// DEFAULT_HALF_LIFE_DAYS constant is 30.0.
