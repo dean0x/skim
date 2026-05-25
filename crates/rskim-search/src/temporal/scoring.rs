@@ -9,9 +9,13 @@
 //! accumulating decay-weighted totals per file. Hotspot scores are then
 //! max-normalized so the busiest file always scores 1.0. Fix density is the
 //! ratio of fix-weighted touches to total weighted touches per file.
-use std::collections::HashMap;
+//!
+//! [`compute_file_temporal_stats`] computes raw (non-decay-weighted) commit
+//! counts per file within 30-day and 90-day windows, for use in the persistence
+//! layer.
+use std::collections::{HashMap, HashSet};
 
-use crate::types::{CommitInfo, FileRiskScores};
+use crate::types::{CommitInfo, FileRiskScores, FileTemporalStats};
 
 /// Default e-folding time (in days) used when callers do not supply a custom value.
 ///
@@ -177,6 +181,92 @@ pub fn compute_file_risk_scores(
             )
         })
         .collect()
+}
+
+/// Compute raw per-file commit counts within 30-day and 90-day windows.
+///
+/// # Parameters
+///
+/// - `commits`: Slice of [`CommitInfo`] values (any order).
+/// - `now_epoch`: Current Unix timestamp in seconds (used for elapsed-time
+///   computation). Pass a fixed value in tests for full determinism.
+///
+/// # Returns
+///
+/// A [`HashMap`] mapping file path strings to [`FileTemporalStats`]. The map is
+/// empty when `commits` is empty.
+///
+/// # Algorithm
+///
+/// Single pass over commits:
+/// 1. Pre-classify each commit once with [`super::is_fix_commit`].
+/// 2. Compute `elapsed_days` for each commit; negative timestamps are clamped
+///    to `0`, future commits are treated as `elapsed_days = 0.0`.
+/// 3. For each commit, deduplicate the touched file list (a file listed twice in
+///    one commit's `changed_files` is counted once).
+/// 4. For each unique file in the commit: increment `total_commits` (always),
+///    `fix_commits` (when the commit is a fix), `changes_30d` (when
+///    `elapsed_days <= 30.0`), and `changes_90d` (when `elapsed_days <= 90.0`).
+///
+/// Boundary semantics: a commit at exactly `30.0` or `90.0` days is **included**
+/// in the respective window (`<=` comparison).
+#[must_use]
+pub fn compute_file_temporal_stats(
+    commits: &[CommitInfo],
+    now_epoch: u64,
+) -> HashMap<String, FileTemporalStats> {
+    if commits.is_empty() {
+        return HashMap::new();
+    }
+
+    let capacity = (commits.len() / 4).clamp(64, 50_000);
+    let mut accum: HashMap<String, FileTemporalStats> = HashMap::with_capacity(capacity);
+    // Per-commit deduplication buffer — reused across iterations.
+    let mut seen_in_commit: HashSet<String> = HashSet::new();
+
+    for commit in commits {
+        let is_fix = super::is_fix_commit(&commit.message);
+
+        // Clamp negative timestamps to 0 before converting to u64.
+        let ts = commit.timestamp.max(0) as u64;
+        let elapsed_days: f64 = if now_epoch >= ts {
+            (now_epoch - ts) as f64 / 86_400.0
+        } else {
+            // Future commit: treat as elapsed = 0 (within both windows).
+            0.0
+        };
+
+        let in_30d = elapsed_days <= 30.0;
+        let in_90d = elapsed_days <= 90.0;
+
+        // Collect unique file paths for this commit.
+        seen_in_commit.clear();
+        for file in &commit.changed_files {
+            let path = file.path_str().into_owned();
+            seen_in_commit.insert(path);
+        }
+
+        for path in &seen_in_commit {
+            let entry = accum.entry(path.clone()).or_insert(FileTemporalStats {
+                changes_30d: 0,
+                changes_90d: 0,
+                total_commits: 0,
+                fix_commits: 0,
+            });
+            entry.total_commits += 1;
+            if is_fix {
+                entry.fix_commits += 1;
+            }
+            if in_30d {
+                entry.changes_30d += 1;
+            }
+            if in_90d {
+                entry.changes_90d += 1;
+            }
+        }
+    }
+
+    accum
 }
 
 // ============================================================================

@@ -6,7 +6,8 @@
 //! - The `index` module provides on-disk persistence via memory-mapped files.
 //! - The `ngram` module handles bigram extraction (pure, no I/O).
 //! - The `temporal` module parses git history via gix and computes risk scoring
-//!   (hotspot, bug-fix density) with exponential decay.
+//!   (hotspot, bug-fix density) with exponential decay. The `temporal::storage`
+//!   sub-module persists temporal data to SQLite with WAL mode.
 //! - The `cochange` module builds and queries a binary co-change matrix with
 //!   Jaccard similarity from git history.
 //! - Returns Result types throughout — no panics in non-test code.
@@ -33,12 +34,16 @@ pub use ngram::{
     extract_query_ngrams_with_weights,
 };
 pub use temporal::{
-    DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, decay_weight, is_fix_commit,
+    DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, compute_file_temporal_stats,
+    decay_weight, is_fix_commit,
+};
+pub use temporal::storage::{
+    CochangeRow, HotspotRow, META_GIT_HEAD, META_LAST_UPDATED, RiskRow, TemporalDb,
 };
 pub use types::{
     CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, FileRiskScores,
-    HistoryResult, IndexStats, LayerBuilder, NodeInfo, Result, SearchError, SearchField,
-    SearchLayer, SearchQuery, SearchResult, TemporalFlags, TemporalMetadata, TemporalSource,
-    byte_offset_to_line, compute_line_range,
+    FileTemporalStats, HistoryResult, IndexStats, LayerBuilder, NodeInfo, Result, SearchError,
+    SearchField, SearchLayer, SearchQuery, SearchResult, TemporalFlags, TemporalMetadata,
+    TemporalSource, byte_offset_to_line, compute_line_range,
 };
 pub use weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT, bigram_weight};
