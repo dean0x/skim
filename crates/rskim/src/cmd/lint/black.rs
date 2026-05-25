@@ -22,12 +22,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "black",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install black: pip install black",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
@@ -66,7 +71,7 @@ fn run_check(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
+    run_tool(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
 }
 
 /// Inject `--check` if no mode flag is present.
@@ -103,7 +108,7 @@ fn run_format(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_format_args, parse_format_impl)
+    run_tool(CONFIG, args, ctx, prepare_format_args, parse_format_impl)
 }
 
 /// Pass args through unchanged for format mode.

@@ -22,7 +22,9 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES, run_file_tool};
+use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
 /// Maximum byte length of JSON input accepted for Tier 1 tree JSON parsing.
 ///
@@ -30,16 +32,22 @@ use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES, run_file_tool}
 /// preventing unbounded allocation on pathological or adversarial responses.
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
-const CONFIG_LS: FileToolConfig<'static> = FileToolConfig {
+const CONFIG_LS: ToolRunConfig<'static> = ToolRunConfig {
     program: "ls",
     env_overrides: &[],
     install_hint: "ls is typically pre-installed on Unix systems",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
-const CONFIG_TREE: FileToolConfig<'static> = FileToolConfig {
+const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     program: "tree",
     env_overrides: &[],
     install_hint: "Install tree via your package manager (e.g., brew install tree)",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Matches a long-form ls entry line: permissions + link count + owner + ...
@@ -66,8 +74,8 @@ pub(crate) fn run(
     tool_name: &str,
 ) -> anyhow::Result<std::process::ExitCode> {
     match tool_name {
-        "tree" => run_file_tool(CONFIG_TREE, args, ctx, prepare_tree_args, parse_tree),
-        _ => run_file_tool(CONFIG_LS, args, ctx, |_| {}, parse_ls),
+        "tree" => run_tool(CONFIG_TREE, args, ctx, prepare_tree_args, parse_tree),
+        _ => run_tool(CONFIG_LS, args, ctx, |_| {}, parse_ls),
     }
 }
 

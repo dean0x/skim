@@ -13,14 +13,19 @@ use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
 use super::{
-    FileToolConfig, MAX_FILES_SHOWN, MAX_INPUT_LINES, MAX_MATCHES_PER_FILE, build_file_result,
-    run_file_tool, try_parse_file_line_content,
+    MAX_FILES_SHOWN, MAX_INPUT_LINES, MAX_MATCHES_PER_FILE, build_file_result,
+    try_parse_file_line_content,
 };
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "rg",
     env_overrides: &[],
     install_hint: "Install ripgrep: https://github.com/BurntSushi/ripgrep",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Run `skim rg [args...]`.
@@ -28,7 +33,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_file_tool(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--json` unless user has conflicting flags.

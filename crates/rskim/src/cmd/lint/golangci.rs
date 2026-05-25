@@ -16,12 +16,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "golangci-lint",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install golangci-lint: https://golangci-lint.run/welcome/install/",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 // Static regex pattern compiled once via LazyLock.
@@ -33,7 +38,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Ensure "run" subcommand is present and inject `--out-format json`.

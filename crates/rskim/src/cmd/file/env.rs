@@ -26,13 +26,18 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES, run_file_tool};
+use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
 /// CONFIG uses "printenv" as the binary name; `skim env` routes here via dispatch.
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "printenv",
     env_overrides: &[],
     install_hint: "printenv is typically pre-installed on Unix systems",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Regex to detect and redact URL credentials: scheme://user:pass@host
@@ -77,7 +82,7 @@ const SENSITIVE_SUFFIXES: &[&str] = &[
 
 /// Run `skim env [args...]` or `skim printenv [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_file_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for env/printenv output.

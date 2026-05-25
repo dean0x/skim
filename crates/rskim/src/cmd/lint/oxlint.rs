@@ -16,12 +16,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "oxlint",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install oxlint: npm install -g oxlint",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// Matches Rust-style location markers in oxlint fancy output.
@@ -37,7 +42,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--format=json` if no `--format` flag is present.

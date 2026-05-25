@@ -61,13 +61,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::InfraResult;
 use crate::runner::CommandOutput;
 
-use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
+use super::combine_stdout_stderr;
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "gh",
     env_overrides: &[],
     install_hint: "Install gh: https://cli.github.com/",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 // ============================================================================
@@ -83,28 +87,28 @@ pub(crate) fn run(
     let action = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     match (subcmd, action) {
-        ("issue", "view") => run_infra_tool(
+        ("issue", "view") => run_tool(
             CONFIG,
             args,
             ctx,
             issue_view::prepare_args,
             issue_view::parse_impl,
         ),
-        ("pr", "view") => run_infra_tool(
+        ("pr", "view") => run_tool(
             CONFIG,
             args,
             ctx,
             pr_view::prepare_args,
             pr_view::parse_impl,
         ),
-        ("pr", "checks") => run_infra_tool(
+        ("pr", "checks") => run_tool(
             CONFIG,
             args,
             ctx,
             pr_checks::prepare_args,
             pr_checks::parse_impl,
         ),
-        ("run", "view") => run_infra_tool(
+        ("run", "view") => run_tool(
             CONFIG,
             args,
             ctx,
@@ -112,12 +116,12 @@ pub(crate) fn run(
             run_view::parse_impl,
         ),
         ("run", "watch") => {
-            // Streaming handler — does not use run_infra_tool.
+            // Streaming handler — does not use run_tool.
             // Passes remaining args (after "run watch") to run_watch.
             let watch_args = if args.len() > 2 { &args[2..] } else { &[] };
             run_watch::run_watch(watch_args, ctx)
         }
-        ("release", "view") => run_infra_tool(
+        ("release", "view") => run_tool(
             CONFIG,
             args,
             ctx,
@@ -125,16 +129,16 @@ pub(crate) fn run(
             release_view::parse_impl,
         ),
         ("api", _) => {
-            // Strip the leading "api" token so run_infra_tool sees the
+            // Strip the leading "api" token so run_tool sees the
             // remaining args only.  This lets use_stdin detection fire when
             // the user pipes `gh api ... | skim gh api` with no
             // endpoint arg — args[1..] is empty → stdin is read.
             // api::prepare_args re-inserts "api" before the spawn so the
             // child process still receives `gh api [endpoint...]`.
             let api_args = if args.is_empty() { &[][..] } else { &args[1..] };
-            run_infra_tool(CONFIG, api_args, ctx, api::prepare_args, api::parse_impl)
+            run_tool(CONFIG, api_args, ctx, api::prepare_args, api::parse_impl)
         }
-        _ => run_infra_tool(
+        _ => run_tool(
             CONFIG,
             args,
             ctx,

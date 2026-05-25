@@ -19,13 +19,17 @@ use serde_json::Value;
 use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 
-use super::{InfraToolConfig, combine_stdout_stderr, passthrough_parse, run_infra_tool};
+use super::{combine_stdout_stderr, passthrough_parse};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "terraform",
     env_overrides: &[],
     install_hint: "Install Terraform: https://developer.hashicorp.com/terraform/downloads",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 /// Matches the plan summary line in text output.
@@ -52,9 +56,9 @@ pub(crate) fn run(
     let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
 
     match subcmd {
-        "plan" => run_infra_tool(CONFIG, args, ctx, prepare_args, parse_plan),
-        "apply" => run_infra_tool(CONFIG, args, ctx, prepare_args, parse_apply),
-        _ => run_infra_tool(CONFIG, args, ctx, prepare_args, passthrough_parse),
+        "plan" => run_tool(CONFIG, args, ctx, prepare_args, parse_plan),
+        "apply" => run_tool(CONFIG, args, ctx, prepare_args, parse_apply),
+        _ => run_tool(CONFIG, args, ctx, prepare_args, passthrough_parse),
     }
 }
 

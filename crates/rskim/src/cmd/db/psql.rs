@@ -22,12 +22,16 @@ use crate::output::ParseResult;
 use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use super::{DbToolConfig, run_db_tool};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: DbToolConfig<'static> = DbToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "psql",
     env_overrides: &[("PAGER", "cat"), ("PGPAGER", "cat")],
     install_hint: "Install PostgreSQL: https://www.postgresql.org/download/",
+    family: "db",
+    skip_ansi_strip: true,
+    command_type: CommandType::Db,
 };
 
 /// Matches the psql row-count footer: `(N rows)` or `(1 row)`.
@@ -45,7 +49,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_db_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for psql output.

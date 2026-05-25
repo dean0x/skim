@@ -1123,6 +1123,88 @@ pub(crate) fn sanitize_for_display(input: &str) -> String {
 }
 
 // ============================================================================
+// Generic tool runner
+// ============================================================================
+
+/// Cross-cutting configuration for a single-tool execution.
+///
+/// Unifies `DbToolConfig`, `InfraToolConfig`, `FileToolConfig`, and
+/// `LinterConfig` into one struct.  The two new fields (`family`,
+/// `skip_ansi_strip`) are the only differences between the four original
+/// family-specific configs; all other fields are structurally identical.
+///
+/// ## Relationship to `ParsedCommandConfig`
+///
+/// `ToolRunConfig` is the caller-facing API; `ParsedCommandConfig` is the
+/// internal config consumed by `run_parsed_command_with_mode`.  `run_tool`
+/// bridges the two, translating caller fields plus `family`/`skip_ansi_strip`
+/// into the full `ParsedCommandConfig`.
+pub(crate) struct ToolRunConfig<'a> {
+    /// Binary name of the tool (e.g., "psql", "eslint").
+    pub program: &'a str,
+    /// Environment variable overrides for the child process.
+    pub env_overrides: &'a [(&'a str, &'a str)],
+    /// Hint printed when the tool binary is not found.
+    pub install_hint: &'a str,
+    /// Family name for analytics labels (e.g. `"db"`, `"infra"`, `"lint"`).
+    pub family: &'a str,
+    /// When `true`, skip ANSI escape stripping on the raw command output.
+    ///
+    /// Set `true` for DB tools (TSV output) and DNS tools (tab field separators).
+    /// See `ParsedCommandConfig::skip_ansi_strip` for full rationale.
+    pub skip_ansi_strip: bool,
+    /// Analytics command type for recording.
+    pub command_type: crate::analytics::CommandType,
+}
+
+/// Execute a tool, parse its output, and emit the result.
+///
+/// Single generic implementation that replaces `run_db_tool`, `run_infra_tool`,
+/// `run_file_tool`, and `run_linter`.  Each family-specific runner had an
+/// identical body; the only differences were `family`, `skip_ansi_strip`, and
+/// `command_type`, which are now carried in `ToolRunConfig`.
+///
+/// ## Constraints
+///
+/// `build::run_parsed_command` is intentionally **not** replaced: it has a
+/// different call shape (no `ctx: &RunContext`, different analytics path).
+/// `run_pkg_subcommand` is also excluded: it has a different signature.
+pub(crate) fn run_tool<T>(
+    config: ToolRunConfig<'_>,
+    args: &[String],
+    ctx: &RunContext,
+    prepare_args: impl FnOnce(&mut Vec<String>),
+    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<T>,
+) -> anyhow::Result<std::process::ExitCode>
+where
+    T: AsRef<str> + serde::Serialize,
+{
+    let mut cmd_args = args.to_vec();
+    prepare_args(&mut cmd_args);
+    let use_stdin = should_read_stdin(args);
+    run_parsed_command_with_mode(
+        ParsedCommandConfig {
+            program: config.program,
+            args: &cmd_args,
+            env_overrides: config.env_overrides,
+            install_hint: config.install_hint,
+            use_stdin,
+            show_stats: ctx.show_stats,
+            output_format: ctx.output_format(),
+            family: config.family,
+            skip_ansi_strip: config.skip_ansi_strip,
+            rec: crate::analytics::RecordingContext {
+                enabled: ctx.analytics_enabled,
+                command_type: config.command_type,
+                parse_tier: None,
+                session_id: ctx.session_id.as_deref(),
+            },
+        },
+        |output, _args| parse_fn(output),
+    )
+}
+
+// ============================================================================
 // Shared test helpers
 // ============================================================================
 

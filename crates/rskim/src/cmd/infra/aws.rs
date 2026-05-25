@@ -16,13 +16,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
+use super::combine_stdout_stderr;
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "aws",
     env_overrides: &[],
     install_hint: "Install AWS CLI: https://aws.amazon.com/cli/",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 /// Keys stripped from AWS JSON responses (metadata, not useful data).
@@ -45,7 +49,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_infra_tool(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--output json` if not already present and subcommand supports it.

@@ -23,13 +23,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
+use super::combine_stdout_stderr;
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "curl",
     env_overrides: &[],
     install_hint: "Install curl: https://curl.se/",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 /// Maximum number of source fields in a JSON response before a truncation notice is added.
@@ -88,7 +92,7 @@ pub(crate) fn run(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for curl — flags are too varied
-    run_infra_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Determine the effective HTTP status code string from the two possible sources.

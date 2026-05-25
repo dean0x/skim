@@ -11,12 +11,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, run_file_tool, try_parse_file_line_content};
+use super::try_parse_file_line_content;
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "grep",
     env_overrides: &[],
     install_hint: "grep is typically pre-installed. For better compression, install ripgrep: https://github.com/BurntSushi/ripgrep",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Run `skim grep [args...]`.
@@ -25,7 +30,7 @@ pub(crate) fn run(
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for grep -- flags are too varied
-    run_file_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Two-tier parse function: Tier 1 regex -> Passthrough.

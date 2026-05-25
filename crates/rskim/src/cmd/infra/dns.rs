@@ -29,29 +29,35 @@ use crate::output::ParseResult;
 use crate::output::canonical::{InfraItem, InfraResult};
 use crate::runner::CommandOutput;
 
-use super::{InfraToolConfig, combine_stdout_stderr, run_infra_tool};
+use super::combine_stdout_stderr;
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
 // ============================================================================
 // Tool configs
 // ============================================================================
 
-const CONFIG_DIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG_DIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "dig",
     env_overrides: &[],
     install_hint: "Install via: apt install dnsutils / brew install bind",
+    family: "infra",
     // dig uses TABs as field separators in ANSWER records (e.g. `name\tTTL\tIN\tA\tip`).
     // strip_ansi_escapes treats \t as a control code and removes it, collapsing fields
     // so RE_DIG_RECORD can no longer match. Skip stripping for dig and nslookup.
     skip_ansi_strip: true,
+    command_type: CommandType::Infra,
 };
 
-const CONFIG_NSLOOKUP: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
     program: "nslookup",
     env_overrides: &[],
     install_hint: "Install via: apt install dnsutils / brew install bind",
+    family: "infra",
     // nslookup also uses TABs as field separators (Server:\t<ip>, Address:\t<ip>#port).
     // See CONFIG_DIG comment for the full rationale.
     skip_ansi_strip: true,
+    command_type: CommandType::Infra,
 };
 
 // ============================================================================
@@ -118,7 +124,7 @@ pub(crate) fn run_dig(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_infra_tool(CONFIG_DIG, args, ctx, |_| {}, parse_dig_impl)
+    run_tool(CONFIG_DIG, args, ctx, |_| {}, parse_dig_impl)
 }
 
 /// Run `skim nslookup [args...]`.
@@ -145,7 +151,7 @@ pub(crate) fn run_nslookup(
             return Ok(std::process::ExitCode::FAILURE);
         }
     }
-    run_infra_tool(CONFIG_NSLOOKUP, args, ctx, |_| {}, parse_nslookup_impl)
+    run_tool(CONFIG_NSLOOKUP, args, ctx, |_| {}, parse_nslookup_impl)
 }
 
 // ============================================================================

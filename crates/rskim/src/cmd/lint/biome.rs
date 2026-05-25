@@ -28,12 +28,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "biome",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install biome: npm install -g @biomejs/biome",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces.
@@ -86,7 +91,7 @@ fn run_check(
         .skip(if has_subcommand { 1 } else { 0 })
         .cloned()
         .collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,
@@ -134,7 +139,7 @@ fn run_format(
     // file args remain (e.g., `cat output.txt | skim biome format`).
     // `prepare_format_args` re-injects "format" for binary execution.
     let remaining: Vec<String> = args.iter().skip(1).cloned().collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,
@@ -146,7 +151,7 @@ fn run_format(
 /// Re-inject the `format` subcommand stripped by `run_format`.
 ///
 /// When `biome format` is executed as a binary, `format` must be the first
-/// argument. We strip it before `run_linter` to allow stdin detection, then
+/// argument. We strip it before `run_tool` to allow stdin detection, then
 /// restore it here.
 fn prepare_format_args(cmd_args: &mut Vec<String>) {
     if cmd_args.first().is_none_or(|a| a != "format") {

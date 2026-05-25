@@ -21,10 +21,8 @@ pub(crate) mod swiftlint;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 
-use super::{ParsedCommandConfig, extract_show_stats, run_parsed_command_with_mode};
-use crate::output::ParseResult;
+use super::extract_show_stats;
 use crate::output::canonical::{LintGroup, LintIssue, LintResult, LintSeverity};
-use crate::runner::CommandOutput;
 
 /// Known linters that the lint handler can dispatch to.
 const KNOWN_LINTERS: &[&str] = &[
@@ -128,67 +126,6 @@ fn print_help() {
     println!("  eslint . 2>&1 | skim eslint  Pipe eslint output");
 }
 
-// ============================================================================
-// Shared linter execution helper
-// ============================================================================
-
-/// Static configuration for a linter binary.
-///
-/// Each linter module exposes a `CONFIG` constant with this type.
-pub(crate) struct LinterConfig<'a> {
-    /// Binary name of the linter (e.g., "eslint", "ruff").
-    pub program: &'a str,
-    /// Environment variable overrides for the child process.
-    pub env_overrides: &'a [(&'a str, &'a str)],
-    /// Hint printed when the linter binary is not found.
-    pub install_hint: &'a str,
-}
-
-/// Execute a linter, parse its output, and emit the result.
-///
-/// This is the single implementation shared by all lint parsers, handling both
-/// text and JSON output modes. It eliminates per-linter `run()` boilerplate by
-/// delegating to [`super::run_parsed_command_with_mode`].
-///
-/// - `config`: static linter metadata (program name, env vars, install hint)
-/// - `args`: raw user args (before prepare_args)
-/// - `ctx`: cross-cutting flags (show_stats, json_output, analytics_enabled)
-/// - `prepare_args`: closure to inject linter-specific flags (e.g., `--format json`)
-/// - `parse_fn`: linter-specific three-tier parse function
-pub(crate) fn run_linter(
-    config: LinterConfig<'_>,
-    args: &[String],
-    ctx: &super::RunContext,
-    prepare_args: impl FnOnce(&mut Vec<String>),
-    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<LintResult>,
-) -> anyhow::Result<ExitCode> {
-    let mut cmd_args = args.to_vec();
-    prepare_args(&mut cmd_args);
-
-    let use_stdin = super::should_read_stdin(args);
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
-            program: config.program,
-            args: &cmd_args,
-            env_overrides: config.env_overrides,
-            install_hint: config.install_hint,
-            use_stdin,
-            show_stats: ctx.show_stats,
-            output_format: ctx.output_format(),
-            family: "lint",
-            skip_ansi_strip: false,
-            rec: crate::analytics::RecordingContext {
-                enabled: ctx.analytics_enabled,
-                command_type: crate::analytics::CommandType::Lint,
-                parse_tier: None,
-                session_id: ctx.session_id.as_deref(),
-            },
-        },
-        |output, _args| parse_fn(output),
-    )
-}
-
 /// Re-export the shared `combine_output` under the name callers expect.
 pub(crate) use super::combine_output as combine_stdout_stderr;
 
@@ -249,6 +186,7 @@ mod tests {
 
     use super::*;
     use crate::output::canonical::{LintIssue, LintSeverity};
+    use crate::runner::CommandOutput;
 
     #[test]
     fn test_group_issues_info_severity_not_counted() {

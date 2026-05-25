@@ -16,12 +16,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "swiftlint",
     env_overrides: &[],
     install_hint: "Install SwiftLint: brew install swiftlint",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// `file.swift:line:col: warning: message (rule_id)`
@@ -34,7 +39,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `--reporter json` unless the user already specified a reporter or fix flags.

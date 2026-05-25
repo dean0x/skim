@@ -15,12 +15,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES, run_file_tool};
+use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "wc",
     env_overrides: &[],
     install_hint: "wc is typically pre-installed on Unix systems",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Matches full wc output: lines words bytes filename
@@ -32,7 +37,7 @@ static RE_WC_SINGLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\d+)\s
 
 /// Run `skim wc [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_file_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for wc output.

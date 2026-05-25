@@ -25,12 +25,16 @@ use crate::output::ParseResult;
 use crate::output::canonical::DbResult;
 use crate::runner::CommandOutput;
 
-use super::{DbToolConfig, run_db_tool};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: DbToolConfig<'static> = DbToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "mysql",
     env_overrides: &[("MYSQL_PAGER", "cat"), ("PAGER", "cat")],
     install_hint: "Install MySQL client: https://dev.mysql.com/downloads/",
+    family: "db",
+    skip_ansi_strip: true,
+    command_type: CommandType::Db,
 };
 
 /// Matches MySQL's "Empty set" output.
@@ -51,7 +55,7 @@ pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_db_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
 }
 
 /// Three-tier parse function for mysql output.

@@ -12,12 +12,7 @@ pub(crate) mod sqlite3;
 
 use std::process::ExitCode;
 
-use super::{
-    ParsedCommandConfig, extract_json_flag, extract_show_stats, run_parsed_command_with_mode,
-};
-use crate::output::ParseResult;
-use crate::output::canonical::DbResult;
-use crate::runner::CommandOutput;
+use super::{extract_json_flag, extract_show_stats};
 
 /// Known DB tools that the db handler can dispatch to.
 const KNOWN_TOOLS: &[&str] = &["mysql", "psql", "sqlite3"];
@@ -92,57 +87,3 @@ fn print_help() {
     println!("  skim sqlite3 app.db \"SELECT * FROM logs LIMIT 20\"");
 }
 
-// ============================================================================
-// Shared DB tool execution helper
-// ============================================================================
-
-/// Static configuration for a DB tool binary.
-pub(crate) struct DbToolConfig<'a> {
-    /// Binary name of the tool (e.g., "psql", "mysql").
-    pub program: &'a str,
-    /// Environment variable overrides for the child process (e.g. pager suppression).
-    pub env_overrides: &'a [(&'a str, &'a str)],
-    /// Hint printed when the tool binary is not found.
-    pub install_hint: &'a str,
-}
-
-/// Execute a DB tool, parse its output, and emit the result.
-///
-/// Parallel to [`crate::cmd::infra::run_infra_tool`] but uses [`CommandType::Db`]
-/// and `family: "db"` for analytics labelling.
-pub(crate) fn run_db_tool(
-    config: DbToolConfig<'_>,
-    args: &[String],
-    ctx: &super::RunContext,
-    prepare_args: impl FnOnce(&mut Vec<String>),
-    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<DbResult>,
-) -> anyhow::Result<ExitCode> {
-    let mut cmd_args = args.to_vec();
-    prepare_args(&mut cmd_args);
-
-    let use_stdin = super::should_read_stdin(args);
-
-    run_parsed_command_with_mode(
-        ParsedCommandConfig {
-            program: config.program,
-            args: &cmd_args,
-            env_overrides: config.env_overrides,
-            install_hint: config.install_hint,
-            use_stdin,
-            show_stats: ctx.show_stats,
-            output_format: ctx.output_format(),
-            family: "db",
-            // DB tools emit tab-separated (TSV) output; stripping ANSI would
-            // drop tab characters and break the TSV parser. See ParsedCommandConfig
-            // docs for full explanation.
-            skip_ansi_strip: true,
-            rec: crate::analytics::RecordingContext {
-                enabled: ctx.analytics_enabled,
-                command_type: crate::analytics::CommandType::Db,
-                parse_tier: None,
-                session_id: ctx.session_id.as_deref(),
-            },
-        },
-        |output, _args| parse_fn(output),
-    )
-}

@@ -23,12 +23,17 @@ use crate::output::ParseResult;
 use crate::output::canonical::{LintIssue, LintResult, LintSeverity};
 use crate::runner::CommandOutput;
 
-use super::{LinterConfig, combine_stdout_stderr, group_issues};
+use super::{combine_stdout_stderr, group_issues};
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: LinterConfig<'static> = LinterConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "prettier",
     env_overrides: &[("NO_COLOR", "1")],
     install_hint: "Install prettier via npm: npm install -g prettier",
+    family: "lint",
+    skip_ansi_strip: false,
+    command_type: CommandType::Lint,
 };
 
 /// AD-LINT-21 (2026-04-15) — Path-aware regex patterns: `.+\S` captures full path including
@@ -78,7 +83,7 @@ fn run_check(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    super::run_linter(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
+    run_tool(CONFIG, args, ctx, prepare_check_args, parse_check_impl)
 }
 
 /// Inject `--check` if not already present.
@@ -127,7 +132,7 @@ fn run_format(
         .filter(|a| a.as_str() != "--write" && a.as_str() != "-w")
         .cloned()
         .collect();
-    super::run_linter(
+    run_tool(
         CONFIG,
         &remaining,
         ctx,

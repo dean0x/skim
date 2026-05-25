@@ -22,17 +22,22 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{FileToolConfig, MAX_DISPLAY_ENTRIES, run_file_tool};
+use super::MAX_DISPLAY_ENTRIES;
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: FileToolConfig<'static> = FileToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "diff",
     env_overrides: &[],
     install_hint: "diff is typically pre-installed on Unix systems",
+    family: "file",
+    skip_ansi_strip: false,
+    command_type: CommandType::FileOps,
 };
 
 /// Run `skim diff [args...]`.
 pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_file_tool(CONFIG, args, ctx, prepare_args, parse_impl)
+    run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
 /// Inject `-u` (unified diff) if not already present.

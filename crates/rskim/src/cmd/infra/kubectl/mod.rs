@@ -17,17 +17,19 @@ pub(crate) mod logs;
 
 use std::process::ExitCode;
 
-use super::{InfraToolConfig, run_infra_tool};
-
 /// Re-exports for sub-module use.
 pub(super) use super::combine_stdout_stderr;
 pub(super) use super::log_result_to_infra;
+use crate::cmd::{ToolRunConfig, run_tool};
+use crate::analytics::CommandType;
 
-const CONFIG: InfraToolConfig<'static> = InfraToolConfig {
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "kubectl",
     env_overrides: &[],
     install_hint: "Install kubectl: https://kubernetes.io/docs/tasks/tools/",
+    family: "infra",
     skip_ansi_strip: false,
+    command_type: CommandType::Infra,
 };
 
 /// Global kubectl flags that accept a value in the following token.
@@ -57,15 +59,15 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
     let subcmd = args.get(sub_idx).map(|s| s.as_str()).unwrap_or("");
 
     match subcmd {
-        "get" => run_infra_tool(CONFIG, args, ctx, get::prepare_args, get::parse_impl),
-        "describe" => run_infra_tool(
+        "get" => run_tool(CONFIG, args, ctx, get::prepare_args, get::parse_impl),
+        "describe" => run_tool(
             CONFIG,
             args,
             ctx,
             describe::prepare_args,
             describe::parse_impl,
         ),
-        "logs" => run_infra_tool(CONFIG, args, ctx, logs::prepare_args, logs::parse_impl),
-        _ => run_infra_tool(CONFIG, args, ctx, |_| {}, super::passthrough_parse),
+        "logs" => run_tool(CONFIG, args, ctx, logs::prepare_args, logs::parse_impl),
+        _ => run_tool(CONFIG, args, ctx, |_| {}, super::passthrough_parse),
     }
 }
