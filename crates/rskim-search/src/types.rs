@@ -252,6 +252,27 @@ pub struct CommitInfo {
     pub changed_files: Vec<FileChangeInfo>,
 }
 
+// ============================================================================
+// Risk scoring types (Issue #183)
+// ============================================================================
+
+/// Per-file hotspot and bug-fix density scores computed from git history.
+///
+/// Both fields are in the range `[0.0, 1.0]`.
+///
+/// - `hotspot`: decay-weighted commit frequency, max-normalized so the most active
+///   file scores `1.0`. Higher values indicate files that change frequently and
+///   recently — strong candidates for code-smell review.
+/// - `fix_density`: fraction of weighted commits that are classified as bug fixes.
+///   A value of `1.0` means every weighted touch was a fix commit; `0.0` means none.
+#[derive(Debug, Clone)]
+pub struct FileRiskScores {
+    /// Decay-weighted commit frequency, max-normalized to `[0.0, 1.0]`.
+    pub hotspot: f64,
+    /// Decay-weighted ratio of fix commits to total commits, in `[0.0, 1.0]`.
+    pub fix_density: f64,
+}
+
 /// Summary metadata about a parsed history result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemporalMetadata {
