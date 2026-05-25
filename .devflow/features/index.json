@@ -36,6 +36,23 @@
       ],
       "lastUpdated": "2026-05-24T09:00:37.079Z",
       "createdBy": "implement"
+    },
+    "temporal-scoring": {
+      "name": "Temporal Risk Scoring",
+      "description": "Per-file hotspot and bug-fix density with exponential decay. Use when adding temporal ranking signals, modifying decay parameters, or debugging risk score computation.",
+      "directories": [
+        "crates/rskim-search/src/temporal/"
+      ],
+      "referencedFiles": [
+        "crates/rskim-search/src/temporal/scoring.rs",
+        "crates/rskim-search/src/temporal/scoring_tests.rs",
+        "crates/rskim-search/src/temporal/mod.rs",
+        "crates/rskim-search/src/temporal/git_parser.rs",
+        "crates/rskim-search/src/types.rs",
+        "crates/rskim-search/src/lib.rs"
+      ],
+      "lastUpdated": "2026-05-25T10:11:00.693Z",
+      "createdBy": "implement"
     }
   }
 }

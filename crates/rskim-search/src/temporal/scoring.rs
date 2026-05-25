@@ -58,7 +58,11 @@ pub fn decay_weight(elapsed_days: f64, half_life_days: f64) -> f64 {
     debug_assert!(half_life_days > 0.0);
     // Treat NaN elapsed as zero (present-moment weight = 1.0) to prevent
     // NaN propagation into accumulators. clamp() alone does not sanitize NaN.
-    let elapsed = if elapsed_days.is_nan() { 0.0 } else { elapsed_days };
+    let elapsed = if elapsed_days.is_nan() {
+        0.0
+    } else {
+        elapsed_days
+    };
     (-elapsed / half_life_days).exp().clamp(0.0, 1.0)
 }
 
