@@ -130,6 +130,58 @@ fn decay_zero_half_life_panics() {
     let _ = decay_weight(1.0, 0.0);
 }
 
+/// `decay_weight` with NaN elapsed_days — result must be finite and in [0.0, 1.0].
+///
+/// NaN inputs must not propagate or cause a panic; the function should return a
+/// well-defined value in the valid output range.
+#[test]
+fn decay_nan_elapsed_does_not_propagate() {
+    let w = decay_weight(f64::NAN, HALF_LIFE);
+    assert!(
+        w.is_finite() && w >= 0.0 && w <= 1.0,
+        "expected finite value in [0,1] for NaN elapsed, got {w}"
+    );
+}
+
+/// `decay_weight` with positive Infinity elapsed_days — result must be finite and in [0.0, 1.0].
+///
+/// exp(-∞) = 0.0, which is a valid lower bound.
+#[test]
+fn decay_positive_infinity_elapsed() {
+    let w = decay_weight(f64::INFINITY, HALF_LIFE);
+    assert!(
+        w.is_finite() && w >= 0.0 && w <= 1.0,
+        "expected finite value in [0,1] for +Inf elapsed, got {w}"
+    );
+    // exp(-Inf) = 0.0 clamped → 0.0
+    assert!(approx_eq(w, 0.0), "expected 0.0, got {w}");
+}
+
+/// `decay_weight` with negative Infinity elapsed_days — result must be clamped to 1.0.
+///
+/// exp(+∞) = +∞ → clamped to 1.0.
+#[test]
+fn decay_negative_infinity_elapsed() {
+    let w = decay_weight(f64::NEG_INFINITY, HALF_LIFE);
+    assert!(
+        w.is_finite() && w >= 0.0 && w <= 1.0,
+        "expected finite value in [0,1] for -Inf elapsed, got {w}"
+    );
+    // exp(+Inf) = +Inf → clamped to 1.0
+    assert!(approx_eq(w, 1.0), "expected 1.0, got {w}");
+}
+
+/// `compute_file_risk_scores` with zero half-life panics unconditionally (assert!).
+///
+/// Unlike `decay_weight` which uses `debug_assert!`, `compute_file_risk_scores`
+/// guards its precondition with `assert!` so it fires in both debug and release builds.
+#[test]
+#[should_panic(expected = "half_life_days must be positive")]
+fn compute_scores_zero_half_life_panics() {
+    let commits = vec![make_commit(NOW, "feat", &["a.rs"])];
+    let _ = compute_file_risk_scores(&commits, NOW, 0.0);
+}
+
 // ============================================================================
 // Group 2: Basic cases
 // ============================================================================
@@ -167,6 +219,39 @@ fn single_fix_commit() {
         approx_eq(s.fix_density, 1.0),
         "fix_density={}",
         s.fix_density
+    );
+}
+
+/// Single commit touching multiple files — all files share the same decay weight
+/// and normalize to hotspot=1.0.
+///
+/// Verifies that a single wide-impact commit distributes the same weight to every
+/// file it touches, so all three reach the maximum after normalization.
+#[test]
+fn single_commit_multiple_files_same_weight() {
+    let commits = vec![make_commit(NOW - 10 * DAY, "feat: wide change", &[
+        "a.rs", "b.rs", "c.rs",
+    ])];
+    let scores = compute_file_risk_scores(&commits, NOW, HALF_LIFE);
+    assert_eq!(scores.len(), 3, "expected 3 file entries");
+
+    // All three files have the same raw weight; after max-normalization each is 1.0.
+    let expected = scores["a.rs"].hotspot;
+    assert!(
+        approx_eq(expected, 1.0),
+        "a.rs hotspot should be 1.0, got {expected}"
+    );
+    assert!(
+        approx_eq(scores["b.rs"].hotspot, expected),
+        "b.rs hotspot {} != a.rs hotspot {}",
+        scores["b.rs"].hotspot,
+        expected
+    );
+    assert!(
+        approx_eq(scores["c.rs"].hotspot, expected),
+        "c.rs hotspot {} != a.rs hotspot {}",
+        scores["c.rs"].hotspot,
+        expected
     );
 }
 
