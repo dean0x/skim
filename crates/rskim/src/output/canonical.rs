@@ -749,8 +749,6 @@ impl DbResult {
         row_count: usize,
         truncated: bool,
     ) -> String {
-        use std::fmt::Write;
-
         let trunc_label = if truncated { " (truncated)" } else { "" };
         let mut output = format!("{tool} query {row_count} rows{trunc_label}");
 

@@ -55,6 +55,28 @@ pub(crate) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
     ParseResult::Passthrough(combined.into_owned())
 }
 
+/// Parse `kubectl describe` text output.
+///
+/// ## State machine for section skipping
+///
+/// `kubectl describe` output is structured as a flat stream of indented
+/// key-value lines, grouped into labelled sections.  Some sections
+/// (Annotations, Managed Fields) are verbose metadata that adds noise
+/// without value for AI context windows.
+///
+/// The parser tracks a single boolean flag `in_skip_section` that acts as a
+/// two-state machine:
+///
+/// - **`false` (normal)**: Process lines as key-value pairs.  When the current
+///   line matches a `SKIP_SECTIONS` header (e.g. `Annotations:`), transition
+///   to **`true`** and drop the header line.
+///
+/// - **`true` (skipping)**: Discard every line.  When a non-indented line
+///   appears (i.e. a new top-level section header or a blank separator),
+///   transition back to **`false`** and re-process that line.
+///
+/// Indentation is the boundary signal: section body lines always start with
+/// at least one space or tab, while new section headers start at column 0.
 fn try_parse_describe(text: &str) -> Option<InfraResult> {
     let mut items: Vec<InfraItem> = Vec::new();
     let mut in_skip_section = false;

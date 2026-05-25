@@ -38,6 +38,42 @@ static RE_BUILD_SUCCESS_BUILDKIT: LazyLock<Regex> =
 static RE_BUILD_WARN_ERROR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^(?:WARN(?:ING)?|ERROR):\s+(.+)$").unwrap());
 
+// ============================================================================
+// BuildFormat enum
+// ============================================================================
+
+/// Detected build output format.
+///
+/// Replaces the former `is_legacy: bool` / `is_buildkit: bool` pair.
+///
+/// ## Illegal state elimination
+///
+/// The old boolean pair had a silent third state — both `false` — which meant
+/// "no build output detected" and was handled by the `if !is_legacy && !is_buildkit`
+/// guard.  `BuildFormat` makes all three states explicit:
+///
+/// - `BuildFormat::Legacy`: classic `Step N/M : COMMAND` lines seen
+/// - `BuildFormat::BuildKit`: modern `=> [stage N/M] COMMAND` lines seen
+/// - `None` (absence of this value): no recognisable build output → `try_parse_build` returns `None`
+///
+/// A 0-step build (both formats seen, no actual steps extracted) is rejected
+/// via an explicit guard to avoid emitting an empty result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildFormat {
+    Legacy,
+    BuildKit,
+}
+
+impl BuildFormat {
+    /// Human-readable label used in the build summary line.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::BuildKit => "BuildKit",
+        }
+    }
+}
+
 /// No-op: `docker build` does not support `--format json`.
 ///
 /// # Safety invariant
@@ -71,15 +107,14 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
     let mut steps: Vec<String> = Vec::new();
     let mut final_image: Option<String> = None;
     let mut warnings: Vec<String> = Vec::new();
-    let mut is_legacy = false;
-    let mut is_buildkit = false;
+    let mut fmt: Option<BuildFormat> = None;
 
     for line in text.lines() {
         let trimmed = line.trim();
 
         // Legacy format
         if let Some(caps) = RE_BUILD_STEP_LEGACY.captures(trimmed) {
-            is_legacy = true;
+            fmt = Some(BuildFormat::Legacy);
             let step_num = &caps[1];
             let total = &caps[2];
             let cmd = &caps[3];
@@ -89,7 +124,7 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
 
         // BuildKit format — match lines like `=> [1/6] FROM ...`
         if let Some(caps) = RE_BUILD_STEP_BUILDKIT.captures(trimmed) {
-            is_buildkit = true;
+            fmt = Some(BuildFormat::BuildKit);
             let stage = &caps[1];
             let cmd = &caps[2];
             // Skip internal/metadata steps
@@ -120,13 +155,19 @@ fn try_parse_build(text: &str) -> Option<InfraResult> {
         }
     }
 
-    if !is_legacy && !is_buildkit {
+    // No recognised build output → passthrough
+    let fmt = fmt?;
+
+    // A recognised header with zero extracted steps is ambiguous; reject rather
+    // than emit an empty result (e.g. a build log where all lines were filtered
+    // as internal/load/exporting steps).
+    if steps.is_empty() && final_image.is_none() {
         return None;
     }
 
-    let format = if is_buildkit { "BuildKit" } else { "legacy" };
+    let label = fmt.label();
     let step_count = steps.len();
-    let summary = format!("{step_count} steps ({format})");
+    let summary = format!("{step_count} steps ({label})");
 
     let mut items: Vec<InfraItem> = steps
         .into_iter()
@@ -244,6 +285,35 @@ mod tests {
         assert_eq!(
             args, original,
             "prepare_args must not modify args for docker build"
+        );
+    }
+
+    // ── BuildFormat enum tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_build_format_legacy_label() {
+        assert_eq!(BuildFormat::Legacy.label(), "legacy");
+    }
+
+    #[test]
+    fn test_build_format_buildkit_label() {
+        assert_eq!(BuildFormat::BuildKit.label(), "BuildKit");
+    }
+
+    /// A build log whose steps are all filtered (internal/load/exporting) should
+    /// return `None` rather than emitting an empty result.
+    #[test]
+    fn test_try_parse_build_zero_steps_returns_none() {
+        // These lines set `fmt = Some(BuildFormat::BuildKit)` but produce no
+        // entries in `steps` because all three are filtered metadata lines.
+        let input = "\
+ => [internal] load build definition from Dockerfile\n\
+ => [internal] load .dockerignore\n\
+ => [internal] load metadata for docker.io/library/python:3.11\n";
+        let result = try_parse_build(input);
+        assert!(
+            result.is_none(),
+            "expected None for all-filtered BuildKit output, got {result:?}"
         );
     }
 }

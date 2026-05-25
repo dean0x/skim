@@ -88,6 +88,14 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<DbResult> {
 ///  val  | val  | val
 /// (N rows)
 /// ```
+///
+/// ## Eager collection pattern
+///
+/// The input is eagerly collected into a `Vec<&str>` so that the parser can use
+/// random-access indexing (`lines[sep_idx - 1]`, slice ranges, `rposition`) to
+/// locate the header, separator, data rows, and footer in a single pass.  A
+/// streaming iterator would require multiple passes or complex lookahead; the
+/// bounded allocation is negligible for the query result sizes skim handles.
 fn try_parse_tabular(text: &str) -> Option<DbResult> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
