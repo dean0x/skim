@@ -178,9 +178,6 @@ fn decay_negative_infinity_elapsed() {
 }
 
 /// `compute_file_risk_scores` with zero half-life panics unconditionally (assert!).
-///
-/// Unlike `decay_weight` which uses `debug_assert!`, `compute_file_risk_scores`
-/// guards its precondition with `assert!` so it fires in both debug and release builds.
 #[test]
 #[should_panic(expected = "half_life_days must be positive")]
 fn compute_scores_zero_half_life_panics() {
