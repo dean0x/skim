@@ -204,15 +204,10 @@ fn try_tier2_noise_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::cmd::test_support::make_output_full;
 
     fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::from_millis(100),
-        }
+        make_output_full(stdout, stderr, exit_code)
     }
 
     const MAVEN_SUCCESS: &str = "[INFO] Scanning for projects...\n[INFO] Building MyApp 1.0.0\n[INFO] BUILD SUCCESS\n[INFO] ------------------------------------------------------------------------\n[INFO] Total time:  2.345 s\n[INFO] Finished at: 2026-01-01T00:00:00Z\n";

@@ -235,25 +235,14 @@ fn try_tier2_noise_strip(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    fn fixtures_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cmd/build")
-    }
+    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output_full};
 
     fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixtures_dir().join(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture {name}: {e}"))
+        _load_fixture("build", name)
     }
 
     fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::from_millis(100),
-        }
+        make_output_full(stdout, stderr, exit_code)
     }
 
     // ========================================================================

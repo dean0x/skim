@@ -561,22 +561,10 @@ fn try_parse_nslookup_regex(text: &str) -> Option<InfraResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output};
 
     fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
-    }
-
-    fn make_output(combined: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: combined.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
+        _load_fixture("infra", name)
     }
 
     // ========================================================================

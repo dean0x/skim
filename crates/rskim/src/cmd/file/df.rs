@@ -100,23 +100,14 @@ fn try_parse_df(stdout: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::cmd::test_support::{load_fixture as _load_fixture, make_output_full};
 
     fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/file");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+        _load_fixture("file", name)
     }
 
     fn make_output(stdout: &str, exit_code: i32) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(exit_code),
-            duration: Duration::ZERO,
-        }
+        make_output_full(stdout, "", Some(exit_code))
     }
 
     #[test]

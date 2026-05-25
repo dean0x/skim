@@ -657,11 +657,7 @@ mod tests {
     }
 
     fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/log");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+        crate::cmd::test_support::load_fixture("log", name)
     }
 
     #[test]

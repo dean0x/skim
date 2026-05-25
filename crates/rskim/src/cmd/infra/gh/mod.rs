@@ -236,25 +236,19 @@ fn try_parse_view_json_auto(obj: &serde_json::Value) -> Option<InfraResult> {
 // Shared test helpers
 // ============================================================================
 
+/// Re-export shared test helpers for gh submodule tests.
+///
+/// Delegates to `crate::cmd::test_support` which provides canonical
+/// `make_output` and `load_fixture` implementations used across the
+/// entire `cmd` subtree.
 #[cfg(test)]
 pub(super) mod test_helpers {
-    use crate::runner::CommandOutput;
-
-    pub(super) fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
+    pub(super) fn make_output(stdout: &str) -> crate::runner::CommandOutput {
+        crate::cmd::test_support::make_output(stdout)
     }
 
     pub(super) fn load_fixture(name: &str) -> String {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/fixtures/cmd/infra");
-        path.push(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+        crate::cmd::test_support::load_fixture("infra", name)
     }
 }
 

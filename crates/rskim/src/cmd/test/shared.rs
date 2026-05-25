@@ -569,8 +569,6 @@ pub(super) fn extract_json_object(text: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     // ========================================================================
@@ -649,12 +647,7 @@ mod tests {
     // ========================================================================
 
     fn make_output(stdout: &str, stderr: &str, code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code: code,
-            duration: Duration::ZERO,
-        }
+        crate::cmd::test_support::make_output_full(stdout, stderr, code)
     }
 
     #[test]

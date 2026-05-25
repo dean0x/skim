@@ -252,16 +252,7 @@ fn parse_bordered_row(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-
-    fn make_output(stdout: &str) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            exit_code: Some(0),
-            duration: std::time::Duration::ZERO,
-        }
-    }
+    use crate::cmd::test_support::*;
 
     #[test]
     fn test_tier1_mysql_tsv() {

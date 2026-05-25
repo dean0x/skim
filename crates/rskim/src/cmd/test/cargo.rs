@@ -522,21 +522,10 @@ fn try_parse_regex(text: &str) -> Option<TestResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Helper to load fixture files
-    fn fixture_path(name: &str) -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests");
-        path.push("fixtures");
-        path.push("cmd");
-        path.push("test");
-        path.push(name);
-        path
-    }
+    use crate::cmd::test_support::load_fixture as _load_fixture;
 
     fn load_fixture(name: &str) -> String {
-        std::fs::read_to_string(fixture_path(name))
-            .unwrap_or_else(|e| panic!("Failed to load fixture '{name}': {e}"))
+        _load_fixture("test", name)
     }
 
     // ========================================================================

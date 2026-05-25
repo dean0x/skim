@@ -500,17 +500,10 @@ fn emit_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::load_fixture as _load_fixture;
 
-    /// Load a fixture file from the test fixtures directory.
     fn load_fixture(name: &str) -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("cmd")
-            .join("test")
-            .join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to load fixture {}: {e}", path.display()))
+        _load_fixture("test", name)
     }
 
     // ========================================================================

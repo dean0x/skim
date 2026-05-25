@@ -154,16 +154,10 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::CommandOutput;
-    use std::time::Duration;
+    use crate::cmd::test_support::make_output_full;
 
     fn make_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> CommandOutput {
-        CommandOutput {
-            stdout: stdout.to_string(),
-            stderr: stderr.to_string(),
-            exit_code,
-            duration: Duration::ZERO,
-        }
+        make_output_full(stdout, stderr, exit_code)
     }
 
     const SWIFTLINT_PASS_JSON: &str = r#"[]"#;
