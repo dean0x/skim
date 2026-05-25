@@ -300,6 +300,42 @@ mod tests {
         assert_eq!(BuildFormat::BuildKit.label(), "BuildKit");
     }
 
+    /// `WARNING:` lines in build output are captured as `warning` items in the result.
+    #[test]
+    fn test_try_parse_build_captures_warnings() {
+        let input = "\
+ => [1/3] FROM docker.io/library/python:3.11\n\
+ => [2/3] COPY requirements.txt .\n\
+ => [3/3] RUN pip install -r requirements.txt\n\
+WARNING: Running pip as the 'root' user can result in broken permissions\n\
+WARNING: pip is configured with locations that require TLS/SSL\n";
+        let result = try_parse_build(input).expect("expected Some for BuildKit output with warnings");
+        let display = result.to_string();
+        assert!(
+            display.contains("Running pip as the 'root' user"),
+            "expected first warning text in output, got: {display}"
+        );
+        assert!(
+            display.contains("pip is configured with locations"),
+            "expected second warning text in output, got: {display}"
+        );
+    }
+
+    /// `ERROR:` lines in build output are captured as `warning` items in the result.
+    #[test]
+    fn test_try_parse_build_captures_errors() {
+        let input = "\
+ => [1/2] FROM docker.io/library/node:20\n\
+ => [2/2] RUN npm install\n\
+ERROR: failed to solve: failed to read dockerfile: open Dockerfile: no such file or directory\n";
+        let result = try_parse_build(input).expect("expected Some for BuildKit output with errors");
+        let display = result.to_string();
+        assert!(
+            display.contains("failed to solve"),
+            "expected error text in output, got: {display}"
+        );
+    }
+
     /// A build log whose steps are all filtered (internal/load/exporting) should
     /// return `None` rather than emitting an empty result.
     #[test]
