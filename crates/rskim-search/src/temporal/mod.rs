@@ -1,16 +1,20 @@
-//! Temporal git history parsing for downstream ranking signals.
+//! Temporal git history parsing and risk scoring for downstream ranking signals.
 //!
 //! # Architecture
 //!
 //! - [`GixSource`]: pure gix-based implementation of [`TemporalSource`].
 //! - [`is_fix_commit`]: standalone fix-classification predicate.
+//! - [`decay_weight`] / [`compute_file_risk_scores`]: exponential-decay hotspot
+//!   and bug-fix density metrics (pure, no I/O).
 //!
 //! No I/O outside of [`GixSource::parse_history`]. All gix types are converted
 //! to shared [`CommitInfo`]/[`FileChangeInfo`] types at the parser boundary.
 
 mod git_parser;
+mod scoring;
 
 pub use git_parser::GixSource;
+pub use scoring::{DEFAULT_HALF_LIFE_DAYS, compute_file_risk_scores, decay_weight};
 
 use regex::Regex;
 

@@ -5,7 +5,8 @@
 //! - Core types (`types` module) are **pure**: no I/O, no side effects.
 //! - The `index` module provides on-disk persistence via memory-mapped files.
 //! - The `ngram` module handles bigram extraction (pure, no I/O).
-//! - The `temporal` module parses git history via gix for temporal scoring.
+//! - The `temporal` module parses git history via gix and computes risk scoring
+//!   (hotspot, bug-fix density) with exponential decay.
 //! - The `cochange` module builds and queries a binary co-change matrix with
 //!   Jaccard similarity from git history.
 //! - Returns Result types throughout — no panics in non-test code.
@@ -31,11 +32,13 @@ pub use ngram::{
     BORDER_MULTIPLIER, Ngram, extract_ngrams, extract_ngrams_with_weights, extract_query_ngrams,
     extract_query_ngrams_with_weights,
 };
-pub use temporal::{GixSource, is_fix_commit};
+pub use temporal::{
+    DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, decay_weight, is_fix_commit,
+};
 pub use types::{
-    CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, HistoryResult, IndexStats,
-    LayerBuilder, NodeInfo, Result, SearchError, SearchField, SearchLayer, SearchQuery,
-    SearchResult, TemporalFlags, TemporalMetadata, TemporalSource, byte_offset_to_line,
-    compute_line_range,
+    CochangeStats, CommitInfo, FieldClassifier, FileChangeInfo, FileId, FileRiskScores,
+    HistoryResult, IndexStats, LayerBuilder, NodeInfo, Result, SearchError, SearchField,
+    SearchLayer, SearchQuery, SearchResult, TemporalFlags, TemporalMetadata, TemporalSource,
+    byte_offset_to_line, compute_line_range,
 };
 pub use weights::{BIGRAM_WEIGHTS, DEFAULT_WEIGHT, bigram_weight};
